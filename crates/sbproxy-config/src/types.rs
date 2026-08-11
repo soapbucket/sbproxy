@@ -7876,7 +7876,8 @@ pub struct SecretsConfig {
     /// Use `secret://<backend>/<name>` references instead.
     #[serde(default)]
     pub map: HashMap<String, String>,
-    /// Reserved rotation shape; no OSS scheduler consumes it.
+    /// How resolved upstream credentials are re-read and how a failed
+    /// re-read behaves. Consumed by the key plane (WOR-2327).
     #[serde(default)]
     pub rotation: Option<RotationConfig>,
     /// Legacy fallback selector; provider URI resolution fails loudly and does
@@ -8178,18 +8179,30 @@ pub struct HashiCorpSecretsConfig {
     pub mount: String,
 }
 
-/// Reserved secret-rotation configuration.
+/// Secret-rotation behavior for credentials the proxy resolves from a
+/// backend and presents upstream.
 ///
-/// No OSS scheduler consumes this compatibility block.
+/// Read at boot into `sbproxy_vault::RotationPolicy` and applied by the
+/// key plane. Process-owned like the rest of `proxy.secrets`: a reload
+/// that changes it is refused with a restart message.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RotationConfig {
-    /// Seconds the previous secret value remains valid after rotation.
-    /// Defaults to 300 (5 minutes).
+    /// How long a resolved credential may still be served after
+    /// re-resolution has **failed**, measured from the end of the
+    /// re-resolve window. Defaults to 300 (5 minutes).
+    ///
+    /// This is availability, not credential overlap: the proxy presents
+    /// upstream credentials rather than validating them, so it has no
+    /// old-value acceptance window to honor. What this prevents is a
+    /// briefly unreachable backend turning every request carrying a bound
+    /// credential into a 503. A deleted or revoked credential is never
+    /// served out of this window.
     #[serde(default = "default_grace")]
     pub grace_period_secs: u64,
-    /// How often (seconds) to re-fetch secrets from the vault backend.
-    /// Defaults to 60.
+    /// How long a resolved credential is served before the backend is
+    /// consulted again. Defaults to 60, which is the value the key plane
+    /// hardcoded before this block was consumed.
     #[serde(default = "default_re_resolve")]
     pub re_resolve_interval_secs: u64,
 }

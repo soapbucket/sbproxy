@@ -891,19 +891,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // that exits `sbproxy plan` with 3. Warning that a key which changes a
     // plan's exit code does nothing is the wrong answer.
     stable("proxy.secrets.map.*", "sbproxy::install_secret_resolver"),
-    config_only(
+    stable(
         "proxy.secrets.rotation.grace_period_secs",
-        "The rotation runtime exists and is unwired. `sbproxy_vault::RotationManager` \
-         implements exactly this grace window and re-resolve interval and is unit tested, but \
-         nothing constructs it from this block and nothing drives the interval, so secrets are \
-         resolved once at boot and never again. WOR-2327.",
+        "sbproxy_core::key_plane::KeyPlane::resolve_credential_secret",
     ),
-    config_only(
+    stable(
         "proxy.secrets.rotation.re_resolve_interval_secs",
-        "The rotation runtime exists and is unwired. `sbproxy_vault::RotationManager` \
-         implements exactly this grace window and re-resolve interval and is unit tested, but \
-         nothing constructs it from this block and nothing drives the interval, so secrets are \
-         resolved once at boot and never again. WOR-2327.",
+        "sbproxy_core::key_plane::KeyPlane::resolve_credential_secret",
     ),
     config_only(
         "proxy.tenants[].credentials[].attrs.budget.reset",

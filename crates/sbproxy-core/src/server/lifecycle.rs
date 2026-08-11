@@ -163,6 +163,13 @@ fn record_process_secrets_fingerprint(secrets: Option<&sbproxy_config::types::Se
 /// backend that "exists" in the YAML. Rejecting here keeps the
 /// failure at the reload, where the operator can act on it.
 ///
+/// Since WOR-2327 the same reasoning covers `rotation:` for the same
+/// mechanical reason: `install_process_rotation` is the identical
+/// set-once shape, so a reload that changed `re_resolve_interval_secs`
+/// would be accepted and then ignored. That message named rotation
+/// before rotation did anything, which was accidentally correct; it is
+/// now correct on purpose.
+///
 /// Mirrors `cluster::reconcile_process_cluster`, which rejects
 /// restart-only cluster changes the same way.
 ///

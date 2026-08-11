@@ -302,13 +302,21 @@ impl std::fmt::Display for CredentialResolveError {
     }
 }
 
-/// How long a resolved credential secret stays cached.
+/// How long a resolved credential secret stays cached, and how long a
+/// stale one may still be served when the backend is unreachable.
 ///
 /// Vault resolution is a network round-trip and must not run per request.
 /// Dropped by [`KeyPlane::invalidate_resolved_credential`] on any admin
 /// mutation, so a rotation takes effect on the same signal that drops the
 /// record itself.
-const RESOLVED_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+///
+/// WOR-2327: this used to be a bare 60 second constant, and
+/// `proxy.secrets.rotation.re_resolve_interval_secs` parsed into nothing.
+/// It is now that key's value, with 60 seconds as the default so a config
+/// without the block behaves exactly as before.
+fn rotation_policy() -> sbproxy_vault::RotationPolicy {
+    sbproxy_vault::process_rotation()
+}
 
 type ResolvedCredentialCache =
     parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedCredential)>>;
@@ -355,21 +363,53 @@ impl KeyPlane {
         id: &str,
         tenant_id: Option<&str>,
     ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
-        if let Some(hit) = {
-            let cache = self.resolved_credentials.lock();
-            cache.get(id).and_then(|(at, value)| {
-                (at.elapsed() < RESOLVED_CREDENTIAL_TTL).then(|| value.clone())
-            })
-        } {
-            return Ok(hit);
+        let policy = rotation_policy();
+        // One read of the cache, kept for both purposes: a fresh entry is
+        // served immediately, and a stale one is held so the grace window
+        // below has something to fall back to when the backend is down.
+        let cached = self.resolved_credentials.lock().get(id).cloned();
+        if let Some((at, value)) = &cached {
+            if at.elapsed() < policy.re_resolve_interval() {
+                return Ok(value.clone());
+            }
         }
+        // Serve the last known-good value when re-resolution fails and the
+        // entry is still inside the grace window.
+        //
+        // This is the availability half of `proxy.secrets.rotation`. It is
+        // not credential overlap: the proxy presents this credential
+        // upstream rather than validating one, so there is no old-value
+        // acceptance to do. What it prevents is a briefly unreachable
+        // vault turning every request carrying a bound credential into a
+        // 503 when a good value was resolved seconds ago.
+        //
+        // Grace defaults to zero, so this is opt-in and the closure is
+        // never reached by a config that did not ask for it.
+        let serve_stale_on_failure = |err: CredentialResolveError| match &cached {
+            Some((at, value)) if at.elapsed() < policy.stale_serve_deadline() => {
+                tracing::warn!(
+                    credential_id = %id,
+                    error = %err,
+                    age_secs = at.elapsed().as_secs(),
+                    grace_secs = policy.grace_period().as_secs(),
+                    "could not re-resolve a bound credential; serving the last known-good \
+                     value for the remainder of proxy.secrets.rotation.grace_period_secs"
+                );
+                Ok(value.clone())
+            }
+            _ => Err(err),
+        };
 
-        let record = self
-            .cache()
-            .resolve_credential(id)
-            .await
-            .map_err(|e| CredentialResolveError::Unresolvable(e.to_string()))?
-            .ok_or(CredentialResolveError::NotFound)?;
+        let record = match self.cache().resolve_credential(id).await {
+            Ok(Some(record)) => record,
+            // A record that is genuinely absent is not a backend failure,
+            // so grace does not apply: the credential was deleted and
+            // continuing to present it would be wrong.
+            Ok(None) => return Err(CredentialResolveError::NotFound),
+            Err(e) => {
+                return serve_stale_on_failure(CredentialResolveError::Unresolvable(e.to_string()))
+            }
+        };
 
         if !record.is_usable() {
             return Err(CredentialResolveError::NotUsable);
@@ -396,16 +436,27 @@ impl KeyPlane {
                 })?
             }
             CredentialMaterial::VaultRef { reference } => {
-                let resolver = sbproxy_vault::process_resolver().ok_or_else(|| {
-                    CredentialResolveError::Unresolvable(
+                let Some(resolver) = sbproxy_vault::process_resolver() else {
+                    // A missing resolver is a config fault, not an
+                    // outage, so grace does not apply: it will not fix
+                    // itself and serving a stale value would hide it.
+                    return Err(CredentialResolveError::Unresolvable(
                         "no secret resolver is installed for a vault-referenced credential"
                             .to_string(),
-                    )
-                })?;
-                resolver
-                    .resolve_async(reference.clone())
-                    .await
-                    .map_err(|e| CredentialResolveError::Unresolvable(e.to_string()))?
+                    ));
+                };
+                // The case grace exists for. Everything above this point
+                // reads local state; this is the network round-trip to the
+                // secret backend, so this is where a vault blip turns a
+                // working deployment into 503s.
+                match resolver.resolve_async(reference.clone()).await {
+                    Ok(secret) => secret,
+                    Err(e) => {
+                        return serve_stale_on_failure(CredentialResolveError::Unresolvable(
+                            e.to_string(),
+                        ))
+                    }
+                }
             }
         };
 
@@ -2258,6 +2309,185 @@ mod resolve_credential_secret_tests {
                 .value,
             "Bearer generation-b",
             "a newer plane must not reuse a resolved secret cached by an older plane",
+        );
+    }
+
+    // --- WOR-2327: proxy.secrets.rotation is consumed ---
+    //
+    // Both keys parsed, validated, and reached nothing. These drive
+    // `resolve_credential_secret`, the production path, rather than the
+    // policy type on its own, so they fail if the policy stops being read
+    // even while `RotationPolicy`'s own tests still pass.
+
+    /// Serializes the four rotation tests below.
+    ///
+    /// They drive two process-wide singletons, the secret resolver and the
+    /// rotation policy, and each one installs a different value. Under
+    /// nextest's process-per-test they would be isolated anyway, but
+    /// `cargo test` runs them as threads in one process and they then
+    /// clobber each other: the interval test observed another test's
+    /// still-working resolver and saw a success where it required a
+    /// failure. Relying on the runner's isolation model would leave a test
+    /// that is green in CI and red in the documented inner loop.
+    ///
+    /// `tokio::sync::Mutex` rather than a sync one: each test awaits
+    /// inside the guarded region, and holding a sync guard across an await
+    /// is what `clippy::await_holding_lock` exists to catch. It also does
+    /// not poison, so a panicking assertion in one test does not cascade
+    /// into the other three.
+    static ROTATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Install a working `secret://fixture/upstream-key` backend.
+    fn install_working_vault() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("upstream-key", "live-secret")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
+        ));
+    }
+
+    /// Replace the resolver with one that has no backends, so the same
+    /// reference now fails the way an unreachable vault does.
+    fn break_the_vault() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        sbproxy_vault::install_process_resolver(Arc::new(sbproxy_vault::SecretResolver::new()));
+    }
+
+    async fn vault_backed_plane() -> KeyPlane {
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "rotating",
+                CredentialMaterial::VaultRef {
+                    reference: "secret://fixture/upstream-key".to_string(),
+                },
+            ),
+        )
+        .await;
+        p
+    }
+
+    #[tokio::test]
+    async fn re_resolve_interval_governs_how_long_a_credential_is_cached() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        // The wiring assertion. A zero interval means every lookup is
+        // stale, so the second call must reach the backend again. Under
+        // the old hardcoded 60 second constant this config could not be
+        // expressed at all.
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(0, 0)));
+        install_working_vault();
+        let p = vault_backed_plane().await;
+
+        assert_eq!(
+            p.resolve_credential_secret("rotating", None)
+                .await
+                .expect("first resolution succeeds")
+                .value,
+            "Bearer live-secret"
+        );
+
+        // Nothing was invalidated. With a 60 second window this would be
+        // served from cache; with a zero window it has to go back out, and
+        // a broken backend proves it did.
+        break_the_vault();
+        assert!(
+            p.resolve_credential_secret("rotating", None).await.is_err(),
+            "a zero re_resolve_interval must send the next lookup back to the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_serves_the_last_known_good_value_when_the_vault_is_down() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        // The availability half. A vault blip used to turn every request
+        // carrying a bound credential into a 503 even though a good value
+        // had been resolved moments earlier.
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(
+            0, 300,
+        )));
+        install_working_vault();
+        let p = vault_backed_plane().await;
+
+        assert_eq!(
+            p.resolve_credential_secret("rotating", None)
+                .await
+                .expect("first resolution succeeds")
+                .value,
+            "Bearer live-secret"
+        );
+
+        break_the_vault();
+        assert_eq!(
+            p.resolve_credential_secret("rotating", None)
+                .await
+                .expect("grace must serve the last known-good value")
+                .value,
+            "Bearer live-secret",
+            "inside the grace window an unreachable vault must not fail the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_is_off_by_default_so_a_dead_vault_still_fails_closed() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        // The other half of the contract. Serving a stale credential is an
+        // availability-over-freshness trade, so it has to be asked for. A
+        // config with no rotation block must keep failing closed.
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(0, 0)));
+        install_working_vault();
+        let p = vault_backed_plane().await;
+        let _ = p.resolve_credential_secret("rotating", None).await;
+
+        break_the_vault();
+        assert!(
+            matches!(
+                p.resolve_credential_secret("rotating", None).await,
+                Err(CredentialResolveError::Unresolvable(_))
+            ),
+            "with grace at zero a failed re-resolution must refuse the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_credential_is_never_covered_by_grace() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        // Grace exists for backend outages. A record that is genuinely
+        // gone was deleted on purpose, and continuing to present it would
+        // turn a revocation into a five minute window where the
+        // credential still works.
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(
+            0, 300,
+        )));
+        install_working_vault();
+        let p = vault_backed_plane().await;
+        let _ = p.resolve_credential_secret("rotating", None).await;
+
+        p.cache()
+            .store()
+            .delete_credential("rotating")
+            .await
+            .expect("delete the record");
+        p.cache().invalidate("rotating").await;
+        assert!(
+            matches!(
+                p.resolve_credential_secret("rotating", None).await,
+                Err(CredentialResolveError::NotFound)
+            ),
+            "a revoked credential must not be served out of the grace window"
         );
     }
 }

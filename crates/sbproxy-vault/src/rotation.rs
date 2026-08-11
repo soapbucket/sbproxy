@@ -1,233 +1,196 @@
-//! Secret rotation with grace period.
+//! Secret rotation policy for resolved upstream credentials.
 //!
-//! When a secret is rotated the old value remains valid for a configurable
-//! grace period so that in-flight requests using the old credential are not
-//! immediately rejected.
+//! Governs two things about a credential the proxy resolves from a secret
+//! backend and then presents to an upstream:
+//!
+//! * **How quickly a rotated value is picked up.** A resolved credential
+//!   is cached; [`RotationPolicy::re_resolve_interval`] is how long that
+//!   cache entry stays fresh before the backend is consulted again.
+//! * **What happens when the backend cannot be reached.** Within
+//!   [`RotationPolicy::grace_period`] of a cache entry going stale, the
+//!   last successfully resolved value keeps being served rather than the
+//!   request being refused.
+//!
+//! ## Why grace means last-known-good and not credential overlap
+//!
+//! The obvious reading of "rotation grace period" is the one secret
+//! providers implement: a window where both the old and the new value are
+//! accepted, which is AWS Secrets Manager's `AWSPREVIOUS` staging label
+//! and Vault's lease-plus-revocation-delay.
+//!
+//! That is not something this proxy can do, because it is the wrong side
+//! of the exchange. On this path sbproxy **presents** a credential to an
+//! upstream; it never validates one. There is no candidate value to
+//! accept-or-reject, so there is nothing for an overlap window to act on.
+//! Honoring the overlap is the secret provider's job, and every backend
+//! this crate speaks to already does it.
+//!
+//! What the proxy *can* get wrong is availability: before this policy
+//! existed, a vault that was briefly unreachable turned every request
+//! carrying a bound credential into a 503, even though a perfectly good
+//! value had been resolved seconds earlier. Serving that last known-good
+//! value for a bounded window is the standard answer (it is
+//! stale-while-revalidate, and it is what Envoy's SDS does with a failed
+//! secret refresh), and it is what `grace_period_secs` now buys.
+//!
+//! An earlier `RotationManager` here implemented the overlap reading,
+//! with a `validate(name, candidate)` that accepted the current or the
+//! previous value. It was tested and it was correct, and nothing in the
+//! workspace could ever have called it, because no code path validates a
+//! credential this crate resolved. It was removed rather than carried
+//! (WOR-2327).
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use crate::secret_string::SecretString;
-
-// --- internal types ---
-
-struct RotationEntry {
-    current: SecretString,
-    /// Previous value and the instant it was superseded.
-    previous: Option<(SecretString, Instant)>,
-}
-
-// --- public API ---
-
-/// Manages secret rotation with a configurable grace period.
+/// Process-wide rotation policy, installed once at binary boot beside the
+/// secret resolver.
 ///
-/// During the grace period both the current **and** the previous value are
-/// accepted when calling [`validate`](RotationManager::validate), which
-/// allows clients holding the old credential to finish their requests without
-/// being forcibly disconnected.
-pub struct RotationManager {
-    secrets: Mutex<HashMap<String, RotationEntry>>,
-    grace_period: Duration,
-    re_resolve_interval: Duration,
-    last_resolve: Mutex<Instant>,
+/// Same shape and same lifecycle as
+/// [`crate::resolver::install_process_resolver`]: `proxy.secrets` is
+/// process-owned, a reload that changes it is refused, so a policy read
+/// at boot stays true for the life of the process.
+static PROCESS_ROTATION: OnceLock<Mutex<Option<Arc<RotationPolicy>>>> = OnceLock::new();
+
+fn process_rotation_cell() -> &'static Mutex<Option<Arc<RotationPolicy>>> {
+    PROCESS_ROTATION.get_or_init(|| Mutex::new(None))
 }
 
-impl RotationManager {
-    /// Create a new manager.
-    ///
-    /// - `grace_period_secs` - how long (seconds) the previous secret value
-    ///   remains valid after a rotation.
-    /// - `re_resolve_interval_secs` - how often the manager considers it time to
-    ///   re-fetch secrets from the vault backend.
-    pub fn new(grace_period_secs: u64, re_resolve_interval_secs: u64) -> Self {
+/// How long a resolved credential stays fresh, and how long a stale one
+/// may still be served when the backend cannot be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RotationPolicy {
+    /// How long a resolved credential is served without re-consulting the
+    /// backend. Shorter means a rotated secret is picked up sooner and the
+    /// backend is called more often.
+    re_resolve_interval: Duration,
+    /// How long past the end of the fresh window a resolved credential may
+    /// still be served, and only when re-resolution has actually failed.
+    /// Zero disables it, so a backend failure refuses the request
+    /// immediately.
+    grace_period: Duration,
+}
+
+impl RotationPolicy {
+    /// Build a policy from the two `proxy.secrets.rotation` values.
+    pub fn new(re_resolve_interval_secs: u64, grace_period_secs: u64) -> Self {
         Self {
-            secrets: Mutex::new(HashMap::new()),
-            grace_period: Duration::from_secs(grace_period_secs),
             re_resolve_interval: Duration::from_secs(re_resolve_interval_secs),
-            last_resolve: Mutex::new(Instant::now()),
+            grace_period: Duration::from_secs(grace_period_secs),
         }
     }
 
-    /// Update (or insert) the current value for `name`.
+    /// How long a resolved credential is served before the backend is
+    /// consulted again.
+    pub fn re_resolve_interval(&self) -> Duration {
+        self.re_resolve_interval
+    }
+
+    /// How long a stale credential may be served after a failed
+    /// re-resolution.
+    pub fn grace_period(&self) -> Duration {
+        self.grace_period
+    }
+
+    /// The age past which a cached credential may not be served at all,
+    /// even when the backend is down.
     ///
-    /// The previous current value, if any, enters the grace period.
-    pub fn update(&self, name: &str, new_value: SecretString) {
-        let mut map = self.secrets.lock();
-        let previous = map.remove(name).map(|old| (old.current, Instant::now()));
-        map.insert(
-            name.to_string(),
-            RotationEntry {
-                current: new_value,
-                previous,
-            },
-        );
+    /// Fresh window plus grace window. A cache entry older than this is
+    /// unusable and a backend failure becomes a refusal.
+    pub fn stale_serve_deadline(&self) -> Duration {
+        self.re_resolve_interval.saturating_add(self.grace_period)
     }
+}
 
-    /// Return `true` if `candidate` matches the **current** value or the
-    /// **previous** value still within its grace period.
-    pub fn validate(&self, name: &str, candidate: &str) -> bool {
-        let map = self.secrets.lock();
-        let Some(entry) = map.get(name) else {
-            return false;
-        };
-        // Check current value.
-        if entry.current == SecretString::new(candidate) {
-            return true;
-        }
-        // Check grace-period previous value.
-        if let Some((ref prev, replaced_at)) = entry.previous {
-            if replaced_at.elapsed() < self.grace_period && *prev == SecretString::new(candidate) {
-                return true;
-            }
-        }
-        false
+impl Default for RotationPolicy {
+    /// The behaviour a config with no `proxy.secrets.rotation:` block
+    /// gets.
+    ///
+    /// The 60 second interval is not a new number: it is the constant that
+    /// was hardcoded in the key plane before this policy existed, kept so
+    /// adding the block is what changes behaviour, never upgrading.
+    ///
+    /// Grace defaults to zero for the same reason. Serving a stale
+    /// credential is a real availability-over-freshness trade and an
+    /// operator should opt into it, not inherit it from a default.
+    fn default() -> Self {
+        Self::new(60, 0)
     }
+}
 
-    /// Return the current value of `name`, or `None` if unknown.
-    pub fn get_current(&self, name: &str) -> Option<SecretString> {
-        self.secrets.lock().get(name).map(|e| e.current.clone())
+/// Install the process-wide rotation policy. Call once at boot, before the
+/// server compiles its config. A second call is ignored, matching
+/// [`crate::resolver::install_process_resolver`].
+pub fn install_process_rotation(policy: Arc<RotationPolicy>) {
+    let mut slot = process_rotation_cell()
+        .lock()
+        .expect("process rotation mutex");
+    if slot.is_none() {
+        *slot = Some(policy);
     }
+}
 
-    /// Return `true` when the re-resolve interval has elapsed since the last
-    /// call to [`mark_resolved`](RotationManager::mark_resolved).
-    pub fn needs_re_resolve(&self) -> bool {
-        self.last_resolve.lock().elapsed() >= self.re_resolve_interval
-    }
+/// The process-wide rotation policy.
+///
+/// Returns [`RotationPolicy::default`] when no `proxy.secrets.rotation:`
+/// block was installed, which keeps a config that never mentions rotation
+/// on exactly the behaviour it had before the block was consumed.
+pub fn process_rotation() -> RotationPolicy {
+    process_rotation_cell()
+        .lock()
+        .expect("process rotation mutex")
+        .as_deref()
+        .copied()
+        .unwrap_or_default()
+}
 
-    /// Record that secrets have just been re-resolved from the vault, resetting
-    /// the re-resolve interval timer.
-    pub fn mark_resolved(&self) {
-        *self.last_resolve.lock() = Instant::now();
-    }
-
-    /// Remove grace-period entries that have expired.
-    pub fn cleanup_expired(&self) {
-        let mut map = self.secrets.lock();
-        for entry in map.values_mut() {
-            if let Some((_, replaced_at)) = &entry.previous {
-                if replaced_at.elapsed() >= self.grace_period {
-                    entry.previous = None;
-                }
-            }
-        }
+/// Clear the installed policy so a test can install its own.
+#[doc(hidden)]
+pub fn reset_process_rotation_for_test() {
+    if let Ok(mut slot) = process_rotation_cell().lock() {
+        *slot = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
-
-    fn mgr(grace_secs: u64) -> RotationManager {
-        RotationManager::new(grace_secs, 3600)
-    }
-
-    // --- update and get_current ---
 
     #[test]
-    fn update_replaces_current_value() {
-        let m = mgr(300);
-        m.update("key", SecretString::new("v1"));
-        m.update("key", SecretString::new("v2"));
-        assert_eq!(m.get_current("key").unwrap().expose(), "v2");
+    fn absent_config_keeps_the_previously_hardcoded_interval() {
+        // The key plane used a bare `const RESOLVED_CREDENTIAL_TTL =
+        // 60s`. A config with no rotation block has to land on the same
+        // number, or wiring the key becomes a silent behaviour change for
+        // every existing deployment.
+        let policy = RotationPolicy::default();
+        assert_eq!(policy.re_resolve_interval(), Duration::from_secs(60));
     }
 
     #[test]
-    fn get_current_returns_none_for_unknown_key() {
-        let m = mgr(300);
-        assert!(m.get_current("nonexistent").is_none());
-    }
-
-    // --- validate ---
-
-    #[test]
-    fn validate_current_value_accepted() {
-        let m = mgr(300);
-        m.update("token", SecretString::new("current_secret"));
-        assert!(m.validate("token", "current_secret"));
-    }
-
-    #[test]
-    fn validate_old_value_accepted_within_grace_period() {
-        let m = mgr(300); // 5 minute grace - definitely not expired in a test
-        m.update("token", SecretString::new("old_secret"));
-        m.update("token", SecretString::new("new_secret"));
-        assert!(
-            m.validate("token", "old_secret"),
-            "grace period should still be active"
+    fn grace_is_off_unless_asked_for() {
+        // Serving a stale credential trades freshness for availability.
+        // That is the operator's call, so the default must not make it
+        // for them.
+        assert_eq!(RotationPolicy::default().grace_period(), Duration::ZERO);
+        assert_eq!(
+            RotationPolicy::default().stale_serve_deadline(),
+            Duration::from_secs(60),
+            "with no grace, the deadline is just the fresh window"
         );
-        assert!(m.validate("token", "new_secret"));
     }
 
     #[test]
-    fn validate_wrong_value_rejected() {
-        let m = mgr(300);
-        m.update("token", SecretString::new("correct"));
-        assert!(!m.validate("token", "wrong"));
+    fn stale_serve_deadline_is_the_two_windows_summed() {
+        let policy = RotationPolicy::new(60, 300);
+        assert_eq!(policy.stale_serve_deadline(), Duration::from_secs(360));
     }
 
     #[test]
-    fn validate_unknown_key_returns_false() {
-        let m = mgr(300);
-        assert!(!m.validate("no_such_key", "anything"));
-    }
-
-    #[test]
-    fn validate_expired_grace_period_rejects_old_value() {
-        // Use 0-second grace period so it expires immediately.
-        let m = RotationManager::new(0, 3600);
-        m.update("token", SecretString::new("old"));
-        m.update("token", SecretString::new("new"));
-        // Sleep a tiny bit to ensure elapsed > 0.
-        thread::sleep(Duration::from_millis(5));
-        assert!(
-            !m.validate("token", "old"),
-            "expired grace period should reject old value"
-        );
-        assert!(m.validate("token", "new"));
-    }
-
-    // --- needs_re_resolve / mark_resolved ---
-
-    #[test]
-    fn needs_re_resolve_after_interval_elapsed() {
-        // 0-second interval expires immediately.
-        let m = RotationManager::new(300, 0);
-        thread::sleep(Duration::from_millis(5));
-        assert!(m.needs_re_resolve());
-    }
-
-    #[test]
-    fn needs_re_resolve_false_immediately_after_mark_resolved() {
-        let m = RotationManager::new(300, 3600);
-        m.mark_resolved();
-        assert!(!m.needs_re_resolve());
-    }
-
-    // --- cleanup_expired ---
-
-    #[test]
-    fn cleanup_removes_expired_previous_entries() {
-        let m = RotationManager::new(0, 3600);
-        m.update("key", SecretString::new("old"));
-        m.update("key", SecretString::new("new"));
-        thread::sleep(Duration::from_millis(5));
-        m.cleanup_expired();
-        // After cleanup the old value should be gone.
-        assert!(!m.validate("key", "old"));
-        assert!(m.validate("key", "new"));
-    }
-
-    #[test]
-    fn cleanup_preserves_active_grace_period_entries() {
-        let m = RotationManager::new(300, 3600); // 5-min grace
-        m.update("key", SecretString::new("old"));
-        m.update("key", SecretString::new("new"));
-        m.cleanup_expired(); // should not remove still-valid previous
-        assert!(
-            m.validate("key", "old"),
-            "active grace period should survive cleanup"
-        );
+    fn stale_serve_deadline_saturates_rather_than_overflowing() {
+        // Both values are operator-supplied `u64` seconds, so the sum can
+        // overflow a Duration. Saturating means an absurd config produces
+        // "effectively forever" instead of a panic on the request path.
+        let policy = RotationPolicy::new(u64::MAX, u64::MAX);
+        assert_eq!(policy.stale_serve_deadline(), Duration::MAX);
     }
 }
