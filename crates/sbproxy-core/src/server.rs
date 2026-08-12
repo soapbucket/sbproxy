@@ -3421,6 +3421,50 @@ struct PolicyVerdictCtx {
     request_id: String,
     tenant_id: String,
     workspace_id: String,
+    /// Origin the decision is being made on.
+    ///
+    /// Required by the shared decision-event family (WOR-2370): a
+    /// decision is meaningless without knowing whose traffic it was made
+    /// on, and `origin` is bounded by config, which makes it the safe
+    /// multi-tenant dimension.
+    origin: String,
+}
+
+/// Which engine answered, in the shared decision-event vocabulary.
+///
+/// `PolicySurface` distinguishes only the built-in enum arm from the
+/// dynamic-dispatch plugin path today. The CEL, Lua, JavaScript, and
+/// WASM engines reach policy through those two surfaces rather than
+/// through their own, so they are not separable here yet; the
+/// engine-neutral events land with their engine already on the call.
+const fn decision_engine_for(
+    surface: sbproxy_observe::events::PolicySurface,
+) -> sbproxy_observe::decision::DecisionEngine {
+    match surface {
+        sbproxy_observe::events::PolicySurface::Plugin => {
+            sbproxy_observe::decision::DecisionEngine::Plugin
+        }
+        _ => sbproxy_observe::decision::DecisionEngine::BuiltIn,
+    }
+}
+
+/// Map a policy verdict onto the shared outcome vocabulary.
+///
+/// `Confirm` maps to `Deny` deliberately. It holds the request pending
+/// human approval, so from the request's point of view it did not
+/// proceed, and a SIEM rule counting refusals should see it. The
+/// distinction survives in the audit record's reason, which names the
+/// confirmation rather than collapsing it.
+const fn decision_outcome_for(
+    verdict: sbproxy_observe::events::VerdictTag,
+) -> sbproxy_observe::decision::DecisionOutcome {
+    match verdict {
+        sbproxy_observe::events::VerdictTag::Deny
+        | sbproxy_observe::events::VerdictTag::Confirm => {
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        }
+        _ => sbproxy_observe::decision::DecisionOutcome::Allow,
+    }
 }
 
 /// Try to publish a [`sbproxy_observe::events::PolicyVerdictEvent`]
@@ -3455,6 +3499,24 @@ fn emit_policy_verdict(
     sbproxy_observe::metrics::record_policy_evaluation_duration(
         &ctx.workspace_id,
         verdict.as_label(),
+        elapsed.as_secs_f64(),
+    );
+    // WOR-2370: the same decision on the shared family. The per-feature
+    // metrics above stay; this is the family new events use and the one
+    // existing events migrate toward, so the policy event is the first
+    // to carry both.
+    let engine = decision_engine_for(surface);
+    sbproxy_observe::decision::record_decision(
+        sbproxy_observe::decision::DecisionEvent::Policy,
+        engine,
+        decision_outcome_for(verdict),
+        &ctx.origin,
+        &ctx.tenant_id,
+    );
+    sbproxy_observe::decision::record_decision_duration(
+        sbproxy_observe::decision::DecisionEvent::Policy,
+        engine,
+        &ctx.origin,
         elapsed.as_secs_f64(),
     );
     let event = sbproxy_observe::events::PolicyVerdictEvent::new(

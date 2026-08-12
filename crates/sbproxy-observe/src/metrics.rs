@@ -367,6 +367,21 @@ pub struct ProxyMetrics {
     pub policy_triggers: CounterVec,
     /// Cache hit/miss with origin and result labels.
     pub cache_results: CounterVec,
+    /// Counter `sbproxy_extension_event_total`: one family for every
+    /// decision event, dimensioned by `event`, `engine`, `outcome`,
+    /// `origin`, and `tenant` rather than duplicated per feature.
+    /// Written through `sbproxy_observe::decision::record_decision`.
+    pub extension_event_total: IntCounterVec,
+    /// Histogram `sbproxy_extension_event_duration_seconds`. No
+    /// `tenant` label on purpose: a histogram multiplies its label set
+    /// by its bucket count, and latency per origin and per engine is
+    /// the actionable cut.
+    pub extension_event_duration: HistogramVec,
+    /// Counter `sbproxy_extension_event_fail_open_total`. Its own
+    /// family rather than an `outcome` label, because a fail-open is a
+    /// request that proceeded without the decision being made, which is
+    /// a different thing to alert on than an engine fault.
+    pub extension_event_fail_open: IntCounterVec,
     /// Circuit breaker state transitions with origin, from_state, and to_state labels.
     pub circuit_breaker_transitions: CounterVec,
     /// Counter `sbproxy_upstream_status_retries_total` of upstream
@@ -685,6 +700,38 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // --- One decision-event family (WOR-2370) ---
+
+        let extension_event_total = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_extension_event_total",
+                "Decision events by pipeline point, engine, and outcome",
+            ),
+            &["event", "engine", "outcome", "origin", "tenant"],
+        )
+        .unwrap();
+
+        let extension_event_duration = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "sbproxy_extension_event_duration_seconds",
+                "Decision event evaluation latency",
+            )
+            .buckets(vec![
+                0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+            ]),
+            &["event", "engine", "origin"],
+        )
+        .unwrap();
+
+        let extension_event_fail_open = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_extension_event_fail_open_total",
+                "Decision events that proceeded without the decision being made",
+            ),
+            &["event", "engine", "origin", "tenant"],
+        )
+        .unwrap();
+
         let cache_results = CounterVec::new(
             Opts::new("sbproxy_cache_results_total", "Cache hit/miss"),
             &["origin", "result"],
@@ -836,6 +883,15 @@ impl ProxyMetrics {
             .register(Box::new(semantic_cache_results.clone()))
             .unwrap();
         registry
+            .register(Box::new(extension_event_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(extension_event_duration.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(extension_event_fail_open.clone()))
+            .unwrap();
+        registry
             .register(Box::new(inference_requests.clone()))
             .unwrap();
         registry
@@ -944,6 +1000,9 @@ impl ProxyMetrics {
             auth_results,
             policy_triggers,
             cache_results,
+            extension_event_total,
+            extension_event_duration,
+            extension_event_fail_open,
             circuit_breaker_transitions,
             upstream_status_retries,
             upstream_timeout_retries,

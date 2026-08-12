@@ -302,6 +302,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_script_duration_seconds` | Histogram | `stable` | `beta` | `engine` | Script-engine invocation duration, by engine. |
 | `sbproxy_script_invocations_total` | Counter | `stable` | `beta` | `engine`, `result` | Script-engine invocations, by engine and outcome. |
 | `sbproxy_script_reloads_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `engine`, `result` | Script-engine hot-reload events, by engine and outcome. |
+| `sbproxy_extension_event_total` | Counter | `stable` | `alpha` | `event`, `engine`, `outcome`, `origin`, `tenant` | Decision events by pipeline point, engine, and outcome. |
+| `sbproxy_extension_event_duration_seconds` | Histogram | `stable` | `alpha` | `event`, `engine`, `origin` | Decision event evaluation latency. |
+| `sbproxy_extension_event_fail_open_total` | Counter | `stable` | `alpha` | `event`, `engine`, `origin`, `tenant` | Decision events that proceeded without the decision being made. |
 | `sbproxy_semantic_cache_results_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `source`, `result` | Semantic-cache hit/miss/error counts. |
 | `sbproxy_serve_lane_admissions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `priority`, `decision` | Served-lane admission gate decisions by priority lane. |
 | `sbproxy_silent_degradations_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `op` | Best-effort operations that failed and were previously dropped silently, by op. |

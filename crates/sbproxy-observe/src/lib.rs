@@ -16,6 +16,11 @@ pub mod capture;
 pub mod cardinality;
 /// Clock-skew monitor: SNTP poller + `/readyz` probe.
 pub mod clock_skew;
+/// The decision-event vocabulary: which pipeline points decide, which
+/// engine answered, what came out, and the one metric family plus
+/// OCSF-shaped audit record they all share instead of hand-rolling
+/// their own (WOR-2365, WOR-2370).
+pub mod decision;
 /// Egress for the typed proxy events: the `events:` block's bounded
 /// queue, background worker, and file / webhook sinks. Delivery never
 /// runs on the publisher's thread, which is the difference between this

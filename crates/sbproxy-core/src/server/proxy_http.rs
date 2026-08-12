@@ -4195,6 +4195,7 @@ impl ProxyHttp for SbProxy {
                         request_id: ctx.request_id.to_string(),
                         tenant_id: workspace_id.clone(),
                         workspace_id,
+                        origin: ctx.hostname.to_string(),
                     };
                     if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
                         &pipeline.enforcers[origin_idx],

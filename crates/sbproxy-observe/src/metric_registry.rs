@@ -3059,6 +3059,43 @@ pub const METRICS: &[MetricCapability] = &[
         ),
     },
     MetricCapability {
+        name: "sbproxy_extension_event_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Proxy,
+        labels: &["event", "engine", "outcome", "origin", "tenant"],
+        description: "Decision events by pipeline point, engine, and outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_extension_event_duration_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_decision_duration"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Proxy,
+        // No `tenant`: a histogram multiplies its label set by its bucket
+        // count, and latency per origin and per engine is the actionable
+        // cut. Per-tenant latency, if it is ever needed, arrives as its
+        // own opt-in histogram rather than by widening this one.
+        labels: &["event", "engine", "origin"],
+        description: "Decision event evaluation latency.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_extension_event_fail_open_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_decision_fail_open"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Proxy,
+        labels: &["event", "engine", "origin", "tenant"],
+        description: "Decision events that proceeded without the decision being made.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_semantic_cache_results_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_semantic_cache"),

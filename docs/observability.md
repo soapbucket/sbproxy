@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-12*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -407,6 +407,36 @@ Divergence is an alert, never enforcement. If the counter and the chain disagree
 Incoherence is the opposite: always enforcement, never configurable. A receipt whose unit declares `measured` while carrying an origin header passes the hash chain and the Ed25519 signature, because neither of those asks whether a document agrees with itself, and `measured` is the provenance a buyer disputes least. Every path that reads a receipt back refuses one, so `failure_mode` is always `closed` on this family. That key answers what happens to traffic when the meter cannot write, and by the time anything reads a receipt the request it describes is over; the only decision left is whether to believe the document. The consequence still follows your posture one layer out, because a chain carrying an incoherent entry will not open and `failure_mode` decides what an unopenable chain does to traffic.
 
 The counter moves on every refusal rather than once per bad receipt, so a polled dashboard keeps incrementing while the entry is still on the chain. That is deliberate: the condition is permanent until somebody edits the file, and `/api/meter/verify` names the sequence number to look at.
+
+### One family for every decision event
+
+The proxy decides many things per request: whether to authenticate, which policies pass, how to key a cache, which provider to route to, whether a guardrail permits a prompt. Each of those arrived with its own metric and its own label vocabulary, which is why `record_policy`, `record_rate_limit_decision`, `record_cache`, and `record_semantic_cache` all count decisions and none of them agree on how.
+
+Three families cover all of them, dimensioned rather than duplicated:
+
+| Metric | Labels | What it answers |
+|---|---|---|
+| `sbproxy_extension_event_total` | `event`, `engine`, `outcome`, `origin`, `tenant` | How often each decision point fired, who answered, and what came out |
+| `sbproxy_extension_event_duration_seconds` | `event`, `engine`, `origin` | Whether a decision point is slow, and whether the engine behind it is the reason |
+| `sbproxy_extension_event_fail_open_total` | `event`, `engine`, `origin`, `tenant` | How often a request proceeded without the decision being made |
+
+`event` is a named pipeline point (`policy`, `cache.key`, `route.decide`, `ai.guardrail.input`, ...). `engine` is who answered it (`built_in`, `plugin`, `cel`, `lua`, `js`, `wasm`, `proxy_wasm`). Separating the two is the point: adding a capability should not mean picking an engine first and inheriting whatever seam that engine happens to have.
+
+`outcome` always carries `error` and `timeout` alongside an event's own verdicts, so a failing hook is alertable without knowing in advance which hook it was in. `decline` is separate from both, and it is not a failure: a routing or cache policy that returns nothing falls through to the configured default, which is the common path rather than the exceptional one.
+
+**Fail-open is its own family, not an outcome label.** A fail-open is not an error. It is a request that proceeded *without* the decision being made, which is a different operational fact and wants a different alert. Buried in a label it stops being alarmable.
+
+**No `tenant` on the histogram, on purpose.** A histogram multiplies its label set by its bucket count, so an unbounded-ish dimension costs ten to fifteen times there what it costs on a counter. Latency per tenant is also rarely the actionable cut; latency per origin and per engine is, because that is what answers "is this hook slow" and "is this engine's marshalling too expensive". If per-tenant latency is ever needed it arrives as a separate opt-in histogram rather than by widening this one.
+
+#### Cardinality budget
+
+Stated here rather than discovered on your Prometheus. The theoretical product is `event x engine x outcome x origin x tenant`, which is 18 x 7 x 7 = 882 before tenancy. In practice it is sparse: one event is normally served by one engine per origin, and most origins use a handful of events.
+
+At 50 origins and 500 tenants, expect roughly 50 x 500 x (events actually configured, typically 4 to 8) x 1 engine x (outcomes actually seen, typically 2 to 3), which lands in the low hundreds of thousands of series if every tenant uses every origin. That is the pathological reading. Tenants are normally partitioned across origins rather than crossed with them, which divides it by the number of origins and puts the realistic figure in the low thousands.
+
+Every label value passes through the global cardinality limiter, which caps at 1000 unique values per label by default and demotes overflow to `__other__`, emitting `sbproxy_label_cardinality_overflow_total{metric, label}`. Watch that counter rather than assuming the estimate above holds for your traffic.
+
+Single-tenant deployments are unchanged. `tenant` resolves to `__default__` and falls through the proxy-wide path, so the series a single-tenant operator's dashboards read are the same ones they were reading before this family existed.
 
 ## Logs
 
