@@ -709,7 +709,7 @@ impl ProxyMetrics {
             ),
             &["event", "engine", "outcome", "origin", "tenant"],
         )
-        .unwrap();
+        .expect("metric name and label set are compile-time constants and are valid");
 
         let extension_event_duration = HistogramVec::new(
             prometheus::HistogramOpts::new(
@@ -721,7 +721,7 @@ impl ProxyMetrics {
             ]),
             &["event", "engine", "origin"],
         )
-        .unwrap();
+        .expect("metric name and label set are compile-time constants and are valid");
 
         let extension_event_fail_open = IntCounterVec::new(
             Opts::new(
@@ -730,7 +730,7 @@ impl ProxyMetrics {
             ),
             &["event", "engine", "origin", "tenant"],
         )
-        .unwrap();
+        .expect("metric name and label set are compile-time constants and are valid");
 
         let cache_results = CounterVec::new(
             Opts::new("sbproxy_cache_results_total", "Cache hit/miss"),
@@ -884,13 +884,13 @@ impl ProxyMetrics {
             .unwrap();
         registry
             .register(Box::new(extension_event_total.clone()))
-            .unwrap();
+            .expect("the decision-event families are registered exactly once, at startup");
         registry
             .register(Box::new(extension_event_duration.clone()))
-            .unwrap();
+            .expect("the decision-event families are registered exactly once, at startup");
         registry
             .register(Box::new(extension_event_fail_open.clone()))
-            .unwrap();
+            .expect("the decision-event families are registered exactly once, at startup");
         registry
             .register(Box::new(inference_requests.clone()))
             .unwrap();
