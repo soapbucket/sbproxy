@@ -1,5 +1,5 @@
 # Headless detection
-*Last modified: 2026-06-18*
+*Last modified: 2026-08-12*
 
 Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer.
 

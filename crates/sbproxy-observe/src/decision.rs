@@ -412,13 +412,17 @@ impl fmt::Display for DecisionOutcome {
 ///
 /// `origin` is required rather than optional: a decision is meaningless
 /// without knowing whose traffic it was made on, and `origin` is bounded
-/// by config, which makes it the safer multi-tenant dimension. Every
+/// by config, which makes it the safer multi-tenant dimension.
+///
+/// **Pass the configured origin id, never the request `Host`.** Every
 /// label value goes through the global cardinality limiter, which
-/// demotes overflow to `__other__`. The budgets are per label name and
-/// shared across every metric using that name: `origin` is 200, `tenant`
-/// is 1000. Callers pass the request `Host` for `origin`, matching every
-/// other origin-labelled recorder in the tree, so a wildcard origin can
-/// consume the budget faster than a config origin count suggests.
+/// demotes overflow to `__other__`, and the budgets are per label name
+/// and shared across every metric using that name: `origin` is 200,
+/// `tenant` is 1000. A `Host` is attacker-chosen, so under a wildcard
+/// origin it would let an unauthenticated caller exhaust a budget that
+/// every other origin-labelled family draws on. Several older recorders
+/// do pass the `Host`; they predate that reasoning and are not the
+/// pattern to copy here.
 pub fn record_decision(
     event: DecisionEvent,
     engine: DecisionEngine,

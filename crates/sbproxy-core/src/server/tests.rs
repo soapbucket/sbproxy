@@ -4395,3 +4395,97 @@ fn every_declared_verdict_maps_without_falling_through() {
         );
     }
 }
+
+/// Read one `sbproxy_decision_event_total` sample by its labels.
+fn decision_event_total(labels: &[(&str, &str)]) -> f64 {
+    sbproxy_observe::metrics::metrics()
+        .render()
+        .lines()
+        .find(|line| {
+            line.starts_with("sbproxy_decision_event_total")
+                && labels
+                    .iter()
+                    .all(|(k, v)| line.contains(&format!("{k}=\"{v}\"")))
+        })
+        .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+        .unwrap_or(0.0)
+}
+
+#[test]
+fn the_recorded_tenant_and_origin_are_the_populated_config_fields() {
+    // The seam, not the mapping function. Two fields on this path are
+    // named alike and only one is ever populated: `workspace_id` is
+    // `CompactString::default()` at every construction site in this
+    // workspace, so wiring the label to it ships `tenant=""` in every
+    // deployment and silently skips the per-tenant budget isolation.
+    // `origin` has the mirror hazard in the other direction: the
+    // request `Host` is attacker-chosen against a shared 200-value
+    // budget. A refactor that swaps either back passes every other test
+    // in this file.
+    let ctx = super::PolicyVerdictCtx {
+        request_id: "req-1".to_owned(),
+        workspace_id: String::new(),
+        origin: "billing-api".to_owned(),
+        tenant: "acme-corp".to_owned(),
+    };
+    let labels = [
+        ("event", "policy"),
+        ("origin", "billing-api"),
+        ("tenant", "acme-corp"),
+    ];
+    let before = decision_event_total(&labels);
+    super::emit_policy_verdict(
+        &ctx,
+        "rate_limit",
+        sbproxy_observe::events::PolicySurface::BuiltIn,
+        sbproxy_observe::events::VerdictTag::Allow,
+        std::time::Instant::now(),
+    );
+    assert!(
+        decision_event_total(&labels) > before,
+        "the decision must be recorded under the origin and tenant it was given, \
+         not under the empty workspace id"
+    );
+}
+
+#[test]
+fn a_faulting_engine_is_recorded_as_error_rather_than_as_its_verdict() {
+    // `outcome` documents `error` and `timeout` as always carried, so
+    // an alert can fire without knowing which hook broke. That is only
+    // true if something emits them.
+    let ctx = super::PolicyVerdictCtx {
+        request_id: "req-2".to_owned(),
+        workspace_id: String::new(),
+        origin: "fault-origin".to_owned(),
+        tenant: "acme-corp".to_owned(),
+    };
+    let labels = [("origin", "fault-origin"), ("outcome", "error")];
+    let before = decision_event_total(&labels);
+    super::emit_policy_verdict_with_outcome(
+        &ctx,
+        "wasm_policy",
+        sbproxy_observe::events::PolicySurface::Plugin,
+        sbproxy_observe::events::VerdictTag::Deny,
+        std::time::Instant::now(),
+        Some(sbproxy_observe::decision::DecisionOutcome::Error),
+    );
+    assert!(
+        decision_event_total(&labels) > before,
+        "an engine fault must not be indistinguishable from an ordinary deny"
+    );
+}
+
+#[test]
+fn a_hook_that_ran_out_of_time_is_separable_from_one_that_faulted() {
+    // A budget change and a bug fix are different responses, which is
+    // why they are different outcomes rather than one `error` bucket.
+    use sbproxy_observe::decision::DecisionOutcome;
+    assert_eq!(
+        super::engine_fault_outcome(&sbproxy_plugin::PluginError::Timeout),
+        DecisionOutcome::Timeout
+    );
+    assert_eq!(
+        super::engine_fault_outcome(&sbproxy_plugin::PluginError::Auth("nope".into())),
+        DecisionOutcome::Error
+    );
+}

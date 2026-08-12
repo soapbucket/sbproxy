@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-12*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed

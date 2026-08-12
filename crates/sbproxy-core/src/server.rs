@@ -3419,7 +3419,13 @@ fn forward_auth_user_from_trust_headers(headers: &[(String, String)]) -> Option<
 #[derive(Clone)]
 struct PolicyVerdictCtx {
     request_id: String,
-    tenant_id: String,
+    /// Workspace the origin belongs to.
+    ///
+    /// Nothing in this workspace populates `CompiledOrigin::workspace_id`
+    /// today, so this is the empty string in every deployment. It stays
+    /// because the enterprise audit binding distinguishes workspace from
+    /// tenant through a lookup the OSS proxy does not own. Do not reach
+    /// for it as a tenant: [`Self::tenant`] is the populated one.
     workspace_id: String,
     /// Origin the decision is being made on.
     ///
@@ -3480,7 +3486,7 @@ const fn decision_engine_for(
 /// proceed, and a SIEM rule counting refusals should see it. The
 /// distinction survives in the audit record's reason, which names the
 /// confirmation rather than collapsing it.
-fn decision_outcome_for(
+const fn decision_outcome_for(
     verdict: sbproxy_observe::events::VerdictTag,
 ) -> sbproxy_observe::decision::DecisionOutcome {
     use sbproxy_observe::decision::DecisionOutcome;
@@ -3495,6 +3501,26 @@ fn decision_outcome_for(
         // is visible because the arm is reachable only for a tag added
         // upstream after this match was written.
         _ => DecisionOutcome::Deny,
+    }
+}
+
+/// Distinguish a hook that ran out of time from one that faulted.
+///
+/// `outcome` is documented as always carrying `error` and `timeout`
+/// alongside an event's own verdicts, so a failing hook is alertable
+/// without knowing in advance which hook it was in. That claim is only
+/// true if something actually produces `timeout`, and
+/// `PluginError::Timeout` is the signal: every sandboxed engine maps its
+/// deadline to it, so a policy that blew its budget is separable from
+/// one that returned garbage. They want different responses, a budget
+/// change versus a bug fix, which is the whole reason they are separate
+/// outcomes.
+const fn engine_fault_outcome(
+    error: &sbproxy_plugin::PluginError,
+) -> sbproxy_observe::decision::DecisionOutcome {
+    match error {
+        sbproxy_plugin::PluginError::Timeout => sbproxy_observe::decision::DecisionOutcome::Timeout,
+        _ => sbproxy_observe::decision::DecisionOutcome::Error,
     }
 }
 
@@ -3570,10 +3596,19 @@ fn emit_policy_verdict_with_outcome(
         &ctx.origin,
         elapsed.as_secs_f64(),
     );
+    // WOR-2370: the audit record carries the resolved tenant, not the
+    // workspace id. Origin and tenant are mandatory on an audit record
+    // rather than optional context, because a record an analyst cannot
+    // filter to a customer is not evidence, and `workspace_id` is
+    // `CompactString::default()` at every construction site in this
+    // workspace. Leaving it would have shipped the Prometheus series
+    // saying `tenant="acme-corp"` while the SIEM record for the same
+    // decision said `tenant_id=""`, and the SIEM record is the
+    // analyst-facing half.
     let event = sbproxy_observe::events::PolicyVerdictEvent::new(
         uuid::Uuid::new_v4(),
         ctx.request_id.clone(),
-        ctx.tenant_id.clone(),
+        ctx.tenant.clone(),
         ctx.workspace_id.clone(),
         chrono::Utc::now(),
         policy_id.to_string(),
@@ -3582,11 +3617,13 @@ fn emit_policy_verdict_with_outcome(
         elapsed_ms,
     );
     if let Err(_dropped) = crate::policy_bus::try_publish(event) {
-        // Bus full or not yet installed; the dropped-events metric
-        // is the paging signal per
-        // `docs/adr-policy-audit-binding.md`. Tenant label uses the
-        // workspace id as the OSS-scope tenant proxy.
-        sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.workspace_id);
+        // Bus full or not yet installed; the dropped-events metric is
+        // the paging signal per `docs/adr-policy-audit-binding.md`. The
+        // drop counter is per tenant on purpose: one noisy tenant
+        // filling the queue must not silently degrade another tenant's
+        // audit trail, which it would if this were keyed on the always
+        // empty workspace id.
+        sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.tenant);
     }
     // WOR-2094: non-allow verdicts land on the console's audit sample.
     // Allow verdicts stay off the ring (they would flood it at request
@@ -3597,7 +3634,7 @@ fn emit_policy_verdict_with_outcome(
                 "policy",
                 policy_id,
                 None,
-                Some(ctx.tenant_id.clone()),
+                Some(ctx.tenant.clone()),
                 None,
                 Some(ctx.request_id.clone()),
                 Some(format!(
@@ -3931,7 +3968,7 @@ async fn check_policies(
                     started,
                     // The request is denied, but the decision was an
                     // engine fault, and those are alerted on separately.
-                    Some(sbproxy_observe::decision::DecisionOutcome::Error),
+                    Some(engine_fault_outcome(&err)),
                 );
                 // WOR-2094: the ring row explains the denial too.
                 ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
@@ -4068,23 +4105,29 @@ async fn check_buffered_dynamic_policies(
                     failure_posture = posture.as_label(),
                     "buffered dynamic policy enforce() returned error"
                 );
+                // WOR-2370: a fail-open is deliberately *not* counted as
+                // `outcome="error"`. The docs say "a fail-open is not an
+                // error", and an operator alerting on the error rate must
+                // not be paged by every request a posture admitted on
+                // purpose. So an admitting posture keeps the verdict's own
+                // outcome, which is the `allow` the request actually got,
+                // and the separate fail-open family carries the fault. A
+                // posture that refuses is a different case: nothing
+                // proceeded, so the engine fault is the outcome.
                 emit_policy_verdict_with_outcome(
                     verdict_ctx,
                     policy_id,
                     compiled.surface,
                     verdict,
                     started,
-                    Some(sbproxy_observe::decision::DecisionOutcome::Error),
+                    (!posture.admits()).then(|| engine_fault_outcome(&error)),
                 );
                 if posture.admits() {
-                    // WOR-2370: this is the fail-open, and it gets its
-                    // own counter rather than an `outcome` label on the
-                    // shared family. The request proceeded *without the
-                    // decision being made*, which is a different
-                    // operational fact from an engine fault and wants a
-                    // different alert. `emit_policy_verdict` above
-                    // already counted the allow; this says the allow was
-                    // not earned.
+                    // The request proceeded *without the decision being
+                    // made*, which is a different operational fact from an
+                    // engine fault and wants a different alert. The call
+                    // above counted the allow; this says the allow was not
+                    // earned.
                     sbproxy_observe::decision::record_decision_fail_open(
                         sbproxy_observe::decision::DecisionEvent::Policy,
                         decision_engine_for(compiled.surface),

@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-12*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
