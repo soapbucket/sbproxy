@@ -124,7 +124,7 @@ impl Default for RotationPolicy {
 pub fn install_process_rotation(policy: Arc<RotationPolicy>) {
     let mut slot = process_rotation_cell()
         .lock()
-        .expect("process rotation mutex");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if slot.is_none() {
         *slot = Some(policy);
     }
@@ -138,7 +138,7 @@ pub fn install_process_rotation(policy: Arc<RotationPolicy>) {
 pub fn process_rotation() -> RotationPolicy {
     process_rotation_cell()
         .lock()
-        .expect("process rotation mutex")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_deref()
         .copied()
         .unwrap_or_default()
