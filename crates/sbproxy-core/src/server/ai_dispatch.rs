@@ -5870,7 +5870,14 @@ pub(super) async fn handle_ai_proxy(
             // site rather than being folded in here.
             sbproxy_observe::decision::DecisionEngine::Cel,
             route_outcome,
-            ctx.hostname.as_str(),
+            // The config-bounded origin id, never the request `Host`.
+            // `origin` is budgeted at 200 across every metric using that
+            // label name, so an attacker-chosen value on a per-request
+            // path can exhaust the shared budget and demote every other
+            // origin-labelled family to `__other__`.
+            ctx.origin_idx
+                .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+                .map_or("", |origin| origin.origin_id.as_str()),
             ctx.tenant_id.as_str(),
         );
 
