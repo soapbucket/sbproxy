@@ -15,7 +15,7 @@ use sbproxy_modules::DynamicHookMetadata;
 use sbproxy_observe::events::PolicySurface;
 use sbproxy_plugin::PolicyEnforcer;
 
-use super::shared_admission::SharedAdmission;
+use super::shared_admission::{SharedAdmission, SharedDecision};
 #[cfg(feature = "agent-class")]
 use super::AgentClassEnforcer;
 use super::{
@@ -123,7 +123,18 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         Policy::AgentClass(p) => builtin(AgentClassEnforcer(Arc::new(p))),
         Policy::A2A(p) => builtin(A2AEnforcer(Arc::new(p))),
         Policy::SemanticConstraint(p) => builtin(SemanticConstraintEnforcer(Arc::new(p))),
-        Policy::AgentBudget(p) => builtin(AgentBudgetEnforcer(p)),
+        Policy::AgentBudget(p) => {
+            // Second variant to carry a shared-admission handle, resolved
+            // once here for the same reason RateLimit is.
+            let enforcer = AgentBudgetEnforcer(p);
+            let shared_admission = enforcer.shared_admission();
+            CompiledEnforcer {
+                surface: PolicySurface::BuiltIn,
+                enforcer: Box::new(enforcer),
+                dynamic_hook: None,
+                shared_admission,
+            }
+        }
         Policy::Plugin(plugin) => {
             let (enforcer, dynamic_hook) = plugin.into_parts();
             CompiledEnforcer {
@@ -168,8 +179,18 @@ pub(crate) async fn resolve_shared_admission(
     let Some(key) = shared.shared_admission_key(req, ctx) else {
         return;
     };
-    let info = shared.shared_admit(key).await;
-    ctx.shared_rate_limit_decision = Some(info);
+    // One arm per policy that can carry a shared tier. The match is
+    // exhaustive on purpose: a third policy adopting this seam has to
+    // decide where its decision lands rather than silently having it
+    // dropped here.
+    match shared.shared_admit(key).await {
+        SharedDecision::RateLimit(info) => {
+            ctx.shared_rate_limit_decision = Some(info);
+        }
+        SharedDecision::AgentBudget { decision, guard } => {
+            ctx.shared_agent_budget_decision = Some((decision, guard));
+        }
+    }
 }
 
 /// Wrap a built-in enforcer that admits entirely in process.
@@ -608,6 +629,47 @@ mod tests {
         assert!(
             chain[0].shared_admission.is_none(),
             "no handle means no await and no store call"
+        );
+    }
+
+    // --- WOR-2315: agent_budget adopts the same seam ---
+
+    /// Compile a one-policy `agent_budget` chain, optionally with a
+    /// shared store attached, the way the pipeline does.
+    fn agent_budget_chain(
+        store: Option<Arc<dyn sbproxy_platform::KVStore>>,
+    ) -> Vec<CompiledEnforcer> {
+        let mut policy =
+            sbproxy_modules::policy::AgentBudgetPolicy::from_config(serde_json::json!({
+                "requests_per_minute": 2.0,
+                "on_anonymous": "skip"
+            }))
+            .expect("agent_budget config");
+        if let Some(store) = store {
+            policy = policy.with_store(Some(store), "seam-test-origin");
+        }
+        compile_builtin_enforcers(
+            vec![Policy::AgentBudget(Arc::new(policy))],
+            "seam-test-route",
+        )
+        .expect("chain compiles")
+    }
+
+    #[test]
+    fn agent_budget_with_a_store_produces_a_shared_admission_handle() {
+        // The regression WOR-2332 warned this branch would recreate:
+        // `try_admit_async` existed and had no production caller, so a
+        // configured store would have been attached and never consulted.
+        let store: Arc<dyn sbproxy_platform::KVStore> = Arc::new(CountingStore::default());
+        assert!(
+            agent_budget_chain(Some(store))[0]
+                .shared_admission
+                .is_some(),
+            "an agent_budget policy with an L2 store must carry a handle"
+        );
+        assert!(
+            agent_budget_chain(None)[0].shared_admission.is_none(),
+            "a local-only agent_budget policy must not pay for the seam"
         );
     }
 

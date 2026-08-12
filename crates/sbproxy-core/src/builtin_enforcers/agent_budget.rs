@@ -31,11 +31,69 @@ use sbproxy_modules::policy::{
 };
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
+use super::shared_admission::{SharedAdmission, SharedDecision};
 use crate::context::RequestContext;
 
 /// Newtype wrapper that adapts [`AgentBudgetPolicy`] to
 /// [`PolicyEnforcer`].
 pub struct AgentBudgetEnforcer(pub Arc<AgentBudgetPolicy>);
+
+impl AgentBudgetEnforcer {
+    /// A handle that admits this policy against its cluster-shared
+    /// counter, for policies that have one.
+    ///
+    /// `None` for a local-only policy, which is the common case and keeps
+    /// exactly the synchronous path it had.
+    pub(crate) fn shared_admission(&self) -> Option<Arc<dyn SharedAdmission>> {
+        if !self.0.has_shared_tier() {
+            return None;
+        }
+        Some(Arc::new(AgentBudgetSharedAdmission {
+            policy: Arc::clone(&self.0),
+        }))
+    }
+}
+
+/// The shared-tier half of [`AgentBudgetEnforcer`].
+///
+/// Split out for the same reason the rate limiter's is: the key has to be
+/// derived under a context borrow that ends before the await, because a
+/// future holding `&mut dyn Any` is not `Send`.
+struct AgentBudgetSharedAdmission {
+    policy: Arc<AgentBudgetPolicy>,
+}
+
+impl SharedAdmission for AgentBudgetSharedAdmission {
+    fn shared_admission_key(
+        &self,
+        _req: &http::Request<Bytes>,
+        ctx: &RequestContext,
+    ) -> Option<String> {
+        // The budget keys on the resolved agent id, not on anything from
+        // the request line. An anonymous request has no key; the policy's
+        // own `on_anonymous` rule decides what that means, and it decides
+        // it locally, so there is nothing for the shared tier to do.
+        #[cfg(feature = "agent-class")]
+        {
+            ctx.agent_id.as_ref().map(|a| a.as_str().to_string())
+        }
+        #[cfg(not(feature = "agent-class"))]
+        {
+            let _ = ctx;
+            None
+        }
+    }
+
+    fn shared_admit<'a>(
+        &'a self,
+        key: String,
+    ) -> Pin<Box<dyn Future<Output = SharedDecision> + Send + 'a>> {
+        Box::pin(async move {
+            let (decision, guard) = self.policy.try_admit_async(Some(&key)).await;
+            SharedDecision::AgentBudget { decision, guard }
+        })
+    }
+}
 
 impl PolicyEnforcer for AgentBudgetEnforcer {
     fn policy_type(&self) -> &'static str {
@@ -67,7 +125,19 @@ impl PolicyEnforcer for AgentBudgetEnforcer {
         let agent_id_owned: Option<String> = None;
 
         let agent_id_ref = agent_id_owned.as_deref();
-        let (decision, guard) = policy.try_admit(agent_id_ref);
+        // WOR-2332/WOR-2315: when a shared counter is attached, admission
+        // already happened at the `check_policies` call site, where the
+        // await is legal. Take it rather than re-running the local path,
+        // which would consume a second token from the local bucket and
+        // double-count every request.
+        //
+        // `take`, not read: a chain may carry more than one agent_budget
+        // policy, and the second must not inherit the first's verdict or
+        // its in-flight permit.
+        let (decision, guard) = match ctx.shared_agent_budget_decision.take() {
+            Some(precomputed) => precomputed,
+            None => policy.try_admit(agent_id_ref),
+        };
         // The guard owns the in-flight slot; stash it on the context
         // so it drops when the request finishes. Reuse the
         // concurrent-limit guard slot since the lifecycle is the

@@ -52,10 +52,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use compact_str::CompactString;
 use sbproxy_extension::cel::CompiledCel;
-use sbproxy_modules::policy::{RateLimitInfo, RateLimitPolicy};
+use sbproxy_modules::policy::RateLimitPolicy;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
-use super::shared_admission::SharedAdmission;
+use super::shared_admission::{SharedAdmission, SharedDecision};
 use crate::context::RequestContext;
 
 /// Bucket-key prefix used when the compiled `key:` expression fails to
@@ -178,8 +178,10 @@ impl SharedAdmission for RateLimitSharedAdmission {
     fn shared_admit<'a>(
         &'a self,
         key: String,
-    ) -> Pin<Box<dyn Future<Output = RateLimitInfo> + Send + 'a>> {
-        Box::pin(async move { self.policy.allow_with_info_async(&key).await })
+    ) -> Pin<Box<dyn Future<Output = SharedDecision> + Send + 'a>> {
+        Box::pin(
+            async move { SharedDecision::RateLimit(self.policy.allow_with_info_async(&key).await) },
+        )
     }
 }
 

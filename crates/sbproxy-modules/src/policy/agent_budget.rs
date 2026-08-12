@@ -54,15 +54,19 @@
 //!
 //! ## Out of scope
 //!
-//! * Cluster-shared `tokens_per_hour`. An hourly fixed window bucketed
-//!   on the wall clock resets on the same boundary for every replica,
-//!   so a fleet can spend close to twice the cap across that boundary.
-//!   That is tolerable for a 60 second window and not for an hourly
-//!   spend budget, so the hourly tier waits on a design that does not
-//!   reset in lock-step.
-//! * Cluster-shared `burst`. In-flight permits are per-process by
-//!   construction: the permit releases when a request on this node
-//!   completes, which no other node can observe.
+//! * Cluster-shared `tokens_per_hour`. The hourly counter is now a
+//!   sliding window rather than a fixed one (WOR-2331), so it no longer
+//!   resets in lock-step and no longer admits ~2x the cap across a
+//!   boundary. Sharing it across replicas is still future work: the
+//!   sliding estimate needs both windows in the shared store, not one
+//!   counter, and that is a second keyspace rather than a knob. Per
+//!   replica the cap is now enforced honestly, which it was not before.
+//! * Cluster-shared `burst`. In-flight permits are per-process **by
+//!   construction**, not by omission: the permit releases when a request
+//!   on this node completes, and no other node can observe that. A
+//!   shared count would have to guess when to release, and a guess that
+//!   runs low leaks slots until restart. Treat `burst` as a per-replica
+//!   concurrency guard and size the fleet cap accordingly.
 //! * Token estimates for responses that never report usage. A
 //!   response with no parseable `usage` block, and any surface that
 //!   cannot report one, consumes zero rather than an invented count.
@@ -249,13 +253,58 @@ impl RequestBucket {
 
 /// Per-`agent_id` rolling token-usage counter for `tokens_per_hour`.
 ///
-/// Uses a fixed-window counter (one wall-clock hour) rather than a
-/// smooth bucket. LLM token accounting is bursty and operators
-/// reason about hourly caps. The window resets on first observation
-/// inside a new hour.
+/// A **sliding-window counter**: two adjacent fixed windows, with the
+/// previous one weighted by how much of the current window has elapsed.
+/// The estimate is
+///
+/// ```text
+/// previous * (1 - elapsed_in_current / window) + current
+/// ```
+///
+/// ## Why not the fixed window this replaces (WOR-2331)
+///
+/// A fixed window resets the whole count at a boundary, so a caller who
+/// spends the full budget just before the reset and again just after
+/// gets close to **2x the configured cap** across it. For a 60 second
+/// window that is a brief, self-correcting overshoot. For an hourly
+/// token budget it means an agent can consume double its allowance
+/// around the boundary, while the operator sees every individual window
+/// enforced exactly as configured and a bill that disagrees.
+///
+/// The longer the window, the worse it gets: the overshoot is a fixed
+/// fraction of the cap but recovery scales with the window. An hour is
+/// long enough that this had to be fixed rather than documented.
+///
+/// ## The accepted error
+///
+/// The weighting assumes the previous window's spend was spread evenly
+/// across it. That is an approximation, and it is the reason to prefer
+/// this over an exact sliding log: exactness costs a per-key sorted set
+/// of every event in the window, and this costs two integers.
+///
+/// The error is bounded and one-directional in the way that matters. If
+/// the previous window's spend was actually concentrated at its end, the
+/// estimate is lower than the true trailing-hour total, so the limiter
+/// admits slightly more than the cap. If it was concentrated at the
+/// start, the estimate runs high and the limiter admits slightly less.
+/// In both cases the excursion is bounded by the previous window's
+/// count and decays linearly to zero across the current window; it never
+/// compounds across windows the way the fixed window's boundary reset
+/// does.
+///
+/// `tokens_per_hour` is billing-adjacent, so that trade is stated here
+/// deliberately rather than inherited from whatever the implementation
+/// happened to do. Over-enforcement refuses traffic a customer paid for;
+/// under-enforcement gives away inference. A bounded, decaying,
+/// explainable error on both sides is the right shape for that, and a
+/// 2x boundary blowout is not.
 #[derive(Debug, Clone)]
 struct TokenBucket {
-    consumed: u64,
+    /// Spend recorded so far in the current window.
+    current: u64,
+    /// Spend recorded in the window immediately before this one. Decays
+    /// out of the estimate as the current window advances.
+    previous: u64,
     limit: u64,
     window_start: Instant,
     window: Duration,
@@ -264,30 +313,59 @@ struct TokenBucket {
 impl TokenBucket {
     fn new(limit: u64, now: Instant) -> Self {
         Self {
-            consumed: 0,
+            current: 0,
+            previous: 0,
             limit,
             window_start: now,
             window: Duration::from_secs(3600),
         }
     }
 
-    /// Returns `true` while the agent is within budget for this hour.
+    /// Returns `true` while the agent is within budget for the trailing
+    /// window.
     fn within_budget(&mut self, now: Instant) -> bool {
         self.maybe_roll(now);
-        self.consumed < self.limit
+        self.estimate(now) < self.limit
     }
 
-    /// Add `n` tokens to the rolling count, rolling the window first
-    /// if it has expired.
+    /// Add `n` tokens to the current window, rolling first if the window
+    /// has advanced.
     fn add(&mut self, n: u64, now: Instant) {
         self.maybe_roll(now);
-        self.consumed = self.consumed.saturating_add(n);
+        self.current = self.current.saturating_add(n);
     }
 
+    /// Weighted estimate of spend over the trailing window.
+    fn estimate(&self, now: Instant) -> u64 {
+        let window = self.window.as_secs_f64();
+        if window <= 0.0 {
+            return self.current;
+        }
+        let elapsed = now.duration_since(self.window_start).as_secs_f64();
+        // Clamped because `maybe_roll` runs first in every caller, so
+        // elapsed is already inside the window; the clamp keeps
+        // `estimate` correct if it is ever called on its own.
+        let weight = (1.0 - (elapsed / window)).clamp(0.0, 1.0);
+        let carried = (self.previous as f64 * weight).round() as u64;
+        carried.saturating_add(self.current)
+    }
+
+    /// Advance the window pair to cover `now`.
+    ///
+    /// One window elapsed shifts current into previous. Two or more
+    /// elapsed means nothing in either is still inside the trailing
+    /// window, so both clear; without that case a long-idle key would
+    /// resurrect a stale count as soon as it was touched again.
     fn maybe_roll(&mut self, now: Instant) {
-        if now.duration_since(self.window_start) >= self.window {
+        let elapsed = now.duration_since(self.window_start);
+        if elapsed >= self.window.saturating_mul(2) {
+            self.previous = 0;
+            self.current = 0;
             self.window_start = now;
-            self.consumed = 0;
+        } else if elapsed >= self.window {
+            self.previous = self.current;
+            self.current = 0;
+            self.window_start += self.window;
         }
     }
 }
@@ -546,6 +624,23 @@ impl AgentBudgetPolicy {
         } else {
             (AgentBudgetDecision::Allow, self.empty_guard())
         }
+    }
+
+    /// Whether admission for this policy has to consult state that lives
+    /// outside this process.
+    ///
+    /// True only when a shared store is attached *and* there is a
+    /// per-minute cap for the shared tier to cover. `tokens_per_hour` and
+    /// `burst` stay local either way, so a policy configuring only those
+    /// has nothing to gain from the async path and keeps its synchronous
+    /// one.
+    ///
+    /// Deliberately mirrors the early return in
+    /// [`Self::try_admit_async`], so the request path and the admission
+    /// call cannot disagree about whether a shared tier is live. That
+    /// disagreement is the whole of WOR-2332.
+    pub fn has_shared_tier(&self) -> bool {
+        self.requests_per_minute.is_some() && (self.async_store.is_some() || self.store.is_some())
     }
 
     /// Async variant of [`AgentBudgetPolicy::try_admit`], and the entry
@@ -1147,11 +1242,91 @@ mod tests {
                 reason: AgentBudgetExceedReason::TokensPerHour
             }
         ));
-        // One hour later the fixed window resets and the agent gets a
-        // fresh budget.
-        let later = start + Duration::from_secs(3601);
-        let (d, _g) = p.try_admit_at(Some("agent"), later);
+        // WOR-2331: one second past the boundary the agent is still
+        // denied. This is the assertion the fixed window failed: it
+        // dropped the whole count at the boundary and admitted a second
+        // full budget, so a caller who spent the cap just before and
+        // just after got close to 2x the configured hourly allowance
+        // while every individual window looked correctly enforced.
+        //
+        // The trailing hour genuinely still contains those 100 tokens,
+        // so the limiter has to say so.
+        let just_after = start + Duration::from_secs(3601);
+        let (d, _g) = p.try_admit_at(Some("agent"), just_after);
+        assert!(
+            matches!(
+                d,
+                AgentBudgetDecision::Deny {
+                    reason: AgentBudgetExceedReason::TokensPerHour
+                }
+            ),
+            "spend must not reset at the window boundary"
+        );
+
+        // Halfway through the next window roughly half the carried spend
+        // has decayed out, so the agent is inside the cap again.
+        let halfway = start + Duration::from_secs(3600 + 1800);
+        let (d, _g) = p.try_admit_at(Some("agent"), halfway);
+        assert_eq!(
+            d,
+            AgentBudgetDecision::Allow,
+            "carried spend must decay across the window, not vanish at its edge"
+        );
+
+        // A full window past the last spend, nothing is carried at all.
+        let fully_past = start + Duration::from_secs(7300);
+        let (d, _g) = p.try_admit_at(Some("agent"), fully_past);
         assert_eq!(d, AgentBudgetDecision::Allow);
+    }
+
+    #[test]
+    fn the_boundary_cannot_be_used_to_spend_twice_the_cap() {
+        // The defect stated as the operator would experience it: spend
+        // the whole hourly cap at the end of one window and try to spend
+        // it again at the start of the next. Under a fixed window both
+        // succeed and the hour straddling the boundary bills ~2x.
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 100,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+
+        p.consume_tokens(Some("agent"), 100);
+        // Cross the boundary by a hair.
+        let just_after = start + Duration::from_secs(3605);
+        let (d, _g) = p.try_admit_at(Some("agent"), just_after);
+        assert!(
+            !d.admits(),
+            "the second full budget is what the fixed window handed out"
+        );
+    }
+
+    #[test]
+    fn spend_decays_rather_than_stepping() {
+        // Pins the shape of the approximation, not just its endpoints:
+        // the carried count comes out linearly across the window instead
+        // of dropping to zero in one step. Written against a cap the
+        // spend sits exactly on, so the admit flips precisely when
+        // enough has decayed.
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 60,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+        p.consume_tokens(Some("agent"), 60);
+
+        // A quarter into the next window, 75% of the spend is still
+        // carried: 45 of 60, under the cap.
+        let quarter = start + Duration::from_secs(3600 + 900);
+        assert_eq!(
+            p.try_admit_at(Some("agent"), quarter).0,
+            AgentBudgetDecision::Allow
+        );
+
+        // But immediately after the boundary essentially all of it is
+        // still carried.
+        let sliver = start + Duration::from_secs(3600 + 1);
+        assert!(!p.try_admit_at(Some("agent"), sliver).0.admits());
     }
 
     #[test]

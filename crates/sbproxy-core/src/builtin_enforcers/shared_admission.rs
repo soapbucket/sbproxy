@@ -43,9 +43,34 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use sbproxy_modules::policy::RateLimitInfo;
+use sbproxy_modules::policy::{AgentBudgetDecision, AgentBudgetGuard, RateLimitInfo};
 
 use crate::context::RequestContext;
+
+/// What consulting a shared tier produced.
+///
+/// One variant per policy that can be configured with cluster-shared
+/// state. An enum rather than a generic or a boxed `Any` because the
+/// trait is `pub(crate)` with exactly these two implementors: the
+/// compiler can then check that every variant is handled where the
+/// decision is written back, and adding a third policy is a deliberate
+/// edit rather than a downcast that silently starts returning `None`.
+pub(crate) enum SharedDecision {
+    /// A rate-limit admission, carrying the headers the 429 path emits.
+    RateLimit(RateLimitInfo),
+    /// An agent-budget admission.
+    ///
+    /// Carries the guard as well as the verdict, because holding the
+    /// guard is what keeps the `burst` in-flight count accurate: it
+    /// releases the slot on drop, so it has to reach the request context
+    /// rather than expire at the end of admission.
+    AgentBudget {
+        /// The verdict, including which sub-budget was exceeded.
+        decision: AgentBudgetDecision,
+        /// The in-flight permit, held for the life of the request.
+        guard: AgentBudgetGuard,
+    },
+}
 
 /// A compiled policy that admits against state shared with other
 /// replicas.
@@ -78,5 +103,5 @@ pub(crate) trait SharedAdmission: Send + Sync {
     fn shared_admit<'a>(
         &'a self,
         key: String,
-    ) -> Pin<Box<dyn Future<Output = RateLimitInfo> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = SharedDecision> + Send + 'a>>;
 }

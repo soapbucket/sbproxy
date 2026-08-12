@@ -10,7 +10,9 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use compact_str::CompactString;
-use sbproxy_modules::policy::{AgentBudgetGuard, AgentBudgetTokenSink, ConcurrentLimitGuard};
+use sbproxy_modules::policy::{
+    AgentBudgetDecision, AgentBudgetGuard, AgentBudgetTokenSink, ConcurrentLimitGuard,
+};
 use sbproxy_modules::transform::{CelHeaderMutation, MarkdownProjection};
 use sbproxy_modules::{ContentShape, RateLimitInfo};
 use sbproxy_observe::UserIdSource;
@@ -652,6 +654,15 @@ pub struct RequestContext {
     /// rate-limit policies fills and drains it once per policy, so the
     /// second never inherits the first's decision.
     pub shared_rate_limit_decision: Option<RateLimitInfo>,
+    /// Agent-budget admission already taken against a cluster-shared
+    /// tier, with the in-flight permit that came with it.
+    ///
+    /// Same hand-off as [`Self::shared_rate_limit_decision`] and taken
+    /// the same way. The guard travels with the decision because
+    /// releasing it is what frees the `burst` slot, so it has to outlive
+    /// admission and reach `agent_budget_guards`; a decision without its
+    /// guard would leak an in-flight count that never comes back.
+    pub shared_agent_budget_decision: Option<(AgentBudgetDecision, AgentBudgetGuard)>,
 
     // --- Transform body buffering ---
     /// Buffer for accumulating upstream response body chunks when transforms are configured.
@@ -1677,6 +1688,7 @@ impl RequestContext {
             response_status: None,
             rate_limit_info: None,
             shared_rate_limit_decision: None,
+            shared_agent_budget_decision: None,
             response_body_buf: None,
             buffering_body: false,
             upstream_content_type: None,

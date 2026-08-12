@@ -1,5 +1,5 @@
 # agent_budget policy
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-11*
 
 ![70 rapid requests from a Cursor user agent: 200s until the per-agent budget trips and the rest return 429](assets/agent-budget.gif)
 
@@ -164,8 +164,35 @@ Two consequences of that shape are worth knowing:
   that never report token counts at all (non-AI traffic through the
   same origin, for example). The budget never invents an estimate.
 
-The hourly window is fixed, not sliding: the counter resets one hour
-after the first charge that opened the window.
+## The hourly window slides
+
+The counter is a sliding window, not a fixed one. It keeps the current
+hour's spend plus the previous hour's, and weights the previous by how
+much of the current hour is left:
+
+```text
+estimate = previous * (1 - elapsed_in_hour / hour) + current
+```
+
+A fixed window would drop the whole count at the boundary, so an agent
+that spent its full cap just before the reset could spend it again just
+after and consume close to **twice** its hourly allowance across that
+hour. Every individual window would have looked correctly enforced while
+the bill disagreed. The longer the window, the worse that gets, which is
+why it matters at an hour and not at a minute.
+
+The weighting assumes the previous hour's spend was spread evenly across
+it, so the estimate is an approximation. That is deliberate: an exact
+answer needs a stored record of every charge in the window, and this
+needs two integers. The error is bounded by the previous hour's count and
+decays linearly to zero as the current hour advances, in both directions.
+It never compounds across windows the way a boundary reset does.
+
+`tokens_per_hour` is enforced per replica. A fleet of ten enforces ten
+times the configured cap, the same as any other local counter here. That
+is a known limit, tracked separately; what changed is that each replica
+now enforces its own cap honestly instead of admitting double around
+every boundary.
 
 ## Observability
 
