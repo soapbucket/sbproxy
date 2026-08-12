@@ -947,6 +947,14 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // that exits `sbproxy plan` with 3. Warning that a key which changes a
     // plan's exit code does nothing is the wrong answer.
     stable("proxy.secrets.map.*", "sbproxy::install_secret_resolver"),
+    // WOR-2191: read inside the ACME renewal task on a local
+    // `acme_config` binding, a crate away from the type that declares the
+    // field, so the reader scan cannot attribute it. The key is live: it
+    // supplies the trusted root for the ACME directory endpoint.
+    stable(
+        "proxy.acme.ca_root",
+        "sbproxy_tls::TlsState::start_acme_renewal_task",
+    ),
     stable(
         "proxy.secrets.rotation.grace_period_secs",
         "sbproxy_core::key_plane::KeyPlane::resolve_credential_secret",
