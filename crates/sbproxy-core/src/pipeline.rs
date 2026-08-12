@@ -6111,7 +6111,8 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: 'this is not valid CEL !!!'
+        headers:
+          - { op: set, name: x-broken, value_expr: 'this is not valid CEL !!!' }
 "#,
         );
         assert!(
@@ -6119,13 +6120,42 @@ origins:
             "diagnostic must name the origin: {msg}"
         );
         assert!(
-            msg.contains("on_response"),
-            "diagnostic must name the field: {msg}"
+            msg.contains("x-broken"),
+            "diagnostic must name the header: {msg}"
         );
         assert!(
             msg.contains("this is not valid CEL !!!"),
             "diagnostic must quote the expression: {msg}"
         );
+    }
+
+    #[test]
+    fn cel_transform_body_replacement_rejects_the_config_naming_the_origin() {
+        // WOR-2362: refusing the key is only useful if the operator can
+        // find which origin carries it.
+        for key in ["on_response", "expression"] {
+            let msg = pipeline_rejection(&format!(
+                r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "transform.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    transforms:
+      - type: cel
+        {key}: '"rewritten"'
+"#
+            ));
+            assert!(
+                msg.contains("transform.local"),
+                "diagnostic must name the origin: {msg}"
+            );
+            assert!(msg.contains(key), "diagnostic must name the key: {msg}");
+        }
     }
 
     #[test]
@@ -6360,7 +6390,6 @@ origins:
           key: 'request.key_id'
     transforms:
       - type: cel
-        on_response: '"rewritten"'
         headers:
           - op: set
             name: x-status
