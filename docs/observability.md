@@ -416,9 +416,9 @@ Three families cover all of them, dimensioned rather than duplicated:
 
 | Metric | Labels | What it answers |
 |---|---|---|
-| `sbproxy_extension_event_total` | `event`, `engine`, `outcome`, `origin`, `tenant` | How often each decision point fired, who answered, and what came out |
-| `sbproxy_extension_event_duration_seconds` | `event`, `engine`, `origin` | Whether a decision point is slow, and whether the engine behind it is the reason |
-| `sbproxy_extension_event_fail_open_total` | `event`, `engine`, `origin`, `tenant` | How often a request proceeded without the decision being made |
+| `sbproxy_decision_event_total` | `event`, `engine`, `outcome`, `origin`, `tenant` | How often each decision point fired, who answered, and what came out |
+| `sbproxy_decision_event_duration_seconds` | `event`, `engine`, `origin` | Whether a decision point is slow, and whether the engine behind it is the reason |
+| `sbproxy_decision_event_fail_open_total` | `event`, `engine`, `origin`, `tenant` | How often a request proceeded without the decision being made |
 
 `event` is a named pipeline point (`policy`, `cache.key`, `route.decide`, `ai.guardrail.input`, ...). `engine` is who answered it (`built_in`, `plugin`, `cel`, `lua`, `js`, `wasm`, `proxy_wasm`). Separating the two is the point: adding a capability should not mean picking an engine first and inheriting whatever seam that engine happens to have.
 

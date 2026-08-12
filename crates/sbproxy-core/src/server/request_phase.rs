@@ -3396,7 +3396,7 @@ pub(super) async fn request_filter(
         request_id: ctx.request_id.to_string(),
         tenant_id: policy_workspace_id.clone(),
         workspace_id: policy_workspace_id,
-        origin: ctx.hostname.to_string(),
+        origin: pipeline.config.origins[origin_idx].origin_id.to_string(),
         tenant: ctx.tenant_id.to_string(),
     };
     let policy_verdict =

@@ -3425,9 +3425,20 @@ struct PolicyVerdictCtx {
     ///
     /// Required by the shared decision-event family (WOR-2370): a
     /// decision is meaningless without knowing whose traffic it was
-    /// made on. This is the request `Host`, which is what every other
-    /// origin-labelled recorder in the tree passes, so it shares their
-    /// 200-value budget rather than introducing a second convention.
+    /// made on.
+    ///
+    /// This is `CompiledOrigin::origin_id`, not the request `Host`.
+    /// Several recorders in this tree pass the `Host`, which is
+    /// attacker-chosen: under a wildcard origin every subdomain is a
+    /// distinct label value. The limiter's accepted-value set is keyed
+    /// by label *name* across every metric that uses it and `origin` is
+    /// budgeted at 200, so exhausting it here would permanently demote
+    /// every not-yet-seen origin to `__other__` on
+    /// `sbproxy_origin_requests_total`, `sbproxy_cache_results_total`,
+    /// and every other origin-labelled family for the life of the
+    /// process. That risk was tolerable while the write path was WAF
+    /// and retry; this family records on every policy decision, so it
+    /// uses the config-bounded id the way `record_cache` already does.
     origin: String,
     /// Tenant the decision is attributed to, for the shared family.
     ///

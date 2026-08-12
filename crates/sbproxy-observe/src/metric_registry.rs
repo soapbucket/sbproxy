@@ -3059,7 +3059,7 @@ pub const METRICS: &[MetricCapability] = &[
         ),
     },
     MetricCapability {
-        name: "sbproxy_extension_event_total",
+        name: "sbproxy_decision_event_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_decision"),
         support: SupportLevel::Stable,
@@ -3070,7 +3070,7 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
-        name: "sbproxy_extension_event_duration_seconds",
+        name: "sbproxy_decision_event_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_decision_duration"),
         support: SupportLevel::Stable,
@@ -3085,7 +3085,7 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
-        name: "sbproxy_extension_event_fail_open_total",
+        name: "sbproxy_decision_event_fail_open_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_decision_fail_open"),
         support: SupportLevel::Stable,

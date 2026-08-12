@@ -427,10 +427,10 @@ pub fn record_decision(
     tenant: &str,
 ) {
     let origin =
-        sanitize_label_budget_tenant("sbproxy_extension_event_total", "origin", origin, tenant);
-    let tenant = sanitize_label_budget("sbproxy_extension_event_total", "tenant", tenant);
+        sanitize_label_budget_tenant("sbproxy_decision_event_total", "origin", origin, tenant);
+    let tenant = sanitize_label_budget("sbproxy_decision_event_total", "tenant", tenant);
     metrics()
-        .extension_event_total
+        .decision_event_total
         .with_label_values(&[
             event.as_label(),
             engine.as_label(),
@@ -457,10 +457,9 @@ pub fn record_decision_duration(
     origin: &str,
     duration_secs: f64,
 ) {
-    let origin =
-        sanitize_label_budget("sbproxy_extension_event_duration_seconds", "origin", origin);
+    let origin = sanitize_label_budget("sbproxy_decision_event_duration_seconds", "origin", origin);
     metrics()
-        .extension_event_duration
+        .decision_event_duration
         .with_label_values(&[event.as_label(), engine.as_label(), origin.as_str()])
         .observe(duration_secs);
 }
@@ -479,14 +478,14 @@ pub fn record_decision_fail_open(
     tenant: &str,
 ) {
     let origin = sanitize_label_budget_tenant(
-        "sbproxy_extension_event_fail_open_total",
+        "sbproxy_decision_event_fail_open_total",
         "origin",
         origin,
         tenant,
     );
-    let tenant = sanitize_label_budget("sbproxy_extension_event_fail_open_total", "tenant", tenant);
+    let tenant = sanitize_label_budget("sbproxy_decision_event_fail_open_total", "tenant", tenant);
     metrics()
-        .extension_event_fail_open
+        .decision_event_fail_open
         .with_label_values(&[
             event.as_label(),
             engine.as_label(),

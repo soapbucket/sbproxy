@@ -367,21 +367,21 @@ pub struct ProxyMetrics {
     pub policy_triggers: CounterVec,
     /// Cache hit/miss with origin and result labels.
     pub cache_results: CounterVec,
-    /// Counter `sbproxy_extension_event_total`: one family for every
+    /// Counter `sbproxy_decision_event_total`: one family for every
     /// decision event, dimensioned by `event`, `engine`, `outcome`,
     /// `origin`, and `tenant` rather than duplicated per feature.
     /// Written through `sbproxy_observe::decision::record_decision`.
-    pub extension_event_total: IntCounterVec,
-    /// Histogram `sbproxy_extension_event_duration_seconds`. No
+    pub decision_event_total: IntCounterVec,
+    /// Histogram `sbproxy_decision_event_duration_seconds`. No
     /// `tenant` label on purpose: a histogram multiplies its label set
     /// by its bucket count, and latency per origin and per engine is
     /// the actionable cut.
-    pub extension_event_duration: HistogramVec,
-    /// Counter `sbproxy_extension_event_fail_open_total`. Its own
+    pub decision_event_duration: HistogramVec,
+    /// Counter `sbproxy_decision_event_fail_open_total`. Its own
     /// family rather than an `outcome` label, because a fail-open is a
     /// request that proceeded without the decision being made, which is
     /// a different thing to alert on than an engine fault.
-    pub extension_event_fail_open: IntCounterVec,
+    pub decision_event_fail_open: IntCounterVec,
     /// Circuit breaker state transitions with origin, from_state, and to_state labels.
     pub circuit_breaker_transitions: CounterVec,
     /// Counter `sbproxy_upstream_status_retries_total` of upstream
@@ -702,18 +702,18 @@ impl ProxyMetrics {
 
         // --- One decision-event family (WOR-2370) ---
 
-        let extension_event_total = IntCounterVec::new(
+        let decision_event_total = IntCounterVec::new(
             Opts::new(
-                "sbproxy_extension_event_total",
+                "sbproxy_decision_event_total",
                 "Decision events by pipeline point, engine, and outcome",
             ),
             &["event", "engine", "outcome", "origin", "tenant"],
         )
         .expect("metric name and label set are compile-time constants and are valid");
 
-        let extension_event_duration = HistogramVec::new(
+        let decision_event_duration = HistogramVec::new(
             prometheus::HistogramOpts::new(
-                "sbproxy_extension_event_duration_seconds",
+                "sbproxy_decision_event_duration_seconds",
                 "Decision event evaluation latency",
             )
             .buckets(vec![
@@ -723,9 +723,9 @@ impl ProxyMetrics {
         )
         .expect("metric name and label set are compile-time constants and are valid");
 
-        let extension_event_fail_open = IntCounterVec::new(
+        let decision_event_fail_open = IntCounterVec::new(
             Opts::new(
-                "sbproxy_extension_event_fail_open_total",
+                "sbproxy_decision_event_fail_open_total",
                 "Decision events that proceeded without the decision being made",
             ),
             &["event", "engine", "origin", "tenant"],
@@ -883,13 +883,13 @@ impl ProxyMetrics {
             .register(Box::new(semantic_cache_results.clone()))
             .unwrap();
         registry
-            .register(Box::new(extension_event_total.clone()))
+            .register(Box::new(decision_event_total.clone()))
             .expect("the decision-event families are registered exactly once, at startup");
         registry
-            .register(Box::new(extension_event_duration.clone()))
+            .register(Box::new(decision_event_duration.clone()))
             .expect("the decision-event families are registered exactly once, at startup");
         registry
-            .register(Box::new(extension_event_fail_open.clone()))
+            .register(Box::new(decision_event_fail_open.clone()))
             .expect("the decision-event families are registered exactly once, at startup");
         registry
             .register(Box::new(inference_requests.clone()))
@@ -1000,9 +1000,9 @@ impl ProxyMetrics {
             auth_results,
             policy_triggers,
             cache_results,
-            extension_event_total,
-            extension_event_duration,
-            extension_event_fail_open,
+            decision_event_total,
+            decision_event_duration,
+            decision_event_fail_open,
             circuit_breaker_transitions,
             upstream_status_retries,
             upstream_timeout_retries,
