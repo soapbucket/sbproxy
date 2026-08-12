@@ -139,6 +139,17 @@ past capacity" is.
 
 - **Silent no-ops.** A call site that became a no-op where a caller still
   reasonably expects work to happen.
+- **An early return inside a long function.** The highest-yield check in
+  this section, on the evidence. `request_filter`,
+  `response_body_filter`, and `handle_ai_proxy` each run many independent
+  stages in sequence, so a `return` added inside one stage silently skips
+  every stage below it: mirroring, `on_request` callbacks, forward rules,
+  `handle_action`, the idempotency capture. Nothing fails. A feature just
+  stops happening for the subset of requests that take the new branch.
+  Ask what runs *after* the block being edited, and prefer a flag that
+  gates one thing to a return that gates everything. Three instances
+  landed in a single change: one caught by review, two by asking that
+  question before committing.
 - **Removed config keys are refused, not deleted.** Config structs
   without `deny_unknown_fields` turn a deleted key from inert-and-
   documented into inert-and-ignored, which is strictly worse. Refuse at
