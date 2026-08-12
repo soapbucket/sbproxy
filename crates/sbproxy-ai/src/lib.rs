@@ -46,6 +46,7 @@ pub mod rag_config;
 pub mod ratelimit;
 pub mod realtime;
 pub mod reasoning;
+pub mod route_event;
 pub mod routing;
 pub mod routing_feedback;
 pub mod routing_state;

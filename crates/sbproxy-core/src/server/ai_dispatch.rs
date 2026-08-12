@@ -5822,14 +5822,57 @@ pub(super) async fn handle_ai_proxy(
             }
         }
 
-        if let Some(target) = decision.route_model() {
-            if !target.is_empty() && target != model {
-                info!(from = %model, to = %target, "AI policy: route_to override");
-                model = target.to_string();
-                body["model"] = serde_json::Value::String(target.to_string());
-                ctx.ai_model = Some(target.to_string());
+        // WOR-2366: the routing decision as an event that returns a plan.
+        //
+        // CEL can only return a scalar, which is exactly why
+        // `route_to:gpt-4o-mini` became a string mini-language. Rather
+        // than growing a second token grammar, the scalar is lifted into
+        // the one-candidate plan it always was, so there is a single
+        // path from here down and the document engines extend it rather
+        // than bypassing it.
+        let route_decision = decision
+            .route_model()
+            .filter(|target| !target.is_empty())
+            .map(sbproxy_ai::route_event::RoutePlan::from_route_to)
+            .map_or(
+                sbproxy_ai::route_event::RouteDecision::Decline,
+                sbproxy_ai::route_event::RouteDecision::Plan,
+            );
+
+        // Declining is the common path and is not a failure: the
+        // configured RoutingStrategy applies unchanged. `Apply` carries
+        // the candidate, so this site never looks the primary up again
+        // and never grows a branch for a `None` it has already been told
+        // cannot happen.
+        let route_outcome = match sbproxy_ai::route_event::RouteApplication::resolve(
+            &route_decision,
+            model.as_str(),
+        ) {
+            sbproxy_ai::route_event::RouteApplication::LeaveAlone => {
+                sbproxy_observe::decision::DecisionOutcome::Decline
             }
-        }
+            sbproxy_ai::route_event::RouteApplication::Apply(candidate) => {
+                info!(
+                    from = %model,
+                    to = %candidate.model,
+                    "AI policy: route plan applied"
+                );
+                body["model"] = serde_json::Value::String(candidate.model.clone());
+                ctx.ai_model = Some(candidate.model.clone());
+                model = candidate.model.clone();
+                sbproxy_observe::decision::DecisionOutcome::Allow
+            }
+        };
+        sbproxy_observe::decision::record_decision(
+            sbproxy_observe::decision::DecisionEvent::RouteDecide,
+            // CEL is what drives this today. A document engine answering
+            // the same event reports its own label from its own call
+            // site rather than being folded in here.
+            sbproxy_observe::decision::DecisionEngine::Cel,
+            route_outcome,
+            ctx.hostname.as_str(),
+            ctx.tenant_id.as_str(),
+        );
 
         if let Some(tag) = decision.sink_tag() {
             ctx.ai_policy_sink_tag = Some(tag.to_string());
