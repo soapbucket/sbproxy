@@ -1,4 +1,36 @@
 services:
+  # WOR-2191: mints a throwaway CA and a Pebble server cert valid for the
+  # hostname `pebble`, into a volume both services read.
+  #
+  # Needed because Pebble's bundled test cert only carries SANs for
+  # `localhost` and `127.0.0.1`. Inside this network sbproxy reaches it as
+  # `pebble:14000`, so even with the right root the hostname would not
+  # match. Generated at startup rather than committed: no private key
+  # belongs in the repo, and this keeps `docker compose up` a single
+  # command with no setup step.
+  pebble-ca:
+    image: alpine/openssl:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /ca/pebble-cert.pem ]; then echo "certs present"; exit 0; fi
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+          -keyout /ca/ca-key.pem -out /ca/ca-cert.pem \
+          -subj "/CN=sbproxy Pebble Test CA/O=sbproxy"
+        openssl req -newkey rsa:2048 -nodes \
+          -keyout /ca/pebble-key.pem -out /ca/pebble.csr \
+          -subj "/CN=pebble/O=sbproxy"
+        printf 'subjectAltName=DNS:pebble,DNS:localhost,IP:127.0.0.1\n' > /ca/ext.cnf
+        openssl x509 -req -in /ca/pebble.csr \
+          -CA /ca/ca-cert.pem -CAkey /ca/ca-key.pem -CAcreateserial \
+          -out /ca/pebble-cert.pem -days 3650 -extfile /ca/ext.cnf
+        echo "generated test CA for hostname 'pebble'"
+    volumes:
+      - pebble-ca:/ca
+    networks:
+      - sbnet
+
   sbproxy:
     build:
       context: ..
@@ -12,9 +44,14 @@ services:
     volumes:
       - ./sb.yml:/etc/sbproxy/sb.yml:ro
       - pebble-certs:/etc/sbproxy/certs
+      # `acme.ca_root` reads ca-cert.pem from here. Verification stays on;
+      # this names which CA to trust rather than skipping the check.
+      - pebble-ca:/etc/sbproxy/pebble-ca:ro
     environment:
       - SB_LOG_LEVEL=info
     depends_on:
+      pebble-ca:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       pebble:
@@ -25,8 +62,13 @@ services:
       - sbnet
 
   pebble:
-    image: letsencrypt/pebble:latest
-    command: pebble -config /test/config/pebble-config.json
+    # WOR-2191: `letsencrypt/pebble` on Docker Hub is gone; the pull fails
+    # with "repository does not exist". Pebble publishes to GHCR now, so
+    # `docker compose up` could not even start this service.
+    image: ghcr.io/letsencrypt/pebble:latest
+    # The GHCR image's entrypoint is already `pebble`, so the binary name
+    # must not be repeated here; the Docker Hub image took a full command.
+    command: ["-config", "/test/config/pebble-config.json"]
     ports:
       - "14000:14000"
       - "15000:15000"
@@ -35,8 +77,12 @@ services:
       - PEBBLE_VA_NOSLEEP=1
       # Accept all validation challenges without actually verifying DNS/HTTP
       - PEBBLE_VA_ALWAYS_VALID=1
+    depends_on:
+      pebble-ca:
+        condition: service_completed_successfully
     volumes:
       - ./pebble-config.json:/test/config/pebble-config.json:ro
+      - pebble-ca:/test/certs/generated:ro
     networks:
       - sbnet
 
@@ -92,3 +138,6 @@ networks:
 
 volumes:
   pebble-certs:
+  # Test CA plus the Pebble server cert, minted by the `pebble-ca`
+  # init service at startup. Never committed.
+  pebble-ca:

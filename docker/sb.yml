@@ -9,42 +9,52 @@ proxy:
   http_bind_port: 8080
   https_bind_port: 8443
 
-  # ACME auto-TLS via the Pebble test server running in the same Compose network.
-  # Pebble uses a self-signed CA, so acme_insecure_skip_verify is required for local testing.
-  certificate_settings:
-    use_acme: true
-    acme_email: test@example.com
-    acme_directory_url: https://pebble:14000/dir
-    acme_insecure_skip_verify: true
-    acme_cache_dir: /etc/sbproxy/certs
+  # ACME auto-TLS via the Pebble test server in the same Compose network.
+  #
+  # WOR-2191: this was authored as `certificate_settings:` with `acme_*`
+  # field names. No such key exists under `proxy:`, and unlike the
+  # document root, `proxy:` denies unknown fields, so the whole config
+  # failed to compile and the demo stack could not start at all.
+  #
+  # `ca_root` is how a private or test CA is trusted (modelled on Caddy's
+  # `acme_ca_root`). Verification stays on: the root is added to the trust
+  # store, not skipped. The client's zero-config escape hatch only fires
+  # for a loopback directory URL, and `pebble` is a container hostname, so
+  # this file has to say which CA it means.
+  acme:
+    enabled: true
+    email: test@example.com
+    directory_url: https://pebble:14000/dir
+    ca_root: /etc/sbproxy/pebble-ca/ca-cert.pem
+    storage_path: /etc/sbproxy/certs
 
-  logging:
-    format: dev
+  observability:
+    log:
+      format: pretty
 
-# Telemetry server exposes a Prometheus-compatible /metrics endpoint.
-# Prometheus scrapes this on port 8888 every 15 seconds (see prometheus.yml).
-telemetry:
-  enabled: true
-  bind_address: "0.0.0.0"
-  bind_port: 8888
+    # OpenTelemetry tracing to Jaeger. View traces at
+    # http://localhost:16686 after generating traffic.
+    #
+    # WOR-2191: authored as a top-level `otel:` block with `otlp_*` field
+    # names. The document root is permissive (the schema-v1 flat-file
+    # promise), so unknown root keys only warn and are dropped: the demo
+    # advertised tracing and shipped none.
+    telemetry:
+      enabled: true
+      endpoint: http://jaeger:4317
+      transport: grpc
+      service_name: sbproxy
+      sample_rate: 1.0
 
-# OpenTelemetry tracing sends spans to Jaeger via OTLP/gRPC.
-# View traces at http://localhost:16686 after generating traffic.
-otel:
-  enabled: true
-  otlp_endpoint: jaeger:4317
-  otlp_protocol: grpc
-  otlp_insecure: true
-  service_name: sbproxy
-  sample_rate: 1.0
-
-# Distributed rate limiting counter store backed by Redis.
-# The L2 cache is shared across all sbproxy instances in the Compose network,
-# so rate limit counters are accurate even when running multiple replicas.
-l2_cache_settings:
-  driver: redis
-  params:
-    dsn: redis://redis:6379/0
+  # Shared counter store for distributed rate limiting, so every replica
+  # in the Compose network spends from one allowance.
+  #
+  # `l2_cache_settings` is the canonical spelling but belongs under
+  # `proxy:`, not at the root. Same silent drop as the block above.
+  l2_cache_settings:
+    driver: redis
+    params:
+      dsn: redis://redis:6379/0
 
 origins:
   # Example origin: proxies httpbin.org and applies a Redis-backed rate limit.
@@ -54,10 +64,14 @@ origins:
       type: proxy
       url: https://httpbin.org
     policies:
-      - type: rate_limit
-        limit: 10
-        window: 1m
-        key: client_ip
+      # WOR-2191: was `type: rate_limit` with `limit` / `window` / `key`,
+      # none of which exist. The registered type is `rate_limiting` and
+      # the rate is expressed directly. `key` is a CEL expression, not a
+      # keyword; omitted here so it buckets on client IP, which is the
+      # default and what `key: client_ip` was reaching for.
+      - type: rate_limiting
+        requests_per_minute: 10
+        burst: 5
 
   # Echo origin for quick connectivity and header inspection.
   # Test with: curl -H "Host: echo.localhost" http://localhost:8080/

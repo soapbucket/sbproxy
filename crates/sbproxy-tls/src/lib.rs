@@ -576,11 +576,38 @@ impl TlsState {
                     }
 
                     // --- Issue or renew certificate via ACME ---
-                    let mut acme_client = AcmeClient::new(
+                    // `ca_root` trusts a private or test CA for the
+                    // directory endpoint (Caddy's `acme_ca_root`). Read
+                    // here rather than cached, because issuance is rare
+                    // and a rotated test CA should not need a restart.
+                    let ca_root = match acme_config.ca_root.as_deref() {
+                        Some(path) => match std::fs::read(path) {
+                            Ok(bytes) => Some(bytes),
+                            Err(e) => {
+                                error!(
+                                    hostname,
+                                    path,
+                                    "acme.ca_root could not be read: {e}. Refusing to fall back \
+                                     to system roots, which would silently restore the \
+                                     verification failure this setting exists to fix."
+                                );
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let mut acme_client = match AcmeClient::with_ca_root(
                         &acme_config.directory_url,
                         &acme_config.email,
                         acme_config.challenge_types.clone(),
-                    );
+                        ca_root.as_deref(),
+                    ) {
+                        Ok(client) => client,
+                        Err(e) => {
+                            error!(hostname, "failed to build the ACME client: {e:#}");
+                            continue;
+                        }
+                    };
 
                     // Load the account key.
                     let key_pair = match AcmeClient::load_or_create_account_key(&cert_store) {
@@ -825,6 +852,7 @@ mod tests {
             storage_backend: backend.to_string(),
             storage_path: path.to_string(),
             renew_before_days: 30,
+            ca_root: None,
         }
     }
 

@@ -258,20 +258,71 @@ impl AcmeClient {
     /// query string, subdomain, or userinfo) does not disable certificate
     /// verification.
     pub fn new(directory_url: &str, email: &str, challenge_types: Vec<String>) -> Self {
-        let accept_invalid = is_loopback_directory(directory_url);
-        let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(accept_invalid)
-            .build()
-            .expect("ACME HTTP client builder failed; cannot honor the configured TLS verification mode");
+        Self::with_ca_root(directory_url, email, challenge_types, None)
+            .expect("no ca_root supplied, so no PEM can fail to parse")
+    }
 
-        Self {
+    /// Create a client that trusts `ca_root` for the directory endpoint.
+    ///
+    /// `ca_root` is PEM bytes holding one or more certificates, from
+    /// `acme.ca_root`. This is the path for a private or test ACME server
+    /// (step-ca, Pebble, an internal CA) whose directory endpoint is
+    /// signed by a root the host does not know.
+    ///
+    /// Modelled on Caddy's `acme_ca_root`. The root is **added** to the
+    /// trust store and verification stays on, rather than the check being
+    /// skipped: a misconfigured or intercepted directory is still refused,
+    /// and the operator states which CA they mean instead of accepting
+    /// any. That distinction is the whole reason to prefer this shape.
+    ///
+    /// Returns an error when the PEM holds no parseable certificate,
+    /// because falling back to system roots would silently restore the
+    /// connection failure the operator added this to fix.
+    pub fn with_ca_root(
+        directory_url: &str,
+        email: &str,
+        challenge_types: Vec<String>,
+        ca_root: Option<&[u8]>,
+    ) -> Result<Self> {
+        let mut builder = reqwest::Client::builder();
+        match ca_root {
+            Some(pem) => {
+                let certs = reqwest::Certificate::from_pem_bundle(pem)
+                    .context("acme.ca_root: no parseable PEM certificate")?;
+                anyhow::ensure!(
+                    !certs.is_empty(),
+                    "acme.ca_root: file parsed but contained no certificate"
+                );
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert);
+                }
+            }
+            None => {
+                // Zero-config Pebble on loopback keeps working. The host is
+                // parsed rather than substring-matched, so a non-loopback
+                // URL that merely contains "localhost" or "127.0.0.1" in a
+                // query string, subdomain, or userinfo does not disable
+                // verification.
+                //
+                // `ca_root` is the better answer whenever the directory is
+                // reachable by any other name, which includes every
+                // container network: it verifies rather than trusting
+                // whatever answers.
+                builder = builder.danger_accept_invalid_certs(is_loopback_directory(directory_url));
+            }
+        }
+        let http = builder.build().context(
+            "ACME HTTP client builder failed; cannot honor the configured TLS verification mode",
+        )?;
+
+        Ok(Self {
             http,
             directory_url: directory_url.to_owned(),
             directory: None,
             email: email.to_owned(),
             challenge_types,
             kid: None,
-        }
+        })
     }
 
     /// Fetch (and cache) the ACME directory from the server.
@@ -1507,6 +1558,70 @@ mod tests {
         assert_eq!(client.email, "test@example.com");
         assert_eq!(client.challenge_types, vec!["http-01"]);
         assert!(client.directory.is_none());
+    }
+
+    // --- WOR-2191: acme.ca_root ---
+
+    /// A throwaway self-signed root, generated rather than vendored so the
+    /// test carries no expiry.
+    fn test_root_pem() -> Vec<u8> {
+        let key_pair = rcgen::KeyPair::generate().expect("generate test root key");
+        let params = rcgen::CertificateParams::new(vec!["test-acme-ca".to_string()])
+            .expect("test root params");
+        params
+            .self_signed(&key_pair)
+            .expect("self-sign test root")
+            .pem()
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_supplied_ca_root_is_accepted() {
+        let client = AcmeClient::with_ca_root(
+            "https://pebble:14000/dir",
+            "test@example.com",
+            vec!["http-01".into()],
+            Some(&test_root_pem()),
+        )
+        .expect("a valid PEM root must build a client");
+        assert_eq!(client.directory_url, "https://pebble:14000/dir");
+    }
+
+    #[test]
+    fn an_unparseable_ca_root_is_refused_rather_than_ignored() {
+        // The important half. Falling back to system roots on a bad file
+        // would silently restore the verification failure the operator
+        // added `ca_root` to fix, and they would see a connection error
+        // pointing at the CA rather than at their typo.
+        let result = AcmeClient::with_ca_root(
+            "https://pebble:14000/dir",
+            "test@example.com",
+            vec![],
+            Some(b"not a certificate"),
+        );
+        let err = match result {
+            Ok(_) => panic!("garbage must not silently fall back to system roots"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("ca_root"),
+            "the error must name the setting: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_directory_does_not_disable_verification() {
+        // The bug behind the docker demo. `pebble:14000` is a container
+        // hostname, not loopback, so the zero-config escape hatch does not
+        // fire and the self-signed directory is refused. `ca_root` is the
+        // supported answer; there is deliberately no skip-verify knob.
+        assert!(!is_loopback_directory("https://pebble:14000/dir"));
+        assert!(is_loopback_directory("https://localhost:14000/dir"));
+        assert!(is_loopback_directory("https://127.0.0.1:14000/dir"));
+        assert!(is_loopback_directory("https://[::1]:14000/dir"));
+        // Substring lookalikes must not qualify.
+        assert!(!is_loopback_directory("https://localhost.example.com/dir"));
+        assert!(!is_loopback_directory("https://evil.test/dir?h=localhost"));
     }
 
     // --- DER to raw ECDSA signature conversion ---

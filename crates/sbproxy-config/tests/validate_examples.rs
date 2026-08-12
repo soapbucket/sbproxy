@@ -103,6 +103,18 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
             .into_iter()
             .map(|name| root.join("enterprise-ai-gateway").join(name)),
     );
+    // WOR-2191: the compose demo is the documented local-evaluation path
+    // and was covered by nothing. It had drifted until it no longer
+    // compiled at all: a `certificate_settings:` block under `proxy:`
+    // (which denies unknown fields), three blocks stranded at the
+    // document root where unknown keys only warn, and a policy naming a
+    // type that does not exist. Every one of those is caught here.
+    out.push(
+        root.parent()
+            .expect("examples/ has a parent")
+            .join("docker")
+            .join("sb.yml"),
+    );
     out.sort();
     out.dedup();
     out

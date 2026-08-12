@@ -5276,6 +5276,28 @@ pub struct AcmeConfig {
     /// Number of days before expiry to attempt renewal.
     #[serde(default = "default_renew_before_days")]
     pub renew_before_days: u32,
+    /// PEM file holding a trusted root for the **ACME directory endpoint**,
+    /// for a CA that is not in the system trust store.
+    ///
+    /// This is about trusting the ACME server you talk to, not the
+    /// certificates it issues. A private or test CA (step-ca, Pebble, an
+    /// internal ACME server) presents a directory endpoint signed by a
+    /// root the host does not know, and without this the client refuses
+    /// the connection before any order begins.
+    ///
+    /// Named and shaped after Caddy's `acme_ca_root`, deliberately.
+    /// Verification stays **on**: the root is added to the trust store
+    /// rather than the check being skipped, so a misconfigured or
+    /// intercepted directory is still refused. There is no
+    /// "skip verification" knob here and there should not be one.
+    ///
+    /// Read at issuance time rather than cached, so a rotated test CA does
+    /// not need a restart. A missing or unparseable file refuses the
+    /// issuance with an error naming the path; it never falls back to
+    /// system roots, because falling back would silently restore the
+    /// verification failure this setting exists to fix.
+    #[serde(default)]
+    pub ca_root: Option<String>,
 }
 
 fn default_acme_directory() -> String {
