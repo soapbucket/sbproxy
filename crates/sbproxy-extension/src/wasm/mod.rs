@@ -154,14 +154,20 @@ impl BoundedStderrPipe {
         guard.bytes.extend_from_slice(&bytes[..take]);
     }
 
-    /// Emit every captured line at debug under the hook's identity and
-    /// return how many lines were emitted.
+    /// Emit every captured line under the hook's identity and return
+    /// how many lines were emitted.
     ///
-    /// `release_max_level_info` compiles `debug!` out of release
-    /// builds, so this is a developer- and support-facing channel. The
-    /// machine-readable half of the same signal is the `error` outcome
-    /// on the decision-event metric family.
-    fn drain_to_log(&self, identity: WasmGuestIdentity<'_>) -> usize {
+    /// `failed` selects the level, and it is the whole reason this is
+    /// useful in production. The workspace enables
+    /// `tracing/release_max_level_info`, which compile-strips `debug!`
+    /// out of release builds, so a capture that only ever emitted at
+    /// debug would be a no-op in the binary operators actually run:
+    /// they would set `--log-level debug`, get nothing, and be exactly
+    /// where they started. A guest that failed is precisely when its
+    /// diagnostics are worth a line, so those go out at `warn` and
+    /// survive; a healthy guest's chatter stays at `debug`, where it
+    /// costs nothing in release.
+    fn drain_to_log(&self, identity: WasmGuestIdentity<'_>, failed: bool) -> usize {
         let mut guard = self
             .buffer
             .lock()
@@ -177,14 +183,24 @@ impl BoundedStderrPipe {
                 continue;
             }
             lines += 1;
-            tracing::debug!(
-                target: "sbproxy::wasm::stderr",
-                bundle = identity.bundle,
-                hook_kind = identity.hook_kind,
-                type_name = identity.type_name,
-                "{}",
-                String::from_utf8_lossy(line),
-            );
+            let line = String::from_utf8_lossy(line);
+            if failed {
+                tracing::warn!(
+                    target: "sbproxy::wasm::stderr",
+                    bundle = identity.bundle,
+                    hook_kind = identity.hook_kind,
+                    type_name = identity.type_name,
+                    "{line}",
+                );
+            } else {
+                tracing::debug!(
+                    target: "sbproxy::wasm::stderr",
+                    bundle = identity.bundle,
+                    hook_kind = identity.hook_kind,
+                    type_name = identity.type_name,
+                    "{line}",
+                );
+            }
         }
         if truncated {
             tracing::debug!(
@@ -849,8 +865,17 @@ impl WasmRuntime {
         // guest that tripped a cap is exactly the one whose stderr
         // explains why, and a trap on the refusal path is the case
         // WOR-2364 opened this on.
+        //
+        // A clean `proc_exit(0)` surfaces as an `Err` carrying `I32Exit`
+        // and is the normal way a WASI command returns, so it is not a
+        // failure and its chatter stays at debug.
+        let failed = memory_denied
+            || table_denied
+            || call_result
+                .as_ref()
+                .is_err_and(|error| !is_successful_exit(error));
         self.last_guest_stderr_lines
-            .store(stderr.drain_to_log(identity), Ordering::Relaxed);
+            .store(stderr.drain_to_log(identity, failed), Ordering::Relaxed);
         let output = stdout
             .try_into_inner()
             .ok_or(WasmCallFailure::HostFailure)?
@@ -1521,12 +1546,12 @@ mod tests {
             type_name: "t",
         };
         assert_eq!(
-            pipe.drain_to_log(identity),
+            pipe.drain_to_log(identity, true),
             3,
             "a trailing fragment with no newline is still a diagnostic worth emitting"
         );
         assert_eq!(
-            pipe.drain_to_log(identity),
+            pipe.drain_to_log(identity, false),
             0,
             "draining must clear the buffer so the next call starts empty"
         );

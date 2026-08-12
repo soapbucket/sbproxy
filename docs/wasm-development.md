@@ -235,15 +235,22 @@ type (epoch deadline, memory exhaustion, unreachable, etc.) and the
 guest stack frame names if available. To get more from the module
 itself:
 
-- Write debug output to stderr. The host captures stderr and routes
-  it through the proxy log when `--log-level debug` is set. This
-  works on both module paths: the `type: wasm` transform and the
-  config-loaded extension bundle. Bundle lines are tagged with the
-  bundle name, hook kind, and `type:` string, so a bundle carrying
-  several hooks stays readable. Capture is bounded at 1 MiB per call
-  and the overflow is dropped with a truncation line rather than
-  failing the call, so a chatty guest is never killed by its own
-  logging.
+- Write debug output to stderr. The host captures it on both module
+  paths: the `type: wasm` transform and the config-loaded extension
+  bundle. Bundle lines are tagged with the bundle name, hook kind, and
+  `type:` string, so a bundle carrying several hooks stays readable.
+  Capture is bounded at 1 MiB per call and the overflow is dropped with
+  a truncation line rather than failing the call, so a chatty guest is
+  never killed by its own logging.
+
+  **The level depends on whether the call failed.** Release builds are
+  compiled with `release_max_level_info`, which strips `debug!`
+  entirely, so a healthy guest's stderr is visible only in a debug
+  build even with `--log-level debug`. A guest that trapped, exhausted
+  its memory or table budget, or exited non-zero has its captured
+  stderr emitted at `warn` instead, which survives release. In practice
+  that means the diagnostics are there when you need them and cost
+  nothing when you do not.
 - Add a feature flag in your module that emits a hex dump of the
   input on stderr. Cheaper than a full debugger, often enough to
   diagnose payload mismatches.

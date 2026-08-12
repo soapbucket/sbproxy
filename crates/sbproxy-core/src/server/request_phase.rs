@@ -3397,6 +3397,7 @@ pub(super) async fn request_filter(
         tenant_id: policy_workspace_id.clone(),
         workspace_id: policy_workspace_id,
         origin: ctx.hostname.to_string(),
+        tenant: ctx.tenant_id.to_string(),
     };
     let policy_verdict =
         check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await;

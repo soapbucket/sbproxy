@@ -4346,3 +4346,52 @@ fn shared_lua_engine_is_cached_and_isolates_request_state() {
         "a global from one invocation must not leak into the next; got {second:?}"
     );
 }
+
+// --- Decision-event outcome mapping (WOR-2370) ---
+
+#[test]
+fn a_confirm_verdict_is_not_counted_as_an_allow() {
+    // Confirm holds the request pending human approval, so from the
+    // request's point of view it did not proceed. A SIEM rule counting
+    // refusals has to see it.
+    use sbproxy_observe::decision::DecisionOutcome;
+    use sbproxy_observe::events::VerdictTag;
+    assert_eq!(
+        super::decision_outcome_for(VerdictTag::Confirm),
+        DecisionOutcome::Deny
+    );
+    assert_eq!(
+        super::decision_outcome_for(VerdictTag::Deny),
+        DecisionOutcome::Deny
+    );
+    assert_eq!(
+        super::decision_outcome_for(VerdictTag::Allow),
+        DecisionOutcome::Allow
+    );
+    assert_eq!(
+        super::decision_outcome_for(VerdictTag::AllowWithHeaders),
+        DecisionOutcome::Allow
+    );
+}
+
+#[test]
+fn every_declared_verdict_maps_without_falling_through() {
+    // `VerdictTag` is `#[non_exhaustive]`, so the mapping needs a
+    // catch-all arm and the compiler cannot tell us when a new variant
+    // lands. Pin that every variant we know about is handled by name,
+    // so the catch-all stays reachable only for genuinely new tags.
+    use sbproxy_observe::decision::DecisionOutcome;
+    use sbproxy_observe::events::VerdictTag;
+    for verdict in [
+        VerdictTag::Allow,
+        VerdictTag::Deny,
+        VerdictTag::Confirm,
+        VerdictTag::AllowWithHeaders,
+    ] {
+        let outcome = super::decision_outcome_for(verdict);
+        assert!(
+            matches!(outcome, DecisionOutcome::Allow | DecisionOutcome::Deny),
+            "{verdict:?} produced {outcome:?}"
+        );
+    }
+}

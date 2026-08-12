@@ -412,9 +412,13 @@ impl fmt::Display for DecisionOutcome {
 ///
 /// `origin` is required rather than optional: a decision is meaningless
 /// without knowing whose traffic it was made on, and `origin` is bounded
-/// by config, which makes it the safe multi-tenant dimension. Every
-/// label value goes through the global cardinality limiter, which caps
-/// at 1000 unique values per label and demotes overflow to `__other__`.
+/// by config, which makes it the safer multi-tenant dimension. Every
+/// label value goes through the global cardinality limiter, which
+/// demotes overflow to `__other__`. The budgets are per label name and
+/// shared across every metric using that name: `origin` is 200, `tenant`
+/// is 1000. Callers pass the request `Host` for `origin`, matching every
+/// other origin-labelled recorder in the tree, so a wildcard origin can
+/// consume the budget faster than a config origin count suggests.
 pub fn record_decision(
     event: DecisionEvent,
     engine: DecisionEngine,

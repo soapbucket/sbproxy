@@ -1018,6 +1018,7 @@ pub(super) async fn handle_action(
                         tenant_id: workspace_id.clone(),
                         workspace_id,
                         origin: ctx.hostname.to_string(),
+                        tenant: ctx.tenant_id.to_string(),
                     };
                     if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
                         enforcers,

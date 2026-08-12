@@ -434,7 +434,7 @@ Stated here rather than discovered on your Prometheus. The theoretical product i
 
 At 50 origins and 500 tenants, expect roughly 50 x 500 x (events actually configured, typically 4 to 8) x 1 engine x (outcomes actually seen, typically 2 to 3), which lands in the low hundreds of thousands of series if every tenant uses every origin. That is the pathological reading. Tenants are normally partitioned across origins rather than crossed with them, which divides it by the number of origins and puts the realistic figure in the low thousands.
 
-Every label value passes through the global cardinality limiter, which caps at 1000 unique values per label by default and demotes overflow to `__other__`, emitting `sbproxy_label_cardinality_overflow_total{metric, label}`. Watch that counter rather than assuming the estimate above holds for your traffic.
+Every label value passes through the global cardinality limiter and demotes overflow to `__other__`, emitting `sbproxy_label_cardinality_overflow_total{metric, label}`. The budgets are per label name, not per metric: `origin` is 200 and `tenant` is 1000. `origin` carries the request `Host`, so a wildcard origin serving many subdomains reaches 200 faster than the origin count in your config suggests, and the accepted-value set is shared with every other `origin`-labelled family. Watch that overflow counter rather than assuming the estimate above holds for your traffic.
 
 Single-tenant deployments are unchanged. `tenant` resolves to `__default__` and falls through the proxy-wide path, so the series a single-tenant operator's dashboards read are the same ones they were reading before this family existed.
 
