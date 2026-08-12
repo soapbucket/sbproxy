@@ -4010,6 +4010,20 @@ async fn check_buffered_dynamic_policies(
                 );
                 emit_policy_verdict(verdict_ctx, policy_id, compiled.surface, verdict, started);
                 if posture.admits() {
+                    // WOR-2370: this is the fail-open, and it gets its
+                    // own counter rather than an `outcome` label on the
+                    // shared family. The request proceeded *without the
+                    // decision being made*, which is a different
+                    // operational fact from an engine fault and wants a
+                    // different alert. `emit_policy_verdict` above
+                    // already counted the allow; this says the allow was
+                    // not earned.
+                    sbproxy_observe::decision::record_decision_fail_open(
+                        sbproxy_observe::decision::DecisionEvent::Policy,
+                        decision_engine_for(compiled.surface),
+                        &verdict_ctx.origin,
+                        &verdict_ctx.tenant_id,
+                    );
                     // `Observe` and `Degraded` both proceed, and both
                     // want the counterfactual on the record: the label
                     // is what an operator alerts on to find controls
