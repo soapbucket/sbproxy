@@ -159,10 +159,17 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     //     body buffer, so there is no request phase for the expression to
     //     run in. `CelScriptTransform::from_config` refuses it and points at
     //     the request-phase surfaces that do exist.
+    //   * `type: cel`, keys `on_response` and its `expression` alias
+    //     (WOR-2362). Alive but unauthored: the expression replaced the
+    //     entire response body with whatever scalar it evaluated to, which
+    //     is producing output rather than deciding. Body rewriting belongs
+    //     to the `javascript`, `lua_json`, and WASM transforms, which can
+    //     parse a body, edit part of it, and re-emit.
+    //     `CelScriptTransform::from_config` refuses both and names them.
     //
-    // Deleting either field on its own would have been silent: neither
-    // config struct sets `deny_unknown_fields`, so an operator's key would
-    // have gone from inert-and-documented to inert-and-ignored.
+    // Deleting any of these fields on its own would have been silent: none
+    // of the config structs set `deny_unknown_fields`, so an operator's key
+    // would have gone from inert-and-documented to inert-and-ignored.
     // WOR-2330: the eleven entries below are what flipping
     // `origins.*.action` to `Enforced` surfaced. Every one has a real
     // production reader; the scan cannot attribute them because the read

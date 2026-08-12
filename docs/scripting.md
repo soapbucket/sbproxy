@@ -46,7 +46,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `transforms[] type: lua_json`, field `script` | Lua | Defines `modify_json(data, ctx)`; return value replaces the JSON response body |
 | `transforms[] type: javascript`, field `script` | JavaScript | Defines `transform(body, ctx)` over the raw body string |
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
-| `transforms[] type: cel`, fields `on_response` / `headers` | CEL | Rewrites the response body and sets/removes response headers from CEL |
+| `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
@@ -404,7 +404,7 @@ There is no `cel:` or `lua:` matcher inside forward rules. To route on anything 
 
 ### 3.5 The `cel` response transform
 
-The `cel` transform is the CEL surface on the response path. It can rewrite the response body (`on_response`, alias `expression`) and set, append, or remove response headers via per-header rules with `value_expr` CEL expressions.
+The `cel` transform is the CEL surface on the response path. It sets, appends, or removes response headers via per-header rules with `value_expr` CEL expressions.
 
 ```yaml
 origins:
@@ -414,22 +414,24 @@ origins:
       url: https://test.sbproxy.dev
     transforms:
       - type: cel
-        on_response: |
-          response.status >= 500
-            ? "upstream error, request id " + request.headers["x-request-id"]
-            : response.body
         headers:
           - { op: set, name: x-served-by, value_expr: '"sbproxy"' }
+          - { op: set, name: x-upstream-status, value_expr: 'string(response.status)' }
           - { op: remove, name: x-internal-trace }
 ```
 
-The expression sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is written back verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null leaves the body unchanged. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+Each `value_expr` sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is used verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null skips the rule. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
 
-Every expression on the transform is compiled when the config compiles: `on_response` and each rule's `value_expr`. A syntax error in either refuses the config, naming the origin and the field or header it belongs to. Responses then only evaluate.
+Every `value_expr` is compiled when the config compiles. A syntax error refuses the config, naming the origin and the header the expression belongs to. Responses then only evaluate.
 
-The transform is response-only, and so is every other transform. There is no `on_request:` here. The key was accepted for a while, compiled at config load and never evaluated, which read as a broken request-phase feature rather than an absent one; it is refused at config compile now. For CEL at request time, reach for the surfaces that actually run there: an `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it.
+**CEL decides, it does not produce.** This transform cannot write a response body, and two removed keys are refused at config compile rather than ignored:
 
-At response time the postures are unchanged and deliberately forgiving, because the response is already on its way out: a header rule whose expression fails is skipped and the rest of the chain still runs, and a failing `on_response` leaves the body byte-for-byte unchanged. Both are logged.
+| Removed key | Why | Reach for instead |
+| -- | -- | -- |
+| `on_request:` | Compiled at config load and never evaluated. Every transform here is response-side: the dispatch signature is `(body, content_type)` and it runs off the response body buffer, so there was no request phase for the expression to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
+| `on_response:` (alias `expression:`) | Replaced the **entire** response body with whatever scalar the expression evaluated to. No partial edit, no structure-aware change, no streaming. That is producing output, which is a different job from deciding. | A `javascript`, `lua_json`, or WASM transform. Each parses the body, edits part of it, and re-emits. |
+
+At response time the posture is deliberately forgiving, because the response is already on its way out: a header rule whose expression fails is skipped, the rest of the chain still runs, and the failure is logged.
 
 ---
 
@@ -945,7 +947,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `engine: cel` custom log field | A CEL parse error rejects the config at compile time; an evaluation error is logged at debug and the field is omitted from the line |
 | Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
-| `cel` transform | Missing both `on_response` and `headers`, a CEL parse error in any expression, or an authored `on_request:` (removed; transforms have no request phase) fails config compile; a runtime evaluation error leaves the body unchanged and skips only the failing header rule |
+| `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |

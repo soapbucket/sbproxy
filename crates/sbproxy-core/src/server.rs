@@ -586,15 +586,15 @@ fn apply_transform_with_ctx(
         Transform::JsJson(t) => t.apply_with_context(body, script_modifier_context(ctx)),
         Transform::CelScript(t) => {
             // Wave 5 day-6 Item 1: typed dispatch for the CEL response
-            // transform. The body-rewriting expression continues to use
-            // the standard `apply_with_response` overload (which the
-            // body-buffer pipeline below already invokes via the fall-
-            // through arm). We split the call here so the per-header
-            // `headers:` rules can evaluate against the live response
-            // context and stash mutations onto `ctx` for the static
-            // action / response_filter to stamp onto the outgoing
-            // response. Body and headers are independent: a transform
-            // may carry only one or the other.
+            // transform. The per-header `headers:` rules evaluate
+            // against the live response context here and stash their
+            // mutations onto `ctx` for the static action /
+            // response_filter to stamp onto the outgoing response.
+            //
+            // WOR-2362: there is no body half any more. The
+            // `on_response:` expression replaced the whole body with a
+            // scalar and is refused at config compile, so header
+            // mutation is the transform's entire output.
             //
             // The body-buffer call site does not own the live response
             // header map (Pingora exposes that via the session struct,
@@ -622,12 +622,10 @@ fn apply_transform_with_ctx(
             ) {
                 Ok(mutations) => {
                     ctx.cel_response_header_mutations.extend(mutations);
+                    Ok(())
                 }
-                Err(e) => {
-                    return Err(anyhow::Error::new(e));
-                }
+                Err(e) => Err(anyhow::Error::new(e)),
             }
-            t.apply(body)
         }
         Transform::A2aAgentCardRewrite(t) => {
             // WOR-2315: typed dispatch for the agent-card rewriter. The

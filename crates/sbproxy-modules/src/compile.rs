@@ -1452,32 +1452,37 @@ hooks:
 
     #[test]
     fn compile_transform_cel_script() {
-        // Wave 5 day-5: pin the new `cel` transform compiles through
-        // the standard dispatch path.
+        // Wave 5 day-5: pin the `cel` transform compiles through the
+        // standard dispatch path. WOR-2362 moved the surface from a
+        // body expression to header rules.
         let json = serde_json::json!({
             "type": "cel",
-            "on_response": r#""hello-from-cel""#,
+            "headers": [{"op": "set", "name": "x-hello", "value_expr": r#""hello-from-cel""#}],
         });
         let transform = compile_transform(&json).unwrap();
         assert_eq!(transform.transform_type(), "cel");
     }
 
     #[test]
-    fn compile_transform_cel_script_via_expression_alias() {
-        // The `expression:` alias mirrors the policy-side CEL field.
-        let json = serde_json::json!({
-            "type": "cel",
-            "expression": r#""hello-from-cel""#,
-        });
-        let transform = compile_transform(&json).unwrap();
-        assert_eq!(transform.transform_type(), "cel");
+    fn compile_transform_cel_script_body_expression_is_refused() {
+        // WOR-2362: `on_response:` and its `expression:` alias both
+        // replaced the whole response body with one scalar. Refused at
+        // the compiler, not silently ignored.
+        for key in ["on_response", "expression"] {
+            let json = serde_json::json!({"type": "cel", key: r#""hello-from-cel""#});
+            let err = compile_transform(&json)
+                .expect_err("a body-replacing cel transform must not compile");
+            assert!(
+                err.to_string().contains(key),
+                "the compiler error must name the key the operator wrote: {err}"
+            );
+        }
     }
 
     #[test]
-    fn compile_transform_cel_script_missing_expression_fails() {
-        // Without `on_response` (or alias), the compiler must reject
-        // the block so a misconfigured `type: cel` does not silently
-        // become a no-op.
+    fn compile_transform_cel_script_missing_headers_fails() {
+        // Without `headers:`, the compiler must reject the block so a
+        // misconfigured `type: cel` does not silently become a no-op.
         let json = serde_json::json!({"type": "cel"});
         assert!(compile_transform(&json).is_err());
     }

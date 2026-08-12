@@ -236,7 +236,14 @@ guest stack frame names if available. To get more from the module
 itself:
 
 - Write debug output to stderr. The host captures stderr and routes
-  it through the proxy log when `--log-level debug` is set.
+  it through the proxy log when `--log-level debug` is set. This
+  works on both module paths: the `type: wasm` transform and the
+  config-loaded extension bundle. Bundle lines are tagged with the
+  bundle name, hook kind, and `type:` string, so a bundle carrying
+  several hooks stays readable. Capture is bounded at 1 MiB per call
+  and the overflow is dropped with a truncation line rather than
+  failing the call, so a chatty guest is never killed by its own
+  logging.
 - Add a feature flag in your module that emits a hex dump of the
   input on stderr. Cheaper than a full debugger, often enough to
   diagnose payload mismatches.

@@ -1,34 +1,29 @@
-//! CEL response-body transform.
+//! CEL response-header transform.
 //!
-//! Evaluates a CEL expression against the response body + status +
-//! headers and replaces the body with the result. The transform is
-//! intended for the trust-bounded sidecar capture path's tests
-//! the e2e harness needs a tiny response-side scripting
-//! lane so it can stamp `request.tls.ja4` / `request.kya.verdict` back
-//! into the response body for assertions, without bringing the full
-//! Lua / JS / WASM stack.
+//! Evaluates CEL expressions against the response status + headers +
+//! body and returns header mutations. The transform is intended for
+//! the trust-bounded sidecar capture path's tests: the e2e harness
+//! needs a tiny response-side scripting lane so it can stamp
+//! `request.tls.ja4` / `request.kya.verdict` onto the response for
+//! assertions, without bringing the full Lua / JS / WASM stack.
 //!
 //! ## Config shape
 //!
 //! ```yaml
 //! transforms:
 //!   - type: cel
-//!     on_response: |
-//!       request.tls.ja4 + ":" + string(response.status)
 //!     headers:
 //!       - { op: set, name: x-tls-ja4, value_expr: "request.tls.ja4" }
 //!       - { op: remove, name: x-internal-trace }
 //! ```
 //!
-//! The `on_response` expression runs at body-buffer time and rewrites
-//! the response body. The `headers` array runs alongside it and lets
-//! operators set / append / remove response headers from CEL. Either
-//! field is independently optional; supplying
-//! neither is an error.
+//! `headers` is the whole surface, and it is required. Each rule's
+//! `value_expr` decides one header value; the transform never produces
+//! a body.
 //!
 //! ## CEL surface
 //!
-//! Bindings exposed to the expression:
+//! Bindings exposed to each `value_expr`:
 //!
 //! - `response.body` - response body as a UTF-8 string. Non-UTF-8
 //!   bodies are passed through as the empty string and the transform
@@ -40,9 +35,26 @@
 //!
 //! ## Result coercion
 //!
-//! The expression returns one of: a string (written back verbatim),
-//! an int / float / bool (rendered as a string), or a map / list
-//! (JSON-serialised). Null returns leave the body unchanged.
+//! A `value_expr` returns one of: a string (used verbatim), an int /
+//! float / bool (rendered as a string), or a map / list
+//! (JSON-serialised). Null skips the rule.
+//!
+//! ## There is no body side (WOR-2362)
+//!
+//! An `on_response:` key (alias `expression:`) used to be accepted
+//! here, and it replaced the **entire** response body with whatever
+//! scalar the expression evaluated to. That is the wrong tool: CEL is
+//! an expression language for deciding, and producing a payload is
+//! what the `javascript`, `lua_json`, and WASM transforms are for,
+//! all of which can parse a body, edit part of it, and re-emit.
+//!
+//! Nothing authored it. Every `type: cel` block in this repository
+//! (examples, e2e fixtures, docs) uses `headers:` rules, so the field
+//! was alive and unused, which is exactly how `on_request:` looked
+//! before someone checked. [`CelScriptTransform::from_config`] refuses
+//! it now rather than dropping it silently: the inner `Config` below
+//! has no `deny_unknown_fields`, so removing the field alone would
+//! demote an authored key from inert to ignored.
 //!
 //! ## Header deny-list
 //!
@@ -69,26 +81,22 @@
 //!
 //! ## Failure posture (WOR-2179)
 //!
-//! Every expression on this transform (`on_response` and each rule's
-//! `value_expr`) is compiled exactly once, in
+//! Every expression on this transform is compiled exactly once, in
 //! [`CelScriptTransform::from_config`], at config-compile time.
 //! Malformed CEL rejects the candidate config with an error naming the
-//! transform, the field or header the expression belongs to, and the bad
+//! transform and the header the expression belongs to, plus the bad
 //! source; boot and reload both refuse it. Response-time evaluation only
 //! evaluates.
 //!
 //! Runtime evaluation errors keep the posture this transform has always
-//! had, now that they are the only failures left here: a header rule
-//! whose expression fails is skipped and the rest of the chain still
-//! runs, and a failing `on_response` leaves the body byte-for-byte
-//! unchanged. Both log a warning. The reasoning is that a response is
-//! already on its way out: turning a bad key lookup into a 500 would
-//! destroy a good response over an observability-shaped expression, and
-//! the operator gets the same information from the log.
+//! had: a header rule whose expression fails is skipped and the rest of
+//! the chain still runs, with a warning logged. The reasoning is that a
+//! response is already on its way out: turning a bad key lookup into a
+//! 500 would destroy a good response over an observability-shaped
+//! expression, and the operator gets the same information from the log.
 
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
 use http::HeaderMap;
 use sbproxy_extension::cel::{CelValue, CompiledCel};
 
@@ -173,21 +181,16 @@ pub enum CelHeaderMutation {
     Remove(String),
 }
 
-/// CEL response-body transform.
+/// CEL response-header transform.
 ///
 /// Construct via [`Self::from_config`], which compiles every configured
 /// expression once, so a value of this type always carries valid
 /// precompiled programs.
 #[derive(Debug)]
 pub struct CelScriptTransform {
-    /// CEL expression that runs at response-body time. Optional when
-    /// `headers` is supplied.
-    pub on_response: Option<String>,
-    /// Header mutation rules evaluated at response time. May be empty
-    /// when only `on_response` is configured.
+    /// Header mutation rules evaluated at response time. Never empty:
+    /// [`Self::from_config`] refuses a transform with no rules.
     pub headers: Vec<CelHeaderRule>,
-    /// [`Self::on_response`] compiled once at config-compile time.
-    compiled_on_response: Option<CompiledCel>,
     /// Each rule's `value_expr` compiled once at config-compile time,
     /// index-aligned with [`Self::headers`]. `remove` rules carry no
     /// expression and hold `None`.
@@ -197,21 +200,17 @@ pub struct CelScriptTransform {
 impl CelScriptTransform {
     /// Build a `CelScriptTransform` from the operator's YAML block.
     ///
-    /// Either `on_response` or `expression` may carry the response-time
-    /// expression; the latter is accepted as an alias so the simple
-    /// "drop a CEL string in" use case mirrors the `expression` field
-    /// the policy block uses.
-    ///
-    /// `headers` is optional. At least one of `on_response` or
-    /// `headers` must be present, otherwise compilation errors out so
-    /// a misconfigured transform fails loudly at config-load time
-    /// rather than silently no-op'ing every response.
+    /// `headers` is the whole surface and must be non-empty, otherwise
+    /// compilation errors out so a misconfigured transform fails loudly
+    /// at config-load time rather than silently no-op'ing every
+    /// response.
     ///
     /// Every expression is compiled here, once. Malformed CEL is a
-    /// config error naming the field or header it belongs to, so it
-    /// never reaches the response path (WOR-2179).
+    /// config error naming the header it belongs to, so it never
+    /// reaches the response path (WOR-2179).
     ///
-    /// An authored `on_request:` is refused; see the inline note below.
+    /// An authored `on_request:` or `on_response:` is refused; see the
+    /// inline notes below.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         // WOR-2319: `on_request:` was compiled here and then thrown
         // away, because there is nowhere to run it. Transforms in this
@@ -231,18 +230,35 @@ impl CelScriptTransform {
              run in. For CEL at request time use an `expression` policy to gate the request, a \
              rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it."
         );
+        // WOR-2362: `on_response:` (alias `expression:`) replaced the
+        // whole response body with the scalar the expression evaluated
+        // to. CEL decides, it does not produce: the transform could
+        // substitute a scalar for the entire payload and nothing else,
+        // no partial edit, no structure-aware change, no streaming.
+        // Every authored `type: cel` block in the tree uses `headers:`,
+        // so this was the alive-but-unused mirror of `on_request:`.
+        // Refuse rather than drop: `Config` below has no
+        // `deny_unknown_fields`, so removing the field alone would make
+        // an authored key silently ignored instead of merely inert.
+        for key in ["on_response", "expression"] {
+            anyhow::ensure!(
+                value.get(key).is_none(),
+                "cel transform `{key}:` was removed: it replaced the entire response body with \
+                 one scalar, which is producing output rather than deciding, and no config in \
+                 this repository authored it. To rewrite a response body use a `javascript`, \
+                 `lua_json`, or WASM transform, each of which can parse the body, edit part of \
+                 it, and re-emit. To set a response header from an expression, keep using this \
+                 transform's `headers:` rules."
+            );
+        }
         #[derive(Deserialize)]
         struct Config {
-            #[serde(default, alias = "expression")]
-            on_response: Option<String>,
             #[serde(default)]
             headers: Vec<CelHeaderRule>,
         }
         let cfg: Config = serde_json::from_value(value)?;
-        if cfg.on_response.is_none() && cfg.headers.is_empty() {
-            anyhow::bail!(
-                "cel transform requires `on_response` (or alias `expression`) or a non-empty `headers` array"
-            );
+        if cfg.headers.is_empty() {
+            anyhow::bail!("cel transform requires a non-empty `headers` array");
         }
         // Validate the deny-list at compile time so a misconfigured
         // transform cannot inject Set-Cookie via the scripting lane.
@@ -283,30 +299,11 @@ impl CelScriptTransform {
             };
             compiled_headers.push(compiled);
         }
-        let compiled_on_response = match cfg.on_response.as_deref() {
-            Some(src) => Some(CompiledCel::compile("transform `cel`: on_response", src)?),
-            None => None,
-        };
 
         Ok(Self {
-            on_response: cfg.on_response,
             headers: cfg.headers,
-            compiled_on_response,
             compiled_headers,
         })
-    }
-
-    /// Apply the response-time CEL expression to `body`.
-    ///
-    /// The standard `(body, content_type)` body-buffer signature is
-    /// used here for parity with the other transforms in this crate,
-    /// even though the CEL transform reads the response status +
-    /// headers via the `RequestContext` -> CEL bridge. Today the
-    /// status / headers come in via [`CelScriptTransform::apply_with_response`];
-    /// the simpler `apply` shim renders an empty `response.status` /
-    /// `response.headers`.
-    pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
-        self.apply_with_response(body, 0, &HeaderMap::new())
     }
 
     /// Evaluate the configured `headers` rules against the live
@@ -552,88 +549,10 @@ impl CelScriptTransform {
             }
         }
     }
-
-    /// Apply the response-time CEL expression with full response
-    /// context.
-    ///
-    /// The body-buffer call site that owns the live status + header
-    /// map calls this overload so `response.status` and
-    /// `response.headers` resolve to real values.
-    pub fn apply_with_response(
-        &self,
-        body: &mut BytesMut,
-        status: u16,
-        headers: &HeaderMap,
-    ) -> anyhow::Result<()> {
-        // When only `headers:` rules are configured the body-side
-        // expression is absent; nothing to do here. The header
-        // mutations are surfaced separately via [`evaluate_headers`].
-        let Some(expression) = self.compiled_on_response.as_ref() else {
-            return Ok(());
-        };
-
-        let ctx = build_response_eval_context(
-            body.as_ref(),
-            status,
-            headers,
-            &CelResponseRequestView::default(),
-        );
-
-        let result = match expression.eval(&ctx) {
-            Ok(v) => v,
-            Err(e) => {
-                // Runtime evaluation errors leave the body untouched.
-                // The proxy logs and continues so a key the response
-                // did not carry does not 500 an otherwise good
-                // response. A syntax error cannot reach here: the
-                // expression was compiled by `from_config`.
-                tracing::warn!(
-                    error = %e,
-                    expression = %expression.source(),
-                    "cel transform: expression evaluation failed; body unchanged",
-                );
-                return Ok(());
-            }
-        };
-
-        match result {
-            CelValue::String(s) => {
-                body.clear();
-                body.extend_from_slice(s.as_bytes());
-            }
-            CelValue::Int(i) => {
-                body.clear();
-                body.extend_from_slice(i.to_string().as_bytes());
-            }
-            CelValue::Float(f) => {
-                body.clear();
-                body.extend_from_slice(f.to_string().as_bytes());
-            }
-            CelValue::Bool(b) => {
-                body.clear();
-                body.extend_from_slice(b.to_string().as_bytes());
-            }
-            CelValue::Null => {
-                // Null leaves the body unchanged. Operators use this
-                // as the "no-op pass" sentinel when the expression
-                // wants to inspect the body without rewriting it.
-            }
-            CelValue::Map(_) | CelValue::List(_) => {
-                // Map / list returns are JSON-serialised so an
-                // expression like `{"echo": response.body}` produces a
-                // valid JSON document.
-                let json = cel_value_to_json(&result);
-                body.clear();
-                serde_json::to_writer(&mut body.writer(), &json)?;
-            }
-        }
-        Ok(())
-    }
 }
 
-/// Build the CEL evaluation context shared by both the body-rewriting
-/// expression (`on_response`) and the per-header value expressions
-/// (`headers[*].value_expr`).
+/// Build the CEL evaluation context the per-header value expressions
+/// (`headers[*].value_expr`) evaluate against.
 ///
 /// Stamps a `response` namespace with `body`, `status`, and `headers`
 /// onto the standard request-context. When request metadata is supplied,
@@ -711,23 +630,22 @@ fn cel_value_to_json(value: &CelValue) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    fn body(s: &str) -> BytesMut {
-        let mut b = BytesMut::new();
-        b.extend_from_slice(s.as_bytes());
-        b
-    }
-
     #[test]
-    fn from_config_requires_on_response_or_headers() {
-        // Missing both fields is a hard error.
+    fn from_config_requires_headers() {
+        // `headers:` is the whole surface now, so an empty transform
+        // is a hard error rather than a silent per-response no-op.
         let v = serde_json::json!({"type": "cel"});
-        assert!(CelScriptTransform::from_config(v).is_err());
+        let err = CelScriptTransform::from_config(v).expect_err("an empty cel transform is a bug");
+        assert!(
+            err.to_string().contains("headers"),
+            "must name the field: {err}"
+        );
     }
 
     #[test]
     fn from_config_accepts_headers_alone() {
-        // Day-6 Item 1: a transform that ONLY mutates headers (no
-        // body rewrite) is a valid configuration.
+        // Day-6 Item 1: a transform that mutates headers is now the
+        // only valid configuration.
         let v = serde_json::json!({
             "type": "cel",
             "headers": [
@@ -735,20 +653,7 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        assert!(t.on_response.is_none());
         assert_eq!(t.headers.len(), 1);
-    }
-
-    #[test]
-    fn from_config_accepts_expression_alias() {
-        // The `expression:` alias mirrors the policy block's CEL
-        // field name so operators have a consistent surface.
-        let v = serde_json::json!({
-            "type": "cel",
-            "expression": r#""hello""#,
-        });
-        let t = CelScriptTransform::from_config(v).unwrap();
-        assert_eq!(t.on_response.as_deref(), Some(r#""hello""#));
     }
 
     #[test]
@@ -757,7 +662,6 @@ mod tests {
         // for cookie injection.
         let v = serde_json::json!({
             "type": "cel",
-            "on_response": r#""ok""#,
             "headers": [
                 {"op": "set", "name": "Set-Cookie", "value_expr": r#""sid=abc""#},
             ],
@@ -1000,7 +904,7 @@ mod tests {
         let v = serde_json::json!({
             "type": "cel",
             "on_request": "not valid !!!",
-            "on_response": r#""ok""#,
+            "headers": [{"op": "set", "name": "x-foo", "value_expr": r#""bar""#}],
         });
         let err = CelScriptTransform::from_config(v).expect_err("still refused");
         let message = err.to_string();
@@ -1018,10 +922,85 @@ mod tests {
     fn omitting_on_request_compiles_cleanly() {
         let t = CelScriptTransform::from_config(serde_json::json!({
             "type": "cel",
-            "on_response": r#""ok""#,
+            "headers": [{"op": "set", "name": "x-foo", "value_expr": r#""bar""#}],
         }))
-        .expect("a response-only cel transform is still the normal case");
-        assert_eq!(t.on_response.as_deref(), Some(r#""ok""#));
+        .expect("a header-only cel transform is the normal case");
+        assert_eq!(t.headers.len(), 1);
+    }
+
+    // --- on_response: is removed and refused (WOR-2362) ---
+
+    #[test]
+    fn on_response_is_refused_at_config_compile_with_the_real_alternatives() {
+        let v = serde_json::json!({
+            "type": "cel",
+            "on_response": r#""rewritten""#,
+        });
+        let err = CelScriptTransform::from_config(v)
+            .expect_err("an authored on_response must fail config compilation, not rewrite bodies");
+        let message = err.to_string();
+        assert!(
+            message.contains("on_response"),
+            "must name the removed key: '{message}'"
+        );
+        for alternative in ["javascript", "lua_json", "headers"] {
+            assert!(
+                message.contains(alternative),
+                "must point at `{alternative}`: '{message}'"
+            );
+        }
+    }
+
+    #[test]
+    fn the_expression_alias_is_refused_too() {
+        // `expression:` was an alias for `on_response:`, so refusing
+        // one without the other would leave the same body-replacement
+        // path reachable under a second name.
+        let v = serde_json::json!({
+            "type": "cel",
+            "expression": r#""rewritten""#,
+        });
+        let err = CelScriptTransform::from_config(v)
+            .expect_err("the alias reaches the same removed path and must be refused");
+        assert!(
+            err.to_string().contains("expression"),
+            "must name the key the operator actually wrote: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_on_response_is_refused_for_being_on_response_not_for_parsing() {
+        // The removal has to win over the CEL parse error, otherwise
+        // an operator fixes the syntax and lands right back here.
+        let v = serde_json::json!({
+            "type": "cel",
+            "on_response": "this is not a valid expression !!!",
+        });
+        let err = CelScriptTransform::from_config(v).expect_err("still refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("was removed"),
+            "the removal must win over the parse error: '{message}'"
+        );
+        assert!(
+            !message.contains("this is not a valid expression !!!"),
+            "no point quoting an expression that has nowhere to run: '{message}'"
+        );
+    }
+
+    #[test]
+    fn on_response_is_refused_even_alongside_valid_header_rules() {
+        // A transform carrying both must not compile the half that
+        // works and quietly drop the half that does not.
+        let v = serde_json::json!({
+            "type": "cel",
+            "on_response": r#""rewritten""#,
+            "headers": [{"op": "set", "name": "x-foo", "value_expr": r#""bar""#}],
+        });
+        assert!(
+            CelScriptTransform::from_config(v).is_err(),
+            "a valid `headers:` block must not license a removed `on_response:`"
+        );
     }
 
     #[test]
@@ -1029,26 +1008,33 @@ mod tests {
         // WOR-2164: the response path must not parse CEL. The engine
         // stamps `sbproxy_script_compile_total{engine="cel"}` on every
         // parse, so the counter is the arbiter.
-        let before = cel_compile_count();
+        //
+        // That counter is process-global and every other test in this
+        // binary that compiles CEL bumps it concurrently, so the
+        // assertion is a bound rather than an equality. The bound is
+        // still decisive: a parse-per-response regression would add two
+        // per iteration, 400 across the loop below, while the handful
+        // of CEL-compiling tests running alongside can only add a few.
+        const EVALUATIONS: u64 = 200;
         let t = CelScriptTransform::from_config(serde_json::json!({
             "type": "cel",
-            "on_response": r#""rewritten""#,
             "headers": [
                 {"op": "set", "name": "x-status", "value_expr": "string(response.status)"},
+                {"op": "set", "name": "x-fixed", "value_expr": r#""constant""#},
             ],
         }))
         .unwrap();
         let after_load = cel_compile_count();
-        assert_eq!(after_load - before, 2, "two expressions, two parses");
 
-        for _ in 0..25 {
-            let mut b = body("original");
-            t.apply_with_response(&mut b, 200, &HeaderMap::new())
-                .unwrap();
+        for _ in 0..EVALUATIONS {
             t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
         }
 
-        assert_eq!(cel_compile_count(), after_load, "no parse per response");
+        let added = cel_compile_count() - after_load;
+        assert!(
+            added < EVALUATIONS,
+            "evaluation must not parse: {added} compiles across {EVALUATIONS} evaluations"
+        );
     }
 
     /// Total CEL compiles recorded by the engine so far, across every
@@ -1146,71 +1132,74 @@ mod tests {
     }
 
     #[test]
-    fn headers_only_transform_apply_is_a_noop_on_body() {
-        // A transform that only mutates headers must leave the body
-        // untouched when `apply_with_response` is invoked.
+    fn the_transform_never_touches_the_body_through_the_dispatch_arm() {
+        // WOR-2362: the body-buffer signature the enum dispatches
+        // through must be a no-op for this transform. If a body path
+        // ever comes back, this is the test that fails.
         let v = serde_json::json!({
             "type": "cel",
             "headers": [{"op": "set", "name": "x-foo", "value_expr": r#""bar""#}],
         });
-        let t = CelScriptTransform::from_config(v).unwrap();
-        let mut b = body("untouched");
-        t.apply_with_response(&mut b, 200, &HeaderMap::new())
-            .unwrap();
+        let t = crate::transform::Transform::CelScript(CelScriptTransform::from_config(v).unwrap());
+        let mut b = bytes::BytesMut::from(&b"untouched"[..]);
+        t.apply(&mut b, None).unwrap();
         assert_eq!(std::str::from_utf8(&b).unwrap(), "untouched");
     }
 
     #[test]
-    fn body_is_replaced_with_a_simple_string_literal() {
+    fn a_header_rule_can_concatenate_response_status_into_a_string() {
         let v = serde_json::json!({
             "type": "cel",
-            "on_response": r#""rewritten""#,
+            "headers": [
+                {"op": "set", "name": "x-status", "value_expr": r#""status=" + string(response.status)"#},
+            ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mut b = body("original-body");
-        t.apply(&mut b).unwrap();
-        assert_eq!(std::str::from_utf8(&b).unwrap(), "rewritten");
+        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        assert_eq!(
+            mutations,
+            vec![CelHeaderMutation::Set(
+                "x-status".to_string(),
+                "status=200".to_string()
+            )]
+        );
     }
 
     #[test]
-    fn body_can_concatenate_response_status_into_a_string() {
+    fn a_header_rule_can_read_response_headers_through_the_namespace() {
         let v = serde_json::json!({
             "type": "cel",
-            "on_response": r#""status=" + string(response.status)"#,
+            "headers": [
+                {"op": "set", "name": "x-echo", "value_expr": r#"response.headers["x-custom"]"#},
+            ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mut b = body("");
-        t.apply_with_response(&mut b, 200, &HeaderMap::new())
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&b).unwrap(), "status=200");
-    }
-
-    #[test]
-    fn body_can_read_response_headers_through_the_namespace() {
-        let v = serde_json::json!({
-            "type": "cel",
-            "on_response": r#"response.headers["x-custom"]"#,
-        });
-        let t = CelScriptTransform::from_config(v).unwrap();
-        let mut b = body("");
         let mut h = HeaderMap::new();
         h.insert("x-custom", "hello-from-header".parse().unwrap());
-        t.apply_with_response(&mut b, 200, &h).unwrap();
-        assert_eq!(std::str::from_utf8(&b).unwrap(), "hello-from-header");
+        let mutations = t.evaluate_headers(b"", 200, &h).unwrap();
+        assert_eq!(
+            mutations,
+            vec![CelHeaderMutation::Set(
+                "x-echo".to_string(),
+                "hello-from-header".to_string()
+            )]
+        );
     }
 
     #[test]
-    fn from_config_rejects_malformed_on_response() {
-        // WOR-2179: a garbage body expression used to warn once per
-        // response and pass the body through, so the transform the
-        // operator wrote never ran. It is a config error now.
+    fn from_config_rejects_malformed_header_expressions() {
+        // WOR-2179: a garbage expression used to warn once per
+        // response, so the transform the operator wrote never ran. It
+        // is a config error now.
         let v = serde_json::json!({
             "type": "cel",
-            "on_response": "this is not a valid expression !!!",
+            "headers": [
+                {"op": "set", "name": "x-foo", "value_expr": "this is not a valid expression !!!"},
+            ],
         });
         let err = CelScriptTransform::from_config(v).expect_err("malformed CEL must not compile");
         let msg = err.to_string();
-        assert!(msg.contains("on_response"), "must name the field: {msg}");
+        assert!(msg.contains("x-foo"), "must name the header: {msg}");
         assert!(
             msg.contains("this is not a valid expression !!!"),
             "must quote the expression: {msg}"
@@ -1218,33 +1207,44 @@ mod tests {
     }
 
     #[test]
-    fn runtime_evaluation_error_leaves_body_untouched() {
+    fn runtime_evaluation_error_skips_only_the_failing_rule() {
         // The failure that is left: an expression that parses but
         // cannot resolve against this response. Documented posture:
-        // warn and pass the body through unchanged rather than 500 a
-        // response that is already good.
+        // warn, skip that rule, keep the rest of the chain.
         let v = serde_json::json!({
             "type": "cel",
-            "on_response": r#"response.headers["x-absent"]"#,
+            "headers": [
+                {"op": "set", "name": "x-absent", "value_expr": r#"response.headers["x-absent"]"#},
+                {"op": "set", "name": "x-fine", "value_expr": r#""still-here""#},
+            ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mut b = body("untouched");
-        t.apply(&mut b).unwrap();
-        assert_eq!(std::str::from_utf8(&b).unwrap(), "untouched");
+        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        assert_eq!(
+            mutations,
+            vec![CelHeaderMutation::Set(
+                "x-fine".to_string(),
+                "still-here".to_string()
+            )],
+            "the failing rule is skipped and the healthy one still fires"
+        );
     }
 
     #[test]
-    fn body_can_be_replaced_with_a_serialised_map() {
+    fn a_header_rule_returning_a_map_is_serialised_as_json() {
         let v = serde_json::json!({
             "type": "cel",
-            "on_response": r#"{"echo": response.body, "code": response.status}"#,
+            "headers": [
+                {"op": "set", "name": "x-detail", "value_expr": r#"{"code": response.status}"#},
+            ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mut b = body("payload");
-        t.apply_with_response(&mut b, 418, &HeaderMap::new())
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(parsed["echo"], "payload");
+        let mutations = t.evaluate_headers(b"", 418, &HeaderMap::new()).unwrap();
+        let CelHeaderMutation::Set(name, value) = &mutations[0] else {
+            panic!("expected a Set mutation, got {mutations:?}");
+        };
+        assert_eq!(name, "x-detail");
+        let parsed: serde_json::Value = serde_json::from_str(value).unwrap();
         assert_eq!(parsed["code"], 418);
     }
 }

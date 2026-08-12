@@ -26,6 +26,10 @@ const WASM_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub(crate) struct EnvelopeWasmProgram {
     runtime: Arc<WasmRuntime>,
+    /// Bundle the module came from. Used to attribute captured guest
+    /// stderr (WOR-2364 §1); one runtime is shared by every hook in a
+    /// bundle, so the identity has to travel with the call.
+    bundle_name: Arc<str>,
     hook_kind: &'static str,
     type_name: Arc<str>,
     config: Arc<Value>,
@@ -49,6 +53,7 @@ impl std::fmt::Debug for EnvelopeWasmProgram {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EnvelopeWasmProgram")
+            .field("bundle_name", &self.bundle_name)
             .field("hook_kind", &self.hook_kind)
             .field("type_name", &self.type_name)
             .field(
@@ -94,6 +99,7 @@ impl EnvelopeWasmProgram {
     fn for_test_with_budget(runtime: Arc<WasmRuntime>, budget: std::time::Duration) -> Self {
         Self {
             runtime,
+            bundle_name: Arc::from("test-bundle"),
             hook_kind: "policy",
             type_name: Arc::from("test"),
             config: Arc::new(json!({})),
@@ -345,9 +351,15 @@ fn wasm_worker(receiver: Arc<Mutex<mpsc::Receiver<WasmJob>>>) {
                 } else {
                     let execution = Arc::clone(&job.invocation.execution);
                     job.program.mark_execution_started();
-                    job.program
-                        .runtime
-                        .execute_bounded_until(&job.input, execution)
+                    job.program.runtime.execute_bounded_until(
+                        &job.input,
+                        execution,
+                        crate::wasm::WasmGuestIdentity {
+                            bundle: &job.program.bundle_name,
+                            hook_kind: job.program.hook_kind,
+                            type_name: &job.program.type_name,
+                        },
+                    )
                 }
             }
             Some(reason) => Err(reason),
@@ -426,6 +438,7 @@ pub(crate) fn prepare_wasm_program(
         type_name.clone(),
         EnvelopeWasmProgram {
             runtime: Arc::clone(runtime),
+            bundle_name: Arc::from(hook.manifest().name.as_str()),
             hook_kind: envelope::hook_kind_label(expected_kind),
             type_name: Arc::from(type_name),
             config: Arc::new(config),
@@ -933,6 +946,36 @@ mod tests {
         let expected = br#"{"version":"sbproxy-envelope/v1","decision":"allow"}"#;
         assert_eq!(runtime.execute_bounded(b"{}").unwrap(), expected);
         assert_eq!(runtime.execute_bounded(b"{}").unwrap(), expected);
+    }
+
+    #[test]
+    fn envelope_wasm_captures_guest_stderr_instead_of_sinking_it() {
+        // WOR-2364 §1: the envelope path handed the guest a
+        // `SinkOutputStream`, so a hook that refused a request could
+        // not say why. The legacy module path kept its diagnostics the
+        // whole time, which made the bundle path, the one operators
+        // actually author against, the one that dropped them.
+        let runtime = runtime("stderr-diagnostic.wasm", limits());
+        let output = runtime.execute_bounded(b"{}").unwrap();
+        assert_eq!(
+            output, br#"{"version":"sbproxy-envelope/v1","decision":"release"}"#,
+            "the decision itself must be unaffected by capturing stderr"
+        );
+        assert_eq!(
+            runtime.last_guest_stderr_lines(),
+            2,
+            "both diagnostic lines the guest wrote must reach the host"
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_reports_no_stderr_for_a_silent_guest() {
+        // The counter has to distinguish "nothing written" from
+        // "written and dropped", otherwise it cannot be used to tell an
+        // operator whether the guest said anything at all.
+        let runtime = runtime("fresh-global.wasm", limits());
+        runtime.execute_bounded(b"{}").unwrap();
+        assert_eq!(runtime.last_guest_stderr_lines(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

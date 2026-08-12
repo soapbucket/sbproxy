@@ -108,8 +108,8 @@ back:
 ```yaml
 transforms:
   - type: cel
-    response_headers:
-      x-ja4: request.tls.ja4
+    headers:
+      - { op: set, name: x-ja4, value_expr: "request.tls.ja4" }
 ```
 
 Then send one request from the client you want to catalogue and record

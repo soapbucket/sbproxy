@@ -255,7 +255,12 @@ impl Transform {
             // They are no-ops here so the YAML schema accepts them
             // and the chain compiles end-to-end.
             Self::CitationBlock(_) | Self::JsonEnvelope(_) | Self::A2aAgentCardRewrite(_) => Ok(()),
-            Self::CelScript(t) => t.apply(body),
+            // WOR-2362: the CEL transform produces header mutations, not
+            // a body. Its `on_response:` body-replacement path is
+            // refused at config compile, so there is nothing for the
+            // body-buffer signature to do here. Header rules are
+            // evaluated by the response-filter wiring in `sbproxy-core`.
+            Self::CelScript(_) => Ok(()),
             Self::Noop => Ok(()),
             Self::Plugin(handler) => dispatch_plugin(handler.handler(), body, content_type),
         }
