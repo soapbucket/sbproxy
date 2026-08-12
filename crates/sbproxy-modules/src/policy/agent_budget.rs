@@ -43,7 +43,7 @@
 //!
 //! Ten replicas holding ten local buckets enforce every configured cap
 //! ten times over, so `requests_per_minute` has the same L2 tier
-//! [`super::rate_limit::RateLimitPolicy`] already carries. Attach a
+//! [`crate::policy::rate_limit::RateLimitPolicy`] already carries. Attach a
 //! shared store with [`AgentBudgetPolicy::with_store`] or
 //! [`AgentBudgetPolicy::with_async_store`] and the per-minute cap is
 //! decided by a fixed-window counter every replica increments, so the
@@ -217,7 +217,7 @@ impl AgentBudgetExceedReason {
 
 /// Per-`agent_id` token bucket for the `requests_per_minute` knob.
 ///
-/// Mirrors the math used by [`super::rate_limit::RateLimitPolicy`] so
+/// Mirrors the math used by [`crate::policy::rate_limit::RateLimitPolicy`] so
 /// the two policies have the same admission semantics modulo the
 /// keying strategy.
 #[derive(Debug, Clone)]
@@ -652,7 +652,7 @@ impl AgentBudgetPolicy {
     /// bucket, so every replica spends from one allowance. This is a
     /// different algorithm from the local bucket: it does not refill
     /// smoothly, it steps at the window boundary, which is the same
-    /// trade [`super::rate_limit::RateLimitPolicy`] makes on its own L2
+    /// trade [`crate::policy::rate_limit::RateLimitPolicy`] makes on its own L2
     /// path.
     ///
     /// With nothing attached, or with no `requests_per_minute` to
