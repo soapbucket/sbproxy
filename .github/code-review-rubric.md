@@ -6,6 +6,9 @@ The checklist an automated reviewer runs against a branch before it
 becomes a PR, and the shape its output takes so the result can be pasted
 into the PR body as a note.
 
+Nine categories: security, concurrency, logging, metrics, correctness,
+code smell, Rust practices, tests, and docs.
+
 This exists because the mechanical gates in `CLAUDE.md` answer "does it
 compile, lint, and pass" and cannot answer "is this going to be a
 problem in six months". Clippy does not know that a `Mutex` guard held
@@ -194,6 +197,49 @@ past capacity" is.
   process-wide counter passes alone and fails under a parallel runner.
 - **Fixtures match the shipped surface.** A test config that no operator
   could write proves nothing about the config operators do write.
+
+## 9. Docs and examples
+
+The category that gets skipped because it looks cosmetic. It is not: a
+doc is the interface most operators actually use, and a wrong one costs
+more than missing code because it is trusted.
+
+- **Does the doc match the code, or the intent?** A number, default,
+  limit, or budget stated in prose and separately defined in code will
+  drift, and the prose is what an operator plans against. Check the
+  constant, do not take the sentence's word for it. This review found
+  `observability.md` and a rustdoc both claiming a 1000-value
+  cardinality budget for a label the limiter caps at 200.
+- **Does a config example actually compile?** Examples in `docs/` are
+  not swept by the `validate_examples` test, which only covers
+  `examples/`. A doc example using a key that has never existed will sit
+  there indefinitely. This review found a `type: cel` block in
+  `headless-detection.md` using a `response_headers:` key with no
+  implementation, anywhere, ever.
+- **Did a change turn a known gap into a promise?** The most expensive
+  doc bug in this class. Extending a doc to say a feature "works on both
+  paths" when one path is a no-op in release builds converts an
+  acknowledged limitation into a support ticket. If the code has a
+  caveat, the doc states the caveat.
+- **Is the doc's claim reachable by the reader?** A capability described
+  without the config that enables it, or described at a scope the config
+  does not offer, reads as shipped.
+- **Removed and refused keys are documented as such**, in
+  `config-stability.md`, with what to use instead. A key that stops
+  working with no entry is indistinguishable from a bug.
+- **Generated docs are regenerated, not hand-edited.** For anything with
+  a generator (`metrics-stability.md`, `llms-full.txt`), a hand edit
+  passes review and fails the drift guard, or worse, passes both and
+  goes stale silently.
+- **The dated header is updated** when the content changes, since it is
+  the only signal a reader has about staleness.
+- **US English, no em-dashes**, per the workspace convention. Fix the
+  source string for anything generated rather than the generated page.
+
+Worth stating plainly: a doc correction found while reviewing unrelated
+code is worth making and worth calling out in the PR, not silently
+folding in. The next person to read that page should be able to see when
+it was last true.
 
 ## Output format
 
