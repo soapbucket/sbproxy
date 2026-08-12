@@ -4509,6 +4509,56 @@ pub struct ResponseCacheConfig {
     /// startup failure naming this origin.
     #[serde(default)]
     pub encryption: Option<OriginCacheEncryptionConfig>,
+
+    /// Operator-authored `cache.key` decision event.
+    ///
+    /// Runs on the request, before the lookup, because a key has to
+    /// exist before anything can be looked up under it. Returns the
+    /// dimensions to fold into the key, or declines and leaves `vary:`
+    /// in charge.
+    ///
+    /// It can only **add** dimensions. The workspace, hostname, method,
+    /// and path segments are stamped by the host on every key whatever
+    /// the event returns, so a policy can narrow a key and can never
+    /// widen one past its own tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_event: Option<DecisionScriptConfig>,
+
+    /// Operator-authored `cache.admit` decision event.
+    ///
+    /// Runs on the response, after the body is buffered, because
+    /// whether something is worth storing depends on status, size, and
+    /// content, none of which exist at request time. Returns `store`
+    /// and an optional `ttl_secs`, or declines and leaves
+    /// `cacheable_status` and `ttl_secs` in charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admit_event: Option<DecisionScriptConfig>,
+}
+
+/// An inline script answering one decision event.
+///
+/// Deliberately the same shape as [`CustomLogFieldConfig`]'s `source` +
+/// `engine` pair rather than a second mechanism: one surface with the
+/// engine as an operator choice is the pattern already shipping, and
+/// generalizing it is the point of the decision-event work.
+///
+/// The accepted engines are narrower than `custom_fields`, and the two
+/// refusals say why rather than leaving it to be discovered:
+///
+/// * `wasm`, because a compiled module is not inline source. A WASM
+///   hook answers these events through the extension-bundle registry.
+/// * `cel`, because these events return a **document** and CEL
+///   evaluates to one scalar. Supporting it would mean a token grammar
+///   for packing a document into a string, which is what
+///   `route_to:gpt-4o-mini` already did once.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionScriptConfig {
+    /// Engine for `source`. One of `lua`, `js`.
+    pub engine: String,
+    /// Script source, evaluated against the event's input context. Its
+    /// result is the event's output document.
+    pub source: String,
 }
 
 /// Query-string normalization policy applied when computing the cache key.
@@ -4550,6 +4600,8 @@ impl Default for ResponseCacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            key_event: None,
+            admit_event: None,
             ttl_secs: default_response_cache_ttl(),
             cacheable_methods: Vec::new(),
             cacheable_status: Vec::new(),

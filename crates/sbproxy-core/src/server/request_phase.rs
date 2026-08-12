@@ -524,6 +524,106 @@ async fn drain_body_for_signature_verification(
 
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
+/// Run the origin's `cache.key` event, if it has one.
+///
+/// `None` means the static `vary:` alone decides the key, which is what
+/// a deployment without the event already does. A faulted engine and a
+/// malformed document both land there too, and are separated on the
+/// metric rather than in the return value: falling back to a *narrower*
+/// key is the safe direction, since it can only cause a miss and never a
+/// cross-tenant hit.
+fn evaluate_cache_key(
+    ctx: &crate::context::RequestContext,
+    req: &pingora_http::RequestHeader,
+    cache_cfg: &sbproxy_config::ResponseCacheConfig,
+) -> Option<sbproxy_cache::cache_event::CacheKeyPlan> {
+    use sbproxy_cache::cache_event::{decode_cache_key, CacheDecision};
+    use sbproxy_observe::decision::{
+        record_decision, record_decision_duration, record_decision_fail_open, DecisionEvent,
+        DecisionOutcome,
+    };
+
+    let script = cache_cfg.key_event.as_ref()?;
+    let pipeline = ctx.pipeline.clone();
+    let origin = ctx
+        .origin_idx
+        .and_then(|idx| pipeline.config.origins.get(idx))
+        .map_or("", |origin| origin.origin_id.as_str());
+    let engine = crate::decision_script::engine_label(script);
+    let started = std::time::Instant::now();
+
+    let context = serde_json::json!({
+        "request": {
+            "method": req.method.as_str(),
+            "path": req.uri.path(),
+            "query": req.uri.query().unwrap_or(""),
+            "host": ctx.hostname.as_str(),
+        },
+        "tenant": ctx.tenant_id.as_str(),
+        "origin": origin,
+    });
+
+    let plan = match crate::decision_script::evaluate(script, &context) {
+        None => {
+            record_decision_fail_open(DecisionEvent::CacheKey, engine, origin, &ctx.tenant_id);
+            record_decision(
+                DecisionEvent::CacheKey,
+                engine,
+                DecisionOutcome::Error,
+                origin,
+                &ctx.tenant_id,
+            );
+            None
+        }
+        Some(document) => match decode_cache_key(&document) {
+            Ok(CacheDecision::Decline) => {
+                record_decision(
+                    DecisionEvent::CacheKey,
+                    engine,
+                    DecisionOutcome::Decline,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                None
+            }
+            Ok(CacheDecision::Plan(plan)) => {
+                record_decision(
+                    DecisionEvent::CacheKey,
+                    engine,
+                    DecisionOutcome::Allow,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                Some(plan)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "sbproxy::decision",
+                    event = "cache.key",
+                    error = %error,
+                    "cache.key returned a document that could not be decoded"
+                );
+                record_decision_fail_open(DecisionEvent::CacheKey, engine, origin, &ctx.tenant_id);
+                record_decision(
+                    DecisionEvent::CacheKey,
+                    engine,
+                    DecisionOutcome::Error,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                None
+            }
+        },
+    };
+    record_decision_duration(
+        DecisionEvent::CacheKey,
+        engine,
+        origin,
+        started.elapsed().as_secs_f64(),
+    );
+    plan
+}
+
 pub(super) async fn request_filter(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -3840,12 +3940,29 @@ pub(super) async fn request_filter(
 
             if method_ok {
                 ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Miss);
-                let key = build_response_cache_key(
+                // WOR-2367: `cache.key`. Runs before the lookup because a
+                // key has to exist before anything can be looked up under
+                // it, which is why this is a separate event from
+                // `cache.admit` rather than one cache policy.
+                let key_plan = evaluate_cache_key(ctx, session.req_header(), cache_cfg);
+                let key = crate::server::build_response_cache_key_with_plan(
                     "",
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
+                    key_plan.as_ref(),
                 );
+                // `skip_lookup` goes upstream for *this* request while
+                // leaving the response eligible for storage, which is a
+                // different thing from refusing to cache and is why the
+                // two are separate fields.
+                //
+                // Expressed as a flag rather than an early return on
+                // purpose: `request_filter` still has to run mirroring,
+                // `on_request` callbacks, forward rules, and
+                // `handle_action` below, and returning here would
+                // silently skip every one of them.
+                let skip_lookup = key_plan.as_ref().is_some_and(|plan| plan.skip_lookup);
 
                 // Cache lookups are synchronous against the trait, but the
                 // Redis backend does blocking TCP I/O under the hood. Use
@@ -3853,15 +3970,23 @@ pub(super) async fn request_filter(
                 // We always pull the entry "including expired" so the SWR
                 // window can be evaluated even when TTL is exceeded; the
                 // freshness check happens on this side.
-                let lookup_store = cache_store.clone();
-                let lookup_key = key.clone();
-                let hit = tokio::task::spawn_blocking(move || {
-                    lookup_store.get_including_expired(&lookup_key)
-                })
-                .await
-                .map_err(|e| {
-                    Error::because(ErrorType::InternalError, "cache lookup join failed", e)
-                })?;
+                let hit = if skip_lookup {
+                    // The key is still computed and still stamped on the
+                    // context, so the response written back lands where a
+                    // later request will find it. Only the read is
+                    // skipped.
+                    Ok(None)
+                } else {
+                    let lookup_store = cache_store.clone();
+                    let lookup_key = key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        lookup_store.get_including_expired(&lookup_key)
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "cache lookup join failed", e)
+                    })?
+                };
 
                 match hit {
                     Ok(Some(entry)) => {

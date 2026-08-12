@@ -1001,6 +1001,146 @@ fn cap_idle_for_service_discovery(
     }
 }
 
+/// Run the origin's `cache.admit` event, or return the static default.
+///
+/// The returned plan is always usable: a declined event, an absent one,
+/// and a faulted one all yield `store: true` with no TTL override, which
+/// is exactly what a deployment without the event does. The three are
+/// distinguished on the metric rather than in the return value, because
+/// the caller's behavior is identical and only the operator's
+/// interpretation differs.
+fn evaluate_cache_admit(
+    ctx: &crate::context::RequestContext,
+    status: u16,
+    headers: &[(String, String)],
+    body_len: usize,
+) -> sbproxy_cache::cache_event::CacheAdmitPlan {
+    use sbproxy_cache::cache_event::{CacheAdmitPlan, CacheDecision};
+    use sbproxy_observe::decision::{
+        record_decision, record_decision_fail_open, DecisionEvent, DecisionOutcome,
+    };
+
+    let default = CacheAdmitPlan {
+        store: true,
+        ttl_secs: None,
+        reason: String::new(),
+    };
+
+    let pipeline = ctx.pipeline.clone();
+    let Some(script) = ctx
+        .origin_idx
+        .and_then(|idx| pipeline.config.origins.get(idx))
+        .and_then(|origin| origin.response_cache.as_ref())
+        .and_then(|cache| cache.admit_event.as_ref())
+    else {
+        return default;
+    };
+
+    let origin = ctx
+        .origin_idx
+        .and_then(|idx| pipeline.config.origins.get(idx))
+        .map_or("", |origin| origin.origin_id.as_str());
+    let engine = crate::decision_script::engine_label(script);
+    let started = std::time::Instant::now();
+
+    // The event's input context. Everything it needs is assembled
+    // before it runs, so the event does no I/O and every engine stays
+    // eligible.
+    let context = serde_json::json!({
+        "response": {
+            "status": status,
+            "body_bytes": body_len,
+            "headers": headers
+                .iter()
+                .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+                .collect::<serde_json::Map<_, _>>(),
+        },
+        "request": {
+            "path": ctx.request_path.as_str(),
+            "host": ctx.hostname.as_str(),
+        },
+        "tenant": ctx.tenant_id.as_str(),
+        "origin": origin,
+    });
+
+    let outcome = crate::decision_script::evaluate(script, &context);
+    let plan = match outcome {
+        None => {
+            // The engine faulted. The request proceeded and the response
+            // is still stored, so this is a fail-open rather than an
+            // error outcome: the decision was never made.
+            record_decision_fail_open(DecisionEvent::CacheAdmit, engine, origin, &ctx.tenant_id);
+            record_decision(
+                DecisionEvent::CacheAdmit,
+                engine,
+                DecisionOutcome::Error,
+                origin,
+                &ctx.tenant_id,
+            );
+            default
+        }
+        Some(document) => match sbproxy_cache::cache_event::decode_cache_admit(&document) {
+            Ok(CacheDecision::Decline) => {
+                record_decision(
+                    DecisionEvent::CacheAdmit,
+                    engine,
+                    DecisionOutcome::Decline,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                default
+            }
+            Ok(CacheDecision::Plan(plan)) => {
+                record_decision(
+                    DecisionEvent::CacheAdmit,
+                    engine,
+                    if plan.store {
+                        DecisionOutcome::Allow
+                    } else {
+                        DecisionOutcome::Deny
+                    },
+                    origin,
+                    &ctx.tenant_id,
+                );
+                plan
+            }
+            Err(error) => {
+                // A malformed document is the script's bug, not the
+                // engine's. Same fallback, different signal, because the
+                // fixes are different: one is a broken runtime and the
+                // other is a broken rule.
+                tracing::warn!(
+                    target: "sbproxy::decision",
+                    event = "cache.admit",
+                    error = %error,
+                    "cache.admit returned a document that could not be decoded"
+                );
+                record_decision_fail_open(
+                    DecisionEvent::CacheAdmit,
+                    engine,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                record_decision(
+                    DecisionEvent::CacheAdmit,
+                    engine,
+                    DecisionOutcome::Error,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                default
+            }
+        },
+    };
+    sbproxy_observe::decision::record_decision_duration(
+        DecisionEvent::CacheAdmit,
+        engine,
+        origin,
+        started.elapsed().as_secs_f64(),
+    );
+    plan
+}
+
 #[async_trait]
 impl ProxyHttp for SbProxy {
     type CTX = RequestContext;
@@ -5014,7 +5154,16 @@ impl ProxyHttp for SbProxy {
                 if let (Some(key), Some(body_buf), Some(status), Some(headers)) =
                     (key, body_buf, status, headers)
                 {
-                    let ttl = {
+                    // WOR-2367: `cache.admit`. This is the earliest point
+                    // where the question the event answers is answerable:
+                    // whether a response is worth storing depends on its
+                    // status, size, and content, and the body is only
+                    // complete here.
+                    //
+                    // Declining leaves `ttl_secs` and the static
+                    // `cacheable_status` gate in charge, which is what a
+                    // deployment without the event already does.
+                    let static_ttl = {
                         let pipeline_guard = ctx.pipeline.clone();
                         ctx.origin_idx
                             .and_then(|idx| pipeline_guard.config.origins.get(idx))
@@ -5022,6 +5171,8 @@ impl ProxyHttp for SbProxy {
                             .map(|c| c.ttl_secs)
                             .unwrap_or(300)
                     };
+                    let admit = evaluate_cache_admit(ctx, status, &headers, body_buf.len());
+                    let ttl = admit.ttl_secs.unwrap_or(static_ttl);
                     let pipeline_for_write = ctx.pipeline.clone();
                     // The write-back must seal under the same origin the
                     // lookup opened under, so resolve the per-origin
@@ -5031,9 +5182,14 @@ impl ProxyHttp for SbProxy {
                         .and_then(|idx| pipeline_for_write.config.origins.get(idx))
                         .map(|o| o.origin_id.to_string())
                         .unwrap_or_default();
+                    // `admit.store` gates the write and nothing else.
+                    // Returning early here would skip the idempotency
+                    // capture further down this same filter, so the event
+                    // refuses to *store* without refusing to serve.
                     if let Some(cache_store) = pipeline_for_write
                         .cache_store_for(&write_origin_id)
                         .cloned()
+                        .filter(|_| admit.store)
                     {
                         let entry = sbproxy_cache::CachedResponse {
                             generation: sbproxy_cache::new_cache_generation(),

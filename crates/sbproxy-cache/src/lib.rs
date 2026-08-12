@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod at_rest;
+pub mod cache_event;
 pub mod reserve;
 pub mod response;
 pub mod store;

@@ -117,6 +117,8 @@ pub mod config_source;
 pub mod config_subscriber;
 pub mod content_capture;
 pub mod context;
+/// Running an operator-authored script for one decision event.
+pub(crate) mod decision_script;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.
 pub mod doctor;

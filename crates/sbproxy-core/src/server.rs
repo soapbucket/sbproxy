@@ -1105,11 +1105,47 @@ fn build_response_cache_key(
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
 ) -> String {
+    build_response_cache_key_with_plan(workspace, hostname, req, cfg, None)
+}
+
+/// As [`build_response_cache_key`], with an optional `cache.key` plan
+/// folded in.
+///
+/// The plan reaches **only** the vary fingerprint, the last segment of
+/// `<workspace>:<hostname>:<method>:<path>:<query>:<vary>`. Every
+/// preceding segment is stamped by the host from values the request
+/// resolved to, whatever the event returns.
+///
+/// That is the whole poisoning defense, and it is structural rather than
+/// advisory: a key policy that omits a dimension it should have included
+/// serves one tenant's response to another, so there is deliberately no
+/// document a policy can return that reaches the workspace prefix. It
+/// can narrow a key by adding dimensions; it cannot widen one.
+pub(crate) fn build_response_cache_key_with_plan(
+    workspace: &str,
+    hostname: &str,
+    req: &pingora_http::RequestHeader,
+    cfg: &sbproxy_config::ResponseCacheConfig,
+    plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
+) -> String {
     let method = req.method.as_str();
     let path = req.uri.path();
     let query = req.uri.query();
     let mode = query_mode_from_config(&cfg.query_normalize);
-    let vary = collect_vary_headers(req, &cfg.vary);
+    let mut vary = collect_vary_headers(req, &cfg.vary);
+    if let Some(plan) = plan {
+        // Added to the configured `vary:`, never replacing it: an
+        // operator's static dimensions stay in the key whatever the
+        // event says.
+        vary.extend(plan.fold_into_vary(|name| {
+            req.headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        }));
+        vary.sort_unstable();
+        vary.dedup();
+    }
     sbproxy_cache::compute_cache_key(workspace, hostname, method, path, query, &mode, &vary)
 }
 

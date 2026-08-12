@@ -902,6 +902,52 @@ fn migrate_features_to_extensions(yaml: &str) -> Result<String> {
     serde_yaml::to_string(&root).context("failed to re-serialise YAML during migration")
 }
 
+/// Validate one `cache.key` / `cache.admit` decision script.
+///
+/// Same `source` + `engine` shape as `custom_fields`, deliberately: one
+/// surface with the engine as an operator choice rather than a second
+/// mechanism with its own rules. The accepted set is narrower, because
+/// these events return documents and `custom_fields` returns a scalar.
+///
+/// Refusing at load rather than per request matters more here than for a
+/// log field: a cache event that fails every evaluation degrades
+/// silently to the static config, and the only symptom is a hit rate
+/// that never improves.
+pub(crate) fn validate_decision_script(
+    what: &str,
+    script: &crate::types::DecisionScriptConfig,
+) -> anyhow::Result<()> {
+    if script.source.trim().is_empty() {
+        anyhow::bail!("{what}: `source` is empty");
+    }
+    match script.engine.as_str() {
+        "lua" | "js" => Ok(()),
+        // CEL is refused here on the design's own terms rather than by
+        // omission. These events return a *document*: `cache.key` a list
+        // of dimensions, `cache.admit` a `{store, ttl_secs, reason}`
+        // object. CEL evaluates to one scalar, so supporting it would
+        // mean inventing a token grammar to pack a document into a
+        // string, which is exactly the mistake `route_to:gpt-4o-mini`
+        // already made once and this epic exists to stop repeating.
+        //
+        // CEL keeps every surface where a scalar *is* the answer: policy
+        // expressions, rate-limit and WAF keys, custom log fields, and
+        // the transform's header rules.
+        "cel" => anyhow::bail!(
+            "{what}: engine `cel` cannot answer this event: it returns a single scalar and this \
+             event returns a document (a list of key dimensions, or `store` plus `ttl_secs`). \
+             Use `lua` or `js`, which return documents natively."
+        ),
+        "wasm" => anyhow::bail!(
+            "{what}: engine `wasm` is not supported here: WASM is a compiled module, not inline \
+             source. Attach a WASM hook through an extension bundle, or use `lua` or `js`."
+        ),
+        other => {
+            anyhow::bail!("{what}: unknown engine `{other}` (expected `lua` or `js`)")
+        }
+    }
+}
+
 /// Validate `observability.log.custom_fields:` at config-load time.
 ///
 /// Each field must declare exactly one value source (`value`, or
@@ -2995,6 +3041,25 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         },
         None => None,
     };
+
+    // WOR-2367: refuse a malformed decision script at load. A cache
+    // event that fails every evaluation degrades silently to the static
+    // config, and the only symptom is a hit rate that never improves,
+    // so the engine name is checked here rather than per request.
+    if let Some(cache) = response_cache.as_ref() {
+        if let Some(script) = cache.key_event.as_ref() {
+            validate_decision_script(
+                &format!("origin '{hostname}': response_cache.key_event"),
+                script,
+            )?;
+        }
+        if let Some(script) = cache.admit_event.as_ref() {
+            validate_decision_script(
+                &format!("origin '{hostname}': response_cache.admit_event"),
+                script,
+            )?;
+        }
+    }
 
     // WOR-2342: refuse a cacheable method that carries a request body.
     //
