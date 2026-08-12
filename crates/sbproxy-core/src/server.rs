@@ -1105,7 +1105,7 @@ fn build_response_cache_key(
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
 ) -> String {
-    build_response_cache_key_with_plan(workspace, hostname, req, cfg, None)
+    build_response_cache_key_with_plan(workspace, hostname, req, cfg, None, "", "")
 }
 
 /// As [`build_response_cache_key`], with an optional `cache.key` plan
@@ -1127,6 +1127,8 @@ pub(crate) fn build_response_cache_key_with_plan(
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
     plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
+    tenant: &str,
+    origin_id: &str,
 ) -> String {
     let method = req.method.as_str();
     let path = req.uri.path();
@@ -1137,15 +1139,31 @@ pub(crate) fn build_response_cache_key_with_plan(
         // Added to the configured `vary:`, never replacing it: an
         // operator's static dimensions stay in the key whatever the
         // event says.
-        vary.extend(plan.fold_into_vary(|name| {
-            req.headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        }));
-        vary.sort_unstable();
-        vary.dedup();
+        vary.extend(plan.fold_into_vary(
+            |name| match name {
+                "tenant" => tenant.to_owned(),
+                "origin" => origin_id.to_owned(),
+                "method" => method.to_owned(),
+                "path" => path.to_owned(),
+                "query" => query.unwrap_or_default().to_owned(),
+                // Decoding refuses every other unprefixed name, so this
+                // is unreachable from a decoded plan.
+                _ => String::new(),
+            },
+            |header| {
+                req.headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            },
+        ));
     }
+    // Sorted unconditionally. Sorting only when a plan exists would key
+    // the same request two ways depending on whether the event returned
+    // one, so a declining policy and an absent one would populate
+    // different entries and neither would ever read the other's.
+    vary.sort_unstable();
+    vary.dedup();
     sbproxy_cache::compute_cache_key(workspace, hostname, method, path, query, &mode, &vary)
 }
 

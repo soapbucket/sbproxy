@@ -3058,6 +3058,30 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
                 &format!("origin '{hostname}': response_cache.admit_event"),
                 script,
             )?;
+            // WOR-2367: these two do not compose yet, and the failure is
+            // silent, so it is refused rather than shipped.
+            //
+            // The stale-while-revalidate refresh runs in a background
+            // task with no request context, so it cannot evaluate
+            // `admit_event` against the response it just fetched. It
+            // writes back under the same key with the static `ttl_secs`
+            // and only the `cacheable_status` gate, which reverts both
+            // halves of the policy: a `ttl_secs` override lasts until
+            // the first refresh, and a response the policy refused is
+            // written by the refresh anyway.
+            //
+            // Refusing the pair is the honest state. Teaching the
+            // refresh to run the event is the fix, and it needs the
+            // event's context to survive into a detached task.
+            if cache.stale_while_revalidate.is_some_and(|swr| swr > 0) {
+                anyhow::bail!(
+                    "origin '{hostname}': response_cache sets both `admit_event` and \
+                     `stale_while_revalidate`, which do not compose. The revalidation refresh \
+                     runs without a request context, so it cannot evaluate the event and would \
+                     write back with the static `ttl_secs`, silently reverting both the event's \
+                     TTL override and any response it refused. Drop one of the two."
+                );
+            }
         }
     }
 
@@ -9169,5 +9193,126 @@ origins:
       ttl_secs: 60
 "#;
         compile_config(yaml).expect("a cache block without methods must compile");
+    }
+}
+
+#[cfg(test)]
+mod cache_decision_event_tests {
+    use super::*;
+
+    fn origin_with_cache(cache_yaml: &str) -> String {
+        format!(
+            "proxy:\n  http_bind_port: 8080\norigins:\n  \"api.local\":\n    action:\n      \
+             type: static\n      status_code: 200\n      content_type: text/plain\n      \
+             body: \"ok\"\n    response_cache:\n{cache_yaml}"
+        )
+    }
+
+    #[test]
+    fn cel_is_refused_for_a_document_returning_cache_event() {
+        // The refusal has to name why, or an operator reads "unsupported"
+        // and assumes it is unimplemented rather than wrong-shaped.
+        for key in ["key_event", "admit_event"] {
+            let yaml = origin_with_cache(&format!(
+                "      enabled: true\n      {key}:\n        engine: cel\n        source: \"true\"\n"
+            ));
+            let error = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{key} with engine cel must not compile"));
+            let message = format!("{error:#}");
+            assert!(message.contains("cel"), "must name the engine: {message}");
+            assert!(
+                message.contains("scalar") && message.contains("document"),
+                "must say why a scalar engine cannot answer a document event: {message}"
+            );
+            assert!(
+                message.contains("lua") && message.contains("js"),
+                "must name what does work: {message}"
+            );
+            assert!(
+                message.contains("api.local"),
+                "must name the origin: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_is_refused_because_it_is_not_inline_source() {
+        let yaml = origin_with_cache(
+            "      enabled: true\n      admit_event:\n        engine: wasm\n        source: \"x\"\n",
+        );
+        let error = compile_config(&yaml).err().expect("wasm must not compile");
+        let message = format!("{error:#}");
+        assert!(message.contains("compiled module"), "{message}");
+        assert!(
+            message.contains("bundle"),
+            "must point at the bundle path: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_engine_names_the_ones_that_work() {
+        let yaml = origin_with_cache(
+            "      enabled: true\n      key_event:\n        engine: rego\n        source: \"x\"\n",
+        );
+        let message = format!(
+            "{:#}",
+            compile_config(&yaml)
+                .err()
+                .expect("unknown engine must not compile")
+        );
+        assert!(message.contains("rego"), "{message}");
+        assert!(
+            message.contains("lua") && message.contains("js"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_source_is_refused() {
+        let yaml = origin_with_cache(
+            "      enabled: true\n      admit_event:\n        engine: lua\n        source: \"   \"\n",
+        );
+        assert!(
+            compile_config(&yaml).is_err(),
+            "an empty script would decline on every request while looking configured"
+        );
+    }
+
+    #[test]
+    fn admit_event_and_stale_while_revalidate_do_not_compose() {
+        // The revalidation refresh runs with no request context, so it
+        // cannot evaluate the event and would write back with the static
+        // ttl, silently reverting both the TTL override and any refusal.
+        let yaml = origin_with_cache(
+            "      enabled: true\n      stale_while_revalidate: 300\n      admit_event:\n        \
+             engine: lua\n        source: \"return {store = true}\"\n",
+        );
+        let message = format!(
+            "{:#}",
+            compile_config(&yaml)
+                .err()
+                .expect("the pair must be refused rather than silently reverting the policy")
+        );
+        assert!(
+            message.contains("stale_while_revalidate") && message.contains("admit_event"),
+            "must name both keys: {message}"
+        );
+        assert!(
+            message.contains("revert"),
+            "must say what goes wrong, not just that it is refused: {message}"
+        );
+    }
+
+    #[test]
+    fn a_valid_pair_still_compiles() {
+        // The refusals above must not be satisfiable by refusing
+        // everything.
+        let yaml = origin_with_cache(
+            "      enabled: true\n      key_event:\n        engine: lua\n        source: \"return \
+             {vary = {'tenant'}}\"\n      admit_event:\n        engine: js\n        source: \
+             \"({store: true})\"\n",
+        );
+        compile_config(&yaml).expect("lua and js decision events must compile");
     }
 }

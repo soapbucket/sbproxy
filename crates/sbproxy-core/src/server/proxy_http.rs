@@ -1020,11 +1020,7 @@ fn evaluate_cache_admit(
         record_decision, record_decision_fail_open, DecisionEvent, DecisionOutcome,
     };
 
-    let default = CacheAdmitPlan {
-        store: true,
-        ttl_secs: None,
-        reason: String::new(),
-    };
+    let default = CacheAdmitPlan::default();
 
     let pipeline = ctx.pipeline.clone();
     let Some(script) = ctx
@@ -1063,23 +1059,38 @@ fn evaluate_cache_admit(
         "origin": origin,
     });
 
-    let outcome = crate::decision_script::evaluate(script, &context);
-    let plan = match outcome {
-        None => {
+    let plan = match crate::decision_script::evaluate(script, &context) {
+        Err(fault) => {
             // The engine faulted. The request proceeded and the response
             // is still stored, so this is a fail-open rather than an
             // error outcome: the decision was never made.
+            // This event genuinely fails open: the response is stored
+            // even though the decision was never made. So the outcome
+            // records what happened, `Allow`, and the separate counter
+            // records that it was not earned. Folding the fault into
+            // `outcome="error"` as well would page an operator on the
+            // error rate for traffic that behaved as configured, which
+            // the sibling policy site rejected for the same reason.
+            //
+            // `fault` still selects the log detail, so a budget overrun
+            // is distinguishable from a broken script.
+            tracing::debug!(
+                target: "sbproxy::decision",
+                event = "cache.admit",
+                ?fault,
+                "cache.admit failed open"
+            );
             record_decision_fail_open(DecisionEvent::CacheAdmit, engine, origin, &ctx.tenant_id);
             record_decision(
                 DecisionEvent::CacheAdmit,
                 engine,
-                DecisionOutcome::Error,
+                DecisionOutcome::Allow,
                 origin,
                 &ctx.tenant_id,
             );
             default
         }
-        Some(document) => match sbproxy_cache::cache_event::decode_cache_admit(&document) {
+        Ok(document) => match sbproxy_cache::cache_event::decode_cache_admit(&document) {
             Ok(CacheDecision::Decline) => {
                 record_decision(
                     DecisionEvent::CacheAdmit,
@@ -1124,7 +1135,7 @@ fn evaluate_cache_admit(
                 record_decision(
                     DecisionEvent::CacheAdmit,
                     engine,
-                    DecisionOutcome::Error,
+                    DecisionOutcome::Allow,
                     origin,
                     &ctx.tenant_id,
                 );

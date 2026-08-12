@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-12*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -3542,6 +3542,8 @@ origins:
 | `cacheable_methods` | list | `[GET]` | HTTP methods eligible for caching. Only `GET` and `HEAD` are accepted; anything else is refused at config load. Alias: `methods`. |
 | `cacheable_status` | list | `[200]` | Status codes eligible for caching. Alias: `status_codes`. |
 | `max_size` | int | 10000 | Upper bound on the in-memory cache size in entries. Ignored when an L2 Redis backend is attached. |
+| `key_event` | object | unset | Request-side `cache.key` decision event: an inline `source` plus an `engine`, returning the dimensions to fold into the cache key. See [Deciding the key and the admission per request](#deciding-the-key-and-the-admission-per-request). |
+| `admit_event` | object | unset | Response-side `cache.admit` decision event: the same shape, returning whether the finished response is stored and for how long. |
 
 #### Why only GET and HEAD
 
@@ -3563,6 +3565,83 @@ To cache AI completions, use [the semantic cache](ai-gateway.md), which keys on
 prompt content with a similarity threshold and per-scope isolation. That is a
 different mechanism for a different job, and it is the one that makes caching a
 `POST` safe.
+
+### Deciding the key and the admission per request
+
+Every field above is static. Two optional events decide part of it per request instead: `key_event` chooses what the cache key varies on, and `admit_event` chooses whether a finished response is stored and for how long.
+
+They are two events rather than one cache policy because of an ordering constraint. A key has to exist before anything can be looked up under it, so `key_event` runs on the request, before the lookup, with no response in scope. Whether a response is worth storing depends on its status and its size, neither of which exists at request time, so `admit_event` runs after the response body is complete.
+
+Both take the same `source` plus `engine` pair as [`custom_fields`](access-log.md#custom-fields), and the accepted engines are `lua` and `js`. Each script sees the event's input as a `ctx` global and returns a document: Lua returns it, JavaScript evaluates to it.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    response_cache:
+      enabled: true
+      ttl_secs: 300
+      cacheable_status: [200]
+      key_event:
+        engine: lua
+        source: |
+          -- ctx.request.{method,path,query,host}, ctx.tenant, ctx.origin
+          if string.find(ctx.request.path, "/v1/reports", 1, true) == 1 then
+            return {
+              vary = { "tenant", "header:x-plan-tier" },
+              reason = "a report body differs per tenant and per plan tier",
+            }
+          end
+          return {}
+      admit_event:
+        engine: js
+        source: |
+          // ctx.response.{status,body_bytes,headers}, ctx.request.{path,host}
+          (() => {
+            if (ctx.response.body_bytes > 1048576) {
+              return { store: false, reason: "too large to be worth a cache slot" };
+            }
+            return { store: true, ttl_secs: 60, reason: "report bodies go stale fast" };
+          })()
+```
+
+`key_event` returns:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vary` | list | Extra dimensions folded into the cache key, added to the static `vary:` list of request headers. At most 16. |
+| `skip_lookup` | bool | Go upstream for this request instead of reading the cache. The response stays eligible for storage. |
+| `reason` | string | Why this plan. Recorded with the decision rather than only in a debug line. Truncated at 512 bytes. |
+
+`admit_event` returns:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `store` | bool | Required. Whether this response is written to the cache. |
+| `ttl_secs` | int | TTL for this entry, replacing the configured `ttl_secs`. Clamped to 30 days. |
+| `reason` | string | Why this plan. Same handling as above. |
+
+Every field on a `key_event` document is optional, and `{}` or `null` declines, which leaves the static `vary:` in charge. `admit_event` declines the same two ways, but any other document has to carry `store`. There is no safe default for that one: guessing `true` caches a response the policy never approved, and guessing `false` silently switches the cache off, so a non-empty document without `store` is refused as incomplete rather than assumed either way.
+
+A dimension name is not free-form. Each one is either a dimension the host resolves itself (`tenant`, `origin`, `method`, `path`, `query`) or a request header written `header:<name>`. Anything else is refused when the document is decoded. That refusal is the safety property: a name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, which is the poisoning bug wearing a working config's clothes. Names are trimmed, lowercased, deduplicated, and sorted, so a policy that returns the same set in a different order still produces the same key.
+
+A `key_event` can only add dimensions to the key. The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host from what the request resolved to, whatever the event returns, so a policy can narrow a key and can never widen one past its own tenant.
+
+The two events fall back in opposite directions, and the asymmetry is deliberate:
+
+- If the `key_event` engine faults, or returns a document that cannot be decoded, the cache is bypassed entirely for that request: no read and no write. Keying on the static `vary:` alone would be coarser rather than narrower, and the same key carries the write-back, so that response would be published to every other caller whose script also faulted.
+- If the `admit_event` engine faults or returns an undecodable document, the response is stored under the configured `ttl_secs`, which is what an origin without the event already does. Nothing about the key changed, so the entry can only be read by requests that were already entitled to it.
+
+Two more things the events cannot do. `skip_lookup: true` goes upstream for this request but leaves the response eligible for storage, so it is not a way to refuse to cache; return `store: false` from `admit_event` for that. And `admit_event` only runs for a response whose status already passed the static `cacheable_status` gate, so it can decline a status that gate allows and cannot start caching one that gate excludes.
+
+Two engines are refused at config compile, on boot and on reload, rather than at request time:
+
+- `engine: cel`, because these events return a document (a list of key dimensions, or `store` plus `ttl_secs`) and CEL evaluates to a single scalar. Supporting it would mean a token grammar for packing a document into a string. The error names `lua` and `js`, which return documents natively.
+- `engine: wasm`, because a compiled module is not inline source. Attach a WASM hook through an [extension bundle](extension-bundles.md) instead.
+
+Sandbox budgets, the engine surfaces, and worked scripts are in [scripting.md](scripting.md). Each evaluation is counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, with faults also counted on `sbproxy_decision_event_fail_open_total`; see [observability.md](observability.md).
 
 ### Choosing the backing store
 

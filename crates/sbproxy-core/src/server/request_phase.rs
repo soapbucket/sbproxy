@@ -526,24 +526,31 @@ async fn drain_body_for_signature_verification(
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 /// Run the origin's `cache.key` event, if it has one.
 ///
-/// `None` means the static `vary:` alone decides the key, which is what
-/// a deployment without the event already does. A faulted engine and a
-/// malformed document both land there too, and are separated on the
-/// metric rather than in the return value: falling back to a *narrower*
-/// key is the safe direction, since it can only cause a miss and never a
-/// cross-tenant hit.
+/// Returns the plan, plus whether the cache must be bypassed entirely.
+///
+/// **A fault bypasses the cache.** The obvious fallback, dropping the
+/// plan and keying on the static `vary:` alone, is a cross-tenant leak:
+/// dropping dimensions makes the key *coarser*, not narrower, and the
+/// same key is used for the write-back. So a script that faults on one
+/// request stores that response under the undimensioned key, and the
+/// next caller whose script also faults is served it as a hit. Failing
+/// open on a key decision has to mean failing closed on the cache.
+///
+/// `None` with no bypass means the event is absent and the static
+/// `vary:` decides, which is what a deployment without the event does.
 fn evaluate_cache_key(
     ctx: &crate::context::RequestContext,
     req: &pingora_http::RequestHeader,
     cache_cfg: &sbproxy_config::ResponseCacheConfig,
-) -> Option<sbproxy_cache::cache_event::CacheKeyPlan> {
+) -> (Option<sbproxy_cache::cache_event::CacheKeyPlan>, bool) {
     use sbproxy_cache::cache_event::{decode_cache_key, CacheDecision};
     use sbproxy_observe::decision::{
-        record_decision, record_decision_duration, record_decision_fail_open, DecisionEvent,
-        DecisionOutcome,
+        record_decision, record_decision_duration, DecisionEvent, DecisionOutcome,
     };
 
-    let script = cache_cfg.key_event.as_ref()?;
+    let Some(script) = cache_cfg.key_event.as_ref() else {
+        return (None, false);
+    };
     let pipeline = ctx.pipeline.clone();
     let origin = ctx
         .origin_idx
@@ -564,18 +571,22 @@ fn evaluate_cache_key(
     });
 
     let plan = match crate::decision_script::evaluate(script, &context) {
-        None => {
-            record_decision_fail_open(DecisionEvent::CacheKey, engine, origin, &ctx.tenant_id);
+        Err(fault) => {
+            // No fail-open counter here, deliberately. Since a fault
+            // bypasses the cache entirely, this event fails *closed*:
+            // the request proceeded without a cache, not with one it
+            // never earned. Counting it as a fail-open would report the
+            // opposite of what happened. The fault is the outcome.
             record_decision(
                 DecisionEvent::CacheKey,
                 engine,
-                DecisionOutcome::Error,
+                fault.outcome(),
                 origin,
                 &ctx.tenant_id,
             );
-            None
+            (None, true)
         }
-        Some(document) => match decode_cache_key(&document) {
+        Ok(document) => match decode_cache_key(&document) {
             Ok(CacheDecision::Decline) => {
                 record_decision(
                     DecisionEvent::CacheKey,
@@ -584,7 +595,7 @@ fn evaluate_cache_key(
                     origin,
                     &ctx.tenant_id,
                 );
-                None
+                (None, false)
             }
             Ok(CacheDecision::Plan(plan)) => {
                 record_decision(
@@ -594,7 +605,7 @@ fn evaluate_cache_key(
                     origin,
                     &ctx.tenant_id,
                 );
-                Some(plan)
+                (Some(plan), false)
             }
             Err(error) => {
                 tracing::warn!(
@@ -603,7 +614,6 @@ fn evaluate_cache_key(
                     error = %error,
                     "cache.key returned a document that could not be decoded"
                 );
-                record_decision_fail_open(DecisionEvent::CacheKey, engine, origin, &ctx.tenant_id);
                 record_decision(
                     DecisionEvent::CacheKey,
                     engine,
@@ -611,7 +621,7 @@ fn evaluate_cache_key(
                     origin,
                     &ctx.tenant_id,
                 );
-                None
+                (None, true)
             }
         },
     };
@@ -3944,13 +3954,16 @@ pub(super) async fn request_filter(
                 // key has to exist before anything can be looked up under
                 // it, which is why this is a separate event from
                 // `cache.admit` rather than one cache policy.
-                let key_plan = evaluate_cache_key(ctx, session.req_header(), cache_cfg);
+                let (key_plan, key_event_bypass) =
+                    evaluate_cache_key(ctx, session.req_header(), cache_cfg);
                 let key = crate::server::build_response_cache_key_with_plan(
                     "",
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
                     key_plan.as_ref(),
+                    ctx.tenant_id.as_str(),
+                    origin.origin_id.as_str(),
                 );
                 // `skip_lookup` goes upstream for *this* request while
                 // leaving the response eligible for storage, which is a
@@ -3962,7 +3975,8 @@ pub(super) async fn request_filter(
                 // `on_request` callbacks, forward rules, and
                 // `handle_action` below, and returning here would
                 // silently skip every one of them.
-                let skip_lookup = key_plan.as_ref().is_some_and(|plan| plan.skip_lookup);
+                let skip_lookup =
+                    key_event_bypass || key_plan.as_ref().is_some_and(|plan| plan.skip_lookup);
 
                 // Cache lookups are synchronous against the trait, but the
                 // Redis backend does blocking TCP I/O under the hood. Use
@@ -4155,7 +4169,18 @@ pub(super) async fn request_filter(
                         // to the client with `x-sbproxy-cache:
                         // HIT-RESERVE` and promoted into the hot
                         // tier so subsequent reads stay hot.
-                        if let Some(reserve) = pipeline.cache_reserve.clone() {
+                        // The reserve is a cache read like any other, so
+                        // it takes the same gate. Without this a
+                        // `skip_lookup` policy asking for live data is
+                        // served a cold-tier body with
+                        // `x-sbproxy-cache: HIT-RESERVE` and never
+                        // reaches upstream.
+                        let reserve = if skip_lookup {
+                            None
+                        } else {
+                            pipeline.cache_reserve.clone()
+                        };
+                        if let Some(reserve) = reserve {
                             let lookup_key = key.clone();
                             let lookup_origin = origin.origin_id.to_string();
                             match reserve.get(&lookup_key).await {
@@ -4307,7 +4332,17 @@ pub(super) async fn request_filter(
                         // Miss: remember the key so the response phase
                         // can populate the cache when the upstream reply
                         // comes back.
-                        ctx.cache_key = Some(key);
+                        //
+                        // Except after a `cache.key` fault. The key we
+                        // hold is missing the dimensions the policy
+                        // wanted, so writing under it would publish this
+                        // response to every other caller whose script
+                        // also faults. A fault means no read *and* no
+                        // write, which is the only fallback that cannot
+                        // leak.
+                        if !key_event_bypass {
+                            ctx.cache_key = Some(key);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "cache lookup error, bypassing cache");

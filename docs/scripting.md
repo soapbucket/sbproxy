@@ -49,6 +49,8 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
+| `origins.<host>.response_cache.key_event`, field `source` | Lua or JavaScript | Returns `{vary, skip_lookup, reason}` before the cache lookup; adds dimensions to the cache key |
+| `origins.<host>.response_cache.admit_event`, field `source` | Lua or JavaScript | Returns `{store, ttl_secs, reason}` once the response body is complete; decides whether it is stored |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
 | `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, or envelope WASM | Uses a typed, versioned JSON envelope and the hook's `type` name |
 | `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
@@ -787,6 +789,117 @@ The full authoring guide is in [wasm-development.md](wasm-development.md), with 
 
 ---
 
+## Cache decision events
+
+`response_cache` is otherwise static. Two optional events let a script answer part of it per request: `key_event` decides what the cache key varies on, and `admit_event` decides whether a finished response is stored and for how long. Both sit under an origin's `response_cache` block and both accept `lua` and `js`, in the same `source` plus `engine` shape as `custom_fields`.
+
+They are two events rather than one cache policy because of an ordering constraint. A key has to exist before anything can be looked up under it, so `key_event` runs on the request, before the lookup, with no response in scope. Whether a response is worth storing depends on its status and its size, neither of which exists at request time, so `admit_event` runs after the response body is complete.
+
+CEL is not on the list, and the reason is the return type. Every CEL surface in section 2 answers with one scalar: a bool, a bucket key, a header value. These events answer with a document, so serving them from CEL would mean packing a document into a string and parsing it back out, which is how `route_to:gpt-4o-mini` became a mini-language. `engine: cel` is refused at config compile, naming `lua` and `js` instead. `engine: wasm` is refused on different grounds: the field takes inline source and a compiled module is not inline source, so a WASM hook attaches through an [extension bundle](extension-bundles.md).
+
+```yaml
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 300
+      cacheable_status: [200]
+      key_event:
+        engine: lua
+        source: |
+          -- Reports are per tenant and per plan tier. Everything else
+          -- keeps the origin's static `vary:`.
+          if string.find(ctx.request.path, "/v1/reports", 1, true) == 1 then
+            return {
+              vary = { "tenant", "header:x-plan-tier" },
+              reason = "a report body differs per tenant and per plan tier",
+            }
+          end
+          return {}
+      admit_event:
+        engine: js
+        source: |
+          (() => {
+            if (ctx.response.body_bytes > 1048576) {
+              return { store: false, reason: "too large to be worth a cache slot" };
+            }
+            if (ctx.response.headers["cache-control"] === "no-store") {
+              return { store: false, reason: "upstream said no-store" };
+            }
+            return { store: true, ttl_secs: 60, reason: "report bodies go stale fast" };
+          })()
+```
+
+### What the script receives
+
+Each event hands its input to the script as a `ctx` global, the same way `engine: lua` and `engine: js` custom log fields do. This is not the modifier context table from section 4.2: there is no `principal`, no `aipref`, and no TLS fingerprint here.
+
+`key_event` sees the request:
+
+```
+ctx.request.method
+ctx.request.path
+ctx.request.query    -- "" when the request carries none
+ctx.request.host
+ctx.tenant           -- resolved tenant id, "" when there is none
+ctx.origin           -- origin id
+```
+
+`admit_event` sees the finished response, plus enough of the request to tell one route from another:
+
+```
+ctx.response.status
+ctx.response.body_bytes
+ctx.response.headers  -- names lowercased; hop-by-hop headers dropped
+ctx.request.path
+ctx.request.host
+ctx.tenant
+ctx.origin
+```
+
+Request headers are deliberately not in either context. A `key_event` names the dimensions and the host resolves their values, so a script can vary on a header it cannot read. To branch on a header value, stamp a derived value into the path or route the traffic to its own origin.
+
+### What the script returns
+
+Lua returns the document (`return { ... }`); JavaScript evaluates to it, so wrap anything with branches in an immediately invoked function as above. A bare object literal at the end of a JavaScript source is parsed as a block, not an object.
+
+`key_event`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `vary` | list of strings | Dimensions folded into the cache key, added to the origin's static `vary:`. At most 16, each at most 128 bytes. |
+| `skip_lookup` | bool | Go upstream for this request rather than reading the cache. The response stays eligible for storage. |
+| `reason` | string | Why. Recorded with the decision rather than only in a debug line. Truncated at 512 bytes. |
+
+`admit_event`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `store` | bool | Required. Whether this response is written to the cache. |
+| `ttl_secs` | int | TTL for this entry, replacing the configured `ttl_secs`. Clamped to 30 days. |
+| `reason` | string | Why. Same handling as above. |
+
+Declining is the cheap common case and means "the static config applies unchanged": `return {}` or `return nil` in Lua, an empty object or nothing at all in JavaScript. A `key_event` document with no `vary` and no `skip_lookup` declines too. `admit_event` is the one exception to everything being optional: any document that is not empty has to carry `store`, because there is no safe default for it. Guessing `true` caches a response the policy never approved, and guessing `false` switches the cache off without saying so.
+
+### Rules the events cannot bend
+
+**Dimension names are a closed set.** Each name in `vary` is either a dimension the host resolves itself (`tenant`, `origin`, `method`, `path`, `query`) or a request header written `header:<name>`. Anything else is refused when the document is decoded. A name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, so a typo has to fail loudly rather than quietly serve one customer's response to another. Names are trimmed, lowercased, deduplicated, and sorted, which keeps the same set in a different order producing the same key.
+
+**A key can only get narrower.** The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host from what the request resolved to, whatever the event returns. A policy adds dimensions to the key and can never widen one past its own tenant.
+
+**A faulted `key_event` bypasses the cache.** If the engine faults, or the document cannot be decoded, the request gets no cache read and no cache write. Falling back to the static `vary:` alone would produce a coarser key rather than a narrower one, and the same key carries the write-back, so that response would be published to every other caller whose script also faulted. `admit_event` fails the other way, because nothing about the key changed: a fault there stores the response under the configured `ttl_secs`, which is what an origin without the event already does.
+
+**`skip_lookup` is not a refusal to cache.** It sends this request upstream and leaves the response eligible for storage, which is what a caller asking for fresh data usually wants. To keep a response out of the cache, return `store: false` from `admit_event`.
+
+**`admit_event` runs downstream of `cacheable_status`.** It only sees a response whose status already passed that gate, so it can decline a status the gate allows and cannot start caching one the gate excludes.
+
+Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation, and both are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`; faults land on `sbproxy_decision_event_fail_open_total` as well. Field-level reference for the block is in [configuration.md](configuration.md#response-cache).
+
+---
+
 ## 7. Modifier reference
 
 Request and response modifiers are lists of typed entries. Each entry can combine the structural fields below with an optional script; entries apply in order.
@@ -926,7 +1039,7 @@ Validate your config before deployment:
 sbproxy validate sb.yml
 ```
 
-Validation checks the YAML shape and typed fields, and compiles every CEL expression the config declares: `expression` and `assertion` policies, rate-limit and WAF persistent-block `key:` expressions, `cel` transform bodies and header rules, and `engine: cel` custom log fields. A CEL syntax error in any of them surfaces here, and at boot and reload, rather than at request time. Inline Lua and JavaScript bodies are still strings to the validator, so their syntax errors surface at request time in the logs. Dynamic bundle JavaScript and TypeScript are different: the candidate loader parses the entry, transpiles TypeScript when needed, verifies every named export, and refuses the candidate before publication when any of those steps fails.
+Validation checks the YAML shape and typed fields, and compiles every CEL expression the config declares: `expression` and `assertion` policies, rate-limit and WAF persistent-block `key:` expressions, `cel` transform bodies and header rules, and `engine: cel` custom log fields. A CEL syntax error in any of them surfaces here, and at boot and reload, rather than at request time. Inline Lua and JavaScript bodies are still strings to the validator, so their syntax errors surface at request time in the logs. The `response_cache` decision events are checked as far as they can be without running: an `engine` other than `lua` or `js`, or an empty `source`, is refused here and at boot and reload, while the script body stays a string until it runs. Dynamic bundle JavaScript and TypeScript are different: the candidate loader parses the entry, transpiles TypeScript when needed, verifies every named export, and refuses the candidate before publication when any of those steps fails.
 
 ### Enabling debug logging
 
@@ -949,6 +1062,8 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
+| `response_cache.key_event` | An `engine` of `cel` or `wasm`, any other unknown engine, or an empty `source` fails config compile; an engine fault or a document that cannot be decoded is logged and bypasses the cache for that request, with no read and no write |
+| `response_cache.admit_event` | The same config-compile checks; an engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
 | JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
 | Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |

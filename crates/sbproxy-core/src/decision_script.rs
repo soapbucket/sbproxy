@@ -35,30 +35,67 @@ use sbproxy_config::DecisionScriptConfig;
 /// the shape `custom_log` established so an operator who has written one
 /// has written the other.
 ///
-/// Returns `None` when the engine faults. A fault is not a decline: the
-/// caller records it as an engine error and applies its own fallback,
-/// which for both cache events is the static config. Distinguishing the
-/// two is what keeps a broken script from looking like a script with no
-/// opinion.
+/// A fault is not a decline. The caller applies its own fallback, but
+/// records the fault separately, which is what keeps a broken script
+/// from looking like a script with no opinion. The fault distinguishes a
+/// budget overrun from every other failure, because raising a budget and
+/// fixing a bug are different responses.
+/// Why an evaluation produced no document.
+///
+/// A budget overrun is separated from every other fault because the two
+/// want different responses: one is a budget to raise or a script to
+/// make cheaper, the other is a bug to fix. Collapsing them is why
+/// `DecisionOutcome::Timeout` would otherwise read flat zero forever
+/// while scripts were timing out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptFault {
+    /// The script did not finish inside its CPU budget.
+    Timeout,
+    /// Anything else: a syntax error, a thrown exception, an
+    /// unavailable engine.
+    Error,
+}
+
+impl ScriptFault {
+    /// The decision-event outcome this fault reports as.
+    pub(crate) const fn outcome(self) -> sbproxy_observe::decision::DecisionOutcome {
+        match self {
+            Self::Timeout => sbproxy_observe::decision::DecisionOutcome::Timeout,
+            Self::Error => sbproxy_observe::decision::DecisionOutcome::Error,
+        }
+    }
+}
+
 pub(crate) fn evaluate(
     script: &DecisionScriptConfig,
     context: &serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> Result<serde_json::Value, ScriptFault> {
     let mut globals = HashMap::new();
     globals.insert("ctx".to_owned(), context.clone());
 
     match script.engine.as_str() {
         "lua" => match sbproxy_extension::lua::LuaEngine::new() {
             Ok(engine) => match engine.execute(&script.source, globals) {
-                Ok(value) => Some(value),
+                Ok(value) => Ok(value),
                 Err(error) => {
+                    // The sandbox reports a budget overrun by putting
+                    // `LuaSandboxTimeout` in the error chain, so that is
+                    // what separates "too slow" from "broken".
+                    let timed_out = error
+                        .chain()
+                        .any(|cause| cause.is::<sbproxy_extension::lua::LuaSandboxTimeout>());
                     tracing::warn!(
                         target: "sbproxy::decision",
                         engine = "lua",
                         error = %error,
+                        timed_out,
                         "decision script failed; falling back to static config"
                     );
-                    None
+                    Err(if timed_out {
+                        ScriptFault::Timeout
+                    } else {
+                        ScriptFault::Error
+                    })
                 }
             },
             Err(error) => {
@@ -68,20 +105,29 @@ pub(crate) fn evaluate(
                     error = %error,
                     "decision script engine unavailable"
                 );
-                None
+                Err(ScriptFault::Error)
             }
         },
         "js" => match sbproxy_extension::js::JsEngine::new() {
             Ok(engine) => match engine.execute(&script.source, globals) {
-                Ok(value) => Some(value),
+                Ok(value) => Ok(value),
                 Err(error) => {
+                    let timed_out = matches!(
+                        error,
+                        sbproxy_extension::js::JsExecutionError::Interrupt { .. }
+                    );
                     tracing::warn!(
                         target: "sbproxy::decision",
                         engine = "js",
                         error = %error,
+                        timed_out,
                         "decision script failed; falling back to static config"
                     );
-                    None
+                    Err(if timed_out {
+                        ScriptFault::Timeout
+                    } else {
+                        ScriptFault::Error
+                    })
                 }
             },
             Err(error) => {
@@ -91,7 +137,7 @@ pub(crate) fn evaluate(
                     error = %error,
                     "decision script engine unavailable"
                 );
-                None
+                Err(ScriptFault::Error)
             }
         },
         // Unreachable from a compiled config: `validate_decision_script`
@@ -104,7 +150,7 @@ pub(crate) fn evaluate(
                 engine = %other,
                 "decision script has an engine the compiler should have refused"
             );
-            None
+            Err(ScriptFault::Error)
         }
     }
 }

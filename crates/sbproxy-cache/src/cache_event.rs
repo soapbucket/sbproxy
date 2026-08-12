@@ -34,6 +34,14 @@
 //! than advisory: **a policy chooses additional dimensions to vary on,
 //! and cannot remove any.**
 //!
+//! A dimension name is either one the host resolves itself (`tenant`,
+//! `origin`, `method`, `path`, `query`) or a request header written
+//! `header:<name>`. Anything else is **refused at decode**, because a
+//! name resolving to nothing would contribute the same empty value to
+//! every request, partition nothing, and merge every caller into one
+//! cache entry. That refusal is load bearing: a silently-inert dimension
+//! is the poisoning bug wearing a working config's clothes.
+//!
 //! `compute_cache_key` builds `<workspace>:<hostname>:<method>:<path>:
 //! <query>:<vary-fingerprint>`, and a policy reaches only the last
 //! segment. The workspace prefix is stamped by the host from the
@@ -67,13 +75,42 @@ use serde::{Deserialize, Serialize};
 
 /// Upper bound on vary dimensions one key plan may add.
 ///
-/// Each dimension is a segment of the fingerprint input, so the cap
-/// bounds both key-derivation cost and how finely a policy can shard its
-/// own cache before it stops being a cache.
+/// Each dimension is a segment of the fingerprint input, so what this
+/// caps is key-derivation cost: how much work one key costs to build and
+/// how long the string that work reads gets.
+///
+/// **It does not cap how many distinct keys a policy produces.** That is
+/// set by the value cardinality of the dimensions chosen, and this
+/// counts dimensions. A single dimension under the cap is enough to
+/// defeat the cache: `header:user-agent`, or any request-id header,
+/// takes a distinct value on nearly every request, so every lookup
+/// misses, every response is stored, and a memory store at
+/// `response_cache.max_size` evicts the entries that were earning their
+/// keep to make room for entries nothing will ask for a second time.
+///
+/// The client drives that from outside the moment a policy names a
+/// header the client controls, and no count-based cap can see it coming.
+/// The real bound is which dimensions a policy picks, not this number.
 pub const MAX_CACHE_VARY_DIMENSIONS: usize = 16;
 
 /// Upper bound on a single vary dimension name, in bytes.
 pub const MAX_CACHE_VARY_NAME_BYTES: usize = 128;
+
+/// Prefix marking a vary dimension that names a request header.
+///
+/// Explicit rather than implied, because a bare name that silently
+/// resolved against headers is how `{"vary": ["tenant"]}` looks correct,
+/// contributes an empty value for every request, partitions nothing, and
+/// serves one customer's response to another.
+pub const CACHE_VARY_HEADER_PREFIX: &str = "header:";
+
+/// Dimension names the host resolves itself, without a prefix.
+///
+/// A name outside this set and without [`CACHE_VARY_HEADER_PREFIX`] is
+/// **refused** rather than resolved to nothing. That refusal is the
+/// difference between a typo that fails loudly and a typo that quietly
+/// merges every caller into one cache bucket.
+pub const CACHE_VARY_HOST_DIMENSIONS: &[&str] = &["tenant", "origin", "method", "path", "query"];
 
 /// Upper bound on a policy-chosen TTL, in seconds (30 days).
 ///
@@ -87,7 +124,14 @@ pub const MAX_CACHE_REASON_BYTES: usize = 512;
 
 /// What a `cache.key` event returned: which dimensions to add to the
 /// key, and whether to skip the lookup entirely.
+///
+/// `#[non_exhaustive]` because a key decision has room to say more than
+/// this: a store selector or a per-request bypass reason are additive
+/// here and breaking for anything downstream that spelled the struct out
+/// as a literal. Nothing outside this crate constructs one today, so the
+/// attribute costs nothing now and is unaffordable later.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CacheKeyPlan {
     /// Extra dimensions folded into the vary fingerprint, normalized on
     /// decode so ordering cannot change the resulting key.
@@ -102,7 +146,19 @@ pub struct CacheKeyPlan {
     /// fresh data while its response is still worth caching for others.
     #[serde(default)]
     pub skip_lookup: bool,
-    /// Why. Reaches the audit record, not only a debug line.
+    /// Why this plan was chosen.
+    ///
+    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then it
+    /// goes nowhere. Nothing in this workspace builds an audit record
+    /// yet, and the `cache.key` call site records the outcome without
+    /// ever reading this field. Wiring it to the audit record is
+    /// outstanding, not done.
+    ///
+    /// It is kept because a reason is what makes a cache decision
+    /// diagnosable, and a debug line is not somewhere to keep one:
+    /// `release_max_level_info` compiles `debug!` out of release builds,
+    /// so a reason that lives only there does not exist in production,
+    /// which is exactly where an operator asks why nothing is caching.
     #[serde(default)]
     pub reason: String,
 }
@@ -110,6 +166,7 @@ pub struct CacheKeyPlan {
 /// What a `cache.admit` event returned: whether to store the response
 /// and for how long.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CacheAdmitPlan {
     /// Store this response.
     pub store: bool,
@@ -117,9 +174,40 @@ pub struct CacheAdmitPlan {
     /// `None` keeps the configured `ttl_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
-    /// Why. Reaches the audit record, not only a debug line.
+    /// Why this response was admitted or refused.
+    ///
+    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then it
+    /// goes nowhere. Nothing in this workspace builds an audit record
+    /// yet, and the `cache.admit` call site records the outcome without
+    /// ever reading this field. Wiring it to the audit record is
+    /// outstanding, not done.
+    ///
+    /// It is kept because a reason is what makes a cache decision
+    /// diagnosable, and a debug line is not somewhere to keep one:
+    /// `release_max_level_info` compiles `debug!` out of release builds,
+    /// so a reason that lives only there does not exist in production,
+    /// which is exactly where an operator asks why a response was never
+    /// stored.
     #[serde(default)]
     pub reason: String,
+}
+
+impl Default for CacheAdmitPlan {
+    /// Store, with no TTL override and no reason.
+    ///
+    /// This is what a deployment without the event does, which is why it
+    /// is also the fallback for a declined, absent, or faulted one: the
+    /// four are separated on the metric rather than in behavior.
+    ///
+    /// Exists so the type can be `#[non_exhaustive]` without blocking
+    /// the fallback its caller needs to construct.
+    fn default() -> Self {
+        Self {
+            store: true,
+            ttl_secs: None,
+            reason: String::new(),
+        }
+    }
 }
 
 /// What a cache decision event returned.
@@ -132,7 +220,15 @@ pub enum CacheDecision<T> {
 }
 
 /// Why a returned cache document was refused.
+///
+/// `#[non_exhaustive]` because this is the part of the surface most
+/// certain to grow. Every bound worth enforcing and every dimension the
+/// host learns to resolve arrives here as a variant, and adding one to
+/// an exhaustive public enum breaks every downstream `match` that
+/// listed the old set. Refusals should be cheap to add; a refusal that
+/// is a breaking change is a refusal that does not get added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CacheEventError {
     /// The document was not an object.
     NotAnObject,
@@ -147,6 +243,11 @@ pub enum CacheEventError {
     /// [`MAX_CACHE_VARY_NAME_BYTES`].
     VaryNameTooLong {
         /// The offending name, truncated for the message.
+        name: String,
+    },
+    /// A vary dimension named something the host cannot resolve.
+    UnknownVaryDimension {
+        /// The offending name.
         name: String,
     },
     /// `store` was missing on a `cache.admit` document.
@@ -171,6 +272,13 @@ impl std::fmt::Display for CacheEventError {
             Self::VaryNameTooLong { name } => {
                 write!(f, "cache.key vary dimension `{name}` is too long")
             }
+            Self::UnknownVaryDimension { name } => write!(
+                f,
+                "cache.key vary dimension `{name}` is not a dimension the host resolves \
+                 (expected one of {CACHE_VARY_HOST_DIMENSIONS:?}, or `header:<name>`). A \
+                 dimension the host cannot resolve would contribute the same empty value to \
+                 every request and partition nothing, which merges callers into one cache entry."
+            ),
             Self::AdmitMissingStore => {
                 write!(
                     f,
@@ -214,7 +322,15 @@ pub fn decode_cache_key(
                     name: bounded(name, 64),
                 });
             }
-            vary.push(name.to_ascii_lowercase());
+            let lowered = name.to_ascii_lowercase();
+            let resolvable = CACHE_VARY_HOST_DIMENSIONS.contains(&lowered.as_str())
+                || lowered
+                    .strip_prefix(CACHE_VARY_HEADER_PREFIX)
+                    .is_some_and(|header| !header.is_empty());
+            if !resolvable {
+                return Err(CacheEventError::UnknownVaryDimension { name: lowered });
+            }
+            vary.push(lowered);
         }
     }
     // Determinism: the same set in a different order must produce the
@@ -279,22 +395,36 @@ pub fn decode_cache_admit(
 }
 
 impl CacheKeyPlan {
-    /// Fold this plan's dimensions into the caller's vary header list.
+    /// Fold this plan's dimensions into the caller's vary pair list.
     ///
-    /// The caller owns the host-stamped key material and passes only the
-    /// vary pairs. A dimension the request does not carry contributes an
-    /// empty value rather than being dropped, so "header absent" and
-    /// "header present and empty" stay distinguishable: collapsing them
-    /// would let a client choose which cache bucket it lands in by
-    /// omitting a header.
+    /// `host` resolves the unprefixed dimensions in
+    /// [`CACHE_VARY_HOST_DIMENSIONS`]; `header` resolves anything
+    /// carrying [`CACHE_VARY_HEADER_PREFIX`]. Decoding already refused
+    /// every other name, so neither resolver is asked for something it
+    /// cannot answer.
+    ///
+    /// A header the request does not carry contributes an empty value
+    /// rather than being dropped, so "header absent" and "header present
+    /// and empty" stay distinguishable: collapsing them would let a
+    /// client choose its cache bucket by omitting a header.
     ///
     /// Returns pairs ready for `vary_fingerprint`, sorted for
     /// determinism.
-    pub fn fold_into_vary(&self, lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    pub fn fold_into_vary(
+        &self,
+        host: impl Fn(&str) -> String,
+        header: impl Fn(&str) -> Option<String>,
+    ) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self
             .vary
             .iter()
-            .map(|name| (name.clone(), lookup(name).unwrap_or_default()))
+            .map(|name| {
+                let value = match name.strip_prefix(CACHE_VARY_HEADER_PREFIX) {
+                    Some(header_name) => header(header_name).unwrap_or_default(),
+                    None => host(name),
+                };
+                (name.clone(), value)
+            })
             .collect();
         out.sort_unstable();
         out
@@ -338,19 +468,19 @@ mod tests {
         // produce the same key. Otherwise every store lands under a key
         // no later lookup reproduces and the cache silently never hits,
         // with nothing failing and the hit-rate panel reading zero.
-        let a = decode_cache_key(&json!({"vary": ["tenant", "model", "prompt_fingerprint"]}));
-        let b = decode_cache_key(&json!({"vary": ["prompt_fingerprint", "tenant", "model"]}));
+        let a = decode_cache_key(&json!({"vary": ["tenant", "path", "header:x-tier"]}));
+        let b = decode_cache_key(&json!({"vary": ["header:x-tier", "tenant", "path"]}));
         assert_eq!(a, b);
     }
 
     #[test]
     fn vary_names_are_case_insensitive_and_deduplicated() {
         let CacheDecision::Plan(plan) =
-            decode_cache_key(&json!({"vary": ["Tenant", "tenant", "TENANT", "model"]})).unwrap()
+            decode_cache_key(&json!({"vary": ["Tenant", "tenant", "TENANT", "Path"]})).unwrap()
         else {
             panic!("expected a plan");
         };
-        assert_eq!(plan.vary, vec!["model", "tenant"]);
+        assert_eq!(plan.vary, vec!["path", "tenant"]);
     }
 
     #[test]
@@ -360,17 +490,21 @@ mod tests {
         // workspace segment, because it only ever produces vary pairs
         // and the host stamps the prefix itself.
         let CacheDecision::Plan(plan) = decode_cache_key(&json!({
-            "vary": ["workspace", "../../other-tenant", "x-tenant-override"],
+            "vary": ["tenant", "header:x-tenant-override", "header:../../other-tenant"],
         }))
         .unwrap() else {
             panic!("expected a plan");
         };
-        let folded = plan.fold_into_vary(|name| Some(format!("value-of-{name}")));
+        let folded = plan.fold_into_vary(
+            |name| format!("host-{name}"),
+            |name| Some(format!("header-{name}")),
+        );
 
-        // Whatever the names are, they are vary pairs. None of them is
-        // the key prefix, and the prefix is not reachable from here.
+        // Whatever the names are, they only ever reach the vary
+        // fingerprint, which is a hash. A dimension name carrying the
+        // key's own `:` separator, or a traversal-looking one, cannot
+        // inject a segment into the key: it is hashed with the rest.
         assert_eq!(folded.len(), 3);
-        assert!(folded.iter().all(|(name, _)| !name.contains(':')));
         let key_a = crate::response::compute_cache_key(
             "tenant-a",
             "api.local",
@@ -401,13 +535,14 @@ mod tests {
     fn an_absent_dimension_is_not_the_same_as_an_empty_one_being_dropped() {
         // Collapsing "header absent" into "dimension not applied" would
         // let a client pick its cache bucket by omitting a header.
-        let CacheDecision::Plan(plan) = decode_cache_key(&json!({"vary": ["x-tier"]})).unwrap()
+        let CacheDecision::Plan(plan) =
+            decode_cache_key(&json!({"vary": ["header:x-tier"]})).unwrap()
         else {
             panic!("expected a plan");
         };
-        let absent = plan.fold_into_vary(|_| None);
-        let present = plan.fold_into_vary(|_| Some("gold".to_owned()));
-        assert_eq!(absent, vec![("x-tier".to_owned(), String::new())]);
+        let absent = plan.fold_into_vary(|name| name.to_owned(), |_| None);
+        let present = plan.fold_into_vary(|name| name.to_owned(), |_| Some("gold".to_owned()));
+        assert_eq!(absent, vec![("header:x-tier".to_owned(), String::new())]);
         assert_ne!(absent, present);
     }
 
@@ -467,6 +602,43 @@ mod tests {
     }
 
     #[test]
+    fn a_dimension_the_host_cannot_resolve_is_refused() {
+        // The bug this exists to stop: a bare `tenant` looks correct,
+        // resolves against nothing, contributes the same empty value to
+        // every request, and merges every caller into one cache entry.
+        // Refusing is the difference between a typo that fails loudly
+        // and a typo that serves one customer's response to another.
+        let error = decode_cache_key(&json!({"vary": ["x-tier"]})).unwrap_err();
+        assert_eq!(
+            error,
+            CacheEventError::UnknownVaryDimension {
+                name: "x-tier".to_owned()
+            }
+        );
+        assert!(
+            error.to_string().contains("header:"),
+            "the message must name the prefix that would have worked: {error}"
+        );
+        // A bare header prefix names no header.
+        assert!(decode_cache_key(&json!({"vary": ["header:"]})).is_err());
+    }
+
+    #[test]
+    fn the_host_dimensions_resolve_without_a_prefix() {
+        let CacheDecision::Plan(plan) =
+            decode_cache_key(&json!({"vary": CACHE_VARY_HOST_DIMENSIONS})).unwrap()
+        else {
+            panic!("every host dimension must be accepted");
+        };
+        let folded = plan.fold_into_vary(|name| format!("v-{name}"), |_| None);
+        assert_eq!(folded.len(), CACHE_VARY_HOST_DIMENSIONS.len());
+        assert!(
+            folded.iter().all(|(_, value)| value.starts_with("v-")),
+            "a host dimension must reach the host resolver, not the header one"
+        );
+    }
+
+    #[test]
     fn a_runaway_vary_list_is_refused() {
         let vary: Vec<_> = (0..MAX_CACHE_VARY_DIMENSIONS + 1)
             .map(|i| format!("d{i}"))
@@ -476,6 +648,52 @@ mod tests {
             Err(CacheEventError::TooManyVaryDimensions {
                 count: MAX_CACHE_VARY_DIMENSIONS + 1
             })
+        );
+    }
+
+    #[test]
+    fn one_client_controlled_dimension_is_accepted_with_unbounded_cardinality() {
+        // The failure this pins: MAX_CACHE_VARY_DIMENSIONS caps how many
+        // dimensions a plan carries, not how many keys those dimensions
+        // produce, and nothing on this path refuses a dimension whose
+        // value the client picks. A single accepted dimension, far under
+        // the cap, gives every request its own key. Every lookup then
+        // misses, every response is stored, and a bounded store evicts
+        // the entries that were earning their keep to make room for
+        // entries nothing will ask for twice. Nothing errors; the cache
+        // just stops being one, and the client drove it from outside.
+        //
+        // This is not a decoder bug, it is the limit of what the decoder
+        // can see. It is executable here so the cap's doc cannot drift
+        // back into claiming it bounds cache fan-out.
+        let CacheDecision::Plan(plan) =
+            decode_cache_key(&json!({"vary": ["header:x-request-id"]})).unwrap()
+        else {
+            panic!("a client-controlled header is still a resolvable dimension, so it is accepted");
+        };
+        assert_eq!(plan.vary.len(), 1, "one dimension, far under the cap");
+
+        // One policy, one request line, one header the caller chose.
+        let keys: std::collections::HashSet<String> = (0..64)
+            .map(|i| {
+                let folded =
+                    plan.fold_into_vary(|name| name.to_owned(), |_| Some(format!("req-{i}")));
+                crate::response::compute_cache_key(
+                    "tenant-a",
+                    "api.local",
+                    "GET",
+                    "/v1/thing",
+                    None,
+                    &crate::response::QueryMode::Sort,
+                    &folded,
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys.len(),
+            64,
+            "64 requests differing only in a client-set header produced 64 keys, so the cap \
+             bounds dimension count and not the number of cache entries a policy can create"
         );
     }
 

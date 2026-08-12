@@ -147,9 +147,16 @@ and never looks at the boolean inside it, so an operator who wrote
 `enable: false` to switch CORS off switched it on. A boot warning next
 to headers the proxy is already sending does not fix that.
 
-Three rows below name a value rather than a key, because only one of the
-accepted values misdescribed the build and the other agreed with it.
-Those three keys stay writable at the value the proxy actually does.
+Three of the rows below name a value rather than a key, because only one
+of the accepted values misdescribed the build and the other agreed with
+it. Those three keys stay writable at the value the proxy actually does.
+
+Two further rows name a value for a different reason. The response
+cache's `key_event` and `admit_event` take an inline script, and two of
+the engine names an operator might reach for cannot answer the event at
+all: one returns the wrong shape, the other is not inline source.
+Neither is inert, so neither is a warning. They are refused where every
+other engine mistake is caught, at config compile.
 
 | Key | Why it is refused | What to use instead |
 |---|---|---|
@@ -159,6 +166,8 @@ Those three keys stay writable at the value the proxy actually does.
 | `origins.*.forward_rules[].origin.hostname` | The request has already been matched to the parent origin by the time a rule fires, so this tag selected no upstream and changed no header. The inline origin's `action`, `request_modifiers`, and `id` are the only three fields anything reads. | The rule's own `origin.action.url`, to send the matched request to a different host. To label the rule, use `origin.id`, which does reach metrics and the emitted OpenAPI document. |
 | `origins.*.forward_rules[].origin.version` | The compiled child origin carries no version label, so the value reached neither routing, logs, metrics, nor the emitted OpenAPI document. | Match the version in the path instead (`rules: - path: { prefix: /v2/ }`). To version the rule for your own records, fold it into `origin.id`. |
 | `origins.*.forward_rules[].origin.workspace_id` | The compiled child origin has no workspace field, so nothing scoped, attributed, or logged a request by it. | `origins.*.tenant_id`, naming an id declared under `proxy.tenants[]`. That one is checked at compile and labels the request everywhere downstream. |
+| `origins.*.response_cache.key_event.engine: cel`, and the same value on `admit_event` | These events return a document, a list of key dimensions for `cache.key` and `store` plus `ttl_secs` for `cache.admit`, and CEL evaluates to a single scalar. Accepting it would mean a token grammar for packing a document into a string, which is what `route_to:gpt-4o-mini` already did once. | `lua` or `js`, which return documents natively. CEL keeps every surface where a scalar is the answer: `expression` and `assertion` policies, rate-limit and WAF keys, custom log fields, and the `cel` transform's header rules. |
+| `origins.*.response_cache.key_event.engine: wasm`, and the same value on `admit_event` | The field takes an inline `source`, and a compiled module is not inline source, so there was nothing for the engine to evaluate. | `lua` or `js` for an inline script. For a compiled hook, attach it through an [extension bundle](extension-bundles.md), which is the surface that gives a module a path, a version, and a load step. |
 | `origins.*.sessions.ttl_seconds` | There is no sessions index to retain. Sessions appear in the admin recent-request ring, which is bounded by entry count and evicts the oldest entry when full, so a session aged out on request volume and never on this deadline. | `sessions.budget.max_per_window` with `sessions.budget.window_seconds`, both enforced. |
 | `origins.*.traffic_capture` | No capture consumer exists. The block was accepted as an untyped value, so nothing validated its contents either and a misspelled field inside it looked exactly like a working setting. | `mirror`, which forwards a fire-and-forget copy of each request to a second upstream without delaying or failing the real one. |
 | `proxy.device_parser_file` | The device parser matches on compiled-in rules and has no code path that opens a catalog file, so a maintained catalog and a missing one behaved identically. | Nothing for device detection. `proxy.ai_providers_file` is the neighboring override that does work, and it applies to the AI provider catalog. |
@@ -281,7 +290,7 @@ them turns an `sbproxy plan` reload into a restart.
 | `allowed_methods` | - | array | `[]` (all) | **stable** | HTTP method allowlist. |
 | `forward_rules` | - | array | `[]` | **beta** | Conditional routing rules. The inline origin's `hostname`, `version`, and `workspace_id` metadata fields fail config load. |
 | `fallback_origin` | - | object | - | **beta** | Secondary origin on primary failure. |
-| `response_cache` | - | object | - | **beta** | Response caching config. |
+| `response_cache` | - | object | - | **beta** | Response caching config. The `key_event` and `admit_event` decision events inside it are **alpha**, and an `engine` of `cel` or `wasm` on either fails config load. |
 | `variables` | - | object | `{}` | **beta** | Named template variables. |
 | `on_request` | - | array | `[]` | **alpha** | Request event hook plugins. |
 | `on_response` | - | array | `[]` | **alpha** | Response event hook plugins. |
@@ -342,6 +351,19 @@ quality 4).
 | `secure` | - | boolean | false | **beta** |
 | `same_site` | `cookie_same_site` | string | - | **beta** |
 | `allow_non_ssl` | - | boolean | false | **beta** |
+
+### Response Cache (`response_cache:`)
+
+The block is **beta** in the origin table above. The two decision events
+are newer than the rest of it and their document shapes have not been
+through a release yet, so they are tiered separately.
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `key_event` | object | - | **alpha** | Request-side `cache.key` script: `source` plus `engine`. Returns the dimensions folded into the cache key. |
+| `admit_event` | object | - | **alpha** | Response-side `cache.admit` script, same shape. Returns whether the response is stored and for how long. |
+| `key_event.engine`, `admit_event.engine` | string | required | **alpha** | `lua` or `js`. `cel` and `wasm` fail config load; see the refusal rows above. |
+| `key_event.source`, `admit_event.source` | string | required | **alpha** | Inline script body. An empty one fails config load. |
 
 ### Request Modifier (`request_modifiers[]`)
 
