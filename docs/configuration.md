@@ -3613,7 +3613,7 @@ origins:
 |-------|------|-------------|
 | `vary` | list | Extra dimensions folded into the cache key, added to the static `vary:` list of request headers. At most 16. |
 | `skip_lookup` | bool | Go upstream for this request instead of reading the cache. The response stays eligible for storage. |
-| `reason` | string | Why this plan. Recorded with the decision rather than only in a debug line. Truncated at 512 bytes. |
+| `reason` | string | Free text explaining the plan, trimmed and truncated at 512 bytes. Carried with the decision; nothing branches on it. |
 
 `admit_event` returns:
 
@@ -3621,7 +3621,7 @@ origins:
 |-------|------|-------------|
 | `store` | bool | Required. Whether this response is written to the cache. |
 | `ttl_secs` | int | TTL for this entry, replacing the configured `ttl_secs`. Clamped to 30 days. |
-| `reason` | string | Why this plan. Same handling as above. |
+| `reason` | string | Same free text, same bounds. |
 
 Every field on a `key_event` document is optional, and `{}` or `null` declines, which leaves the static `vary:` in charge. `admit_event` declines the same two ways, but any other document has to carry `store`. There is no safe default for that one: guessing `true` caches a response the policy never approved, and guessing `false` silently switches the cache off, so a non-empty document without `store` is refused as incomplete rather than assumed either way.
 
@@ -3641,7 +3641,9 @@ Two engines are refused at config compile, on boot and on reload, rather than at
 - `engine: cel`, because these events return a document (a list of key dimensions, or `store` plus `ttl_secs`) and CEL evaluates to a single scalar. Supporting it would mean a token grammar for packing a document into a string. The error names `lua` and `js`, which return documents natively.
 - `engine: wasm`, because a compiled module is not inline source. Attach a WASM hook through an [extension bundle](extension-bundles.md) instead.
 
-Sandbox budgets, the engine surfaces, and worked scripts are in [scripting.md](scripting.md). Each evaluation is counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, with faults also counted on `sbproxy_decision_event_fail_open_total`; see [observability.md](observability.md).
+An `admit_event` next to a non-zero `stale_while_revalidate` is refused for a third reason: the two do not compose yet. The revalidation refresh runs in the background with no request context, so it cannot evaluate the event, and it writes back with the static `ttl_secs` and the `cacheable_status` gate alone. A TTL override would last until the first refresh, and a response the event refused would be written by the refresh anyway. Config compile fails naming both keys; drop one of the two.
+
+Sandbox budgets, the engine surfaces, and worked scripts are in [scripting.md](scripting.md). Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose. `cache.admit` genuinely fails open, so a fault records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`. `cache.key` fails closed on the cache, so a fault records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, and no fail-open counter: counting it there would report the opposite of what happened. See [observability.md](observability.md).
 
 ### Choosing the backing store
 

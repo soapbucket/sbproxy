@@ -361,7 +361,7 @@ through a release yet, so they are tiered separately.
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
 | `key_event` | object | - | **alpha** | Request-side `cache.key` script: `source` plus `engine`. Returns the dimensions folded into the cache key. |
-| `admit_event` | object | - | **alpha** | Response-side `cache.admit` script, same shape. Returns whether the response is stored and for how long. |
+| `admit_event` | object | - | **alpha** | Response-side `cache.admit` script, same shape. Returns whether the response is stored and for how long. Refused alongside a non-zero `stale_while_revalidate`, which the background refresh cannot evaluate it against. |
 | `key_event.engine`, `admit_event.engine` | string | required | **alpha** | `lua` or `js`. `cel` and `wasm` fail config load; see the refusal rows above. |
 | `key_event.source`, `admit_event.source` | string | required | **alpha** | Inline script body. An empty one fails config load. |
 

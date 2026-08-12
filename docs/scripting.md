@@ -872,7 +872,7 @@ Lua returns the document (`return { ... }`); JavaScript evaluates to it, so wrap
 |---|---|---|
 | `vary` | list of strings | Dimensions folded into the cache key, added to the origin's static `vary:`. At most 16, each at most 128 bytes. |
 | `skip_lookup` | bool | Go upstream for this request rather than reading the cache. The response stays eligible for storage. |
-| `reason` | string | Why. Recorded with the decision rather than only in a debug line. Truncated at 512 bytes. |
+| `reason` | string | Free text explaining the plan, trimmed and truncated at 512 bytes. Carried with the decision; nothing branches on it. |
 
 `admit_event`:
 
@@ -880,7 +880,7 @@ Lua returns the document (`return { ... }`); JavaScript evaluates to it, so wrap
 |---|---|---|
 | `store` | bool | Required. Whether this response is written to the cache. |
 | `ttl_secs` | int | TTL for this entry, replacing the configured `ttl_secs`. Clamped to 30 days. |
-| `reason` | string | Why. Same handling as above. |
+| `reason` | string | Same free text, same bounds. |
 
 Declining is the cheap common case and means "the static config applies unchanged": `return {}` or `return nil` in Lua, an empty object or nothing at all in JavaScript. A `key_event` document with no `vary` and no `skip_lookup` declines too. `admit_event` is the one exception to everything being optional: any document that is not empty has to carry `store`, because there is no safe default for it. Guessing `true` caches a response the policy never approved, and guessing `false` switches the cache off without saying so.
 
@@ -896,7 +896,9 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **`admit_event` runs downstream of `cacheable_status`.** It only sees a response whose status already passed that gate, so it can decline a status the gate allows and cannot start caching one the gate excludes.
 
-Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation, and both are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`; faults land on `sbproxy_decision_event_fail_open_total` as well. Field-level reference for the block is in [configuration.md](configuration.md#response-cache).
+**`admit_event` and `stale_while_revalidate` do not compose.** The revalidation refresh runs in the background with no request context, so it cannot evaluate the event and would write back with the static `ttl_secs`, reverting both the override and any refusal. Setting both on one origin fails config compile until the refresh can carry the event's context.
+
+Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation. Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose: `cache.admit` fails open, so it records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`, while `cache.key` fails closed on the cache and records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, with no fail-open counter. The field-level reference for the block is in [configuration.md](configuration.md#response-cache).
 
 ---
 
@@ -1063,7 +1065,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | `response_cache.key_event` | An `engine` of `cel` or `wasm`, any other unknown engine, or an empty `source` fails config compile; an engine fault or a document that cannot be decoded is logged and bypasses the cache for that request, with no read and no write |
-| `response_cache.admit_event` | The same config-compile checks; an engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
+| `response_cache.admit_event` | The same config-compile checks, plus a refusal when the origin also sets `stale_while_revalidate`; an engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
 | JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
 | Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |
