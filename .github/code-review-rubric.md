@@ -249,7 +249,7 @@ absence of a finding is visible rather than ambiguous.
 ```markdown
 ### Review notes
 
-**Blocker / Major / Minor** — `path/to/file.rs:LINE` — one-line claim.
+**Blocker / Major / Minor** - `path/to/file.rs:LINE` - one-line claim.
 Failure scenario: concrete inputs or state, and what goes wrong.
 
 ### Checked and sound

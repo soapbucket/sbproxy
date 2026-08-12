@@ -50,7 +50,7 @@
 //! by [`RoutePlan::from_route_to`]. CEL keeps working, expresses exactly
 //! what it could always express, and the document engines get the rest.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Upper bound on candidates in one plan.
 ///
@@ -58,6 +58,16 @@ use serde::{Deserialize, Serialize};
 /// as a memory one. Eight is past any real fallback chain and well short
 /// of a policy bug that returns the whole provider catalog.
 pub const MAX_ROUTE_CANDIDATES: usize = 8;
+
+/// Upper bound on a model or provider id, in bytes.
+///
+/// These are the strings that *leave* this module: `model` reaches the
+/// request body sent upstream, the access log, and the `model` metric
+/// label, whose accepted values the cardinality limiter retains for the
+/// process lifetime. An unbounded name is therefore retained memory that
+/// no scrape or reload releases, which is a worse failure than the
+/// bounded `reason` this module was already careful about.
+pub const MAX_ROUTE_NAME_BYTES: usize = 256;
 
 /// Upper bound on a `reason` string, in bytes.
 ///
@@ -70,7 +80,7 @@ pub const MAX_ROUTE_REASON_BYTES: usize = 512;
 /// Mirrors [`crate::routing::CascadeTier`] deliberately: a plan should
 /// be able to express what the built-in cascade already expresses, or it
 /// is again less capable than the thing it extends.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RouteCandidate {
     /// Name of the provider in `AiHandlerConfig::providers`.
     pub provider_id: String,
@@ -84,19 +94,35 @@ pub struct RouteCandidate {
 }
 
 /// An ordered routing plan plus the reason it was chosen.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct RoutePlan {
     /// Candidates in preference order. Never empty: an empty list is a
     /// decline, which is a different thing and has its own variant.
     pub candidates: Vec<RouteCandidate>,
     /// Why this plan was chosen.
     ///
-    /// Not decoration. It is what makes a routing decision diagnosable,
-    /// and it reaches the access log, the routing metric, and the audit
-    /// record rather than only a debug line. `release_max_level_info`
-    /// compiles `debug!` out of release builds, so a reason that lives
-    /// only in a debug line does not exist where an operator needs it.
-    #[serde(default)]
+    /// Not decoration: it is what makes a routing decision diagnosable,
+    /// and `release_max_level_info` compiles `debug!` out of release
+    /// builds, so a reason that lives only in a debug line does not
+    /// exist where an operator needs it.
+    ///
+    /// **Its destination is the audit record, not a metric label.** This
+    /// is operator- or guest-authored free text, so as a label value it
+    /// is an unbounded-cardinality primitive: it would burn the label's
+    /// whole budget with distinct strings and pin every accepted one in
+    /// the limiter for the process lifetime.
+    ///
+    /// **It must go through the redactor before it is emitted anywhere.**
+    /// A hook is free to explain itself with
+    /// `"prompt looked like " + prompt.slice(0, 100)`, and nothing on
+    /// this path scrubs that today, which is why
+    /// [`sbproxy_observe::decision::DecisionAudit`] documents `reason` as
+    /// already-redacted on arrival.
+    ///
+    /// Nothing reads this field yet. The routing event records its
+    /// outcome but not its reason, so wiring it to the audit record is
+    /// outstanding rather than done.
     pub reason: String,
 }
 
@@ -176,6 +202,7 @@ pub enum RouteDecision {
 
 /// Why a returned routing document was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RouteEventError {
     /// The document was not an object.
     NotAnObject,
@@ -190,6 +217,19 @@ pub enum RouteEventError {
     TooManyCandidates {
         /// How many were returned.
         count: usize,
+    },
+    /// A candidate field had the wrong JSON type.
+    CandidateFieldType {
+        /// Position of the offending candidate.
+        index: usize,
+        /// Which field.
+        field: &'static str,
+    },
+    /// A candidate's model or provider id exceeded
+    /// [`MAX_ROUTE_NAME_BYTES`].
+    CandidateNameTooLong {
+        /// Position of the offending candidate.
+        index: usize,
     },
     /// A candidate named a provider that is not configured.
     UnknownProvider {
@@ -213,6 +253,15 @@ impl std::fmt::Display for RouteEventError {
             Self::TooManyCandidates { count } => write!(
                 f,
                 "route.decide returned {count} candidates, the cap is {MAX_ROUTE_CANDIDATES}"
+            ),
+            Self::CandidateFieldType { index, field } => write!(
+                f,
+                "route.decide candidate {index} has a wrongly typed `{field}`"
+            ),
+            Self::CandidateNameTooLong { index } => write!(
+                f,
+                "route.decide candidate {index} has a model or provider id over \
+                 {MAX_ROUTE_NAME_BYTES} bytes"
             ),
             Self::UnknownProvider { provider_id } => write!(
                 f,
@@ -266,20 +315,46 @@ pub fn decode_route_plan(value: &serde_json::Value) -> Result<RouteDecision, Rou
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .ok_or(RouteEventError::CandidateMissingModel { index })?;
-        let provider_id = entry
-            .get("provider_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        // A threshold outside 0.0..=1.0 is a policy bug rather than a
-        // refusal-worthy one: clamp it and let the plan run. Refusing
-        // the whole plan over a malformed optional field would send the
-        // request to the built-in strategy, which is a bigger behavior
-        // change than the operator asked for.
-        let quality_threshold = entry
-            .get("quality_threshold")
-            .and_then(serde_json::Value::as_f64)
-            .map(|value| value.clamp(0.0, 1.0) as f32);
+        // A wrong-typed `provider_id` must not silently become the empty
+        // "resolve from the model" sentinel: that would turn a malformed
+        // provider into an opt-out of the provider check rather than a
+        // failure of it.
+        let provider_id = match entry.get("provider_id") {
+            None | Some(serde_json::Value::Null) => "",
+            Some(serde_json::Value::String(provider)) => provider.trim(),
+            Some(_) => {
+                return Err(RouteEventError::CandidateFieldType {
+                    index,
+                    field: "provider_id",
+                })
+            }
+        };
+        if model.len() > MAX_ROUTE_NAME_BYTES || provider_id.len() > MAX_ROUTE_NAME_BYTES {
+            return Err(RouteEventError::CandidateNameTooLong { index });
+        }
+        // A threshold *outside* 0.0..=1.0 is a policy bug rather than a
+        // refusal-worthy one: clamp it and let the plan run. A
+        // wrong-*typed* one is different and is refused, because
+        // dropping it to `None` reads as "accepts any response", so a
+        // quality gate the operator wrote silently becomes no gate. A
+        // stringified number is the ordinary way a Lua or JS bridge
+        // produces this.
+        //
+        // `as_f64` cannot yield NaN: `serde_json::Number` has no
+        // non-finite representation and `arbitrary_precision` is off, so
+        // `clamp` never sees the one input that would pass NaN through.
+        let quality_threshold = match entry.get("quality_threshold") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(number)) => {
+                number.as_f64().map(|value| value.clamp(0.0, 1.0) as f32)
+            }
+            Some(_) => {
+                return Err(RouteEventError::CandidateFieldType {
+                    index,
+                    field: "quality_threshold",
+                })
+            }
+        };
         candidates.push(RouteCandidate {
             provider_id: provider_id.to_owned(),
             model: model.to_owned(),
@@ -440,6 +515,62 @@ mod tests {
     }
 
     #[test]
+    fn a_wrongly_typed_field_is_refused_rather_than_coerced() {
+        // Dropping a bad `quality_threshold` to `None` reads as "accepts
+        // any response", so a quality gate the operator wrote silently
+        // becomes no gate. A stringified number is what a Lua or JS
+        // bridge produces when anything on the path stringifies.
+        assert_eq!(
+            decode_route_plan(&json!({
+                "candidates": [{"model": "m", "quality_threshold": "0.8"}]
+            })),
+            Err(RouteEventError::CandidateFieldType {
+                index: 0,
+                field: "quality_threshold"
+            })
+        );
+        // A wrongly typed provider is worse: coerced to the empty string
+        // it becomes the "resolve from the model" sentinel, so it would
+        // opt out of the provider check rather than fail it.
+        assert_eq!(
+            decode_route_plan(&json!({
+                "candidates": [{"model": "m", "provider_id": 42}]
+            })),
+            Err(RouteEventError::CandidateFieldType {
+                index: 0,
+                field: "provider_id"
+            })
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_is_absent_rather_than_wrongly_typed() {
+        // JSON encoders emit null for an absent optional constantly, so
+        // refusing it would reject documents nobody considers malformed.
+        let RouteDecision::Plan(plan) = decode_route_plan(&json!({
+            "candidates": [{"model": "m", "provider_id": null, "quality_threshold": null}]
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        assert_eq!(plan.candidates[0].provider_id, "");
+        assert_eq!(plan.candidates[0].quality_threshold, None);
+    }
+
+    #[test]
+    fn a_runaway_model_name_is_refused_before_it_leaves_the_module() {
+        // `model` reaches the upstream request body, the access log, and
+        // the `model` metric label, whose accepted values the cardinality
+        // limiter retains for the process lifetime. An unbounded name is
+        // retained memory nothing releases.
+        let long = "x".repeat(MAX_ROUTE_NAME_BYTES + 1);
+        assert_eq!(
+            decode_route_plan(&json!({"candidates": [{"model": long}]})),
+            Err(RouteEventError::CandidateNameTooLong { index: 0 })
+        );
+    }
+
+    #[test]
     fn a_runaway_plan_is_capped() {
         let candidates: Vec<_> = (0..MAX_ROUTE_CANDIDATES + 1)
             .map(|i| json!({"model": format!("m{i}")}))
@@ -583,9 +714,11 @@ mod tests {
 
     #[test]
     fn an_overlong_reason_is_truncated_on_a_character_boundary() {
-        // The reason becomes a metric label and an audit field, so it is
-        // bounded at the edge rather than at each consumer.
-        let reason = "\u{00e9}".repeat(MAX_ROUTE_REASON_BYTES);
+        // A 3-byte character on purpose. With a 2-byte one the cap
+        // divides evenly, `is_char_boundary` is already true, the
+        // back-up loop never executes, and the test passes against a
+        // naive `reason[..CAP]` that would panic here.
+        let reason = "\u{20ac}".repeat(MAX_ROUTE_REASON_BYTES);
         let RouteDecision::Plan(plan) = decode_route_plan(&json!({
             "candidates": [{"model": "a"}],
             "reason": reason,
@@ -593,9 +726,13 @@ mod tests {
         .unwrap() else {
             panic!("expected a plan");
         };
-        assert!(plan.reason.len() <= MAX_ROUTE_REASON_BYTES);
+        assert_eq!(
+            plan.reason.len(),
+            MAX_ROUTE_REASON_BYTES - (MAX_ROUTE_REASON_BYTES % 3),
+            "truncation must back up to the nearest character boundary"
+        );
         assert!(
-            plan.reason.chars().all(|c| c == '\u{00e9}'),
+            plan.reason.chars().all(|c| c == '\u{20ac}'),
             "truncation must not split a character"
         );
     }

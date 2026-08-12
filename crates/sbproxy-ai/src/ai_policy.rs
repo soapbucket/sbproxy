@@ -105,6 +105,17 @@ impl AiPolicyAction {
 pub struct AiPolicyDecision {
     /// The actions emitted, in expression order.
     pub actions: Vec<AiPolicyAction>,
+    /// True when these actions came from `on_error` rather than from the
+    /// expression evaluating successfully.
+    ///
+    /// The request proceeded *without the policy's decision being made*,
+    /// which is a fail-open and is a different operational fact from a
+    /// policy that ran and had no opinion. Without this flag the two are
+    /// indistinguishable downstream: an expression that dereferences a
+    /// field which is null for some traffic would raise the ordinary
+    /// decline count and leave the fail-open counter reading zero, so the
+    /// only trace of a half-broken policy would be a log line.
+    pub fail_open: bool,
 }
 
 impl AiPolicyDecision {
@@ -381,6 +392,7 @@ impl CompiledAiPolicy {
     fn on_error_decision(&self) -> AiPolicyDecision {
         AiPolicyDecision {
             actions: self.on_error.clone(),
+            fail_open: true,
         }
     }
 
@@ -392,7 +404,10 @@ impl CompiledAiPolicy {
         ctx.set("ai", view.to_cel());
         match self.engine.eval(&self.expr, &ctx) {
             Ok(CelValue::String(s)) => match AiPolicyAction::parse(&s) {
-                Ok(a) => AiPolicyDecision { actions: vec![a] },
+                Ok(a) => AiPolicyDecision {
+                    actions: vec![a],
+                    fail_open: false,
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "ai_policy: unrecognized action token; using on_error");
                     self.on_error_decision()
@@ -421,7 +436,10 @@ impl CompiledAiPolicy {
                 if actions.is_empty() {
                     actions.push(AiPolicyAction::Allow);
                 }
-                AiPolicyDecision { actions }
+                AiPolicyDecision {
+                    actions,
+                    fail_open: false,
+                }
             }
             Ok(other) => {
                 tracing::warn!(
