@@ -52,6 +52,47 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError};
 
+/// Prefix of the export a module uses to declare its envelope ABI.
+///
+/// The major version is encoded in the export **name**, so
+/// `sbproxy_envelope_abi_v1` declares major 1.
+const ENVELOPE_ABI_EXPORT_PREFIX: &str = "sbproxy_envelope_abi_v";
+
+/// The export name this host serves.
+const ENVELOPE_ABI_EXPORT: &str = "sbproxy_envelope_abi_v1";
+
+/// Whether a module declares an envelope ABI at all, and whether the one
+/// it declares is the one this host serves.
+///
+/// Returns `(declares_any, declares_ours)`.
+///
+/// **Why the version is in the name rather than in an i32 global.** OPA
+/// exports `opa_wasm_abi_version` as a global, and that is the shape
+/// WOR-2364 item 4 pointed at. It is not available to us: wasmtime does
+/// not expose a global's initializer through `Module`, so reading the
+/// value would require instantiating, and
+/// `envelope_wasm_load_validation_does_not_execute_the_core_start` pins
+/// that load validation must not instantiate. A module whose core
+/// `start` section traps has to load cleanly and fail at call time.
+///
+/// Encoding the version in the export name keeps the property that
+/// mattered, that the claim lives in the artifact rather than in the
+/// manifest beside it, and it stays readable by `wasm-objdump` before
+/// instantiation, which was OPA's actual goal.
+fn module_abi_declaration(module: &Module) -> (bool, bool) {
+    let mut declares_any = false;
+    let mut declares_ours = false;
+    for export in module.exports() {
+        if export.name().starts_with(ENVELOPE_ABI_EXPORT_PREFIX) {
+            declares_any = true;
+            if export.name() == ENVELOPE_ABI_EXPORT {
+                declares_ours = true;
+            }
+        }
+    }
+    (declares_any, declares_ours)
+}
+
 /// Per-invocation cap on captured WASM stderr, in bytes.
 const STDERR_CAPTURE_LIMIT: usize = 1024 * 1024;
 
@@ -354,6 +395,8 @@ pub(crate) enum WasmLoadFailure {
     InvalidModule,
     InvalidImports,
     InvalidStart,
+    /// The module exports an ABI version this host does not serve.
+    AbiMismatch,
     RuntimeUnavailable,
 }
 
@@ -363,6 +406,7 @@ impl WasmLoadFailure {
             Self::InvalidModule => "invalid_module",
             Self::InvalidImports => "invalid_imports",
             Self::InvalidStart => "invalid_start",
+            Self::AbiMismatch => "abi_mismatch",
             Self::RuntimeUnavailable => "runtime_unavailable",
         }
     }
@@ -924,6 +968,29 @@ fn prepare_bundle_instance(
         _ => return Err(WasmLoadFailure::InvalidStart),
     }
 
+    // WOR-2364 item 4: trust the artifact over the file beside it.
+    //
+    // The manifest carries `abi: sbproxy-envelope/v1`, and a manifest
+    // sits next to the module rather than inside it, so it can be wrong:
+    // a module built against a future ABI with a hand-edited manifest
+    // loads clean and fails at first call, with an error that does not
+    // name the cause. OPA solved this by exporting the ABI version as an
+    // i32 global that `wasm-objdump` can read before instantiation.
+    //
+    // Declaring it is optional, because every bundle in the field
+    // predates this and refusing them would be a breaking change for a
+    // check that is meant to catch a mistake rather than create one. A
+    // module that *does* declare it is held to it.
+    //
+    // Major and minor are split the way OPA splits them: a minor bump is
+    // backward compatible, so a module built for an older minor of the
+    // same major still loads. That is what lets an envelope field be
+    // added without invalidating existing bundles.
+    let (declares_any_abi, declares_our_abi) = module_abi_declaration(module);
+    if declares_any_abi && !declares_our_abi {
+        return Err(WasmLoadFailure::AbiMismatch);
+    }
+
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut EnvelopeHostState| {
         &mut state.wasi
@@ -1316,6 +1383,48 @@ mod tests {
     fn envelope_wasm_rejects_blocking_wasi_poll_at_load_time() {
         let result = WasmRuntime::from_bundle_bytes(POLL_ONEOFF_WASM, envelope_limits());
         assert!(matches!(result, Err(WasmLoadFailure::InvalidImports)));
+    }
+
+    #[test]
+    fn a_module_declaring_a_foreign_abi_is_refused_at_load() {
+        // WOR-2364 item 4: trust the artifact over the file beside it.
+        // The manifest's `abi:` sits next to the module and can be
+        // hand-edited to claim anything, so a module built against a
+        // future ABI used to load clean and fail at first call with an
+        // error that did not name the cause.
+        const ABI_V9_WASM: &[u8] = include_bytes!("../bundle/testdata/wasm/abi-v9.wasm");
+        assert_eq!(
+            WasmRuntime::from_bundle_bytes(ABI_V9_WASM, envelope_limits()).err(),
+            Some(WasmLoadFailure::AbiMismatch),
+            "a declared ABI this host does not serve must fail at load, not at first call"
+        );
+    }
+
+    #[test]
+    fn a_module_declaring_our_abi_loads_and_runs() {
+        // The refusal must not be satisfiable by refusing every module
+        // that declares anything.
+        const ABI_V1_WASM: &[u8] = include_bytes!("../bundle/testdata/wasm/abi-v1.wasm");
+        let runtime = WasmRuntime::from_bundle_bytes(ABI_V1_WASM, envelope_limits())
+            .expect("a module declaring the served ABI must load");
+        assert_eq!(
+            runtime.execute_bounded(b"{}").unwrap(),
+            br#"{"version":"sbproxy-envelope/v1","decision":"release"}"#
+        );
+    }
+
+    #[test]
+    fn a_module_declaring_nothing_still_loads() {
+        // Declaring is optional. Every bundle in the field predates this
+        // check, and refusing them would make a guard meant to catch a
+        // mistake into one that creates a breaking change.
+        const FRESH_GLOBAL_WASM: &[u8] =
+            include_bytes!("../bundle/testdata/wasm/fresh-global.wasm");
+        let runtime = WasmRuntime::from_bundle_bytes(FRESH_GLOBAL_WASM, envelope_limits());
+        assert!(
+            runtime.is_ok(),
+            "an undeclared module must keep loading; the check is opt-in by construction"
+        );
     }
 
     #[test]
