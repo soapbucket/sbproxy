@@ -4004,11 +4004,11 @@ pub(super) async fn request_filter(
 
                 // WOR-2407: refuse an entry another config stored.
                 // The key already carries this origin's fingerprint, so
-                // under an exact-keyed backend this cannot fire. Under
-                // memcached, which hashes every key to fit its 250-byte
-                // limit, a lookup matches a digest rather than the key,
-                // and this is what stops the collision from being
-                // served. Counted apart from an ordinary miss so a
+                // under an exact-keyed backend this cannot fire. It can
+                // on the two that match a digest of the key rather than
+                // the key: memcached hashes to fit its 250-byte limit,
+                // and the file store names entries by the SHA-256 of
+                // the key. Counted apart from an ordinary miss so a
                 // rolling change reads as a rollout on the dashboard
                 // rather than as a cache that went cold unexplained.
                 let hit = match hit {

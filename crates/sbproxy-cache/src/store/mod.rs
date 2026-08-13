@@ -41,10 +41,12 @@ pub struct CachedResponse {
     /// (WOR-2407).
     ///
     /// The same value the entry's key carries as its last segment, so
-    /// under an exact-keyed backend this is redundant by construction.
-    /// It is stamped anyway for the backend where it is not: memcached
-    /// hashes every key to fit the protocol's 250-byte limit, so a
-    /// lookup there matches a digest of the key rather than the key.
+    /// under an exact-keyed backend (memory, redis) this is redundant
+    /// by construction. It is stamped anyway for the two backends where
+    /// it is not: memcached hashes every key to fit the protocol's
+    /// 250-byte limit, and the file store names each entry by the
+    /// SHA-256 of its key. A lookup on either matches a digest of the
+    /// key rather than the key itself.
     ///
     /// Empty on entries written before this field existed, which
     /// [`CachedResponse::serves_config`] treats as "no opinion" rather
@@ -287,7 +289,7 @@ mod tests {
         // The key already partitions on the fingerprint, so this only
         // fires where the backend matches a digest of the key rather
         // than the key itself: memcached hashes to fit its 250-byte
-        // limit.
+        // limit, and the file store hashes into a filename.
         assert!(
             !entry_stamped("00112233445566ff").serves_config("ffee5544332211a0"),
             "an entry written under another config must not be served"
