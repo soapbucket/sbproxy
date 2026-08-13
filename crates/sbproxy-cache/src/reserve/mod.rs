@@ -105,6 +105,10 @@ impl ReserveMetadata {
             body: body.to_vec(),
             cached_at,
             ttl_secs,
+            // The reserve manifest carries no fingerprint. The key this
+            // entry is recomposed under already does, so unstamped is
+            // the honest value rather than a guess.
+            config_fp: String::new(),
         }
     }
 }
@@ -188,6 +192,7 @@ mod tests {
             body: br#"{"version":1}"#.to_vec(),
             cached_at: 10,
             ttl_secs: 60,
+            config_fp: String::new(),
         };
 
         let metadata =

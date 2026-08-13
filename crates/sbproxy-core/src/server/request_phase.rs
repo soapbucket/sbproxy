@@ -4002,6 +4002,35 @@ pub(super) async fn request_filter(
                     })?
                 };
 
+                // WOR-2407: refuse an entry another config stored.
+                // The key already carries this origin's fingerprint, so
+                // under an exact-keyed backend this cannot fire. Under
+                // memcached, which hashes every key to fit its 250-byte
+                // limit, a lookup matches a digest rather than the key,
+                // and this is what stops the collision from being
+                // served. Counted apart from an ordinary miss so a
+                // rolling change reads as a rollout on the dashboard
+                // rather than as a cache that went cold unexplained.
+                let hit = match hit {
+                    Ok(Some(entry))
+                        if !entry
+                            .serves_config(origin.cache_config_fingerprint.as_str()) =>
+                    {
+                        sbproxy_observe::metrics::record_cache(
+                            origin.origin_id.as_ref(),
+                            "config_miss",
+                        );
+                        tracing::debug!(
+                            origin = %origin.origin_id,
+                            stored = %entry.config_fp,
+                            current = %origin.cache_config_fingerprint,
+                            "cache entry belongs to another config revision; treating as a miss"
+                        );
+                        Ok(None)
+                    }
+                    other => other,
+                };
+
                 match hit {
                     Ok(Some(entry)) => {
                         let now = std::time::SystemTime::now()

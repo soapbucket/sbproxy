@@ -1468,6 +1468,11 @@ fn spawn_swr_revalidation(
             body,
             cached_at: refreshed_at,
             ttl_secs,
+            // WOR-2407: a refresh replaces the exact entry it observed,
+            // under the same key, so it inherits that entry's config
+            // identity rather than re-deriving one. `compare_and_swap`
+            // compares against `stale_entry`, so the two must agree.
+            config_fp: stale_entry.config_fp.clone(),
         };
         // Write-back goes through spawn_blocking for the same reason
         // the live path does: blocking I/O for the Redis backend.

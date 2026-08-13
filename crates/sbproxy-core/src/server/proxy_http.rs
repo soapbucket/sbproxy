@@ -5193,6 +5193,15 @@ impl ProxyHttp for SbProxy {
                         .and_then(|idx| pipeline_for_write.config.origins.get(idx))
                         .map(|o| o.origin_id.to_string())
                         .unwrap_or_default();
+                    // WOR-2407: stamp the config this entry belongs to.
+                    // Redundant against the key on an exact-keyed
+                    // backend, load bearing on memcached, which matches
+                    // a digest of the key rather than the key.
+                    let write_config_fp = ctx
+                        .origin_idx
+                        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
+                        .map(|o| o.cache_config_fingerprint.to_string())
+                        .unwrap_or_default();
                     // `admit.store` gates the write and nothing else.
                     // Returning early here would skip the idempotency
                     // capture further down this same filter, so the event
@@ -5212,6 +5221,7 @@ impl ProxyHttp for SbProxy {
                                 .unwrap_or_default()
                                 .as_secs(),
                             ttl_secs: ttl,
+                            config_fp: write_config_fp,
                         };
                         // --- Cache Reserve admission ---
                         // Mirror into the cold tier subject to the
