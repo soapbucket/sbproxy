@@ -94,6 +94,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "access_log.output.type",
         "sbproxy_core::server::access_log::emit_access_log",
     ),
+    // Read cross-crate: `compile_single_forward_rule` in sbproxy-core
+    // pulls it off the serde_json value rather than off the typed
+    // struct, which is the shape this guard cannot see.
+    stable(
+        "origins.*.forward_rules[].rules[].when",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
     config_only(
         "agent_classes.hosted_feed.bootstrap_keys[]",
         "No fetcher exists for a hosted agent-class feed, and no signature check is installed \

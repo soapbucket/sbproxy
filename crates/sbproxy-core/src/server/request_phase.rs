@@ -4444,6 +4444,24 @@ pub(super) async fn request_filter(
         // forward rules to match against.
         let request_path = session.req_header().uri.path().to_string();
         let request_query = session.req_header().uri.query().map(|q| q.to_string());
+        // Built once for the whole rule set, and only when some entry
+        // actually declares a `when`. Routing runs on every request, so
+        // an origin with no predicate must not pay to assemble a CEL
+        // context it will never read.
+        let cel_ctx = fwd_rules
+            .iter()
+            .flat_map(|rule| rule.matchers.iter())
+            .any(|entry| entry.when.is_some())
+            .then(|| {
+                sbproxy_extension::cel::context::build_request_context(
+                    session.req_header().method.as_str(),
+                    &request_path,
+                    &session.req_header().headers,
+                    request_query.as_deref(),
+                    ctx.client_ip.map(|ip| ip.to_string()).as_deref(),
+                    &ctx.hostname,
+                )
+            });
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
             // Each `MatcherEntry` ANDs method/path/header/query/body;
             // entries in the list are ORed. `match_request_with_body`
@@ -4458,6 +4476,7 @@ pub(super) async fn request_filter(
                     request_query.as_deref(),
                     request_headers,
                     matched_body.as_deref(),
+                    cel_ctx.as_ref(),
                 )
             });
             if let Some(params) = captured {

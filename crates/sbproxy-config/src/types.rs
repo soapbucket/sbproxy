@@ -7547,6 +7547,20 @@ pub struct ForwardRuleMatcher {
     /// are the same matcher.
     #[serde(default)]
     pub method: Option<MethodSpec>,
+
+    /// CEL predicate ANDed with the structured matchers above.
+    ///
+    /// Exists for the conditions the structured fields cannot express:
+    /// OR, negation, and comparisons across two parts of the request.
+    /// It is evaluated last, only once every structured matcher in the
+    /// entry has already passed, so a rule that fails on a cheap path
+    /// check never pays for it.
+    ///
+    /// The bindings available here are the request as it arrived, and
+    /// nothing that a later pipeline pass produces. See
+    /// `docs/scripting.md`.
+    #[serde(default)]
+    pub when: Option<String>,
 }
 
 /// HTTP method spec for a [`ForwardRuleMatcher`]. Either a single method

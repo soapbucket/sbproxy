@@ -58,7 +58,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 
 Two AI-gateway surfaces are deliberately not free-form scripting: the `ai_policy` block is a single CEL expression over gateway-computed signals ([ai-policy-cel.md](ai-policy-cel.md)), and guardrails are typed `guardrails: input:` / `output:` blocks (`injection`, `pii`, `jailbreak`, `toxicity`, `schema`, ...) documented in [ai-gateway.md](ai-gateway.md).
 
-Forward rules are not a scripting surface. A forward rule matches with declarative matchers only (path, header, query); see section 3.5 for the shapes, and use an `expression` policy when you need a scripted request gate.
+Forward rules match with declarative matchers first (method, path, header, query, body) and may add a CEL `when:` predicate for the conditions those cannot express. See section 3.5 for the shapes and [3.2](#32-what-each-config-site-offers) for what a `when:` can read.
 
 ---
 
@@ -205,29 +205,29 @@ Within a populated namespace, missing fields render as zero values (`""`, `0`, `
 
 ### 3.2 What each config site offers
 
-Six places in a config take a CEL expression, and they do not all see the same context. A `transform: cel` runs after the headless detector, so it gets `request.headless_signal`; a `policy: expression` runs before the response exists, so it has no `response`.
+Seven places in a config take a CEL expression, and they do not all see the same context. A `transform: cel` runs after the headless detector, so it gets `request.headless_signal`; a `policy: expression` runs before the response exists, so it has no `response`.
 
-| Binding | `policy: expression` | `policy: assertion` | `transform: cel` | `rate_limit.key` | `custom_log` field | `waf` `track_by: cel` |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|
-| `request.method`, `.path`, `.host`, `.query`, `.headers` | yes | yes | no | yes | yes | yes |
-| `request.time`, `.unix_nanos` | yes | yes | no | yes | no | yes |
-| `connection.remote_ip` | yes | yes | no | yes | no | yes |
-| `jwt.claims` | yes | yes | no | yes | no | yes |
-| `request.trust_tier` | yes | yes | no | no | no | no |
-| `request.tls` | yes | no | yes | no | no | no |
-| `request.agent_class` and the other `agent_*` scalars | yes | no | yes | no | no | no |
-| `request.agent` (detector map: `.score`, `.headless_score`, ...) | yes | no | no | no | no | no |
-| `agent` | yes | no | yes | no | no | no |
-| `request.aipref` | yes | no | no | no | no | no |
-| `request.kya` | yes | no | no | no | no | no |
-| `request.ml_classification` | yes | no | no | no | no | no |
-| `principal` | yes | no | no | no | no | no |
-| `request.headless_signal` | no | no | yes | no | no | no |
-| `response` | no | yes | yes | no | `response.status` only | no |
-| `features` | yes | no | no | yes | no | yes |
-| `envelope` | no | no | no | yes | no | yes |
-| `request.key_id` | no | no | no | yes | no | yes |
-| `tenant_id`, `provider`, `model`, `tokens_in`, `tokens_out`, `client_ip`, `attribution` | no | no | no | no | yes | no |
+| Binding | `policy: expression` | `policy: assertion` | `transform: cel` | `rate_limit.key` | `custom_log` field | `waf` `track_by: cel` | forward rule `when` |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `request.method`, `.path`, `.host`, `.query`, `.headers` | yes | yes | no | yes | yes | yes | yes |
+| `request.time`, `.unix_nanos` | yes | yes | no | yes | no | yes | yes |
+| `connection.remote_ip` | yes | yes | no | yes | no | yes | yes |
+| `jwt.claims` | yes | yes | no | yes | no | yes | yes |
+| `request.trust_tier` | yes | yes | no | no | no | no | no |
+| `request.tls` | yes | no | yes | no | no | no | no |
+| `request.agent_class` and the other `agent_*` scalars | yes | no | yes | no | no | no | no |
+| `request.agent` (detector map: `.score`, `.headless_score`, ...) | yes | no | no | no | no | no | no |
+| `agent` | yes | no | yes | no | no | no | no |
+| `request.aipref` | yes | no | no | no | no | no | no |
+| `request.kya` | yes | no | no | no | no | no | no |
+| `request.ml_classification` | yes | no | no | no | no | no | no |
+| `principal` | yes | no | no | no | no | no | no |
+| `request.headless_signal` | no | no | yes | no | no | no | no |
+| `response` | no | yes | yes | no | `response.status` only | no | no |
+| `features` | yes | no | no | yes | no | yes | no |
+| `envelope` | no | no | no | yes | no | yes | no |
+| `request.key_id` | no | no | no | yes | no | yes | no |
+| `tenant_id`, `provider`, `model`, `tokens_in`, `tokens_out`, `client_ip`, `attribution` | no | no | no | no | yes | no | no |
 
 Three columns are easy to misread.
 
@@ -237,7 +237,22 @@ The `custom_log` column looks eccentric because it is. That site builds its own 
 
 The `waf` column is identical to `rate_limit.key` because both run through the same evaluator. If you are keying a persistent block, write it as you would a rate-limit key.
 
-Two related surfaces are not in the table. `ai_policy.expression` evaluates over a single `ai` namespace and is documented in [ai-policy-cel.md](ai-policy-cel.md); it does not share this context and is not checked against it. Forward rules are not CEL at all (see [3.5](#35-forward-rule-matchers-not-cel)).
+The forward-rule column is the narrowest, and deliberately so. A forward rule matches during routing, before authentication, identity enrichment, the TLS fingerprint pass, and the classifiers have run, so none of what those produce exists yet. It sees the request as it arrived.
+
+A `when:` is ANDed with the structured matchers in the same entry and evaluated last, so a rule that fails a cheap path check never pays for it. Use it for what the structured fields cannot say, which is OR, negation, and comparisons across two parts of the request:
+
+```yaml
+forward_rules:
+  - rules:
+      - match: /
+        when: 'request.path.startsWith("/v1") || request.path.startsWith("/v2")'
+    origin:
+      url: https://versioned.test.sbproxy.dev
+```
+
+A predicate that fails to evaluate does not match, and the rule is skipped. Routing past a gate an operator wrote would be the worse failure.
+
+One related surface is not in the table. `ai_policy.expression` evaluates over a single `ai` namespace and is documented in [ai-policy-cel.md](ai-policy-cel.md); it does not share this context and is not checked against it.
 
 A binding marked `no` is refused when the config loads, whether you write it as `request.trust_tier` or as `request["trust_tier"]`. The message names the site and lists what that site does provide, so the fix is usually visible without opening this page:
 
@@ -384,9 +399,11 @@ policies:
         action: pass
 ```
 
-### 3.5 Forward-rule matchers (not CEL)
+### 3.5 Forward-rule matchers
 
-Forward rules dispatch to inline child origins with declarative matchers, evaluated in order with first match winning. Each entry in a rule's `rules:` list may carry a `path`, `header`, and `query` matcher; matchers present in one entry are ANDed, entries in the list are ORed.
+Forward rules dispatch to inline child origins with declarative matchers, evaluated in order with first match winning. Each entry in a rule's `rules:` list may carry a `method`, `path`, `header`, `query`, and `body` matcher; matchers present in one entry are ANDed, entries in the list are ORed.
+
+An entry may also carry a CEL `when:`, ANDed with the rest and evaluated last. Reach for it when a condition needs OR, negation, or a comparison across two parts of the request, which the structured matchers cannot express no matter how many of them are added. Its bindings are in [3.2](#32-what-each-config-site-offers), and they are the narrowest of any surface because routing runs before the rest of the pipeline.
 
 ```yaml
 origins:

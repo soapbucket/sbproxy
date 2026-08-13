@@ -82,6 +82,14 @@ pub enum CelSurface {
     RateLimitKey,
     /// A `custom_log` field with `engine: cel`.
     CustomLogField,
+    /// A forward rule's `when:` predicate.
+    ///
+    /// The narrowest surface, and deliberately so. Forward rules match
+    /// during routing, before authentication, identity enrichment, the
+    /// TLS fingerprint pass, and the classifiers have run, so none of
+    /// what those produce exists yet. It gets the request as it
+    /// arrived and nothing else.
+    ForwardRuleWhen,
     /// `waf` policy `persistent_block` with `track_by: cel`.
     ///
     /// Shares [`Self::RateLimitKey`]'s bindings exactly, because it
@@ -114,6 +122,7 @@ impl CelSurface {
             Self::TransformCel => "transform `cel`",
             Self::RateLimitKey => "policy `rate_limiting` key",
             Self::CustomLogField => "custom log field",
+            Self::ForwardRuleWhen => "forward rule `when`",
             Self::WafPersistent => "waf persistent rule",
         }
     }
@@ -147,6 +156,12 @@ impl CelSurface {
                 "request.trust_tier",
             ],
             Self::PolicyAssertion => vec!["request.trust_tier", "response"],
+            // Nothing beyond the base. Everything else in this module's
+            // vocabulary is stamped by a pass that has not run yet at
+            // routing time, so declaring any of it would promise a
+            // binding that reads empty rather than one that reads
+            // wrong, which is the harder failure to debug.
+            Self::ForwardRuleWhen => Vec::new(),
             // Deliberately without `REQUEST_BASE`. The transform's
             // request half is a placeholder: `build_response_eval_context`
             // calls `build_request_context("GET", "/", &HeaderMap::new(),
