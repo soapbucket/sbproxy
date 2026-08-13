@@ -27,3 +27,15 @@ origins:
     response_cache:
       enabled: true
       ttl_secs: 60
+
+      # Cached entries belong to the config that produced them. Change
+      # the upstream url above, or anything else that decides what the
+      # upstream returns, and this origin starts a fresh entry set
+      # instead of serving the old backend's responses. That matters
+      # most with a shared store, where a rolling change would otherwise
+      # let one node serve entries another node wrote.
+      #
+      # Bump epoch to rotate the entries by hand, for the case the proxy
+      # cannot see: the upstream changed its response shape and nothing
+      # here changed. Costs one cold start for this origin.
+      # epoch: 1

@@ -193,6 +193,7 @@ mod tests {
             Utc::now(),
             "rate_limit".to_string(),
             PolicySurface::BuiltIn,
+            sbproxy_observe::decision::DecisionEngine::BuiltIn,
             VerdictTag::Allow,
             1,
         )
@@ -221,6 +222,7 @@ mod tests {
             Utc::now(),
             "rate_limit".to_string(),
             PolicySurface::BuiltIn,
+            sbproxy_observe::decision::DecisionEngine::BuiltIn,
             VerdictTag::Allow,
             1,
         );

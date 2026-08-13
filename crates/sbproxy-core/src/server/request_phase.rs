@@ -87,10 +87,18 @@ fn request_requires_graphql_replay(
     pipeline: &CompiledPipeline,
     origin_idx: usize,
 ) -> bool {
-    matches!(
-        request_effective_action(session, pipeline, origin_idx),
-        Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
-    )
+    match request_effective_action(session, pipeline, origin_idx) {
+        // Ambiguous, so take the safe reading: validation may be
+        // pending. Assuming the base action would let the idempotency
+        // pre-check serve a cached response before the current GraphQL
+        // action has validated it, which is the replay this flag
+        // exists to prevent.
+        EffectiveAction::Indeterminate => true,
+        EffectiveAction::Resolved(action) => matches!(
+            action,
+            Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
+        ),
+    }
 }
 
 /// Resolve the base or header/path/query-matched forward-rule action without
@@ -100,7 +108,7 @@ fn request_effective_action<'a>(
     session: &Session,
     pipeline: &'a CompiledPipeline,
     origin_idx: usize,
-) -> Option<&'a Action> {
+) -> EffectiveAction<'a> {
     let request = session.req_header();
     let forwarded_action = pipeline
         .forward_rules
@@ -120,7 +128,34 @@ fn request_effective_action<'a>(
             })
         })
         .map(|rule| &rule.action);
-    forwarded_action.or_else(|| pipeline.actions.get(origin_idx))
+    // `match_request` cannot evaluate a `body:` matcher or a `when:`
+    // predicate, so its `None` means "no rule matched" *or* "a rule
+    // could not be evaluated here". Collapsing both to the base action
+    // is how a stale-while-revalidate write lands in another rule's
+    // cache entry, so the two are kept apart in the type.
+    if forwarded_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return EffectiveAction::Indeterminate;
+    }
+    EffectiveAction::Resolved(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
+}
+
+/// What a preview of the routing decision could establish.
+///
+/// Exists because `Option<&Action>` cannot say "unknown". A preview runs
+/// before the body is buffered and before a CEL context is built, so a
+/// rule gated on either is unevaluable there, and a caller that reads
+/// that as "the base action" silently routes around the rule.
+enum EffectiveAction<'a> {
+    /// The action this request will land on.
+    Resolved(Option<&'a Action>),
+    /// A rule exists that this path cannot evaluate, so the caller must
+    /// take its conservative branch rather than assume.
+    Indeterminate,
 }
 
 /// AI actions own idempotency and response replay because their current
@@ -130,7 +165,13 @@ fn request_uses_ai_owned_replay_paths(
     pipeline: &CompiledPipeline,
     origin_idx: usize,
 ) -> bool {
-    action_uses_ai_owned_replay_paths(request_effective_action(session, pipeline, origin_idx))
+    match request_effective_action(session, pipeline, origin_idx) {
+        // Claim the AI-owned reading rather than the base action's, so
+        // the idempotency middleware does not serve cached bytes ahead
+        // of the guardrails.
+        EffectiveAction::Indeterminate => true,
+        EffectiveAction::Resolved(action) => action_uses_ai_owned_replay_paths(action),
+    }
 }
 
 fn action_uses_ai_owned_replay_paths(action: Option<&Action>) -> bool {
@@ -1620,11 +1661,18 @@ pub(super) async fn request_filter(
         request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
     let initial_ai_surface = {
         let request = session.req_header();
-        ai_surface_label_for_action(
-            request_effective_action(session, &pipeline, origin_idx),
-            request.method.as_str(),
-            request.uri.path(),
-        )
+        match request_effective_action(session, &pipeline, origin_idx) {
+            // A rule this preview cannot evaluate might route the
+            // request away from AI entirely. Leaving the early label
+            // off is honest: an unattributed early denial is a gap in
+            // telemetry, a wrongly attributed one is bad data, and the
+            // handler stamps the real label for every admitted request
+            // anyway.
+            EffectiveAction::Indeterminate => None,
+            EffectiveAction::Resolved(action) => {
+                ai_surface_label_for_action(action, request.method.as_str(), request.uri.path())
+            }
+        }
     };
     if let Some(surface) = initial_ai_surface {
         ctx.ai_surface = Some(surface.to_string());
@@ -3942,6 +3990,7 @@ pub(super) async fn request_filter(
                         ctx.hostname.as_str(),
                         session.req_header(),
                         cache_cfg,
+                        origin.cache_config_fingerprint.as_str(),
                     );
                     let invalidate_origin = origin.origin_id.to_string();
                     tokio::spawn(async move {
@@ -3985,6 +4034,7 @@ pub(super) async fn request_filter(
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
+                    origin.cache_config_fingerprint.as_str(),
                     key_plan.as_ref(),
                 );
                 // `skip_lookup` goes upstream for *this* request while
@@ -4022,6 +4072,34 @@ pub(super) async fn request_filter(
                     .map_err(|e| {
                         Error::because(ErrorType::InternalError, "cache lookup join failed", e)
                     })?
+                };
+
+                // WOR-2407: refuse an entry another config stored.
+                // The key already carries this origin's fingerprint, so
+                // under an exact-keyed backend this cannot fire. It can
+                // on the two that match a digest of the key rather than
+                // the key: memcached hashes to fit its 250-byte limit,
+                // and the file store names entries by the SHA-256 of
+                // the key. Counted apart from an ordinary miss so a
+                // rolling change reads as a rollout on the dashboard
+                // rather than as a cache that went cold unexplained.
+                let hit = match hit {
+                    Ok(Some(entry))
+                        if !entry.serves_config(origin.cache_config_fingerprint.as_str()) =>
+                    {
+                        sbproxy_observe::metrics::record_cache(
+                            origin.origin_id.as_ref(),
+                            "config_miss",
+                        );
+                        tracing::debug!(
+                            origin = %origin.origin_id,
+                            stored = %entry.config_fp,
+                            current = %origin.cache_config_fingerprint,
+                            "cache entry belongs to another config revision; treating as a miss"
+                        );
+                        Ok(None)
+                    }
+                    other => other,
                 };
 
                 match hit {
@@ -4468,6 +4546,24 @@ pub(super) async fn request_filter(
         // forward rules to match against.
         let request_path = session.req_header().uri.path().to_string();
         let request_query = session.req_header().uri.query().map(|q| q.to_string());
+        // Built once for the whole rule set, and only when some entry
+        // actually declares a `when`. Routing runs on every request, so
+        // an origin with no predicate must not pay to assemble a CEL
+        // context it will never read.
+        let cel_ctx = fwd_rules
+            .iter()
+            .flat_map(|rule| rule.matchers.iter())
+            .any(|entry| entry.when.is_some())
+            .then(|| {
+                sbproxy_extension::cel::context::build_request_context(
+                    session.req_header().method.as_str(),
+                    &request_path,
+                    &session.req_header().headers,
+                    request_query.as_deref(),
+                    ctx.client_ip.map(|ip| ip.to_string()).as_deref(),
+                    &ctx.hostname,
+                )
+            });
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
             // Each `MatcherEntry` ANDs method/path/header/query/body;
             // entries in the list are ORed. `match_request_with_body`
@@ -4482,6 +4578,7 @@ pub(super) async fn request_filter(
                     request_query.as_deref(),
                     request_headers,
                     matched_body.as_deref(),
+                    cel_ctx.as_ref(),
                 )
             });
             if let Some(params) = captured {

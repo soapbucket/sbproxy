@@ -4,7 +4,7 @@
 //! What each config site offers a CEL expression, and the config-load
 //! check that holds it to that.
 //!
-//! Six places in a config accept CEL, and each builds its own evaluation
+//! Seven places in a config accept CEL, and each builds its own evaluation
 //! context. They overlap but are not equal: a `transform: cel` gets
 //! `request.headless_signal`, a `policy: expression` does not; a
 //! `policy: expression` gets `principal`, a `transform: cel` does not.
@@ -82,6 +82,14 @@ pub enum CelSurface {
     RateLimitKey,
     /// A `custom_log` field with `engine: cel`.
     CustomLogField,
+    /// A forward rule's `when:` predicate.
+    ///
+    /// The narrowest surface, and deliberately so. Forward rules match
+    /// during routing, before authentication, identity enrichment, the
+    /// TLS fingerprint pass, and the classifiers have run, so none of
+    /// what those produce exists yet. It gets the request as it
+    /// arrived and nothing else.
+    ForwardRuleWhen,
     /// `waf` policy `persistent_block` with `track_by: cel`.
     ///
     /// Shares [`Self::RateLimitKey`]'s bindings exactly, because it
@@ -114,6 +122,7 @@ impl CelSurface {
             Self::TransformCel => "transform `cel`",
             Self::RateLimitKey => "policy `rate_limiting` key",
             Self::CustomLogField => "custom log field",
+            Self::ForwardRuleWhen => "forward rule `when`",
             Self::WafPersistent => "waf persistent rule",
         }
     }
@@ -147,6 +156,12 @@ impl CelSurface {
                 "request.trust_tier",
             ],
             Self::PolicyAssertion => vec!["request.trust_tier", "response"],
+            // Nothing beyond the base. Everything else in this module's
+            // vocabulary is stamped by a pass that has not run yet at
+            // routing time, so declaring any of it would promise a
+            // binding that reads empty rather than one that reads
+            // wrong, which is the harder failure to debug.
+            Self::ForwardRuleWhen => Vec::new(),
             // Deliberately without `REQUEST_BASE`. The transform's
             // request half is a placeholder: `build_response_eval_context`
             // calls `build_request_context("GET", "/", &HeaderMap::new(),
@@ -729,6 +744,39 @@ mod tests {
             paths(r#"request[request.method]"#),
             ["request", "request.method"]
         );
+    }
+
+    #[test]
+    fn the_forward_rule_surface_refuses_anything_a_later_pass_produces() {
+        // The operator-visible half of this surface. Routing runs before
+        // the passes that stamp these, so naming one has to be a
+        // config-load error rather than an expression that reads empty
+        // and routes traffic somewhere nobody chose.
+        for source in [
+            r#"request.trust_tier == "named""#,
+            "request.tls.trustworthy",
+            "features.debug",
+            "principal.sub != \"\"",
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::ForwardRuleWhen
+                .validate("forward rule `r` when", source, &program)
+                .expect_err("{source} is not available during routing");
+        }
+    }
+
+    #[test]
+    fn the_forward_rule_surface_accepts_the_request_as_it_arrived() {
+        for source in [
+            r#"request.path.startsWith("/v1")"#,
+            r#"request.headers["x-tenant"] == "acme""#,
+            r#"connection.remote_ip != """#,
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::ForwardRuleWhen
+                .validate("forward rule `r` when", source, &program)
+                .expect("the request base is populated during routing");
+        }
     }
 
     #[test]

@@ -218,6 +218,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_secs(),
             ttl_secs: ttl,
+            config_fp: String::new(),
         }
     }
 

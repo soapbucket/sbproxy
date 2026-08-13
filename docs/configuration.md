@@ -946,7 +946,7 @@ origins:
 | `observability` | object | | Per-origin `log.redact.pii` override, composed with tenant or proxy scope. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
-| `forward_rules` | list | | Method, path, header, query, and body match rules that route to inline child origins. |
+| `forward_rules` | list | | Method, path, header, query, body, and CEL `when` match rules that route to inline child origins. |
 | `fallback_origin` | object | | Inline origin served when the primary upstream errors or returns a configured status. See [Fallback origin](#fallback-origin). |
 | `response_cache` | object | | Per-origin response cache. |
 | `variables` | map | | Static template variables. |
@@ -3544,12 +3544,13 @@ origins:
 | `max_size` | int | 10000 | Upper bound on the in-memory cache size in entries. Ignored when an L2 Redis backend is attached. |
 | `key_event` | object | unset | Request-side `cache.key` decision event: an inline `source` plus an `engine`, returning the dimensions to fold into the cache key. See [Deciding the key and the admission per request](#deciding-the-key-and-the-admission-per-request). |
 | `admit_event` | object | unset | Response-side `cache.admit` decision event: the same shape, returning whether the finished response is stored and for how long. |
+| `epoch` | int | 0 | Operator-controlled cache generation. Bumping it rotates this origin's entries and nothing else. See [Which config changes rotate the cache](#which-config-changes-rotate-the-cache). |
 
 #### Why only GET and HEAD
 
 The cache key is built from the workspace, hostname, method, path, canonical
-query, and a fingerprint of the `Vary` headers. It does not include the request
-body.
+query, a fingerprint of the `Vary` headers, and a fingerprint of the origin's
+cache-relevant config. It does not include the request body.
 
 For `GET` and `HEAD` that is complete: the request is fully described by its
 target and its headers. For a method whose body carries the request it is not.
@@ -3565,6 +3566,64 @@ To cache AI completions, use [the semantic cache](ai-gateway.md), which keys on
 prompt content with a similarity threshold and per-scope isolation. That is a
 different mechanism for a different job, and it is the one that makes caching a
 `POST` safe.
+
+#### Which config changes rotate the cache
+
+A cached entry is only valid for the config that produced it. If you repoint an
+upstream and the old entries stay readable, the proxy serves the previous
+backend's responses under the new configuration until they expire. In a
+multi-node deployment sharing one Redis or memcached, that is worse than it
+sounds: every node reads the same key space, so during a rolling change a node
+still on the old config can serve entries a node on the new one just wrote, and
+the reverse.
+
+So the cache key ends with a fingerprint of the origin's cache-relevant config.
+Two revisions of an origin write to different keys. Neither refuses to serve;
+each keeps its own entries, and the ones nobody is reading any more age out on
+their TTLs. Rolling a config change costs a cold cache for the origins that
+changed, and nothing for the origins that did not.
+
+The fingerprint covers what decides the response the upstream returns:
+
+- the `action` block, including the upstream URL and, on an AI origin, the
+  provider and model
+- `authentication`
+- `request_modifiers`, `transforms`, `filters`, `on_request`, `forward_rules`,
+  `fallback_origin`, and `variables`
+- the `response_cache` block itself, `epoch` included
+
+It deliberately does not cover `response_modifiers`, `cors`, `hsts`,
+`compression`, `session`, error pages, observability, timeouts, or policies.
+Cached entries hold the upstream's own response, captured before any
+response-side rewriting runs and replayed the same way, so none of those can
+change what is in an entry. Nor does it cover anything outside the origin: an
+unrelated origin, a log level, or a listener change leaves every existing entry
+readable.
+
+`epoch` exists for the case the fingerprint cannot see. If an upstream starts
+returning a different response shape and nothing in your config changed, no
+fingerprint would move, and the cache would keep serving the old shape until the
+TTL ran out. Bump `epoch` to rotate that origin's entries by hand:
+
+```yaml
+origins:
+  "api.example.com":
+    response_cache:
+      enabled: true
+      ttl_secs: 300
+      epoch: 1        # was 0; rotates this origin's cached entries
+```
+
+Bumping it when you did not need to costs one cold start for one origin, so it
+is safe to reach for when you are unsure.
+
+Two access-log fields make this observable. `config_revision` names the config
+the node was serving, and `cache_config_fingerprint` names the entry set the
+origin was reading and writing. During a rolling change both appear with two
+values across the fleet, which is what tells you the rollout is half finished
+rather than that something has broken. A lookup that finds an entry stamped by
+another config counts as `result="config_miss"` on
+`sbproxy_cache_results_total`, separately from an ordinary miss.
 
 ### Deciding the key and the admission per request
 
@@ -3651,7 +3710,7 @@ Sandbox budgets, the engine surfaces, and worked scripts are in [scripting.md](s
 
 ### Choosing the backing store
 
-There is one response-cache store per process. Every origin with `response_cache.enabled` shares it, which is safe because the cache key already carries the workspace, hostname, method, path, canonical query, and the Vary fingerprint, so two origins cannot read each other's entries. The store is built only when at least one origin enables the cache.
+There is one response-cache store per process. Every origin with `response_cache.enabled` shares it, which is safe because the cache key already carries the workspace, hostname, method, path, canonical query, the Vary fingerprint, and the origin's config fingerprint, so two origins cannot read each other's entries. The store is built only when at least one origin enables the cache.
 
 `proxy.response_cache_store` picks which store that is. It is a top-level `proxy` block, not a per-origin field.
 
@@ -3920,7 +3979,7 @@ Each forward rule has a `rules` array where each entry is a matcher. The deseria
 
 Set exactly one of `prefix`, `exact`, `template`, or `regex` on a path matcher. If more than one is set, precedence is `template` > `regex` > `exact` > `prefix` (so `exact` beats `prefix`).
 
-Within a single matcher entry, every present matcher (`method`, `path`, `header`, `query`, `body`) must succeed for the entry to fire. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key; note that the supported method field is the singular `method`, and the Go-era plural `methods` stays rejected.
+Within a single matcher entry, every present matcher (`method`, `path`, `header`, `query`, `body`, `when`) must succeed for the entry to fire. `when` is a CEL predicate, evaluated last and only once the structured matchers have passed; it sees the request as it arrived and nothing a later pipeline pass produces, and naming anything else is refused at config load. See [scripting.md](scripting.md) for its bindings. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key; note that the supported method field is the singular `method`, and the Go-era plural `methods` stays rejected.
 
 A method matcher composes with the other matchers in its entry, so routing writes away from reads takes one rule:
 

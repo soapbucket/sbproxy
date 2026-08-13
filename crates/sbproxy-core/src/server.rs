@@ -1098,15 +1098,19 @@ fn collect_vary_headers(
 /// Build the canonical response-cache key for a request.
 ///
 /// `workspace` is the empty string in OSS / single-tenant mode; the
-/// enterprise crate populates it. The result is the colon-delimited
+/// enterprise crate populates it. `config_fp` is the serving origin's
+/// [`cache_config_fingerprint`]. The result is the colon-delimited
 /// shape documented at the top of `sbproxy_cache::response`.
+///
+/// [`cache_config_fingerprint`]: sbproxy_config::CompiledOrigin::cache_config_fingerprint
 fn build_response_cache_key(
     workspace: &str,
     hostname: &str,
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
+    config_fp: &str,
 ) -> String {
-    build_response_cache_key_with_plan(workspace, hostname, req, cfg, None)
+    build_response_cache_key_with_plan(workspace, hostname, req, cfg, config_fp, None)
 }
 
 /// As [`build_response_cache_key`], with an optional `cache.key` plan
@@ -1127,6 +1131,7 @@ pub(crate) fn build_response_cache_key_with_plan(
     hostname: &str,
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
+    config_fp: &str,
     plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
 ) -> String {
     let method = req.method.as_str();
@@ -1174,7 +1179,9 @@ pub(crate) fn build_response_cache_key_with_plan(
             },
         ));
     }
-    sbproxy_cache::compute_cache_key(workspace, hostname, method, path, query, &mode, &vary)
+    sbproxy_cache::compute_cache_key(
+        workspace, hostname, method, path, query, &mode, &vary, config_fp,
+    )
 }
 
 /// HTTP client used by the stale-while-revalidate path. Reused across
@@ -1254,6 +1261,19 @@ fn build_swr_revalidation_request(
             })
         })
         .map(|rule| &rule.action);
+    // Revalidating against the wrong upstream writes that upstream's
+    // response into this entry's key, so an ambiguous preview must skip
+    // the refresh rather than guess. `None` from `match_request` means
+    // "no rule matched" or "a rule could not be evaluated here", and
+    // only the rule set can tell those apart.
+    if forward_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return None;
+    }
     let action = forward_action.or_else(|| pipeline.actions.get(origin_idx))?;
     let Action::Proxy(proxy) = action else {
         return None;
@@ -1462,6 +1482,11 @@ fn spawn_swr_revalidation(
             body,
             cached_at: refreshed_at,
             ttl_secs,
+            // WOR-2407: a refresh replaces the exact entry it observed,
+            // under the same key, so it inherits that entry's config
+            // identity rather than re-deriving one. `compare_and_swap`
+            // compares against `stale_entry`, so the two must agree.
+            config_fp: stale_entry.config_fp.clone(),
         };
         // Write-back goes through spawn_blocking for the same reason
         // the live path does: blocking I/O for the Redis backend.
@@ -3668,6 +3693,7 @@ fn emit_policy_verdict_with_outcome(
         chrono::Utc::now(),
         policy_id.to_string(),
         surface,
+        engine,
         verdict,
         elapsed_ms,
     );

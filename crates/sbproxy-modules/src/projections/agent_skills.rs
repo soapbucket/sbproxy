@@ -1689,6 +1689,7 @@ spec:
         let with_skills = CompiledOrigin {
             hostname: CompactString::new("with.example.com"),
             origin_id: CompactString::new("with"),
+            cache_config_fingerprint: CompactString::default(),
             workspace_id: CompactString::default(),
             tenant_id: compact_str::CompactString::const_new("__default__"),
             action_config: serde_json::json!({"type": "proxy"}),
@@ -1742,6 +1743,7 @@ spec:
         let without = CompiledOrigin {
             hostname: CompactString::new("without.example.com"),
             origin_id: CompactString::new("without"),
+            cache_config_fingerprint: CompactString::default(),
             workspace_id: CompactString::default(),
             tenant_id: compact_str::CompactString::const_new("__default__"),
             action_config: serde_json::json!({"type": "proxy"}),

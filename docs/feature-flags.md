@@ -43,7 +43,7 @@ The `flag_enabled(name, key)` CEL function reads the global store. The most comm
 flag_enabled("new-checkout", jwt.claims.sub)
 ```
 
-Use it anywhere the request-time CEL context is available: `expression` and `assertion` policies, CEL rate-limit keys, CEL access-log fields, and the AI selectors. Forward rules have no CEL matcher, so a flag that should route rather than gate belongs in a policy in front of the route or in a separate hostname. Unknown flags evaluate to `false`. Segment rules are not part of the YAML surface because this helper has no segment argument.
+Use it anywhere the request-time CEL context is available: `expression` and `assertion` policies, CEL rate-limit keys, CEL access-log fields, and the AI selectors. A forward rule's `when:` is CEL but does not carry `features`, because routing runs before flags resolve, so naming `flag()` there is refused at config load. A flag that should route rather than gate belongs in a policy in front of the route or in a separate hostname. Unknown flags evaluate to `false`. Segment rules are not part of the YAML surface because this helper has no segment argument.
 
 ## Run it
 

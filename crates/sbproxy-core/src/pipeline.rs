@@ -475,16 +475,28 @@ pub struct MatcherEntry {
     /// JSON request-body field matcher. Evaluated last because it is the
     /// only matcher that reads bytes the request phase had to buffer.
     pub body: Option<BodyMatch>,
+    /// CEL predicate ANDed with the matchers above, evaluated last.
+    ///
+    /// `Arc` because a compiled entry is cloned per config generation
+    /// and the program is immutable once compiled.
+    pub when: Option<std::sync::Arc<sbproxy_extension::cel::CompiledCel>>,
 }
 
 impl MatcherEntry {
     /// Evaluate this entry against the incoming request, with no body.
     ///
     /// Callers that only need to know which action a request will land on,
-    /// and that run before or without body buffering, use this. An entry
-    /// carrying a body matcher cannot pass here, which keeps those callers
-    /// conservative: they fall back to the origin's own action rather than
-    /// claim a body-gated rule they have not proved.
+    /// and that run before or without body buffering, use this.
+    ///
+    /// An entry carrying a body matcher or a `when` predicate cannot pass
+    /// here, because neither input is available yet. That makes a `None`
+    /// from this method ambiguous: it means "no rule matched" *or* "a rule
+    /// could not be evaluated". Callers that turn `None` into the origin's
+    /// base action must therefore first ask
+    /// [`forward_rules_need_full_matching`] whether the rule set contains
+    /// anything unevaluable, and skip their optimisation when it does.
+    /// Guessing the base action for a rule that routes elsewhere is how a
+    /// stale-while-revalidate write lands in the wrong cache entry.
     pub fn match_request(
         &self,
         method: &http::Method,
@@ -492,7 +504,7 @@ impl MatcherEntry {
         query: Option<&str>,
         headers: &http::HeaderMap,
     ) -> Option<HashMap<String, String>> {
-        self.match_request_with_body(method, path, query, headers, None)
+        self.match_request_with_body(method, path, query, headers, None, None)
     }
 
     /// Evaluate this entry against the incoming request and its buffered body.
@@ -510,12 +522,14 @@ impl MatcherEntry {
         query: Option<&str>,
         headers: &http::HeaderMap,
         body: Option<&[u8]>,
+        cel_ctx: Option<&sbproxy_extension::cel::CelContext>,
     ) -> Option<HashMap<String, String>> {
         let any_present = self.method.is_some()
             || self.path.is_some()
             || self.header.is_some()
             || self.query.is_some()
-            || self.body.is_some();
+            || self.body.is_some()
+            || self.when.is_some();
         if !any_present {
             return None;
         }
@@ -546,8 +560,52 @@ impl MatcherEntry {
                 return None;
             }
         }
+        // Last, and only once every structured matcher has passed, so a
+        // rule that fails a cheap path check never pays for an
+        // evaluation.
+        if let Some(predicate) = &self.when {
+            let Some(cel_ctx) = cel_ctx else {
+                // The caller builds the context only when some entry
+                // declares a `when`. Reaching here without one means the
+                // rule cannot be evaluated, and a routing rule that
+                // cannot be evaluated must not match: silently routing
+                // on the structured half alone would send traffic
+                // somewhere the operator gated.
+                return None;
+            };
+            match predicate.eval_bool(cel_ctx) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(error) => {
+                    // Fail closed for the same reason. A predicate that
+                    // errors has not said yes.
+                    tracing::warn!(
+                        site = %predicate.site(),
+                        %error,
+                        "forward rule `when` failed to evaluate; rule did not match"
+                    );
+                    return None;
+                }
+            }
+        }
         Some(captured)
     }
+}
+
+/// Whether any entry in `rules` carries a matcher [`MatcherEntry::match_request`]
+/// cannot evaluate, so a preview of which action will fire is not trustworthy.
+///
+/// `body` and `when` both qualify: the first needs a buffered body and the
+/// second needs a CEL context, and neither exists at the points that preview
+/// routing. A caller seeing `true` here must not fall back to the origin's
+/// base action, because the request may well land on a forward rule that
+/// routes somewhere else entirely.
+#[must_use]
+pub fn forward_rules_need_full_matching(rules: &[CompiledForwardRule]) -> bool {
+    rules
+        .iter()
+        .flat_map(|rule| rule.matchers.iter())
+        .any(|entry| entry.when.is_some() || entry.body.is_some())
 }
 
 /// Largest request body any body matcher across `rules` will read, or `None`
@@ -2962,11 +3020,22 @@ fn compile_single_forward_rule(
         let header = compile_header_matcher(non_null(rule.get("header")))?;
         let query = compile_query_matcher(non_null(rule.get("query")))?;
         let body = compile_body_matcher(non_null(rule.get("body")))?;
+        let when = match non_null(rule.get("when")).and_then(|v| v.as_str()) {
+            Some(source) => Some(std::sync::Arc::new(
+                sbproxy_extension::cel::CompiledCel::compile(
+                    sbproxy_extension::cel::CelSurface::ForwardRuleWhen,
+                    format!("forward rule `{rule_id}` when"),
+                    source,
+                )?,
+            )),
+            None => None,
+        };
         if method.is_some()
             || path.is_some()
             || header.is_some()
             || query.is_some()
             || body.is_some()
+            || when.is_some()
         {
             matchers.push(MatcherEntry {
                 method,
@@ -2974,6 +3043,7 @@ fn compile_single_forward_rule(
                 header,
                 query,
                 body,
+                when,
             });
         }
     }
@@ -3540,6 +3610,7 @@ mod tests {
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
+                cache_config_fingerprint: CompactString::default(),
                 workspace_id: CompactString::default(),
                 tenant_id: compact_str::CompactString::const_new("__default__"),
                 action_config: action,
@@ -4045,6 +4116,7 @@ origins:
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
+                cache_config_fingerprint: CompactString::default(),
                 workspace_id: CompactString::default(),
                 tenant_id: compact_str::CompactString::const_new("__default__"),
                 action_config: action,
@@ -5067,6 +5139,7 @@ mod body_matcher_tests {
             header: None,
             query: None,
             body: Some(compiled(json)),
+            when: None,
         }
     }
 
@@ -5186,6 +5259,171 @@ mod body_matcher_tests {
         assert!(!present.matches(None));
     }
 
+    fn when_predicate(source: &str) -> std::sync::Arc<sbproxy_extension::cel::CompiledCel> {
+        std::sync::Arc::new(
+            sbproxy_extension::cel::CompiledCel::compile(
+                sbproxy_extension::cel::CelSurface::ForwardRuleWhen,
+                "forward rule `test` when",
+                source,
+            )
+            .expect("test predicate compiles"),
+        )
+    }
+
+    fn request_cel_context(
+        path: &str,
+        headers: &http::HeaderMap,
+    ) -> sbproxy_extension::cel::CelContext {
+        sbproxy_extension::cel::context::build_request_context(
+            "GET",
+            path,
+            headers,
+            None,
+            None,
+            "api.example.com",
+        )
+    }
+
+    #[test]
+    fn a_when_predicate_ands_with_the_structured_matchers() {
+        let entry = MatcherEntry {
+            method: None,
+            path: Some(PathMatch::Prefix("/v1".to_string())),
+            header: None,
+            query: None,
+            body: None,
+            when: Some(when_predicate(r#"request.path.endsWith("/chat")"#)),
+        };
+        let headers = http::HeaderMap::new();
+
+        let ctx = request_cel_context("/v1/chat", &headers);
+        assert!(
+            entry
+                .match_request_with_body(
+                    &http::Method::GET,
+                    "/v1/chat",
+                    None,
+                    &headers,
+                    None,
+                    Some(&ctx),
+                )
+                .is_some(),
+            "prefix and predicate both pass"
+        );
+
+        // Prefix passes, predicate does not: the entry must not fire.
+        let ctx = request_cel_context("/v1/models", &headers);
+        assert!(entry
+            .match_request_with_body(
+                &http::Method::GET,
+                "/v1/models",
+                None,
+                &headers,
+                None,
+                Some(&ctx),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_when_predicate_without_a_context_does_not_match() {
+        // Fail closed. The caller builds a context only when some entry
+        // declares a `when`, so arriving here without one is a bug, and
+        // matching on the structured half alone would route traffic
+        // past a gate the operator wrote.
+        let entry = MatcherEntry {
+            method: None,
+            path: Some(PathMatch::Prefix("/v1".to_string())),
+            header: None,
+            query: None,
+            body: None,
+            when: Some(when_predicate("true")),
+        };
+        assert!(
+            entry
+                .match_request_with_body(
+                    &http::Method::GET,
+                    "/v1/chat",
+                    None,
+                    &http::HeaderMap::new(),
+                    None,
+                    None,
+                )
+                .is_none(),
+            "a predicate that could not be evaluated has not said yes"
+        );
+    }
+
+    #[test]
+    fn a_when_predicate_that_errors_does_not_match() {
+        // Same posture for a runtime failure. `request.headers[...]` on
+        // an absent key errors rather than returning a falsy value.
+        let entry = MatcherEntry {
+            method: None,
+            path: None,
+            header: None,
+            query: None,
+            body: None,
+            when: Some(when_predicate(r#"request.headers["x-absent"] == "1""#)),
+        };
+        let headers = http::HeaderMap::new();
+        let ctx = request_cel_context("/v1/chat", &headers);
+        assert!(entry
+            .match_request_with_body(
+                &http::Method::GET,
+                "/v1/chat",
+                None,
+                &headers,
+                None,
+                Some(&ctx),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_when_predicate_expresses_the_or_the_structured_matchers_cannot() {
+        // The reason this exists. Two independent structured matchers
+        // always AND; this is the same rule as an OR.
+        let entry = MatcherEntry {
+            method: None,
+            path: None,
+            header: None,
+            query: None,
+            body: None,
+            when: Some(when_predicate(
+                r#"request.path.startsWith("/v1") || request.path.startsWith("/v2")"#,
+            )),
+        };
+        let headers = http::HeaderMap::new();
+        for path in ["/v1/chat", "/v2/chat"] {
+            let ctx = request_cel_context(path, &headers);
+            assert!(
+                entry
+                    .match_request_with_body(
+                        &http::Method::GET,
+                        path,
+                        None,
+                        &headers,
+                        None,
+                        Some(&ctx),
+                    )
+                    .is_some(),
+                "{path} should match"
+            );
+        }
+        let ctx = request_cel_context("/v3/chat", &headers);
+        assert!(entry
+            .match_request_with_body(
+                &http::Method::GET,
+                "/v3/chat",
+                None,
+                &headers,
+                None,
+                Some(&ctx)
+            )
+            .is_none());
+    }
+
     #[test]
     fn the_body_matcher_ands_with_the_other_matchers() {
         let entry = MatcherEntry {
@@ -5199,6 +5437,7 @@ mod body_matcher_tests {
             body: Some(compiled(
                 serde_json::json!({"pointer": "/model", "value": "gpt-4o"}),
             )),
+            when: None,
         };
         let mut headers = http::HeaderMap::new();
         headers.insert("x-tier", http::HeaderValue::from_static("gold"));
@@ -5209,7 +5448,8 @@ mod body_matcher_tests {
                 "/v1/chat/completions",
                 None,
                 &headers,
-                Some(CHAT_BODY)
+                Some(CHAT_BODY),
+                None,
             )
             .is_some());
         // Body agrees, path does not.
@@ -5219,7 +5459,8 @@ mod body_matcher_tests {
                 "/v1/embeddings",
                 None,
                 &headers,
-                Some(CHAT_BODY)
+                Some(CHAT_BODY),
+                None,
             )
             .is_none());
         // Path and header agree, body does not.
@@ -5230,6 +5471,7 @@ mod body_matcher_tests {
                 None,
                 &headers,
                 Some(br#"{"model":"claude-sonnet-4"}"#),
+                None,
             )
             .is_none());
         // Everything else agrees but no body was buffered.
@@ -5239,7 +5481,8 @@ mod body_matcher_tests {
                 "/v1/chat/completions",
                 None,
                 &headers,
-                None
+                None,
+                None,
             )
             .is_none());
     }
@@ -5252,6 +5495,7 @@ mod body_matcher_tests {
             header: None,
             query: None,
             body: None,
+            when: None,
         };
         let headers = http::HeaderMap::new();
         assert!(entry
@@ -5263,7 +5507,8 @@ mod body_matcher_tests {
                 "/v1/chat",
                 None,
                 &headers,
-                Some(CHAT_BODY)
+                Some(CHAT_BODY),
+                None,
             )
             .is_some());
     }
@@ -5282,6 +5527,7 @@ mod body_matcher_tests {
                 header: None,
                 query: None,
                 body: None,
+                when: None,
             }]),
             rule_with(vec![MatcherEntry {
                 method: None,
@@ -5291,6 +5537,7 @@ mod body_matcher_tests {
                     name: "debug".to_string(),
                 }),
                 body: None,
+                when: None,
             }]),
         ];
         assert_eq!(forward_rule_body_cap(&rules), None);
@@ -5399,7 +5646,8 @@ mod body_matcher_tests {
                 "/v1/chat/completions",
                 None,
                 &headers,
-                Some(CHAT_BODY)
+                Some(CHAT_BODY),
+                None,
             )
             .is_some());
     }
@@ -5423,6 +5671,7 @@ mod method_matcher_tests {
             header: None,
             query: None,
             body: None,
+            when: None,
         }
     }
 
@@ -5504,6 +5753,7 @@ mod method_matcher_tests {
             header: None,
             query: None,
             body: None,
+            when: None,
         };
         let headers = http::HeaderMap::new();
         // Both must hold.
@@ -5518,6 +5768,103 @@ mod method_matcher_tests {
         assert!(entry
             .match_request(&http::Method::POST, "/web/x", None, &headers)
             .is_none());
+    }
+
+    #[test]
+    fn a_when_predicate_survives_config_compilation() {
+        // The seam the unit tests above cannot reach. They build
+        // `MatcherEntry` literals, so a typo in the `when` key name would
+        // leave every predicate compiled to `None` and every entry
+        // matching on its structured half alone. That direction fails
+        // *open*, which is the whole thing this feature exists to stop.
+        let rule = serde_json::json!({
+            "rules": [{
+                "path": {"prefix": "/v1/"},
+                "when": "request.path.endsWith(\"/chat\")",
+            }],
+            "origin": {
+                "action": {"type": "proxy", "url": "https://api.test"}
+            }
+        });
+        let registry = empty_extension_registry();
+        let compiled_rule = compile_single_forward_rule(
+            &rule,
+            "chat-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        )
+        .expect("the forward rule compiles");
+        assert!(
+            compiled_rule.matchers[0].when.is_some(),
+            "the predicate must survive compilation; if this is None the entry \
+             silently matches on its path prefix alone"
+        );
+
+        let headers = http::HeaderMap::new();
+        let ctx = sbproxy_extension::cel::context::build_request_context(
+            "GET",
+            "/v1/models",
+            &headers,
+            None,
+            None,
+            "api.test",
+        );
+        assert!(
+            compiled_rule.matchers[0]
+                .match_request_with_body(
+                    &http::Method::GET,
+                    "/v1/models",
+                    None,
+                    &headers,
+                    None,
+                    Some(&ctx),
+                )
+                .is_none(),
+            "the prefix matches but the predicate does not, so the entry must not fire"
+        );
+    }
+
+    #[test]
+    fn a_when_naming_an_unavailable_binding_fails_config_load() {
+        // `trust_tier` is stamped long after routing. Refusing here is
+        // what keeps it from being an expression that reads empty on
+        // every request.
+        let rule = serde_json::json!({
+            "rules": [{"when": "request.trust_tier == \"named\""}],
+            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+        });
+        let registry = empty_extension_registry();
+        // `CompiledForwardRule` has no `Debug`, so unwrap the error side
+        // by hand rather than through `expect_err`.
+        let Err(error) = compile_single_forward_rule(
+            &rule,
+            "gated-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        ) else {
+            panic!("a binding routing cannot supply must not load");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("request.trust_tier"), "{message}");
+    }
+
+    #[test]
+    fn a_rule_set_with_a_predicate_is_not_previewable() {
+        // Guards the fallback that would otherwise revalidate against
+        // the wrong upstream.
+        let rule = serde_json::json!({
+            "rules": [{"path": {"prefix": "/v1/"}, "when": "true"}],
+            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+        });
+        let registry = empty_extension_registry();
+        let compiled_rule = compile_single_forward_rule(
+            &rule,
+            "preview-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        )
+        .expect("compiles");
+        assert!(forward_rules_need_full_matching(&[compiled_rule]));
     }
 
     #[test]
@@ -6675,6 +7022,7 @@ origins:
                 .unwrap()
                 .as_secs(),
             ttl_secs: 300,
+            config_fp: String::new(),
         };
         scoped.put("k", &entry).unwrap();
         assert_eq!(scoped.get("k").unwrap().expect("hit").body, entry.body);
@@ -6825,6 +7173,7 @@ origins:
                 .unwrap()
                 .as_secs(),
             ttl_secs: 300,
+            config_fp: String::new(),
         };
         stores.per_origin["a.example"]
             .put("shared-key", &entry)
@@ -7000,6 +7349,7 @@ origins:
             body: b"body".to_vec(),
             cached_at: 1_700_000_000,
             ttl_secs: 300,
+            config_fp: String::new(),
         };
 
         let before = build_response_cache_store(

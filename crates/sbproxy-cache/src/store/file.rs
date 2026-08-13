@@ -335,6 +335,7 @@ mod tests {
             body: b"hello from file cache".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
+            config_fp: String::new(),
         }
     }
 
@@ -380,6 +381,7 @@ mod tests {
             body: b"stale".to_vec(),
             cached_at: now_secs().saturating_sub(200),
             ttl_secs: 1,
+            config_fp: String::new(),
         };
         store.put("exp", &expired).unwrap();
         assert!(store.get("exp").unwrap().is_none());
@@ -442,6 +444,7 @@ mod tests {
             body: b"one".to_vec(),
             cached_at: now_secs(),
             ttl_secs: 300,
+            config_fp: String::new(),
         };
         let e2 = CachedResponse {
             generation: 0,
@@ -450,6 +453,7 @@ mod tests {
             body: b"two".to_vec(),
             cached_at: now_secs(),
             ttl_secs: 300,
+            config_fp: String::new(),
         };
 
         store.put("key1", &e1).unwrap();
@@ -479,6 +483,7 @@ mod tests {
             body: vec![0u8; 2 * 1024 * 1024],
             cached_at: now_secs(),
             ttl_secs: 300,
+            config_fp: String::new(),
         };
         assert!(store.put("huge", &huge).is_err());
     }
@@ -554,6 +559,7 @@ mod tests {
             body: b"stale".to_vec(),
             cached_at: now_secs().saturating_sub(500),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         store.put("swr", &stale).unwrap();
 
@@ -593,6 +599,7 @@ mod tests {
             body: b"stale".to_vec(),
             cached_at: now_secs().saturating_sub(500),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         store.put("gone", &stale).unwrap();
         assert!(store.get("gone").unwrap().is_none());
@@ -621,6 +628,7 @@ mod tests {
                     body: vec![i; 64 * 1024],
                     cached_at: now_secs(),
                     ttl_secs: 300,
+                    config_fp: String::new(),
                 };
                 for _ in 0..16 {
                     store.put("hot", &entry).unwrap();

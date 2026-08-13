@@ -579,6 +579,17 @@ pub(super) fn emit_access_log(
     let upstream_status = ctx.response_status.filter(|upstream| *upstream != status);
 
     let context = AccessLogContext {
+        // WOR-2407: name the config that served this request, and the
+        // cache identity its entries belong to. Both come off the
+        // pipeline the request already resolved against, so a reload
+        // mid-flight cannot stamp a revision the request never used.
+        config_revision: Some(ctx.pipeline.config_revision.clone())
+            .filter(|revision| !revision.is_empty()),
+        cache_config_fingerprint: ctx
+            .origin_idx
+            .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+            .filter(|origin| origin.response_cache.is_some())
+            .map(|origin| origin.cache_config_fingerprint.to_string()),
         envelope_request_id: ctx.envelope_request_id.map(|u| u.to_string()),
         user_id: ctx.user_id.clone(),
         user_id_source: ctx.user_id_source,
@@ -780,6 +791,12 @@ impl HttpFields {
 /// production path share the same shape, and so adding a field
 /// doesn't churn every test fixture.
 pub(super) struct AccessLogContext {
+    /// Config revision this node was serving (WOR-2407).
+    pub(super) config_revision: Option<String>,
+    /// Serving origin's cache-config fingerprint (WOR-2407). `None`
+    /// when the origin has no response cache, so the field does not
+    /// appear on log lines where it would mean nothing.
+    pub(super) cache_config_fingerprint: Option<String>,
     pub(super) envelope_request_id: Option<String>,
     pub(super) user_id: Option<String>,
     pub(super) user_id_source: Option<sbproxy_observe::UserIdSource>,
@@ -926,6 +943,8 @@ impl AccessLogContext {
     #[cfg(test)]
     pub(super) fn empty() -> Self {
         Self {
+            config_revision: None,
+            cache_config_fingerprint: None,
             envelope_request_id: None,
             user_id: None,
             user_id_source: None,
@@ -1110,6 +1129,8 @@ pub(super) fn emit_access_log_entry(
         timestamp: chrono::Utc::now().to_rfc3339(),
         request_id,
         origin: hostname.to_string(),
+        config_revision: context.config_revision,
+        cache_config_fingerprint: context.cache_config_fingerprint,
         method: method.to_string(),
         path: path.to_string(),
         query: http_fields.query,
@@ -1308,6 +1329,40 @@ mod run_identity_tests {
         );
         let line = std::fs::read_to_string(&path).expect("the access log line was written");
         serde_json::from_str(line.trim()).expect("the emitted line is JSON")
+    }
+
+    /// WOR-2407: a served request says which config served it.
+    ///
+    /// Without this, a rolling change is invisible in the log stream:
+    /// every line looks the same whether the node picked up the new
+    /// revision an hour ago or has not picked it up at all.
+    #[test]
+    fn the_serving_config_revision_reaches_the_access_log() {
+        let mut context = AccessLogContext::empty();
+        context.config_revision = Some("9f2c41a0be77".to_string());
+        context.cache_config_fingerprint = Some("00112233445566ff".to_string());
+
+        let line = emit(context);
+
+        assert_eq!(line["config_revision"], "9f2c41a0be77");
+        assert_eq!(line["cache_config_fingerprint"], "00112233445566ff");
+    }
+
+    /// The pair stays absent rather than null on traffic that has
+    /// neither, so a consumer counting distinct revisions does not have
+    /// to filter a null out of the set first.
+    #[test]
+    fn config_identity_is_omitted_when_there_is_none_to_report() {
+        let line = emit(AccessLogContext::empty());
+
+        assert!(
+            line.get("config_revision").is_none(),
+            "an unset revision must be omitted, not serialized as null: {line}"
+        );
+        assert!(
+            line.get("cache_config_fingerprint").is_none(),
+            "an origin with no response cache must not carry a cache fingerprint: {line}"
+        );
     }
 
     #[test]

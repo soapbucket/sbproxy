@@ -148,6 +148,7 @@ fn swr_write_back_does_not_resurrect_an_invalidated_entry() {
         body: b"stale".to_vec(),
         cached_at: 1,
         ttl_secs: 60,
+        config_fp: String::new(),
     };
     let refreshed = sbproxy_cache::CachedResponse {
         generation: 2,
@@ -180,6 +181,7 @@ fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
                 header: None,
                 query: None,
                 body: None,
+                when: None,
             }],
             action: sbproxy_modules::compile_action(&serde_json::json!({
                 "type": "proxy",
@@ -4450,6 +4452,52 @@ fn the_recorded_tenant_and_origin_are_the_populated_config_fields() {
 }
 
 #[test]
+fn the_audit_record_names_the_same_engine_the_metric_does() {
+    // WOR-2406. Before this the Prometheus series for a CEL denial
+    // said engine="cel" while the audit record for that same decision
+    // said surface: built_in, so an analyst correlating an alert to
+    // the trail found the two disagreeing about who decided. Same
+    // shape as the tenant bug the comment in `server.rs` describes,
+    // one dimension over.
+    //
+    // Driven through the real bus rather than by constructing an
+    // event, so this fails if `emit_policy_verdict` stops threading
+    // the engine it was handed.
+    let (bus, mut rx) = super::super::policy_bus::channel(8);
+    super::super::policy_bus::init_global_bus(bus);
+    let ctx = super::PolicyVerdictCtx {
+        request_id: "req-3".to_owned(),
+        workspace_id: String::new(),
+        origin: "audit-origin".to_owned(),
+        tenant: "acme-corp".to_owned(),
+    };
+    super::emit_policy_verdict(
+        &ctx,
+        "expression",
+        sbproxy_observe::events::PolicySurface::BuiltIn,
+        sbproxy_observe::decision::DecisionEngine::Cel,
+        sbproxy_observe::events::VerdictTag::Deny,
+        std::time::Instant::now(),
+    );
+    let mut ours = None;
+    while let Ok(event) = rx.try_recv() {
+        if event.request_id == "req-3" {
+            ours = Some(event);
+            break;
+        }
+    }
+    let event = ours.expect(
+        "the emitted verdict must reach the bus; a silent miss here would make this test \
+         pass without checking anything",
+    );
+    assert_eq!(
+        event.engine,
+        sbproxy_observe::decision::DecisionEngine::Cel,
+        "the audit record must carry the engine the metric was told about"
+    );
+}
+
+#[test]
 fn a_faulting_engine_is_recorded_as_error_rather_than_as_its_verdict() {
     // `outcome` documents `error` and `timeout` as always carried, so
     // an alert can fire without knowing which hook broke. That is only
@@ -4503,6 +4551,10 @@ fn cache_key_request(headers: &[(&'static str, &'static str)]) -> pingora_http::
     req
 }
 
+/// Stand-in origin cache-config fingerprint. These tests are about the
+/// vary and `cache.key` plan segments, so they hold it constant.
+const FP: &str = "00112233445566ff";
+
 fn cache_cfg_with_vary(vary: &[&str]) -> sbproxy_config::ResponseCacheConfig {
     sbproxy_config::ResponseCacheConfig {
         enabled: true,
@@ -4521,9 +4573,9 @@ fn a_declining_plan_keys_identically_to_no_plan_at_all() {
     let cfg = cache_cfg_with_vary(&["x-tier", "accept-encoding"]);
     let empty = sbproxy_cache::cache_event::CacheKeyPlan::default();
 
-    let without = super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, None);
+    let without = super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, None);
     let with_empty =
-        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, Some(&empty));
+        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, Some(&empty));
     assert_eq!(without, with_empty);
 }
 
@@ -4539,8 +4591,8 @@ fn the_operators_static_vary_order_is_not_reordered_by_a_plan() {
     let reversed = cache_cfg_with_vary(&["accept-encoding", "x-tier"]);
 
     assert_ne!(
-        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, None),
-        super::build_response_cache_key_with_plan("", "api.local", &req, &reversed, None),
+        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, None),
+        super::build_response_cache_key_with_plan("", "api.local", &req, &reversed, FP, None),
         "config order is part of the key contract; this pins that we did not silently \
          normalize it"
     );
@@ -4566,11 +4618,11 @@ fn a_plan_dimension_actually_changes_the_key() {
     let absent = cache_key_request(&[]);
 
     let key_gold =
-        super::build_response_cache_key_with_plan("", "api.local", &gold, &cfg, Some(&plan));
+        super::build_response_cache_key_with_plan("", "api.local", &gold, &cfg, FP, Some(&plan));
     let key_free =
-        super::build_response_cache_key_with_plan("", "api.local", &free, &cfg, Some(&plan));
+        super::build_response_cache_key_with_plan("", "api.local", &free, &cfg, FP, Some(&plan));
     let key_absent =
-        super::build_response_cache_key_with_plan("", "api.local", &absent, &cfg, Some(&plan));
+        super::build_response_cache_key_with_plan("", "api.local", &absent, &cfg, FP, Some(&plan));
 
     assert_ne!(key_gold, key_free, "two tiers must not share an entry");
     assert_ne!(
@@ -4593,6 +4645,7 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
         "api.local",
         &cache_key_request(&[]),
         &cfg,
+        FP,
         None,
     );
     for name in sbproxy_cache::cache_event::CACHE_VARY_HOST_DIMENSIONS {
@@ -4611,6 +4664,7 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
             "api.local",
             &cache_key_request(&[]),
             &cfg,
+            FP,
             Some(&plan),
         );
         assert_ne!(
