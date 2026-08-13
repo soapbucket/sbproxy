@@ -139,6 +139,7 @@ async fn audit_bus_round_trips_a_verdict_event() {
         chrono::Utc::now(),
         "counting_test_plugin".to_string(),
         PolicySurface::Plugin,
+        sbproxy_observe::decision::DecisionEngine::BuiltIn,
         VerdictTag::Allow,
         2,
     );

@@ -4451,6 +4451,52 @@ fn the_recorded_tenant_and_origin_are_the_populated_config_fields() {
 }
 
 #[test]
+fn the_audit_record_names_the_same_engine_the_metric_does() {
+    // WOR-2406. Before this the Prometheus series for a CEL denial
+    // said engine="cel" while the audit record for that same decision
+    // said surface: built_in, so an analyst correlating an alert to
+    // the trail found the two disagreeing about who decided. Same
+    // shape as the tenant bug the comment in `server.rs` describes,
+    // one dimension over.
+    //
+    // Driven through the real bus rather than by constructing an
+    // event, so this fails if `emit_policy_verdict` stops threading
+    // the engine it was handed.
+    let (bus, mut rx) = super::super::policy_bus::channel(8);
+    super::super::policy_bus::init_global_bus(bus);
+    let ctx = super::PolicyVerdictCtx {
+        request_id: "req-3".to_owned(),
+        workspace_id: String::new(),
+        origin: "audit-origin".to_owned(),
+        tenant: "acme-corp".to_owned(),
+    };
+    super::emit_policy_verdict(
+        &ctx,
+        "expression",
+        sbproxy_observe::events::PolicySurface::BuiltIn,
+        sbproxy_observe::decision::DecisionEngine::Cel,
+        sbproxy_observe::events::VerdictTag::Deny,
+        std::time::Instant::now(),
+    );
+    let mut ours = None;
+    while let Ok(event) = rx.try_recv() {
+        if event.request_id == "req-3" {
+            ours = Some(event);
+            break;
+        }
+    }
+    let event = ours.expect(
+        "the emitted verdict must reach the bus; a silent miss here would make this test \
+         pass without checking anything",
+    );
+    assert_eq!(
+        event.engine,
+        sbproxy_observe::decision::DecisionEngine::Cel,
+        "the audit record must carry the engine the metric was told about"
+    );
+}
+
+#[test]
 fn a_faulting_engine_is_recorded_as_error_rather_than_as_its_verdict() {
     // `outcome` documents `error` and `timeout` as always carried, so
     // an alert can fire without knowing which hook broke. That is only
