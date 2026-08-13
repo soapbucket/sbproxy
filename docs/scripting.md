@@ -814,7 +814,7 @@ origins:
           -- keeps the origin's static `vary:`.
           if string.find(ctx.request.path, "/v1/reports", 1, true) == 1 then
             return {
-              vary = { "tenant", "header:x-plan-tier" },
+              vary = { "header:x-plan-tier", "header:x-region" },
               reason = "a report body differs per tenant and per plan tier",
             }
           end
@@ -886,9 +886,9 @@ Declining is the cheap common case and means "the static config applies unchange
 
 ### Rules the events cannot bend
 
-**Dimension names are a closed set.** Each name in `vary` is either a dimension the host resolves itself (`tenant`, `origin`, `method`, `path`, `query`) or a request header written `header:<name>`. Anything else is refused when the document is decoded. A name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, so a typo has to fail loudly rather than quietly serve one customer's response to another. Names are trimmed, lowercased, deduplicated, and sorted, which keeps the same set in a different order producing the same key.
+**Dimension names are a closed set.** Each name in `vary` is either `query` or a request header written `header:<name>`. Anything else is refused when the document is decoded. A name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, so a typo has to fail loudly rather than quietly serve one customer's response to another. Names are trimmed, lowercased, deduplicated, and sorted, which keeps the same set in a different order producing the same key.
 
-**A key can only get narrower.** The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host from what the request resolved to, whatever the event returns. A policy adds dimensions to the key and can never widen one past its own tenant.
+**A key can only get narrower.** The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host whatever the event returns, so a policy adds dimensions and can never widen a key. Worth being precise about what separates tenants: `workspace` is empty on every path today, so that separation comes from `hostname` plus the per-origin cache store, not from the workspace segment.
 
 **A faulted `key_event` bypasses the cache.** If the engine faults, or the document cannot be decoded, the request gets no cache read and no cache write. Falling back to the static `vary:` alone would produce a coarser key rather than a narrower one, and the same key carries the write-back, so that response would be published to every other caller whose script also faulted. `admit_event` fails the other way, because nothing about the key changed: a fault there stores the response under the configured `ttl_secs`, which is what an origin without the event already does.
 

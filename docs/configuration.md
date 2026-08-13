@@ -3590,7 +3590,7 @@ origins:
           -- ctx.request.{method,path,query,host}, ctx.tenant, ctx.origin
           if string.find(ctx.request.path, "/v1/reports", 1, true) == 1 then
             return {
-              vary = { "tenant", "header:x-plan-tier" },
+              vary = { "header:x-plan-tier", "header:x-region" },
               reason = "a report body differs per tenant and per plan tier",
             }
           end
@@ -3625,9 +3625,13 @@ origins:
 
 Every field on a `key_event` document is optional, and `{}` or `null` declines, which leaves the static `vary:` in charge. `admit_event` declines the same two ways, but any other document has to carry `store`. There is no safe default for that one: guessing `true` caches a response the policy never approved, and guessing `false` silently switches the cache off, so a non-empty document without `store` is refused as incomplete rather than assumed either way.
 
-A dimension name is not free-form. Each one is either a dimension the host resolves itself (`tenant`, `origin`, `method`, `path`, `query`) or a request header written `header:<name>`. Anything else is refused when the document is decoded. That refusal is the safety property: a name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, which is the poisoning bug wearing a working config's clothes. Names are trimmed, lowercased, deduplicated, and sorted, so a policy that returns the same set in a different order still produces the same key.
+A dimension name is not free-form. Each one is either `query` or a request header written `header:<name>`. Anything else is refused when the document is decoded. That refusal is the safety property: a name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, which is the poisoning bug wearing a working config's clothes. Names are trimmed, lowercased, deduplicated, and sorted, so a policy that returns the same set in a different order still produces the same key.
 
-A `key_event` can only add dimensions to the key. The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host from what the request resolved to, whatever the event returns, so a policy can narrow a key and can never widen one past its own tenant.
+A `key_event` can only add dimensions to the key. The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host whatever the event returns, so a policy can narrow a key and can never widen one.
+
+Worth being precise about which segment separates tenants, because the obvious answer is wrong: `workspace` is passed as the empty string on every path in this build, so tenant separation comes from `hostname` plus the per-origin store handle, not from a workspace prefix.
+
+**Why the host-resolved list is one entry long.** `method`, `path`, and the hostname are already key segments, so varying on them adds nothing. `tenant` and `origin` are worse than redundant: both are fixed per origin, so every request that could share a key already agrees on them, and a `tenant` dimension would look like a tenant partition while delivering none. `query` earns its place only because `query_normalize: ignore_all` deliberately empties that segment, and this is the way to put it back for a subset of requests. Note it resolves the raw query, so it does not inherit the origin's normalization. Everything else that genuinely partitions is a request header.
 
 The two events fall back in opposite directions, and the asymmetry is deliberate:
 

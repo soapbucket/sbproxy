@@ -4489,3 +4489,131 @@ fn a_hook_that_ran_out_of_time_is_separable_from_one_that_faulted() {
         DecisionOutcome::Error
     );
 }
+
+// --- cache.key plan folding (WOR-2367) ---
+
+/// A request header map with the given pairs, for key-building tests.
+fn cache_key_request(headers: &[(&'static str, &'static str)]) -> pingora_http::RequestHeader {
+    let mut req = pingora_http::RequestHeader::build("GET", b"/thing?b=2&a=1", None).unwrap();
+    for (name, value) in headers {
+        req.insert_header(*name, *value).unwrap();
+    }
+    req
+}
+
+fn cache_cfg_with_vary(vary: &[&str]) -> sbproxy_config::ResponseCacheConfig {
+    sbproxy_config::ResponseCacheConfig {
+        enabled: true,
+        vary: vary.iter().map(|v| (*v).to_owned()).collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_declining_plan_keys_identically_to_no_plan_at_all() {
+    // The property that made the merged sort tempting. It has to hold,
+    // or a policy that declines on some requests and answers on others
+    // populates two entries per variant and neither ever reads the
+    // other's.
+    let req = cache_key_request(&[("x-tier", "gold")]);
+    let cfg = cache_cfg_with_vary(&["x-tier", "accept-encoding"]);
+    let empty = sbproxy_cache::cache_event::CacheKeyPlan::default();
+
+    let without = super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, None);
+    let with_empty =
+        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, Some(&empty));
+    assert_eq!(without, with_empty);
+}
+
+#[test]
+fn the_operators_static_vary_order_is_not_reordered_by_a_plan() {
+    // Sorting the merged list would give the same property as appending
+    // sorted, and would also change the key of every existing
+    // multi-entry `vary:` config on deploy: cold cache, origin load
+    // spike, and old entries holding store space until their TTLs run
+    // out. Nothing would have warned about it.
+    let req = cache_key_request(&[("x-tier", "gold"), ("accept-encoding", "gzip")]);
+    let cfg = cache_cfg_with_vary(&["x-tier", "accept-encoding"]);
+    let reversed = cache_cfg_with_vary(&["accept-encoding", "x-tier"]);
+
+    assert_ne!(
+        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, None),
+        super::build_response_cache_key_with_plan("", "api.local", &req, &reversed, None),
+        "config order is part of the key contract; this pins that we did not silently \
+         normalize it"
+    );
+}
+
+#[test]
+fn a_plan_dimension_actually_changes_the_key() {
+    // The whole point of the event. If a plan's dimensions did not
+    // reach the fingerprint, every caller would share one entry and
+    // nothing would say so.
+    let cfg = cache_cfg_with_vary(&[]);
+    let plan = match sbproxy_cache::cache_event::decode_cache_key(&serde_json::json!({
+        "vary": ["header:x-tier"]
+    }))
+    .unwrap()
+    {
+        sbproxy_cache::cache_event::CacheDecision::Plan(plan) => plan,
+        sbproxy_cache::cache_event::CacheDecision::Decline => panic!("expected a plan"),
+    };
+
+    let gold = cache_key_request(&[("x-tier", "gold")]);
+    let free = cache_key_request(&[("x-tier", "free")]);
+    let absent = cache_key_request(&[]);
+
+    let key_gold =
+        super::build_response_cache_key_with_plan("", "api.local", &gold, &cfg, Some(&plan));
+    let key_free =
+        super::build_response_cache_key_with_plan("", "api.local", &free, &cfg, Some(&plan));
+    let key_absent =
+        super::build_response_cache_key_with_plan("", "api.local", &absent, &cfg, Some(&plan));
+
+    assert_ne!(key_gold, key_free, "two tiers must not share an entry");
+    assert_ne!(
+        key_gold, key_absent,
+        "an absent header must not collide with a present one"
+    );
+}
+
+#[test]
+fn every_accepted_host_dimension_has_a_real_resolver_arm() {
+    // The two lists live in different crates: the accepted set is in
+    // `sbproxy-cache`, the resolver is here. A name added to the set
+    // without an arm would decode fine and resolve to a constant, which
+    // is the partitions-nothing bug the refusal exists to prevent. This
+    // walks the real constant through the real resolver so the pairing
+    // cannot drift silently.
+    let cfg = cache_cfg_with_vary(&[]);
+    let baseline = super::build_response_cache_key_with_plan(
+        "",
+        "api.local",
+        &cache_key_request(&[]),
+        &cfg,
+        None,
+    );
+    for name in sbproxy_cache::cache_event::CACHE_VARY_HOST_DIMENSIONS {
+        let plan = match sbproxy_cache::cache_event::decode_cache_key(&serde_json::json!({
+            "vary": [name]
+        }))
+        .unwrap()
+        {
+            sbproxy_cache::cache_event::CacheDecision::Plan(plan) => plan,
+            sbproxy_cache::cache_event::CacheDecision::Decline => {
+                panic!("`{name}` is in the accepted set and must decode to a plan")
+            }
+        };
+        let keyed = super::build_response_cache_key_with_plan(
+            "",
+            "api.local",
+            &cache_key_request(&[]),
+            &cfg,
+            Some(&plan),
+        );
+        assert_ne!(
+            keyed, baseline,
+            "`{name}` is accepted at decode but did not change the key, so it partitions nothing"
+        );
+    }
+}

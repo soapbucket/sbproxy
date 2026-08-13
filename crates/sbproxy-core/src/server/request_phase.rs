@@ -3962,8 +3962,6 @@ pub(super) async fn request_filter(
                     session.req_header(),
                     cache_cfg,
                     key_plan.as_ref(),
-                    ctx.tenant_id.as_str(),
-                    origin.origin_id.as_str(),
                 );
                 // `skip_lookup` goes upstream for *this* request while
                 // leaving the response eligible for storage, which is a

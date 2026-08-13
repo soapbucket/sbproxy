@@ -34,8 +34,7 @@
 //! than advisory: **a policy chooses additional dimensions to vary on,
 //! and cannot remove any.**
 //!
-//! A dimension name is either one the host resolves itself (`tenant`,
-//! `origin`, `method`, `path`, `query`) or a request header written
+//! A dimension name is either `query` or a request header written
 //! `header:<name>`. Anything else is **refused at decode**, because a
 //! name resolving to nothing would contribute the same empty value to
 //! every request, partition nothing, and merge every caller into one
@@ -44,10 +43,17 @@
 //!
 //! `compute_cache_key` builds `<workspace>:<hostname>:<method>:<path>:
 //! <query>:<vary-fingerprint>`, and a policy reaches only the last
-//! segment. The workspace prefix is stamped by the host from the
-//! resolved tenant on every key, whatever the policy returns. A policy
-//! can therefore narrow a key, never widen it past its own tenant, and
-//! there is no document it can return that escapes.
+//! segment. Every earlier segment is stamped by the host whatever the
+//! policy returns, so a policy can narrow a key and there is no
+//! document it can return that widens one.
+//!
+//! Worth being precise about which segment does the separating, because
+//! the obvious answer is wrong in this build: `workspace` is passed as
+//! the empty string on every production path, so tenant separation
+//! comes from `hostname` plus the per-origin store handle
+//! (`cache_store_for(origin)`), not from a workspace prefix. The
+//! structural property holds either way, since a plan only ever
+//! produces vary pairs and those are hashed into the last segment.
 //!
 //! ## Determinism is a correctness property, not a preference
 //!
@@ -110,7 +116,7 @@ pub const CACHE_VARY_HEADER_PREFIX: &str = "header:";
 /// **refused** rather than resolved to nothing. That refusal is the
 /// difference between a typo that fails loudly and a typo that quietly
 /// merges every caller into one cache bucket.
-pub const CACHE_VARY_HOST_DIMENSIONS: &[&str] = &["tenant", "origin", "method", "path", "query"];
+pub const CACHE_VARY_HOST_DIMENSIONS: &[&str] = &["query"];
 
 /// Upper bound on a policy-chosen TTL, in seconds (30 days).
 ///
@@ -468,19 +474,20 @@ mod tests {
         // produce the same key. Otherwise every store lands under a key
         // no later lookup reproduces and the cache silently never hits,
         // with nothing failing and the hit-rate panel reading zero.
-        let a = decode_cache_key(&json!({"vary": ["tenant", "path", "header:x-tier"]}));
-        let b = decode_cache_key(&json!({"vary": ["header:x-tier", "tenant", "path"]}));
+        let a = decode_cache_key(&json!({"vary": ["query", "header:x-tier", "header:x-region"]}));
+        let b = decode_cache_key(&json!({"vary": ["header:x-region", "query", "header:x-tier"]}));
         assert_eq!(a, b);
     }
 
     #[test]
     fn vary_names_are_case_insensitive_and_deduplicated() {
         let CacheDecision::Plan(plan) =
-            decode_cache_key(&json!({"vary": ["Tenant", "tenant", "TENANT", "Path"]})).unwrap()
+            decode_cache_key(&json!({"vary": ["Query", "query", "QUERY", "Header:X-Tier"]}))
+                .unwrap()
         else {
             panic!("expected a plan");
         };
-        assert_eq!(plan.vary, vec!["path", "tenant"]);
+        assert_eq!(plan.vary, vec!["header:x-tier", "query"]);
     }
 
     #[test]
@@ -490,7 +497,7 @@ mod tests {
         // workspace segment, because it only ever produces vary pairs
         // and the host stamps the prefix itself.
         let CacheDecision::Plan(plan) = decode_cache_key(&json!({
-            "vary": ["tenant", "header:x-tenant-override", "header:../../other-tenant"],
+            "vary": ["query", "header:x-tenant-override", "header:../../other-tenant"],
         }))
         .unwrap() else {
             panic!("expected a plan");
@@ -700,11 +707,11 @@ mod tests {
     #[test]
     fn a_non_string_vary_entry_is_refused() {
         assert_eq!(
-            decode_cache_key(&json!({"vary": ["tenant", 7]})),
+            decode_cache_key(&json!({"vary": ["query", 7]})),
             Err(CacheEventError::VaryNotStrings)
         );
         assert_eq!(
-            decode_cache_key(&json!({"vary": "tenant"})),
+            decode_cache_key(&json!({"vary": "query"})),
             Err(CacheEventError::VaryNotStrings)
         );
     }
