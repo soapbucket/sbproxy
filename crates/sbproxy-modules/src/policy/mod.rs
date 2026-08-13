@@ -147,7 +147,10 @@ pub enum Policy {
     /// request context. If the expression evaluates to false, the request is denied.
     Expression(ExpressionPolicy),
     /// Rego decision policy, evaluated on the Regorus interpreter.
-    Rego(rego::RegoPolicy),
+    ///
+    /// Boxed: `RegoPolicy` holds a parsed Regorus engine, and unboxed it
+    /// would set the size of every `Policy` in every compiled chain.
+    Rego(Box<rego::RegoPolicy>),
     /// CEL assertion policy for response-time validation. Evaluates a CEL
     /// expression and logs/flags when it returns false.
     Assertion(AssertionPolicy),

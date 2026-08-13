@@ -156,7 +156,7 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         // Rego policy denied anything" rather than "not instrumented",
         // which WOR-2357 found to be worse than an omission.
         Policy::Rego(p) => with_engine(
-            builtin(super::rego::RegoEnforcer(Arc::new(p))),
+            builtin(super::rego::RegoEnforcer(Arc::new(*p))),
             DecisionEngine::Rego,
         ),
         Policy::Assertion(p) => builtin(AssertionEnforcer(Arc::new(p))),
