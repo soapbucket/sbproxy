@@ -43,7 +43,7 @@
 //!   the upstream thinks is asking
 //! * attached extension bundles, which can carry request-side hooks
 //! * the `response_cache` block itself, including
-//!   [`ResponseCacheConfig::epoch`]
+//!   [`epoch`](crate::types::ResponseCacheConfig::epoch)
 //!
 //! Deliberately not covered: response modifiers, CORS, HSTS,
 //! compression, sessions, error pages, observability, timeouts, and
