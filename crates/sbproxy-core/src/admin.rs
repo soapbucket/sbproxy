@@ -1775,7 +1775,25 @@ fn handle_config_write(
         }
     }
     // Validate BEFORE writing so a bad config never clobbers the file.
-    let compiled = match sbproxy_config::compile_config(yaml) {
+    // Resolution comes first for the same reason: a `source:` pointer
+    // body compiles trivially on its own, so without resolving here a
+    // pointer at a broken payload would be validated as the pointer,
+    // written to disk, and only then refused by the delegated reload,
+    // leaving a file behind that fails the next boot or SIGHUP.
+    let resolved_body = match crate::config_source::resolve(yaml) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"failed to resolve config source: {}"}}"#,
+                    format!("{e:#}").replace('"', "'")
+                ),
+            )
+        }
+    };
+    let compiled = match sbproxy_config::compile_config(&resolved_body.text) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -4584,6 +4602,13 @@ mod tests {
         })
     }
 
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .current_dir(dir)
@@ -4607,6 +4632,10 @@ mod tests {
         // resolved payload, so an operator-caused failure is a 400 with
         // the old config still serving, matching the documented
         // contract for both admin routes.
+        if !git_available() {
+            eprintln!("skipping: git is not available on this host");
+            return;
+        }
         let fixture = tempfile::tempdir().expect("tempdir");
         let repo = fixture.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
