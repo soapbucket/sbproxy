@@ -100,6 +100,12 @@ pub enum QueryMode {
 /// [`path_invalidation_prefix`] stops before the query segment, so a
 /// mutation still evicts every cached variant of a path whatever config
 /// wrote it.
+// The parameter list is the key format, segment by segment, in the
+// order the format string below writes them. Bundling it into a struct
+// to get under the seven-argument threshold would put the segment list
+// somewhere other than the code that renders it, which is the one place
+// a reader checks when they need to know what a key contains.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_cache_key(
     workspace: &str,
     hostname: &str,
