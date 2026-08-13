@@ -117,18 +117,41 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         Policy::Csrf(p) => builtin(CsrfEnforcer(Arc::new(p))),
         Policy::Ddos(p) => builtin(DdosEnforcer(Arc::new(p))),
         Policy::Sri(p) => builtin(SriEnforcer(Arc::new(p))),
-        // The two policies whose decision *is* a CEL expression. A
-        // `rate_limiting` key or a `waf` Lua rule is deliberately not
-        // here: those scripts compute an input, and the enforcer still
-        // makes the call, so attributing the verdict to the script
-        // would be confidently wrong rather than merely coarse.
+        // The one policy whose decision at *this* seam is a CEL
+        // expression.
+        //
+        // Three neighbours look like they belong here and do not.
+        //
+        // `assertion` is response-phase. `AssertionEnforcer` is a
+        // `response_phase_enforcer!` placeholder whose `enforce`
+        // returns `Allow` unconditionally, and the expression is
+        // really evaluated in `proxy_http`'s response-header phase,
+        // which emits no decision event at all. Labelling the
+        // placeholder `Cel` would stamp `engine="cel"` on a constant
+        // `allow` once per request and pull the CEL latency histogram
+        // toward zero, while the assertion that actually failed stayed
+        // invisible. It stays `BuiltIn` until that site emits its own
+        // event.
+        //
+        // A `rate_limiting` `key:` and a `waf` `persistent_block`
+        // `track_by: cel` compute a bucket key rather than a verdict.
+        // The enforcer still decides, so the script has no say to
+        // attribute.
+        //
+        // `waf` custom rules are the genuinely hard case, and not for
+        // that reason. A Lua or JS rule's `match(request)` return
+        // value *is* the match, and `true` becomes
+        // `WafResult::Blocked`, so that verdict really is the
+        // script's. It stays `BuiltIn` because one `waf` policy mixes
+        // regex and scripted rules freely, so no single label chosen
+        // at compile time is true of every request it decides.
+        // Attributing per rule means moving the emission to where the
+        // rule fires.
         Policy::Expression(p) => with_engine(
             builtin(ExpressionEnforcer(Arc::new(p))),
             DecisionEngine::Cel,
         ),
-        Policy::Assertion(p) => {
-            with_engine(builtin(AssertionEnforcer(Arc::new(p))), DecisionEngine::Cel)
-        }
+        Policy::Assertion(p) => builtin(AssertionEnforcer(Arc::new(p))),
         Policy::Waf(p) => builtin(WafEnforcer(Arc::new(p))),
         Policy::RequestValidator(p) => builtin(RequestValidatorEnforcer(Arc::new(p))),
         Policy::ContentDigest(p) => builtin(ContentDigestEnforcer(Arc::new(p))),
@@ -317,6 +340,58 @@ mod tests {
                 "key": "request.headers[\"x-api-key\"]"
             }))
             .expect("rate limit policy compiles"),
+        );
+        let compiled = compile_one(policy, "test-route").expect("policy compiles");
+        assert_eq!(compiled.engine, DecisionEngine::BuiltIn);
+    }
+
+    #[test]
+    fn a_bundle_backed_policy_reports_the_runtime_that_runs_it() {
+        // The reason `DynamicHookMetadata` grew a `runtime` field. Both
+        // of these used to report `plugin`, which is the same answer a
+        // linked Rust plugin gives, so an operator could not tell which
+        // of their bundles denied a request.
+        for (runtime, expected) in [
+            (
+                sbproxy_config::BundleRuntime::Javascript,
+                DecisionEngine::JavaScript,
+            ),
+            (sbproxy_config::BundleRuntime::Wasm, DecisionEngine::Wasm),
+        ] {
+            let metadata = sbproxy_modules::DynamicHookMetadata::new(
+                "test-bundle",
+                "test_hook",
+                runtime,
+                sbproxy_config::BundleBodyMode::None,
+                1024,
+                sbproxy_config::FailureMode::Closed,
+            );
+            let policy = Policy::Plugin(sbproxy_modules::PluginPolicy::dynamic(
+                Box::new(FakePlugin),
+                metadata,
+            ));
+            let compiled = compile_one(policy, "test-route").expect("policy compiles");
+            assert_eq!(compiled.engine, expected, "runtime {runtime:?}");
+            assert_eq!(
+                compiled.surface,
+                PolicySurface::Plugin,
+                "the surface is still plugin; only the engine narrowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_phase_assertion_is_not_attributed_to_cel_here() {
+        // `AssertionEnforcer` returns `Allow` unconditionally at this
+        // seam; the expression runs in the response phase. Labelling it
+        // `Cel` would report a constant allow as a CEL decision on
+        // every request.
+        let policy = Policy::Assertion(
+            sbproxy_modules::policy::assertion::AssertionPolicy::from_config(serde_json::json!({
+                "name": "no-5xx",
+                "expression": "response.status < 500"
+            }))
+            .expect("assertion policy compiles"),
         );
         let compiled = compile_one(policy, "test-route").expect("policy compiles");
         assert_eq!(compiled.engine, DecisionEngine::BuiltIn);
