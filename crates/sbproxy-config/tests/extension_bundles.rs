@@ -246,6 +246,74 @@ fn payment_hook_manifest_uses_no_body_contract() {
 }
 
 #[test]
+fn mutates_is_accepted_only_on_the_wired_guardrail_kinds() {
+    // The two kinds with host write-back accept the declaration and
+    // default to inspect-only when it is absent.
+    for kind in ["ai_guardrail_input", "ai_guardrail_output"] {
+        let yaml = JAVASCRIPT_MANIFEST
+            .replace("kind: policy", &format!("kind: {kind}"))
+            .replace(
+                "    export: enforce",
+                "    export: enforce
+    execution:
+      mutates: true",
+            );
+        let manifest = parse_manifest(&yaml);
+        assert!(manifest.hooks[0].execution.mutates, "{kind}");
+    }
+    let manifest =
+        parse_manifest(&JAVASCRIPT_MANIFEST.replace("kind: policy", "kind: ai_guardrail_output"));
+    assert!(!manifest.hooks[0].execution.mutates);
+
+    // Tool-call and stream hooks are content-bearing but have no wire
+    // write-back yet: declaring mutation there must refuse at load, not
+    // silently drop the rewrite at dispatch. Lifecycle and non-AI kinds
+    // refuse for the simpler reason that they carry nothing to mutate.
+    for kind in [
+        "ai_tool_call",
+        "ai_stream_event",
+        "ai_close",
+        "ai_failure",
+        "policy",
+    ] {
+        let mut yaml = JAVASCRIPT_MANIFEST
+            .replace("kind: policy", &format!("kind: {kind}"))
+            .replace(
+                "    export: enforce",
+                "    export: enforce
+    execution:
+      mutates: true",
+            );
+        if kind == "ai_stream_event" {
+            // Streamed AI events are Proxy-Wasm-only; keep the refusal
+            // under test the mutates one.
+            yaml = yaml
+                .replace(
+                    "runtime: javascript",
+                    "runtime: proxy_wasm
+abi: 0.2.1",
+                )
+                .replace("entry: src/index.ts", "entry: filter.wasm")
+                .replace(
+                    "      mutates: true",
+                    "      mutates: true
+      body_mode: streamed",
+                )
+                .replace(
+                    "    export: enforce
+",
+                    "",
+                );
+        }
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("mutates is not supported"),
+            "{kind}: {error}"
+        );
+    }
+}
+
+#[test]
 fn payment_hook_manifest_rejects_body_access() {
     let yaml = JAVASCRIPT_MANIFEST.replace("kind: policy", "kind: payment");
 

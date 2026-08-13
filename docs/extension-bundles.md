@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-13*
 
 Dynamic bundles add policies, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -275,7 +275,11 @@ AI hooks receive a provider-neutral event with `schema_version: 1`, a monotonica
 | `ai_stream_event` | Normalized message-start, text-delta, usage, or message-stop chunk |
 | `ai_close` | One terminal summary with finish reason, byte and delta counts, tool-call count, and token usage when known |
 
-JavaScript and envelope WASM AI hooks return `release`, `flag`, or `block`. A `block` carries an HTTP status from 400 through 599 plus a bounded code and client-safe message. A `flag` carries the code and message but does not stop traffic. `enforcement_mode: observe` moves a hook onto a bounded observation lane; the default `block` mode waits for the decision before releasing the corresponding operation or bytes.
+JavaScript and envelope WASM AI hooks return `release`, `flag`, `block`, or `mutate`. A `block` carries an HTTP status from 400 through 599 plus a bounded code and client-safe message. A `flag` carries the code and message but does not stop traffic. `enforcement_mode: observe` moves a hook onto a bounded observation lane; the default `block` mode waits for the decision before releasing the corresponding operation or bytes.
+
+A `mutate` rewrites the event's content in place and releases it. The decision carries a bounded `code` and a `body_base64` payload holding the replacement content: plain UTF-8 text for `ai_guardrail_output`, and the JSON of the canonical message list for `ai_guardrail_input`. The host applies the rewrite before the next hook runs, so hooks compose: a redactor followed by a classifier classifies the redacted content. What ships is the rewritten content, spliced back into the provider-shaped body; a rewrite the body shape cannot faithfully carry (for example, one replacement text against a multi-choice completion) refuses the response rather than shipping the original.
+
+Mutation is declared, not inferred. A hook may return `mutate` only when its manifest entry sets `execution.mutates: true`, which is accepted on `ai_guardrail_input` and `ai_guardrail_output` hooks; declaring it elsewhere refuses at config load. An undeclared or oversized rewrite (the payload is capped by `sandbox.max_buffer_bytes`) is an engine fault handled under the bundle's failure posture: refused under `closed`, released unmodified under an admitting posture. Identity fields such as `sequence` and `request_id` are host-owned and cannot be rewritten.
 
 ## Payment and x402 events
 

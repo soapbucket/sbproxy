@@ -272,6 +272,16 @@ pub struct BundleExecution {
     /// Body access mode required by this hook.
     #[serde(default)]
     pub body_mode: BundleBodyMode,
+    /// Whether this hook may return a `mutate` decision.
+    ///
+    /// Default false, and false is the cheap path: an inspect-only
+    /// hook's payload never needs re-validation, and the host reads
+    /// this declaration rather than inferring intent from whether a
+    /// payload came back changed, which would make the cost depend on
+    /// the data instead of the config. Only the content-bearing AI
+    /// hooks may declare it; validation refuses it elsewhere.
+    #[serde(default)]
+    pub mutates: bool,
 }
 
 /// One hook declared by a bundle manifest.
@@ -589,6 +599,22 @@ impl BundleManifest {
                 && hook.execution.body_mode != BundleBodyMode::None
             {
                 return invalid("payment hooks require body_mode none");
+            }
+            if hook.execution.mutates
+                && !matches!(
+                    hook.kind,
+                    BundleHookKind::AiGuardrailInput | BundleHookKind::AiGuardrailOutput
+                )
+            {
+                // Tool-call and stream chunks are content-bearing too,
+                // but the host has no write-back for their wire frames
+                // yet: a declared mutation there would be applied to
+                // the in-memory event and silently absent from what
+                // ships, which is worse than a refusal at config load.
+                return invalid(format!(
+                    "mutates is not supported for {} hooks; only ai.guardrail_input and ai.guardrail_output hooks may mutate",
+                    hook_kind_label(hook.kind)
+                ));
             }
             if let Some(schema) = &hook.config_schema {
                 validate_schema(schema)?;

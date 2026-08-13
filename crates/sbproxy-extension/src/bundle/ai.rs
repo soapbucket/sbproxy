@@ -55,6 +55,10 @@ struct PreparedAiHook {
     kind: ExtensionHookKind,
     enforcement: AiExtensionEnforcement,
     failure_posture: FailureMode,
+    /// Whether the manifest declared this hook may return `Mutate`.
+    mutates: bool,
+    /// Cap on a mutate body, from the manifest sandbox.
+    max_buffer_bytes: usize,
     runner: PreparedAiRunner,
 }
 
@@ -90,6 +94,12 @@ impl AiExtensionChain {
                 kind: public_kind,
                 enforcement: registration.enforcement,
                 failure_posture: FailureMode::Closed,
+                // Linked registrations do not declare mutation yet, so a
+                // linked hook returning `Mutate` is an engine fault under
+                // its (closed) posture until the public registration
+                // grows the flag. Inspect-only is the safe default.
+                mutates: false,
+                max_buffer_bytes: 0,
                 runner: PreparedAiRunner::Linked((registration.factory)()),
             }));
 
@@ -203,6 +213,9 @@ fn prepare_dynamic_hook(
         kind: public_kind,
         enforcement,
         failure_posture: hook.manifest().failure_posture,
+        mutates: hook.hook().execution.mutates,
+        max_buffer_bytes: usize::try_from(hook.manifest().sandbox.max_buffer_bytes)
+            .unwrap_or(usize::MAX),
         runner,
     })
 }
@@ -221,11 +234,23 @@ struct ActiveAiHook {
     kind: ExtensionHookKind,
     enforcement: AiExtensionEnforcement,
     failure_posture: FailureMode,
+    /// Whether the manifest declared this hook may return `Mutate`. A
+    /// linked Rust hook declares through its registration; a hook that
+    /// returns `Mutate` without declaring is an engine fault under its
+    /// posture, so the cheap inspect-only path is a manifest fact
+    /// rather than an inference from what came back.
+    mutates: bool,
+    /// Cap on a mutate body. The envelope decoder caps bundle output at
+    /// decode; this cap also covers linked hooks, which return the
+    /// variant directly with no envelope in between.
+    max_buffer_bytes: usize,
     runner: ActiveAiRunner,
 }
 
 impl From<PreparedAiHook> for ActiveAiHook {
     fn from(hook: PreparedAiHook) -> Self {
+        let mutates = hook.mutates;
+        let max_buffer_bytes = hook.max_buffer_bytes;
         let runner = match hook.runner {
             PreparedAiRunner::Linked(runner) => ActiveAiRunner::Linked(runner),
             PreparedAiRunner::Envelope(runner) => ActiveAiRunner::Envelope(runner),
@@ -237,6 +262,8 @@ impl From<PreparedAiHook> for ActiveAiHook {
         Self {
             id: hook.id,
             kind: hook.kind,
+            mutates,
+            max_buffer_bytes,
             enforcement: hook.enforcement,
             failure_posture: hook.failure_posture,
             runner,
@@ -250,7 +277,11 @@ impl ActiveAiHook {
             ActiveAiRunner::Linked(hook) => hook.handle(event).await,
             ActiveAiRunner::Envelope(program) => {
                 let output = program.invoke("event", event).await?;
-                decode_ai_decision(&output).map_err(|error| {
+                // The manifest's sandbox buffer cap bounds a mutate
+                // body at decode, before the base64 payload becomes a
+                // held allocation; dispatch re-checks it for runners
+                // that have no envelope.
+                decode_ai_decision(&output, self.max_buffer_bytes).map_err(|error| {
                     PluginError::Internal(anyhow::anyhow!(
                         "AI bundle hook returned {}",
                         error.code()
@@ -272,6 +303,30 @@ impl ActiveAiHook {
         }
         Ok(())
     }
+}
+
+/// Chain verdict for one dispatched event.
+///
+/// Distinct from [`AiExtensionDecision`], which is one hook's answer:
+/// this is the whole enforcing chain's. `Mutated` carries no payload
+/// because the applied content lives on the event the caller handed
+/// in; there is exactly one copy of the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiChainVerdict {
+    /// Every enforcing hook released the event as delivered.
+    Release,
+    /// At least one hook rewrote the payload in place; read the event
+    /// back rather than assuming it is what was sent.
+    Mutated,
+    /// A hook refused the event.
+    Block {
+        /// Client-safe refusal status.
+        status: u16,
+        /// Stable machine-readable refusal code.
+        code: String,
+        /// Client-safe refusal message.
+        message: String,
+    },
 }
 
 /// Request-local AI extension state.
@@ -298,16 +353,16 @@ impl AiExtensionSession {
     /// Deliver an event to observation hooks and await every enforcing hook.
     ///
     /// Events must have schema version 1 and strictly increasing sequence
-    /// values. The first block verdict stops the chain.
+    /// values. The first block verdict stops the chain. The observation
+    /// lane receives the event as submitted, before any enforcing hook
+    /// mutates it; mutations are attributed on the enforcing lane's log
+    /// records.
     ///
     /// # Errors
     ///
     /// Returns a plugin error for an invalid event, an enforcing hook failure
     /// under closed posture, or use after [`Self::finish`].
-    pub async fn dispatch(
-        &mut self,
-        event: &AiExtensionEvent,
-    ) -> PluginResult<AiExtensionDecision> {
+    pub async fn dispatch(&mut self, event: &mut AiExtensionEvent) -> PluginResult<AiChainVerdict> {
         if self.finished {
             return Err(PluginError::Config(
                 "AI extension session has already finished".to_owned(),
@@ -339,14 +394,22 @@ impl AiExtensionSession {
         }
 
         let kind = event.hook_kind();
+        let mut mutated = false;
         for hook in self.enforcing.iter_mut().filter(|hook| hook.kind == kind) {
+            // Hooks run in chain dispatch order (the order
+            // `dispatch_order` reports: linked registrations first,
+            // then bundle hooks sorted by type name) and each sees the
+            // previous hook's output: the event is mutated in place,
+            // so a redactor followed by a classifier classifies the
+            // redacted payload rather than one that will never be
+            // sent.
             match hook.invoke(event).await {
                 Ok(AiExtensionDecision::Block {
                     status,
                     code,
                     message,
                 }) => {
-                    return Ok(AiExtensionDecision::Block {
+                    return Ok(AiChainVerdict::Block {
                         status,
                         code,
                         message,
@@ -356,6 +419,48 @@ impl AiExtensionSession {
                     tracing::info!(hook = %hook.id, %code, %message, "AI extension hook flagged an event");
                 }
                 Ok(AiExtensionDecision::Release) => {}
+                Ok(AiExtensionDecision::Mutate { body, code }) => {
+                    match Self::apply_hook_mutation(hook, event, &body) {
+                        Ok(()) => {
+                            mutated = true;
+                            tracing::info!(
+                                hook = %hook.id,
+                                %code,
+                                bytes = body.len(),
+                                "AI extension hook mutated the event payload"
+                            );
+                        }
+                        Err(reason) if hook.failure_posture.admits() => {
+                            // The mutation is refused but the posture
+                            // admits: the event continues UNMODIFIED,
+                            // which is the same reading as a hook that
+                            // errored. A half-applied mutation is not a
+                            // state this chain can be in.
+                            tracing::warn!(
+                                hook = %hook.id,
+                                posture = hook.failure_posture.as_label(),
+                                %reason,
+                                "AI extension hook mutation refused under an admitting posture"
+                            );
+                        }
+                        Err(reason) => {
+                            return Err(PluginError::Config(format!(
+                                "AI extension hook `{}` returned an invalid mutation: {reason}",
+                                hook.id
+                            )));
+                        }
+                    }
+                }
+                // The enum is non_exhaustive for out-of-tree matchers;
+                // in-tree, a variant this host does not know is a build
+                // error upstream, so this arm is unreachable today and
+                // deliberately conservative if that ever changes.
+                Ok(_) => {
+                    return Err(PluginError::Config(format!(
+                        "AI extension hook `{}` returned a decision this host does not support",
+                        hook.id
+                    )));
+                }
                 Err(error) if hook.failure_posture.admits() => {
                     tracing::warn!(
                         hook = %hook.id,
@@ -367,7 +472,34 @@ impl AiExtensionSession {
                 Err(error) => return Err(error),
             }
         }
-        Ok(AiExtensionDecision::Release)
+        if mutated {
+            return Ok(AiChainVerdict::Mutated);
+        }
+        Ok(AiChainVerdict::Release)
+    }
+
+    /// Validate and apply one hook's mutation to the event in place.
+    ///
+    /// Refusals are stable labels the posture logic maps like any other
+    /// engine fault: an undeclared mutation (the manifest said
+    /// inspect-only), an oversized body, a payload kind that does not
+    /// accept mutation, or a body that does not parse as the kind's
+    /// content shape.
+    fn apply_hook_mutation(
+        hook: &ActiveAiHook,
+        event: &mut AiExtensionEvent,
+        body: &[u8],
+    ) -> Result<(), &'static str> {
+        if !hook.mutates {
+            return Err("mutation_not_declared");
+        }
+        if !event.payload.accepts_mutation() {
+            return Err("event_not_mutable");
+        }
+        if hook.max_buffer_bytes != 0 && body.len() > hook.max_buffer_bytes {
+            return Err("mutate_body_over_buffer_cap");
+        }
+        event.payload.apply_mutation(body)
     }
 
     /// Finish request-local Proxy-Wasm contexts and close the observation lane.
@@ -581,21 +713,21 @@ mod tests {
         let chain = AiExtensionChain::from_registry(&registry).unwrap();
         assert!(chain.has_enforcing(ExtensionHookKind::AiGuardrailOutput));
         let mut session = chain.start_session();
-        let output = event(
+        let mut output = event(
             1,
             AiExtensionEventPayload::GuardrailOutput {
                 content: "blocked text".to_owned(),
             },
         );
         assert_eq!(
-            session.dispatch(&output).await.unwrap(),
-            AiExtensionDecision::Block {
+            session.dispatch(&mut output).await.unwrap(),
+            AiChainVerdict::Block {
                 status: 451,
                 code: "fixture_block".to_owned(),
                 message: "blocked by fixture".to_owned(),
             }
         );
-        assert!(session.dispatch(&output).await.is_err());
+        assert!(session.dispatch(&mut output).await.is_err());
     }
 
     #[tokio::test]
@@ -610,7 +742,7 @@ mod tests {
 
         assert_eq!(
             session
-                .dispatch(&event(
+                .dispatch(&mut event(
                     1,
                     AiExtensionEventPayload::GuardrailInput {
                         stage: "original".to_owned(),
@@ -619,7 +751,7 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            AiExtensionDecision::Release
+            AiChainVerdict::Release
         );
     }
 
@@ -635,7 +767,7 @@ mod tests {
         let mut session = chain.start_session();
         assert_eq!(
             session
-                .dispatch(&event(
+                .dispatch(&mut event(
                     1,
                     AiExtensionEventPayload::Stream {
                         chunk: AiExtensionStreamChunk::ContentDelta {
@@ -646,9 +778,210 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            AiExtensionDecision::Release
+            AiChainVerdict::Release
         );
         session.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_mutating_hooks_compose_in_chain_order() {
+        // Hook one rewrites the content; hook two refuses unless it
+        // sees hook one's output, proving each hook receives the
+        // previous hook's rewrite rather than the original. Bundle
+        // hooks dispatch sorted by type name (WOR-2272), so the type
+        // names carry an explicit a_/b_ prefix to pin the order the
+        // test depends on.
+        let registry = load_bundle(
+            concat!(
+                "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: ai-mutate\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n",
+                "  - kind: ai_guardrail_output\n    type: a_redact_output\n    export: redact\n    execution:\n      mutates: true\n",
+                "  - kind: ai_guardrail_output\n    type: b_polish_output\n    export: polish\n    execution:\n      mutates: true\n",
+            ),
+            "entry.js",
+            concat!(
+                r#"export function redact(input) { if (input.event.content !== "raw text") throw new Error("first hook saw " + input.event.content); return {version:"sbproxy-envelope/v1",decision:"mutate",code:"redacted",body_base64:"Y2xlYW4gdGV4dA=="}; }"#,
+                "\n",
+                r#"export function polish(input) { if (input.event.content !== "clean text") throw new Error("second hook saw " + input.event.content); return {version:"sbproxy-envelope/v1",decision:"mutate",code:"polished",body_base64:"Y2xlYW5lciB0ZXh0"}; }"#,
+            )
+            .as_bytes(),
+        );
+        let chain = AiExtensionChain::from_registry(&registry).unwrap();
+        let mut session = chain.start_session();
+        let mut output = event(
+            1,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw text".to_owned(),
+            },
+        );
+        assert_eq!(
+            session.dispatch(&mut output).await.unwrap(),
+            AiChainVerdict::Mutated
+        );
+        // The caller reads the final content off the event; identity
+        // fields are host-owned and unchanged.
+        assert_eq!(
+            output.payload,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "cleaner text".to_owned(),
+            }
+        );
+        assert_eq!(output.sequence, 1);
+        assert_eq!(output.request_id.as_deref(), Some("request-fixture"));
+    }
+
+    #[tokio::test]
+    async fn block_after_mutate_short_circuits_and_keeps_the_rewrite() {
+        let registry = load_bundle(
+            concat!(
+                "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: ai-mutate-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n",
+                "  - kind: ai_guardrail_output\n    type: a_redact_output\n    export: redact\n    execution:\n      mutates: true\n",
+                "  - kind: ai_guardrail_output\n    type: b_block_output\n    export: block\n",
+            ),
+            "entry.js",
+            concat!(
+                r#"export function redact(input) { return {version:"sbproxy-envelope/v1",decision:"mutate",code:"redacted",body_base64:"Y2xlYW4gdGV4dA=="}; }"#,
+                "\n",
+                r#"export function block(input) { if (input.event.content !== "clean text") throw new Error("block hook saw " + input.event.content); return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"still_bad",message:"refused after rewrite"}; }"#,
+            )
+            .as_bytes(),
+        );
+        let chain = AiExtensionChain::from_registry(&registry).unwrap();
+        let mut session = chain.start_session();
+        let mut output = event(
+            1,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw text".to_owned(),
+            },
+        );
+        assert_eq!(
+            session.dispatch(&mut output).await.unwrap(),
+            AiChainVerdict::Block {
+                status: 451,
+                code: "still_bad".to_owned(),
+                message: "refused after rewrite".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclared_mutation_is_an_engine_fault_under_closed_posture() {
+        // The manifest says inspect-only (no `mutates: true`), so a
+        // mutate decision is the engine misbehaving, not a feature.
+        let registry = load_bundle(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: ai-undeclared\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_output\n    type: sneaky_output\n    export: sneak\n",
+            "entry.js",
+            br#"export function sneak(input) { return {version:"sbproxy-envelope/v1",decision:"mutate",code:"sneaky",body_base64:"Y2xlYW4gdGV4dA=="}; }"#,
+        );
+        let chain = AiExtensionChain::from_registry(&registry).unwrap();
+        let mut session = chain.start_session();
+        let mut output = event(
+            1,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw text".to_owned(),
+            },
+        );
+        assert!(session.dispatch(&mut output).await.is_err());
+        // The refused mutation was not half-applied.
+        assert_eq!(
+            output.payload,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw text".to_owned(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclared_mutation_under_an_admitting_posture_continues_unmodified() {
+        let registry = load_bundle(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: ai-undeclared-open\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nfailure_posture: open\nhooks:\n  - kind: ai_guardrail_output\n    type: sneaky_output\n    export: sneak\n",
+            "entry.js",
+            br#"export function sneak(input) { return {version:"sbproxy-envelope/v1",decision:"mutate",code:"sneaky",body_base64:"Y2xlYW4gdGV4dA=="}; }"#,
+        );
+        let chain = AiExtensionChain::from_registry(&registry).unwrap();
+        let mut session = chain.start_session();
+        let mut output = event(
+            1,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw text".to_owned(),
+            },
+        );
+        assert_eq!(
+            session.dispatch(&mut output).await.unwrap(),
+            AiChainVerdict::Release
+        );
+        assert_eq!(
+            output.payload,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw text".to_owned(),
+            },
+        );
+    }
+
+    struct NoopLinkedHook;
+
+    impl sbproxy_plugin::AiExtensionHook for NoopLinkedHook {
+        fn handle<'a>(
+            &'a self,
+            _event: &'a AiExtensionEvent,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = PluginResult<AiExtensionDecision>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(AiExtensionDecision::Release) })
+        }
+    }
+
+    #[test]
+    fn hook_mutation_guard_refuses_before_touching_the_event() {
+        let hook = ActiveAiHook {
+            id: "fixture".to_owned(),
+            kind: ExtensionHookKind::AiGuardrailOutput,
+            enforcement: AiExtensionEnforcement::Block,
+            failure_posture: FailureMode::Closed,
+            mutates: false,
+            max_buffer_bytes: 4,
+            runner: ActiveAiRunner::Linked(Arc::new(NoopLinkedHook)),
+        };
+        let mut output = event(
+            1,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw".to_owned(),
+            },
+        );
+        assert_eq!(
+            AiExtensionSession::apply_hook_mutation(&hook, &mut output, b"new"),
+            Err("mutation_not_declared")
+        );
+        let hook = ActiveAiHook {
+            mutates: true,
+            ..hook
+        };
+        assert_eq!(
+            AiExtensionSession::apply_hook_mutation(&hook, &mut output, b"12345"),
+            Err("mutate_body_over_buffer_cap")
+        );
+        // A non-content event refuses regardless of declaration.
+        let mut close = event(
+            2,
+            AiExtensionEventPayload::Close {
+                finish_reason: None,
+                content_bytes: 0,
+                content_delta_count: 0,
+                tool_call_count: 0,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        );
+        assert_eq!(
+            AiExtensionSession::apply_hook_mutation(&hook, &mut close, b"new"),
+            Err("event_not_mutable")
+        );
+        // Every refusal above left the original payload in place.
+        assert_eq!(
+            output.payload,
+            AiExtensionEventPayload::GuardrailOutput {
+                content: "raw".to_owned(),
+            },
+        );
     }
 
     #[test]

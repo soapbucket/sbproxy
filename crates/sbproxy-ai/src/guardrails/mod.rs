@@ -641,6 +641,89 @@ pub fn assistant_response_text(content: &str) -> Option<String> {
     None
 }
 
+/// Rewrite the assistant text of a provider-shaped response body.
+///
+/// The write-back inverse of [`assistant_response_text`], for the case
+/// that inverse is well defined: exactly one text slot. The extraction
+/// concatenates every slot into one string, so a body with two choices
+/// or two text blocks has no faithful place to put a single
+/// replacement, and guessing (first slot keeps everything, the rest go
+/// empty) would corrupt multi-completion responses. `None` means
+/// unrepresentable and the caller must refuse, not ship the original.
+///
+/// Round-trip property tests rely on: when this returns `Some(body)`,
+/// `assistant_response_text(&body)` equals `replacement`.
+pub fn replace_assistant_response_text(content: &str, replacement: &str) -> Option<String> {
+    // One slot is either a `content` that is a plain string, or one
+    // array part carrying a `text` string field, mirroring exactly
+    // what `append_content` reads on the extraction side.
+    fn content_slots(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::String(_) => 1,
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter(|part| part.get("text").is_some_and(serde_json::Value::is_string))
+                .count(),
+            _ => 0,
+        }
+    }
+
+    fn write_slot(value: &mut serde_json::Value, replacement: &str) {
+        match value {
+            serde_json::Value::String(text) => *text = replacement.to_owned(),
+            serde_json::Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    if let Some(text) = part.get_mut("text").filter(|t| t.is_string()) {
+                        *text = serde_json::Value::String(replacement.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut value: serde_json::Value = serde_json::from_str(content).ok()?;
+
+    // Collect the mutable content values for each recognized shape,
+    // in the same order the extraction reads them.
+    let contents: Vec<&mut serde_json::Value> = if value.get("choices").is_some() {
+        value
+            .get_mut("choices")?
+            .as_array_mut()?
+            .iter_mut()
+            .filter_map(|choice| choice.get_mut("message")?.get_mut("content"))
+            .collect()
+    } else if value.get("output").is_some() {
+        value
+            .get_mut("output")?
+            .as_array_mut()?
+            .iter_mut()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                    && item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            })
+            .filter_map(|item| item.get_mut("content"))
+            .collect()
+    } else if value.get("type").and_then(serde_json::Value::as_str) == Some("message")
+        && value.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+    {
+        value.get_mut("content").into_iter().collect()
+    } else {
+        return None;
+    };
+
+    let mut slotted: Vec<&mut serde_json::Value> = contents
+        .into_iter()
+        .filter(|content| content_slots(content) > 0)
+        .collect();
+    let total: usize = slotted.iter().map(|content| content_slots(content)).sum();
+    if total != 1 {
+        return None;
+    }
+    write_slot(slotted.pop()?, replacement);
+    serde_json::to_string(&value).ok()
+}
+
 /// Public text view of a slice of messages, used by the guardrail mesh as
 /// its content-addressed cache key. Same extraction the serial pipeline's
 /// detectors see.
@@ -925,6 +1008,59 @@ pub struct GuardrailsConfig {
 mod tests {
     use super::*;
     use std::sync::{Arc, Once};
+
+    #[test]
+    fn replace_assistant_text_round_trips_the_single_slot_shapes() {
+        // When the replace succeeds, extraction of the result must
+        // equal the replacement: that property is what lets a caller
+        // treat the spliced body as carrying exactly the hook's text.
+        let cases = [
+            // OpenAI Chat, string content.
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"raw"},"finish_reason":"stop"}],"usage":{"total_tokens":2}}"#,
+            // OpenAI Chat, one text part.
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"text","text":"raw"}]}}]}"#,
+            // OpenAI Responses output item.
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"raw"}]}]}"#,
+            // Anthropic Messages.
+            r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"raw"}]}"#,
+        ];
+        for case in cases {
+            let replaced = replace_assistant_response_text(case, "clean text")
+                .unwrap_or_else(|| panic!("replace failed for {case}"));
+            assert_eq!(
+                assistant_response_text(&replaced).as_deref(),
+                Some("clean text"),
+                "{case}"
+            );
+        }
+        // Fields around the slot survive the splice.
+        let replaced = replace_assistant_response_text(cases[0], "clean text").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&replaced).unwrap();
+        assert_eq!(value["usage"]["total_tokens"], 2);
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn replace_assistant_text_refuses_ambiguous_shapes() {
+        // Two choices: the concatenated extraction has no faithful
+        // inverse, and guessing would corrupt an n>1 completion.
+        assert!(replace_assistant_response_text(
+            r#"{"choices":[{"message":{"role":"assistant","content":"a"}},{"message":{"role":"assistant","content":"b"}}]}"#,
+            "clean",
+        )
+        .is_none());
+        // Two text parts in one message.
+        assert!(replace_assistant_response_text(
+            r#"{"choices":[{"message":{"role":"assistant","content":[{"text":"a"},{"text":"b"}]}}]}"#,
+            "clean",
+        )
+        .is_none());
+        // No recognized slot at all.
+        assert!(replace_assistant_response_text(r#"{"result":"a"}"#, "clean").is_none());
+        assert!(replace_assistant_response_text("not json", "clean").is_none());
+        // Zero-slot choices.
+        assert!(replace_assistant_response_text(r#"{"choices":[]}"#, "clean").is_none());
+    }
 
     #[derive(Debug)]
     struct SafeClassifier;

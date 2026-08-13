@@ -18,7 +18,7 @@ mod response_semantics;
 #[cfg(test)]
 mod tests;
 
-pub use ai::{AiExtensionChain, AiExtensionSession};
+pub use ai::{AiChainVerdict, AiExtensionChain, AiExtensionSession};
 pub use envelope_wasm::{
     build_wasm_action, build_wasm_policy, build_wasm_transform, WasmActionAdapter,
     WasmPolicyAdapter, WasmTransformAdapter,

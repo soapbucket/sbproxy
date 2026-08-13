@@ -5571,12 +5571,21 @@ pub(super) async fn handle_ai_proxy(
         } => {
             ctx.ai_guardrail_labels = labels;
             if let Some(extensions) = ai_extensions.as_mut() {
-                if let Err(block) = extensions
+                match extensions
                     .guard_input(InputGuardrailStage::Original.label(), &body)
                     .await
                 {
-                    send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
-                    return Ok(());
+                    Ok(None) => {}
+                    Ok(Some(messages)) => {
+                        if let Some(block) = write_mutated_input_messages(&mut body, &messages) {
+                            send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                            return Ok(());
+                        }
+                    }
+                    Err(block) => {
+                        send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                        return Ok(());
+                    }
                 }
             }
             flagged_count
@@ -5740,18 +5749,32 @@ pub(super) async fn handle_ai_proxy(
                                 guardrail_flagged_count = flagged_count;
                                 ctx.ai_guardrail_labels = labels;
                                 if let Some(extensions) = ai_extensions.as_mut() {
-                                    if let Err(block) = extensions
+                                    match extensions
                                         .guard_input(
                                             InputGuardrailStage::RagAugmented.label(),
                                             &body,
                                         )
                                         .await
                                     {
-                                        send_ai_extension_block_response(
-                                            session, ctx, &ai_span, block,
-                                        )
-                                        .await?;
-                                        return Ok(());
+                                        Ok(None) => {}
+                                        Ok(Some(messages)) => {
+                                            if let Some(block) =
+                                                write_mutated_input_messages(&mut body, &messages)
+                                            {
+                                                send_ai_extension_block_response(
+                                                    session, ctx, &ai_span, block,
+                                                )
+                                                .await?;
+                                                return Ok(());
+                                            }
+                                        }
+                                        Err(block) => {
+                                            send_ai_extension_block_response(
+                                                session, ctx, &ai_span, block,
+                                            )
+                                            .await?;
+                                            return Ok(());
+                                        }
                                     }
                                 }
                             }
@@ -6172,10 +6195,29 @@ pub(super) async fn handle_ai_proxy(
             {
                 send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
             } else if (200..300).contains(&response.status) {
+                let mut response = response;
                 if let Some(extensions) = ai_extensions.as_mut() {
-                    if let Err(block) = extensions.guard_output(&response.body).await {
-                        send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
-                        return Ok(());
+                    match extensions.guard_output(&response.body).await {
+                        Ok(None) => {}
+                        Ok(Some(content)) => {
+                            match apply_ai_output_mutation(&response.body, &content) {
+                                Some(new_body) => response.body = new_body,
+                                None => {
+                                    send_ai_extension_block_response(
+                                        session,
+                                        ctx,
+                                        &ai_span,
+                                        crate::ai_extensions::AiExtensionBlock::mutation_unrepresentable(),
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(block) => {
+                            send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                            return Ok(());
+                        }
                     }
                 }
                 {
@@ -6489,7 +6531,7 @@ pub(super) async fn handle_ai_proxy(
                             // The stored body is behind one reference count.
                             // Cloning the handle here costs a refcount bump,
                             // not a copy of the response.
-                            let body = hit.response.body.clone();
+                            let mut body = hit.response.body.clone();
                             if let Some(block) = ai_output_guardrail_block(
                                 hit.response.status,
                                 guardrail_pipeline.as_deref(),
@@ -6505,13 +6547,36 @@ pub(super) async fn handle_ai_proxy(
                             }
                             if (200..300).contains(&hit.response.status) {
                                 if let Some(extensions) = ai_extensions.as_mut() {
-                                    if let Err(block) = extensions.guard_output(body.as_ref()).await
-                                    {
-                                        send_ai_extension_block_response(
-                                            session, ctx, &ai_span, block,
-                                        )
-                                        .await?;
-                                        return Ok(());
+                                    match extensions.guard_output(body.as_ref()).await {
+                                        Ok(None) => {}
+                                        Ok(Some(content)) => {
+                                            // The mutation applies to this
+                                            // delivery only; the stored hit
+                                            // keeps the admitted body.
+                                            match apply_ai_output_mutation(body.as_ref(), &content)
+                                            {
+                                                Some(new_body) => {
+                                                    body = bytes::Bytes::from(new_body);
+                                                }
+                                                None => {
+                                                    send_ai_extension_block_response(
+                                                        session,
+                                                        ctx,
+                                                        &ai_span,
+                                                        crate::ai_extensions::AiExtensionBlock::mutation_unrepresentable(),
+                                                    )
+                                                    .await?;
+                                                    return Ok(());
+                                                }
+                                            }
+                                        }
+                                        Err(block) => {
+                                            send_ai_extension_block_response(
+                                                session, ctx, &ai_span, block,
+                                            )
+                                            .await?;
+                                            return Ok(());
+                                        }
                                     }
                                 }
                             }
@@ -9043,7 +9108,7 @@ pub(super) async fn relay_ai_response_with_cache(
     // writes, so local lanes echo a model id exactly like hosted
     // lanes. Streaming responses get the same rewrite per SSE frame
     // in `relay_ai_stream` (WOR-1811, `rewrite_stream_chunk_model`).
-    let resp_body: bytes::Bytes = match ctx
+    let mut resp_body: bytes::Bytes = match ctx
         .as_ref()
         .and_then(|c| c.ai_serve_model.as_deref())
         .filter(|_| (200..300).contains(&status))
@@ -9067,7 +9132,7 @@ pub(super) async fn relay_ai_response_with_cache(
         .as_ref()
         .map(|c| c.ai_reversible_redactions.clone())
         .unwrap_or_default();
-    let direct_client_body = direct_response_body
+    let mut direct_client_body = direct_response_body
         .as_ref()
         .map(|body| restore_reversible_pii(body, &reversible_pairs));
     if (200..300).contains(&status) {
@@ -9178,15 +9243,58 @@ pub(super) async fn relay_ai_response_with_cache(
     }
     if (200..300).contains(&status) {
         if let Some(extensions) = ai_extensions.as_mut() {
-            if let Err(block) = extensions.guard_output(&resp_body).await {
-                if let Some(request_ctx) = ctx.as_mut() {
-                    return send_ai_extension_block_response(session, request_ctx, &ai_span, block)
-                        .await;
+            match extensions.guard_output(&resp_body).await {
+                Ok(None) => {}
+                Ok(Some(content)) => {
+                    match apply_ai_output_mutation(&resp_body, &content) {
+                        Some(new_body) => {
+                            let new_body = bytes::Bytes::from(new_body);
+                            // Native bypass ships `direct_client_body`
+                            // rather than the canonical body, and in
+                            // bypass mode the two share a wire shape,
+                            // so the mutation must land on both or the
+                            // client receives bytes the hook never
+                            // approved.
+                            if direct_client_body.is_some() {
+                                direct_client_body = Some(new_body.clone());
+                            }
+                            resp_body = new_body;
+                        }
+                        None => {
+                            let block =
+                                crate::ai_extensions::AiExtensionBlock::mutation_unrepresentable();
+                            if let Some(request_ctx) = ctx.as_mut() {
+                                return send_ai_extension_block_response(
+                                    session,
+                                    request_ctx,
+                                    &ai_span,
+                                    block,
+                                )
+                                .await;
+                            }
+                            let body = ErrorEnvelope::new("guardrail_violation", &block.message)
+                                .code(&block.code)
+                                .to_bytes();
+                            return send_response(session, block.status, "application/json", &body)
+                                .await;
+                        }
+                    }
                 }
-                let body = ErrorEnvelope::new("guardrail_violation", &block.message)
-                    .code(&block.code)
-                    .to_bytes();
-                return send_response(session, block.status, "application/json", &body).await;
+                Err(block) => {
+                    if let Some(request_ctx) = ctx.as_mut() {
+                        return send_ai_extension_block_response(
+                            session,
+                            request_ctx,
+                            &ai_span,
+                            block,
+                        )
+                        .await;
+                    }
+                    let body = ErrorEnvelope::new("guardrail_violation", &block.message)
+                        .code(&block.code)
+                        .to_bytes();
+                    return send_response(session, block.status, "application/json", &body).await;
+                }
             }
         }
     }
@@ -10210,6 +10318,176 @@ fn process_guard_events(
     }
 
     (None, released, completed)
+}
+
+/// Write a hook-rewritten canonical message list back into the
+/// provider-shaped request body.
+///
+/// The inverse of `canonical_input_messages`, per body shape: a
+/// `messages` or `input` array takes the canonical list wholesale
+/// (roles serialize to the provider wire spelling), while the
+/// single-string shapes (`input`, `prompt`, `query`) can only carry
+/// one plain user message back. `Some(block)` is the refusal for a
+/// rewrite the shape cannot represent; shipping the original behind a
+/// hook that believes it rewrote the input is the outcome this
+/// refusal exists to prevent.
+fn write_mutated_input_messages(
+    body: &mut serde_json::Value,
+    messages: &[sbproxy_plugin::AiExtensionMessage],
+) -> Option<crate::ai_extensions::AiExtensionBlock> {
+    use crate::ai_extensions::AiExtensionBlock;
+    let refuse = || Some(AiExtensionBlock::mutation_unrepresentable());
+    let single_user_text = || match messages {
+        [message]
+            if message.role == sbproxy_plugin::AiExtensionRole::User
+                && message.name.is_none()
+                && message.tool_call_id.is_none() =>
+        {
+            Some(message.content.clone())
+        }
+        _ => None,
+    };
+    if body
+        .get("messages")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        let Ok(wire) = serde_json::to_value(messages) else {
+            return refuse();
+        };
+        body["messages"] = wire;
+        return None;
+    }
+    if let Some(input) = body.get("input") {
+        if input.is_array() {
+            let Ok(wire) = serde_json::to_value(messages) else {
+                return refuse();
+            };
+            body["input"] = wire;
+            return None;
+        }
+        if input.is_string() {
+            let Some(text) = single_user_text() else {
+                return refuse();
+            };
+            body["input"] = serde_json::Value::String(text);
+            return None;
+        }
+    }
+    for field in ["prompt", "query"] {
+        if body.get(field).is_some_and(serde_json::Value::is_string) {
+            let Some(text) = single_user_text() else {
+                return refuse();
+            };
+            body[field] = serde_json::Value::String(text);
+            return None;
+        }
+    }
+    refuse()
+}
+
+/// Splice hook-rewritten output text back into the response body.
+///
+/// Mirrors `canonical_output_text`'s extraction: a JSON body takes
+/// the single-slot assistant-text replacement, a plain-text body is
+/// replaced whole. `None` is unrepresentable (multi-slot completion)
+/// and the caller must refuse.
+fn apply_ai_output_mutation(original: &[u8], content: &str) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(original).ok()?;
+    if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+        sbproxy_ai::guardrails::replace_assistant_response_text(text, content)
+            .map(String::into_bytes)
+    } else {
+        Some(content.as_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod mutation_write_back_tests {
+    use super::{apply_ai_output_mutation, write_mutated_input_messages};
+    use sbproxy_plugin::{AiExtensionMessage, AiExtensionRole};
+
+    fn user(content: &str) -> AiExtensionMessage {
+        AiExtensionMessage {
+            role: AiExtensionRole::User,
+            content: content.to_owned(),
+            name: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn messages_array_takes_the_full_canonical_list() {
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "raw"}],
+            "temperature": 0.2,
+        });
+        let messages = [
+            AiExtensionMessage {
+                role: AiExtensionRole::System,
+                content: "be safe".to_owned(),
+                name: None,
+                tool_call_id: None,
+            },
+            user("clean"),
+        ];
+        assert!(write_mutated_input_messages(&mut body, &messages).is_none());
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "be safe"},
+                    {"role": "user", "content": "clean"},
+                ],
+                "temperature": 0.2,
+            })
+        );
+    }
+
+    #[test]
+    fn single_string_shapes_take_one_user_message_and_refuse_more() {
+        for field in ["input", "prompt", "query"] {
+            let mut body = serde_json::json!({"model": "m", field: "raw"});
+            assert!(write_mutated_input_messages(&mut body, &[user("clean")]).is_none());
+            assert_eq!(body[field], "clean");
+
+            // A message list a plain-string field cannot carry.
+            let mut body = serde_json::json!({"model": "m", field: "raw"});
+            let block = write_mutated_input_messages(&mut body, &[user("clean"), user("second")])
+                .expect("two messages cannot land in one string field");
+            assert_eq!(block.code, "ai_extension_mutation_unrepresentable");
+            // The refused rewrite left the body untouched.
+            assert_eq!(body[field], "raw");
+        }
+    }
+
+    #[test]
+    fn unknown_body_shapes_refuse_rather_than_guess() {
+        let mut body = serde_json::json!({"model": "m", "embedding_input": ["a"]});
+        assert!(write_mutated_input_messages(&mut body, &[user("clean")]).is_some());
+    }
+
+    #[test]
+    fn output_mutation_splices_json_and_replaces_plain_text() {
+        let json = br#"{"choices":[{"message":{"role":"assistant","content":"raw"},"finish_reason":"stop"}]}"#;
+        let spliced = apply_ai_output_mutation(json, "clean").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&spliced).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "clean");
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+
+        assert_eq!(
+            apply_ai_output_mutation(b"plain completion", "clean").as_deref(),
+            Some(b"clean".as_ref())
+        );
+
+        // Multi-choice JSON has no faithful single-text inverse.
+        assert!(apply_ai_output_mutation(
+            br#"{"choices":[{"message":{"content":"a"}},{"message":{"content":"b"}}]}"#,
+            "clean",
+        )
+        .is_none());
+    }
 }
 
 async fn dispatch_ai_hub_events(

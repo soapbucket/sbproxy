@@ -455,6 +455,8 @@ struct AiDecisionWire {
     code: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    body_base64: Option<String>,
 }
 
 fn valid_event_code(value: &str) -> bool {
@@ -465,7 +467,10 @@ fn valid_event_code(value: &str) -> bool {
         })
 }
 
-pub(crate) fn decode_ai_decision(bytes: &[u8]) -> Result<AiExtensionDecision, EnvelopeError> {
+pub(crate) fn decode_ai_decision(
+    bytes: &[u8],
+    max_body_bytes: usize,
+) -> Result<AiExtensionDecision, EnvelopeError> {
     let response: AiDecisionWire =
         serde_json::from_slice(bytes).map_err(|_| EnvelopeError::new("invalid_envelope"))?;
     if response.version != ENVELOPE_VERSION {
@@ -475,11 +480,28 @@ pub(crate) fn decode_ai_decision(bytes: &[u8]) -> Result<AiExtensionDecision, En
         "release"
             if response.status.is_none()
                 && response.code.is_none()
-                && response.message.is_none() =>
+                && response.message.is_none()
+                && response.body_base64.is_none() =>
         {
             Ok(AiExtensionDecision::Release)
         }
-        "block" | "flag" => {
+        "mutate" if response.status.is_none() && response.message.is_none() => {
+            let code = response
+                .code
+                .filter(|value| valid_event_code(value))
+                .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+            let body_base64 = response
+                .body_base64
+                .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(body_base64)
+                .map_err(|_| EnvelopeError::new("invalid_envelope"))?;
+            if body.len() > max_body_bytes {
+                return Err(EnvelopeError::new("output_limit"));
+            }
+            Ok(AiExtensionDecision::Mutate { body, code })
+        }
+        "block" | "flag" if response.body_base64.is_none() => {
             let code = response
                 .code
                 .filter(|value| valid_event_code(value))
@@ -552,6 +574,7 @@ mod tests {
         assert_eq!(
             decode_ai_decision(
                 br#"{"version":"sbproxy-envelope/v1","decision":"block","status":403,"code":"policy_denied","message":"request denied"}"#,
+                usize::MAX,
             )
             .unwrap(),
             AiExtensionDecision::Block {
@@ -561,12 +584,16 @@ mod tests {
             }
         );
         assert_eq!(
-            decode_ai_decision(br#"{"version":"sbproxy-envelope/v1","decision":"release"}"#,)
-                .unwrap(),
+            decode_ai_decision(
+                br#"{"version":"sbproxy-envelope/v1","decision":"release"}"#,
+                usize::MAX
+            )
+            .unwrap(),
             AiExtensionDecision::Release
         );
         assert!(decode_ai_decision(
             br#"{"version":"sbproxy-envelope/v1","decision":"block","status":200,"code":"bad","message":"bad"}"#,
+            usize::MAX,
         )
         .is_err());
         let oversized = serde_json::json!({
@@ -575,7 +602,89 @@ mod tests {
             "code": "x".repeat(65),
             "message": "safe",
         });
-        assert!(decode_ai_decision(oversized.to_string().as_bytes()).is_err());
+        assert!(decode_ai_decision(oversized.to_string().as_bytes(), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn ai_mutate_decision_decodes_body_and_enforces_the_cap_at_decode() {
+        let decoded = decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"pii_redacted","body_base64":"aGVsbG8="}"#,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            AiExtensionDecision::Mutate {
+                body: b"hello".to_vec(),
+                code: "pii_redacted".to_owned(),
+            }
+        );
+
+        // The manifest buffer cap applies before the decoded payload
+        // exists as a value: five bytes against a cap of four.
+        let error = decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"pii_redacted","body_base64":"aGVsbG8="}"#,
+            4,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "output_limit");
+    }
+
+    #[test]
+    fn ai_mutate_decision_is_strict_about_its_fields() {
+        // Missing body: never a silent release.
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"pii_redacted"}"#,
+            usize::MAX,
+        )
+        .is_err());
+        // Missing or invalid code.
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","body_base64":"aGVsbG8="}"#,
+            usize::MAX,
+        )
+        .is_err());
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"NOT VALID","body_base64":"aGVsbG8="}"#,
+            usize::MAX,
+        )
+        .is_err());
+        // Block-shaped fields on a mutate.
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"x","body_base64":"aGVsbG8=","status":403}"#,
+            usize::MAX,
+        )
+        .is_err());
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"x","body_base64":"aGVsbG8=","message":"m"}"#,
+            usize::MAX,
+        )
+        .is_err());
+        // Invalid base64.
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"mutate","code":"x","body_base64":"!!!"}"#,
+            usize::MAX,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ai_body_on_a_non_mutate_decision_is_refused() {
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"release","body_base64":"aGVsbG8="}"#,
+            usize::MAX,
+        )
+        .is_err());
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"block","status":403,"code":"c","message":"m","body_base64":"aGVsbG8="}"#,
+            usize::MAX,
+        )
+        .is_err());
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"flag","code":"c","message":"m","body_base64":"aGVsbG8="}"#,
+            usize::MAX,
+        )
+        .is_err());
     }
 
     #[test]

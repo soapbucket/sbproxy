@@ -13,11 +13,11 @@ use sbproxy_extension::bundle::{
     DynamicBundleRegistry, PaymentExtensionChain,
 };
 use sbproxy_plugin::{
-    ActionHandler, ActionOutcome, AiExtensionDecision, AiExtensionEvent, AiExtensionEventPayload,
-    AiExtensionMessage, AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall,
-    ExtensionHookKind, ExtensionRuntime, PaymentExtensionDecision, PaymentExtensionEvent,
-    PaymentExtensionOutcome, PaymentExtensionPhase, PolicyDecision, PolicyEnforcer,
-    TransformContext, TransformHandler, AI_EXTENSION_EVENT_SCHEMA_VERSION,
+    ActionHandler, ActionOutcome, AiExtensionEvent, AiExtensionEventPayload, AiExtensionMessage,
+    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, ExtensionHookKind,
+    ExtensionRuntime, PaymentExtensionDecision, PaymentExtensionEvent, PaymentExtensionOutcome,
+    PaymentExtensionPhase, PolicyDecision, PolicyEnforcer, TransformContext, TransformHandler,
+    AI_EXTENSION_EVENT_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -302,10 +302,10 @@ async fn published_ai_payment_and_proxy_wasm_hooks_execute() {
             },
         ),
     ];
-    for event in events {
+    for mut event in events {
         assert_eq!(
-            session.dispatch(&event).await.unwrap(),
-            AiExtensionDecision::Release
+            session.dispatch(&mut event).await.unwrap(),
+            sbproxy_extension::bundle::AiChainVerdict::Release
         );
     }
     session.finish().unwrap();
