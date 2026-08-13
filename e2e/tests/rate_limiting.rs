@@ -21,7 +21,7 @@ origins:
       - type: rate_limiting
         requests_per_second: 5
         burst: 5
-        key: ip
+        key: 'connection.remote_ip'
         headers:
           enabled: true
           include_retry_after: true
