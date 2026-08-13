@@ -3217,7 +3217,7 @@ Every entry in the `transforms:` list is wrapped with these pipeline-level field
 | `content_types` | list | `[]` | Content-Type substrings the transform applies to. Empty matches all. |
 | `failure_posture` | string | `open` | What happens to the response when this transform fails: `closed` replaces the body with a generic error instead of forwarding it, `open` skips the failed transform and continues with the next one. `degraded` and `observe` are rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
 | `fail_on_error` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: closed`, `false` means `open`. Still parses and is used only when `failure_posture` is absent; setting both to values that disagree is a config-load error. |
-| `max_body_size` | int | 10485760 | Maximum body size, in bytes, that this transform will buffer. Larger bodies skip the transform. |
+| `max_body_size` | int | 10485760 | Maximum body size, in bytes, that this transform will buffer. What a larger body does depends on `failure_posture`: under `open` it skips the transform and passes through unmodified; under `closed` it fails the response, because a body the transform never saw must not reach the client. |
 | `disabled` | bool | false | When true, the transform is parsed but not applied. |
 
 Type-specific fields are listed below.

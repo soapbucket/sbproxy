@@ -141,6 +141,24 @@ fn hold_request_body_chunk(body: &mut Option<Bytes>) {
 /// Stop a buffered response whose transform failed after Pingora committed the
 /// upstream headers. The status line cannot be rewritten safely at this phase,
 /// so closing the stream is the only way to avoid completing a false success.
+/// The transform that forbids skipping when the body outgrows the
+/// buffer, if any.
+///
+/// A `closed` posture promises the untransformed body never reaches the
+/// client, and body size is influenceable from either side of the
+/// proxy, so an oversized body must fail the response rather than
+/// bypass the transform. Returns the first closed transform's type
+/// name for attribution; `None` means every attached transform is
+/// `open` and the documented pass-through stands.
+fn oversized_body_refusal(
+    transforms: &[sbproxy_modules::transform::CompiledTransform],
+) -> Option<&str> {
+    transforms
+        .iter()
+        .find(|t| t.failure_posture == FailureMode::Closed)
+        .map(|t| t.transform.transform_type())
+}
+
 fn abort_committed_transform_response(
     body: &mut Option<Bytes>,
     ctx: &mut RequestContext,
@@ -5474,6 +5492,34 @@ impl ProxyHttp for SbProxy {
                     10 * 1024 * 1024
                 };
                 if buf.len() + chunk.len() > max_size {
+                    // WOR-2411: a `closed` transform's contract is that
+                    // the untransformed body must not reach the client,
+                    // and body size is influenceable from either side of
+                    // the proxy. Skipping the transform because the body
+                    // is big would let "make it big enough" bypass the
+                    // exact control `closed` promises, more quietly than
+                    // the error path ever could. The status line is long
+                    // gone by body-filter time, so the refusal is the
+                    // same one a failing `closed` transform takes on a
+                    // committed response: abort the stream, and a
+                    // truncated response replaces silently delivered
+                    // unredacted bytes.
+                    if has_transforms {
+                        if let Some(transform_name) =
+                            oversized_body_refusal(&pipeline.transforms[origin_idx])
+                        {
+                            warn!(
+                                hostname = %ctx.hostname,
+                                buffered = buf.len(),
+                                chunk = chunk.len(),
+                                max = max_size,
+                                transform = transform_name,
+                                "response body exceeded max_body_size; a closed transform \
+                                 cannot be skipped, failing the response"
+                            );
+                            return abort_committed_transform_response(body, ctx, transform_name);
+                        }
+                    }
                     warn!(
                         hostname = %ctx.hostname,
                         buffered = buf.len(),
@@ -6883,6 +6929,46 @@ mod tests {
         assert_eq!(ctx.response_status_override, Some(500));
         assert!(ctx.response_reason_override.is_none());
         assert_eq!(ctx.transform_error_attribution.as_deref(), Some("bundle"));
+    }
+
+    fn cap_test_transform(posture: FailureMode) -> sbproxy_modules::transform::CompiledTransform {
+        let inner =
+            sbproxy_modules::transform::HtmlToMarkdownTransform::from_config(serde_json::json!({}))
+                .expect("default html_to_markdown");
+        sbproxy_modules::transform::CompiledTransform {
+            transform: sbproxy_modules::transform::Transform::HtmlToMarkdown(inner),
+            content_types: Vec::new(),
+            failure_posture: posture,
+            max_body_size: 1024,
+        }
+    }
+
+    #[test]
+    fn an_oversized_body_fails_the_response_when_a_closed_transform_is_attached() {
+        // WOR-2411. A `closed` transform's contract is that the
+        // untransformed body never reaches the client, and body size is
+        // influenceable from either side of the proxy. Before this, a
+        // big-enough body skipped the transform and passed through
+        // unmodified: "make it big" bypassed exactly the control
+        // `closed` promises, silently.
+        let transforms = [
+            cap_test_transform(FailureMode::Open),
+            cap_test_transform(FailureMode::Closed),
+        ];
+        assert_eq!(
+            oversized_body_refusal(&transforms),
+            Some("html_to_markdown"),
+            "one closed transform among open ones is enough to refuse"
+        );
+    }
+
+    #[test]
+    fn an_oversized_body_still_passes_through_when_every_transform_is_open() {
+        // The documented pass-through is the correct behaviour for the
+        // open posture and must survive this change.
+        let transforms = [cap_test_transform(FailureMode::Open)];
+        assert_eq!(oversized_body_refusal(&transforms), None);
+        assert_eq!(oversized_body_refusal(&[]), None);
     }
 
     #[test]
