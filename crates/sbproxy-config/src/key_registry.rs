@@ -1207,6 +1207,7 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("policy", "object_authz"),
     deferred("policy", "openapi_validation"),
     deferred("policy", "page_shield"),
+    deferred("policy", "rego"),
     deferred("policy", "pay_per_crawl"),
     deferred("policy", "prompt_injection_v2"),
     deferred("policy", "rate_limit_budget"),
