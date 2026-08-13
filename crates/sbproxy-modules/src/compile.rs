@@ -519,6 +519,7 @@ fn dynamic_hook_metadata(hook: &LoadedBundleHook) -> Result<crate::DynamicHookMe
     Ok(crate::DynamicHookMetadata::new(
         hook.manifest().name.clone(),
         hook.hook().type_name.clone(),
+        hook.manifest().runtime,
         hook.hook().execution.body_mode,
         maximum,
         hook.manifest().failure_posture,

@@ -4438,6 +4438,7 @@ fn the_recorded_tenant_and_origin_are_the_populated_config_fields() {
         &ctx,
         "rate_limit",
         sbproxy_observe::events::PolicySurface::BuiltIn,
+        sbproxy_observe::decision::DecisionEngine::BuiltIn,
         sbproxy_observe::events::VerdictTag::Allow,
         std::time::Instant::now(),
     );
@@ -4465,6 +4466,7 @@ fn a_faulting_engine_is_recorded_as_error_rather_than_as_its_verdict() {
         &ctx,
         "wasm_policy",
         sbproxy_observe::events::PolicySurface::Plugin,
+        sbproxy_observe::decision::DecisionEngine::Wasm,
         sbproxy_observe::events::VerdictTag::Deny,
         std::time::Instant::now(),
         Some(sbproxy_observe::decision::DecisionOutcome::Error),

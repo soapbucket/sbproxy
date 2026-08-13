@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use sbproxy_modules::policy::Policy;
 use sbproxy_modules::DynamicHookMetadata;
+use sbproxy_observe::decision::DecisionEngine;
 use sbproxy_observe::events::PolicySurface;
 use sbproxy_plugin::PolicyEnforcer;
 
@@ -39,6 +40,16 @@ pub struct CompiledEnforcer {
     /// `BuiltIn` for the 21 framework-shipped policies, `Plugin`
     /// for trait objects supplied via [`Policy::Plugin`].
     pub surface: PolicySurface,
+    /// Which engine actually makes this policy's decision.
+    ///
+    /// Resolved here rather than at the emission site because the
+    /// answer is a property of how the policy was compiled, and the
+    /// emission site sees only a `PolicySurface`, which cannot tell a
+    /// linked Rust plugin from a WASM bundle or a CEL expression from
+    /// a rate limiter. Deriving it there meant labelling every
+    /// non-plugin decision `BuiltIn`, including the operator-authored
+    /// CEL ones, which are the decisions most in need of attribution.
+    pub engine: sbproxy_observe::decision::DecisionEngine,
     /// The dispatchable enforcer.
     pub enforcer: Box<dyn PolicyEnforcer>,
     /// Dynamic bundle execution metadata, absent for built-ins and linked plugins.
@@ -93,6 +104,7 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
             let shared_admission = enforcer.shared_admission();
             CompiledEnforcer {
                 surface: PolicySurface::BuiltIn,
+                engine: DecisionEngine::BuiltIn,
                 enforcer: Box::new(enforcer),
                 dynamic_hook: None,
                 shared_admission,
@@ -105,8 +117,18 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         Policy::Csrf(p) => builtin(CsrfEnforcer(Arc::new(p))),
         Policy::Ddos(p) => builtin(DdosEnforcer(Arc::new(p))),
         Policy::Sri(p) => builtin(SriEnforcer(Arc::new(p))),
-        Policy::Expression(p) => builtin(ExpressionEnforcer(Arc::new(p))),
-        Policy::Assertion(p) => builtin(AssertionEnforcer(Arc::new(p))),
+        // The two policies whose decision *is* a CEL expression. A
+        // `rate_limiting` key or a `waf` Lua rule is deliberately not
+        // here: those scripts compute an input, and the enforcer still
+        // makes the call, so attributing the verdict to the script
+        // would be confidently wrong rather than merely coarse.
+        Policy::Expression(p) => with_engine(
+            builtin(ExpressionEnforcer(Arc::new(p))),
+            DecisionEngine::Cel,
+        ),
+        Policy::Assertion(p) => {
+            with_engine(builtin(AssertionEnforcer(Arc::new(p))), DecisionEngine::Cel)
+        }
         Policy::Waf(p) => builtin(WafEnforcer(Arc::new(p))),
         Policy::RequestValidator(p) => builtin(RequestValidatorEnforcer(Arc::new(p))),
         Policy::ContentDigest(p) => builtin(ContentDigestEnforcer(Arc::new(p))),
@@ -130,6 +152,7 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
             let shared_admission = enforcer.shared_admission();
             CompiledEnforcer {
                 surface: PolicySurface::BuiltIn,
+                engine: DecisionEngine::BuiltIn,
                 enforcer: Box::new(enforcer),
                 dynamic_hook: None,
                 shared_admission,
@@ -137,8 +160,19 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         }
         Policy::Plugin(plugin) => {
             let (enforcer, dynamic_hook) = plugin.into_parts();
+            // A linked Rust plugin and a config-loaded bundle both land
+            // here; only the bundle carries hook metadata, and its
+            // runtime is the engine.
+            let engine = dynamic_hook
+                .as_ref()
+                .map_or(DecisionEngine::Plugin, |hook| match hook.runtime() {
+                    sbproxy_config::BundleRuntime::Javascript => DecisionEngine::JavaScript,
+                    sbproxy_config::BundleRuntime::Wasm => DecisionEngine::Wasm,
+                    sbproxy_config::BundleRuntime::ProxyWasm => DecisionEngine::ProxyWasm,
+                });
             CompiledEnforcer {
                 surface: PolicySurface::Plugin,
+                engine,
                 enforcer,
                 dynamic_hook,
                 // The seam is internal, so a plugin cannot opt into it.
@@ -202,10 +236,17 @@ pub(crate) async fn resolve_shared_admission(
 fn builtin<E: PolicyEnforcer>(enforcer: E) -> CompiledEnforcer {
     CompiledEnforcer {
         surface: PolicySurface::BuiltIn,
+        engine: DecisionEngine::BuiltIn,
         enforcer: Box::new(enforcer),
         dynamic_hook: None,
         shared_admission: None,
     }
+}
+
+/// Re-label a built-in enforcer with the engine that decides for it.
+fn with_engine(mut compiled: CompiledEnforcer, engine: DecisionEngine) -> CompiledEnforcer {
+    compiled.engine = engine;
+    compiled
 }
 
 #[cfg(test)]
@@ -240,6 +281,56 @@ mod tests {
         > {
             Box::pin(async { Ok(sbproxy_plugin::PolicyDecision::Allow) })
         }
+    }
+
+    #[test]
+    fn a_cel_policy_is_attributed_to_cel_rather_than_to_the_framework() {
+        // The complaint WOR-2357 opens with: the richest CEL surface
+        // reported as `built_in`, so the one decision an operator wrote
+        // themselves was the one they could not attribute.
+        let policy = Policy::Expression(
+            sbproxy_modules::policy::expression::ExpressionPolicy::from_config(
+                serde_json::json!({"expression": "request.method == \"GET\""}),
+            )
+            .expect("expression policy compiles"),
+        );
+        let compiled = compile_one(policy, "test-route").expect("policy compiles");
+        assert_eq!(compiled.engine, DecisionEngine::Cel);
+        assert_eq!(
+            compiled.surface,
+            PolicySurface::BuiltIn,
+            "the surface is still built-in; only the engine changed"
+        );
+    }
+
+    #[test]
+    fn a_rate_limiter_with_a_cel_key_is_not_a_cel_decision() {
+        // The trap this mapping is deliberately narrow to avoid. The
+        // expression computes a bucket key; the rate limiter decides.
+        // Labelling this `Cel` would tell an operator that CEL denied a
+        // request it had no say in, which is worse than a coarse label
+        // because it is confidently wrong.
+        let policy = Policy::RateLimit(
+            sbproxy_modules::policy::rate_limit::RateLimitPolicy::from_config(serde_json::json!({
+                "requests_per_second": 10.0,
+                "burst": 5,
+                "key": "request.headers[\"x-api-key\"]"
+            }))
+            .expect("rate limit policy compiles"),
+        );
+        let compiled = compile_one(policy, "test-route").expect("policy compiles");
+        assert_eq!(compiled.engine, DecisionEngine::BuiltIn);
+    }
+
+    #[test]
+    fn a_linked_plugin_stays_a_plugin() {
+        let policy = Policy::Plugin(sbproxy_modules::PluginPolicy::linked(Box::new(FakePlugin)));
+        let compiled = compile_one(policy, "test-route").expect("policy compiles");
+        assert_eq!(
+            compiled.engine,
+            DecisionEngine::Plugin,
+            "a linked Rust plugin carries no bundle runtime"
+        );
     }
 
     #[test]
