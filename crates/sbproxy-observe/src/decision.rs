@@ -267,6 +267,8 @@ pub enum DecisionEngine {
     /// A JavaScript or TypeScript bundle hook.
     JavaScript,
     /// An envelope-ABI WebAssembly bundle hook.
+    /// Rego, evaluated in process on the Regorus interpreter.
+    Rego,
     Wasm,
     /// A Proxy-Wasm filter.
     ProxyWasm,
@@ -281,6 +283,7 @@ impl DecisionEngine {
             Self::Cel => "cel",
             Self::Lua => "lua",
             Self::JavaScript => "js",
+            Self::Rego => "rego",
             Self::Wasm => "wasm",
             Self::ProxyWasm => "proxy_wasm",
         }
@@ -295,6 +298,7 @@ impl DecisionEngine {
         Self::JavaScript,
         Self::Wasm,
         Self::ProxyWasm,
+        Self::Rego,
     ];
 
     /// Whether this engine returns a document rather than a scalar.
@@ -306,8 +310,13 @@ impl DecisionEngine {
     pub const fn returns_documents(self) -> bool {
         match self {
             Self::Cel => false,
+            // Rego sits here rather than beside CEL: a rule may
+            // return any value, and `policy: rego` narrowing that to a
+            // boolean is this surface's choice rather than the
+            // language's limit.
             Self::BuiltIn
             | Self::Plugin
+            | Self::Rego
             | Self::Lua
             | Self::JavaScript
             | Self::Wasm

@@ -37,6 +37,7 @@ pub mod rate_limit;
 pub mod rate_limit_budget;
 pub mod rate_limit_cluster;
 pub mod receipt_token;
+pub mod rego;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
@@ -145,6 +146,8 @@ pub enum Policy {
     /// CEL expression-based policy. Evaluates a CEL expression against the
     /// request context. If the expression evaluates to false, the request is denied.
     Expression(ExpressionPolicy),
+    /// Rego decision policy, evaluated on the Regorus interpreter.
+    Rego(rego::RegoPolicy),
     /// CEL assertion policy for response-time validation. Evaluates a CEL
     /// expression and logs/flags when it returns false.
     Assertion(AssertionPolicy),
@@ -240,6 +243,7 @@ impl Policy {
             Self::Ddos(_) => "ddos",
             Self::Sri(_) => "sri",
             Self::Expression(_) => "expression",
+            Self::Rego(_) => "rego",
             Self::Assertion(_) => "assertion",
             Self::Waf(_) => "waf",
             Self::RequestValidator(_) => "request_validator",
@@ -275,6 +279,7 @@ impl std::fmt::Debug for Policy {
             Self::Ddos(r) => f.debug_tuple("Ddos").field(r).finish(),
             Self::Sri(r) => f.debug_tuple("Sri").field(r).finish(),
             Self::Expression(r) => f.debug_tuple("Expression").field(r).finish(),
+            Self::Rego(r) => f.debug_tuple("Rego").field(r).finish(),
             Self::Assertion(r) => f.debug_tuple("Assertion").field(r).finish(),
             Self::Waf(r) => f.debug_tuple("Waf").field(r).finish(),
             Self::RequestValidator(r) => f.debug_tuple("RequestValidator").field(r).finish(),

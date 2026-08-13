@@ -16,6 +16,17 @@ https://github.com/cloudflare/pingora
 
 ===========================================================================
 
+regorus
+Copyright 2024-2026 Microsoft Corporation
+Licensed under MIT AND Apache-2.0 AND BSD-3-Clause
+https://github.com/microsoft/regorus
+
+Note the conjunction: regorus is licensed under all three simultaneously
+rather than at the recipient's choice, so the Apache-2.0 attribution
+requirement applies here even though MIT is also listed.
+
+===========================================================================
+
 ring
 Copyright 2015-2026 Brian Smith
 Licensed under ISC-style license AND Apache License, Version 2.0

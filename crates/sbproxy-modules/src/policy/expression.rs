@@ -164,6 +164,34 @@ impl ExpressionPolicy {
         hostname: &str,
         views: ExpressionViews<'_>,
     ) -> bool {
+        let ctx = build_policy_context(method, path, headers, query, client_ip, hostname, views);
+        // The expression was compiled once at config-compile time.
+        // Runtime evaluation errors fail closed: the expression could
+        // not prove the request is allowed, so it is denied.
+        self.compiled.eval_bool(&ctx).unwrap_or(false)
+    }
+}
+
+/// Assemble the evaluation context a request-phase decision policy
+/// reads.
+///
+/// Extracted from `evaluate_with_views` so `policy: rego` reads the
+/// same context rather than assembling a second one. Two assemblers
+/// would drift the moment either gained a binding, and the drift would
+/// be invisible: a Rego policy reading a binding this function stopped
+/// populating sees `undefined`, which is a legal value it will happily
+/// reason about rather than complain of.
+#[allow(clippy::too_many_arguments)]
+pub fn build_policy_context(
+    method: &str,
+    path: &str,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    client_ip: Option<&str>,
+    hostname: &str,
+    views: ExpressionViews<'_>,
+) -> sbproxy_extension::cel::CelContext {
+    {
         let mut ctx = sbproxy_extension::cel::context::build_request_context(
             method, path, headers, query, client_ip, hostname,
         );
@@ -231,11 +259,7 @@ impl ExpressionPolicy {
         if let Some(principal) = views.principal.as_ref() {
             sbproxy_extension::cel::context::populate_principal_namespace(&mut ctx, principal);
         }
-
-        // The expression was compiled once at config-compile time.
-        // Runtime evaluation errors fail closed: the expression could
-        // not prove the request is allowed, so it is denied.
-        self.compiled.eval_bool(&ctx).unwrap_or(false)
+        ctx
     }
 }
 
