@@ -1393,7 +1393,8 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// budget block / upstream error". The `outcome` label is a small
 /// closed set (`ok`, `guardrail_block`, `content_filter`,
 /// `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`,
-/// `auth_denied`, `client_error`, `other`) so cardinality stays bounded.
+/// `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`, `refusal`,
+/// `client_error`, `other`) so cardinality stays bounded.
 static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -1413,6 +1414,28 @@ static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+/// One terminal decision for every AI request, including requests rejected
+/// before provider dispatch. `decision` is `admitted` or `rejected`; `reason`
+/// is `none` for admitted traffic and otherwise reuses the bounded outcome
+/// vocabulary.
+static AI_GATEWAY_DECISIONS: LazyLock<Result<CounterVec, prometheus::Error>> =
+    LazyLock::new(|| {
+        register_counter_vec!(
+            Opts::new(
+                "sbproxy_ai_gateway_decisions_total",
+                "AI gateway admission decisions, including pre-provider rejections"
+            ),
+            &["decision", "reason"]
+        )
+    });
+
+/// Record one terminal AI gateway admission decision.
+pub fn record_ai_gateway_decision(decision: &'static str, reason: &'static str) {
+    if let Ok(counter) = AI_GATEWAY_DECISIONS.as_ref() {
+        counter.with_label_values(&[decision, reason]).inc();
+    }
+}
 
 /// Record one AI request against the per-attribution outcome counter.
 /// `outcome` must be one of the closed-set labels documented on the
@@ -2200,6 +2223,25 @@ mod tests {
                     .any(|l| l.name() == "api_key_id" && l.value() == "sk_outcome0001")
         });
         assert!(has_row, "outcome row with identity must be recorded");
+    }
+
+    #[test]
+    fn test_record_ai_gateway_decision() {
+        record_ai_gateway_decision("rejected", "gateway_auth_denied");
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "sbproxy_ai_gateway_decisions_total")
+            .expect("gateway decisions counter registered");
+        assert!(family.get_metric().iter().any(|metric| {
+            let labels = metric.get_label();
+            labels
+                .iter()
+                .any(|label| label.name() == "decision" && label.value() == "rejected")
+                && labels
+                    .iter()
+                    .any(|label| label.name() == "reason" && label.value() == "gateway_auth_denied")
+        }));
     }
 
     #[test]

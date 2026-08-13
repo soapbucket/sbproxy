@@ -87,37 +87,20 @@ fn request_requires_graphql_replay(
     pipeline: &CompiledPipeline,
     origin_idx: usize,
 ) -> bool {
-    let request = session.req_header();
-    let path = request.uri.path();
-    let query = request.uri.query();
-    let forwarded_action = pipeline
-        .forward_rules
-        .get(origin_idx)
-        .and_then(|rules| {
-            rules.iter().find(|rule| {
-                rule.matchers.iter().any(|matcher| {
-                    matcher
-                        .match_request(&request.method, path, query, &request.headers)
-                        .is_some()
-                })
-            })
-        })
-        .map(|rule| &rule.action);
-    let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
-
     matches!(
-        effective_action,
+        request_effective_action(session, pipeline, origin_idx),
         Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
     )
 }
 
-/// AI actions own idempotency and response replay because their current
-/// guardrail policy must run before cached bytes are served.
-fn request_uses_ai_owned_replay_paths(
+/// Resolve the base or header/path/query-matched forward-rule action without
+/// consuming a request body. The same route choice is needed before middleware
+/// runs for replay ownership and AI rejection attribution.
+fn request_effective_action<'a>(
     session: &Session,
-    pipeline: &CompiledPipeline,
+    pipeline: &'a CompiledPipeline,
     origin_idx: usize,
-) -> bool {
+) -> Option<&'a Action> {
     let request = session.req_header();
     let forwarded_action = pipeline
         .forward_rules
@@ -137,11 +120,30 @@ fn request_uses_ai_owned_replay_paths(
             })
         })
         .map(|rule| &rule.action);
-    action_uses_ai_owned_replay_paths(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
+    forwarded_action.or_else(|| pipeline.actions.get(origin_idx))
+}
+
+/// AI actions own idempotency and response replay because their current
+/// guardrail policy must run before cached bytes are served.
+fn request_uses_ai_owned_replay_paths(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    action_uses_ai_owned_replay_paths(request_effective_action(session, pipeline, origin_idx))
 }
 
 fn action_uses_ai_owned_replay_paths(action: Option<&Action>) -> bool {
     matches!(action, Some(Action::AiProxy(_)))
+}
+
+fn ai_surface_label_for_action(
+    action: Option<&Action>,
+    method: &str,
+    path: &str,
+) -> Option<&'static str> {
+    action_uses_ai_owned_replay_paths(action)
+        .then(|| sbproxy_ai::handler::classify_surface(method, path).label())
 }
 
 #[cfg(test)]
@@ -160,6 +162,14 @@ mod ai_owned_replay_path_tests {
 
         assert!(action_uses_ai_owned_replay_paths(Some(&action)));
         assert!(!action_uses_ai_owned_replay_paths(Some(&Action::Noop)));
+        assert_eq!(
+            ai_surface_label_for_action(Some(&action), "POST", "/v1/chat/completions"),
+            Some("chat_completions")
+        );
+        assert_eq!(
+            ai_surface_label_for_action(Some(&Action::Noop), "POST", "/v1/chat/completions"),
+            None
+        );
     }
 }
 
@@ -1454,15 +1464,6 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- Health check endpoint ---
-    if path == "/health" {
-        send_response(session, 200, "application/json", b"{\"status\":\"ok\"}").await?;
-        // Record the real status so the request log / metrics show 200,
-        // not the unset-status 0 sentinel (WOR-1746).
-        ctx.response_status = Some(200);
-        return Ok(true);
-    }
-
     // --- Metrics endpoint ---
     if path == "/metrics" {
         let body = metrics().render();
@@ -1588,7 +1589,14 @@ pub(super) async fn request_filter(
     ctx.request_path = compact_str::CompactString::new(req_for_host.uri.path());
 
     let pipeline = ctx.pipeline.clone();
-    let origin_idx = match pipeline.resolve_origin(hostname) {
+    let resolved_origin = pipeline.resolve_origin(hostname);
+    if crate::dispatch::should_serve_unrouted_health(&path, resolved_origin.is_some()) {
+        send_response(session, 200, "application/json", b"{\"status\":\"ok\"}").await?;
+        ctx.response_status = Some(200);
+        return Ok(true);
+    }
+
+    let origin_idx = match resolved_origin {
         Some(idx) => idx,
         None => {
             warn!(hostname = %hostname, "no origin configured for hostname");
@@ -1603,6 +1611,24 @@ pub(super) async fn request_filter(
         }
     };
     ctx.origin_idx = Some(origin_idx);
+
+    // Attribute gateway-side denials to AI before auth or policy middleware
+    // can short-circuit. The handler will stamp the same label again for an
+    // admitted request; doing it here is what makes a bad virtual key or an
+    // early policy denial visible without pretending a provider was tried.
+    let ai_proxy_owns_replay_paths =
+        request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
+    let initial_ai_surface = {
+        let request = session.req_header();
+        ai_surface_label_for_action(
+            request_effective_action(session, &pipeline, origin_idx),
+            request.method.as_str(),
+            request.uri.path(),
+        )
+    };
+    if let Some(surface) = initial_ai_surface {
+        ctx.ai_surface = Some(surface.to_string());
+    }
 
     if crate::proxy_wasm_http::start_request(session, ctx, origin_idx).await? {
         return Ok(true);
@@ -2662,8 +2688,6 @@ pub(super) async fn request_filter(
 
     // --- Force SSL redirect ---
     let origin = &pipeline.config.origins[origin_idx];
-    let ai_proxy_owns_replay_paths =
-        request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
     if origin.force_ssl {
         // Determine whether the inbound request is already on TLS.
         //

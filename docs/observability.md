@@ -1190,12 +1190,13 @@ Three tiers, each with explicit on-call semantics:
 - **Log-only (P3).** Records the alert in Alertmanager but routes to log destinations only. Examples: cardinality near budget (90% of cap), deprecated-flag use, exemplar emission rate dropping.
 
 When `proxy.alerting.channels` is configured, the in-process evaluator publishes
-these seven built-in rules:
+these eight built-in rules:
 
 | Rule | Default input and threshold |
 |---|---|
 | `budget_exhaustion` | Highest configured budget utilization. Warning at 80%, critical at 95%. |
 | `error_rate_spike` | AI-provider errors over attempts in the latest minute. Warning above 10%, critical above 20%; inactive below 10 attempts. |
+| `gateway_rejection_spike` | AI requests rejected before provider dispatch as a fraction of all gateway decisions in the latest minute. Warning above 10%, critical above 20%; inactive below 10 decisions. |
 | `burn_rate` | Proxy request availability over the last 60 minutes against a 99% target, firing at 14.4x. Inactive until the process-local ring holds those 60 minutes, so it is blind for the first hour after a restart. |
 | `latency_slo` | Proxy-wide request p99 for the latest minute. Warning above 200 ms, critical above 400 ms. |
 | `rate_limit_approaching` | Rejected route and tenant rate-limit decisions as a fraction of all decisions in the latest minute. Warning above 80%, critical at 95%. |
@@ -1255,11 +1256,15 @@ key.
 
 ## Health endpoints
 
-The proxy listener itself serves `/health` (and `/metrics`), so a fresh install with no extra configuration is probeable. `/healthz` and `/readyz` live on the admin listener, which is disabled by default and binds `127.0.0.1:9090` when enabled:
+The proxy listener serves `/metrics` and an unrouted-host `/health` fallback,
+so a fresh install with no matching origin is probeable. When the request Host
+matches a configured origin, that origin owns `/health` and its response is
+proxied normally. `/healthz` and `/readyz` live on the admin listener, which is
+disabled by default and binds `127.0.0.1:9090` when enabled:
 
 ```bash
 curl http://localhost:8080/health
-# 200 OK, {"status":"ok"}. Served on the proxy listener.
+# 200 OK, {"status":"ok"}, when localhost is not a configured origin.
 
 curl http://localhost:9090/healthz
 # 200 OK, no body. Liveness only; the kubelet uses this to decide whether to restart the pod.

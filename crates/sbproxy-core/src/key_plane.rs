@@ -685,7 +685,8 @@ fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
         None => {
             tracing::warn!(
                 "key_management.crypto.pepper is unset; generating an ephemeral pepper. \
-                 Stored key hashes will not survive a restart. Set a stable pepper in production."
+                 Stored key hashes will not survive a restart or successful config reload. \
+                 Set a stable pepper in production."
             );
             sbproxy_security::random_aes256_key().to_vec()
         }
@@ -695,7 +696,8 @@ fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
         None => {
             tracing::warn!(
                 "key_management.crypto.master_key is unset; generating an ephemeral master key. \
-                 Encrypted upstream credentials will not be decryptable after a restart."
+                 Encrypted upstream credentials will not be decryptable after a restart or \
+                 successful config reload."
             );
             sbproxy_security::random_aes256_key().to_vec()
         }

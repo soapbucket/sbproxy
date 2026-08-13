@@ -183,6 +183,10 @@ async fn run(
                 }).flatten();
                 let rate_limit_window =
                     alerting::rate_limit_delta(prev.rate_limit_counters, now.rate_limit_counters);
+                let gateway_window = alerting::gateway_rejection_delta(
+                    prev.gateway_counters,
+                    now.gateway_counters,
+                );
                 let pipeline = crate::reload::current_pipeline();
                 let circuit_breakers = sample_circuit_breakers(
                     &pipeline.actions,
@@ -207,6 +211,10 @@ async fn run(
                         prev.provider_counters,
                         now.provider_counters,
                     ),
+                    gateway_rejection_rate: gateway_window.map(|(rate, _)| rate),
+                    gateway_decisions: gateway_window
+                        .map(|(_, decisions)| decisions)
+                        .unwrap_or_default(),
                     p99_latency_ms: minute_sample.and(p99_latency_ms),
                     rate_limit_rejections: rate_limit_window.map(|(rejections, _)| rejections),
                     rate_limit_decisions: rate_limit_window

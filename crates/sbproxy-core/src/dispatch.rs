@@ -28,7 +28,6 @@ pub(crate) fn unsupported_plugin_action_proxy_message() -> String {
 ///
 /// This is a simplified version of the full Pingora pipeline dispatch.
 /// It handles:
-/// - Health check endpoint (/health)
 /// - ACME challenge interception
 /// - Hostname-based origin lookup
 /// - Auth checks (API key, basic auth, bearer, JWT)
@@ -43,22 +42,22 @@ pub async fn dispatch_h3_request(
 ) -> Result<HttpResponse> {
     let path = uri.path();
 
-    // --- 1. Health check ---
-    if path == "/health" {
-        debug!("H3 health check");
-        return Ok(json_response(200, r#"{"status":"ok"}"#));
-    }
-
-    // --- 2. ACME HTTP-01 challenge interception ---
+    // --- 1. ACME HTTP-01 challenge interception ---
     if path.starts_with(ACME_CHALLENGE_PREFIX) {
         return handle_acme_challenge(path).await;
     }
 
-    // --- 3. Origin lookup ---
+    // --- 2. Origin lookup ---
     let hostname = extract_hostname(&headers, &uri);
     let pipeline = reload::current_pipeline();
 
-    let origin_idx = match pipeline.resolve_origin(&hostname) {
+    let resolved_origin = pipeline.resolve_origin(&hostname);
+    if should_serve_unrouted_health(path, resolved_origin.is_some()) {
+        debug!(hostname = %hostname, "H3 unrouted health fallback");
+        return Ok(json_response(200, r#"{"status":"ok"}"#));
+    }
+
+    let origin_idx = match resolved_origin {
         Some(idx) => idx,
         None => {
             // WOR-1097: a request for an unrouted Host is rejected
@@ -74,7 +73,7 @@ pub async fn dispatch_h3_request(
         }
     };
 
-    // --- 4. Auth check ---
+    // --- 3. Auth check ---
     if let Some(auth) = pipeline.auths.get(origin_idx).and_then(|a| a.as_ref()) {
         let authorized = check_auth(auth, &headers, &uri, &method).await;
         if !authorized {
@@ -91,7 +90,7 @@ pub async fn dispatch_h3_request(
         }
     }
 
-    // --- 5. Action dispatch ---
+    // --- 4. Action dispatch ---
     let action = match pipeline.actions.get(origin_idx) {
         Some(a) => a,
         None => {
@@ -102,7 +101,7 @@ pub async fn dispatch_h3_request(
 
     let mut resp = dispatch_action(action, &method, &uri, &headers, body).await?;
 
-    // --- 6. Add Alt-Svc header ---
+    // --- 5. Add Alt-Svc header ---
     let alt_svc = reload::alt_svc_value();
     if !alt_svc.is_empty() {
         resp.headers
@@ -684,6 +683,13 @@ fn text_response(status: u16, body: &str) -> HttpResponse {
     }
 }
 
+/// Preserve the legacy data-plane liveness probe only when routing has no
+/// configured owner for the request. A matched origin must receive its own
+/// `/health` request like any other path.
+pub(crate) fn should_serve_unrouted_health(path: &str, has_origin: bool) -> bool {
+    path == "/health" && !has_origin
+}
+
 #[cfg(test)]
 pub(crate) fn javascript_proxy_action_fixture() -> (tempfile::TempDir, Action) {
     let directory = tempfile::TempDir::new().expect("temporary JavaScript bundle directory");
@@ -984,43 +990,30 @@ mod tests {
         );
     }
 
-    // --- Health check ---
+    // --- Data-plane route ownership ---
 
     #[tokio::test]
-    async fn health_check_returns_200() {
+    async fn unrouted_health_keeps_the_compatibility_probe() {
         let method = http::Method::GET;
         let uri: http::Uri = "/health".parse().unwrap();
-        let headers = http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "host",
+            "completely-unknown-health-host.example".parse().unwrap(),
+        );
 
         let resp = dispatch_h3_request(method, uri, headers, None, "127.0.0.1".parse().unwrap())
             .await
             .unwrap();
 
         assert_eq!(resp.status, 200);
-        let body = resp.body.unwrap();
-        let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(
-            body_str.contains("ok"),
-            "body should contain ok: {body_str}"
-        );
     }
 
-    #[tokio::test]
-    async fn health_check_content_type_is_json() {
-        let method = http::Method::GET;
-        let uri: http::Uri = "/health".parse().unwrap();
-        let headers = http::HeaderMap::new();
-
-        let resp = dispatch_h3_request(method, uri, headers, None, "127.0.0.1".parse().unwrap())
-            .await
-            .unwrap();
-
-        assert!(
-            resp.headers
-                .iter()
-                .any(|(k, v)| k == "Content-Type" && v.contains("application/json")),
-            "Content-Type should be application/json"
-        );
+    #[test]
+    fn a_configured_origin_owns_its_health_path() {
+        assert!(!should_serve_unrouted_health("/health", true));
+        assert!(should_serve_unrouted_health("/health", false));
+        assert!(!should_serve_unrouted_health("/healthz", false));
     }
 
     // --- ACME challenge ---

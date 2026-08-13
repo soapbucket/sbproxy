@@ -416,10 +416,11 @@ impl AiClient {
     /// redirect contract (WOR-2165).
     async fn send_provider_request(
         &self,
-        request: reqwest::Request,
-        provider_name: &str,
+        mut request: reqwest::Request,
+        provider: &ProviderConfig,
     ) -> Result<reqwest::Response> {
-        send_governed(&self.http, self.egress.as_ref(), provider_name, request).await
+        apply_provider_timeout(&mut request, provider);
+        send_governed(&self.http, self.egress.as_ref(), &provider.name, request).await
     }
 
     /// Borrow the shadow supervisor (test + diagnostic accessor).
@@ -1058,7 +1059,7 @@ impl AiClient {
 
         let req = req.json(send_body).build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = self.send_provider_request(req, &provider.name).await?;
+        let resp = self.send_provider_request(req, provider).await?;
 
         Ok(resp)
     }
@@ -1105,7 +1106,7 @@ impl AiClient {
 
         let req = self.http.get(url).header(auth_header, auth_value).build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = self.send_provider_request(req, &provider.name).await?;
+        let resp = self.send_provider_request(req, provider).await?;
 
         Ok(resp)
     }
@@ -1201,7 +1202,7 @@ impl AiClient {
 
         let req = req.build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = self.send_provider_request(req, &provider.name).await?;
+        let resp = self.send_provider_request(req, provider).await?;
         Ok(resp)
     }
 }
@@ -1320,7 +1321,7 @@ impl AiClient {
 
         let req = req.body(body).build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = self.send_provider_request(req, &provider.name).await?;
+        let resp = self.send_provider_request(req, provider).await?;
         Ok(resp)
     }
 
@@ -1402,7 +1403,7 @@ impl AiClient {
             .body(body)
             .build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = self.send_provider_request(req, &provider.name).await?;
+        let resp = self.send_provider_request(req, provider).await?;
         Ok(resp)
     }
 }
@@ -1464,6 +1465,12 @@ pub(crate) fn strip_sensitive_headers(headers: &mut reqwest::header::HeaderMap) 
     }
     headers.remove(reqwest::header::AUTHORIZATION);
     headers.remove(reqwest::header::COOKIE);
+}
+
+fn apply_provider_timeout(request: &mut reqwest::Request, provider: &ProviderConfig) {
+    if let Some(timeout_ms) = provider.timeout_ms {
+        *request.timeout_mut() = Some(Duration::from_millis(timeout_ms));
+    }
 }
 
 /// Send `request`, re-authorizing every redirect hop (WOR-2165).
@@ -1676,7 +1683,8 @@ impl AiClient {
                 }
                 ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
                 let resp = match req.json(send_body).build() {
-                    Ok(request) => {
+                    Ok(mut request) => {
+                        apply_provider_timeout(&mut request, &provider);
                         send_governed(&http, egress.as_ref(), &provider.name, request).await
                     }
                     Err(error) => Err(anyhow::Error::new(error)),
@@ -2891,6 +2899,36 @@ mod tests {
             std::future::pending::<()>().await;
         });
         (format!("http://{address}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn provider_timeout_bounds_primary_requests() {
+        let (base_url, server) = serve_one_hanging_response().await;
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "timeout-provider",
+            "api_key": "test-secret",
+            "base_url": base_url,
+            "allow_private_base_url": true,
+            "timeout_ms": 25
+        }))
+        .expect("provider fixture");
+
+        let bounded = tokio::time::timeout(
+            Duration::from_millis(250),
+            AiClient::new().forward_get_request(&provider, "/v1/models"),
+        )
+        .await;
+        server.abort();
+
+        let error = bounded
+            .expect("provider timeout must fire before the outer test bound")
+            .expect_err("the hanging provider must time out");
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "expected a reqwest timeout, got: {error:#}"
+        );
     }
 
     #[tokio::test]

@@ -1032,25 +1032,52 @@ pub(super) fn classify_error_class(status: u16) -> Option<String> {
 /// both return 400, so the status alone cannot tell "we refused this on
 /// policy" from "the client sent garbage". Returns a `&'static str` so
 /// the value is a stable, bounded metric label.
-pub(super) fn ai_outcome_label(status: u16, override_outcome: Option<&str>) -> &'static str {
+pub(super) fn ai_outcome_label(
+    status: u16,
+    override_outcome: Option<&str>,
+    provider_attempted: bool,
+) -> &'static str {
     if let Some(o) = override_outcome {
         return match o {
             "guardrail_block" | "guardrail_blocked" => "guardrail_block",
             "content_filter" => "content_filter",
             "budget_exceeded" => "budget_exceeded",
+            "policy_block" | "policy_route_blocked" => "policy_block",
             "refusal" => "refusal",
             _ => "other",
         };
     }
     match status {
+        101 => "ok",
         200..=299 => "ok",
         402 => "budget_exceeded",
-        401 | 403 => "auth_denied",
+        401 | 403 if provider_attempted => "upstream_auth_denied",
+        401 | 403 => "gateway_auth_denied",
         429 => "rate_limited",
         408 | 504 => "timeout",
         500..=599 => "upstream_5xx",
         400..=499 => "client_error",
         _ => "other",
+    }
+}
+
+/// Partition terminal AI requests into gateway admission decisions. Reaching
+/// the AI action is evidence for successful local responses such as cache
+/// hits, while a provider attempt is evidence for every dispatched response.
+/// Successful infrastructure responses on an AI origin made neither decision
+/// and are omitted. Failures after AI surface classification remain gateway
+/// rejections even when middleware stopped them before the action.
+pub(super) fn ai_gateway_decision(
+    outcome: &'static str,
+    provider_attempts: u32,
+    ai_action_reached: bool,
+) -> Option<(&'static str, &'static str)> {
+    if provider_attempts > 0 || (ai_action_reached && outcome == "ok") {
+        Some(("admitted", "none"))
+    } else if !ai_action_reached && matches!(outcome, "ok" | "other") {
+        None
+    } else {
+        Some(("rejected", outcome))
     }
 }
 
@@ -1324,20 +1351,43 @@ mod run_identity_tests {
 
 #[cfg(test)]
 mod outcome_tests {
-    use super::ai_outcome_label;
+    use super::{ai_gateway_decision, ai_outcome_label};
+
+    #[test]
+    fn gateway_decision_distinguishes_pre_dispatch_rejections() {
+        assert_eq!(
+            ai_gateway_decision("gateway_auth_denied", 0, false),
+            Some(("rejected", "gateway_auth_denied"))
+        );
+        assert_eq!(
+            ai_gateway_decision("client_error", 0, true),
+            Some(("rejected", "client_error"))
+        );
+        assert_eq!(
+            ai_gateway_decision("ok", 0, true),
+            Some(("admitted", "none"))
+        );
+        assert_eq!(
+            ai_gateway_decision("upstream_5xx", 1, true),
+            Some(("admitted", "none"))
+        );
+        assert_eq!(ai_gateway_decision("ok", 0, false), None);
+        assert_eq!(ai_gateway_decision("other", 0, false), None);
+    }
 
     /// WOR-1496: status-derived outcomes map into the closed set, with
     /// 402 distinguished as a budget block (not a generic client error).
     #[test]
     fn outcome_label_from_status() {
-        assert_eq!(ai_outcome_label(200, None), "ok");
-        assert_eq!(ai_outcome_label(402, None), "budget_exceeded");
-        assert_eq!(ai_outcome_label(401, None), "auth_denied");
-        assert_eq!(ai_outcome_label(403, None), "auth_denied");
-        assert_eq!(ai_outcome_label(429, None), "rate_limited");
-        assert_eq!(ai_outcome_label(504, None), "timeout");
-        assert_eq!(ai_outcome_label(503, None), "upstream_5xx");
-        assert_eq!(ai_outcome_label(400, None), "client_error");
+        assert_eq!(ai_outcome_label(200, None, false), "ok");
+        assert_eq!(ai_outcome_label(101, None, false), "ok");
+        assert_eq!(ai_outcome_label(402, None, false), "budget_exceeded");
+        assert_eq!(ai_outcome_label(401, None, false), "gateway_auth_denied");
+        assert_eq!(ai_outcome_label(403, None, true), "upstream_auth_denied");
+        assert_eq!(ai_outcome_label(429, None, false), "rate_limited");
+        assert_eq!(ai_outcome_label(504, None, true), "timeout");
+        assert_eq!(ai_outcome_label(503, None, true), "upstream_5xx");
+        assert_eq!(ai_outcome_label(400, None, false), "client_error");
     }
 
     /// The AI-specific override wins over the status, so a guardrail
@@ -1346,20 +1396,28 @@ mod outcome_tests {
     #[test]
     fn outcome_label_override_wins() {
         assert_eq!(
-            ai_outcome_label(400, Some("guardrail_block")),
+            ai_outcome_label(400, Some("guardrail_block"), false),
             "guardrail_block"
         );
         assert_eq!(
-            ai_outcome_label(403, Some("guardrail_block")),
+            ai_outcome_label(403, Some("guardrail_block"), false),
             "guardrail_block"
         );
         assert_eq!(
-            ai_outcome_label(200, Some("content_filter")),
+            ai_outcome_label(200, Some("content_filter"), true),
             "content_filter"
+        );
+        assert_eq!(
+            ai_outcome_label(403, Some("policy_block"), false),
+            "policy_block"
+        );
+        assert_eq!(
+            ai_outcome_label(403, Some("policy_route_blocked"), false),
+            "policy_block"
         );
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.
-        assert_eq!(ai_outcome_label(200, Some("bogus")), "other");
+        assert_eq!(ai_outcome_label(200, Some("bogus"), false), "other");
     }
 }
 

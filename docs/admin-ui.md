@@ -277,6 +277,35 @@ before.
   reading "This node owns its configuration," because the affirmative
   answer is what tells an operator the editor is trustworthy.
 
+## Extensions (`/extensions`)
+
+Use Extensions after startup or a reload to verify which extension code the
+running proxy actually accepted. The page reports the active pipeline
+generation, not another read of the files on disk, so it also tells you when a
+candidate reload failed and the previous generation stayed live.
+
+Start with the generation revision and the six summary counts. A nonzero
+**failed** or **collisions** count opens a **Failures and collisions** section:
+
+- For a failed bundle, read the loader phase and bounded error detail, fix the
+  bundle or config, reload, then confirm that the running revision changed.
+- For a collision, read the match key, competing registrations, resolution,
+  and winner. This tells you which implementation receives requests without
+  requiring a `doctor` run on the host.
+
+The **Bundle ledger** is sorted by stable bundle ID. Find a bundle there to
+check its version, source, runtime, artifact, and load result. Its hooks show
+where that code can run: dispatch mode and chain position, request phase, body
+access, timeout, buffer limit, and granted host capabilities. An **active**
+hook is attached to this generation; **available** means it loaded but is not
+attached; **failed** and **shadowed** rows include the reason or winning
+registration when available.
+
+The inventory refreshes every 15 seconds, or use **Refresh** after a reload.
+If refresh fails, the last successful generation remains visible with a stale
+warning. Extension installation and attachment are configured in `sb.yml`;
+this page is read-only.
+
 ## Logs (`/logs`)
 
 ![The Logs page: requests with a Gateway decision column reading cache, routing, and guardrail outcomes, two custom-property columns, and the filter bar](assets/admin-logs.png)
@@ -297,8 +326,8 @@ tail and a runtime log-level control.
   requests with per-session summaries. The Gateway column reads cache,
   retry, failover, load-balancer, and guardrail decisions as one causal
   rail; expanding a row shows every bounded field.
-- **Mutations:** none directly on request data; `GET`/`PUT
-  /admin/log-level` reads and sets the live tracing filter (e.g.
+- **Mutations:** none directly on request data; `GET`/`PUT /admin/log-level`
+  reads and sets the live tracing filter (e.g.
   `debug` or `sbproxy_ai=debug`) without a restart.
 - **Live tail:** toggling it opens `GET /api/requests/stream`
   (Server-Sent Events) and appends new rows as they complete; the UI
@@ -309,14 +338,18 @@ tail and a runtime log-level control.
 
 ### Debugging a request
 
-The Logs page is the debug loop for a misbehaving proxy, with no
-restart at any step:
+The Logs page is the first debug loop for a misbehaving proxy:
 
 1. Raise the tracing level. The level control accepts a plain level
    (`debug`, `trace`) or a `tracing` filter directive like
    `sbproxy_ai=debug`, which turns on AI-path detail while the rest
    of the process stays at `info`. It applies immediately via
-   `PUT /admin/log-level` and confirms with a toast.
+   `PUT /admin/log-level` and confirms with a toast. Official release binaries
+   compile SBproxy's own `debug!` and `trace!` events out with a static maximum
+   of `info`; raising the filter cannot restore those events. It can still
+   expose more detail from dependencies compiled without that ceiling. Use the
+   structured request decision fields below, or reproduce with a development
+   build when SBproxy-internal debug events are required.
 2. Turn on Live tail and reproduce the problem. New requests stream
    in as they complete, with the same properties and gateway decisions
    as snapshot rows. The active filter predicate is applied to both.
@@ -383,7 +416,9 @@ client-side. While the page is open it samples the endpoint every
 five seconds and charts what happened *between* samples: counter
 deltas become per-second rates, histogram bucket deltas become
 per-interval latency percentiles. The raw scrape stays one click away
-and remains the source of truth.
+and remains the source of truth. Requests to `/metrics` are excluded
+from the proxy traffic totals and latency histograms, so leaving this
+page open does not inflate the values it displays.
 
 - **Shows:** `GET /metrics`, rendered as three layers.
   - *Numeric tiles* with trend sparklines: requests/s, total
@@ -453,8 +488,9 @@ and provider health from the live counters.
 
 - **Shows:** `GET /metrics`, specifically the TTFT/TPOT/throughput
   histograms, per-provider request/error counts and error rate,
-  failover reasons, cascade-tier outcomes, and router-strategy
-  decisions. When context-compression policies are active, a
+  gateway admission/rejection rate with rejection reasons, failover
+  reasons, cascade-tier outcomes, and router-strategy decisions. When
+  context-compression policies are active, a
   compression section reports compressed requests, tokens and cost
   saved, per-lever savings, request outcomes, and the average
   compression ratio per lever.
@@ -500,7 +536,8 @@ Read-only alert operations over the runtime installed from `sb.yml`.
   reports the delivery result. It cannot edit rules or channels.
 - **Authority and retention:** `sb.yml` is authoritative. Rule state, channel
   health, and history reset with the process. The provider error-rate rule
-  remains inactive below 10 attempts in an evaluation window.
+  remains inactive below 10 attempts in an evaluation window; the gateway
+  rejection-rate rule remains inactive below 10 decisions.
 - **Empty/error notes:** no `proxy.alerting` block renders a disabled state;
   an enabled runtime with no channels keeps tests unavailable; no history is a
   normal process-lifetime empty state. A webhook channel pointed at a private
@@ -775,33 +812,6 @@ browser profiles or give each node its own loopback address
 ![Cluster page with a three-node roster, health rail, and placement summary](assets/admin-cluster.png)
 
 ![The same cluster after killing node-c: the health rail marks it unhealthy and an alert reports membership as dead](assets/admin-cluster-degraded.png)
-
-## Documentation coverage audit
-
-The 2026-07-30 audit compared all 25 named console routes with the
-shipped capability catalog and the data that the runtime already
-records. Sessions and custom properties; routing, retry, failover,
-load-balancer, cache, and guardrail decisions; spend; alert evaluation;
-and model-host deployments, jobs, and storage all have purpose-built
-console surfaces.
-
-Several shipped capability families do not. Raw Config, Logs, and
-Metrics remain useful fallbacks, but they do not count as a dedicated
-operator workflow in this table.
-
-| Capability without a dedicated view | Available today | Disposition |
-|---|---|---|
-| MCP servers, tools, versions, risk, and quarantine | Config, Logs, Metrics, and session linkage | Planned, not shipped: server and tool inventory plus bounded failure reasons fold into the agent and tool traffic view. |
-| A2A hops and denials; Agent Skills integrity | Config plus raw metrics and audit events | Planned, not shipped: runtime health folds into the same agent and tool traffic view. Declarative Agent Skills authoring stays in Config. |
-| Agent identity and trust; AI crawler verification; RSL/CAP payment outcomes; Web Bot Auth | Overview health, Config, Logs, Metrics, Spend, and the bundled Grafana AI-traffic dashboard | Planned, not shipped: embedded-console traffic and the paid and blocked summaries fold into the agent and tool traffic view. RSL terms and crawler policy authoring stay in Config. |
-| Outbound credentials and DPoP proofs | Credentials, Config, and redacted Logs | Proof policy stays declarative. Credential health is a candidate for the broader console-coverage work rather than a commitment. |
-| CEL, Lua, JavaScript, and WASM policy execution | Config, Audit, and Logs | Authoring stays in Config. Replay-diff visualization is a separate planned follow-up. |
-
-The same audit found three documentation-only gaps, Get started, Jobs,
-and Operators, which the sections above close. Every new component
-route must declare a documentation slug, and the router tests verify
-that the mapped Markdown page exists so a rename cannot silently break
-the console link.
 
 ## See also
 

@@ -15,7 +15,7 @@
 #        'http://127.0.0.1:8080/old/anything?debug=1&keep=yes' | jq
 #
 #   # The proxy rewrites:
-#   #   - path  /old/anything           -> /new/anything
+#   #   - path  /old/anything           -> /anything/anything
 #   #   - query debug=1&keep=yes        -> tenant=prod&keep=yes&extra=1
 #   #   - method GET                    -> POST
 #   #   - body  empty                   -> {"injected":true,"source":"proxy"}
@@ -43,7 +43,7 @@ origins:
           path:
             replace:
               old: /old/
-              new: /new/
+              new: /anything/
         query:
           set:
             tenant: prod

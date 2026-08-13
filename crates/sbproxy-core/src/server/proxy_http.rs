@@ -24,6 +24,62 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
+fn request_modifiers_for_route(
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+    forward_rule_idx: Option<usize>,
+) -> Vec<sbproxy_config::RequestModifierConfig> {
+    let mut modifiers = pipeline
+        .config
+        .origins
+        .get(origin_idx)
+        .map(|origin| origin.request_modifiers.to_vec())
+        .unwrap_or_default();
+    if let Some(forward_rule_idx) = forward_rule_idx {
+        if let Some(rule) = pipeline
+            .forward_rules
+            .get(origin_idx)
+            .and_then(|rules| rules.get(forward_rule_idx))
+        {
+            modifiers.extend(rule.request_modifiers.iter().cloned());
+        }
+    }
+    modifiers
+}
+
+fn downstream_half_closed(session: &Session) -> bool {
+    match session.as_downstream() {
+        pingora_core::protocols::http::ServerSession::H1(session) => session.is_half_closed(),
+        _ => false,
+    }
+}
+
+fn client_disconnected(
+    error_source: Option<pingora_error::ErrorSource>,
+    downstream_half_closed: bool,
+) -> bool {
+    downstream_half_closed
+        || error_source.is_some_and(|source| source == pingora_error::ErrorSource::Downstream)
+}
+
+fn should_record_proxy_request_metrics(path: &str) -> bool {
+    path != "/metrics"
+}
+
+fn record_inbound_key_request_for_path(
+    path: &str,
+    provider: Option<&str>,
+    key_mode: &str,
+    tenant_id: &str,
+    api_key_id: Option<&str>,
+) -> bool {
+    if !should_record_proxy_request_metrics(path) {
+        return false;
+    }
+    sbproxy_observe::metrics::record_inbound_key_request(provider, key_mode, tenant_id, api_key_id);
+    true
+}
+
 /// Make the GraphQL-validated POST body authoritative at the request-body
 /// boundary.
 ///
@@ -68,6 +124,27 @@ fn emit_graphql_validated_request_body(
 /// an empty chunk and the stream has not ended.
 fn hold_request_body_chunk(body: &mut Option<Bytes>) {
     *body = Some(Bytes::new());
+}
+
+/// Stop a buffered response whose transform failed after Pingora committed the
+/// upstream headers. The status line cannot be rewritten safely at this phase,
+/// so closing the stream is the only way to avoid completing a false success.
+fn abort_committed_transform_response(
+    body: &mut Option<Bytes>,
+    ctx: &mut RequestContext,
+    transform_name: &str,
+) -> Result<Option<std::time::Duration>> {
+    *body = None;
+    ctx.response_body_buf = None;
+    ctx.buffering_body = false;
+    ctx.response_status = Some(500);
+    ctx.response_status_override = Some(500);
+    ctx.response_reason_override = None;
+    ctx.transform_error_attribution = Some(transform_name.to_string());
+    Err(pingora_error::Error::explain(
+        ErrorType::InternalError,
+        "response transform failed after response headers were committed",
+    ))
 }
 
 /// Complete a deferred body-bound authentication proof against the bytes the
@@ -1163,8 +1240,8 @@ impl ProxyHttp for SbProxy {
     /// Handle incoming request before proxying.
     ///
     /// This phase:
-    /// 1. Handles the /health endpoint
-    /// 2. Extracts hostname and resolves the origin
+    /// 1. Extracts hostname and resolves the origin
+    /// 2. Handles the unrouted-host /health compatibility probe
     /// 3. Handles CORS preflight requests (short-circuits before auth)
     /// 4. Runs auth checks
     /// 5. Runs policy enforcement
@@ -1808,6 +1885,9 @@ impl ProxyHttp for SbProxy {
                     }
                 }
 
+                advanced_modifiers =
+                    request_modifiers_for_route(&pipeline, idx, ctx.forward_rule_idx);
+
                 if !origin.request_modifiers.is_empty() {
                     let tmpl = build_request_template_context(session, ctx, origin);
                     for modifier in &origin.request_modifiers {
@@ -1829,8 +1909,6 @@ impl ProxyHttp for SbProxy {
                             js_scripts.push(script.clone());
                         }
                     }
-                    // Clone modifiers for advanced processing (URL rewrite, query, method, body).
-                    advanced_modifiers = origin.request_modifiers.to_vec();
                 }
 
                 // Collect forward-rule request modifiers (OUTSIDE the origin modifier block
@@ -1838,16 +1916,17 @@ impl ProxyHttp for SbProxy {
                 if let Some(fwd_idx) = ctx.forward_rule_idx {
                     if let Some(fwd_rules) = pipeline.forward_rules.get(idx) {
                         if let Some(fwd_rule) = fwd_rules.get(fwd_idx) {
+                            let tmpl = build_request_template_context(session, ctx, origin);
                             for modifier in &fwd_rule.request_modifiers {
                                 if let Some(hm) = &modifier.headers {
                                     for key in &hm.remove {
                                         req_to_remove.push(key.clone());
                                     }
                                     for (key, value) in &hm.set {
-                                        req_to_set.push((key.clone(), value.clone()));
+                                        req_to_set.push((key.clone(), tmpl.resolve(value)));
                                     }
                                     for (key, value) in &hm.add {
-                                        req_to_append.push((key.clone(), value.clone()));
+                                        req_to_append.push((key.clone(), tmpl.resolve(value)));
                                     }
                                 }
                                 // This loop read `headers` and nothing else, so a
@@ -5484,14 +5563,11 @@ impl ProxyHttp for SbProxy {
                                     error = %e,
                                     "transform pipeline invariant violated, returning 500 with attribution"
                                 );
-                                ctx.response_status_override = Some(500);
-                                // A modifier's custom reason phrase must not
-                                // pair with the forced 500.
-                                ctx.response_reason_override = None;
-                                ctx.transform_error_attribution = Some(transform_name.to_string());
-                                buf.clear();
-                                buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
-                                break;
+                                return abort_committed_transform_response(
+                                    body,
+                                    ctx,
+                                    transform_name,
+                                );
                             }
                             // Read the resolved posture off the compiled
                             // transform, never the legacy `fail_on_error`
@@ -5507,11 +5583,11 @@ impl ProxyHttp for SbProxy {
                                         failure_posture = posture.as_label(),
                                         "transform failed; response failed by failure_posture"
                                     );
-                                    // Replace body with generic error. Internal details are
-                                    // logged above but never sent to the client.
-                                    buf.clear();
-                                    buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
-                                    break;
+                                    return abort_committed_transform_response(
+                                        body,
+                                        ctx,
+                                        transform_name,
+                                    );
                                 }
                                 FailureMode::Open => {
                                     warn!(
@@ -6113,6 +6189,8 @@ impl ProxyHttp for SbProxy {
         metrics().active_connections.dec();
 
         let status_u16 = final_response_status(ctx, session.response_written());
+        let record_proxy_request_metrics =
+            should_record_proxy_request_metrics(session.req_header().uri.path());
 
         // Phase 7: AI realtime WebSocket session-close hook. When the
         // request opened a realtime session, observe duration, tick
@@ -6226,8 +6304,10 @@ impl ProxyHttp for SbProxy {
         //
         // No-op unless this origin's resolved role writes receipts.
         {
-            let client_disconnected =
-                e.is_some_and(|error| *error.esource() == pingora_error::ErrorSource::Downstream);
+            let client_disconnected = client_disconnected(
+                e.map(|error| error.esource().clone()),
+                downstream_half_closed(session),
+            );
             let path = session.req_header().uri.path().to_string();
             let settled = crate::meter_runtime::record_response(
                 ctx,
@@ -6278,19 +6358,22 @@ impl ProxyHttp for SbProxy {
             .request_start
             .map(|s| s.elapsed().as_secs_f64())
             .unwrap_or(0.0);
-        sbproxy_observe::metrics::record_request_with_labels(
-            &hostname,
-            &method,
-            status_u16,
-            latency_secs,
-            ctx.request_body_bytes,
-            ctx.response_body_bytes,
-            agent_labels,
-        );
+        if record_proxy_request_metrics {
+            sbproxy_observe::metrics::record_request_with_labels(
+                &hostname,
+                &method,
+                status_u16,
+                latency_secs,
+                ctx.request_body_bytes,
+                ctx.response_body_bytes,
+                agent_labels,
+            );
+        }
         // WOR-2093: one canonical id for the metric, the ring row below,
         // the access log, and spans.
         let accountable_key_id = ctx.accountable_key_id().map(str::to_string);
-        sbproxy_observe::metrics::record_inbound_key_request(
+        record_inbound_key_request_for_path(
+            session.req_header().uri.path(),
             ctx.native_key_provider.as_deref(),
             ctx.inbound_key_mode.as_str(),
             ctx.tenant_id.as_str(),
@@ -6361,7 +6444,7 @@ impl ProxyHttp for SbProxy {
             .request_start
             .map(|s| s.elapsed().as_secs_f64())
             .unwrap_or(0.0);
-        if duration > 0.0 {
+        if record_proxy_request_metrics && duration > 0.0 {
             metrics()
                 .request_duration
                 .with_label_values(&[hostname.as_str()])
@@ -6405,9 +6488,8 @@ impl ProxyHttp for SbProxy {
         }
 
         // Per-origin active-connection bookkeeping. The actual request
-        // counter + per-origin views were updated in the
-        // `record_request_with_labels` call above, so we only need to
-        // decrement the active gauge here.
+        // counter + per-origin views were updated above for traffic
+        // requests, so we only need to decrement the active gauge here.
         if !hostname.is_empty() {
             sbproxy_observe::metrics::dec_active(&hostname);
         }
@@ -6441,8 +6523,19 @@ impl ProxyHttp for SbProxy {
         // identity dimensions plus a closed outcome label so spend can
         // be sliced value-vs-waste. Non-AI traffic is skipped.
         if ctx.ai_provider.is_some() || ctx.ai_surface.is_some() {
-            let outcome =
-                crate::server::access_log::ai_outcome_label(status_u16, ctx.ai_outcome.as_deref());
+            let outcome = crate::server::access_log::ai_outcome_label(
+                status_u16,
+                ctx.ai_outcome.as_deref(),
+                ctx.admin_ai_attempts > 0,
+            );
+            let gateway_decision = crate::server::access_log::ai_gateway_decision(
+                outcome,
+                ctx.admin_ai_attempts,
+                ctx.ai_gateway_action_reached,
+            );
+            if let Some((decision, reason)) = gateway_decision {
+                sbproxy_ai::ai_metrics::record_ai_gateway_decision(decision, reason);
+            }
             sbproxy_ai::ai_metrics::record_ai_outcome_attributed(
                 ctx.hostname.as_str(),
                 ctx.ai_provider.as_deref().unwrap_or(""),
@@ -6754,6 +6847,103 @@ fn apply_response_status_override(
 mod tests {
     use super::*;
     use pingora_error::ErrorSource;
+
+    #[test]
+    fn closed_transform_failure_aborts_a_committed_response() {
+        let mut ctx = RequestContext::default();
+        let mut body = Some(Bytes::from_static(b"unsafe upstream body"));
+
+        let result = abort_committed_transform_response(&mut body, &mut ctx, "bundle");
+
+        assert!(result.is_err());
+        assert!(body.is_none());
+        assert_eq!(ctx.response_status, Some(500));
+        assert_eq!(ctx.response_status_override, Some(500));
+        assert!(ctx.response_reason_override.is_none());
+        assert_eq!(ctx.transform_error_attribution.as_deref(), Some("bundle"));
+    }
+
+    #[test]
+    fn downstream_half_close_counts_as_a_client_disconnect_without_a_write_error() {
+        assert!(client_disconnected(None, true));
+        assert!(client_disconnected(
+            Some(pingora_error::ErrorSource::Downstream),
+            false
+        ));
+        assert!(!client_disconnected(
+            Some(pingora_error::ErrorSource::Upstream),
+            false
+        ));
+    }
+
+    #[test]
+    fn metrics_scrapes_do_not_count_as_proxy_traffic() {
+        assert!(!should_record_proxy_request_metrics("/metrics"));
+        assert!(should_record_proxy_request_metrics("/metrics/tenant"));
+        assert!(should_record_proxy_request_metrics("/health"));
+        assert!(!record_inbound_key_request_for_path(
+            "/metrics", None, "none", "", None,
+        ));
+        assert!(record_inbound_key_request_for_path(
+            "/metrics/tenant",
+            None,
+            "none",
+            "",
+            None,
+        ));
+    }
+
+    #[test]
+    fn forward_rule_advanced_request_modifiers_join_the_route_pipeline() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "forward.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          id: api
+          action:
+            type: proxy
+            url: http://127.0.0.1:18889
+          request_modifiers:
+            - url:
+                path:
+                  replace:
+                    old: /api/
+                    new: /v2/
+              query:
+                set:
+                  routed: forward
+                remove:
+                  - stale
+              method: POST
+              body:
+                replace_json:
+                  routed: true
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let modifiers = request_modifiers_for_route(&pipeline, 0, Some(0));
+        let mut request =
+            pingora_http::RequestHeader::build("GET", b"/api/items?stale=1", None).unwrap();
+        let mut ctx = RequestContext::default();
+
+        apply_advanced_request_modifiers(&modifiers, &mut request, &mut ctx);
+
+        assert_eq!(request.method, http::Method::POST);
+        assert_eq!(request.uri.to_string(), "/v2/items?routed=forward");
+        assert_eq!(
+            ctx.replacement_request_body.as_deref(),
+            Some(&b"{\"routed\":true}"[..])
+        );
+    }
 
     /// `status.text` rides the header struct Pingora's HTTP/1.x
     /// serializer reads the status line from, so asserting on

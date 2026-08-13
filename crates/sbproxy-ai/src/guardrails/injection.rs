@@ -11,7 +11,7 @@
 //! `sbproxy-ai`; reversing the direction to put the constants in
 //! `sbproxy-modules` would create a cycle.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::GuardrailBlock;
 
@@ -135,14 +135,44 @@ pub fn detect(
 }
 
 /// Detects prompt injection attempts.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct InjectionGuardrail {
     /// Custom injection patterns to match.
-    #[serde(default)]
     pub patterns: Vec<String>,
     /// Whether to use built-in common injection patterns.
-    #[serde(default = "default_true")]
     pub detect_common: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InjectionGuardrailConfig {
+    // These fields belong to the common guardrail entry envelope. The
+    // injection implementation does not use them, but accepting them here
+    // keeps the documented `type` and `action` spellings valid while still
+    // rejecting fields from a different guardrail, such as `keywords`.
+    #[serde(default, rename = "type")]
+    _type: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "action")]
+    _action: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "stream_policy")]
+    _stream_policy: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    patterns: Vec<String>,
+    #[serde(default = "default_true")]
+    detect_common: bool,
+}
+
+impl<'de> Deserialize<'de> for InjectionGuardrail {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let config = InjectionGuardrailConfig::deserialize(deserializer)?;
+        Ok(Self {
+            patterns: config.patterns,
+            detect_common: config.detect_common,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -263,6 +293,19 @@ mod tests {
         let guard: InjectionGuardrail = serde_json::from_value(json).unwrap();
         assert!(guard.detect_common);
         assert!(guard.patterns.is_empty());
+    }
+
+    #[test]
+    fn deserialization_rejects_the_toxicity_keywords_field() {
+        let error = serde_json::from_value::<InjectionGuardrail>(serde_json::json!({
+            "keywords": ["ignore me"]
+        }))
+        .expect_err("an injection guardrail must not silently discard `keywords`");
+
+        assert!(
+            error.to_string().contains("unknown field `keywords`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

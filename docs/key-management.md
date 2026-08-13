@@ -588,10 +588,19 @@ data key, encrypts the secret with AES-256-GCM bound to the record id, then wrap
 the data key under a key derived from the `master_key`. Only the wrapped data key
 reaches disk, so you can rotate the master without re-encrypting every payload.
 
-Set `pepper` and `master_key` to a stable secret in production. Both accept
-`env:NAME` or `file:PATH` so you can inject them from your secret manager. If you
-leave them unset, sbproxy generates an ephemeral value and warns: stored hashes
-and encrypted credentials will not survive a restart.
+Set `pepper` and `master_key` to a stable secret in production. Both accept the
+same secret forms as the rest of `sb.yml`: `${NAME}` interpolation,
+`env:NAME`, `file:PATH`, inline values, and configured secret-provider URIs.
+`${NAME}` is expanded while the YAML is loaded; the remaining reference forms
+are resolved when the key plane is constructed. Both `${NAME}` and `env:NAME`
+are valid here, so you do not need to translate an existing environment-secret
+convention for these two fields.
+
+If either value is unset, sbproxy generates a new ephemeral value and warns.
+That value changes on every process restart and every successful config reload,
+including SIGHUP, filesystem-watch reload, and `POST /admin/reload`. Stored key
+hashes and encrypted credentials created under the previous value immediately
+become unusable when the new generation is published.
 
 Generate each value as 32 bytes of cryptographic randomness, hex-encoded
 (`openssl rand -hex 32`), and never reuse one value for both roles. See

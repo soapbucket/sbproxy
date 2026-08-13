@@ -47,6 +47,20 @@ containerized rollout is separate work from the curl-install VM path in
 [`deploy/aws/README.md`](../deploy/aws/README.md) and
 [`deploy/azure/README.md`](../deploy/azure/README.md).
 
+### Official release artifacts include the admin UI
+
+The standard GitHub release workflow builds `ui/dist`, then compiles every
+published `sbproxy` binary with `--features embed-admin-ui`. The release
+tarballs therefore serve the dashboard at `/admin/ui/` when the admin server
+is enabled. The multi-architecture `docker.io/soapbucket/sbproxy` image copies
+those same release binaries into its distroless runtime, so the Docker Hub
+image includes the dashboard too. This is not limited to
+`Dockerfile.cloudbuild`.
+
+A local default Cargo build remains lean and does not embed the UI unless you
+build the frontend and pass the feature explicitly. See
+[admin-ui.md](admin-ui.md#build-and-enable-it).
+
 `Dockerfile.cloudbuild` and `Dockerfile.ci` share a five-stage Rust
 spine; `Dockerfile.ci` is exactly that spine, and `Dockerfile.cloudbuild`
 adds two stages of its own (**admin-ui** and **cert-gen**) for seven

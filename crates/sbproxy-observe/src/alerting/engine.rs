@@ -37,10 +37,13 @@ use super::slo::{check_slo_violation, SloRule};
 /// every provider rather than one upstream origin, so it carries a fixed scope
 /// name instead of a hostname.
 pub const PROVIDER_ERROR_SCOPE: &str = "ai_providers";
+/// Origin label for gateway admission decisions made before provider dispatch.
+pub const GATEWAY_REJECTION_SCOPE: &str = "ai_gateway";
 /// Origin label for proxy-wide latency and rate-limit rules.
 pub const PROXY_SCOPE: &str = "proxy";
 const BUDGET_FIRING_KEY: &str = "budget_exhaustion";
 const PROVIDER_ERROR_FIRING_KEY: &str = "error_rate_spike:origin=ai_providers";
+const GATEWAY_REJECTION_FIRING_KEY: &str = "gateway_rejection_spike:origin=ai_gateway";
 const SLO_FIRING_KEY: &str = "latency_slo:origin=proxy";
 const RATE_LIMIT_FIRING_KEY: &str = "rate_limit_approaching:origin=proxy";
 const BURN_RATE_FIRING_KEY: &str = "burn_rate:scope=substrate";
@@ -115,6 +118,11 @@ pub struct MetricReadings {
     /// [`Self::provider_error_rate`]. Windows below the configured floor are
     /// inactive and cannot fire or resolve the provider-error rule.
     pub provider_attempts: u64,
+    /// Fraction of AI gateway decisions rejected before provider dispatch in
+    /// the latest interval.
+    pub gateway_rejection_rate: Option<f64>,
+    /// AI gateway decisions observed in the same interval.
+    pub gateway_decisions: u64,
     /// Aggregate request p99 latency for the latest sampling window, in
     /// milliseconds.
     pub p99_latency_ms: Option<f64>,
@@ -149,6 +157,10 @@ pub struct EngineConfig {
     /// Minimum provider attempts required before an error-rate window is
     /// active. This prevents sparse traffic from paging on noisy fractions.
     pub provider_error_min_attempts: u64,
+    /// Gateway rejection threshold in `[0, 1]`.
+    pub gateway_rejection_threshold: f64,
+    /// Minimum gateway decisions required before the rejection rule is active.
+    pub gateway_rejection_min_decisions: u64,
     /// Proxy-wide p99 latency threshold, in milliseconds.
     pub slo_p99_threshold_ms: f64,
     /// Fraction of rate-limit decisions that may reject before alerting.
@@ -165,6 +177,8 @@ impl Default for EngineConfig {
             budget_thresholds: vec![0.80, 0.95],
             provider_error_threshold: 0.10,
             provider_error_min_attempts: 10,
+            gateway_rejection_threshold: 0.10,
+            gateway_rejection_min_decisions: 10,
             slo_p99_threshold_ms: 200.0,
             rate_limit_rejection_threshold: 0.80,
             cert_expiry_warn_days: vec![30, 7],
@@ -239,7 +253,7 @@ impl AlertEngine {
     pub fn evaluate(&mut self, readings: &MetricReadings) -> Vec<Alert> {
         let mut to_fire = Vec::new();
         let evaluated_at = chrono::Utc::now().to_rfc3339();
-        let mut evaluations = Vec::with_capacity(7);
+        let mut evaluations = Vec::with_capacity(8);
 
         match readings.budget_utilization {
             Some(utilization) => {
@@ -294,6 +308,46 @@ impl AlertEngine {
                 state: RuleEvaluationState::Inactive,
                 reading,
                 sample_count: Some(readings.provider_attempts),
+                evaluated_at: evaluated_at.clone(),
+            }),
+        }
+
+        let gateway_active =
+            readings.gateway_decisions >= self.config.gateway_rejection_min_decisions;
+        match (readings.gateway_rejection_rate, gateway_active) {
+            (Some(rate), true) => {
+                let rule = ErrorRateRule {
+                    origin: GATEWAY_REJECTION_SCOPE.to_string(),
+                    threshold: self.config.gateway_rejection_threshold,
+                };
+                let mut alert = check_error_rate_spike(&rule, rate);
+                if let Some(alert) = alert.as_mut() {
+                    alert.rule = "gateway_rejection_spike".to_string();
+                    let observed_pct = (rate * 100.0) as u32;
+                    let threshold_pct = (self.config.gateway_rejection_threshold * 100.0) as u32;
+                    alert.message = format!(
+                        "AI gateway rejection rate {observed_pct}% exceeds threshold {threshold_pct}%"
+                    );
+                }
+                let state = if alert.is_some() {
+                    RuleEvaluationState::Firing
+                } else {
+                    RuleEvaluationState::Ok
+                };
+                self.apply_active_rule(GATEWAY_REJECTION_FIRING_KEY, alert, &mut to_fire);
+                evaluations.push(RuleEvaluation {
+                    rule: "gateway_rejection_spike".to_string(),
+                    state,
+                    reading: Some(rate),
+                    sample_count: Some(readings.gateway_decisions),
+                    evaluated_at: evaluated_at.clone(),
+                });
+            }
+            (reading, false) | (reading @ None, true) => evaluations.push(RuleEvaluation {
+                rule: "gateway_rejection_spike".to_string(),
+                state: RuleEvaluationState::Inactive,
+                reading,
+                sample_count: Some(readings.gateway_decisions),
                 evaluated_at: evaluated_at.clone(),
             }),
         }
@@ -609,6 +663,15 @@ pub struct ProviderCounters {
     pub attempts: f64,
 }
 
+/// Monotonic AI gateway admission counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GatewayCounters {
+    /// All terminal AI gateway decisions.
+    pub decisions: f64,
+    /// Decisions rejected before provider dispatch.
+    pub rejections: f64,
+}
+
 /// Monotonic proxy request counters used to build one-minute burn samples.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RequestCounters {
@@ -650,6 +713,8 @@ pub struct HistogramCounters {
 pub struct RegistrySnapshot {
     /// AI provider attempts and failures.
     pub provider_counters: ProviderCounters,
+    /// AI gateway admissions and pre-provider rejections.
+    pub gateway_counters: GatewayCounters,
     /// Highest active budget utilization.
     pub budget_utilization: Option<f64>,
     /// Whether the proxy request counter family is available. This separates
@@ -683,6 +748,15 @@ pub fn sample_registry() -> RegistrySnapshot {
             }
             "sbproxy_ai_provider_attempts_total" => {
                 snapshot.provider_counters.attempts = sum_counter(&family);
+            }
+            "sbproxy_ai_gateway_decisions_total" => {
+                for metric in family.get_metric() {
+                    let count = metric.get_counter().value();
+                    snapshot.gateway_counters.decisions += count;
+                    if label_value(metric, "decision") == Some("rejected") {
+                        snapshot.gateway_counters.rejections += count;
+                    }
+                }
             }
             "sbproxy_ai_budget_utilization_ratio" => {
                 snapshot.budget_utilization = Some(max_gauge(&family));
@@ -859,6 +933,18 @@ pub fn provider_attempt_delta(prev: ProviderCounters, now: ProviderCounters) -> 
     (now.attempts - prev.attempts).max(0.0) as u64
 }
 
+/// Gateway rejection fraction and decision count for one sampling window.
+/// Idle or reset windows return `None` so they neither fire nor resolve an
+/// existing incident.
+pub fn gateway_rejection_delta(prev: GatewayCounters, now: GatewayCounters) -> Option<(f64, u64)> {
+    let decisions = now.decisions - prev.decisions;
+    if decisions <= 0.0 {
+        return None;
+    }
+    let rejections = (now.rejections - prev.rejections).max(0.0);
+    Some(((rejections / decisions).clamp(0.0, 1.0), decisions as u64))
+}
+
 /// Turn monotonic request counters into one complete minute of burn history.
 ///
 /// Idle windows return a zero-request sample so the bounded ring advances with
@@ -905,6 +991,8 @@ mod tests {
             budget_utilization: budget,
             provider_error_rate: errors,
             provider_attempts: errors.map(|_| 10).unwrap_or(0),
+            gateway_rejection_rate: None,
+            gateway_decisions: 0,
             p99_latency_ms: None,
             rate_limit_rejections: None,
             rate_limit_decisions: 0,
@@ -919,12 +1007,22 @@ mod tests {
             budget_utilization: None,
             provider_error_rate: Some(rate),
             provider_attempts: attempts,
+            gateway_rejection_rate: None,
+            gateway_decisions: 0,
             p99_latency_ms: None,
             rate_limit_rejections: None,
             rate_limit_decisions: 0,
             cert_expiry: None,
             circuit_breakers: None,
             minute_sample: None,
+        }
+    }
+
+    fn gateway_readings(rate: f64, decisions: u64) -> MetricReadings {
+        MetricReadings {
+            gateway_rejection_rate: Some(rate),
+            gateway_decisions: decisions,
+            ..MetricReadings::default()
         }
     }
 
@@ -968,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_inputs_publish_all_seven_rules_as_inactive_without_firing() {
+    fn absent_inputs_publish_all_eight_rules_as_inactive_without_firing() {
         let mut engine = AlertEngine::new(EngineConfig::default());
 
         assert!(engine.evaluate(&MetricReadings::default()).is_empty());
@@ -981,6 +1079,7 @@ mod tests {
             vec![
                 ("budget_exhaustion", RuleEvaluationState::Inactive),
                 ("error_rate_spike", RuleEvaluationState::Inactive),
+                ("gateway_rejection_spike", RuleEvaluationState::Inactive),
                 ("burn_rate", RuleEvaluationState::Inactive),
                 ("latency_slo", RuleEvaluationState::Inactive),
                 ("rate_limit_approaching", RuleEvaluationState::Inactive),
@@ -1465,6 +1564,22 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_rejection_spike_fires_separately_from_provider_errors() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+
+        let fired = engine.evaluate(&gateway_readings(0.50, 10));
+
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule, "gateway_rejection_spike");
+        assert_eq!(fired[0].labels["origin"], "ai_gateway");
+        assert!(engine
+            .latest_evaluations()
+            .iter()
+            .any(|evaluation| evaluation.rule == "gateway_rejection_spike"
+                && evaluation.state == RuleEvaluationState::Firing));
+    }
+
+    #[test]
     fn provider_error_burn_is_inactive_below_the_minimum_attempts() {
         let mut engine = AlertEngine::new(EngineConfig::default());
 
@@ -1543,6 +1658,21 @@ mod tests {
         // No attempts in the window: no reading, so no alert and no recovery.
         assert_eq!(error_burn(now, now), None);
         assert_eq!(provider_attempt_delta(now, now), 0);
+    }
+
+    #[test]
+    fn gateway_rejection_rate_is_a_windowed_delta() {
+        let prev = GatewayCounters {
+            decisions: 100.0,
+            rejections: 10.0,
+        };
+        let now = GatewayCounters {
+            decisions: 120.0,
+            rejections: 15.0,
+        };
+
+        assert_eq!(gateway_rejection_delta(prev, now), Some((0.25, 20)));
+        assert_eq!(gateway_rejection_delta(now, now), None);
     }
 
     #[test]

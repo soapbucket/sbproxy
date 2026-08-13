@@ -932,6 +932,12 @@ Filter passed to `tracing-subscriber`. Accepts a bare level
 (`info`, `debug`, `trace`, `warn`, `error`) or a per-target filter
 string (`sbproxy=debug,h2=warn,pingora=info`).
 
+The official release binary has a compile-time maximum of `info` for SBproxy's
+own tracing calls, so `debug` and `trace` cannot restore SBproxy events that
+were removed at compile time. Dependencies built without that ceiling may
+still emit at those levels. Use a development build (`cargo build`) when you
+need SBproxy-internal debug or trace events.
+
 - **Default:** `info`.
 - **Priority:** `--log-level` > `SB_LOG_LEVEL` > `RUST_LOG` >
   `proxy.observability.log.level` > `info`.
@@ -1218,7 +1224,8 @@ what a reload does to a level set through the admin API, is in
 
 At runtime, the filter can be changed without a restart through the
 admin API: `PUT /admin/log-level` with `{"level": "debug"}` (see
-[admin-api-reference.md](admin-api-reference.md)).
+[admin-api-reference.md](admin-api-reference.md)). The same release-build
+ceiling applies: changing a filter never restores compile-stripped events.
 
 ### Access logs
 
@@ -1354,8 +1361,11 @@ hot-reload workflow.
 ## 6. Health checks
 
 SBproxy serves probe endpoints on two listeners. The main data plane
-(`http_bind_port`, default `8080`) always serves a minimal `/health`
-plus `/metrics`. The embedded admin listener (`proxy.admin`, default
+(`http_bind_port`, default `8080`) serves `/metrics` and keeps a minimal
+`/health` compatibility response for requests whose `Host` does not match a
+configured origin. A matched origin owns `/health` like every other route, so
+an application's health endpoint remains reachable through the proxy. The
+embedded admin listener (`proxy.admin`, default
 `127.0.0.1:9090`) serves the full probe set unauthenticated, alongside
 its authenticated operator routes. All responses are
 `application/json`.
@@ -1364,7 +1374,7 @@ its authenticated operator routes. All responses are
 
 | Endpoint        | Listener | Aliases    | Purpose                | Success | Failure |
 |-----------------|----------|-----------|-------------------------|---------|---------|
-| `/health`       | data plane | (none)  | Liveness; fixed body     | `200`   | never   |
+| `/health`       | data plane | (none)  | Unrouted-host liveness fallback; otherwise routed to the origin | `200` for fallback | never for fallback |
 | `/livez`        | admin    | `/live`   | Liveness; process is up  | `200`   | never   |
 | `/readyz`       | admin    | `/ready`  | Readiness; ready to serve | `200`   | `503`   |
 | `/healthz`      | admin    | (none)    | Liveness; trivial body   | `200`   | never   |
@@ -1372,12 +1382,14 @@ its authenticated operator routes. All responses are
 
 The bare `/live` and `/ready` aliases return identical bodies to
 `/livez` and `/readyz`. On the admin listener, `/health` is the rich
-operator/SIEM endpoint; on the data plane it is a fixed liveness body
-(`{"status":"ok"}`) suitable for load balancers that can only probe
-the serving port. K8s readiness probes should hit `/readyz` and
+operator/SIEM endpoint. On the data plane, an unrouted Host receives the fixed
+liveness body (`{"status":"ok"}`); a Host that matches an origin reaches that
+origin's `/health` route. K8s readiness probes should hit `/readyz` and
 liveness probes `/livez` when the admin listener is reachable from
-the kubelet; otherwise use the data plane's `/health` for both (see
-[section 12](#12-kubernetes-deployment)).
+the kubelet. If they use the data-plane fallback instead, keep the probe Host
+outside the configured origin set (the default pod-IP Host normally does) or
+choose an application health route deliberately (see [section
+12](#12-kubernetes-deployment)).
 
 ### `/livez`
 
@@ -2030,9 +2042,12 @@ spec:
 
 ### Probes
 
-The example above probes `/health` on the serving port (`8080`), which
-returns a fixed `200` whenever the process is up. That is the simplest
-working configuration and needs nothing beyond the default config.
+The example above probes `/health` on the serving port (`8080`). Kubernetes
+uses the pod IP as the Host, so it receives the fixed `200` liveness fallback
+unless that IP is itself configured as an origin. If you configure pod-IP
+origins or set an explicit matching Host header, `/health` routes to that
+origin instead; use the admin probes below or make the application's response
+part of your readiness contract.
 
 The richer `/livez` and `/readyz` endpoints live on the embedded admin
 listener, not the serving port. To use them as probes, enable the
