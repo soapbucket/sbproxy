@@ -151,6 +151,14 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
             builtin(ExpressionEnforcer(Arc::new(p))),
             DecisionEngine::Cel,
         ),
+        // Wired in the same change that declares the variant. A
+        // `DecisionEngine` nothing emits reads on a dashboard as "no
+        // Rego policy denied anything" rather than "not instrumented",
+        // which WOR-2357 found to be worse than an omission.
+        Policy::Rego(p) => with_engine(
+            builtin(super::rego::RegoEnforcer(Arc::new(*p))),
+            DecisionEngine::Rego,
+        ),
         Policy::Assertion(p) => builtin(AssertionEnforcer(Arc::new(p))),
         Policy::Waf(p) => builtin(WafEnforcer(Arc::new(p))),
         Policy::RequestValidator(p) => builtin(RequestValidatorEnforcer(Arc::new(p))),

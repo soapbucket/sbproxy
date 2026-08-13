@@ -250,6 +250,10 @@ async-trait = "0.1"
 
 # CEL expressions
 cel = { version = "0.13", features = ["regex", "chrono", "json"] }
+# Rego interpreter for `policy: rego` (WOR-2408). Default features are
+# load bearing: `default-features = false` fails to build because the
+# `net` builtin assumes `arc`.
+regorus = "0.11"
 
 # Lua scripting
 mlua = { version = "0.11", features = ["luau", "serialize", "vendored", "error-send"] }

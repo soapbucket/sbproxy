@@ -39,6 +39,7 @@ pub mod prompt_injection_v2;
 pub mod rate_limit;
 pub mod rate_limit_budget;
 mod registry;
+pub mod rego;
 pub mod request_limit;
 pub mod request_validator;
 pub mod response_phase;

@@ -2584,7 +2584,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships twenty-six policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
+SBproxy ships twenty-seven policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 

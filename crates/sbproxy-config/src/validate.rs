@@ -143,6 +143,7 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
 
 /// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`.
 pub const KNOWN_POLICY_TYPES: &[&str] = &[
+    "rego",
     "rate_limit_budget",
     "rate_limiting",
     "ip_filter",

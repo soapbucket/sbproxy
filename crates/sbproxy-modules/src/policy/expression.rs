@@ -164,79 +164,101 @@ impl ExpressionPolicy {
         hostname: &str,
         views: ExpressionViews<'_>,
     ) -> bool {
-        let mut ctx = sbproxy_extension::cel::context::build_request_context(
-            method, path, headers, query, client_ip, hostname,
-        );
-        // Translate the `sbproxy-modules` parser type into the
-        // dependency-neutral CEL view so `sbproxy-extension` does not
-        // need to depend back on `sbproxy-modules`.
-        let view = views
-            .aipref
-            .map(|s| sbproxy_extension::cel::context::AiprefView {
-                train: s.train,
-                search: s.search,
-                ai_input: s.ai_input,
-            });
-        sbproxy_extension::cel::context::populate_aipref_namespace(&mut ctx, view.as_ref());
-
-        // Wave 5 / G5.1: stamp the KYA verdict whenever the verifier
-        // ran. When `views.kya` is `None`, the namespace is not
-        // populated; `request.kya.verdict` resolves to the empty
-        // string in that case so policy expressions do not need to
-        // probe for presence.
-        if let Some(kya) = views.kya {
-            sbproxy_extension::cel::context::populate_kya_namespace(&mut ctx, &kya);
-        }
-
-        if let Some(tls) = views.tls {
-            sbproxy_extension::cel::context::populate_tls_namespace(&mut ctx, &tls);
-        }
-
-        if let Some(agent_class) = views.agent_class {
-            sbproxy_extension::cel::context::populate_agent_class_namespace(&mut ctx, &agent_class);
-        }
-        if let Some(trust_tier) = views.trust_tier {
-            sbproxy_extension::cel::context::populate_trust_tier_namespace(&mut ctx, trust_tier);
-        }
-
-        // Wave 5 / A5.2: stamp the ML classifier verdict whenever
-        // inference produced one.
-        if let Some(ml) = views.ml {
-            sbproxy_extension::cel::context::populate_ml_namespace(&mut ctx, &ml);
-        }
-
-        // WOR-114 Phase 2: stamp the per-request feature flags so
-        // policy expressions can read `features.debug` etc. Same
-        // opt-in shape as the other Wave 5 views; absent `features`
-        // means the flags namespace is not populated and any
-        // `features.*` access yields the engine's default.
-        if let Some(flags) = views.features.as_ref() {
-            sbproxy_extension::cel::context::populate_features_namespace(&mut ctx, flags);
-        }
-
-        // WOR-589: stamp the agent-detection verdict whenever the scorer
-        // ran (proxy.extensions.agent_detect.enabled). Absent `agent_detect`
-        // leaves `request.agent.*` unset.
-        if let Some(agent) = views.agent_detect.as_ref() {
-            sbproxy_extension::cel::context::populate_agent_detect_namespace(&mut ctx, agent);
-        }
-
-        // Capture envelope and principal namespaces. Both are
-        // opt-in views; an evaluator that has not threaded them
-        // through compiles unchanged and reads the engine's zero
-        // value for `envelope.*` / `principal.*`.
-        if let Some(envelope) = views.envelope.as_ref() {
-            sbproxy_extension::cel::context::populate_envelope_namespace(&mut ctx, envelope);
-        }
-        if let Some(principal) = views.principal.as_ref() {
-            sbproxy_extension::cel::context::populate_principal_namespace(&mut ctx, principal);
-        }
-
+        let ctx = build_policy_context(method, path, headers, query, client_ip, hostname, views);
         // The expression was compiled once at config-compile time.
         // Runtime evaluation errors fail closed: the expression could
         // not prove the request is allowed, so it is denied.
         self.compiled.eval_bool(&ctx).unwrap_or(false)
     }
+}
+
+/// Assemble the evaluation context a request-phase decision policy
+/// reads.
+///
+/// Extracted from `evaluate_with_views` so `policy: rego` reads the
+/// same context rather than assembling a second one. Two assemblers
+/// would drift the moment either gained a binding, and the drift would
+/// be invisible: a Rego policy reading a binding this function stopped
+/// populating sees `undefined`, which is a legal value it will happily
+/// reason about rather than complain of.
+#[allow(clippy::too_many_arguments)]
+pub fn build_policy_context(
+    method: &str,
+    path: &str,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    client_ip: Option<&str>,
+    hostname: &str,
+    views: ExpressionViews<'_>,
+) -> sbproxy_extension::cel::CelContext {
+    let mut ctx = sbproxy_extension::cel::context::build_request_context(
+        method, path, headers, query, client_ip, hostname,
+    );
+    // Translate the `sbproxy-modules` parser type into the
+    // dependency-neutral CEL view so `sbproxy-extension` does not
+    // need to depend back on `sbproxy-modules`.
+    let view = views
+        .aipref
+        .map(|s| sbproxy_extension::cel::context::AiprefView {
+            train: s.train,
+            search: s.search,
+            ai_input: s.ai_input,
+        });
+    sbproxy_extension::cel::context::populate_aipref_namespace(&mut ctx, view.as_ref());
+
+    // Wave 5 / G5.1: stamp the KYA verdict whenever the verifier
+    // ran. When `views.kya` is `None`, the namespace is not
+    // populated; `request.kya.verdict` resolves to the empty
+    // string in that case so policy expressions do not need to
+    // probe for presence.
+    if let Some(kya) = views.kya {
+        sbproxy_extension::cel::context::populate_kya_namespace(&mut ctx, &kya);
+    }
+
+    if let Some(tls) = views.tls {
+        sbproxy_extension::cel::context::populate_tls_namespace(&mut ctx, &tls);
+    }
+
+    if let Some(agent_class) = views.agent_class {
+        sbproxy_extension::cel::context::populate_agent_class_namespace(&mut ctx, &agent_class);
+    }
+    if let Some(trust_tier) = views.trust_tier {
+        sbproxy_extension::cel::context::populate_trust_tier_namespace(&mut ctx, trust_tier);
+    }
+
+    // Wave 5 / A5.2: stamp the ML classifier verdict whenever
+    // inference produced one.
+    if let Some(ml) = views.ml {
+        sbproxy_extension::cel::context::populate_ml_namespace(&mut ctx, &ml);
+    }
+
+    // WOR-114 Phase 2: stamp the per-request feature flags so
+    // policy expressions can read `features.debug` etc. Same
+    // opt-in shape as the other Wave 5 views; absent `features`
+    // means the flags namespace is not populated and any
+    // `features.*` access yields the engine's default.
+    if let Some(flags) = views.features.as_ref() {
+        sbproxy_extension::cel::context::populate_features_namespace(&mut ctx, flags);
+    }
+
+    // WOR-589: stamp the agent-detection verdict whenever the scorer
+    // ran (proxy.extensions.agent_detect.enabled). Absent `agent_detect`
+    // leaves `request.agent.*` unset.
+    if let Some(agent) = views.agent_detect.as_ref() {
+        sbproxy_extension::cel::context::populate_agent_detect_namespace(&mut ctx, agent);
+    }
+
+    // Capture envelope and principal namespaces. Both are
+    // opt-in views; an evaluator that has not threaded them
+    // through compiles unchanged and reads the engine's zero
+    // value for `envelope.*` / `principal.*`.
+    if let Some(envelope) = views.envelope.as_ref() {
+        sbproxy_extension::cel::context::populate_envelope_namespace(&mut ctx, envelope);
+    }
+    if let Some(principal) = views.principal.as_ref() {
+        sbproxy_extension::cel::context::populate_principal_namespace(&mut ctx, principal);
+    }
+    ctx
 }
 
 /// Bundle of optional view objects that an

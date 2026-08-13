@@ -1,4 +1,4 @@
-# SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
+# SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
 *Last modified: 2026-08-12*
 
@@ -7,6 +7,7 @@ SBproxy includes four scripting engines for custom logic: CEL (Common Expression
 | Engine | Implementation | Best for |
 |--------|----------------|----------|
 | CEL | `cel-rust` (the `cel` crate), with custom SBproxy functions | Policy gates, routing keys, response header rules |
+| Rego | Regorus (Microsoft's Rust interpreter), in process | Policy gates you already have written for OPA |
 | Lua | `mlua` running the Luau runtime, sandboxed | Header modifiers, JSON body rewriting, WAF custom rules |
 | JavaScript | `rquickjs` (QuickJS), sandboxed with JSON helpers | JS-native body transforms and response modifiers |
 | WASM | `wasmtime` running WASI preview-1 modules, no filesystem or network | Polyglot body transforms, untrusted code with strong isolation |
@@ -506,6 +507,63 @@ Every `value_expr` is compiled when the config compiles. A syntax error refuses 
 | `on_response:` (alias `expression:`) | Replaced the **entire** response body with whatever scalar the expression evaluated to. No partial edit, no structure-aware change, no streaming. That is producing output, which is a different job from deciding. | A `javascript`, `lua_json`, or WASM transform. Each parses the body, edits part of it, and re-emits. |
 
 At response time the posture is deliberately forgiving, because the response is already on its way out: a header rule whose expression fails is skipped, the rest of the chain still runs, and the failure is logged.
+
+---
+
+## 3a. Rego policies
+
+`policy: rego` evaluates a Rego module against the same request context a `policy: expression` sees. It exists for one reason: some teams already have Rego, and rewriting a working policy set is worse than running it. If you are writing a new policy from scratch, prefer `expression`; the reasons are below and they are not stylistic.
+
+```yaml
+policies:
+  - type: rego
+    module: |
+      package sbproxy
+
+      default allow := false
+
+      allow if {
+        input.request.trust_tier == "strong"
+      }
+
+      allow if {
+        input.request.method == "GET"
+        startswith(input.request.path, "/public/")
+      }
+    # Optional. Defaults shown.
+    query: data.sbproxy.allow
+    deny_status: 403
+    deny_message: forbidden by policy
+    budget_ms: 50
+```
+
+### What `input` contains
+
+The exact binding set of `policy: expression` in [the table above](#32-what-each-config-site-offers), converted to JSON. `request.trust_tier` in CEL is `input.request.trust_tier` in Rego; both engines read the same assembled context, so the vocabulary cannot drift between them. A decision is portable in both directions by translating syntax alone, with two exceptions below.
+
+`input.jwt.claims` deserves the same warning it carries on the CEL side, and it matters more here because Rego is what people reach for to write authorization: the claims are **decoded, not verified**. `input.jwt.claims.role == "admin"` trusts whatever the client sent. Signature verification belongs to the `jwt` auth provider under `authentication:`; gate the route there first, then use the claims for authorization.
+
+### The two things Rego does not inherit
+
+**Typos are not caught at config load.** A CEL expression naming a binding its surface does not provide is refused when the config loads. Rego cannot offer that: `input.request.trust_teir` is not an error, it is `undefined`, which is a value the language is designed to reason about. A misspelled binding is a rule that never fires, discovered from traffic behavior rather than from an error message. This is the strongest reason to prefer `expression` when either engine would do.
+
+**The SBproxy helper functions do not exist in Rego.** `flag_enabled()` and `tls_fingerprint_matches()` have no Rego equivalent; a policy needing either belongs in `expression`. The generic helpers have standard Rego analogs: `ip_in_cidr` is `net.cidr_contains`, `sha256` is `crypto.sha256`, `regex_match` is `regex.match`.
+
+### Failure posture
+
+Everything fails closed, at the earliest point it can be detected:
+
+| Fault | When it is caught | What happens |
+|---|---|---|
+| Module does not parse | config load | config refused, boot and reload both name the error |
+| Module parses but is semantically invalid (unsafe variable, `query` naming no rule) | config load | config refused; the engine runs one trial evaluation so deferred analysis cannot push an authoring mistake to request time |
+| Rule errors, returns a non-boolean, or exceeds `budget_ms` at request time | per request | request denied with `deny_status`, one warning logged |
+
+`budget_ms` bounds one evaluation's wall clock and defaults to 50ms, matching the extension-bundle sandbox. It cannot be zero.
+
+### One OPA divergence worth knowing
+
+Builtin errors are strict here. Upstream OPA treats a builtin error as `undefined` and moves on; Regorus propagates it, and this surface turns it into a denial. A policy that leans on that forgiveness upstream, for example calling `net.cidr_contains` on a header that is sometimes not a CIDR, works on OPA and denies here. Guard the input first, or accept the deny.
 
 ---
 

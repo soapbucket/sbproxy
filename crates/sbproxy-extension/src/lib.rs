@@ -13,4 +13,5 @@ pub mod flags;
 pub mod js;
 pub mod lua;
 pub mod mcp;
+pub mod rego;
 pub mod wasm;

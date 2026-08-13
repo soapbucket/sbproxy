@@ -238,6 +238,10 @@ fn compile_policy_with_optional_registry(
         "ddos" | "ddos_protection" => Ok(Policy::Ddos(DdosPolicy::from_config(config.clone())?)),
         "waf" => Ok(Policy::Waf(WafPolicy::from_config(config.clone())?)),
         "sri" => Ok(Policy::Sri(SriPolicy::from_config(config.clone())?)),
+        "rego" => Ok(Policy::Rego(Box::new(
+            crate::policy::rego::RegoPolicy::from_config(config.clone())
+                .context("invalid `rego` policy")?,
+        ))),
         "expression" => Ok(Policy::Expression(ExpressionPolicy::from_config(
             config.clone(),
         )?)),

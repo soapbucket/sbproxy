@@ -22,6 +22,7 @@ sbproxy-observe.workspace = true
 
 # CEL expression engine
 cel.workspace = true
+regorus.workspace = true
 
 # Lua scripting engine
 mlua.workspace = true

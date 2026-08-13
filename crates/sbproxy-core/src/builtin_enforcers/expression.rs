@@ -79,101 +79,7 @@ impl PolicyEnforcer for ExpressionEnforcer {
         // before producing the future. The CEL evaluation
         // (`evaluate_with_views`) is synchronous; the async block
         // only carries the boolean result.
-        #[cfg(feature = "agent-class")]
-        let kya_view = Some(sbproxy_extension::cel::context::KyaVerdictView {
-            verdict: ctx.kya_verdict,
-            agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
-            vendor: ctx.kya_vendor.as_deref(),
-            kya_version: ctx.kya_version.as_deref(),
-            kyab_balance: ctx.kya_kyab_balance,
-        });
-        #[cfg(not(feature = "agent-class"))]
-        let kya_view: Option<sbproxy_extension::cel::context::KyaVerdictView<'_>> = None;
-
-        let tls_view = ctx.tls_fingerprint.as_ref().map(|fp| {
-            sbproxy_extension::cel::context::TlsFingerprintView {
-                ja3: fp.ja3.as_deref(),
-                ja4: fp.ja4.as_deref(),
-                ja4h: fp.ja4h.as_deref(),
-                trustworthy: fp.trustworthy,
-            }
-        });
-
-        #[cfg(feature = "agent-class")]
-        let agent_class_view = Some(sbproxy_extension::cel::context::AgentClassView {
-            agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
-            agent_vendor: ctx.agent_vendor.as_deref(),
-            agent_purpose: ctx.agent_purpose.map(|p| p.as_str()),
-            agent_id_source: ctx.agent_id_source.map(|s| s.as_str()),
-            agent_rdns_hostname: ctx.agent_rdns_hostname.as_deref(),
-        });
-        #[cfg(not(feature = "agent-class"))]
-        let agent_class_view: Option<sbproxy_extension::cel::context::AgentClassView<'_>> = None;
-
-        let ml_view: Option<sbproxy_extension::cel::context::MlClassificationView<'_>> = None;
-
-        let features_view = sbproxy_extension::cel::context::FeatureFlagsView {
-            debug: ctx.flags.debug,
-            trace: ctx.flags.trace,
-            no_cache: ctx.flags.no_cache,
-            extra: &ctx.flags.extra,
-        };
-        // WOR-589: expose the agent-detection verdict (WOR-706 stamps it
-        // on ctx when proxy.extensions.agent_detect is enabled) so CEL
-        // policies can branch on `request.agent.score` etc.
-        let agent_detect_view = ctx.agent_detection.as_ref().map(|ad| {
-            sbproxy_extension::cel::context::AgentDetectView {
-                score: ad.score,
-                agent_id: ad.agent_id.as_deref(),
-                provenance: ad.provenance.as_str(),
-                confidence: ad.confidence,
-                signals_used: &ad.signals_used,
-                // WOR-817: surface the headless score + indicator
-                // names so CEL policies can branch on
-                // `request.agent.headless_score >= 50` alongside
-                // the existing rule-based fields.
-                headless_score: ad.headless_score,
-                headless_indicators: &ad.headless_indicators,
-            }
-        });
-        // WOR-2083: expose the unified principal so `principal.*`
-        // expressions evaluate against the live identity rather than
-        // the engine's zero values. `docs/scripting.md` has documented
-        // this namespace since it shipped; this is the call site that
-        // was missing. An anonymous principal still populates the
-        // namespace (empty sub, default tenant), matching the
-        // no-probing contract the other namespaces follow.
-        let p = &ctx.principal;
-        let principal_view = Some(sbproxy_extension::cel::context::PrincipalView {
-            tenant_id: Some(p.tenant_id.as_str()),
-            sub: Some(p.sub.as_str()),
-            source: Some(p.source.as_str()),
-            virtual_key_name: p.virtual_key.as_ref().map(|vk| vk.name.as_str()),
-            virtual_key_allowed_providers: p
-                .virtual_key
-                .as_ref()
-                .map(|vk| vk.allowed_providers.as_slice()),
-            project: p.attrs.project.as_deref(),
-            user: p.attrs.user.as_deref(),
-            team: p.attrs.team.as_deref(),
-            tags: Some(&p.attrs.tags),
-            metadata: Some(&p.attrs.metadata),
-            roles: Some(&p.attrs.roles),
-            claims: p.attrs.claims.as_ref(),
-        });
-
-        let views = sbproxy_modules::ExpressionViews {
-            aipref: ctx.aipref.as_ref(),
-            kya: kya_view,
-            tls: tls_view,
-            agent_class: agent_class_view,
-            trust_tier: Some(ctx.trust_tier.as_str()),
-            ml: ml_view,
-            features: Some(features_view),
-            agent_detect: agent_detect_view,
-            envelope: None,
-            principal: principal_view,
-        };
+        let views = decision_views(ctx);
 
         let allowed = policy.evaluate_with_views(
             &method,
@@ -196,6 +102,110 @@ impl PolicyEnforcer for ExpressionEnforcer {
             return Box::pin(async move { Ok(PolicyDecision::Deny { status, message }) });
         }
         Box::pin(async move { Ok(PolicyDecision::Allow) })
+    }
+}
+
+/// Assemble the view bundle a request-phase decision policy reads.
+///
+/// Shared by `policy: expression` and `policy: rego` so the two engines
+/// see the same request. Duplicating it would let one gain a view the
+/// other lacks, and on the Rego side that difference reads as
+/// `undefined` rather than as an error, so nobody would find out.
+pub(crate) fn decision_views(ctx: &RequestContext) -> sbproxy_modules::ExpressionViews<'_> {
+    #[cfg(feature = "agent-class")]
+    let kya_view = Some(sbproxy_extension::cel::context::KyaVerdictView {
+        verdict: ctx.kya_verdict,
+        agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
+        vendor: ctx.kya_vendor.as_deref(),
+        kya_version: ctx.kya_version.as_deref(),
+        kyab_balance: ctx.kya_kyab_balance,
+    });
+    #[cfg(not(feature = "agent-class"))]
+    let kya_view: Option<sbproxy_extension::cel::context::KyaVerdictView<'_>> = None;
+
+    let tls_view = ctx.tls_fingerprint.as_ref().map(|fp| {
+        sbproxy_extension::cel::context::TlsFingerprintView {
+            ja3: fp.ja3.as_deref(),
+            ja4: fp.ja4.as_deref(),
+            ja4h: fp.ja4h.as_deref(),
+            trustworthy: fp.trustworthy,
+        }
+    });
+
+    #[cfg(feature = "agent-class")]
+    let agent_class_view = Some(sbproxy_extension::cel::context::AgentClassView {
+        agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
+        agent_vendor: ctx.agent_vendor.as_deref(),
+        agent_purpose: ctx.agent_purpose.map(|p| p.as_str()),
+        agent_id_source: ctx.agent_id_source.map(|s| s.as_str()),
+        agent_rdns_hostname: ctx.agent_rdns_hostname.as_deref(),
+    });
+    #[cfg(not(feature = "agent-class"))]
+    let agent_class_view: Option<sbproxy_extension::cel::context::AgentClassView<'_>> = None;
+
+    let ml_view: Option<sbproxy_extension::cel::context::MlClassificationView<'_>> = None;
+
+    let features_view = sbproxy_extension::cel::context::FeatureFlagsView {
+        debug: ctx.flags.debug,
+        trace: ctx.flags.trace,
+        no_cache: ctx.flags.no_cache,
+        extra: &ctx.flags.extra,
+    };
+    // WOR-589: expose the agent-detection verdict (WOR-706 stamps it
+    // on ctx when proxy.extensions.agent_detect is enabled) so CEL
+    // policies can branch on `request.agent.score` etc.
+    let agent_detect_view = ctx.agent_detection.as_ref().map(|ad| {
+        sbproxy_extension::cel::context::AgentDetectView {
+            score: ad.score,
+            agent_id: ad.agent_id.as_deref(),
+            provenance: ad.provenance.as_str(),
+            confidence: ad.confidence,
+            signals_used: &ad.signals_used,
+            // WOR-817: surface the headless score + indicator
+            // names so CEL policies can branch on
+            // `request.agent.headless_score >= 50` alongside
+            // the existing rule-based fields.
+            headless_score: ad.headless_score,
+            headless_indicators: &ad.headless_indicators,
+        }
+    });
+    // WOR-2083: expose the unified principal so `principal.*`
+    // expressions evaluate against the live identity rather than
+    // the engine's zero values. `docs/scripting.md` has documented
+    // this namespace since it shipped; this is the call site that
+    // was missing. An anonymous principal still populates the
+    // namespace (empty sub, default tenant), matching the
+    // no-probing contract the other namespaces follow.
+    let p = &ctx.principal;
+    let principal_view = Some(sbproxy_extension::cel::context::PrincipalView {
+        tenant_id: Some(p.tenant_id.as_str()),
+        sub: Some(p.sub.as_str()),
+        source: Some(p.source.as_str()),
+        virtual_key_name: p.virtual_key.as_ref().map(|vk| vk.name.as_str()),
+        virtual_key_allowed_providers: p
+            .virtual_key
+            .as_ref()
+            .map(|vk| vk.allowed_providers.as_slice()),
+        project: p.attrs.project.as_deref(),
+        user: p.attrs.user.as_deref(),
+        team: p.attrs.team.as_deref(),
+        tags: Some(&p.attrs.tags),
+        metadata: Some(&p.attrs.metadata),
+        roles: Some(&p.attrs.roles),
+        claims: p.attrs.claims.as_ref(),
+    });
+
+    sbproxy_modules::ExpressionViews {
+        aipref: ctx.aipref.as_ref(),
+        kya: kya_view,
+        tls: tls_view,
+        agent_class: agent_class_view,
+        trust_tier: Some(ctx.trust_tier.as_str()),
+        ml: ml_view,
+        features: Some(features_view),
+        agent_detect: agent_detect_view,
+        envelope: None,
+        principal: principal_view,
     }
 }
 
