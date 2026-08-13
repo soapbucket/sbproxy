@@ -5258,6 +5258,48 @@ impl ProxyHttp for SbProxy {
             return Ok(None);
         }
 
+        // --- Closed-posture size refusal, ahead of every capture ---
+        //
+        // WOR-2411. This must run before the response cache and the
+        // idempotency capture accumulate this chunk: both store the
+        // *pre-transform* body, and on the chunk that crosses the cap
+        // with end_of_stream set they would otherwise dispatch their
+        // writes in this same call, so the bytes the closed posture is
+        // about to refuse would be served verbatim from cache for the
+        // entry's whole TTL. Aborting first means nothing captures them.
+        if ctx.buffering_body {
+            if let (Some(transform_buf), Some(chunk)) =
+                (ctx.response_body_buf.as_ref(), body.as_ref())
+            {
+                if let Some(idx) = ctx.origin_idx {
+                    let pipeline = ctx.pipeline.clone();
+                    let transforms = pipeline.transforms.get(idx).map_or(&[][..], Vec::as_slice);
+                    let max_size = transforms
+                        .iter()
+                        .map(|t| t.max_body_size)
+                        .max()
+                        .unwrap_or(10 * 1024 * 1024);
+                    if transform_buf.len() + chunk.len() > max_size {
+                        if let Some(transform_name) =
+                            oversized_body_refusal(transforms, ctx.upstream_content_type.as_deref())
+                        {
+                            warn!(
+                                hostname = %ctx.hostname,
+                                buffered = transform_buf.len(),
+                                chunk = chunk.len(),
+                                max = max_size,
+                                transform = transform_name,
+                                "response body exceeded max_body_size; a closed transform \
+                                 cannot be skipped, failing the response"
+                            );
+                            let name = transform_name.to_owned();
+                            return abort_committed_transform_response(body, ctx, &name);
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Response cache: accumulate body chunks ---
         //
         // When request_filter decided the response is cacheable and
