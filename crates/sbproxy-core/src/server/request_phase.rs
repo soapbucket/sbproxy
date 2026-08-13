@@ -103,6 +103,19 @@ fn request_requires_graphql_replay(
             })
         })
         .map(|rule| &rule.action);
+    // An unevaluable matcher makes the preview ambiguous, and the safe
+    // reading is that validation may be pending. Assuming the base
+    // action here would let the idempotency pre-check serve a cached
+    // response before the current GraphQL action has validated it,
+    // which is the replay this flag exists to prevent.
+    if forwarded_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return true;
+    }
     let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
 
     matches!(
@@ -137,6 +150,18 @@ fn request_uses_ai_owned_replay_paths(
             })
         })
         .map(|rule| &rule.action);
+    // Same reasoning as the GraphQL preview above: when the rule set
+    // holds a matcher this path cannot evaluate, claim the AI-owned
+    // reading rather than the base action's, so the idempotency
+    // middleware does not serve cached bytes ahead of the guardrails.
+    if forwarded_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return true;
+    }
     action_uses_ai_owned_replay_paths(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
 }
 

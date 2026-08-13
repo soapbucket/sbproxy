@@ -946,7 +946,7 @@ origins:
 | `observability` | object | | Per-origin `log.redact.pii` override, composed with tenant or proxy scope. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
-| `forward_rules` | list | | Method, path, header, query, and body match rules that route to inline child origins. |
+| `forward_rules` | list | | Method, path, header, query, body, and CEL `when` match rules that route to inline child origins. |
 | `fallback_origin` | object | | Inline origin served when the primary upstream errors or returns a configured status. See [Fallback origin](#fallback-origin). |
 | `response_cache` | object | | Per-origin response cache. |
 | `variables` | map | | Static template variables. |
@@ -3920,7 +3920,7 @@ Each forward rule has a `rules` array where each entry is a matcher. The deseria
 
 Set exactly one of `prefix`, `exact`, `template`, or `regex` on a path matcher. If more than one is set, precedence is `template` > `regex` > `exact` > `prefix` (so `exact` beats `prefix`).
 
-Within a single matcher entry, every present matcher (`method`, `path`, `header`, `query`, `body`) must succeed for the entry to fire. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key; note that the supported method field is the singular `method`, and the Go-era plural `methods` stays rejected.
+Within a single matcher entry, every present matcher (`method`, `path`, `header`, `query`, `body`, `when`) must succeed for the entry to fire. `when` is a CEL predicate, evaluated last and only once the structured matchers have passed; it sees the request as it arrived and nothing a later pipeline pass produces, and naming anything else is refused at config load. See [scripting.md](scripting.md) for its bindings. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key; note that the supported method field is the singular `method`, and the Go-era plural `methods` stays rejected.
 
 A method matcher composes with the other matchers in its entry, so routing writes away from reads takes one rule:
 

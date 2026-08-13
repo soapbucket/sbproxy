@@ -68,7 +68,7 @@ CEL is a non-Turing-complete expression language. No loops, no side effects, no 
 
 ### 3.1 Context variables
 
-The CEL context is built per request. Every binding below is available to `expression` policies, which have the widest context of the six places a config accepts CEL. The others see less, and [3.2](#32-what-each-config-site-offers) lists exactly what.
+The CEL context is built per request. Every binding below is available to `expression` policies, which have the widest context of the seven places a config accepts CEL. The others see less, and [3.2](#32-what-each-config-site-offers) lists exactly what.
 
 Naming a binding your site does not populate is refused when the config loads, so a typo or a copied expression fails at boot with a message naming the site, the binding, and what is available there. Before v1.12 it compiled and then missed at evaluation, which on a rate-limit `key:` meant every request quietly sharing one `__cel_key_error__` bucket.
 
@@ -244,11 +244,17 @@ A `when:` is ANDed with the structured matchers in the same entry and evaluated 
 ```yaml
 forward_rules:
   - rules:
-      - match: /
-        when: 'request.path.startsWith("/v1") || request.path.startsWith("/v2")'
+      - header:
+          name: x-tenant
+          value: acme
+        when: '!request.path.startsWith("/internal/")'
     origin:
-      url: https://versioned.test.sbproxy.dev
+      action:
+        type: proxy
+        url: https://acme.test.sbproxy.dev
 ```
+
+That one is not expressible without it. Entries in a `rules:` list OR, and matchers inside one entry AND, so a plain OR across two paths is already two entries and does not need CEL. What has no structured form is the negation above, and comparisons that draw on two different parts of the request at once.
 
 A predicate that fails to evaluate does not match, and the rule is skipped. Routing past a gate an operator wrote would be the worse failure.
 
@@ -468,7 +474,7 @@ origins:
 
 The shorthand `match: /api/` on an entry is equivalent to `path: { prefix: /api/ }`. Header matchers take `name` plus either `value` (exact) or `prefix`; header name lookup is case-insensitive, value comparison is case-sensitive. Query matchers take `name` and an optional exact `value`; with no `value`, parameter presence is enough. Template captures surface as `path_params` on the request context.
 
-There is no `cel:` or `lua:` matcher inside forward rules. To route on anything a matcher cannot express, gate with an `expression` policy or split hostnames.
+There is no `lua:` matcher inside forward rules, and the CEL one is `when:` above. For a condition needing a binding routing does not have, such as a trust tier or a classifier verdict, gate with an `expression` policy instead: those run after the passes that produce it.
 
 ### 3.6 The `cel` response transform
 

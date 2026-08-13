@@ -486,10 +486,17 @@ impl MatcherEntry {
     /// Evaluate this entry against the incoming request, with no body.
     ///
     /// Callers that only need to know which action a request will land on,
-    /// and that run before or without body buffering, use this. An entry
-    /// carrying a body matcher cannot pass here, which keeps those callers
-    /// conservative: they fall back to the origin's own action rather than
-    /// claim a body-gated rule they have not proved.
+    /// and that run before or without body buffering, use this.
+    ///
+    /// An entry carrying a body matcher or a `when` predicate cannot pass
+    /// here, because neither input is available yet. That makes a `None`
+    /// from this method ambiguous: it means "no rule matched" *or* "a rule
+    /// could not be evaluated". Callers that turn `None` into the origin's
+    /// base action must therefore first ask
+    /// [`forward_rules_need_full_matching`] whether the rule set contains
+    /// anything unevaluable, and skip their optimisation when it does.
+    /// Guessing the base action for a rule that routes elsewhere is how a
+    /// stale-while-revalidate write lands in the wrong cache entry.
     pub fn match_request(
         &self,
         method: &http::Method,
@@ -583,6 +590,22 @@ impl MatcherEntry {
         }
         Some(captured)
     }
+}
+
+/// Whether any entry in `rules` carries a matcher [`MatcherEntry::match_request`]
+/// cannot evaluate, so a preview of which action will fire is not trustworthy.
+///
+/// `body` and `when` both qualify: the first needs a buffered body and the
+/// second needs a CEL context, and neither exists at the points that preview
+/// routing. A caller seeing `true` here must not fall back to the origin's
+/// base action, because the request may well land on a forward rule that
+/// routes somewhere else entirely.
+#[must_use]
+pub fn forward_rules_need_full_matching(rules: &[CompiledForwardRule]) -> bool {
+    rules
+        .iter()
+        .flat_map(|rule| rule.matchers.iter())
+        .any(|entry| entry.when.is_some() || entry.body.is_some())
 }
 
 /// Largest request body any body matcher across `rules` will read, or `None`
@@ -5743,6 +5766,103 @@ mod method_matcher_tests {
         assert!(entry
             .match_request(&http::Method::POST, "/web/x", None, &headers)
             .is_none());
+    }
+
+    #[test]
+    fn a_when_predicate_survives_config_compilation() {
+        // The seam the unit tests above cannot reach. They build
+        // `MatcherEntry` literals, so a typo in the `when` key name would
+        // leave every predicate compiled to `None` and every entry
+        // matching on its structured half alone. That direction fails
+        // *open*, which is the whole thing this feature exists to stop.
+        let rule = serde_json::json!({
+            "rules": [{
+                "path": {"prefix": "/v1/"},
+                "when": "request.path.endsWith(\"/chat\")",
+            }],
+            "origin": {
+                "action": {"type": "proxy", "url": "https://api.test"}
+            }
+        });
+        let registry = empty_extension_registry();
+        let compiled_rule = compile_single_forward_rule(
+            &rule,
+            "chat-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        )
+        .expect("the forward rule compiles");
+        assert!(
+            compiled_rule.matchers[0].when.is_some(),
+            "the predicate must survive compilation; if this is None the entry \
+             silently matches on its path prefix alone"
+        );
+
+        let headers = http::HeaderMap::new();
+        let ctx = sbproxy_extension::cel::context::build_request_context(
+            "GET",
+            "/v1/models",
+            &headers,
+            None,
+            None,
+            "api.test",
+        );
+        assert!(
+            compiled_rule.matchers[0]
+                .match_request_with_body(
+                    &http::Method::GET,
+                    "/v1/models",
+                    None,
+                    &headers,
+                    None,
+                    Some(&ctx),
+                )
+                .is_none(),
+            "the prefix matches but the predicate does not, so the entry must not fire"
+        );
+    }
+
+    #[test]
+    fn a_when_naming_an_unavailable_binding_fails_config_load() {
+        // `trust_tier` is stamped long after routing. Refusing here is
+        // what keeps it from being an expression that reads empty on
+        // every request.
+        let rule = serde_json::json!({
+            "rules": [{"when": "request.trust_tier == \"named\""}],
+            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+        });
+        let registry = empty_extension_registry();
+        // `CompiledForwardRule` has no `Debug`, so unwrap the error side
+        // by hand rather than through `expect_err`.
+        let Err(error) = compile_single_forward_rule(
+            &rule,
+            "gated-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        ) else {
+            panic!("a binding routing cannot supply must not load");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("request.trust_tier"), "{message}");
+    }
+
+    #[test]
+    fn a_rule_set_with_a_predicate_is_not_previewable() {
+        // Guards the fallback that would otherwise revalidate against
+        // the wrong upstream.
+        let rule = serde_json::json!({
+            "rules": [{"path": {"prefix": "/v1/"}, "when": "true"}],
+            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+        });
+        let registry = empty_extension_registry();
+        let compiled_rule = compile_single_forward_rule(
+            &rule,
+            "preview-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        )
+        .expect("compiles");
+        assert!(forward_rules_need_full_matching(&[compiled_rule]));
     }
 
     #[test]

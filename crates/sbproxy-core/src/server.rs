@@ -1254,6 +1254,19 @@ fn build_swr_revalidation_request(
             })
         })
         .map(|rule| &rule.action);
+    // Revalidating against the wrong upstream writes that upstream's
+    // response into this entry's key, so an ambiguous preview must skip
+    // the refresh rather than guess. `None` from `match_request` means
+    // "no rule matched" or "a rule could not be evaluated here", and
+    // only the rule set can tell those apart.
+    if forward_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return None;
+    }
     let action = forward_action.or_else(|| pipeline.actions.get(origin_idx))?;
     let Action::Proxy(proxy) = action else {
         return None;

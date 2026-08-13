@@ -4,7 +4,7 @@
 //! What each config site offers a CEL expression, and the config-load
 //! check that holds it to that.
 //!
-//! Six places in a config accept CEL, and each builds its own evaluation
+//! Seven places in a config accept CEL, and each builds its own evaluation
 //! context. They overlap but are not equal: a `transform: cel` gets
 //! `request.headless_signal`, a `policy: expression` does not; a
 //! `policy: expression` gets `principal`, a `transform: cel` does not.
@@ -744,6 +744,39 @@ mod tests {
             paths(r#"request[request.method]"#),
             ["request", "request.method"]
         );
+    }
+
+    #[test]
+    fn the_forward_rule_surface_refuses_anything_a_later_pass_produces() {
+        // The operator-visible half of this surface. Routing runs before
+        // the passes that stamp these, so naming one has to be a
+        // config-load error rather than an expression that reads empty
+        // and routes traffic somewhere nobody chose.
+        for source in [
+            r#"request.trust_tier == "named""#,
+            "request.tls.trustworthy",
+            "features.debug",
+            "principal.sub != \"\"",
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::ForwardRuleWhen
+                .validate("forward rule `r` when", source, &program)
+                .expect_err("{source} is not available during routing");
+        }
+    }
+
+    #[test]
+    fn the_forward_rule_surface_accepts_the_request_as_it_arrived() {
+        for source in [
+            r#"request.path.startsWith("/v1")"#,
+            r#"request.headers["x-tenant"] == "acme""#,
+            r#"connection.remote_ip != """#,
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::ForwardRuleWhen
+                .validate("forward rule `r` when", source, &program)
+                .expect("the request base is populated during routing");
+        }
     }
 
     #[test]
