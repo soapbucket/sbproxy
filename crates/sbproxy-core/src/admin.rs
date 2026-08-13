@@ -1774,6 +1774,18 @@ fn handle_config_write(
             );
         }
     }
+    // A body naming a remote source meets the ownership guard BEFORE
+    // any resolution: resolving means cloning the named repository, and
+    // a write this node would refuse anyway must not reach the network
+    // first, nor have its 409 turned into a 400 about an unreachable
+    // host. Plain bodies keep the guard's documented after-validation
+    // ordering below, so a syntax error still wins over an ownership
+    // violation.
+    if matches!(sbproxy_config::source::parse_source_head(yaml), Ok(Some(_))) {
+        if let Some(rejection) = guard_config_write(&path, yaml) {
+            return rejection;
+        }
+    }
     // Validate BEFORE writing so a bad config never clobbers the file.
     // Resolution comes first for the same reason: a `source:` pointer
     // body compiles trivially on its own, so without resolving here a
