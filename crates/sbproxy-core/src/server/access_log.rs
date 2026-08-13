@@ -579,6 +579,17 @@ pub(super) fn emit_access_log(
     let upstream_status = ctx.response_status.filter(|upstream| *upstream != status);
 
     let context = AccessLogContext {
+        // WOR-2407: name the config that served this request, and the
+        // cache identity its entries belong to. Both come off the
+        // pipeline the request already resolved against, so a reload
+        // mid-flight cannot stamp a revision the request never used.
+        config_revision: Some(ctx.pipeline.config_revision.clone())
+            .filter(|revision| !revision.is_empty()),
+        cache_config_fingerprint: ctx
+            .origin_idx
+            .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+            .filter(|origin| origin.response_cache.is_some())
+            .map(|origin| origin.cache_config_fingerprint.to_string()),
         envelope_request_id: ctx.envelope_request_id.map(|u| u.to_string()),
         user_id: ctx.user_id.clone(),
         user_id_source: ctx.user_id_source,
@@ -780,6 +791,12 @@ impl HttpFields {
 /// production path share the same shape, and so adding a field
 /// doesn't churn every test fixture.
 pub(super) struct AccessLogContext {
+    /// Config revision this node was serving (WOR-2407).
+    pub(super) config_revision: Option<String>,
+    /// Serving origin's cache-config fingerprint (WOR-2407). `None`
+    /// when the origin has no response cache, so the field does not
+    /// appear on log lines where it would mean nothing.
+    pub(super) cache_config_fingerprint: Option<String>,
     pub(super) envelope_request_id: Option<String>,
     pub(super) user_id: Option<String>,
     pub(super) user_id_source: Option<sbproxy_observe::UserIdSource>,
@@ -926,6 +943,8 @@ impl AccessLogContext {
     #[cfg(test)]
     pub(super) fn empty() -> Self {
         Self {
+            config_revision: None,
+            cache_config_fingerprint: None,
             envelope_request_id: None,
             user_id: None,
             user_id_source: None,
@@ -1032,25 +1051,52 @@ pub(super) fn classify_error_class(status: u16) -> Option<String> {
 /// both return 400, so the status alone cannot tell "we refused this on
 /// policy" from "the client sent garbage". Returns a `&'static str` so
 /// the value is a stable, bounded metric label.
-pub(super) fn ai_outcome_label(status: u16, override_outcome: Option<&str>) -> &'static str {
+pub(super) fn ai_outcome_label(
+    status: u16,
+    override_outcome: Option<&str>,
+    provider_attempted: bool,
+) -> &'static str {
     if let Some(o) = override_outcome {
         return match o {
             "guardrail_block" | "guardrail_blocked" => "guardrail_block",
             "content_filter" => "content_filter",
             "budget_exceeded" => "budget_exceeded",
+            "policy_block" | "policy_route_blocked" => "policy_block",
             "refusal" => "refusal",
             _ => "other",
         };
     }
     match status {
+        101 => "ok",
         200..=299 => "ok",
         402 => "budget_exceeded",
-        401 | 403 => "auth_denied",
+        401 | 403 if provider_attempted => "upstream_auth_denied",
+        401 | 403 => "gateway_auth_denied",
         429 => "rate_limited",
         408 | 504 => "timeout",
         500..=599 => "upstream_5xx",
         400..=499 => "client_error",
         _ => "other",
+    }
+}
+
+/// Partition terminal AI requests into gateway admission decisions. Reaching
+/// the AI action is evidence for successful local responses such as cache
+/// hits, while a provider attempt is evidence for every dispatched response.
+/// Successful infrastructure responses on an AI origin made neither decision
+/// and are omitted. Failures after AI surface classification remain gateway
+/// rejections even when middleware stopped them before the action.
+pub(super) fn ai_gateway_decision(
+    outcome: &'static str,
+    provider_attempts: u32,
+    ai_action_reached: bool,
+) -> Option<(&'static str, &'static str)> {
+    if provider_attempts > 0 || (ai_action_reached && outcome == "ok") {
+        Some(("admitted", "none"))
+    } else if !ai_action_reached && matches!(outcome, "ok" | "other") {
+        None
+    } else {
+        Some(("rejected", outcome))
     }
 }
 
@@ -1083,6 +1129,8 @@ pub(super) fn emit_access_log_entry(
         timestamp: chrono::Utc::now().to_rfc3339(),
         request_id,
         origin: hostname.to_string(),
+        config_revision: context.config_revision,
+        cache_config_fingerprint: context.cache_config_fingerprint,
         method: method.to_string(),
         path: path.to_string(),
         query: http_fields.query,
@@ -1283,6 +1331,40 @@ mod run_identity_tests {
         serde_json::from_str(line.trim()).expect("the emitted line is JSON")
     }
 
+    /// WOR-2407: a served request says which config served it.
+    ///
+    /// Without this, a rolling change is invisible in the log stream:
+    /// every line looks the same whether the node picked up the new
+    /// revision an hour ago or has not picked it up at all.
+    #[test]
+    fn the_serving_config_revision_reaches_the_access_log() {
+        let mut context = AccessLogContext::empty();
+        context.config_revision = Some("9f2c41a0be77".to_string());
+        context.cache_config_fingerprint = Some("00112233445566ff".to_string());
+
+        let line = emit(context);
+
+        assert_eq!(line["config_revision"], "9f2c41a0be77");
+        assert_eq!(line["cache_config_fingerprint"], "00112233445566ff");
+    }
+
+    /// The pair stays absent rather than null on traffic that has
+    /// neither, so a consumer counting distinct revisions does not have
+    /// to filter a null out of the set first.
+    #[test]
+    fn config_identity_is_omitted_when_there_is_none_to_report() {
+        let line = emit(AccessLogContext::empty());
+
+        assert!(
+            line.get("config_revision").is_none(),
+            "an unset revision must be omitted, not serialized as null: {line}"
+        );
+        assert!(
+            line.get("cache_config_fingerprint").is_none(),
+            "an origin with no response cache must not carry a cache fingerprint: {line}"
+        );
+    }
+
     #[test]
     fn a_run_id_read_from_the_body_reaches_the_access_log() {
         let mut context = AccessLogContext::empty();
@@ -1324,20 +1406,43 @@ mod run_identity_tests {
 
 #[cfg(test)]
 mod outcome_tests {
-    use super::ai_outcome_label;
+    use super::{ai_gateway_decision, ai_outcome_label};
+
+    #[test]
+    fn gateway_decision_distinguishes_pre_dispatch_rejections() {
+        assert_eq!(
+            ai_gateway_decision("gateway_auth_denied", 0, false),
+            Some(("rejected", "gateway_auth_denied"))
+        );
+        assert_eq!(
+            ai_gateway_decision("client_error", 0, true),
+            Some(("rejected", "client_error"))
+        );
+        assert_eq!(
+            ai_gateway_decision("ok", 0, true),
+            Some(("admitted", "none"))
+        );
+        assert_eq!(
+            ai_gateway_decision("upstream_5xx", 1, true),
+            Some(("admitted", "none"))
+        );
+        assert_eq!(ai_gateway_decision("ok", 0, false), None);
+        assert_eq!(ai_gateway_decision("other", 0, false), None);
+    }
 
     /// WOR-1496: status-derived outcomes map into the closed set, with
     /// 402 distinguished as a budget block (not a generic client error).
     #[test]
     fn outcome_label_from_status() {
-        assert_eq!(ai_outcome_label(200, None), "ok");
-        assert_eq!(ai_outcome_label(402, None), "budget_exceeded");
-        assert_eq!(ai_outcome_label(401, None), "auth_denied");
-        assert_eq!(ai_outcome_label(403, None), "auth_denied");
-        assert_eq!(ai_outcome_label(429, None), "rate_limited");
-        assert_eq!(ai_outcome_label(504, None), "timeout");
-        assert_eq!(ai_outcome_label(503, None), "upstream_5xx");
-        assert_eq!(ai_outcome_label(400, None), "client_error");
+        assert_eq!(ai_outcome_label(200, None, false), "ok");
+        assert_eq!(ai_outcome_label(101, None, false), "ok");
+        assert_eq!(ai_outcome_label(402, None, false), "budget_exceeded");
+        assert_eq!(ai_outcome_label(401, None, false), "gateway_auth_denied");
+        assert_eq!(ai_outcome_label(403, None, true), "upstream_auth_denied");
+        assert_eq!(ai_outcome_label(429, None, false), "rate_limited");
+        assert_eq!(ai_outcome_label(504, None, true), "timeout");
+        assert_eq!(ai_outcome_label(503, None, true), "upstream_5xx");
+        assert_eq!(ai_outcome_label(400, None, false), "client_error");
     }
 
     /// The AI-specific override wins over the status, so a guardrail
@@ -1346,20 +1451,28 @@ mod outcome_tests {
     #[test]
     fn outcome_label_override_wins() {
         assert_eq!(
-            ai_outcome_label(400, Some("guardrail_block")),
+            ai_outcome_label(400, Some("guardrail_block"), false),
             "guardrail_block"
         );
         assert_eq!(
-            ai_outcome_label(403, Some("guardrail_block")),
+            ai_outcome_label(403, Some("guardrail_block"), false),
             "guardrail_block"
         );
         assert_eq!(
-            ai_outcome_label(200, Some("content_filter")),
+            ai_outcome_label(200, Some("content_filter"), true),
             "content_filter"
+        );
+        assert_eq!(
+            ai_outcome_label(403, Some("policy_block"), false),
+            "policy_block"
+        );
+        assert_eq!(
+            ai_outcome_label(403, Some("policy_route_blocked"), false),
+            "policy_block"
         );
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.
-        assert_eq!(ai_outcome_label(200, Some("bogus")), "other");
+        assert_eq!(ai_outcome_label(200, Some("bogus"), false), "other");
     }
 }
 

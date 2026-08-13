@@ -216,8 +216,8 @@ Connection: close
 Each served request is filed under the tenant that served it, which is what makes per-tenant spend reporting possible:
 
 ```
-sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="acme.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="acme-corp"} 1
-sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="shared.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="__default__"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="acme.local",outcome="gateway_auth_denied",provider="",surface="chat_completions",tenant_id="acme-corp"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="shared.local",outcome="gateway_auth_denied",provider="",surface="chat_completions",tenant_id="__default__"} 1
 sbproxy_ai_requests_attributed_total{api_key_id="cfg:9:acme-corp:10:acme.local:openai-shared",model="gpt-4o-mini",origin="acme.local",outcome="ok",provider="openai",surface="chat_completions",tenant_id="acme-corp"} 1
 ```
 

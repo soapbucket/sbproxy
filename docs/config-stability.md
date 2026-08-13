@@ -360,6 +360,7 @@ through a release yet, so they are tiered separately.
 
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
+| `epoch` | integer | `0` | **beta** | Operator-controlled cache generation. Bumping it rotates this origin's cached entries and nothing else. The proxy already rotates them on any config change that alters what the upstream returns, so this is for the case it cannot see: an upstream that changed its response shape with no config change here. |
 | `key_event` | object | - | **alpha** | Request-side `cache.key` script: `source` plus `engine`. Returns the dimensions folded into the cache key. |
 | `admit_event` | object | - | **alpha** | Response-side `cache.admit` script, same shape. Returns whether the response is stored and for how long. Refused alongside a non-zero `stale_while_revalidate`, which the background refresh cannot evaluate it against. |
 | `key_event.engine`, `admit_event.engine` | string | required | **alpha** | `lua` or `js`. `cel` and `wasm` fail config load; see the refusal rows above. |

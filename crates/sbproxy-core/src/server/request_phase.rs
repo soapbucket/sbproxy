@@ -87,50 +87,28 @@ fn request_requires_graphql_replay(
     pipeline: &CompiledPipeline,
     origin_idx: usize,
 ) -> bool {
-    let request = session.req_header();
-    let path = request.uri.path();
-    let query = request.uri.query();
-    let forwarded_action = pipeline
-        .forward_rules
-        .get(origin_idx)
-        .and_then(|rules| {
-            rules.iter().find(|rule| {
-                rule.matchers.iter().any(|matcher| {
-                    matcher
-                        .match_request(&request.method, path, query, &request.headers)
-                        .is_some()
-                })
-            })
-        })
-        .map(|rule| &rule.action);
-    // An unevaluable matcher makes the preview ambiguous, and the safe
-    // reading is that validation may be pending. Assuming the base
-    // action here would let the idempotency pre-check serve a cached
-    // response before the current GraphQL action has validated it,
-    // which is the replay this flag exists to prevent.
-    if forwarded_action.is_none()
-        && pipeline
-            .forward_rules
-            .get(origin_idx)
-            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
-    {
-        return true;
+    match request_effective_action(session, pipeline, origin_idx) {
+        // Ambiguous, so take the safe reading: validation may be
+        // pending. Assuming the base action would let the idempotency
+        // pre-check serve a cached response before the current GraphQL
+        // action has validated it, which is the replay this flag
+        // exists to prevent.
+        EffectiveAction::Indeterminate => true,
+        EffectiveAction::Resolved(action) => matches!(
+            action,
+            Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
+        ),
     }
-    let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
-
-    matches!(
-        effective_action,
-        Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
-    )
 }
 
-/// AI actions own idempotency and response replay because their current
-/// guardrail policy must run before cached bytes are served.
-fn request_uses_ai_owned_replay_paths(
+/// Resolve the base or header/path/query-matched forward-rule action without
+/// consuming a request body. The same route choice is needed before middleware
+/// runs for replay ownership and AI rejection attribution.
+fn request_effective_action<'a>(
     session: &Session,
-    pipeline: &CompiledPipeline,
+    pipeline: &'a CompiledPipeline,
     origin_idx: usize,
-) -> bool {
+) -> EffectiveAction<'a> {
     let request = session.req_header();
     let forwarded_action = pipeline
         .forward_rules
@@ -150,23 +128,63 @@ fn request_uses_ai_owned_replay_paths(
             })
         })
         .map(|rule| &rule.action);
-    // Same reasoning as the GraphQL preview above: when the rule set
-    // holds a matcher this path cannot evaluate, claim the AI-owned
-    // reading rather than the base action's, so the idempotency
-    // middleware does not serve cached bytes ahead of the guardrails.
+    // `match_request` cannot evaluate a `body:` matcher or a `when:`
+    // predicate, so its `None` means "no rule matched" *or* "a rule
+    // could not be evaluated here". Collapsing both to the base action
+    // is how a stale-while-revalidate write lands in another rule's
+    // cache entry, so the two are kept apart in the type.
     if forwarded_action.is_none()
         && pipeline
             .forward_rules
             .get(origin_idx)
             .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
     {
-        return true;
+        return EffectiveAction::Indeterminate;
     }
-    action_uses_ai_owned_replay_paths(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
+    EffectiveAction::Resolved(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
+}
+
+/// What a preview of the routing decision could establish.
+///
+/// Exists because `Option<&Action>` cannot say "unknown". A preview runs
+/// before the body is buffered and before a CEL context is built, so a
+/// rule gated on either is unevaluable there, and a caller that reads
+/// that as "the base action" silently routes around the rule.
+enum EffectiveAction<'a> {
+    /// The action this request will land on.
+    Resolved(Option<&'a Action>),
+    /// A rule exists that this path cannot evaluate, so the caller must
+    /// take its conservative branch rather than assume.
+    Indeterminate,
+}
+
+/// AI actions own idempotency and response replay because their current
+/// guardrail policy must run before cached bytes are served.
+fn request_uses_ai_owned_replay_paths(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    match request_effective_action(session, pipeline, origin_idx) {
+        // Claim the AI-owned reading rather than the base action's, so
+        // the idempotency middleware does not serve cached bytes ahead
+        // of the guardrails.
+        EffectiveAction::Indeterminate => true,
+        EffectiveAction::Resolved(action) => action_uses_ai_owned_replay_paths(action),
+    }
 }
 
 fn action_uses_ai_owned_replay_paths(action: Option<&Action>) -> bool {
     matches!(action, Some(Action::AiProxy(_)))
+}
+
+fn ai_surface_label_for_action(
+    action: Option<&Action>,
+    method: &str,
+    path: &str,
+) -> Option<&'static str> {
+    action_uses_ai_owned_replay_paths(action)
+        .then(|| sbproxy_ai::handler::classify_surface(method, path).label())
 }
 
 #[cfg(test)]
@@ -185,6 +203,14 @@ mod ai_owned_replay_path_tests {
 
         assert!(action_uses_ai_owned_replay_paths(Some(&action)));
         assert!(!action_uses_ai_owned_replay_paths(Some(&Action::Noop)));
+        assert_eq!(
+            ai_surface_label_for_action(Some(&action), "POST", "/v1/chat/completions"),
+            Some("chat_completions")
+        );
+        assert_eq!(
+            ai_surface_label_for_action(Some(&Action::Noop), "POST", "/v1/chat/completions"),
+            None
+        );
     }
 }
 
@@ -1479,15 +1505,6 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- Health check endpoint ---
-    if path == "/health" {
-        send_response(session, 200, "application/json", b"{\"status\":\"ok\"}").await?;
-        // Record the real status so the request log / metrics show 200,
-        // not the unset-status 0 sentinel (WOR-1746).
-        ctx.response_status = Some(200);
-        return Ok(true);
-    }
-
     // --- Metrics endpoint ---
     if path == "/metrics" {
         let body = metrics().render();
@@ -1613,7 +1630,14 @@ pub(super) async fn request_filter(
     ctx.request_path = compact_str::CompactString::new(req_for_host.uri.path());
 
     let pipeline = ctx.pipeline.clone();
-    let origin_idx = match pipeline.resolve_origin(hostname) {
+    let resolved_origin = pipeline.resolve_origin(hostname);
+    if crate::dispatch::should_serve_unrouted_health(&path, resolved_origin.is_some()) {
+        send_response(session, 200, "application/json", b"{\"status\":\"ok\"}").await?;
+        ctx.response_status = Some(200);
+        return Ok(true);
+    }
+
+    let origin_idx = match resolved_origin {
         Some(idx) => idx,
         None => {
             warn!(hostname = %hostname, "no origin configured for hostname");
@@ -1628,6 +1652,31 @@ pub(super) async fn request_filter(
         }
     };
     ctx.origin_idx = Some(origin_idx);
+
+    // Attribute gateway-side denials to AI before auth or policy middleware
+    // can short-circuit. The handler will stamp the same label again for an
+    // admitted request; doing it here is what makes a bad virtual key or an
+    // early policy denial visible without pretending a provider was tried.
+    let ai_proxy_owns_replay_paths =
+        request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
+    let initial_ai_surface = {
+        let request = session.req_header();
+        match request_effective_action(session, &pipeline, origin_idx) {
+            // A rule this preview cannot evaluate might route the
+            // request away from AI entirely. Leaving the early label
+            // off is honest: an unattributed early denial is a gap in
+            // telemetry, a wrongly attributed one is bad data, and the
+            // handler stamps the real label for every admitted request
+            // anyway.
+            EffectiveAction::Indeterminate => None,
+            EffectiveAction::Resolved(action) => {
+                ai_surface_label_for_action(action, request.method.as_str(), request.uri.path())
+            }
+        }
+    };
+    if let Some(surface) = initial_ai_surface {
+        ctx.ai_surface = Some(surface.to_string());
+    }
 
     if crate::proxy_wasm_http::start_request(session, ctx, origin_idx).await? {
         return Ok(true);
@@ -2687,8 +2736,6 @@ pub(super) async fn request_filter(
 
     // --- Force SSL redirect ---
     let origin = &pipeline.config.origins[origin_idx];
-    let ai_proxy_owns_replay_paths =
-        request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
     if origin.force_ssl {
         // Determine whether the inbound request is already on TLS.
         //
@@ -3943,6 +3990,7 @@ pub(super) async fn request_filter(
                         ctx.hostname.as_str(),
                         session.req_header(),
                         cache_cfg,
+                        origin.cache_config_fingerprint.as_str(),
                     );
                     let invalidate_origin = origin.origin_id.to_string();
                     tokio::spawn(async move {
@@ -3986,6 +4034,7 @@ pub(super) async fn request_filter(
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
+                    origin.cache_config_fingerprint.as_str(),
                     key_plan.as_ref(),
                 );
                 // `skip_lookup` goes upstream for *this* request while
@@ -4023,6 +4072,34 @@ pub(super) async fn request_filter(
                     .map_err(|e| {
                         Error::because(ErrorType::InternalError, "cache lookup join failed", e)
                     })?
+                };
+
+                // WOR-2407: refuse an entry another config stored.
+                // The key already carries this origin's fingerprint, so
+                // under an exact-keyed backend this cannot fire. It can
+                // on the two that match a digest of the key rather than
+                // the key: memcached hashes to fit its 250-byte limit,
+                // and the file store names entries by the SHA-256 of
+                // the key. Counted apart from an ordinary miss so a
+                // rolling change reads as a rollout on the dashboard
+                // rather than as a cache that went cold unexplained.
+                let hit = match hit {
+                    Ok(Some(entry))
+                        if !entry.serves_config(origin.cache_config_fingerprint.as_str()) =>
+                    {
+                        sbproxy_observe::metrics::record_cache(
+                            origin.origin_id.as_ref(),
+                            "config_miss",
+                        );
+                        tracing::debug!(
+                            origin = %origin.origin_id,
+                            stored = %entry.config_fp,
+                            current = %origin.cache_config_fingerprint,
+                            "cache entry belongs to another config revision; treating as a miss"
+                        );
+                        Ok(None)
+                    }
+                    other => other,
                 };
 
                 match hit {

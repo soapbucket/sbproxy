@@ -1457,6 +1457,13 @@ describe the previous build. Content type is
 
 Runtime tracing-filter control, no restart required.
 
+Official release binaries compile SBproxy's own `debug!` and `trace!` events
+out with a static maximum of `info`. This endpoint changes the runtime filter;
+it cannot restore events absent from the binary. A `debug` or `trace` filter
+may still reveal dependency events compiled without that ceiling. Use a
+development build when troubleshooting requires SBproxy-internal debug or
+trace events.
+
 `GET` returns `{"level": "info"}` (or whatever directive is active,
 e.g. `sbproxy_ai=debug`). `PUT`/`POST` body `{"level": "debug"}` (or a
 per-target directive like `{"level": "sbproxy_ai=debug"}`) sets it

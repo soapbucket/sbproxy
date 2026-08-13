@@ -1255,8 +1255,8 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         }
     };
 
-    match sbproxy_config::compile_config(&yaml) {
-        Ok(_) => {}
+    let compiled = match sbproxy_config::compile_config(&yaml) {
+        Ok(compiled) => compiled,
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: YAML parse failed");
             let msg = sanitise_path_in_error(&e.to_string(), &path);
@@ -1269,6 +1269,28 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
                 ),
             );
         }
+    };
+
+    // Keep the file-backed reload contract aligned with PUT /admin/config:
+    // failures caused by operator-supplied config are 4xx, while failures in
+    // the shared runtime transaction below remain 5xx.
+    let config_dir = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Err(error) =
+        crate::pipeline::CompiledPipeline::from_config_for_validation_at(compiled, config_dir)
+    {
+        tracing::warn!(error = ?error, "admin reload: pipeline compile failed");
+        let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
+        return (
+            400,
+            "application/json",
+            format!(
+                r#"{{"error":"config does not compile: {}"}}"#,
+                msg.replace('"', "'")
+            ),
+        );
     }
 
     let path_text = path.to_string_lossy();
@@ -6638,6 +6660,26 @@ origins:
         );
     }
 
+    #[test]
+    fn admin_reload_returns_400_on_pipeline_compile_error() {
+        let f = write_yaml(
+            r#"
+origins:
+  "invalid.example":
+    action:
+      type: this_action_type_does_not_exist
+"#,
+        );
+        let state = make_state().with_config_path(f.path());
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) =
+            handle_admin_request("POST", "/admin/reload", &state, Some(&auth), None);
+
+        assert_eq!(status, 400, "body: {body}");
+        assert!(body.contains("config does not compile"), "body: {body}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn admin_reload_concurrent_calls_one_wins_one_409s() {
         // Two simultaneous calls to /admin/reload: the single-flight
@@ -7450,6 +7492,7 @@ origins:
             CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
+                cache_config_fingerprint: CompactString::default(),
                 workspace_id: CompactString::default(),
                 tenant_id: compact_str::CompactString::const_new("__default__"),
                 action_config: serde_json::json!({"type": "noop"}),

@@ -376,10 +376,13 @@ fn parse_ulid_header(headers: &HeaderMap, name: &str) -> (Option<Ulid>, SessionD
 ///
 /// 1. If the caller supplied `X-Sb-Session-Id` and it parses as a ULID,
 ///    use it. Auto-generation never overwrites a caller-supplied value.
-/// 2. Otherwise, consult `cfg.auto_generate`. `Never` produces nothing;
-///    `Always` mints a fresh ULID; `Anonymous` mints a ULID only when
+/// 2. If the caller supplied an invalid value, drop it without replacing it.
+///    Auto-generation is only for an absent header, so a rejected caller value
+///    cannot also create a standalone session for the same request.
+/// 3. With no supplied header, consult `cfg.auto_generate`. `Never` produces
+///    nothing; `Always` mints a fresh ULID; `Anonymous` mints a ULID only when
 ///    `user_id_resolved` is `false`.
-/// 3. When capture is disabled (`cfg.capture == false`), always
+/// 4. When capture is disabled (`cfg.capture == false`), always
 ///    produce nothing regardless of headers.
 ///
 /// `user_id_resolved` is the caller-side signal that
@@ -401,9 +404,13 @@ pub fn capture_session_id(
     if !cfg.capture {
         return (None, SessionDropCounts::default());
     }
+    let caller_supplied = headers.contains_key(SESSION_ID_HEADER);
     let (parsed, drops) = parse_ulid_header(headers, SESSION_ID_HEADER);
     if parsed.is_some() {
         return (parsed, drops);
+    }
+    if caller_supplied {
+        return (None, drops);
     }
     let auto = match cfg.auto_generate {
         AutoGenerate::Never => false,
@@ -951,12 +958,10 @@ mod tests {
     }
 
     #[test]
-    fn session_invalid_format_dropped_then_auto_generated() {
+    fn session_invalid_format_is_dropped_without_replacement() {
         let headers = headers_from(&[("X-Sb-Session-Id", "not-a-ulid")]);
         let (got, drops) = capture_session_id(&headers, &SessionsConfig::default(), false, TEST_WS);
-        // Anonymous default: invalid header drops, then auto-generation
-        // mints a fresh ULID because no user_id is resolved.
-        assert!(got.is_some());
+        assert!(got.is_none());
         assert_eq!(drops.invalid_format, 1);
     }
 

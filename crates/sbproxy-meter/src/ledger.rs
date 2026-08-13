@@ -304,36 +304,44 @@ impl<P: LedgerPayload> UsageLedger<P> {
     /// investigator wants.
     pub fn open(path: impl AsRef<Path>, signing_seed_hex: Option<&str>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let (signing_key, verifying_key) = match signing_seed_hex {
-            Some(seed) => {
-                let sk = signing_key_from_seed_hex(seed)?;
-                let vk = sk.verifying_key();
-                (Some(sk), Some(vk))
-            }
-            None => (None, None),
-        };
+        let result = (|| {
+            let (signing_key, verifying_key) = match signing_seed_hex {
+                Some(seed) => {
+                    let sk = signing_key_from_seed_hex(seed)?;
+                    let vk = sk.verifying_key();
+                    (Some(sk), Some(vk))
+                }
+                None => (None, None),
+            };
 
-        // Replay any existing chain to restore head + dedup set.
-        let (seq, head, seen) = replay_head::<P>(&path)?;
+            // Replay any existing chain to restore head + dedup set.
+            let (seq, head, seen) = replay_head::<P>(&path)?;
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| anyhow::anyhow!("usage ledger: cannot open {}: {e}", path.display()))?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| {
+                    anyhow::anyhow!("usage ledger: cannot open {}: {e}", path.display())
+                })?;
 
-        Ok(Self {
-            path,
-            signing_key,
-            verifying_key,
-            state: parking_lot::Mutex::new(LedgerState {
-                seq,
-                head,
-                seen,
-                file,
-            }),
-            payload: PhantomData,
-        })
+            Ok(Self {
+                path,
+                signing_key,
+                verifying_key,
+                state: parking_lot::Mutex::new(LedgerState {
+                    seq,
+                    head,
+                    seen,
+                    file,
+                }),
+                payload: PhantomData,
+            })
+        })();
+        if result.is_err() && P::meter_observed() {
+            LEDGER_HEALTH.store(2, Ordering::Relaxed);
+        }
+        result
     }
 
     /// The public verifying key, when signing is enabled.
@@ -756,6 +764,24 @@ mod tests {
             // a per-test discriminator without needing a clock
             tag.len()
         ))
+    }
+
+    #[test]
+    fn a_metered_ledger_open_failure_marks_the_probe_failed() {
+        LEDGER_HEALTH.store(0, Ordering::Relaxed);
+        let directory = temp_path("open-dir");
+        let _ = std::fs::remove_file(&directory);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory");
+
+        let result = UsageLedger::<TestPayload>::open(&directory, None);
+
+        assert!(
+            result.is_err(),
+            "a directory cannot be opened as a ledger file"
+        );
+        assert_eq!(ledger_health(), LedgerHealth::Failed);
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 
     #[test]

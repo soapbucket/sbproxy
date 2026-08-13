@@ -72,6 +72,7 @@ const providerErrors = computed(() => fam("sbproxy_ai_provider_errors_total"));
 const attributedRequests = computed(() =>
   fam("sbproxy_ai_requests_attributed_total"),
 );
+const gatewayDecisions = computed(() => fam("sbproxy_ai_gateway_decisions_total"));
 const failovers = computed(() => fam("sbproxy_ai_failovers_total"));
 const attempts = computed(() => fam("sbproxy_ai_provider_attempts_total"));
 const cascade = computed(() => fam("sbproxy_ai_cascade_tier_outcomes_total"));
@@ -111,9 +112,24 @@ const attemptRows = computed(() => groupByLabels(attempts.value, ["provider", "o
 const cascadeRows = computed(() => groupByLabels(cascade.value, ["tier", "outcome"]));
 const lbRows = computed(() => groupByLabels(lbDecisions.value, ["strategy", "provider"]));
 const outcomeSplit = computed(() => groupByLabel(attributedRequests.value, "outcome"));
+const gatewayDecisionRows = computed(() =>
+  groupByLabels(gatewayDecisions.value, ["decision", "reason"]),
+);
+const gatewayDecisionTotal = computed(() => sumSamples(gatewayDecisions.value));
+const gatewayRejections = computed(() =>
+  sumSamples(gatewayDecisions.value, { decision: "rejected" }),
+);
+const gatewayRejectionRate = computed(() =>
+  gatewayDecisionTotal.value > 0
+    ? gatewayRejections.value / gatewayDecisionTotal.value
+    : 0,
+);
 
 const hasAiTraffic = computed(
-  () => sumSamples(attributedRequests.value) > 0 || providerHealth.value.length > 0,
+  () =>
+    sumSamples(attributedRequests.value) > 0 ||
+    gatewayDecisionTotal.value > 0 ||
+    providerHealth.value.length > 0,
 );
 
 function rateTone(rate: number): "ok" | "warn" | "err" {
@@ -184,6 +200,12 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
         :value="formatNumber(sumSamples(attributedRequests))"
         sub="since start"
       />
+      <StatCard
+        label="Gateway rejection rate"
+        :value="`${(gatewayRejectionRate * 100).toFixed(1)}%`"
+        :sub="`${formatNumber(gatewayRejections)} rejected before provider dispatch`"
+        :tone="gatewayRejectionRate >= 0.05 ? 'accent' : 'default'"
+      />
     </div>
 
     <section class="panel">
@@ -224,6 +246,12 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
         <div v-if="attemptRows.length">
           <h3>Attempts (provider / outcome)</h3>
           <MiniBars :items="attemptRows" :format="formatNumber" />
+        </div>
+      </div>
+      <div v-if="gatewayDecisionRows.length" class="subgrid">
+        <div>
+          <h3>Gateway decisions (decision / reason)</h3>
+          <MiniBars :items="gatewayDecisionRows" :format="formatNumber" />
         </div>
       </div>
       <div class="subgrid" v-if="failoverRows.length || cascadeRows.length || lbRows.length">

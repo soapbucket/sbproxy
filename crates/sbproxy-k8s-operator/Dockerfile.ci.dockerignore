@@ -1,0 +1,4 @@
+**
+!target/
+!target/release-fast/
+!target/release-fast/sbproxy-k8s-operator

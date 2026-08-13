@@ -450,6 +450,7 @@ impl EncryptedCacheStore {
             body,
             cached_at: entry.cached_at,
             ttl_secs: entry.ttl_secs,
+            config_fp: entry.config_fp.clone(),
         })
     }
 
@@ -520,6 +521,7 @@ impl EncryptedCacheStore {
             body: plain_body,
             cached_at: stored.cached_at,
             ttl_secs: stored.ttl_secs,
+            config_fp: stored.config_fp.clone(),
         }))
     }
 
@@ -677,6 +679,7 @@ mod tests {
             body: br#"{"account":"acct_1234","balance":9000}"#.to_vec(),
             cached_at: now_secs(),
             ttl_secs: 300,
+            config_fp: String::new(),
         }
     }
 
@@ -1095,6 +1098,7 @@ mod tests {
             body: b"stale".to_vec(),
             cached_at: now_secs().saturating_sub(500),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         store.put("k", &stale).unwrap();
 
@@ -1116,6 +1120,7 @@ mod tests {
             body: vec![],
             cached_at: now_secs(),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         store.put("k", &empty).unwrap();
         let got = store.get("k").unwrap().expect("should hit");
@@ -1396,6 +1401,7 @@ mod tests {
             body: br#"{"fixture":"sbrc-v1","ok":true}"#.to_vec(),
             cached_at: 1_700_000_000,
             ttl_secs: 300,
+            config_fp: String::new(),
         }
     }
 

@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cache_identity;
 pub mod cluster;
 pub mod compiler;
 pub mod config_authority;

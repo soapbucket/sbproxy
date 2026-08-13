@@ -111,6 +111,7 @@ pub(super) async fn handle_action(
         }
 
         Action::AiProxy(ai) => {
+            ctx.ai_gateway_action_reached = true;
             // Pull hostname from the resolved origin (if any) so the AI
             // handler can use it for classifier lookups and other
             // per-origin features.
@@ -1095,24 +1096,34 @@ pub(super) async fn handle_action(
                                 )
                             })?;
                     ctx.response_status = Some(response.status);
-                    let body = apply_plugin_action_response_transforms(
+                    let transform_outcome = apply_plugin_action_response_transforms(
                         response.body.unwrap_or_default(),
                         &response.headers,
                         pipeline,
                         origin_idx,
                         ctx,
                     );
-                    let transformed_status =
-                        ctx.response_status_override.unwrap_or(response.status);
-                    let (status, reason, headers, body) = apply_plugin_action_response_modifiers(
-                        session,
-                        transformed_status,
-                        response.headers,
-                        body,
-                        pipeline,
-                        origin_idx,
-                        ctx,
-                    );
+                    let (status, reason, headers, body) = if transform_outcome.terminal_failure {
+                        let mut headers = response.headers;
+                        set_plugin_action_response_header(
+                            &mut headers,
+                            "content-type",
+                            "application/json",
+                        );
+                        (500, None, headers, transform_outcome.body)
+                    } else {
+                        let transformed_status =
+                            ctx.response_status_override.unwrap_or(response.status);
+                        apply_plugin_action_response_modifiers(
+                            session,
+                            transformed_status,
+                            response.headers,
+                            transform_outcome.body,
+                            pipeline,
+                            origin_idx,
+                            ctx,
+                        )
+                    };
                     let (content_type, extras) = split_plugin_action_response_headers(headers);
                     ctx.response_status = Some(status);
                     send_response_with_extras_and_reason(
@@ -1131,21 +1142,35 @@ pub(super) async fn handle_action(
     }
 }
 
+struct PluginActionTransformOutcome {
+    body: Bytes,
+    terminal_failure: bool,
+}
+
 fn apply_plugin_action_response_transforms(
     body: Bytes,
     headers: &[(String, String)],
     pipeline: &CompiledPipeline,
     origin_idx: Option<usize>,
     ctx: &mut RequestContext,
-) -> Bytes {
+) -> PluginActionTransformOutcome {
     let Some(origin_idx) = origin_idx else {
-        return body;
+        return PluginActionTransformOutcome {
+            body,
+            terminal_failure: false,
+        };
     };
     let Some(transforms) = pipeline.transforms.get(origin_idx) else {
-        return body;
+        return PluginActionTransformOutcome {
+            body,
+            terminal_failure: false,
+        };
     };
     if transforms.is_empty() {
-        return body;
+        return PluginActionTransformOutcome {
+            body,
+            terminal_failure: false,
+        };
     }
 
     let content_type = headers
@@ -1154,6 +1179,7 @@ fn apply_plugin_action_response_transforms(
         .map(|(_, value)| value.as_str());
     let ratio = resolved_token_bytes_ratio(pipeline.config.origins.get(origin_idx));
     let mut body = bytes::BytesMut::from(body.as_ref());
+    let mut terminal_failure = false;
     for compiled_transform in transforms {
         if body.len() > compiled_transform.max_body_size {
             warn!(
@@ -1190,9 +1216,11 @@ fn apply_plugin_action_response_transforms(
                     "plugin action transform invariant violated, returning a generic response"
                 );
                 ctx.response_status_override = Some(500);
+                ctx.response_reason_override = None;
                 ctx.transform_error_attribution = Some(transform_name.to_string());
                 body.clear();
                 body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                terminal_failure = true;
                 break;
             }
             match compiled_transform.failure_posture {
@@ -1204,8 +1232,12 @@ fn apply_plugin_action_response_transforms(
                         failure_posture = FailureMode::Closed.as_label(),
                         "plugin action transform failed; replacing the response body"
                     );
+                    ctx.response_status_override = Some(500);
+                    ctx.response_reason_override = None;
+                    ctx.transform_error_attribution = Some(transform_name.to_string());
                     body.clear();
                     body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                    terminal_failure = true;
                     break;
                 }
                 FailureMode::Open => {
@@ -1228,7 +1260,10 @@ fn apply_plugin_action_response_transforms(
             }
         }
     }
-    body.freeze()
+    PluginActionTransformOutcome {
+        body: body.freeze(),
+        terminal_failure,
+    }
 }
 
 fn apply_plugin_action_response_modifiers(
@@ -1689,13 +1724,21 @@ origins:
         set:
           safe: true
         failure_posture: closed
+    response_modifiers:
+      - status:
+          code: 204
+        headers:
+          set:
+            content-type: text/html
+        body:
+          replace: unsafe modifier body
 "#,
         )
         .expect("fixture config");
         let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
         let action = response_action(
             200,
-            vec![("content-type".into(), "application/json".into())],
+            vec![("content-type".into(), "text/plain".into())],
             Bytes::from_static(b"not-json"),
         );
 
@@ -1704,10 +1747,22 @@ origins:
         assert!(result.expect("closed transform failure must dispatch a safe response"));
         let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
         assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "response: {response}"
+        );
+        assert!(
+            response.contains("content-type: application/json\r\n"),
+            "response: {response}"
+        );
+        assert!(
             response.ends_with("\r\n\r\n{\"error\":\"internal server error\"}"),
             "response: {response}"
         );
         assert!(!response.contains("not-json"), "response: {response}");
+        assert!(
+            !response.contains("unsafe modifier body"),
+            "response: {response}"
+        );
     }
 
     #[tokio::test]

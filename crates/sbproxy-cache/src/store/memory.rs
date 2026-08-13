@@ -148,6 +148,7 @@ mod tests {
             body: b"hello".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
+            config_fp: String::new(),
         }
     }
 
@@ -191,6 +192,7 @@ mod tests {
             body: vec![],
             cached_at: now_secs().saturating_sub(100),
             ttl_secs: 1,
+            config_fp: String::new(),
         };
         store.put("expired", &entry).unwrap();
         assert!(store.get("expired").unwrap().is_none());
@@ -244,6 +246,7 @@ mod tests {
             body: b"stale".to_vec(),
             cached_at: now_secs().saturating_sub(500),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         store.put("k", &stale).unwrap();
         assert!(store.get("k").unwrap().is_none(), "live get evicts stale");
@@ -271,6 +274,7 @@ mod tests {
             body: b"not found".to_vec(),
             cached_at: now_secs(),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         store.put("k1", &updated).unwrap();
 

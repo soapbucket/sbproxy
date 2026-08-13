@@ -43,6 +43,13 @@ CREATE TABLE access_log
     bytes_out                 UInt64,
     client_ip                 LowCardinality(String),
 
+    -- Serving config identity. Both are low cardinality by
+    -- construction: one value per live revision, and during a rolling
+    -- change two. `GROUP BY config_revision` is how you tell whether a
+    -- latency or error change tracks the rollout.
+    config_revision           LowCardinality(Nullable(String)),
+    cache_config_fingerprint  LowCardinality(Nullable(String)),
+
     -- Attribution
     workspace_id              LowCardinality(String),
     auth_type                 LowCardinality(Nullable(String)),

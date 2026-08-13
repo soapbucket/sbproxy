@@ -37,9 +37,35 @@ pub struct CachedResponse {
     pub cached_at: u64,
     /// Time-to-live in seconds from `cached_at`.
     pub ttl_secs: u64,
+    /// Cache-config fingerprint of the origin that stored this entry
+    /// (WOR-2407).
+    ///
+    /// The same value the entry's key carries as its last segment, so
+    /// under an exact-keyed backend (memory, redis) this is redundant
+    /// by construction. It is stamped anyway for the two backends where
+    /// it is not: memcached hashes every key to fit the protocol's
+    /// 250-byte limit, and the file store names each entry by the
+    /// SHA-256 of its key. A lookup on either matches a digest of the
+    /// key rather than the key itself.
+    ///
+    /// Empty on entries written before this field existed, which
+    /// [`CachedResponse::serves_config`] treats as "no opinion" rather
+    /// than as a mismatch.
+    #[serde(default)]
+    pub config_fp: String,
 }
 
 impl CachedResponse {
+    /// Whether this entry may be served against an origin whose current
+    /// cache-config fingerprint is `current` (WOR-2407).
+    ///
+    /// An unstamped entry is served. It predates the field, and the key
+    /// it was found under already had to match, so refusing it would
+    /// cold-start a cache to re-derive a decision the key already made.
+    pub fn serves_config(&self, current: &str) -> bool {
+        self.config_fp.is_empty() || self.config_fp == current
+    }
+
     /// Return the stored `ETag` validator, if present.
     pub fn etag(&self) -> Option<&str> {
         self.header_value("etag")
@@ -96,6 +122,9 @@ impl CachedResponse {
             body: self.body.clone(),
             cached_at,
             ttl_secs,
+            // A 304 refreshes metadata around the same representation,
+            // so the entry still belongs to the config that stored it.
+            config_fp: self.config_fp.clone(),
         }
     }
 
@@ -243,6 +272,59 @@ mod tests {
             .as_secs()
     }
 
+    fn entry_stamped(config_fp: &str) -> CachedResponse {
+        CachedResponse {
+            generation: 0,
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            cached_at: now_secs(),
+            ttl_secs: 60,
+            config_fp: config_fp.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_entry_stamped_by_another_config_is_not_served() {
+        // The key already partitions on the fingerprint, so this only
+        // fires where the backend matches a digest of the key rather
+        // than the key itself: memcached hashes to fit its 250-byte
+        // limit, and the file store hashes into a filename.
+        assert!(
+            !entry_stamped("00112233445566ff").serves_config("ffee5544332211a0"),
+            "an entry written under another config must not be served"
+        );
+    }
+
+    #[test]
+    fn an_entry_stamped_by_this_config_is_served() {
+        assert!(entry_stamped("00112233445566ff").serves_config("00112233445566ff"));
+    }
+
+    #[test]
+    fn an_unstamped_entry_is_still_served() {
+        // Written before the field existed. The key it was found under
+        // already matched, so refusing it would cold-start a cache to
+        // re-derive a decision the key had already made.
+        assert!(
+            entry_stamped("").serves_config("00112233445566ff"),
+            "a legacy entry must not be discarded for lacking a stamp"
+        );
+    }
+
+    #[test]
+    fn a_304_refresh_keeps_the_stamp_of_the_config_that_stored_it() {
+        let refreshed = entry_stamped("00112233445566ff").freshen_from_not_modified(
+            &[("etag".to_string(), "\"v2\"".to_string())],
+            now_secs(),
+            60,
+        );
+        assert_eq!(
+            refreshed.config_fp, "00112233445566ff",
+            "revalidation keeps the representation, so it keeps its config identity"
+        );
+    }
+
     #[test]
     fn an_absurd_ttl_does_not_panic_on_the_expiry_check() {
         // `ttl_secs` is attacker-writable on a shared backing store, so
@@ -255,6 +337,7 @@ mod tests {
             body: Vec::new(),
             cached_at: now_secs(),
             ttl_secs: u64::MAX,
+            config_fp: String::new(),
         };
         assert!(!entry.is_expired(), "a saturated expiry is still future");
 
@@ -265,6 +348,7 @@ mod tests {
             body: Vec::new(),
             cached_at: u64::MAX,
             ttl_secs: u64::MAX,
+            config_fp: String::new(),
         };
         assert!(!pinned.is_expired(), "both fields at the maximum saturate");
     }
@@ -278,6 +362,7 @@ mod tests {
             body: Vec::new(),
             cached_at: now_secs().saturating_sub(600),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
         assert!(entry.is_expired());
     }
@@ -297,6 +382,7 @@ mod tests {
             body: b"body".to_vec(),
             cached_at: now_secs(),
             ttl_secs: 60,
+            config_fp: String::new(),
         };
 
         let encoded = serde_json::to_vec(&entry).expect("serialize");
@@ -327,6 +413,7 @@ mod tests {
             body: br#"{"value":1}"#.to_vec(),
             cached_at: 10,
             ttl_secs: 5,
+            config_fp: String::new(),
         };
 
         let refreshed = entry.freshen_from_not_modified(

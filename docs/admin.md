@@ -231,6 +231,37 @@ text, so the IPv4-mapped form a dual-stack listener reports
 and echoes the CORS headers (with credentials) so a browser SPA on that
 origin can call the API cross-origin.
 
+### Docker-published admin ports
+
+Docker port forwarding changes the peer address the container sees. Even when
+the host publishes only to loopback, for example
+`-p 127.0.0.1:9090:9090`, the request commonly reaches sbproxy from the
+Docker bridge gateway rather than from `127.0.0.1`. An empty `allow_ips`
+therefore returns `403` by design.
+
+Bind the admin listener inside the container, keep the host publication on
+loopback, and allow the exact bridge network used by that container:
+
+```yaml
+proxy:
+  admin:
+    enabled: true
+    bind: 0.0.0.0
+    port: 9090
+    allow_ips: ["172.18.0.0/16"] # example only; inspect your network
+    username: admin
+    password: ${ADMIN_PASSWORD}
+```
+
+Find the real subnet with `docker network inspect <network>` and use the
+narrowest CIDR that covers the reported gateway. Do not copy
+`172.17.0.0/16` blindly: user-defined networks, Docker Desktop, rootless
+Docker, and CI runners can use different ranges. The host-side
+`127.0.0.1:9090` publication remains the first exposure boundary;
+`allow_ips` is the independent in-container boundary. Because `bind` and the
+bridge CIDR are off-loopback from sbproxy's perspective, configure a real
+password as shown above.
+
 ## What it can do
 
 Everything below is reachable at `http(s)://<bind>:<port>`. Probe and session

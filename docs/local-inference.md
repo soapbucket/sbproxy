@@ -346,6 +346,12 @@ in-process embedding backend for enforcing verdicts. Set
 `classifier:`. Unlike the routing-only `type: classifier` entry, these modes
 block when their configured unsafe class wins.
 
+The model is not bundled. Before enabling classifier mode, run the pinned
+[MiniLM download commands](#download-the-models), which place `model.onnx` and
+`tokenizer.json` under `/var/lib/sbproxy/models/minilm/`. The runnable
+[ai-safety-classifiers example](../examples/ai-safety-classifiers/) points its
+`model_path` and `tokenizer_path` at those files.
+
 Classifier mode is never an automatic upgrade. Keyword mode remains the
 zero-dependency default, and it is a literal substring matcher. When
 classifier mode is explicit, startup and reload construct the enforcing

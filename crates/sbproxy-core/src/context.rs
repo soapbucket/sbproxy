@@ -1150,6 +1150,11 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// Whether request processing reached the configured AI action. This
+    /// separates successful AI responses that need no provider attempt (for
+    /// example a semantic-cache hit) from infrastructure responses such as an
+    /// HTTPS redirect or CORS preflight on an AI origin.
+    pub ai_gateway_action_reached: bool,
     /// WOR-1496: AI-specific request outcome override for the
     /// per-attribution outcome metric. Set at block sites whose HTTP
     /// status alone is ambiguous (a guardrail block and a generic bad
@@ -1785,6 +1790,7 @@ impl RequestContext {
             managed_fallback_reason: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
+            ai_gateway_action_reached: false,
             ai_outcome: None,
             ai_guardrail_category: None,
             ai_guardrail_action: None,

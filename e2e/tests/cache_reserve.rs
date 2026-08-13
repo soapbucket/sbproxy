@@ -129,6 +129,7 @@ async fn reserve_hit_returns_body_and_promotes_to_hot() {
             .unwrap()
             .as_secs(),
         ttl_secs: 3600,
+        config_fp: String::new(),
     };
     hot.put("/api/long-tail", &cached).unwrap();
 
@@ -162,6 +163,7 @@ async fn evicted_hot_entry_is_admitted_and_recovered_from_reserve() {
             .unwrap()
             .as_secs(),
         ttl_secs: 3600,
+        config_fp: String::new(),
     };
     hot.put("/api/keep", &cached).unwrap();
 

@@ -197,6 +197,19 @@ impl AlertRuntime {
                 last_evaluated_at: None,
             },
             AlertRuleSnapshot {
+                rule: "gateway_rejection_spike".to_string(),
+                description: "AI requests rejected before provider dispatch".to_string(),
+                thresholds: vec![
+                    config.gateway_rejection_threshold,
+                    (config.gateway_rejection_threshold * 2.0).min(1.0),
+                ],
+                minimum_samples: Some(config.gateway_rejection_min_decisions),
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                last_evaluated_at: None,
+            },
+            AlertRuleSnapshot {
                 rule: "burn_rate".to_string(),
                 description:
                     "Availability burn rate over the last 60 minutes of a process-local ring"
@@ -460,7 +473,7 @@ mod tests {
         assert!(snapshot.enabled);
         assert_eq!(snapshot.authority, AlertAuthority::File);
         assert!(snapshot.read_only);
-        assert_eq!(snapshot.rules.len(), 7);
+        assert_eq!(snapshot.rules.len(), 8);
         let budget = snapshot
             .rules
             .iter()
@@ -477,6 +490,13 @@ mod tests {
         assert_eq!(provider.minimum_samples, Some(10));
         assert_eq!(provider.sample_count, Some(4));
         assert!(provider.last_evaluated_at.is_some());
+        let gateway = snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.rule == "gateway_rejection_spike")
+            .unwrap();
+        assert_eq!(gateway.state, RuleEvaluationState::Inactive);
+        assert_eq!(gateway.minimum_samples, Some(10));
     }
 
     #[test]

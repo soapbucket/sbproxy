@@ -838,6 +838,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_gateway_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_ai_gateway_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["decision", "reason"],
+        description: "AI gateway admission decisions, including pre-provider rejections.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_guardrail_blocks_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_guardrail_block"),

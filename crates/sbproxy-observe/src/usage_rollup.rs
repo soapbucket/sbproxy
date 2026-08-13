@@ -112,8 +112,13 @@ impl RollupOutcome {
     pub fn from_outcome_label(label: &str) -> Self {
         match label {
             "ok" => Self::Ok,
-            "guardrail_block" | "content_filter" | "budget_exceeded" | "rate_limited"
-            | "auth_denied" | "policy_block" => Self::Blocked,
+            "guardrail_block"
+            | "content_filter"
+            | "budget_exceeded"
+            | "rate_limited"
+            | "auth_denied"
+            | "gateway_auth_denied"
+            | "policy_block" => Self::Blocked,
             _ => Self::Error,
         }
     }
@@ -1342,6 +1347,7 @@ mod tests {
             "budget_exceeded",
             "rate_limited",
             "auth_denied",
+            "gateway_auth_denied",
             "policy_block",
         ] {
             assert_eq!(
@@ -1350,7 +1356,14 @@ mod tests {
                 "{blocked} must map to Blocked"
             );
         }
-        for err in ["timeout", "upstream_5xx", "client_error", "other", "??"] {
+        for err in [
+            "timeout",
+            "upstream_5xx",
+            "upstream_auth_denied",
+            "client_error",
+            "other",
+            "??",
+        ] {
             assert_eq!(
                 RollupOutcome::from_outcome_label(err),
                 RollupOutcome::Error,

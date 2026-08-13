@@ -318,6 +318,7 @@ mod tests {
             body: b"memcached test".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
+            config_fp: String::new(),
         }
     }
 
@@ -390,6 +391,7 @@ mod tests {
             body: vec![],
             cached_at: now_secs(),
             ttl_secs: 60 * 60 * 24 * 60,
+            config_fp: String::new(),
         };
         let ttl = MemcachedStore::remaining_ttl(&entry);
         assert_eq!(
@@ -422,6 +424,7 @@ mod tests {
             body: vec![],
             cached_at: now_secs().saturating_sub(400),
             ttl_secs: 1,
+            config_fp: String::new(),
         };
         assert_eq!(MemcachedStore::remaining_ttl(&entry), 0);
     }
