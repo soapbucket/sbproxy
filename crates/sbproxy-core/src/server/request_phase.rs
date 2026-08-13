@@ -110,38 +110,29 @@ fn request_effective_action<'a>(
     origin_idx: usize,
 ) -> EffectiveAction<'a> {
     let request = session.req_header();
-    let forwarded_action = pipeline
+    // Walked in priority order, stopping at the first rule the preview
+    // cannot answer for. A later rule that previews clean is shadowed
+    // by an earlier unevaluable one under first-match-wins, so treating
+    // it as the winner would answer for the wrong rule.
+    let rules = pipeline
         .forward_rules
         .get(origin_idx)
-        .and_then(|rules| {
-            rules.iter().find(|rule| {
-                rule.matchers.iter().any(|matcher| {
-                    matcher
-                        .match_request(
-                            &request.method,
-                            request.uri.path(),
-                            request.uri.query(),
-                            &request.headers,
-                        )
-                        .is_some()
-                })
-            })
-        })
-        .map(|rule| &rule.action);
-    // `match_request` cannot evaluate a `body:` matcher or a `when:`
-    // predicate, so its `None` means "no rule matched" *or* "a rule
-    // could not be evaluated here". Collapsing both to the base action
-    // is how a stale-while-revalidate write lands in another rule's
-    // cache entry, so the two are kept apart in the type.
-    if forwarded_action.is_none()
-        && pipeline
-            .forward_rules
-            .get(origin_idx)
-            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
-    {
-        return EffectiveAction::Indeterminate;
+        .map_or(&[][..], Vec::as_slice);
+    match crate::pipeline::preview_forward_rules(
+        rules,
+        &request.method,
+        request.uri.path(),
+        request.uri.query(),
+        &request.headers,
+    ) {
+        crate::pipeline::ForwardRulePreview::Matched(rule) => {
+            EffectiveAction::Resolved(Some(&rule.action))
+        }
+        crate::pipeline::ForwardRulePreview::NoMatch => {
+            EffectiveAction::Resolved(pipeline.actions.get(origin_idx))
+        }
+        crate::pipeline::ForwardRulePreview::Indeterminate => EffectiveAction::Indeterminate,
     }
-    EffectiveAction::Resolved(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
 }
 
 /// What a preview of the routing decision could establish.
@@ -1653,10 +1644,21 @@ pub(super) async fn request_filter(
     };
     ctx.origin_idx = Some(origin_idx);
 
+    if crate::proxy_wasm_http::start_request(session, ctx, origin_idx).await? {
+        return Ok(true);
+    }
+
     // Attribute gateway-side denials to AI before auth or policy middleware
     // can short-circuit. The handler will stamp the same label again for an
     // admitted request; doing it here is what makes a bad virtual key or an
     // early policy denial visible without pretending a provider was tried.
+    //
+    // This runs after `start_request` on purpose: a Proxy-Wasm filter may
+    // rewrite the method or URI, and a preview taken against the
+    // pre-rewrite request answers for a route the request no longer
+    // takes. Read against the rewritten request, replay ownership and
+    // the surface label describe what will actually be dispatched, and
+    // the labelling still lands before any auth or policy short-circuit.
     let ai_proxy_owns_replay_paths =
         request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
     let initial_ai_surface = {
@@ -1676,10 +1678,6 @@ pub(super) async fn request_filter(
     };
     if let Some(surface) = initial_ai_surface {
         ctx.ai_surface = Some(surface.to_string());
-    }
-
-    if crate::proxy_wasm_http::start_request(session, ctx, origin_idx).await? {
-        return Ok(true);
     }
 
     // Validated GraphQL requests may pass through body-consuming middleware

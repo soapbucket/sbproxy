@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-13*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It

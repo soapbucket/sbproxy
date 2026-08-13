@@ -1,4 +1,14 @@
+# Everything is excluded except the operator binary the Dockerfile
+# COPYs. The Dockerfile parameterizes the cargo profile via
+# CARGO_PROFILE, so every profile's copy of the binary is admitted
+# here; a profile listed in the Dockerfile but not here fails at COPY
+# with an empty context, which is exactly the .dockerignore-vs-COPY
+# conflict WOR-2399 was about.
 **
 !target/
 !target/release-fast/
 !target/release-fast/sbproxy-k8s-operator
+!target/release/
+!target/release/sbproxy-k8s-operator
+!target/debug/
+!target/debug/sbproxy-k8s-operator

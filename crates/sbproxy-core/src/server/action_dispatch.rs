@@ -1104,7 +1104,17 @@ pub(super) async fn handle_action(
                         ctx,
                     );
                     let (status, reason, headers, body) = if transform_outcome.terminal_failure {
+                        // The body the action produced is gone, so the
+                        // headers describing it must go with it. A
+                        // surviving `content-encoding: gzip` makes the
+                        // plain JSON error undecodable at the client,
+                        // and a `set-cookie` minted for the failed
+                        // response has no business riding on the 500.
                         let mut headers = response.headers;
+                        headers.retain(|(name, _)| {
+                            !name.eq_ignore_ascii_case("content-encoding")
+                                && !name.eq_ignore_ascii_case("set-cookie")
+                        });
                         set_plugin_action_response_header(
                             &mut headers,
                             "content-type",

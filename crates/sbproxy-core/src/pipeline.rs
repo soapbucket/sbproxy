@@ -592,20 +592,123 @@ impl MatcherEntry {
     }
 }
 
-/// Whether any entry in `rules` carries a matcher [`MatcherEntry::match_request`]
-/// cannot evaluate, so a preview of which action will fire is not trustworthy.
+/// What a preview of one matcher entry could establish without a body
+/// or a CEL context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatcherPreview {
+    /// Every present matcher was evaluable and at least one failed, so
+    /// this entry cannot fire no matter what the body or predicate say.
+    NoMatch,
+    /// Every present matcher was evaluable and all passed.
+    Match,
+    /// The evaluable matchers passed, but the entry also carries a
+    /// `body:` or `when:` this preview cannot answer, so whether it
+    /// fires is unknowable here.
+    Unevaluable,
+}
+
+impl MatcherEntry {
+    /// Preview this entry against the request head alone.
+    ///
+    /// The distinction between [`MatcherPreview::NoMatch`] and
+    /// [`MatcherPreview::Unevaluable`] is what lets a rule walk stay
+    /// cheap: an entry whose *path already fails* cannot match at full
+    /// evaluation either, whatever its predicate says, so it does not
+    /// poison the preview for the rules after it.
+    #[must_use]
+    pub fn preview(
+        &self,
+        method: &http::Method,
+        path: &str,
+        query: Option<&str>,
+        headers: &http::HeaderMap,
+    ) -> MatcherPreview {
+        let any_present = self.method.is_some()
+            || self.path.is_some()
+            || self.header.is_some()
+            || self.query.is_some()
+            || self.body.is_some()
+            || self.when.is_some();
+        if !any_present {
+            return MatcherPreview::NoMatch;
+        }
+        if let Some(m) = &self.method {
+            if !m.matches(method) {
+                return MatcherPreview::NoMatch;
+            }
+        }
+        if let Some(p) = &self.path {
+            if p.match_with_params(path).is_none() {
+                return MatcherPreview::NoMatch;
+            }
+        }
+        if let Some(h) = &self.header {
+            if !h.matches(headers) {
+                return MatcherPreview::NoMatch;
+            }
+        }
+        if let Some(q) = &self.query {
+            if !q.matches(query) {
+                return MatcherPreview::NoMatch;
+            }
+        }
+        if self.body.is_some() || self.when.is_some() {
+            return MatcherPreview::Unevaluable;
+        }
+        MatcherPreview::Match
+    }
+}
+
+/// What a preview of a whole forward-rule set could establish.
 ///
-/// `body` and `when` both qualify: the first needs a buffered body and the
-/// second needs a CEL context, and neither exists at the points that preview
-/// routing. A caller seeing `true` here must not fall back to the origin's
-/// base action, because the request may well land on a forward rule that
-/// routes somewhere else entirely.
+/// No `Debug`/`PartialEq`: `CompiledForwardRule` derives neither, and
+/// callers match on the shape rather than compare values.
+#[derive(Clone, Copy)]
+pub enum ForwardRulePreview<'a> {
+    /// The first rule that can fire is fully evaluable and matched.
+    Matched(&'a CompiledForwardRule),
+    /// No rule can fire on this request head.
+    NoMatch,
+    /// Before any evaluable rule matched, a rule was reached whose
+    /// verdict needs the body or a CEL context. Everything after it is
+    /// shadowed by first-match-wins, so the preview must stop claiming
+    /// anything.
+    Indeterminate,
+}
+
+/// Walk `rules` in priority order and preview which will fire.
+///
+/// First match wins at full evaluation, so the walk must stop at the
+/// first rule it cannot answer for: a later rule that previews clean is
+/// not the winner if an earlier unevaluable rule fires. Getting this
+/// wrong is how a stale-while-revalidate refresh follows a later rule's
+/// upstream into an earlier rule's cache entry, or how the idempotency
+/// middleware serves cached bytes ahead of the guardrails of the AI
+/// action the request actually lands on.
 #[must_use]
-pub fn forward_rules_need_full_matching(rules: &[CompiledForwardRule]) -> bool {
-    rules
-        .iter()
-        .flat_map(|rule| rule.matchers.iter())
-        .any(|entry| entry.when.is_some() || entry.body.is_some())
+pub fn preview_forward_rules<'a>(
+    rules: &'a [CompiledForwardRule],
+    method: &http::Method,
+    path: &str,
+    query: Option<&str>,
+    headers: &http::HeaderMap,
+) -> ForwardRulePreview<'a> {
+    for rule in rules {
+        let mut rule_unevaluable = false;
+        for entry in &rule.matchers {
+            match entry.preview(method, path, query, headers) {
+                // Entries within a rule are ORed, so one clean match
+                // settles the rule regardless of its siblings.
+                MatcherPreview::Match => return ForwardRulePreview::Matched(rule),
+                MatcherPreview::Unevaluable => rule_unevaluable = true,
+                MatcherPreview::NoMatch => {}
+            }
+        }
+        if rule_unevaluable {
+            return ForwardRulePreview::Indeterminate;
+        }
+    }
+    ForwardRulePreview::NoMatch
 }
 
 /// Largest request body any body matcher across `rules` will read, or `None`
@@ -5848,23 +5951,88 @@ mod method_matcher_tests {
         assert!(message.contains("request.trust_tier"), "{message}");
     }
 
-    #[test]
-    fn a_rule_set_with_a_predicate_is_not_previewable() {
-        // Guards the fallback that would otherwise revalidate against
-        // the wrong upstream.
-        let rule = serde_json::json!({
-            "rules": [{"path": {"prefix": "/v1/"}, "when": "true"}],
-            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
-        });
+    fn preview_rule(spec: serde_json::Value) -> CompiledForwardRule {
         let registry = empty_extension_registry();
-        let compiled_rule = compile_single_forward_rule(
-            &rule,
+        compile_single_forward_rule(
+            &spec,
             "preview-lane",
             PipelineConstructionMode::Validation,
             registry.as_ref(),
         )
-        .expect("compiles");
-        assert!(forward_rules_need_full_matching(&[compiled_rule]));
+        .expect("compiles")
+    }
+
+    #[test]
+    fn a_reachable_predicate_makes_the_preview_indeterminate() {
+        // Guards the fallback that would otherwise revalidate against
+        // the wrong upstream.
+        let rules = [preview_rule(serde_json::json!({
+            "rules": [{"path": {"prefix": "/v1/"}, "when": "true"}],
+            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+        }))];
+        let headers = http::HeaderMap::new();
+        assert!(matches!(
+            preview_forward_rules(&rules, &http::Method::GET, "/v1/chat", None, &headers),
+            ForwardRulePreview::Indeterminate
+        ));
+    }
+
+    #[test]
+    fn a_predicate_behind_a_failing_path_does_not_poison_the_preview() {
+        // The evaluable half of the entry already failed, so the
+        // predicate can never fire and the walk keeps going.
+        let rules = [
+            preview_rule(serde_json::json!({
+                "rules": [{"path": {"prefix": "/admin/"}, "when": "true"}],
+                "origin": {"action": {"type": "proxy", "url": "https://admin.test"}}
+            })),
+            preview_rule(serde_json::json!({
+                "rules": [{"path": {"prefix": "/api/"}}],
+                "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+            })),
+        ];
+        let headers = http::HeaderMap::new();
+        assert!(matches!(
+            preview_forward_rules(&rules, &http::Method::GET, "/api/items", None, &headers),
+            ForwardRulePreview::Matched(rule) if std::ptr::eq(rule, &rules[1])
+        ));
+    }
+
+    #[test]
+    fn an_earlier_reachable_predicate_shadows_a_later_clean_match() {
+        // WOR-2409. First match wins at full evaluation, so a later
+        // rule that previews clean is not the winner when an earlier
+        // rule's predicate might fire. Answering with the later rule is
+        // how the idempotency middleware serves cached bytes ahead of
+        // the AI guardrails the request actually lands on.
+        let rules = [
+            preview_rule(serde_json::json!({
+                "rules": [{"when": "request.path.startsWith(\"/api/\")"}],
+                "origin": {"action": {"type": "proxy", "url": "https://gated.test"}}
+            })),
+            preview_rule(serde_json::json!({
+                "rules": [{"path": {"prefix": "/api/"}}],
+                "origin": {"action": {"type": "proxy", "url": "https://plain.test"}}
+            })),
+        ];
+        let headers = http::HeaderMap::new();
+        assert!(matches!(
+            preview_forward_rules(&rules, &http::Method::GET, "/api/items", None, &headers),
+            ForwardRulePreview::Indeterminate
+        ));
+    }
+
+    #[test]
+    fn a_rule_set_with_no_match_previews_as_no_match() {
+        let rules = [preview_rule(serde_json::json!({
+            "rules": [{"path": {"prefix": "/v1/"}}],
+            "origin": {"action": {"type": "proxy", "url": "https://api.test"}}
+        }))];
+        let headers = http::HeaderMap::new();
+        assert!(matches!(
+            preview_forward_rules(&rules, &http::Method::GET, "/other", None, &headers),
+            ForwardRulePreview::NoMatch
+        ));
     }
 
     #[test]

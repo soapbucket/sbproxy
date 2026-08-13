@@ -58,8 +58,20 @@ fn client_disconnected(
     error_source: Option<pingora_error::ErrorSource>,
     downstream_half_closed: bool,
 ) -> bool {
-    downstream_half_closed
-        || error_source.is_some_and(|source| source == pingora_error::ErrorSource::Downstream)
+    // Half-close alone must not count. RFC 9112 §9.6 lets a client
+    // shut down its write side and keep reading, our Pingora fork
+    // tolerates that and finishes delivering the response, and at the
+    // TCP layer a polite half-close and a full abandonment both arrive
+    // as one FIN. Counting the FIN by itself turned every fully
+    // delivered response into `client_disconnected` at the client's
+    // option, which on a metering origin is a self-serve discount and
+    // wrong dispute evidence. The half-close signal only means
+    // "client went away" when delivery also failed to complete, so it
+    // needs an error beside it; a downstream-sourced error keeps
+    // counting on its own, as it always has.
+    let delivery_failed = error_source.is_some();
+    error_source.is_some_and(|source| source == pingora_error::ErrorSource::Downstream)
+        || (downstream_half_closed && delivery_failed)
 }
 
 fn should_record_proxy_request_metrics(path: &str) -> bool {
@@ -6874,12 +6886,32 @@ mod tests {
     }
 
     #[test]
-    fn downstream_half_close_counts_as_a_client_disconnect_without_a_write_error() {
-        assert!(client_disconnected(None, true));
+    fn a_delivered_response_over_a_half_closed_connection_is_not_a_disconnect() {
+        // The billing dodge: RFC 9112 §9.6 half-close plus complete
+        // delivery arrived with no error, and counting the FIN alone
+        // let any client discount its own fully received response by
+        // calling shutdown(SHUT_WR) after sending the request.
+        assert!(
+            !client_disconnected(None, true),
+            "half-close with clean delivery is a delivered response"
+        );
+    }
+
+    #[test]
+    fn a_failed_delivery_still_classifies_as_a_client_disconnect() {
+        // A downstream-sourced error counts on its own, as before.
         assert!(client_disconnected(
             Some(pingora_error::ErrorSource::Downstream),
             false
         ));
+        // Half-close plus any delivery failure is the client gone
+        // mid-response, whichever side the error was attributed to.
+        assert!(client_disconnected(
+            Some(pingora_error::ErrorSource::Upstream),
+            true
+        ));
+        // An upstream failure with the client still fully connected is
+        // the origin's problem, not a disconnect.
         assert!(!client_disconnected(
             Some(pingora_error::ErrorSource::Upstream),
             false

@@ -1,5 +1,5 @@
 # Build pipeline
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-13*
 
 How the proxy container images are built, what stays warm between
 runs, and what the expected wall-clock numbers are. Companion to

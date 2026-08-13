@@ -1248,33 +1248,26 @@ fn build_swr_revalidation_request(
 ) -> Option<SwrRevalidationRequest> {
     let path = request.uri.path();
     let query = request.uri.query();
-    let forward_action = pipeline
+    // Revalidating against the wrong upstream writes that upstream's
+    // response into this entry's key, so the preview walks the rules in
+    // priority order and an ambiguous answer skips the refresh rather
+    // than guessing. A later rule that previews clean is shadowed by an
+    // earlier unevaluable one under first-match-wins.
+    let rules = pipeline
         .forward_rules
         .get(origin_idx)
-        .and_then(|rules| {
-            rules.iter().find(|rule| {
-                rule.matchers.iter().any(|matcher| {
-                    matcher
-                        .match_request(&request.method, path, query, &request.headers)
-                        .is_some()
-                })
-            })
-        })
-        .map(|rule| &rule.action);
-    // Revalidating against the wrong upstream writes that upstream's
-    // response into this entry's key, so an ambiguous preview must skip
-    // the refresh rather than guess. `None` from `match_request` means
-    // "no rule matched" or "a rule could not be evaluated here", and
-    // only the rule set can tell those apart.
-    if forward_action.is_none()
-        && pipeline
-            .forward_rules
-            .get(origin_idx)
-            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
-    {
-        return None;
-    }
-    let action = forward_action.or_else(|| pipeline.actions.get(origin_idx))?;
+        .map_or(&[][..], Vec::as_slice);
+    let action = match crate::pipeline::preview_forward_rules(
+        rules,
+        &request.method,
+        path,
+        query,
+        &request.headers,
+    ) {
+        crate::pipeline::ForwardRulePreview::Matched(rule) => Some(&rule.action),
+        crate::pipeline::ForwardRulePreview::NoMatch => pipeline.actions.get(origin_idx),
+        crate::pipeline::ForwardRulePreview::Indeterminate => return None,
+    }?;
     let Action::Proxy(proxy) = action else {
         return None;
     };

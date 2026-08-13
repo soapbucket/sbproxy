@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-13*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 

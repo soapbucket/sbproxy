@@ -10,6 +10,31 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Changed, and worth checking before you upgrade
+
+- **A configured origin now owns `/health` on the data plane.** Until
+  now the proxy answered `GET /health` itself with a fixed
+  `{"status":"ok"}` before any origin routing ran. It now proxies the
+  path like any other when an origin or forward rule matches it. If a
+  load balancer probes `/health` **with a configured origin's Host
+  header**, that probe now reaches your upstream, and an upstream with
+  no `/health` route answers 404, which a health checker reads as
+  unhealthy. Point such probes at the admin listener's health route, or
+  make sure the upstream serves the path. Probes against the pod IP or
+  an unconfigured Host still get the built-in response.
+- **`timeout_ms` on an AI provider is now enforced.** The key
+  previously validated and did nothing. It bounds one dispatch attempt
+  wall-clock from connect through the end of the response body, so a
+  streaming completion that runs past it is severed mid-stream; each
+  retry attempt gets a fresh window, so worst case is
+  `(timeout_ms + backoff) x (max_retries + 1)` per provider. A config
+  carrying a forgotten low value starts cutting requests off on
+  upgrade: check yours before deploying.
+- **The `outcome` label value `auth_denied` split in two.** Gateway-side
+  refusals and upstream auth failures were one value and are now
+  distinguishable; dashboards keyed on `outcome="auth_denied"` need
+  updating. Usage rollups keep the legacy mapping.
+
 ## [1.11.0] - 2026-08-10
 
 ### Added

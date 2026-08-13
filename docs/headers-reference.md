@@ -1,5 +1,5 @@
 # Headers reference
-*Last modified: 2026-07-21*
+*Last modified: 2026-08-13*
 
 Every header SBproxy reads or stamps, with the config that triggers it.
 This is the single source of truth; `docs/manual.md` and the marketing
@@ -63,7 +63,7 @@ These fire only when the relevant config or request state applies.
 
 | Header | Trigger | Description |
 |---|---|---|
-| `X-Sb-Session-Id` | A session ID was captured | Echoed when the caller supplied a valid ULID, or when the proxy auto-generated one. Auto-generation follows `sessions.auto_generate`: the default `anonymous` mints an ID only for requests with no resolved user identity; `always` and `never` do what they say. No session captured means no header. |
+| `X-Sb-Session-Id` | A session ID was captured | Echoed when the caller supplied a valid ULID, or when the proxy auto-generated one. Auto-generation follows `sessions.auto_generate`: the default `anonymous` mints an ID only for requests with no resolved user identity; `never` does what it says, and `always` has one exception: a request carrying an *invalid* session header is dropped from session tracking (and counted on the drop metric) rather than being assigned a fresh session, so a malformed ID cannot silently fork into a new identity. No session captured means no header. |
 | `x-sbproxy-cache` | `response_cache.enabled: true` on the origin | Values: `HIT`, `STALE`, `HIT-RESERVE`. There is no `MISS` value; a cache miss simply omits the header. |
 | `x-sbproxy-debug-request-id` | Request carried `x-sb-flags: debug` | The request's correlation ID, stamped for quick copy-paste debugging. |
 | `x-sbproxy-debug-config-rev` | Request carried `x-sb-flags: debug` | The compiled-config revision that served the request. |

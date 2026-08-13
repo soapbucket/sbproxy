@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-13*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes

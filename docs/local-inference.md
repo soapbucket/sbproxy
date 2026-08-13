@@ -1,5 +1,5 @@
 # Local inference for gateway helper models
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-13*
 
 SBproxy can run four AI-gateway features on local ONNX models instead of paid
 APIs:
