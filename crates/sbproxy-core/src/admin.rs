@@ -1255,7 +1255,27 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         }
     };
 
-    let compiled = match sbproxy_config::compile_config(&yaml) {
+    // Resolve `source:` before validating anything. The pointer document
+    // is near-empty and compiles trivially, so validating it proves
+    // nothing about the payload it points at; and resolving here means
+    // the transaction below is handed the already-fetched text rather
+    // than fetching the source a second time.
+    let resolved = match crate::config_source::resolve(&yaml) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            tracing::warn!(error = %e, "admin reload: config source resolution failed");
+            let msg = sanitise_path_in_error(&format!("{e:#}"), &path);
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"failed to resolve config source: {}"}}"#,
+                    msg.replace('"', "'")
+                ),
+            );
+        }
+    };
+    let compiled = match sbproxy_config::compile_config(&resolved.text) {
         Ok(compiled) => compiled,
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: YAML parse failed");
@@ -1294,7 +1314,8 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     }
 
     let path_text = path.to_string_lossy();
-    let outcome = match crate::server::reload_from_config_yaml(&path_text, &yaml) {
+    let outcome = match crate::server::reload_from_resolved_yaml(&path_text, &resolved.text, &yaml)
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             sbproxy_observe::metrics::record_config_reload("failure");
@@ -1753,8 +1774,38 @@ fn handle_config_write(
             );
         }
     }
+    // A body naming a remote source meets the ownership guard BEFORE
+    // any resolution: resolving means cloning the named repository, and
+    // a write this node would refuse anyway must not reach the network
+    // first, nor have its 409 turned into a 400 about an unreachable
+    // host. Plain bodies keep the guard's documented after-validation
+    // ordering below, so a syntax error still wins over an ownership
+    // violation.
+    if matches!(sbproxy_config::source::parse_source_head(yaml), Ok(Some(_))) {
+        if let Some(rejection) = guard_config_write(&path, yaml) {
+            return rejection;
+        }
+    }
     // Validate BEFORE writing so a bad config never clobbers the file.
-    let compiled = match sbproxy_config::compile_config(yaml) {
+    // Resolution comes first for the same reason: a `source:` pointer
+    // body compiles trivially on its own, so without resolving here a
+    // pointer at a broken payload would be validated as the pointer,
+    // written to disk, and only then refused by the delegated reload,
+    // leaving a file behind that fails the next boot or SIGHUP.
+    let resolved_body = match crate::config_source::resolve(yaml) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"failed to resolve config source: {}"}}"#,
+                    format!("{e:#}").replace('"', "'")
+                ),
+            )
+        }
+    };
+    let compiled = match sbproxy_config::compile_config(&resolved_body.text) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -4561,6 +4612,77 @@ mod tests {
             cors_origins: Vec::new(),
             operators: Vec::new(),
         })
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_pointer_whose_payload_does_not_compile_is_refused_with_a_400() {
+        // WOR-2410. The reload handler used to validate the raw text it
+        // read off disk, and a `source:` pointer document is near-empty
+        // and compiles trivially, so the validation proved nothing and
+        // the payload's compile failure surfaced as the transaction's
+        // 500. The handler now resolves first and validates the
+        // resolved payload, so an operator-caused failure is a 400 with
+        // the old config still serving, matching the documented
+        // contract for both admin routes.
+        if !git_available() {
+            eprintln!("skipping: git is not available on this host");
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        git_in(&repo, &["init", "--quiet"]);
+        git_in(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_in(&repo, &["config", "user.email", "fixture@example.test"]);
+        git_in(&repo, &["config", "user.name", "Fixture"]);
+        git_in(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            repo.join("sb.yml"),
+            "origins:\n  \"api.test\":\n    action:\n      type: this_action_type_does_not_exist\n",
+        )
+        .expect("write payload");
+        git_in(&repo, &["add", "sb.yml"]);
+        git_in(&repo, &["commit", "--quiet", "-m", "broken payload"]);
+
+        let pointer = format!(
+            "source:\n  kind: git\n  repo: file://{}\n  revision: main\n  path: sb.yml\n",
+            repo.display()
+        );
+        let config_path = fixture.path().join("sb.yml");
+        std::fs::write(&config_path, &pointer).expect("write pointer");
+
+        let mut state = make_state();
+        state.config_path = Some(config_path);
+
+        let (status, _content_type, body) = handle_reload(&state);
+        assert_eq!(
+            status, 400,
+            "an operator-caused compile failure in the resolved payload is a 400: {body}"
+        );
+        assert!(
+            body.contains("this_action_type_does_not_exist"),
+            "the error names the payload's fault, not the pointer's: {body}"
+        );
     }
 
     #[tokio::test]
