@@ -3668,6 +3668,7 @@ fn emit_policy_verdict_with_outcome(
         chrono::Utc::now(),
         policy_id.to_string(),
         surface,
+        engine,
         verdict,
         elapsed_ms,
     );

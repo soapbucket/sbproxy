@@ -43,6 +43,16 @@ pub struct PolicyVerdictEvent {
     pub policy_id: String,
     /// Built-in dispatch path versus dynamic-dispatch plugin path.
     pub surface: PolicySurface,
+    /// Which engine actually made this decision.
+    ///
+    /// Carried beside `surface` rather than derived from it, because a
+    /// surface cannot tell a CEL expression from a rate limiter or a
+    /// WASM bundle from a linked Rust plugin. Without this the
+    /// Prometheus series for a decision said `engine="cel"` while the
+    /// audit record for that same decision said `surface: built_in`,
+    /// so an operator correlating an alert to the trail found the two
+    /// disagreeing about who decided.
+    pub engine: crate::decision::DecisionEngine,
     /// Coarse verdict tag suitable for metrics labels.
     ///
     /// The full [`sbproxy_plugin::PolicyDecision`] payload (status
@@ -76,6 +86,7 @@ impl PolicyVerdictEvent {
         occurred_at: chrono::DateTime<chrono::Utc>,
         policy_id: String,
         surface: PolicySurface,
+        engine: crate::decision::DecisionEngine,
         verdict: VerdictTag,
         decision_latency_ms: u32,
     ) -> Self {
@@ -87,6 +98,7 @@ impl PolicyVerdictEvent {
             occurred_at,
             policy_id,
             surface,
+            engine,
             verdict,
             decision_latency_ms,
         }
