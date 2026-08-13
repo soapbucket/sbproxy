@@ -318,6 +318,14 @@ pub enum ExtensionHookKind {
     AiStreamEvent,
     /// AI stream-close event hook.
     AiClose,
+    /// AI call-failure event hook.
+    ///
+    /// Fires when an upstream AI call fails. Purely additive: it is the
+    /// one point on the AI chain that had no hook at all, so nothing
+    /// observed a provider error, and an operator could not rewrite one
+    /// into a house-standard shape, attribute it to a tenant, or drive a
+    /// fallback from a policy.
+    AiFailure,
     /// Payment lifecycle event hook.
     Payment,
 }
@@ -448,6 +456,55 @@ pub enum AiExtensionEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion_tokens: Option<u64>,
     },
+    /// An upstream AI call failed.
+    ///
+    /// Carries a classified cause rather than a message, so a hook
+    /// branches on a closed set instead of pattern-matching provider
+    /// prose that changes without notice. `status` and `provider` are
+    /// what an operator attributes a failure by; `message` is bounded
+    /// and client-safe.
+    Failure {
+        /// Classified cause, from the shared failure classifier.
+        cause: AiFailureCause,
+        /// Upstream HTTP status, when the call got one. Absent for a
+        /// transport failure that never received a response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// Provider the failed attempt was dispatched to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Bounded, client-safe description. Never the raw provider
+        /// body, which can carry prompt fragments back to the caller.
+        message: String,
+    },
+}
+
+/// Why an upstream AI call failed, as a closed set.
+///
+/// Mirrors `sbproxy_ai::failure_cause::FailureCause` one to one. It is
+/// restated here rather than re-exported because `sbproxy-plugin` is a
+/// public surface and `sbproxy-ai` is not: a plugin author must be able
+/// to match this without depending on an internal crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum AiFailureCause {
+    /// The request timed out.
+    Timeout,
+    /// The provider rate-limited the request.
+    RateLimit,
+    /// The prompt exceeded the model's context window.
+    ContextWindowExceeded,
+    /// The provider refused on content-policy or safety grounds.
+    ContentPolicy,
+    /// Authentication or authorization failed.
+    Auth,
+    /// A provider-side server error.
+    ServerError,
+    /// A malformed request the provider rejected.
+    BadRequest,
+    /// An unclassifiable outcome.
+    Unknown,
 }
 
 /// Versioned provider-neutral event shared by linked and bundled AI hooks.
@@ -478,6 +535,7 @@ impl AiExtensionEvent {
             AiExtensionEventPayload::ToolCall { .. } => ExtensionHookKind::AiToolCall,
             AiExtensionEventPayload::Stream { .. } => ExtensionHookKind::AiStreamEvent,
             AiExtensionEventPayload::Close { .. } => ExtensionHookKind::AiClose,
+            AiExtensionEventPayload::Failure { .. } => ExtensionHookKind::AiFailure,
         }
     }
 }

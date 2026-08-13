@@ -878,6 +878,7 @@ const fn inventory_hook_kind(kind: BundleHookKind) -> ExtensionHookKind {
         BundleHookKind::AiGuardrailOutput => ExtensionHookKind::AiGuardrailOutput,
         BundleHookKind::AiStreamEvent => ExtensionHookKind::AiStreamEvent,
         BundleHookKind::AiClose => ExtensionHookKind::AiClose,
+        BundleHookKind::AiFailure => ExtensionHookKind::AiFailure,
         BundleHookKind::Payment => ExtensionHookKind::Payment,
         BundleHookKind::ProxyWasm => ExtensionHookKind::ProxyWasmFilter,
     }
@@ -892,7 +893,8 @@ const fn hook_phase(kind: BundleHookKind) -> &'static str {
         | BundleHookKind::AiGuardrailInput
         | BundleHookKind::AiGuardrailOutput
         | BundleHookKind::AiStreamEvent
-        | BundleHookKind::AiClose => "ai",
+        | BundleHookKind::AiClose
+        | BundleHookKind::AiFailure => "ai",
         BundleHookKind::Payment => "payment",
     }
 }
@@ -905,6 +907,7 @@ const fn is_ai_kind(kind: BundleHookKind) -> bool {
             | BundleHookKind::AiGuardrailOutput
             | BundleHookKind::AiStreamEvent
             | BundleHookKind::AiClose
+            | BundleHookKind::AiFailure
     )
 }
 
@@ -918,6 +921,7 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
+        BundleHookKind::AiFailure => "ai_failure",
         BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
     }

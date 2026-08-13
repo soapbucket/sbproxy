@@ -57,6 +57,7 @@ struct AiHookKinds {
     tool: bool,
     stream: bool,
     close: bool,
+    failure: bool,
     enforcing_input: bool,
     enforcing_output: bool,
     enforcing_tool: bool,
@@ -92,6 +93,7 @@ impl AiRequestExtensions {
                 tool: kind(ExtensionHookKind::AiToolCall),
                 stream: kind(ExtensionHookKind::AiStreamEvent),
                 close: kind(ExtensionHookKind::AiClose),
+                failure: kind(ExtensionHookKind::AiFailure),
                 enforcing_input: enforcing(ExtensionHookKind::AiGuardrailInput),
                 enforcing_output: enforcing(ExtensionHookKind::AiGuardrailOutput),
                 enforcing_tool: enforcing(ExtensionHookKind::AiToolCall),
@@ -258,6 +260,39 @@ impl AiRequestExtensions {
             .await?;
         }
         Ok(())
+    }
+
+    /// Report a failed upstream call to any `ai.failure` hooks.
+    ///
+    /// The one point on the AI chain that had no hook at all, so a
+    /// provider error was observed by nothing: an operator could not
+    /// rewrite it into a house-standard shape, attribute it to a
+    /// tenant, or drive a fallback from a policy.
+    ///
+    /// A verdict here cannot change the outcome. The call already
+    /// failed, and a hook that blocks a failure is asking to turn one
+    /// error into a different one, so the dispatch result is recorded
+    /// and discarded rather than propagated. That keeps this event
+    /// purely additive, which is what lets it ship ahead of hook
+    /// mutation.
+    pub(crate) async fn failure(
+        &mut self,
+        cause: sbproxy_plugin::AiFailureCause,
+        status: Option<u16>,
+        provider: Option<&str>,
+        message: &str,
+    ) {
+        if !self.kinds.failure {
+            return;
+        }
+        let _ = self
+            .dispatch(AiExtensionEventPayload::Failure {
+                cause,
+                status,
+                provider: provider.map(bounded_id),
+                message: bounded_id(message),
+            })
+            .await;
     }
 
     /// Emit close metadata once and finish runtime contexts.
@@ -575,5 +610,101 @@ mod tests {
         let block = request.close().await.unwrap_err();
         assert_eq!(block.status, 409);
         assert_eq!(block.code, "fixture_close");
+    }
+}
+
+#[cfg(test)]
+mod failure_event_tests {
+    use sbproxy_config::ExtensionBundlesConfig;
+    use sbproxy_extension::bundle::{AiExtensionChain, DynamicBundleRegistry};
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    use super::AiRequestExtensions;
+
+    fn chain(manifest: &str, javascript: &str) -> (TempDir, AiExtensionChain) {
+        let directory = TempDir::new().unwrap();
+        let bundle = directory.path().join("fixture");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(bundle.join("bundle.yaml"), manifest).unwrap();
+        std::fs::write(bundle.join("entry.js"), javascript).unwrap();
+        let registry = DynamicBundleRegistry::load(
+            &ExtensionBundlesConfig {
+                bundles_dir: Some(directory.path().display().to_string()),
+                sources: Vec::new(),
+            },
+            directory.path(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let chain = AiExtensionChain::from_registry(registry.as_ref()).unwrap();
+        (directory, chain)
+    }
+
+    #[tokio::test]
+    async fn a_failure_hook_receives_the_classified_cause_and_not_provider_prose() {
+        // The event carries a closed set so a hook branches on a cause
+        // rather than pattern-matching provider text that changes
+        // without notice. The hook asserts the shape itself and throws
+        // if it is wrong, which surfaces as a block we then ignore.
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: failure-observer\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_failure\n    type: observe_failure\n    export: observe\n",
+            r#"export function observe(input) {
+                 const e = input.event;
+                 if (e.cause !== "rate_limit") throw new Error("wrong cause: " + e.cause);
+                 if (e.status !== 429) throw new Error("wrong status");
+                 if (e.provider !== "openai") throw new Error("wrong provider");
+                 return {version:"sbproxy-envelope/v1",decision:"release"};
+               }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        request
+            .failure(
+                sbproxy_plugin::AiFailureCause::RateLimit,
+                Some(429),
+                Some("openai"),
+                "rate_limit",
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_blocking_failure_hook_cannot_change_the_outcome() {
+        // The call already failed. A hook that blocks a failure is
+        // asking to turn one error into a different one, so the verdict
+        // is recorded and discarded. This is what keeps the event purely
+        // additive and lets it ship ahead of hook mutation.
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: failure-blocker\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_failure\n    type: block_failure\n    export: refuse\n",
+            r#"export function refuse() { return {version:"sbproxy-envelope/v1",decision:"block",status:418,code:"nope",message:"nope"}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        // Returns unit: there is no verdict for the caller to act on.
+        request
+            .failure(
+                sbproxy_plugin::AiFailureCause::ServerError,
+                Some(500),
+                Some("anthropic"),
+                "server_error",
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_chain_without_a_failure_hook_does_not_dispatch() {
+        // A bundle carrying only a close hook must not see failures.
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: close-only\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_close\n    type: inspect_close\n    export: inspect\n",
+            r#"export function inspect() { throw new Error("a close hook must never see a failure event"); }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        request
+            .failure(
+                sbproxy_plugin::AiFailureCause::Timeout,
+                None,
+                None,
+                "timeout",
+            )
+            .await;
     }
 }

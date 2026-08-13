@@ -2967,6 +2967,31 @@ fn route_origin_label(ctx: &crate::context::RequestContext) -> &str {
         .map_or("", |origin| origin.origin_id.as_str())
 }
 
+/// Map the internal failure classification onto the public one.
+///
+/// The two are deliberately separate types. `sbproxy-ai` is internal and
+/// `sbproxy-plugin` is one of the three public crates, so a plugin
+/// author must be able to match a failure cause without depending on an
+/// internal crate. This is the seam that keeps that true, and it is
+/// exhaustive so a new internal cause cannot silently arrive as
+/// `Unknown` on the public surface.
+const fn ai_failure_cause(
+    cause: sbproxy_ai::failure_cause::FailureCause,
+) -> sbproxy_plugin::AiFailureCause {
+    use sbproxy_ai::failure_cause::FailureCause;
+    use sbproxy_plugin::AiFailureCause;
+    match cause {
+        FailureCause::Timeout => AiFailureCause::Timeout,
+        FailureCause::RateLimit => AiFailureCause::RateLimit,
+        FailureCause::ContextWindowExceeded => AiFailureCause::ContextWindowExceeded,
+        FailureCause::ContentPolicy => AiFailureCause::ContentPolicy,
+        FailureCause::Auth => AiFailureCause::Auth,
+        FailureCause::ServerError => AiFailureCause::ServerError,
+        FailureCause::BadRequest => AiFailureCause::BadRequest,
+        FailureCause::Unknown => AiFailureCause::Unknown,
+    }
+}
+
 /// Rewrite the request body's `model` field, if the body is an object.
 ///
 /// `body["model"] = ..` looks equivalent and is not: `serde_json`'s
@@ -7866,6 +7891,26 @@ pub(super) async fn handle_ai_proxy(
                         status,
                         &String::from_utf8_lossy(&body_bytes),
                     );
+                    // WOR-2368: `ai.failure`. The one point on the AI
+                    // chain that had no hook, so a provider error was
+                    // observed by nothing and an operator could not
+                    // rewrite it into a house shape, attribute it to a
+                    // tenant, or drive a fallback from a policy.
+                    //
+                    // The classified cause goes out, never the raw
+                    // provider body: it can carry prompt fragments back,
+                    // and a hook branching on provider prose would break
+                    // whenever that prose changed.
+                    if let Some(extensions) = ai_extensions.as_mut() {
+                        extensions
+                            .failure(
+                                ai_failure_cause(cause),
+                                Some(status),
+                                Some(provider.name.as_str()),
+                                cause.as_str(),
+                            )
+                            .await;
+                    }
                     if cause == sbproxy_ai::failure_cause::FailureCause::ContentPolicy
                         && attempt + 1 < provider_order.len()
                         && attempt + 1 < max_attempts

@@ -241,6 +241,8 @@ pub enum BundleHookKind {
     AiStreamEvent,
     /// AI stream-close hook.
     AiClose,
+    /// AI call-failure hook.
+    AiFailure,
     /// Payment lifecycle event hook.
     Payment,
     /// Proxy-Wasm HTTP lifecycle filter.
@@ -929,6 +931,7 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
+        BundleHookKind::AiFailure => "ai_failure",
         BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
     }

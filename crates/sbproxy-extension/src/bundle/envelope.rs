@@ -40,6 +40,7 @@ pub(crate) const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
+        BundleHookKind::AiFailure => "ai_failure",
         BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
     }

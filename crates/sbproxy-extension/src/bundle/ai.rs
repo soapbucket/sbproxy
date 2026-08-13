@@ -21,7 +21,7 @@ use super::{BundleLoadError, BundleRegistry, LoadedBundleHook};
 const OBSERVATION_QUEUE_CAPACITY: usize = 64;
 const MAX_PROXY_WASM_BLOCK_MESSAGE_BYTES: usize = 4 * 1024;
 
-const AI_HOOK_KINDS: [(BundleHookKind, ExtensionHookKind); 5] = [
+const AI_HOOK_KINDS: [(BundleHookKind, ExtensionHookKind); 6] = [
     (
         BundleHookKind::AiGuardrailInput,
         ExtensionHookKind::AiGuardrailInput,
@@ -36,6 +36,7 @@ const AI_HOOK_KINDS: [(BundleHookKind, ExtensionHookKind); 5] = [
         ExtensionHookKind::AiStreamEvent,
     ),
     (BundleHookKind::AiClose, ExtensionHookKind::AiClose),
+    (BundleHookKind::AiFailure, ExtensionHookKind::AiFailure),
 ];
 
 #[derive(Clone)]
