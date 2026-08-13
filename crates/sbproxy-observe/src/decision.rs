@@ -266,9 +266,9 @@ pub enum DecisionEngine {
     Lua,
     /// A JavaScript or TypeScript bundle hook.
     JavaScript,
-    /// An envelope-ABI WebAssembly bundle hook.
     /// Rego, evaluated in process on the Regorus interpreter.
     Rego,
+    /// An envelope-ABI WebAssembly bundle hook.
     Wasm,
     /// A Proxy-Wasm filter.
     ProxyWasm,
