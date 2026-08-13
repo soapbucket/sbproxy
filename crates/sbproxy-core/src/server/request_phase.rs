@@ -4013,8 +4013,7 @@ pub(super) async fn request_filter(
                 // rather than as a cache that went cold unexplained.
                 let hit = match hit {
                     Ok(Some(entry))
-                        if !entry
-                            .serves_config(origin.cache_config_fingerprint.as_str()) =>
+                        if !entry.serves_config(origin.cache_config_fingerprint.as_str()) =>
                     {
                         sbproxy_observe::metrics::record_cache(
                             origin.origin_id.as_ref(),

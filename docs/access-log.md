@@ -274,6 +274,8 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `tokens_out` | int? | Completion tokens, when known. |
 | `trace_id` | string? | W3C trace id when distributed tracing is active, for span correlation. |
 | `cache_result` | string? | One of `hit`, `miss`, `stale`, `bypass` for cached responses. |
+| `config_revision` | string? | Short hex tag of the config this node was serving when the request landed. The same value webhooks and alerts carry. During a rolling config change the fleet's lines show two of these at once, which is what separates "the rollout is half finished" from "something is broken". |
+| `cache_config_fingerprint` | string? | Digest of the serving origin's cache-relevant config, and the last segment of every response-cache key it produces. Two nodes logging different values for one origin are reading and writing separate entry sets. Absent for origins with no response cache. See [Which config changes rotate the cache](configuration.md#which-config-changes-rotate-the-cache). |
 | `upstream_host` | string? | Upstream host the proxy contacted; absent on short-circuited requests (auth deny, WAF block, cache hit). |
 | `request_headers` | object? | Captured request headers, lowercased keys. Absent when no allowlist or no matches. |
 | `response_headers` | object? | Captured response headers, same shape as `request_headers`. |

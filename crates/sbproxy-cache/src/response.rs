@@ -571,7 +571,16 @@ mod tests {
             &gzip,
             FP,
         );
-        let key_br = compute_cache_key("", "example.com", "GET", "/x", None, &QueryMode::Sort, &br, FP);
+        let key_br = compute_cache_key(
+            "",
+            "example.com",
+            "GET",
+            "/x",
+            None,
+            &QueryMode::Sort,
+            &br,
+            FP,
+        );
         assert_ne!(
             key_gzip, key_br,
             "different Accept-Encoding values must produce different cache keys"

@@ -76,7 +76,8 @@ fn a_request_modifier_moves_the_fingerprint() {
 
 #[test]
 fn the_response_cache_block_itself_moves_the_fingerprint() {
-    let longer_ttl = config_with("https://test.sbproxy.dev", "", "").replace("ttl_secs: 60", "ttl_secs: 120");
+    let longer_ttl =
+        config_with("https://test.sbproxy.dev", "", "").replace("ttl_secs: 60", "ttl_secs: 120");
     assert_ne!(
         fingerprint(&baseline()),
         fingerprint(&longer_ttl),
@@ -164,7 +165,8 @@ fn the_fingerprint_is_lowercase_hex_and_bounded() {
     let fp = fingerprint(&baseline());
     assert_eq!(fp.len(), 16, "expected 16 hex chars, got {fp:?}");
     assert!(
-        fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        fp.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "the fingerprint reaches a cache key and a Redis glob, so it must \
          stay lowercase hex: {fp:?}"
     );
