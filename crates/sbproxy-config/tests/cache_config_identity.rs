@@ -101,6 +101,23 @@ fn bumping_the_epoch_moves_the_fingerprint() {
     );
 }
 
+#[test]
+fn outbound_web_bot_auth_moves_the_fingerprint() {
+    // Signing the outbound request changes who the upstream thinks is
+    // asking, and an upstream that answers signed agents differently is
+    // the ordinary case rather than the exotic one.
+    let signed = config_with(
+        "https://test.sbproxy.dev",
+        "    outbound_web_bot_auth: true\n",
+        "",
+    );
+    assert_ne!(
+        fingerprint(&baseline()),
+        fingerprint(&signed),
+        "outbound identity changes the response the upstream returns"
+    );
+}
+
 // --- config that must not move the fingerprint ---
 
 #[test]

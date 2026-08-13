@@ -39,6 +39,9 @@
 //!   `on_request` scripts, all of which rewrite what is sent
 //! * forward rules and the fallback origin, which reroute
 //! * variables, which those rewrites interpolate
+//! * outbound credentials and Web Bot Auth signing, which change who
+//!   the upstream thinks is asking
+//! * attached extension bundles, which can carry request-side hooks
 //! * the `response_cache` block itself, including
 //!   [`ResponseCacheConfig::epoch`]
 //!
@@ -105,6 +108,20 @@ pub fn origin_cache_fingerprint(origin: &CompiledOrigin) -> CompactString {
     update_json_slice(&mut hasher, b"forward_rules", &origin.forward_rules);
     update_optional_json(&mut hasher, b"fallback", origin.fallback_origin.as_ref());
     update_variables(&mut hasher, origin.variables.as_deref());
+
+    // Outbound identity. Both change who the upstream thinks is asking,
+    // and an upstream that answers a signed or credentialed request
+    // differently is the ordinary case rather than the exotic one.
+    update_optional_json(
+        &mut hasher,
+        b"outbound_credential",
+        origin.outbound_credential.as_ref(),
+    );
+    update_field(&mut hasher, b"outbound_web_bot_auth");
+    update_field(&mut hasher, &[u8::from(origin.outbound_web_bot_auth)]);
+
+    // Attached extension bundles, which can carry request-side hooks.
+    update_extensions(&mut hasher, &origin.extensions);
 
     // The cache's own configuration, including the operator epoch.
     update_serializable(&mut hasher, b"response_cache", &origin.response_cache);
@@ -189,6 +206,33 @@ fn update_variables(
         update_field(hasher, name.as_bytes());
         match variables.get(name) {
             Some(value) => update_json(hasher, b"value", value),
+            // Unreachable: `name` came from this map's own key set.
+            None => update_field(hasher, b""),
+        }
+    }
+}
+
+/// Absorb the origin's attached extension bundles.
+///
+/// Keys are sorted for the same reason [`update_variables`] sorts its
+/// own: `HashMap` order must not move the fingerprint between two runs
+/// over one config.
+fn update_extensions(
+    hasher: &mut Sha256,
+    extensions: &std::collections::HashMap<String, serde_yaml::Value>,
+) {
+    update_field(hasher, b"extensions");
+    let mut names: Vec<&String> = extensions.keys().collect();
+    names.sort_unstable();
+    update_field(hasher, (names.len() as u64).to_le_bytes().as_slice());
+    for name in names {
+        update_field(hasher, name.as_bytes());
+        match extensions.get(name).map(serde_json::to_value) {
+            Some(Ok(json)) => update_json(hasher, b"value", &json),
+            // A YAML value with no JSON projection (a non-string map
+            // key, say). Absorb its debug form rather than skipping the
+            // field, so two configs differing only here cannot collide.
+            Some(Err(_)) => update_field(hasher, b"<unprojectable>"),
             // Unreachable: `name` came from this map's own key set.
             None => update_field(hasher, b""),
         }
