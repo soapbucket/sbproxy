@@ -4,10 +4,11 @@
 //! [`PolicyEnforcer`] for `policy: rego`.
 //!
 //! The Rego twin of the `expression` enforcer, and deliberately a thin
-//! one. Both call [`decision_views`](super::expression::decision_views)
-//! and [`build_policy_context`](sbproxy_modules::policy::expression::build_policy_context),
-//! so a request looks the same to both engines and an operator porting a
-//! decision between them is changing syntax rather than vocabulary.
+//! one. Both call the same `decision_views` and `build_policy_context`
+//! helpers, so a request looks the same to both engines and an operator
+//! porting a decision between them is changing syntax rather than
+//! vocabulary. (Neither is linked here: `decision_views` is private to
+//! this crate, and a public doc cannot link a private item.)
 //!
 //! Failure is a denial. A rule that errors, names nothing, or returns a
 //! document has not proved the request is allowed, which is the same

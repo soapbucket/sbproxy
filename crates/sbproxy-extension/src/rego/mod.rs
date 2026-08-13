@@ -24,7 +24,7 @@
 //!
 //! # The input contract
 //!
-//! `input` is built from the same [`CelContext`](crate::cel::CelContext)
+//! `input` is built from the same [`CelContext`]
 //! that `policy: expression` evaluates against, converted to JSON. That
 //! is deliberate and is the whole reason [`context_to_input`] exists
 //! rather than a second assembly path.
