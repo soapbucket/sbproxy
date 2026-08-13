@@ -57,6 +57,17 @@ use anyhow::{Context, Result};
 
 use crate::cel::{CelContext, CelValue};
 
+/// Work units between deadline checks during evaluation.
+///
+/// Regorus checks the clock every N units rather than continuously, so
+/// this trades deadline precision against the cost of the check. A
+/// thousand is fine grained enough that a runaway rule is stopped in
+/// well under a millisecond of overshoot.
+const EXECUTION_CHECK_INTERVAL: std::num::NonZeroU32 = match std::num::NonZeroU32::new(1_000) {
+    Some(interval) => interval,
+    None => unreachable!(),
+};
+
 /// A compiled Rego policy, parsed once at config load.
 ///
 /// Holds the engine with its module already added. Per-request work is
@@ -95,6 +106,7 @@ impl CompiledRego {
         site: impl Into<String>,
         module: &str,
         query: impl Into<String>,
+        budget_ms: u64,
     ) -> Result<Self> {
         let site = site.into();
         let query = query.into();
@@ -102,11 +114,55 @@ impl CompiledRego {
         engine
             .add_policy(format!("{site}.rego"), module.to_owned())
             .with_context(|| format!("{site}: invalid Rego module"))?;
-        Ok(Self {
+
+        // Bound evaluation before anything is evaluated, including the
+        // trial below. Without this a policy is unbounded on the request
+        // path: `net.cidr_expand` over an attacker-supplied header can
+        // allocate millions of strings, and it would do so while holding
+        // this engine's lock on a runtime worker.
+        engine.set_execution_timer_config(regorus::utils::limits::ExecutionTimerConfig {
+            limit: std::time::Duration::from_millis(budget_ms),
+            check_interval: EXECUTION_CHECK_INTERVAL,
+        });
+
+        let mut compiled = Self {
             site,
             query,
             engine,
-        })
+        };
+
+        // `add_policy` parses and stops. Scheduling, safety analysis,
+        // and rule resolution happen on the first evaluation, so a
+        // module with an unsafe variable, or a `query` naming no rule,
+        // parses clean and then fails every request forever. Force that
+        // work now, against an empty input, so it is a config error at
+        // boot and reload rather than an origin that 403s permanently
+        // with only a warn line to explain it.
+        compiled.prove_evaluable()?;
+        Ok(compiled)
+    }
+
+    /// Run the query once against an empty input so deferred analysis
+    /// happens at config load.
+    ///
+    /// An empty input is enough: the analyzer's work does not depend on
+    /// input values, and a rule that reads a missing binding yields
+    /// `undefined` rather than an error. So this catches the structural
+    /// faults and does not reject a policy for reading a field a real
+    /// request would carry.
+    fn prove_evaluable(&mut self) -> Result<()> {
+        self.engine
+            .set_input_json("{}")
+            .with_context(|| format!("{}: empty input rejected", self.site))?;
+        self.engine.eval_rule(self.query.clone()).with_context(|| {
+            format!(
+                "{}: rule `{}` could not be evaluated. The module parsed, so this is a \
+                     semantic fault: an unsafe variable, or a query naming a rule the module \
+                     does not define",
+                self.site, self.query
+            )
+        })?;
+        Ok(())
     }
 
     /// The config site this policy came from.
@@ -227,16 +283,20 @@ allow if {
 
     #[test]
     fn a_malformed_module_is_a_config_error_naming_the_site() {
-        let error =
-            CompiledRego::compile("policy `rego` (authz)", "this is not rego !!!", "data.x")
-                .expect_err("a malformed module must not compile");
+        let error = CompiledRego::compile(
+            "policy `rego` (authz)",
+            "this is not rego !!!",
+            "data.x",
+            50,
+        )
+        .expect_err("a malformed module must not compile");
         assert!(error.to_string().contains("policy `rego` (authz)"));
     }
 
     #[test]
     fn a_rule_decides_from_the_shared_context() {
         let mut policy =
-            CompiledRego::compile("policy `rego`", ALLOW_ENGINEERS, "data.sbproxy.allow")
+            CompiledRego::compile("policy `rego`", ALLOW_ENGINEERS, "data.sbproxy.allow", 50)
                 .expect("module compiles");
         let mut ctx = context();
         assert!(
@@ -284,9 +344,13 @@ package sbproxy
 
 allow := {"reason": "because"}
 "#;
-        let mut policy =
-            CompiledRego::compile("policy `rego`", RETURNS_A_DOCUMENT, "data.sbproxy.allow")
-                .expect("module compiles");
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            RETURNS_A_DOCUMENT,
+            "data.sbproxy.allow",
+            50,
+        )
+        .expect("module compiles");
         let error = policy
             .eval_bool(&context())
             .expect_err("a document is not a verdict");
@@ -297,13 +361,36 @@ allow := {"reason": "because"}
     }
 
     #[test]
-    fn a_missing_rule_is_an_error_rather_than_a_silent_allow() {
-        let mut policy =
-            CompiledRego::compile("policy `rego`", ALLOW_ENGINEERS, "data.sbproxy.nonexistent")
-                .expect("module compiles");
-        policy
-            .eval_bool(&context())
-            .expect_err("a query naming no rule must not evaluate to a verdict");
+    fn a_missing_rule_is_refused_at_load_rather_than_denying_forever() {
+        // Now a *load* error rather than a runtime one: a query naming
+        // no rule used to parse clean and then deny every request
+        // forever, with a warn line as the only explanation.
+        CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.nonexistent",
+            50,
+        )
+        .expect_err("a query naming no rule must not load");
+    }
+
+    #[test]
+    fn a_module_that_parses_but_cannot_be_analysed_is_refused_at_load() {
+        // `add_policy` parses and stops; scheduling and safety analysis
+        // run on first evaluation. Without the trial evaluation in
+        // `compile`, this module booted fine and then denied every
+        // request to its origin permanently.
+        const UNSAFE_VAR: &str = r#"
+package sbproxy
+
+allow if {
+    x == 1
+}
+"#;
+        let error = CompiledRego::compile("policy `rego`", UNSAFE_VAR, "data.sbproxy.allow", 50)
+            .expect_err("an unsafe variable must not load");
+        let message = format!("{error:#}");
+        assert!(message.contains("semantic fault"), "{message}");
     }
 
     #[test]

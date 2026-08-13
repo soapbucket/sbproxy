@@ -46,6 +46,14 @@ fn default_query() -> String {
     "data.sbproxy.allow".to_owned()
 }
 
+/// Default evaluation budget, matching the bundle sandbox default.
+///
+/// Every other scripting engine bounds its time; this is the fifth and
+/// must not be the one that does not.
+const fn default_budget_ms() -> u64 {
+    50
+}
+
 /// Default refusal status, matching `policy: expression`.
 const fn default_deny_status() -> u16 {
     403
@@ -53,7 +61,7 @@ const fn default_deny_status() -> u16 {
 
 /// Default refusal message, matching `policy: expression`.
 fn default_deny_msg() -> String {
-    "Forbidden by policy".to_owned()
+    "forbidden by policy".to_owned()
 }
 
 /// A Rego policy attached to an origin.
@@ -66,6 +74,8 @@ pub struct RegoPolicy {
     pub deny_status: u16,
     /// Message returned when the rule denies.
     pub deny_message: String,
+    /// Wall-clock budget for one evaluation.
+    pub budget_ms: u64,
     /// The parsed module.
     ///
     /// `Mutex` because Regorus threads `input` through the engine rather
@@ -103,10 +113,18 @@ impl RegoPolicy {
             deny_status: u16,
             #[serde(default = "default_deny_msg")]
             deny_message: String,
+            #[serde(default = "default_budget_ms")]
+            budget_ms: u64,
         }
 
         let cfg: Config = serde_json::from_value(value)?;
-        Self::new(cfg.module, cfg.query, cfg.deny_status, cfg.deny_message)
+        Self::new(
+            cfg.module,
+            cfg.query,
+            cfg.deny_status,
+            cfg.deny_message,
+            cfg.budget_ms,
+        )
     }
 
     /// Build from parts, parsing the module once.
@@ -120,13 +138,20 @@ impl RegoPolicy {
         query: String,
         deny_status: u16,
         deny_message: String,
+        budget_ms: u64,
     ) -> anyhow::Result<Self> {
-        let compiled = CompiledRego::compile("policy `rego`", &module, query.clone())?;
+        anyhow::ensure!(
+            budget_ms > 0,
+            "policy `rego`: budget_ms must be greater than zero; a zero budget would refuse \
+             every request before the rule ran"
+        );
+        let compiled = CompiledRego::compile("policy `rego`", &module, query.clone(), budget_ms)?;
         Ok(Self {
             module,
             query,
             deny_status,
             deny_message,
+            budget_ms,
             compiled: Arc::new(Mutex::new(compiled)),
         })
     }
@@ -209,16 +234,32 @@ allow if {
     }
 
     #[test]
-    fn an_evaluation_failure_denies_rather_than_admits() {
-        // The posture that matters. A rule naming nothing is a policy
-        // that never said yes, and admitting on that would turn an
-        // authoring mistake into an open door.
-        let policy = RegoPolicy::from_config(serde_json::json!({
+    fn a_query_naming_no_rule_is_refused_at_load() {
+        // This used to load clean and deny every request forever. The
+        // engine now proves the query evaluable at compile time, so an
+        // authoring mistake is a config error rather than a silent
+        // permanent outage on that origin.
+        RegoPolicy::from_config(serde_json::json!({
             "module": MODULE,
             "query": "data.sbproxy.no_such_rule"
         }))
-        .expect("policy compiles");
-        assert!(!policy.evaluate(&context("GET")));
+        .expect_err("a query naming no rule must not load");
+    }
+
+    #[test]
+    fn a_zero_budget_is_refused_rather_than_denying_everything() {
+        RegoPolicy::from_config(serde_json::json!({
+            "module": MODULE,
+            "budget_ms": 0
+        }))
+        .expect_err("a zero budget would refuse every request before the rule ran");
+    }
+
+    #[test]
+    fn the_budget_defaults_and_is_carried() {
+        let policy = RegoPolicy::from_config(serde_json::json!({ "module": MODULE }))
+            .expect("policy compiles");
+        assert_eq!(policy.budget_ms, 50);
     }
 
     #[test]
