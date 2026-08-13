@@ -113,9 +113,8 @@ impl CompiledRego {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy(format!("{site}.rego"), module.to_owned())
-            .map_err(|error| {
+            .inspect_err(|_| {
                 sbproxy_observe::metrics::record_script_compile("rego", "parse_error");
-                error
             })
             .with_context(|| format!("{site}: invalid Rego module"))?;
 
