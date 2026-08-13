@@ -23,13 +23,15 @@
 //!
 //! The obvious implementation asks the `cel` crate for the variables a
 //! program references and checks them against a per-site set. It has no
-//! teeth here. Only eight roots exist (`agent`, `connection`,
-//! `envelope`, `features`, `jwt`, `principal`, `request`, `response`),
-//! and every interesting difference between the sites is a *field of
-//! `request`*: `trust_tier`, `tls`, `ml_classification`, `aipref`,
-//! `kya`, `headless_signal` are all stamped into that one map by
-//! separate `populate_*` calls. A root-level check sees `request` on
-//! both sides and passes everything.
+//! teeth here. The shared builders expose only eight roots (`agent`,
+//! `connection`, `envelope`, `features`, `jwt`, `principal`, `request`,
+//! `response`), and every interesting difference between the sites is a
+//! *field of `request`*: `trust_tier`, `tls`, `ml_classification`,
+//! `aipref`, `kya`, `headless_signal` are all stamped into that one map
+//! by separate `populate_*` calls. A root-level check sees `request` on
+//! both sides and passes everything. (`custom_log` is the exception
+//! that proves it, with seven roots of its own and a `request` that is
+//! not the shared one.)
 //!
 //! So [`referenced_paths`] walks the AST itself and reports dotted paths
 //! two levels deep.
@@ -56,11 +58,19 @@ use cel::common::ast::{EntryExpr, Expr, IdedExpr};
 
 /// A config site that accepts a CEL expression.
 ///
-/// Each variant declares the bindings its site populates. Adding a site
-/// means adding a variant, and `surface_contract_matches_runtime_context`
-/// in this module's tests fails until the declaration matches what the
-/// site's context builder actually produces.
+/// Each variant declares the bindings its site populates.
+///
+/// The declarations are hand-written, and only two of them are held to
+/// the code by a test: `REQUEST_BASE` against `build_request_context`,
+/// and [`Self::PolicyAssertion`] against `build_response_context`. The
+/// per-site `populate_*` lists are not, because the sequence of
+/// `populate_*` calls lives at the call site rather than in this crate.
+/// So when you add a `populate_*` call to a site, add its binding here
+/// in the same change. Nothing will fail if you forget; the binding
+/// will simply be refused, and the operator will be told to use
+/// something the config already supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CelSurface {
     /// `policy: expression`, the widest surface.
     PolicyExpression,
@@ -116,9 +126,14 @@ impl CelSurface {
     pub fn available(self) -> Vec<&'static str> {
         let mut paths: Vec<&'static str> = match self {
             Self::PolicyExpression => vec![
-                "envelope",
+                "agent",
                 "features",
                 "principal",
+                // Stamped by `populate_agent_detect_namespace`, which is
+                // a different map from the `agent_*` scalars below.
+                // `request.agent.headless_score` is the documented
+                // headless-detection gate.
+                "request.agent",
                 "request.agent_class",
                 "request.agent_id",
                 "request.agent_id_source",
@@ -130,9 +145,17 @@ impl CelSurface {
                 "request.ml_classification",
                 "request.tls",
                 "request.trust_tier",
-                "agent",
             ],
             Self::PolicyAssertion => vec!["request.trust_tier", "response"],
+            // Deliberately without `REQUEST_BASE`. The transform's
+            // request half is a placeholder: `build_response_eval_context`
+            // calls `build_request_context("GET", "/", &HeaderMap::new(),
+            // None, None, "")`, so `request.method` is always `"GET"`,
+            // the headers are always empty, and `connection.remote_ip`
+            // is a missing key that errors. Declaring those would
+            // promise bindings that silently evaluate to a placeholder,
+            // which is the failure this module exists to end rather
+            // than one to inherit.
             Self::TransformCel => vec![
                 "agent",
                 "request.agent_class",
@@ -148,13 +171,9 @@ impl CelSurface {
             // Both of these run through `rate_limit_key_from_cel`, so
             // one list serves them. Splitting it would let the two
             // drift apart while the evaluator stayed shared.
-            Self::RateLimitKey | Self::WafPersistent => vec![
-                "envelope",
-                "features",
-                "request.key_id",
-                "request.name",
-                "request.weight",
-            ],
+            Self::RateLimitKey | Self::WafPersistent => {
+                vec!["envelope", "features", "request.key_id"]
+            }
             // custom_log builds its own JSON context rather than using
             // the shared builders, which is why its shape is unlike the
             // rest. It is the only site with `attribution` and the only
@@ -183,13 +202,15 @@ impl CelSurface {
         paths
     }
 
-    /// Whether this site's context comes from `build_request_context`
-    /// (or `build_response_context`, which layers on top of it).
+    /// Whether this site builds a real request context with the
+    /// request's own method, path, headers, and peer.
     ///
-    /// `custom_log` is the one site that does not: it assembles a
-    /// `serde_json::Value` of its own.
+    /// Two sites do not, for different reasons. `custom_log` assembles
+    /// a `serde_json::Value` of its own and never calls the shared
+    /// builder. `transform: cel` calls it with placeholder arguments,
+    /// so the bindings exist but describe no actual request.
     const fn uses_shared_request_context(self) -> bool {
-        !matches!(self, Self::CustomLogField)
+        !matches!(self, Self::CustomLogField | Self::TransformCel)
     }
 
     /// Refuse an expression that reaches for a binding this site does
@@ -289,6 +310,17 @@ fn walk(node: &IdedExpr, bound: &mut Vec<String>, found: &mut BTreeSet<String>) 
             walk(&select.operand, bound, found);
         }
         Expr::Call(call) => {
+            // `request["trust_tier"]` parses as a call to `_[_]`, not as
+            // a Select, so without this it would report a bare
+            // `request` and slip through: every surface populates some
+            // `request.*`, and a bare root matches any of them. Bracket
+            // notation is what the header docs steer operators toward,
+            // so the hole would have been the common shape rather than
+            // an exotic one.
+            if let Some(path) = index_path(call, bound) {
+                found.insert(path);
+                return;
+            }
             if let Some(target) = &call.target {
                 walk(target, bound, found);
             }
@@ -358,6 +390,32 @@ fn select_path(node: &IdedExpr, bound: &[String]) -> Option<String> {
         // Deeper than two segments: report the first two and stop, since
         // that is the depth the surface contract is written at.
         Expr::Select(_) => select_path(&select.operand, bound),
+        _ => None,
+    }
+}
+
+/// The `root.key` path for `root["key"]`, when the index is a string
+/// literal over a free identifier.
+///
+/// `None` for anything else, including a computed index like
+/// `request[header_name]`, whose key is not knowable at config load.
+/// Those fall through to the ordinary walk and report the bare root.
+fn index_path(call: &cel::common::ast::CallExpr, bound: &[String]) -> Option<String> {
+    if call.func_name != "_[_]" {
+        return None;
+    }
+    // `_[_]` is a global call, so operand and index are both args.
+    let [operand, index] = call.args.as_slice() else {
+        return None;
+    };
+    let Expr::Ident(root) = &operand.expr else {
+        return None;
+    };
+    let root = free_root(root, bound)?;
+    match &index.expr {
+        Expr::Literal(cel::common::ast::LiteralValue::String(key)) => {
+            Some(format!("{root}.{}", key.inner()))
+        }
         _ => None,
     }
 }
@@ -579,6 +637,98 @@ mod tests {
                  declare, so an expression reading it would be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_agent_detect_map_is_a_policy_expression_binding() {
+        // Regression for a refusal that would have broken production.
+        // `populate_agent_detect_namespace` stamps `request.agent.*`,
+        // which is a different map from the `request.agent_*` scalars,
+        // and `request.agent.headless_score` is the gate documented in
+        // headless-detection.md. Omitting it here refused a documented
+        // config at load, and no CI lane would have caught it: the
+        // reproduction lives in an e2e test and in a doc YAML, neither
+        // of which the PR lane compiles.
+        for source in [
+            "request.agent.score < 80",
+            "request.agent.headless_score < 50",
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::PolicyExpression
+                .validate("policy `expression`", source, &program)
+                .expect("the agent-detect map is populated for policy expressions");
+        }
+    }
+
+    #[test]
+    fn the_transform_surface_does_not_promise_a_placeholder_request() {
+        // `build_response_eval_context` builds its request half from
+        // literals, so these evaluate to a placeholder rather than to
+        // the request. Refusing is the honest answer; declaring them
+        // would hand the operator a binding that always says "GET".
+        for source in [
+            r#"request.method == "POST""#,
+            r#"request.headers["x-tenant"] != """#,
+            r#"connection.remote_ip != """#,
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::TransformCel
+                .validate("transform `cel`", source, &program)
+                .expect_err("the transform request context is a placeholder");
+        }
+    }
+
+    #[test]
+    fn the_rate_limit_key_declares_only_the_field_that_exists() {
+        // `populate_resolved_key_id` inserts `key_id` and nothing else.
+        // `request.name` and `request.weight` were declared for a while
+        // and exist nowhere in the codebase; accepting them meant a key
+        // that loaded clean and then bucketed every request under
+        // `__cel_key_error__`, which is the exact bug being fixed.
+        let program = cel::Program::compile("request.key_id").expect("compiles");
+        CelSurface::RateLimitKey
+            .validate("policy `rate_limiting` key", "request.key_id", &program)
+            .expect("key_id is populated");
+
+        for source in ["request.weight", "request.name"] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::RateLimitKey
+                .validate("policy `rate_limiting` key", source, &program)
+                .expect_err("no populate call stamps this");
+        }
+    }
+
+    #[test]
+    fn bracket_notation_is_checked_like_a_dotted_path() {
+        // `request["headless_signal"]` parses as a call to `_[_]`, not
+        // as a Select, so a walk that only understood Select reported a
+        // bare `request` and let it through. Bracket notation is what
+        // the header documentation steers operators toward, so this was
+        // the common shape rather than an exotic one.
+        assert_eq!(
+            paths(r#"request["trust_tier"]"#),
+            ["request.trust_tier"],
+            "a string index should resolve to the same path as a select"
+        );
+        let source = r#"request["headless_signal"]"#;
+        let program = cel::Program::compile(source).expect("compiles");
+        CelSurface::PolicyExpression
+            .validate("policy `expression`", source, &program)
+            .expect_err("bracket notation must not bypass the check");
+    }
+
+    #[test]
+    fn a_computed_index_falls_back_to_the_root_rather_than_guessing() {
+        // The key is not knowable at config load, so the indexed path
+        // cannot be resolved and the bare root is reported instead.
+        // That keeps it permissive, which is the right direction to
+        // fail when the alternative is refusing a config over a key we
+        // cannot read. The expression *inside* the brackets is still a
+        // real lookup and is still checked.
+        assert_eq!(
+            paths(r#"request[request.method]"#),
+            ["request", "request.method"]
+        );
     }
 
     #[test]

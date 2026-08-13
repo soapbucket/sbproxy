@@ -20,6 +20,7 @@ use cel::objects::Key;
 pub use cel::Value as CelRawValue;
 pub use compiled::CompiledCel;
 pub use functions::{set_tls_fingerprint_matcher, TlsFingerprintMatcher};
+pub use surface::CelSurface;
 
 // --- Types ---
 

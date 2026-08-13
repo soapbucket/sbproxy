@@ -20,8 +20,7 @@
 
 use serde::Deserialize;
 
-use sbproxy_extension::cel::surface::CelSurface;
-use sbproxy_extension::cel::CompiledCel;
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 
 /// Verdict recorded when a compiled assertion fails to evaluate.
 ///

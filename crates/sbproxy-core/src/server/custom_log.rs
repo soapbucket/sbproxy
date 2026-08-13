@@ -35,8 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use pingora_proxy::Session;
-use sbproxy_extension::cel::surface::CelSurface;
-use sbproxy_extension::cel::CompiledCel;
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 
 use crate::context::RequestContext;
 

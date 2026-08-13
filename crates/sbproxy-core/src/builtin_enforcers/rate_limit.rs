@@ -51,8 +51,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use compact_str::CompactString;
-use sbproxy_extension::cel::surface::CelSurface;
-use sbproxy_extension::cel::CompiledCel;
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 use sbproxy_modules::policy::RateLimitPolicy;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 

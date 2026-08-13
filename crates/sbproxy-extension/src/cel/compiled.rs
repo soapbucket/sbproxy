@@ -92,7 +92,16 @@ impl CompiledCel {
     /// `sbproxy-core`).
     ///
     /// Returns an error naming the site and quoting the source when the
-    /// expression does not parse.
+    /// expression does not parse, or when it reads a binding `surface`
+    /// does not populate.
+    ///
+    /// Those two failures are separate series on
+    /// `sbproxy_script_compile_total{engine="cel"}`. A refusal here
+    /// parsed successfully, so it counts once under `result="ok"` from
+    /// [`CelEngine::compile`] and once under `result="surface_error"`.
+    /// The number of expressions that actually loaded is `ok` minus
+    /// `surface_error`; alert on the latter directly rather than
+    /// inferring it from a dip in the former.
     pub fn compile(surface: CelSurface, site: impl Into<String>, source: &str) -> Result<Self> {
         let site = site.into();
         let engine = CelEngine::new();
@@ -101,7 +110,10 @@ impl CompiledCel {
             .map_err(|e| anyhow::anyhow!("{site}: invalid CEL expression {source:?}: {e}"))?;
         surface
             .validate(&site, source, expr.program())
-            .map_err(|message| anyhow::anyhow!("{message}"))?;
+            .map_err(|message| {
+                sbproxy_observe::metrics::record_script_compile("cel", "surface_error");
+                anyhow::anyhow!("{message}")
+            })?;
         COMPILE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
         Ok(Self { site, engine, expr })
     }

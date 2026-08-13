@@ -38,8 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use sbproxy_extension::cel::surface::CelSurface;
-use sbproxy_extension::cel::CompiledCel;
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 use sbproxy_platform::storage::KVStore;
 use serde::Deserialize;
 

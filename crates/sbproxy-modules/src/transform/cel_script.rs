@@ -98,8 +98,7 @@
 use std::time::Duration;
 
 use http::HeaderMap;
-use sbproxy_extension::cel::surface::CelSurface;
-use sbproxy_extension::cel::{CelValue, CompiledCel};
+use sbproxy_extension::cel::{CelSurface, CelValue, CompiledCel};
 
 /// Re-exported so `sbproxy-core`'s header-mutating call site can build
 /// the per-request TLS view it threads into

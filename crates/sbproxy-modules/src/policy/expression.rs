@@ -18,8 +18,7 @@
 
 use std::sync::Arc;
 
-use sbproxy_extension::cel::surface::CelSurface;
-use sbproxy_extension::cel::CompiledCel;
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 use serde::Deserialize;
 
 use crate::policy::aipref::AiprefSignal;

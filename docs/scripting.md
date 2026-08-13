@@ -205,17 +205,18 @@ Within a populated namespace, missing fields render as zero values (`""`, `0`, `
 
 ### 3.2 What each config site offers
 
-Six places in a config take a CEL expression, and they do not all see the same context. A `transform: cel` runs after the headless detector, so it gets `request.headless_signal`; a `policy: expression` runs before the response exists, so it has no `response`. The table is the whole contract.
+Six places in a config take a CEL expression, and they do not all see the same context. A `transform: cel` runs after the headless detector, so it gets `request.headless_signal`; a `policy: expression` runs before the response exists, so it has no `response`.
 
 | Binding | `policy: expression` | `policy: assertion` | `transform: cel` | `rate_limit.key` | `custom_log` field | `waf` `track_by: cel` |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
-| `request.method`, `.path`, `.host`, `.query`, `.headers` | yes | yes | yes | yes | yes | yes |
-| `request.time`, `.unix_nanos` | yes | yes | yes | yes | no | yes |
-| `connection.remote_ip` | yes | yes | yes | yes | no | yes |
-| `jwt.claims` | yes | yes | yes | yes | no | yes |
+| `request.method`, `.path`, `.host`, `.query`, `.headers` | yes | yes | no | yes | yes | yes |
+| `request.time`, `.unix_nanos` | yes | yes | no | yes | no | yes |
+| `connection.remote_ip` | yes | yes | no | yes | no | yes |
+| `jwt.claims` | yes | yes | no | yes | no | yes |
 | `request.trust_tier` | yes | yes | no | no | no | no |
 | `request.tls` | yes | no | yes | no | no | no |
-| `request.agent_class` and the other `agent_*` fields | yes | no | yes | no | no | no |
+| `request.agent_class` and the other `agent_*` scalars | yes | no | yes | no | no | no |
+| `request.agent` (detector map: `.score`, `.headless_score`, ...) | yes | no | no | no | no | no |
 | `agent` | yes | no | yes | no | no | no |
 | `request.aipref` | yes | no | no | no | no | no |
 | `request.kya` | yes | no | no | no | no | no |
@@ -223,23 +224,31 @@ Six places in a config take a CEL expression, and they do not all see the same c
 | `principal` | yes | no | no | no | no | no |
 | `request.headless_signal` | no | no | yes | no | no | no |
 | `response` | no | yes | yes | no | `response.status` only | no |
-| `envelope`, `features` | yes | no | no | yes | no | yes |
-| `request.key_id`, `.name`, `.weight` | no | no | no | yes | no | yes |
+| `features` | yes | no | no | yes | no | yes |
+| `envelope` | no | no | no | yes | no | yes |
+| `request.key_id` | no | no | no | yes | no | yes |
 | `tenant_id`, `provider`, `model`, `tokens_in`, `tokens_out`, `client_ip`, `attribution` | no | no | no | no | yes | no |
 
-Two rows are easy to misread.
+Three columns are easy to misread.
+
+The `transform: cel` column has no request bindings at all, which surprises people. A response transform builds its request half from placeholders rather than from the request, so `request.method` there would always read `"GET"` no matter what the client sent. Rather than hand you a binding that quietly lies, the config refuses it. If you need to branch a response header on the request, decide it in a `policy: expression` and carry the result forward.
 
 The `custom_log` column looks eccentric because it is. That site builds its own context rather than sharing the request builder, which is why it is the only one with `attribution` and token counts, and the only one whose `request` has no `time`. Treat it as its own vocabulary.
 
 The `waf` column is identical to `rate_limit.key` because both run through the same evaluator. If you are keying a persistent block, write it as you would a rate-limit key.
 
-A binding marked `no` is refused when the config loads. The message names the site and lists what that site does provide, so the fix is usually visible without opening this page:
+Two related surfaces are not in the table. `ai_policy.expression` evaluates over a single `ai` namespace and is documented in [ai-policy-cel.md](ai-policy-cel.md); it does not share this context and is not checked against it. Forward rules are not CEL at all (see [3.5](#35-forward-rule-matchers-not-cel)).
+
+A binding marked `no` is refused when the config loads, whether you write it as `request.trust_tier` or as `request["trust_tier"]`. The message names the site and lists what that site does provide, so the fix is usually visible without opening this page:
 
 ```text
-origin `api`: policy `expression`: expression "request.headless_signal.detected"
-references request.headless_signal, which policy `expression` does not provide.
-Available here: agent, connection.remote_ip, envelope, features, jwt.claims,
-principal, request.agent_class, ..., request.trust_tier
+origin `api`: invalid policy config
+
+Caused by:
+    policy `expression`: expression "request.headless_signal.detected" references
+    request.headless_signal, which policy `expression` does not provide. Available
+    here: agent, connection.remote_ip, features, jwt.claims, principal,
+    request.agent, request.agent_class, ..., request.unix_nanos
 ```
 
 ### 3.3 Built-in functions
