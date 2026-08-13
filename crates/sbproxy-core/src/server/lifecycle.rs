@@ -4696,6 +4696,7 @@ origins:
         let origin = CompiledOrigin {
             hostname: compact_str::CompactString::new("api.acme.example.com"),
             origin_id: compact_str::CompactString::new("api-acme"),
+            cache_config_fingerprint: compact_str::CompactString::default(),
             workspace_id: compact_str::CompactString::default(),
             tenant_id: compact_str::CompactString::new("acme"),
             action_config: serde_json::Value::Null,

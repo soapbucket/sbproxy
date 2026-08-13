@@ -29,6 +29,15 @@ pub struct CompiledOrigin {
     pub hostname: CompactString,
     /// Stable identifier for this origin within its workspace.
     pub origin_id: CompactString,
+    /// Digest of the config that decides what this origin's upstream
+    /// returns, folded into every response-cache key it produces.
+    ///
+    /// Keeps a node from reading entries a differently-configured node
+    /// wrote out of a shared store during a rolling change. Computed
+    /// once here by [`crate::cache_identity::origin_cache_fingerprint`];
+    /// the request path only reads it. See that module for what the
+    /// projection covers and why it is narrow.
+    pub cache_config_fingerprint: CompactString,
     /// Workspace that owns this origin (used for multi-tenant isolation).
     pub workspace_id: CompactString,
     /// WOR-1053: tenant this origin resolves to. `__default__` for

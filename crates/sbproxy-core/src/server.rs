@@ -1097,15 +1097,19 @@ fn collect_vary_headers(
 /// Build the canonical response-cache key for a request.
 ///
 /// `workspace` is the empty string in OSS / single-tenant mode; the
-/// enterprise crate populates it. The result is the colon-delimited
+/// enterprise crate populates it. `config_fp` is the serving origin's
+/// [`cache_config_fingerprint`]. The result is the colon-delimited
 /// shape documented at the top of `sbproxy_cache::response`.
+///
+/// [`cache_config_fingerprint`]: sbproxy_config::CompiledOrigin::cache_config_fingerprint
 fn build_response_cache_key(
     workspace: &str,
     hostname: &str,
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
+    config_fp: &str,
 ) -> String {
-    build_response_cache_key_with_plan(workspace, hostname, req, cfg, None)
+    build_response_cache_key_with_plan(workspace, hostname, req, cfg, config_fp, None)
 }
 
 /// As [`build_response_cache_key`], with an optional `cache.key` plan
@@ -1126,6 +1130,7 @@ pub(crate) fn build_response_cache_key_with_plan(
     hostname: &str,
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
+    config_fp: &str,
     plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
 ) -> String {
     let method = req.method.as_str();
@@ -1173,7 +1178,9 @@ pub(crate) fn build_response_cache_key_with_plan(
             },
         ));
     }
-    sbproxy_cache::compute_cache_key(workspace, hostname, method, path, query, &mode, &vary)
+    sbproxy_cache::compute_cache_key(
+        workspace, hostname, method, path, query, &mode, &vary, config_fp,
+    )
 }
 
 /// HTTP client used by the stale-while-revalidate path. Reused across

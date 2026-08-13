@@ -3418,9 +3418,13 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         config.connection_pool.as_ref(),
     )?;
 
-    Ok(CompiledOrigin {
+    let mut compiled = CompiledOrigin {
         hostname: CompactString::new(hostname),
         origin_id: CompactString::new(hostname),
+        // Filled in below, once every field the projection reads is in
+        // place. Deriving it here would mean listing those fields
+        // twice and letting the two copies drift.
+        cache_config_fingerprint: CompactString::default(),
         workspace_id: CompactString::default(),
         tenant_id,
         action_config: config.action,
@@ -3498,7 +3502,14 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         attestation: config.attestation,
         // WOR-1043 PR3: origin-scope observability overrides.
         observability: config.observability,
-    })
+    };
+
+    // WOR-2407: name the config this origin's cached entries belong to,
+    // so a shared store cannot hand them to a node running a different
+    // one. Computed once, here; the request path only reads it.
+    compiled.cache_config_fingerprint = crate::cache_identity::origin_cache_fingerprint(&compiled);
+
+    Ok(compiled)
 }
 
 /// Returns true when the JSON value's `type` field equals `wanted`.

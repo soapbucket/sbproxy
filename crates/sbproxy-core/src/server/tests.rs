@@ -4501,6 +4501,10 @@ fn cache_key_request(headers: &[(&'static str, &'static str)]) -> pingora_http::
     req
 }
 
+/// Stand-in origin cache-config fingerprint. These tests are about the
+/// vary and `cache.key` plan segments, so they hold it constant.
+const FP: &str = "00112233445566ff";
+
 fn cache_cfg_with_vary(vary: &[&str]) -> sbproxy_config::ResponseCacheConfig {
     sbproxy_config::ResponseCacheConfig {
         enabled: true,
@@ -4519,9 +4523,9 @@ fn a_declining_plan_keys_identically_to_no_plan_at_all() {
     let cfg = cache_cfg_with_vary(&["x-tier", "accept-encoding"]);
     let empty = sbproxy_cache::cache_event::CacheKeyPlan::default();
 
-    let without = super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, None);
+    let without = super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, None);
     let with_empty =
-        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, Some(&empty));
+        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, Some(&empty));
     assert_eq!(without, with_empty);
 }
 
@@ -4537,8 +4541,8 @@ fn the_operators_static_vary_order_is_not_reordered_by_a_plan() {
     let reversed = cache_cfg_with_vary(&["accept-encoding", "x-tier"]);
 
     assert_ne!(
-        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, None),
-        super::build_response_cache_key_with_plan("", "api.local", &req, &reversed, None),
+        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, None),
+        super::build_response_cache_key_with_plan("", "api.local", &req, &reversed, FP, None),
         "config order is part of the key contract; this pins that we did not silently \
          normalize it"
     );
@@ -4564,11 +4568,11 @@ fn a_plan_dimension_actually_changes_the_key() {
     let absent = cache_key_request(&[]);
 
     let key_gold =
-        super::build_response_cache_key_with_plan("", "api.local", &gold, &cfg, Some(&plan));
+        super::build_response_cache_key_with_plan("", "api.local", &gold, &cfg, FP, Some(&plan));
     let key_free =
-        super::build_response_cache_key_with_plan("", "api.local", &free, &cfg, Some(&plan));
+        super::build_response_cache_key_with_plan("", "api.local", &free, &cfg, FP, Some(&plan));
     let key_absent =
-        super::build_response_cache_key_with_plan("", "api.local", &absent, &cfg, Some(&plan));
+        super::build_response_cache_key_with_plan("", "api.local", &absent, &cfg, FP, Some(&plan));
 
     assert_ne!(key_gold, key_free, "two tiers must not share an entry");
     assert_ne!(
@@ -4591,6 +4595,7 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
         "api.local",
         &cache_key_request(&[]),
         &cfg,
+        FP,
         None,
     );
     for name in sbproxy_cache::cache_event::CACHE_VARY_HOST_DIMENSIONS {
@@ -4609,6 +4614,7 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
             "api.local",
             &cache_key_request(&[]),
             &cfg,
+            FP,
             Some(&plan),
         );
         assert_ne!(

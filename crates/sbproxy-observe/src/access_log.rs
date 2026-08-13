@@ -31,6 +31,26 @@ pub struct AccessLogEntry {
     pub request_id: String,
     /// Origin hostname that handled the request.
     pub origin: String,
+    /// Short hex tag of the config revision this node was serving when
+    /// the request landed (WOR-2407).
+    ///
+    /// The same value webhooks and alerts carry. During a rolling
+    /// change the fleet's log stream shows two of these at once, which
+    /// is what turns "some requests look wrong" into "the ones on the
+    /// old revision look wrong". Absent when no config has been loaded,
+    /// which in practice is only the synthetic test pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
+    /// Digest of the serving origin's cache-relevant config
+    /// (WOR-2407).
+    ///
+    /// The last segment of every response-cache key this origin
+    /// produces. Two nodes logging different values for one origin are
+    /// reading and writing separate entry sets, so this is what
+    /// explains a cache that went cold on deploy without anything
+    /// having failed. Absent for origins with no response cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_config_fingerprint: Option<String>,
     /// HTTP method (GET, POST, ...).
     pub method: String,
     /// Request path (without query string; see `query`).
@@ -612,6 +632,8 @@ impl Default for AccessLogEntry {
             timestamp: String::new(),
             request_id: String::new(),
             origin: String::new(),
+            config_revision: None,
+            cache_config_fingerprint: None,
             method: String::new(),
             path: String::new(),
             query: None,
@@ -931,6 +953,8 @@ mod tests {
             timestamp: "2026-04-16T12:00:00Z".to_string(),
             request_id: "abc123".to_string(),
             origin: "api.example.com".to_string(),
+            config_revision: None,
+            cache_config_fingerprint: None,
             method: "GET".to_string(),
             path: "/health".to_string(),
             query: None,

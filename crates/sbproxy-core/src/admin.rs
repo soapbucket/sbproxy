@@ -7450,6 +7450,7 @@ origins:
             CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
+                cache_config_fingerprint: CompactString::default(),
                 workspace_id: CompactString::default(),
                 tenant_id: compact_str::CompactString::const_new("__default__"),
                 action_config: serde_json::json!({"type": "noop"}),

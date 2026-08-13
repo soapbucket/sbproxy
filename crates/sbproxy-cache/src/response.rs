@@ -4,7 +4,7 @@
 //! shared by both the runtime cache lookup path (in `sbproxy-core`) and
 //! the unit tests below. The key format is:
 //!
-//! `<workspace>:<hostname>:<method>:<path>:<query-canonical>:<vary-fingerprint>`
+//! `<workspace>:<hostname>:<method>:<path>:<query-canonical>:<vary-fingerprint>:<config-fingerprint>`
 //!
 //! Each segment is colon-delimited so that key collisions across
 //! tenants, hostnames, methods, paths, query variants, and Vary
@@ -12,6 +12,13 @@
 //! matching. The `vary-fingerprint` is a stable hash of the
 //! lowercased header name plus value pairs, so cardinality is bounded
 //! even when callers send long Vary header values.
+//!
+//! The `config-fingerprint` names the origin config that produced the
+//! entry. A shared store (Redis, memcached, a file store on a shared
+//! volume) is one flat key space across every node, so without this
+//! segment a fleet mid-rolling-change serves entries written under a
+//! config that no longer applies. See
+//! `sbproxy_config::cache_identity` for what feeds it.
 
 use serde::Deserialize;
 
@@ -83,6 +90,16 @@ pub enum QueryMode {
 /// allowlist a subset). `vary_headers` is a slice of `(lowercased
 /// name, value)` pairs that the caller already canonicalized; the
 /// fingerprint is a stable BLAKE3 hash so the key length stays bounded.
+///
+/// `config_fp` identifies the origin config that produced the entry, so
+/// two nodes running different cache-relevant config cannot read each
+/// other's entries out of a shared store (WOR-2407). It is computed
+/// once per origin at compile time by
+/// `sbproxy_config::cache_identity::origin_cache_fingerprint`, never
+/// per request. It is the **last** segment on purpose:
+/// [`path_invalidation_prefix`] stops before the query segment, so a
+/// mutation still evicts every cached variant of a path whatever config
+/// wrote it.
 pub fn compute_cache_key(
     workspace: &str,
     hostname: &str,
@@ -91,17 +108,24 @@ pub fn compute_cache_key(
     query: Option<&str>,
     query_mode: &QueryMode,
     vary_headers: &[(String, String)],
+    config_fp: &str,
 ) -> String {
     use std::fmt::Write;
     let canonical_query = canonicalize_query(query, query_mode);
     let vary_fp = vary_fingerprint(vary_headers);
     let mut key = String::with_capacity(
-        workspace.len() + hostname.len() + method.len() + path.len() + canonical_query.len() + 32,
+        workspace.len()
+            + hostname.len()
+            + method.len()
+            + path.len()
+            + canonical_query.len()
+            + config_fp.len()
+            + 32,
     );
     write!(
         key,
-        "{}:{}:{}:{}:{}:{}",
-        workspace, hostname, method, path, canonical_query, vary_fp
+        "{}:{}:{}:{}:{}:{}:{}",
+        workspace, hostname, method, path, canonical_query, vary_fp, config_fp
     )
     .unwrap();
     key
@@ -407,7 +431,38 @@ fn entity_tag_list_matches(value: &[u8], current_opaque: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// Stand-in origin fingerprint for tests that are not themselves
+    /// about config identity.
+    const FP: &str = "00112233445566ff";
+
     // --- compute_cache_key tests ---
+
+    /// Two nodes running different cache-relevant config must not read
+    /// each other's entries out of a shared store (WOR-2407).
+    ///
+    /// Without the fingerprint segment every node on a rolling config
+    /// change shares one flat key space, so whichever writes first
+    /// decides what the whole fleet serves until the TTL expires.
+    #[test]
+    fn a_different_config_fingerprint_partitions_the_key() {
+        let key = |fp: &str| {
+            compute_cache_key(
+                "",
+                "example.com",
+                "GET",
+                "/api/v1",
+                None,
+                &QueryMode::Sort,
+                &[],
+                fp,
+            )
+        };
+        assert_ne!(
+            key("0f1e2d3c4b5a6978"),
+            key("69780f1e2d3c4b5a"),
+            "an origin whose cache-relevant config changed must not share entries with the old one"
+        );
+    }
 
     #[test]
     fn test_basic_cache_key() {
@@ -419,9 +474,11 @@ mod tests {
             None,
             &QueryMode::Sort,
             &[],
+            FP,
         );
-        // Trailing two empty segments (`::`) reflect "no query, no vary".
-        assert_eq!(key, ":example.com:GET:/api/v1::");
+        // Trailing empty segments (`::`) reflect "no query, no vary";
+        // the config fingerprint is the last segment.
+        assert_eq!(key, ":example.com:GET:/api/v1:::00112233445566ff");
     }
 
     #[test]
@@ -434,6 +491,7 @@ mod tests {
             Some("b=2&a=1"),
             &QueryMode::Sort,
             &[],
+            FP,
         );
         let b = compute_cache_key(
             "",
@@ -443,6 +501,7 @@ mod tests {
             Some("a=1&b=2"),
             &QueryMode::Sort,
             &[],
+            FP,
         );
         assert_eq!(
             a, b,
@@ -465,6 +524,7 @@ mod tests {
             Some("a=1&b=2"),
             &QueryMode::IgnoreAll,
             &[],
+            FP,
         );
         let without_q = compute_cache_key(
             "",
@@ -474,6 +534,7 @@ mod tests {
             None,
             &QueryMode::IgnoreAll,
             &[],
+            FP,
         );
         assert_eq!(with_q, without_q, "IgnoreAll must drop the query entirely");
     }
@@ -489,6 +550,7 @@ mod tests {
             Some("a=1&utm_source=foo&b=2"),
             &allow,
             &[],
+            FP,
         );
         assert!(key.contains(":a=1:"), "only `a` should survive: {}", key);
         assert!(!key.contains("utm_source"), "utm_source should be dropped");
@@ -507,8 +569,9 @@ mod tests {
             None,
             &QueryMode::Sort,
             &gzip,
+            FP,
         );
-        let key_br = compute_cache_key("", "example.com", "GET", "/x", None, &QueryMode::Sort, &br);
+        let key_br = compute_cache_key("", "example.com", "GET", "/x", None, &QueryMode::Sort, &br, FP);
         assert_ne!(
             key_gzip, key_br,
             "different Accept-Encoding values must produce different cache keys"
@@ -525,6 +588,7 @@ mod tests {
             None,
             &QueryMode::Sort,
             &[],
+            FP,
         );
         let b = compute_cache_key(
             "ws-2",
@@ -534,6 +598,7 @@ mod tests {
             None,
             &QueryMode::Sort,
             &[],
+            FP,
         );
         assert_ne!(a, b, "different workspaces must not collide");
     }
@@ -549,6 +614,7 @@ mod tests {
             Some("a=1"),
             &QueryMode::Sort,
             &[("accept".to_string(), "json".to_string())],
+            FP,
         );
         assert!(
             get_key.starts_with(&prefix),

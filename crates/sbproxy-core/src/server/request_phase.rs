@@ -3918,6 +3918,7 @@ pub(super) async fn request_filter(
                         ctx.hostname.as_str(),
                         session.req_header(),
                         cache_cfg,
+                        origin.cache_config_fingerprint.as_str(),
                     );
                     let invalidate_origin = origin.origin_id.to_string();
                     tokio::spawn(async move {
@@ -3961,6 +3962,7 @@ pub(super) async fn request_filter(
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
+                    origin.cache_config_fingerprint.as_str(),
                     key_plan.as_ref(),
                 );
                 // `skip_lookup` goes upstream for *this* request while

@@ -520,6 +520,7 @@ mod tests {
             None,
             &crate::response::QueryMode::Sort,
             &folded,
+            "00112233445566ff",
         );
         let key_b = crate::response::compute_cache_key(
             "tenant-b",
@@ -529,6 +530,7 @@ mod tests {
             None,
             &crate::response::QueryMode::Sort,
             &folded,
+            "00112233445566ff",
         );
         assert_ne!(
             key_a, key_b,
@@ -693,6 +695,7 @@ mod tests {
                     None,
                     &crate::response::QueryMode::Sort,
                     &folded,
+                    "00112233445566ff",
                 )
             })
             .collect();

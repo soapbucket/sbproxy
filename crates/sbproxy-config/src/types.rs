@@ -4488,6 +4488,20 @@ pub struct ResponseCacheConfig {
     #[serde(default)]
     pub query_normalize: QueryNormalize,
 
+    /// Operator-controlled cache generation for this origin.
+    ///
+    /// Folded into the origin's cache-config fingerprint, so bumping it
+    /// rotates this origin's entries and nothing else. Defaults to 0.
+    ///
+    /// The fingerprint already moves on its own for any config change
+    /// that alters what the upstream returns. This exists for the case
+    /// it cannot see: an upstream that changed its response shape with
+    /// no sbproxy config change at all. Rotating is cheap and safe, the
+    /// old entries simply age out on their existing TTLs, so an
+    /// unnecessary bump costs one cold start rather than correctness.
+    #[serde(default)]
+    pub epoch: u64,
+
     /// When set, the proxy serves an expired entry within
     /// `ttl + stale_while_revalidate` seconds while triggering a
     /// background revalidation. Stale replays carry the
@@ -4608,6 +4622,7 @@ impl Default for ResponseCacheConfig {
             max_size: default_response_cache_max_size(),
             vary: Vec::new(),
             query_normalize: QueryNormalize::default(),
+            epoch: 0,
             stale_while_revalidate: None,
             invalidate_on_mutation: default_invalidate_on_mutation(),
             encryption: None,
