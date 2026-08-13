@@ -541,8 +541,16 @@ impl AiExtensionEvent {
 }
 
 /// Verdict returned by an awaited AI extension hook.
+///
+/// `#[non_exhaustive]` as of the mutation release: out-of-tree matchers
+/// need a wildcard arm, and the honest reading of that arm is
+/// [`AiExtensionDecision::Release`], because a hook that does not
+/// understand a verdict must not invent a refusal or apply a payload it
+/// cannot see. Adding the attribute and the first new variant in one
+/// release means downstream code breaks once rather than twice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AiExtensionDecision {
     /// Release the operation or stream bytes.
     Release,
@@ -561,6 +569,23 @@ pub enum AiExtensionDecision {
         code: String,
         /// Bounded diagnostic message.
         message: String,
+    },
+    /// Release the operation with a modified payload.
+    ///
+    /// Only the content-bearing hooks accept this: guardrail input and
+    /// output, tool calls, and stream events. The host revalidates the
+    /// replacement against the same limits the original passed, and the
+    /// hook after this one in the chain sees the modified payload, so a
+    /// redactor followed by a classifier classifies what will actually
+    /// be sent.
+    Mutate {
+        /// The replacement payload for the event's content field,
+        /// base64-encoded on the wire and size-capped by the hook's
+        /// `max_buffer_bytes` before it is ever decoded into a value.
+        body: Vec<u8>,
+        /// Stable bounded reason code naming why the payload changed,
+        /// so the mutation is attributable on the decision family.
+        code: String,
     },
 }
 
