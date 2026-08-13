@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use sbproxy_extension::cel::surface::CelSurface;
 use sbproxy_extension::cel::CompiledCel;
 use sbproxy_platform::storage::KVStore;
 use serde::Deserialize;
@@ -240,6 +241,7 @@ impl PersistentBlockStore {
                 );
             };
             Some(Arc::new(CompiledCel::compile(
+                CelSurface::WafPersistent,
                 "waf policy `persistent_block` key",
                 source,
             )?))

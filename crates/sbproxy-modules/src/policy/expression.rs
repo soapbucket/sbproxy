@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use sbproxy_extension::cel::surface::CelSurface;
 use sbproxy_extension::cel::CompiledCel;
 use serde::Deserialize;
 
@@ -78,7 +79,11 @@ impl ExpressionPolicy {
     /// source once. Returns an error naming the policy type and the
     /// bad expression when the source does not compile.
     pub fn new(expression: String, deny_status: u16, deny_message: String) -> anyhow::Result<Self> {
-        let compiled = CompiledCel::compile("policy `expression`", &expression)?;
+        let compiled = CompiledCel::compile(
+            CelSurface::PolicyExpression,
+            "policy `expression`",
+            &expression,
+        )?;
         Ok(Self {
             expression,
             deny_status,
@@ -290,6 +295,35 @@ pub struct ExpressionViews<'a> {
 mod tests {
     use super::*;
     use crate::policy::Policy;
+
+    #[test]
+    fn from_config_refuses_a_binding_this_surface_never_populates() {
+        // The wiring proof for WOR-2355: this goes through the real
+        // `from_config` path an operator's YAML takes, not through the
+        // validator directly. `headless_signal` is stamped by the
+        // transform surface only, so before this check the expression
+        // compiled clean and missed at evaluation, and an
+        // `expression` policy that misses fails closed: every request
+        // denied, with nothing in the config to explain it.
+        let error = ExpressionPolicy::from_config(serde_json::json!({
+            "expression": "request.headless_signal.detected"
+        }))
+        .expect_err("a transform-only binding must not load on a policy expression");
+        let message = error.to_string();
+        assert!(message.contains("request.headless_signal"), "{message}");
+        assert!(message.contains("policy `expression`"), "{message}");
+    }
+
+    #[test]
+    fn from_config_still_accepts_a_macro_over_headers() {
+        // The upgrade hazard in the other direction: this config is
+        // valid today and must keep loading. See `cel::surface` for why
+        // a naive check would have refused it.
+        ExpressionPolicy::from_config(serde_json::json!({
+            "expression": "request.headers.all(k, k != \"x-evil\")"
+        }))
+        .expect("a comprehension over request.headers must keep loading");
+    }
 
     #[test]
     fn expression_policy_type() {

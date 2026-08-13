@@ -98,6 +98,7 @@
 use std::time::Duration;
 
 use http::HeaderMap;
+use sbproxy_extension::cel::surface::CelSurface;
 use sbproxy_extension::cel::{CelValue, CompiledCel};
 
 /// Re-exported so `sbproxy-core`'s header-mutating call site can build
@@ -293,6 +294,7 @@ impl CelScriptTransform {
             let compiled = match (rule.op, rule.value_expr.as_deref()) {
                 (CelHeaderOp::Remove, _) | (_, None) => None,
                 (_, Some(src)) => Some(CompiledCel::compile(
+                    CelSurface::TransformCel,
                     format!("transform `cel`: header `{}` value_expr", rule.name),
                     src,
                 )?),

@@ -58,7 +58,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 
 Two AI-gateway surfaces are deliberately not free-form scripting: the `ai_policy` block is a single CEL expression over gateway-computed signals ([ai-policy-cel.md](ai-policy-cel.md)), and guardrails are typed `guardrails: input:` / `output:` blocks (`injection`, `pii`, `jailbreak`, `toxicity`, `schema`, ...) documented in [ai-gateway.md](ai-gateway.md).
 
-Forward rules are not a scripting surface. A forward rule matches with declarative matchers only (path, header, query); see section 3.4 for the shapes, and use an `expression` policy when you need a scripted request gate.
+Forward rules are not a scripting surface. A forward rule matches with declarative matchers only (path, header, query); see section 3.5 for the shapes, and use an `expression` policy when you need a scripted request gate.
 
 ---
 
@@ -68,7 +68,9 @@ CEL is a non-Turing-complete expression language. No loops, no side effects, no 
 
 ### 3.1 Context variables
 
-The CEL context is built per request. Every namespace below is available to `expression` policies; rate-limit `key:` expressions see the core `request`, `connection`, and `jwt` namespaces plus `envelope` and `features`.
+The CEL context is built per request. Every binding below is available to `expression` policies, which have the widest context of the six places a config accepts CEL. The others see less, and [3.2](#32-what-each-config-site-offers) lists exactly what.
+
+Naming a binding your site does not populate is refused when the config loads, so a typo or a copied expression fails at boot with a message naming the site, the binding, and what is available there. Before v1.12 it compiled and then missed at evaluation, which on a rate-limit `key:` meant every request quietly sharing one `__cel_key_error__` bucket.
 
 #### `request` - incoming HTTP request
 
@@ -79,7 +81,6 @@ The CEL context is built per request. Every namespace below is available to `exp
 | `request.host` | string | Hostname the request was routed by |
 | `request.headers` | map | Request headers, keys lowercase with hyphens preserved |
 | `request.query` | string | Raw query string (empty string when absent) |
-| `request.scheme` | string | URL scheme when known |
 | `request.time` | int | Wall clock at context build, Unix epoch seconds |
 | `request.unix_nanos` | int | Same instant in epoch nanoseconds |
 | `request.agent_id` | string | Resolved agent identifier (`human`, `anonymous`, `unknown`, or a catalog id like `openai-gptbot`) |
@@ -202,7 +203,46 @@ The `response` namespace is available where CEL runs at response time: assertion
 
 Within a populated namespace, missing fields render as zero values (`""`, `0`, `false`, empty map), so expressions like `size(request.agent_id) > 0` work without probing for presence first. A namespace whose subsystem never ran for the request (for example `request.tls` on a plain HTTP listener) may be absent entirely; guard those accesses or accept the fail-closed deny.
 
-### 3.2 Built-in functions
+### 3.2 What each config site offers
+
+Six places in a config take a CEL expression, and they do not all see the same context. A `transform: cel` runs after the headless detector, so it gets `request.headless_signal`; a `policy: expression` runs before the response exists, so it has no `response`. The table is the whole contract.
+
+| Binding | `policy: expression` | `policy: assertion` | `transform: cel` | `rate_limit.key` | `custom_log` field | `waf` `track_by: cel` |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| `request.method`, `.path`, `.host`, `.query`, `.headers` | yes | yes | yes | yes | yes | yes |
+| `request.time`, `.unix_nanos` | yes | yes | yes | yes | no | yes |
+| `connection.remote_ip` | yes | yes | yes | yes | no | yes |
+| `jwt.claims` | yes | yes | yes | yes | no | yes |
+| `request.trust_tier` | yes | yes | no | no | no | no |
+| `request.tls` | yes | no | yes | no | no | no |
+| `request.agent_class` and the other `agent_*` fields | yes | no | yes | no | no | no |
+| `agent` | yes | no | yes | no | no | no |
+| `request.aipref` | yes | no | no | no | no | no |
+| `request.kya` | yes | no | no | no | no | no |
+| `request.ml_classification` | yes | no | no | no | no | no |
+| `principal` | yes | no | no | no | no | no |
+| `request.headless_signal` | no | no | yes | no | no | no |
+| `response` | no | yes | yes | no | `response.status` only | no |
+| `envelope`, `features` | yes | no | no | yes | no | yes |
+| `request.key_id`, `.name`, `.weight` | no | no | no | yes | no | yes |
+| `tenant_id`, `provider`, `model`, `tokens_in`, `tokens_out`, `client_ip`, `attribution` | no | no | no | no | yes | no |
+
+Two rows are easy to misread.
+
+The `custom_log` column looks eccentric because it is. That site builds its own context rather than sharing the request builder, which is why it is the only one with `attribution` and token counts, and the only one whose `request` has no `time`. Treat it as its own vocabulary.
+
+The `waf` column is identical to `rate_limit.key` because both run through the same evaluator. If you are keying a persistent block, write it as you would a rate-limit key.
+
+A binding marked `no` is refused when the config loads. The message names the site and lists what that site does provide, so the fix is usually visible without opening this page:
+
+```text
+origin `api`: policy `expression`: expression "request.headless_signal.detected"
+references request.headless_signal, which policy `expression` does not provide.
+Available here: agent, connection.remote_ip, envelope, features, jwt.claims,
+principal, request.agent_class, ..., request.trust_tier
+```
+
+### 3.3 Built-in functions
 
 CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`) and the `cel` crate's stock helpers such as `contains`, `startsWith`, `endsWith`, and `size`. SBproxy registers these additional functions on every evaluation context:
 
@@ -224,7 +264,7 @@ CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, 
 
 `flag_enabled` reads the process-wide set declared by the top-level `flags:` block. Its second argument is the stable bucketing key; use a user, tenant, or subject identifier rather than a random request ID. Successful hot reloads replace the full flag set atomically, and an absent `flags:` block clears it. Unknown flags evaluate to `false`. See [Edge feature flags](feature-flags.md) for the rule grammar.
 
-### 3.3 CEL policy examples
+### 3.4 CEL policy examples
 
 The scripted request gate is the `expression` policy. It takes one CEL expression; `false` (or an evaluation error) denies the request with `deny_status` (default 403) and `deny_message`.
 
@@ -335,7 +375,7 @@ policies:
         action: pass
 ```
 
-### 3.4 Forward-rule matchers (not CEL)
+### 3.5 Forward-rule matchers (not CEL)
 
 Forward rules dispatch to inline child origins with declarative matchers, evaluated in order with first match winning. Each entry in a rule's `rules:` list may carry a `path`, `header`, and `query` matcher; matchers present in one entry are ANDed, entries in the list are ORed.
 
@@ -404,7 +444,7 @@ The shorthand `match: /api/` on an entry is equivalent to `path: { prefix: /api/
 
 There is no `cel:` or `lua:` matcher inside forward rules. To route on anything a matcher cannot express, gate with an `expression` policy or split hostnames.
 
-### 3.5 The `cel` response transform
+### 3.6 The `cel` response transform
 
 The `cel` transform is the CEL surface on the response path. It sets, appends, or removes response headers via per-header rules with `value_expr` CEL expressions.
 

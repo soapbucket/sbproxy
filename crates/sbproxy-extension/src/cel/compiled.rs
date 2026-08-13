@@ -34,6 +34,7 @@ use std::cell::Cell;
 
 use anyhow::Result;
 
+use super::surface::CelSurface;
 use super::{CelContext, CelEngine, CelExpression, CelValue};
 
 thread_local! {
@@ -92,12 +93,15 @@ impl CompiledCel {
     ///
     /// Returns an error naming the site and quoting the source when the
     /// expression does not parse.
-    pub fn compile(site: impl Into<String>, source: &str) -> Result<Self> {
+    pub fn compile(surface: CelSurface, site: impl Into<String>, source: &str) -> Result<Self> {
         let site = site.into();
         let engine = CelEngine::new();
         let expr = engine
             .compile(source)
             .map_err(|e| anyhow::anyhow!("{site}: invalid CEL expression {source:?}: {e}"))?;
+        surface
+            .validate(&site, source, expr.program())
+            .map_err(|message| anyhow::anyhow!("{message}"))?;
         COMPILE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
         Ok(Self { site, engine, expr })
     }
@@ -133,8 +137,12 @@ mod tests {
 
     #[test]
     fn compile_rejects_malformed_source_and_names_the_site() {
-        let err = CompiledCel::compile("policy `assertion` (no-5xx)", "this is not valid CEL !!!")
-            .expect_err("malformed CEL must not compile");
+        let err = CompiledCel::compile(
+            CelSurface::PolicyAssertion,
+            "policy `assertion` (no-5xx)",
+            "this is not valid CEL !!!",
+        )
+        .expect_err("malformed CEL must not compile");
         let msg = err.to_string();
         assert!(msg.contains("policy `assertion` (no-5xx)"), "{msg}");
         assert!(msg.contains("this is not valid CEL !!!"), "{msg}");
@@ -146,8 +154,12 @@ mod tests {
         // parse, and the request path pays none. If a future refactor
         // reintroduces a per-evaluation compile, this fails.
         let before = compile_count_on_this_thread();
-        let compiled = CompiledCel::compile("test site", r#"request.method == "GET""#)
-            .expect("valid CEL compiles");
+        let compiled = CompiledCel::compile(
+            CelSurface::PolicyExpression,
+            "test site",
+            r#"request.method == "GET""#,
+        )
+        .expect("valid CEL compiles");
         let after = compile_count_on_this_thread();
         assert_eq!(after - before, 1, "one call, one parse");
 
@@ -167,7 +179,8 @@ mod tests {
         // A non-boolean result is a runtime error. The type reports it
         // and lets the call site decide what to do, which is what makes
         // per-surface postures possible.
-        let compiled = CompiledCel::compile("test site", "1 + 1").expect("valid CEL");
+        let compiled = CompiledCel::compile(CelSurface::PolicyExpression, "test site", "1 + 1")
+            .expect("valid CEL");
         let ctx = CelContext::new();
         assert!(compiled.eval_bool(&ctx).is_err());
         assert!(matches!(compiled.eval(&ctx), Ok(CelValue::Int(2))));
@@ -183,8 +196,12 @@ mod tests {
         // field. Pinning both halves here so the next person reaching
         // for a presence check finds the working form next to the
         // broken one.
-        let err = CompiledCel::compile("probe", r#"has(request.headers["x-tier"])"#)
-            .expect_err("has() over an index must not compile");
+        let err = CompiledCel::compile(
+            CelSurface::PolicyExpression,
+            "probe",
+            r#"has(request.headers["x-tier"])"#,
+        )
+        .expect_err("has() over an index must not compile");
         assert!(
             err.to_string().contains("has() macro"),
             "the parse error should name the macro: {err}"
@@ -192,16 +209,30 @@ mod tests {
 
         // Dotted access is a field selection, so has() takes it. Only
         // useful for header names that are legal CEL identifiers.
-        CompiledCel::compile("probe", "has(request.headers.host)").expect("has() over a field");
+        CompiledCel::compile(
+            CelSurface::PolicyExpression,
+            "probe",
+            "has(request.headers.host)",
+        )
+        .expect("has() over a field");
 
         // The form a hyphenated header actually needs.
-        CompiledCel::compile("probe", r#""x-tier" in request.headers"#).expect("in over a map");
+        CompiledCel::compile(
+            CelSurface::PolicyExpression,
+            "probe",
+            r#""x-tier" in request.headers"#,
+        )
+        .expect("in over a map");
     }
 
     #[test]
     fn site_and_source_are_readable_for_diagnostics() {
-        let compiled =
-            CompiledCel::compile("policy `rate_limiting` key", "request.key_id").expect("valid");
+        let compiled = CompiledCel::compile(
+            CelSurface::RateLimitKey,
+            "policy `rate_limiting` key",
+            "request.key_id",
+        )
+        .expect("valid");
         assert_eq!(compiled.site(), "policy `rate_limiting` key");
         assert_eq!(compiled.source(), "request.key_id");
         let debug = format!("{compiled:?}");

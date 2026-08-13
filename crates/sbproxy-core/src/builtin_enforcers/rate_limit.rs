@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use compact_str::CompactString;
+use sbproxy_extension::cel::surface::CelSurface;
 use sbproxy_extension::cel::CompiledCel;
 use sbproxy_modules::policy::RateLimitPolicy;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
@@ -126,6 +127,7 @@ impl RateLimitEnforcer {
     pub fn new(policy: Arc<RateLimitPolicy>, metric_policy: &str) -> anyhow::Result<Self> {
         let compiled_key = match policy.key.as_deref() {
             Some(expr) if !expr.is_empty() => Some(Arc::new(CompiledCel::compile(
+                CelSurface::RateLimitKey,
                 "policy `rate_limiting` key",
                 expr,
             )?)),
@@ -515,13 +517,19 @@ mod tests {
         // Posture pinned: a request whose key expression cannot
         // evaluate is still rate limited, in a namespace of its own, so
         // it neither shares a bucket with correctly keyed traffic nor
-        // collapses the whole origin into one bucket. The expression
-        // below parses (so the config is accepted) and fails at
-        // evaluation (the namespace it reads does not exist).
+        // collapses the whole origin into one bucket.
+        //
+        // This used to read `no_such_namespace.field`, which was
+        // accepted at config load and missed at evaluation. WOR-2355
+        // made that a config-load refusal, so the remaining way to
+        // reach this bucket is an expression whose bindings are all
+        // real and whose evaluation still fails: indexing a header that
+        // the request does not carry. That is also the more realistic
+        // operator mistake now that typos cannot load.
         let policy = RateLimitPolicy::from_config(serde_json::json!({
             "requests_per_second": 0.001,
             "burst": 1,
-            "key": "no_such_namespace.field"
+            "key": "request.headers[\"x-tenant-id\"]"
         }))
         .unwrap();
         let enforcer =

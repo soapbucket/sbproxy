@@ -7,6 +7,7 @@
 pub mod compiled;
 pub mod context;
 pub mod functions;
+pub mod surface;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +34,15 @@ impl CelExpression {
     /// Returns the original source string of this expression.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The compiled program, for callers that need to inspect what the
+    /// expression reads rather than evaluate it.
+    ///
+    /// [`surface::CelSurface::validate`] uses this at config load to
+    /// hold an expression to the bindings its config site populates.
+    pub fn program(&self) -> &cel::Program {
+        &self.program
     }
 }
 

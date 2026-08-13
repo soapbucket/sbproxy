@@ -20,6 +20,7 @@
 
 use serde::Deserialize;
 
+use sbproxy_extension::cel::surface::CelSurface;
 use sbproxy_extension::cel::CompiledCel;
 
 /// Verdict recorded when a compiled assertion fails to evaluate.
@@ -105,7 +106,11 @@ impl AssertionPolicy {
     /// assertion name, and the bad expression when the source does not
     /// compile.
     pub fn new(expression: String, name: String) -> anyhow::Result<Self> {
-        let compiled = CompiledCel::compile(format!("policy `assertion` ({name})"), &expression)?;
+        let compiled = CompiledCel::compile(
+            CelSurface::PolicyAssertion,
+            format!("policy `assertion` ({name})"),
+            &expression,
+        )?;
         Ok(Self {
             expression,
             name,

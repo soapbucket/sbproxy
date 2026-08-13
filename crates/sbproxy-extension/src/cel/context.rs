@@ -3,7 +3,7 @@
 //! Builds a [`CelContext`] from HTTP request data, populating the standard
 //! namespaces that sbproxy CEL expressions can reference:
 //!
-//! - `request` - method, path, host, headers, query, scheme
+//! - `request` - method, path, host, headers, query, time
 //! - `connection` - remote_ip
 //! - `jwt.claims` - decoded JWT claims when an `Authorization: Bearer`
 //!   header carries a structurally-valid JWT. Decoded only; signature
@@ -29,7 +29,6 @@ use super::{CelContext, CelValue};
 /// - `request.host` - Hostname from the request
 /// - `request.headers` - Map of header name to value (lowercase keys)
 /// - `request.query` - Raw query string (if present)
-/// - `request.scheme` - URL scheme (if provided)
 /// - `request.time` - Current request time as Unix epoch seconds (integer)
 /// - `request.unix_nanos` - Current request time as Unix epoch nanoseconds (integer)
 /// - `connection.remote_ip` - Client IP address (if known)
