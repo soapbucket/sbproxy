@@ -812,6 +812,27 @@ pub(crate) fn reload_from_config_yaml(
     reload_from_config_yaml_locked(config_path, yaml)
 }
 
+/// As [`reload_from_config_yaml`], for a caller that already resolved
+/// the document's `source:` pointer.
+///
+/// Exists so the admin reload path can validate the *resolved* payload
+/// and then commit that same payload, rather than validating the
+/// pointer document (a near-empty file that compiles trivially) and
+/// having the transaction fetch the source a second time. `original`
+/// is the on-disk text and feeds drift tracking, which compares
+/// against the file, so a pointer file still reads as unchanged.
+pub(crate) fn reload_from_resolved_yaml(
+    config_path: &str,
+    resolved_text: &str,
+    original: &str,
+) -> anyhow::Result<ReloadOutcome> {
+    let _reload_guard = CONFIG_RELOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let compiled = sbproxy_config::compile_config(resolved_text)?;
+    reload_compiled_config_locked(config_path, compiled, None, Some(original))
+}
+
 /// What a non-blocking reload attempt did.
 ///
 /// The distinction exists for callers on a timer. [`Self::Busy`] is not a
