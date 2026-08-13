@@ -3449,6 +3449,7 @@ mod transform_posture_tests {
             DynamicHookMetadata::new(
                 "stub-bundle",
                 "stub_bundle_transform",
+                sbproxy_config::BundleRuntime::Wasm,
                 BundleBodyMode::Buffered,
                 1024,
                 posture,

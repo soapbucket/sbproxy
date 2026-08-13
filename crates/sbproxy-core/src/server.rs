@@ -427,6 +427,7 @@ mod transform_failure_routing_tests {
             DynamicHookMetadata::new(
                 "stub-bundle",
                 "stub_bundle_transform",
+                sbproxy_config::BundleRuntime::Wasm,
                 BundleBodyMode::Buffered,
                 1024,
                 FailureMode::Open,
@@ -3536,24 +3537,6 @@ struct PolicyVerdictCtx {
     tenant: String,
 }
 
-/// Which engine answered, in the shared decision-event vocabulary.
-///
-/// `PolicySurface` distinguishes only the built-in enum arm from the
-/// dynamic-dispatch plugin path today. The CEL, Lua, JavaScript, and
-/// WASM engines reach policy through those two surfaces rather than
-/// through their own, so they are not separable here yet; the
-/// engine-neutral events land with their engine already on the call.
-const fn decision_engine_for(
-    surface: sbproxy_observe::events::PolicySurface,
-) -> sbproxy_observe::decision::DecisionEngine {
-    match surface {
-        sbproxy_observe::events::PolicySurface::Plugin => {
-            sbproxy_observe::decision::DecisionEngine::Plugin
-        }
-        _ => sbproxy_observe::decision::DecisionEngine::BuiltIn,
-    }
-}
-
 /// Map a policy verdict onto the shared outcome vocabulary.
 ///
 /// `Confirm` maps to `Deny` deliberately. It holds the request pending
@@ -3609,10 +3592,19 @@ fn emit_policy_verdict(
     ctx: &PolicyVerdictCtx,
     policy_id: &str,
     surface: sbproxy_observe::events::PolicySurface,
+    engine: sbproxy_observe::decision::DecisionEngine,
     verdict: sbproxy_observe::events::VerdictTag,
     decision_started: std::time::Instant,
 ) {
-    emit_policy_verdict_with_outcome(ctx, policy_id, surface, verdict, decision_started, None);
+    emit_policy_verdict_with_outcome(
+        ctx,
+        policy_id,
+        surface,
+        engine,
+        verdict,
+        decision_started,
+        None,
+    );
 }
 
 /// As [`emit_policy_verdict`], but lets the caller name the shared
@@ -3628,6 +3620,7 @@ fn emit_policy_verdict_with_outcome(
     ctx: &PolicyVerdictCtx,
     policy_id: &str,
     surface: sbproxy_observe::events::PolicySurface,
+    engine: sbproxy_observe::decision::DecisionEngine,
     verdict: sbproxy_observe::events::VerdictTag,
     decision_started: std::time::Instant,
     engine_outcome: Option<sbproxy_observe::decision::DecisionOutcome>,
@@ -3657,7 +3650,6 @@ fn emit_policy_verdict_with_outcome(
     // metrics above stay; this is the family new events use and the one
     // existing events migrate toward, so the policy event is the first
     // to carry both.
-    let engine = decision_engine_for(surface);
     sbproxy_observe::decision::record_decision(
         sbproxy_observe::decision::DecisionEvent::Policy,
         engine,
@@ -4007,6 +3999,7 @@ async fn check_policies(
         let policy_id = compiled.enforcer.policy_type();
         let started = std::time::Instant::now();
         let surface = compiled.surface;
+        let engine = compiled.engine;
         // WOR-2332: admission against a cluster-shared tier happens here,
         // not inside `enforce`. See `resolve_shared_admission`.
         crate::builtin_enforcers::resolve_shared_admission(compiled, &req_snapshot, ctx).await;
@@ -4039,6 +4032,7 @@ async fn check_policies(
                     verdict_ctx,
                     policy_id,
                     surface,
+                    engine,
                     VerdictTag::Deny,
                     started,
                     // The request is denied, but the decision was an
@@ -4056,7 +4050,14 @@ async fn check_policies(
             &mut ctx.policy_response_headers,
             &mut confirm_state,
         );
-        emit_policy_verdict(verdict_ctx, policy_id, surface, translated.verdict, started);
+        emit_policy_verdict(
+            verdict_ctx,
+            policy_id,
+            surface,
+            engine,
+            translated.verdict,
+            started,
+        );
         // WOR-2094: mirror every verdict onto the request context so the
         // admin ring row can explain what applied, not just what denied.
         ctx.record_policy_decision(policy_id, translated.verdict.as_label());
@@ -4193,6 +4194,7 @@ async fn check_buffered_dynamic_policies(
                     verdict_ctx,
                     policy_id,
                     compiled.surface,
+                    compiled.engine,
                     verdict,
                     started,
                     (!posture.admits()).then(|| engine_fault_outcome(&error)),
@@ -4205,7 +4207,7 @@ async fn check_buffered_dynamic_policies(
                     // earned.
                     sbproxy_observe::decision::record_decision_fail_open(
                         sbproxy_observe::decision::DecisionEvent::Policy,
-                        decision_engine_for(compiled.surface),
+                        compiled.engine,
                         &verdict_ctx.origin,
                         &verdict_ctx.tenant,
                     );
@@ -4235,6 +4237,7 @@ async fn check_buffered_dynamic_policies(
             verdict_ctx,
             policy_id,
             compiled.surface,
+            compiled.engine,
             translated.verdict,
             started,
         );

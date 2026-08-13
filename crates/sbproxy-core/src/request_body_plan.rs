@@ -206,7 +206,14 @@ mod tests {
         cap: usize,
         posture: FailureMode,
     ) -> DynamicHookMetadata {
-        DynamicHookMetadata::new("fixture-bundle", hook_type, body_mode, cap, posture)
+        DynamicHookMetadata::new(
+            "fixture-bundle",
+            hook_type,
+            sbproxy_config::BundleRuntime::Wasm,
+            body_mode,
+            cap,
+            posture,
+        )
     }
 
     #[test]

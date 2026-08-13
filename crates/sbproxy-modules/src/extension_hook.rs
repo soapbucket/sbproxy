@@ -5,7 +5,7 @@
 //! pipeline can plan request-body access without widening the public plugin
 //! traits.
 
-use sbproxy_config::{BundleBodyMode, FailureMode};
+use sbproxy_config::{BundleBodyMode, BundleRuntime, FailureMode};
 use sbproxy_plugin::{ActionHandler, PolicyEnforcer, TransformHandler};
 
 /// Manifest-derived execution metadata for one dynamic bundle hook.
@@ -13,6 +13,7 @@ use sbproxy_plugin::{ActionHandler, PolicyEnforcer, TransformHandler};
 pub struct DynamicHookMetadata {
     bundle_id: String,
     hook_type: String,
+    runtime: BundleRuntime,
     body_mode: BundleBodyMode,
     max_buffer_bytes: usize,
     failure_posture: FailureMode,
@@ -24,6 +25,7 @@ impl DynamicHookMetadata {
     pub fn new(
         bundle_id: impl Into<String>,
         hook_type: impl Into<String>,
+        runtime: BundleRuntime,
         body_mode: BundleBodyMode,
         max_buffer_bytes: usize,
         failure_posture: FailureMode,
@@ -31,6 +33,7 @@ impl DynamicHookMetadata {
         Self {
             bundle_id: bundle_id.into(),
             hook_type: hook_type.into(),
+            runtime,
             body_mode,
             max_buffer_bytes,
             failure_posture,
@@ -47,6 +50,18 @@ impl DynamicHookMetadata {
     #[must_use]
     pub fn hook_type(&self) -> &str {
         &self.hook_type
+    }
+
+    /// Return the runtime that executes this hook.
+    ///
+    /// Carried so a decision this hook makes can be attributed to the
+    /// engine that made it. Without it every bundle-backed policy
+    /// reports as a generic plugin, which is the same answer a linked
+    /// Rust plugin gives and tells an operator nothing about which of
+    /// their bundles denied a request.
+    #[must_use]
+    pub const fn runtime(&self) -> BundleRuntime {
+        self.runtime
     }
 
     /// Return the declared request-body access mode.
