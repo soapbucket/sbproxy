@@ -296,9 +296,9 @@ impl DecisionEngine {
         Self::Cel,
         Self::Lua,
         Self::JavaScript,
+        Self::Rego,
         Self::Wasm,
         Self::ProxyWasm,
-        Self::Rego,
     ];
 
     /// Whether this engine returns a document rather than a scalar.

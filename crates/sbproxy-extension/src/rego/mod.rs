@@ -113,6 +113,10 @@ impl CompiledRego {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy(format!("{site}.rego"), module.to_owned())
+            .map_err(|error| {
+                sbproxy_observe::metrics::record_script_compile("rego", "parse_error");
+                error
+            })
             .with_context(|| format!("{site}: invalid Rego module"))?;
 
         // Bound evaluation before anything is evaluated, including the
@@ -138,7 +142,10 @@ impl CompiledRego {
         // work now, against an empty input, so it is a config error at
         // boot and reload rather than an origin that 403s permanently
         // with only a warn line to explain it.
-        compiled.prove_evaluable()?;
+        compiled.prove_evaluable().inspect_err(|_| {
+            sbproxy_observe::metrics::record_script_compile("rego", "semantic_error");
+        })?;
+        sbproxy_observe::metrics::record_script_compile("rego", "ok");
         Ok(compiled)
     }
 
@@ -189,10 +196,28 @@ impl CompiledRego {
     /// evaluate, or the result is not a boolean. Every one of those is
     /// a fail-closed condition at the call site.
     pub fn eval_bool(&mut self, ctx: &CelContext) -> Result<bool> {
-        let input = context_to_input(ctx);
-        self.engine
-            .set_input_json(&input.to_string())
+        let start = std::time::Instant::now();
+        let outcome = self.eval_bool_inner(ctx);
+        sbproxy_observe::metrics::record_script_duration("rego", start.elapsed().as_secs_f64());
+        sbproxy_observe::metrics::record_script_invocation(
+            "rego",
+            if outcome.is_ok() {
+                "ok"
+            } else {
+                "runtime_error"
+            },
+        );
+        outcome
+    }
+
+    fn eval_bool_inner(&mut self, ctx: &CelContext) -> Result<bool> {
+        use serde::Deserialize;
+        // Feed regorus the tree directly rather than serialising to a
+        // string it immediately reparses; the conversion is the only
+        // pass over the context this way.
+        let input = regorus::Value::deserialize(context_to_input(ctx))
             .with_context(|| format!("{}: input document rejected", self.site))?;
+        self.engine.set_input(input);
         let value = self
             .engine
             .eval_rule(self.query.clone())
@@ -240,7 +265,9 @@ fn cel_to_json(value: &CelValue) -> serde_json::Value {
     }
 }
 
-/// Convert a CEL map, preserving key order so the JSON is stable.
+/// Convert a CEL map. The source is a `HashMap` with no order of its
+/// own; `serde_json::Map` (without `preserve_order`) is a BTreeMap, so
+/// keys come out sorted and the document is deterministic.
 fn convert_map(entries: &HashMap<String, CelValue>) -> serde_json::Value {
     let mut object = serde_json::Map::with_capacity(entries.len());
     for (key, value) in entries {

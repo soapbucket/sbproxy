@@ -49,8 +49,17 @@ impl PolicyEnforcer for RegoEnforcer {
         };
 
         let method = req.method().as_str().to_owned();
-        let path = req.uri().path().to_owned();
-        let query = req.uri().query().map(std::borrow::ToOwned::to_owned);
+        // Read the URI exactly as the expression enforcer does, so the
+        // two engines cannot disagree about an authority-form request.
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.path().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        let query = req
+            .uri()
+            .path_and_query()
+            .and_then(|pq| pq.query().map(std::borrow::ToOwned::to_owned));
         let headers = req.headers().clone();
         let client_ip = ctx.client_ip.map(|ip| ip.to_string());
         let hostname = ctx.hostname.to_string();

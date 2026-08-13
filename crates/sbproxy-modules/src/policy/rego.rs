@@ -31,7 +31,7 @@
 //! engineer around, and it is the reason to reach for `expression` when
 //! either would do.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use serde::Deserialize;
 
@@ -65,11 +65,10 @@ fn default_deny_msg() -> String {
 }
 
 /// A Rego policy attached to an origin.
+///
+/// The module source and query are owned by [`CompiledRego`]; this
+/// struct holds only what the enforcer reads per request.
 pub struct RegoPolicy {
-    /// The module source, retained for diagnostics.
-    pub module: String,
-    /// The rule reference evaluated per request.
-    pub query: String,
     /// Status returned when the rule denies.
     pub deny_status: u16,
     /// Message returned when the rule denies.
@@ -82,16 +81,17 @@ pub struct RegoPolicy {
     /// than passing it per evaluation, so a shared engine needs
     /// exclusive access for the set-then-evaluate pair. The critical
     /// section is one evaluation, measured at roughly 57 µs, and it
-    /// holds no `.await`.
-    compiled: Arc<Mutex<CompiledRego>>,
+    /// holds no `.await`. The policy itself already sits behind an
+    /// `Arc` in the compiled chain, so no second `Arc` here.
+    compiled: Mutex<CompiledRego>,
 }
 
 impl std::fmt::Debug for RegoPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RegoPolicy")
-            .field("query", &self.query)
             .field("deny_status", &self.deny_status)
+            .field("budget_ms", &self.budget_ms)
             .finish()
     }
 }
@@ -145,14 +145,12 @@ impl RegoPolicy {
             "policy `rego`: budget_ms must be greater than zero; a zero budget would refuse \
              every request before the rule ran"
         );
-        let compiled = CompiledRego::compile("policy `rego`", &module, query.clone(), budget_ms)?;
+        let compiled = CompiledRego::compile("policy `rego`", &module, query, budget_ms)?;
         Ok(Self {
-            module,
-            query,
             deny_status,
             deny_message,
             budget_ms,
-            compiled: Arc::new(Mutex::new(compiled)),
+            compiled: Mutex::new(compiled),
         })
     }
 
@@ -215,7 +213,6 @@ allow if {
     fn from_config_defaults_the_query_to_the_conventional_rule() {
         let policy = RegoPolicy::from_config(serde_json::json!({ "module": MODULE }))
             .expect("policy compiles");
-        assert_eq!(policy.query, "data.sbproxy.allow");
         assert_eq!(policy.deny_status, 403);
     }
 
