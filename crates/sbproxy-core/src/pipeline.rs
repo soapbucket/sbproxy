@@ -491,10 +491,9 @@ impl MatcherEntry {
     /// An entry carrying a body matcher or a `when` predicate cannot pass
     /// here, because neither input is available yet. That makes a `None`
     /// from this method ambiguous: it means "no rule matched" *or* "a rule
-    /// could not be evaluated". Callers that turn `None` into the origin's
-    /// base action must therefore first ask
-    /// [`forward_rules_need_full_matching`] whether the rule set contains
-    /// anything unevaluable, and skip their optimisation when it does.
+    /// could not be evaluated". Callers previewing routing should use
+    /// [`preview_forward_rules`] instead, which walks the rules in
+    /// priority order and says explicitly when the answer is unknowable.
     /// Guessing the base action for a rule that routes elsewhere is how a
     /// stale-while-revalidate write lands in the wrong cache entry.
     pub fn match_request(
