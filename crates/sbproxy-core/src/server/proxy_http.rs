@@ -138,9 +138,6 @@ fn hold_request_body_chunk(body: &mut Option<Bytes>) {
     *body = Some(Bytes::new());
 }
 
-/// Stop a buffered response whose transform failed after Pingora committed the
-/// upstream headers. The status line cannot be rewritten safely at this phase,
-/// so closing the stream is the only way to avoid completing a false success.
 /// The transform that forbids skipping when the body outgrows the
 /// buffer, if any.
 ///
@@ -148,17 +145,27 @@ fn hold_request_body_chunk(body: &mut Option<Bytes>) {
 /// client, and body size is influenceable from either side of the
 /// proxy, so an oversized body must fail the response rather than
 /// bypass the transform. Returns the first closed transform's type
-/// name for attribution; `None` means every attached transform is
-/// `open` and the documented pass-through stands.
-fn oversized_body_refusal(
-    transforms: &[sbproxy_modules::transform::CompiledTransform],
-) -> Option<&str> {
+/// name for attribution; `None` means every transform that would apply
+/// is `open` and the documented pass-through stands.
+///
+/// Filtered by content type with the same predicate apply-time uses: a
+/// closed transform that would never have touched this response cannot
+/// forbid delivering it, or every large download on an origin whose
+/// HTML redactor is scoped to `text/html` would abort mid-stream.
+fn oversized_body_refusal<'t>(
+    transforms: &'t [sbproxy_modules::transform::CompiledTransform],
+    content_type: Option<&str>,
+) -> Option<&'t str> {
     transforms
         .iter()
+        .filter(|t| t.matches_content_type(content_type))
         .find(|t| t.failure_posture == FailureMode::Closed)
         .map(|t| t.transform.transform_type())
 }
 
+/// Stop a buffered response whose transform failed after Pingora committed the
+/// upstream headers. The status line cannot be rewritten safely at this phase,
+/// so closing the stream is the only way to avoid completing a false success.
 fn abort_committed_transform_response(
     body: &mut Option<Bytes>,
     ctx: &mut RequestContext,
@@ -2774,7 +2781,7 @@ impl ProxyHttp for SbProxy {
         // Header-only discovery misses consumers that read the
         // rendered document (some browsers' "view source" tooling,
         // HTML-parsing scrapers that ignore headers); the inline tag
-        // closes that gap without changing the header behaviour.
+        // closes that gap without changing the header behavior.
         //
         // WOR-808 PR6: same treatment for RSS / Atom feeds. The link
         // slots into `<channel>` (RSS) or `<feed>` (Atom) with the
@@ -5492,34 +5499,10 @@ impl ProxyHttp for SbProxy {
                     10 * 1024 * 1024
                 };
                 if buf.len() + chunk.len() > max_size {
-                    // WOR-2411: a `closed` transform's contract is that
-                    // the untransformed body must not reach the client,
-                    // and body size is influenceable from either side of
-                    // the proxy. Skipping the transform because the body
-                    // is big would let "make it big enough" bypass the
-                    // exact control `closed` promises, more quietly than
-                    // the error path ever could. The status line is long
-                    // gone by body-filter time, so the refusal is the
-                    // same one a failing `closed` transform takes on a
-                    // committed response: abort the stream, and a
-                    // truncated response replaces silently delivered
-                    // unredacted bytes.
-                    if has_transforms {
-                        if let Some(transform_name) =
-                            oversized_body_refusal(&pipeline.transforms[origin_idx])
-                        {
-                            warn!(
-                                hostname = %ctx.hostname,
-                                buffered = buf.len(),
-                                chunk = chunk.len(),
-                                max = max_size,
-                                transform = transform_name,
-                                "response body exceeded max_body_size; a closed transform \
-                                 cannot be skipped, failing the response"
-                            );
-                            return abort_committed_transform_response(body, ctx, transform_name);
-                        }
-                    }
+                    // The closed-posture refusal (WOR-2411) ran before
+                    // the capture blocks, so reaching this arm means
+                    // every transform that applies to this content type
+                    // is `open` and the documented pass-through stands.
                     warn!(
                         hostname = %ctx.hostname,
                         buffered = buf.len(),
@@ -6956,7 +6939,7 @@ mod tests {
             cap_test_transform(FailureMode::Closed),
         ];
         assert_eq!(
-            oversized_body_refusal(&transforms),
+            oversized_body_refusal(&transforms, Some("text/html")),
             Some("html_to_markdown"),
             "one closed transform among open ones is enough to refuse"
         );
@@ -6964,11 +6947,33 @@ mod tests {
 
     #[test]
     fn an_oversized_body_still_passes_through_when_every_transform_is_open() {
-        // The documented pass-through is the correct behaviour for the
+        // The documented pass-through is the correct behavior for the
         // open posture and must survive this change.
         let transforms = [cap_test_transform(FailureMode::Open)];
-        assert_eq!(oversized_body_refusal(&transforms), None);
-        assert_eq!(oversized_body_refusal(&[]), None);
+        assert_eq!(oversized_body_refusal(&transforms, Some("text/html")), None);
+        assert_eq!(oversized_body_refusal(&[], Some("text/html")), None);
+    }
+
+    #[test]
+    fn a_closed_transform_scoped_to_another_content_type_does_not_refuse() {
+        // The over-refusal review caught: a closed HTML redactor scoped
+        // to text/html must not abort every large zip download on the
+        // same origin. The seam filters with the same predicate
+        // apply-time uses, so a transform that would never have touched
+        // this response cannot forbid delivering it.
+        let mut scoped = cap_test_transform(FailureMode::Closed);
+        scoped.content_types = vec!["text/html".to_owned()];
+        let transforms = [scoped];
+        assert_eq!(
+            oversized_body_refusal(&transforms, Some("application/zip")),
+            None,
+            "a non-matching content type is outside the closed contract"
+        );
+        assert_eq!(
+            oversized_body_refusal(&transforms, Some("text/html; charset=utf-8")),
+            Some("html_to_markdown"),
+            "the matching content type still refuses"
+        );
     }
 
     #[test]

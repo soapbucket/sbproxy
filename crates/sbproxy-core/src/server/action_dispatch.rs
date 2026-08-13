@@ -1192,6 +1192,33 @@ fn apply_plugin_action_response_transforms(
     let mut terminal_failure = false;
     for compiled_transform in transforms {
         if body.len() > compiled_transform.max_body_size {
+            // WOR-2411: skipping is only lawful under `open`. A
+            // `closed` transform's contract is that the untransformed
+            // body never reaches the client, and body size is
+            // influenceable, so an oversized body fails the response
+            // exactly as a transform error under the same posture
+            // does. Content-type scoping applies first: a transform
+            // that would never touch this response cannot forbid it.
+            if compiled_transform.failure_posture == FailureMode::Closed
+                && compiled_transform.matches_content_type(content_type)
+            {
+                warn!(
+                    transform = compiled_transform.transform.transform_type(),
+                    body_bytes = body.len(),
+                    max_body_size = compiled_transform.max_body_size,
+                    failure_posture = compiled_transform.failure_posture.as_label(),
+                    "plugin action response exceeds a closed transform's limit; failing the \
+                     response"
+                );
+                // Substitute the body before flagging: the terminal
+                // path serves whatever is in the buffer, and serving
+                // the oversized original would deliver exactly the
+                // bytes this refusal exists to withhold.
+                body.clear();
+                body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                terminal_failure = true;
+                break;
+            }
             warn!(
                 transform = compiled_transform.transform.transform_type(),
                 body_bytes = body.len(),
@@ -1717,6 +1744,90 @@ origins:
         assert!(
             response.ends_with("\r\n\r\ntransformed"),
             "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_oversized_body_fails_under_a_closed_transform() {
+        // WOR-2411, the action-path half. A body over max_body_size
+        // used to skip the transform with the posture ignored, so
+        // "make the body big enough" served it untransformed under a
+        // posture spelled closed. The refusal must also not leak the
+        // oversized original in the 500's own body.
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: closed
+        max_body_size: 16
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            Bytes::from_static(b"{\"padding\":\"well over sixteen bytes of body\"}"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("the refusal must dispatch a safe response"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "response: {response}"
+        );
+        assert!(
+            !response.contains("well over sixteen bytes"),
+            "the oversized body must not ride on its own refusal: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_oversized_body_passes_under_an_open_transform() {
+        // The documented skip stands under open.
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: open
+        max_body_size: 16
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            Bytes::from_static(b"{\"padding\":\"well over sixteen bytes of body\"}"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("the skip must dispatch the original response"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "response: {response}"
+        );
+        assert!(
+            response.contains("well over sixteen bytes"),
+            "the open posture passes the oversized body through: {response}"
         );
     }
 
