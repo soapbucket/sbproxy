@@ -163,6 +163,47 @@ fn oversized_body_refusal<'t>(
         .map(|t| t.transform.transform_type())
 }
 
+/// The whole first-position guard for WOR-2411, taking the real request
+/// context so every condition is testable against the type production
+/// uses.
+///
+/// Returns the closed transform's type name when this chunk must be
+/// refused before the capture blocks see it. Deliberately not gated on
+/// `buffering_body`: buffering starts in the transform section, so a
+/// body whose first chunk alone crosses the cap arrives before
+/// buffering exists, and an earlier version gated on it missed exactly
+/// the single-chunk delivery that small caps see most.
+///
+/// Exempt states: a pending fallback or replacement body discards the
+/// upstream body entirely, so nothing oversized remains to refuse; and
+/// a response the all-open pass-through already committed to raw
+/// delivery must not be aborted after its raw prefix reached the
+/// client.
+fn closed_refusal_before_capture(ctx: &RequestContext, chunk_len: usize) -> Option<String> {
+    if ctx.transform_passthrough_committed
+        || ctx.fallback_body.is_some()
+        || ctx.response_body_replacement.is_some()
+    {
+        return None;
+    }
+    let idx = ctx.origin_idx?;
+    let pipeline = ctx.pipeline.clone();
+    let transforms = pipeline.transforms.get(idx).map_or(&[][..], Vec::as_slice);
+    if transforms.is_empty() {
+        return None;
+    }
+    let buffered: usize = ctx.response_body_buf.as_ref().map_or(0, |b| b.len());
+    let max_size = transforms
+        .iter()
+        .map(|t| t.max_body_size)
+        .max()
+        .unwrap_or(10 * 1024 * 1024);
+    if buffered.saturating_add(chunk_len) <= max_size {
+        return None;
+    }
+    oversized_body_refusal(transforms, ctx.upstream_content_type.as_deref()).map(str::to_owned)
+}
+
 /// Stop a buffered response whose transform failed after Pingora committed the
 /// upstream headers. The status line cannot be rewritten safely at this phase,
 /// so closing the stream is the only way to avoid completing a false success.
@@ -5267,36 +5308,32 @@ impl ProxyHttp for SbProxy {
         // writes in this same call, so the bytes the closed posture is
         // about to refuse would be served verbatim from cache for the
         // entry's whole TTL. Aborting first means nothing captures them.
-        if ctx.buffering_body {
-            if let (Some(transform_buf), Some(chunk)) =
-                (ctx.response_body_buf.as_ref(), body.as_ref())
-            {
-                if let Some(idx) = ctx.origin_idx {
-                    let pipeline = ctx.pipeline.clone();
-                    let transforms = pipeline.transforms.get(idx).map_or(&[][..], Vec::as_slice);
-                    let max_size = transforms
-                        .iter()
-                        .map(|t| t.max_body_size)
-                        .max()
-                        .unwrap_or(10 * 1024 * 1024);
-                    if transform_buf.len() + chunk.len() > max_size {
-                        if let Some(transform_name) =
-                            oversized_body_refusal(transforms, ctx.upstream_content_type.as_deref())
-                        {
-                            warn!(
-                                hostname = %ctx.hostname,
-                                buffered = transform_buf.len(),
-                                chunk = chunk.len(),
-                                max = max_size,
-                                transform = transform_name,
-                                "response body exceeded max_body_size; a closed transform \
-                                 cannot be skipped, failing the response"
-                            );
-                            let name = transform_name.to_owned();
-                            return abort_committed_transform_response(body, ctx, &name);
-                        }
-                    }
-                }
+        //
+        // Deliberately NOT gated on `buffering_body`: buffering starts
+        // in the transform section below, so a body whose first chunk
+        // alone crosses the cap arrives here before buffering exists,
+        // and gating on it made the refusal miss exactly the
+        // single-chunk delivery that small caps see most. The projected
+        // size is whatever is buffered so far (zero on the first chunk)
+        // plus this chunk.
+        //
+        // Two states are exempt. A pending fallback or replacement body
+        // (consumed just below) discards the upstream body entirely, so
+        // there is nothing oversized left to refuse. And once the
+        // all-open pass-through has committed this response to raw
+        // delivery, aborting a later chunk would truncate a stream
+        // whose raw prefix the client already holds, which is worse
+        // than the pass-through the open posture already chose.
+        if let Some(chunk_len) = body.as_ref().map(bytes::Bytes::len) {
+            if let Some(name) = closed_refusal_before_capture(ctx, chunk_len) {
+                warn!(
+                    hostname = %ctx.hostname,
+                    chunk = chunk_len,
+                    transform = %name,
+                    "response body exceeded max_body_size; a closed transform \
+                     cannot be skipped, failing the response"
+                );
+                return abort_committed_transform_response(body, ctx, &name);
             }
         }
 
@@ -5519,6 +5556,13 @@ impl ProxyHttp for SbProxy {
             None => return Ok(None),
         };
 
+        // A response committed to raw delivery stays raw (WOR-2418):
+        // re-buffering after the overflow flush would run transforms and
+        // the SRI scanner over the tail alone.
+        if ctx.transform_passthrough_committed {
+            return Ok(None);
+        }
+
         // Start buffering on the first chunk.
         if !ctx.buffering_body {
             ctx.buffering_body = true;
@@ -5541,10 +5585,11 @@ impl ProxyHttp for SbProxy {
                     10 * 1024 * 1024
                 };
                 if buf.len() + chunk.len() > max_size {
-                    // The closed-posture refusal (WOR-2411) ran before
-                    // the capture blocks, so reaching this arm means
-                    // every transform that applies to this content type
-                    // is `open` and the documented pass-through stands.
+                    // The closed-posture refusal (WOR-2411) runs before
+                    // the capture blocks on every chunk, so reaching
+                    // this arm means every transform that applies to
+                    // this content type is `open` and the documented
+                    // pass-through stands.
                     warn!(
                         hostname = %ctx.hostname,
                         buffered = buf.len(),
@@ -5552,7 +5597,14 @@ impl ProxyHttp for SbProxy {
                         max = max_size,
                         "response body buffer exceeded max_body_size, passing through unmodified"
                     );
-                    // Flush the buffer plus this chunk as-is and stop buffering.
+                    // Flush the buffer plus this chunk as-is, and commit
+                    // the rest of this response to raw delivery
+                    // (WOR-2418): without the commitment, buffering
+                    // restarted on the next chunk and the transforms
+                    // plus the SRI scanner ran on the post-overflow
+                    // tail alone, handing the client a raw head
+                    // concatenated with a transformed tail, and the
+                    // scanner a verdict over a fragment.
                     let combined = buf.split().freeze();
                     let mut out = bytes::BytesMut::with_capacity(combined.len() + chunk.len());
                     out.extend_from_slice(&combined);
@@ -5560,6 +5612,7 @@ impl ProxyHttp for SbProxy {
                     *body = Some(out.freeze());
                     ctx.response_body_buf = None;
                     ctx.buffering_body = false;
+                    ctx.transform_passthrough_committed = true;
                     return Ok(None);
                 }
                 buf.extend_from_slice(&chunk);
@@ -6966,6 +7019,80 @@ mod tests {
             failure_posture: posture,
             max_body_size: 1024,
         }
+    }
+
+    fn refusal_test_ctx(config_yaml: &str) -> RequestContext {
+        let config = sbproxy_config::compile_config(config_yaml).expect("fixture config");
+        let pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.upstream_content_type = Some("application/json".to_owned());
+        ctx
+    }
+
+    const CLOSED_CAP_CONFIG: &str = r#"
+origins:
+  "cap.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: closed
+        max_body_size: 16
+"#;
+
+    #[test]
+    fn a_single_oversized_first_chunk_is_refused_before_anything_captures_it() {
+        // The re-review's crux. Buffering starts in the transform
+        // section, so an earlier version gated this guard on
+        // `buffering_body` and never fired for a body whose first chunk
+        // alone crossed the cap: the cache write dispatched, the
+        // pass-through arm served the body under a 200, and the closed
+        // transform was bypassed entirely. Single-chunk delivery is the
+        // common case for small caps, not the edge.
+        let ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
+        assert!(!ctx.buffering_body, "the crux: buffering has not started");
+        assert_eq!(
+            closed_refusal_before_capture(&ctx, 45).as_deref(),
+            Some("json"),
+            "the first chunk must be refused before the capture blocks see it"
+        );
+        assert_eq!(
+            closed_refusal_before_capture(&ctx, 8),
+            None,
+            "a chunk under the cap proceeds"
+        );
+    }
+
+    #[test]
+    fn the_refusal_respects_the_exempt_states() {
+        // A pending replacement discards the upstream body, so there is
+        // nothing oversized left to refuse; and a response committed to
+        // raw delivery must not be aborted after its raw prefix reached
+        // the client.
+        let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
+        ctx.transform_passthrough_committed = true;
+        assert_eq!(closed_refusal_before_capture(&ctx, 45), None);
+
+        let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
+        ctx.response_body_replacement = Some(bytes::Bytes::from_static(b"replacement"));
+        assert_eq!(closed_refusal_before_capture(&ctx, 45), None);
+    }
+
+    #[test]
+    fn the_refusal_counts_what_is_already_buffered() {
+        let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
+        ctx.response_body_buf = Some(bytes::BytesMut::from(&b"twelve bytes"[..]));
+        assert_eq!(
+            closed_refusal_before_capture(&ctx, 8).as_deref(),
+            Some("json"),
+            "12 buffered + 8 arriving crosses a 16-byte cap"
+        );
     }
 
     #[test]

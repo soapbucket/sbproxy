@@ -667,6 +667,12 @@ pub struct RequestContext {
     // --- Transform body buffering ---
     /// Buffer for accumulating upstream response body chunks when transforms are configured.
     pub response_body_buf: Option<BytesMut>,
+    /// Once an oversized body under an all-`open` transform set has been
+    /// flushed raw, the rest of this response is committed to raw
+    /// delivery: no re-buffering, no transforms on the tail, no SRI
+    /// verdict over a fragment, and no closed-posture abort after a raw
+    /// prefix already reached the client.
+    pub transform_passthrough_committed: bool,
     /// Whether we are currently buffering the response body for transform processing.
     pub buffering_body: bool,
     /// Cached upstream content-type header for transform content-type matching.
@@ -1696,6 +1702,7 @@ impl RequestContext {
             shared_agent_budget_decision: None,
             response_body_buf: None,
             buffering_body: false,
+            transform_passthrough_committed: false,
             upstream_content_type: None,
             sri_scan_enabled: false,
             content_digest_verified: false,

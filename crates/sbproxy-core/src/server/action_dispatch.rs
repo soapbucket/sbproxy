@@ -1216,6 +1216,8 @@ fn apply_plugin_action_response_transforms(
                 // bytes this refusal exists to withhold.
                 body.clear();
                 body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                ctx.transform_error_attribution =
+                    Some(compiled_transform.transform.transform_type().to_string());
                 terminal_failure = true;
                 break;
             }
