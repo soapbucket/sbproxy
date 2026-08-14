@@ -98,6 +98,13 @@ pub enum CelSurface {
     /// stays a separate variant only so a diagnostic names the WAF
     /// rather than a rate limit the operator did not write.
     WafPersistent,
+    /// An `ai_proxy` action's `ai_policy.expression`.
+    ///
+    /// The one surface whose whole vocabulary is a single namespace:
+    /// the gateway-computed `ai` decision view. Nothing request-shaped
+    /// is populated, so `request.*` here is a typo to refuse at load,
+    /// not a binding that reads empty.
+    AiPolicy,
 }
 
 /// Bindings shared by every site that starts from `build_request_context`.
@@ -124,6 +131,7 @@ impl CelSurface {
             Self::CustomLogField => "custom log field",
             Self::ForwardRuleWhen => "forward rule `when`",
             Self::WafPersistent => "waf persistent rule",
+            Self::AiPolicy => "ai_policy `expression`",
         }
     }
 
@@ -189,6 +197,9 @@ impl CelSurface {
             Self::RateLimitKey | Self::WafPersistent => {
                 vec!["envelope", "features", "request.key_id"]
             }
+            // The evaluator sets exactly one variable: `ai`, from
+            // `AiDecisionView::to_cel`. See ai-policy-cel.md.
+            Self::AiPolicy => vec!["ai"],
             // custom_log builds its own JSON context rather than using
             // the shared builders, which is why its shape is unlike the
             // rest. It is the only site with `attribution` and the only
@@ -225,7 +236,10 @@ impl CelSurface {
     /// builder. `transform: cel` calls it with placeholder arguments,
     /// so the bindings exist but describe no actual request.
     const fn uses_shared_request_context(self) -> bool {
-        !matches!(self, Self::CustomLogField | Self::TransformCel)
+        !matches!(
+            self,
+            Self::CustomLogField | Self::TransformCel | Self::AiPolicy
+        )
     }
 
     /// Refuse an expression that reaches for a binding this site does

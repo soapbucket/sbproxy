@@ -4029,23 +4029,58 @@ async fn check_policies(
         let decision = match enforced.await {
             Ok(d) => d,
             Err(err) => {
+                // WOR-2423: a dynamic bundle hook running in the header
+                // phase declares the same `failure_posture` the buffered
+                // path already honors (WOR-2268); consulting it only on
+                // one of the two paths made the setting silently inert
+                // for `body_mode: none` policy hooks. Built-in and
+                // linked enforcers have no posture and keep the
+                // unconditional refusal.
+                let posture = compiled
+                    .dynamic_hook
+                    .as_ref()
+                    .map(|metadata| metadata.failure_posture());
+                let verdict = match posture {
+                    Some(posture) if posture.admits() => VerdictTag::Allow,
+                    _ => VerdictTag::Deny,
+                };
                 tracing::warn!(
                     target: "sbproxy::policy",
                     error = %err,
                     policy = %policy_id,
-                    "policy enforce() returned error; treating as deny"
+                    failure_posture = posture.map(|p| p.as_label()).unwrap_or("none"),
+                    "policy enforce() returned error"
                 );
                 emit_policy_verdict_with_outcome(
                     verdict_ctx,
                     policy_id,
                     surface,
                     engine,
-                    VerdictTag::Deny,
+                    verdict,
                     started,
-                    // The request is denied, but the decision was an
-                    // engine fault, and those are alerted on separately.
-                    Some(engine_fault_outcome(&err)),
+                    // A fail-open is not an error (WOR-2370): an
+                    // admitting posture keeps the verdict's own outcome
+                    // and the fail-open family carries the fault.
+                    (verdict == VerdictTag::Deny).then(|| engine_fault_outcome(&err)),
                 );
+                if let Some(posture) = posture.filter(|posture| posture.admits()) {
+                    // The request proceeded without the decision being
+                    // made; count the unearned allow separately, exactly
+                    // as the buffered path does.
+                    sbproxy_observe::decision::record_decision_fail_open(
+                        sbproxy_observe::decision::DecisionEvent::Policy,
+                        engine,
+                        &verdict_ctx.origin,
+                        &verdict_ctx.tenant,
+                    );
+                    let label = if posture.records_counterfactual() || posture.guarantee_waived() {
+                        posture.as_label()
+                    } else {
+                        verdict.as_label()
+                    };
+                    ctx.record_policy_decision(policy_id, label);
+                    continue;
+                }
                 // WOR-2094: the ring row explains the denial too.
                 ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
                 ctx.deny_reason = Some(format!("{policy_id}: enforce error"));

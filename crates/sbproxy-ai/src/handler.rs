@@ -397,9 +397,11 @@ impl AiHandlerConfig {
     }
 
     /// Return the compiled AI policy plane for this handler, compiling it
-    /// once (WOR-1542). `None` when no policy is configured or it failed to
-    /// compile (logged once); the request path treats both as "no policy",
-    /// so a policy bug never takes the gateway down.
+    /// once (WOR-1542). `None` when no policy is configured. The failure
+    /// arm is defensive: `from_config` already refused any policy that
+    /// does not compile (WOR-2422), so for a loaded config this compile
+    /// cannot fail; if the invariant ever breaks it is still logged
+    /// rather than panicking.
     pub fn ai_policy(&self) -> Option<&std::sync::Arc<crate::ai_policy::CompiledAiPolicy>> {
         self.ai_policy_compiled
             .get_or_init(|| {
@@ -977,6 +979,17 @@ impl AiHandlerConfig {
             .reasoning
             .validate()
             .map_err(|error| anyhow::anyhow!("ai reasoning: {error}"))?;
+        // WOR-2422: every other CEL surface refuses the config when an
+        // expression does not compile; this one used to log an error
+        // and disable itself, so a typo shipped a proxy that booted
+        // green with the policy silently absent. Compile once here for
+        // validation (the runtime instance still compiles lazily on
+        // first use); binding mistakes are caught too, because the
+        // compile goes through the `ai_policy` CEL surface.
+        if let Some(policy) = config.ai_policy.as_ref() {
+            crate::ai_policy::CompiledAiPolicy::compile(policy)
+                .map_err(|error| anyhow::anyhow!("ai ai_policy: {error}"))?;
+        }
         // WOR-2233: `token_rate` scores remaining headroom against a
         // per-provider tokens-per-minute limit, and nothing supplies
         // one. `Router::token_limits` has no config field and no
@@ -2103,6 +2116,45 @@ mod tests {
             error.contains("reasoning budget must be greater than zero"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_an_ai_policy_that_does_not_compile() {
+        // WOR-2422: a policy typo used to log-and-disable, booting a
+        // proxy that advertised a policy it silently did not run.
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_policy": {"expression": "ai.surface ==   "},
+        });
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("a syntax error must refuse the config")
+            .to_string();
+        assert!(error.contains("ai_policy"), "{error}");
+    }
+
+    #[test]
+    fn from_config_rejects_an_ai_policy_naming_a_binding_the_surface_lacks() {
+        // The evaluator sets exactly one variable, `ai`; a reference
+        // to the request vocabulary is a typo caught at load like on
+        // every other CEL surface, not a runtime fault eaten by
+        // `on_error`.
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_policy": {"expression": "request.method == \"GET\""},
+        });
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("an unknown binding must refuse the config")
+            .to_string();
+        assert!(error.contains("ai_policy"), "{error}");
+    }
+
+    #[test]
+    fn from_config_accepts_a_valid_ai_policy() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_policy": {"expression": "ai.guardrails.flagged_count > 1 ? 'block' : 'allow'"},
+        });
+        AiHandlerConfig::from_config(json).expect("a valid ai.* policy must load");
     }
 
     #[test]

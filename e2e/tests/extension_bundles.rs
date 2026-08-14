@@ -626,3 +626,87 @@ origins:
         "the buffered action should still receive the complete body"
     );
 }
+
+// --- Header-phase failure posture (WOR-2423) ---
+//
+// A `body_mode: none` policy hook runs in the header phase. Its
+// manifest `failure_posture` must decide what an engine fault does,
+// exactly as the buffered path already honors it: `open` admits the
+// request, `closed` refuses it.
+
+fn header_phase_policy_manifest(name: &str, policy_type: &str, posture: &str) -> String {
+    format!(
+        r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: {name}
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: {policy_type}
+    export: inspect
+    execution:
+      body_mode: none
+failure_posture: {posture}
+"#
+    )
+}
+
+const THROWING_POLICY_JS: &str =
+    r#"export function inspect() { throw new Error("engine fault on purpose"); }"#;
+
+#[test]
+fn header_phase_policy_fault_admits_under_an_open_posture() {
+    let upstream = MockUpstream::start(serde_json::json!({"ok": true})).expect("start upstream");
+    let manifest = header_phase_policy_manifest("open-fault", "open_fault_policy", "open");
+    let files = [
+        ("bundles/open-fault/bundle.yaml", manifest.as_str()),
+        ("bundles/open-fault/entry.js", THROWING_POLICY_JS),
+    ];
+    let proxy = ProxyHarness::start_with_workspace(
+        &proxy_policy_config(&upstream, "open_fault_policy"),
+        &files,
+    )
+    .expect("start proxy");
+
+    let response = proxy.get("/", "extension.localhost").expect("request");
+    assert_eq!(
+        response.status,
+        200,
+        "an open posture must admit the request when the hook faults: {:?}",
+        response.text().unwrap_or_default()
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "the admitted request must reach the upstream"
+    );
+}
+
+#[test]
+fn header_phase_policy_fault_refuses_under_the_closed_default() {
+    let upstream = MockUpstream::start(serde_json::json!({"ok": true})).expect("start upstream");
+    let manifest = header_phase_policy_manifest("closed-fault", "closed_fault_policy", "closed");
+    let files = [
+        ("bundles/closed-fault/bundle.yaml", manifest.as_str()),
+        ("bundles/closed-fault/entry.js", THROWING_POLICY_JS),
+    ];
+    let proxy = ProxyHarness::start_with_workspace(
+        &proxy_policy_config(&upstream, "closed_fault_policy"),
+        &files,
+    )
+    .expect("start proxy");
+
+    let response = proxy.get("/", "extension.localhost").expect("request");
+    assert_eq!(
+        response.status, 500,
+        "a closed posture must refuse the request when the hook faults"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        0,
+        "the refused request must not reach the upstream: {:?}",
+        upstream.captured()
+    );
+}

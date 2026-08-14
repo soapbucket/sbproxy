@@ -37,7 +37,7 @@
 //! deliberately does not, and `AiPolicyConfig::on_error` keeps its own
 //! vocabulary. See that field's documentation for the argument.
 
-use sbproxy_extension::cel::{CelContext, CelEngine, CelExpression, CelValue};
+use sbproxy_extension::cel::{CelContext, CelSurface, CelValue, CompiledCel};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -337,15 +337,14 @@ fn default_on_error() -> String {
 
 /// A compiled, ready-to-evaluate policy.
 pub struct CompiledAiPolicy {
-    engine: CelEngine,
-    expr: CelExpression,
+    cel: CompiledCel,
     on_error: Vec<AiPolicyAction>,
 }
 
 impl std::fmt::Debug for CompiledAiPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledAiPolicy")
-            .field("expression", &self.expr.source())
+            .field("expression", &self.cel.source())
             .field("on_error", &self.on_error)
             .finish()
     }
@@ -369,10 +368,15 @@ impl CompiledAiPolicy {
     /// invalid `on_error` action, so misconfiguration is caught at config
     /// load rather than on the request path.
     pub fn compile(cfg: &AiPolicyConfig) -> anyhow::Result<Self> {
-        let engine = CelEngine::new();
-        let expr = engine
-            .compile(&cfg.expression)
-            .map_err(|e| anyhow::anyhow!("ai_policy.expression: {e}"))?;
+        // Through `CompiledCel` like every other CEL surface, so a
+        // reference to a binding the evaluator never sets (there is
+        // only `ai`) is a load error with the surface's vocabulary in
+        // the message, not a runtime fault the `on_error` list eats.
+        let cel = CompiledCel::compile(
+            CelSurface::AiPolicy,
+            "ai_policy `expression`",
+            &cfg.expression,
+        )?;
         let on_error = parse_action_list(&cfg.on_error)
             .map_err(|e| anyhow::anyhow!("ai_policy.on_error: {e}"))?;
         if on_error
@@ -381,11 +385,7 @@ impl CompiledAiPolicy {
         {
             anyhow::bail!("ai_policy.on_error: invalid compression selector");
         }
-        Ok(Self {
-            engine,
-            expr,
-            on_error,
-        })
+        Ok(Self { cel, on_error })
     }
 
     /// The fallback decision used on an evaluation error.
@@ -402,7 +402,7 @@ impl CompiledAiPolicy {
     pub fn evaluate(&self, view: &AiDecisionView) -> AiPolicyDecision {
         let mut ctx = CelContext::new();
         ctx.set("ai", view.to_cel());
-        match self.engine.eval(&self.expr, &ctx) {
+        match self.cel.eval(&ctx) {
             Ok(CelValue::String(s)) => match AiPolicyAction::parse(&s) {
                 Ok(a) => AiPolicyDecision {
                     actions: vec![a],
