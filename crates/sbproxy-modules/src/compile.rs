@@ -700,6 +700,7 @@ hooks:
         let config = ExtensionBundlesConfig {
             bundles_dir: Some(directory.path().display().to_string()),
             sources: Vec::new(),
+            grants: Default::default(),
         };
         let registry = DynamicBundleRegistry::load(&config, directory.path(), &BTreeSet::new())
             .expect("load dynamic compile fixture");

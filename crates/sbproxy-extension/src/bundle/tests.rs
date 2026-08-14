@@ -77,6 +77,7 @@ fn local_config(path: &Path) -> ExtensionBundlesConfig {
     ExtensionBundlesConfig {
         bundles_dir: Some(path.display().to_string()),
         sources: Vec::new(),
+        grants: Default::default(),
     }
 }
 
@@ -247,6 +248,7 @@ fn sources_process_bundles_dir_first_then_declarations_in_order() {
         VALID_JAVASCRIPT,
     );
     let config = ExtensionBundlesConfig {
+        grants: Default::default(),
         bundles_dir: Some("short".to_owned()),
         sources: vec![
             BundleSourceConfig::Directory {
@@ -836,6 +838,7 @@ fn git_source_uses_verified_materializer_and_safe_provenance() {
         "resolved-private-token",
     );
     let config = ExtensionBundlesConfig {
+        grants: Default::default(),
         bundles_dir: None,
         sources: vec![BundleSourceConfig::Git {
             repo: "https://secret@example.test/repo.git".to_owned(),
@@ -902,6 +905,7 @@ fn git_rejects_missing_digest_mutable_revision_and_unresolved_credential() {
         calls: Arc::new(Mutex::new(Vec::new())),
     }));
     let mut config = ExtensionBundlesConfig {
+        grants: Default::default(),
         bundles_dir: None,
         sources: vec![BundleSourceConfig::Git {
             repo: "https://token@example.test/repo.git".to_owned(),

@@ -950,6 +950,7 @@ mod tests {
         let repo = "https://example.test/private-bundles.git";
         let config = sbproxy_config::ExtensionBundlesConfig {
             bundles_dir: None,
+            grants: Default::default(),
             sources: vec![sbproxy_config::BundleSourceConfig::Git {
                 repo: repo.to_string(),
                 revision: "a".repeat(40),
@@ -980,6 +981,7 @@ mod tests {
         let secret_material = "literal-private-token-that-must-not-leak";
         let config = sbproxy_config::ExtensionBundlesConfig {
             bundles_dir: None,
+            grants: Default::default(),
             sources: vec![sbproxy_config::BundleSourceConfig::Git {
                 repo: "https://example.test/private-bundles.git".to_string(),
                 revision: "a".repeat(40),

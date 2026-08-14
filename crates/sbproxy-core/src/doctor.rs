@@ -2085,6 +2085,7 @@ origins:
         let config = sbproxy_config::ExtensionBundlesConfig {
             bundles_dir: Some("bundles".to_owned()),
             sources: Vec::new(),
+            grants: Default::default(),
         };
         let before = DoctorReport::collect();
         let exit_code = before.exit_code();

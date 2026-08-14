@@ -720,6 +720,7 @@ hooks:
     let config = sbproxy_config::ExtensionBundlesConfig {
         bundles_dir: Some(directory.path().display().to_string()),
         sources: Vec::new(),
+        grants: Default::default(),
     };
     let registry = sbproxy_extension::bundle::DynamicBundleRegistry::load(
         &config,

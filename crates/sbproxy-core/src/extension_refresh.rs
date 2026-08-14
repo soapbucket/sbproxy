@@ -275,6 +275,7 @@ mod tests {
         let config = ExtensionBundlesConfig {
             bundles_dir: None,
             sources: vec![git_source(0)],
+            grants: Default::default(),
         };
 
         assert!(BundleRefreshPoller::from_config("sb.yml", &config).is_none());
@@ -285,6 +286,7 @@ mod tests {
         let config = ExtensionBundlesConfig {
             bundles_dir: None,
             sources: vec![git_source(300), git_source(45)],
+            grants: Default::default(),
         };
 
         let poller = BundleRefreshPoller::from_config("sb.yml", &config)

@@ -370,6 +370,7 @@ fn published_config_uses_a_config_relative_local_bundle_directory() {
         ExtensionBundlesConfig {
             bundles_dir: Some("bundles".to_owned()),
             sources: Vec::new(),
+            grants: Default::default(),
         }
     );
 }

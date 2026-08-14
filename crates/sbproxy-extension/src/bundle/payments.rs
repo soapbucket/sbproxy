@@ -191,6 +191,7 @@ mod tests {
             &ExtensionBundlesConfig {
                 bundles_dir: Some(directory.path().display().to_string()),
                 sources: Vec::new(),
+                grants: Default::default(),
             },
             directory.path(),
             &BTreeSet::new(),
@@ -222,6 +223,7 @@ mod tests {
             &ExtensionBundlesConfig {
                 bundles_dir: Some(directory.path().display().to_string()),
                 sources: Vec::new(),
+                grants: Default::default(),
             },
             directory.path(),
             &BTreeSet::new(),
