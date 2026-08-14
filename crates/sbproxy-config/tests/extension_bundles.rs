@@ -858,3 +858,64 @@ fn digest_scope_bundle_v1_requires_a_digest_to_scope() {
         BundleDigestScope::BundleV1
     );
 }
+
+// --- net:outbound declarations (WOR-2424) ---
+
+#[test]
+fn per_hook_outbound_declarations_parse_on_javascript_only() {
+    let yaml = JAVASCRIPT_MANIFEST.replace(
+        "    export: enforce",
+        "    export: enforce\n    permissions:\n      - \"net:outbound=https://api.example.test\"\n      - \"net:outbound=http://internal.example.test:8080\"",
+    );
+    let manifest = parse_manifest(&yaml);
+    assert_eq!(manifest.hooks[0].permissions.len(), 2);
+
+    // The wasm runtimes have no host-call surface; a declaration there
+    // must refuse at parse, naming the runtime.
+    let wasm = yaml
+        .replace(
+            "runtime: javascript",
+            "runtime: wasm\nabi: sbproxy-envelope/v1",
+        )
+        .replace("entry: src/index.ts", "entry: entry.wasm")
+        .replace("    export: enforce\n", "");
+    let error = manifest_error(&wasm);
+    assert!(
+        error.contains("no host \\\n") || error.contains("no host call surface"),
+        "{error}"
+    );
+}
+
+#[test]
+fn malformed_outbound_declarations_refuse_with_named_reasons() {
+    for (entry, needle) in [
+        ("fs:read", "unrecognized capability"),
+        ("net:outbound=ftp://files.example.test", "not grantable"),
+        ("net:outbound=https://*.example.test", "exact hostname"),
+        (
+            "net:outbound=https://api.example.test:notaport",
+            "not a port",
+        ),
+        ("net:outbound=api.example.test", "missing `<scheme>://`"),
+    ] {
+        let yaml = JAVASCRIPT_MANIFEST.replace(
+            "    export: enforce",
+            &format!("    export: enforce\n    permissions:\n      - \"{entry}\""),
+        );
+        let error = manifest_error(&yaml);
+        assert!(error.contains(needle), "{entry}: {error}");
+    }
+}
+
+#[test]
+fn grant_entries_validate_with_the_same_parser() {
+    let mut config = sbproxy_config::ExtensionBundlesConfig::default();
+    config.grants.insert(
+        "prober".to_owned(),
+        vec!["net:outbound=gopher://old.example.test".to_owned()],
+    );
+    let error = config.validate().expect_err("a bad grant must refuse");
+    let text = error.to_string();
+    assert!(text.contains("extensions.grants.prober"), "{text}");
+    assert!(text.contains("not grantable"), "{text}");
+}

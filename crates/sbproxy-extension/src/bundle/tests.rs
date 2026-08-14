@@ -1212,3 +1212,137 @@ fn bundle_v1_digest_is_stable_across_two_computations() {
     load_ok(temp.path());
     load_ok(temp.path());
 }
+
+// --- net:outbound (WOR-2424) ---
+
+fn outbound_manifest(name: &str, destination: &str) -> String {
+    format!(
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: policy\n    type: outbound_probe\n    export: run\n    permissions:\n      - \"net:outbound={destination}\"\n"
+    )
+}
+
+#[test]
+fn a_declared_destination_without_a_grant_refuses_the_candidate() {
+    let base = tempfile::TempDir::new().unwrap();
+    write_bundle(
+        base.path(),
+        "prober",
+        &outbound_manifest("prober", "https://api.example.test"),
+        br#"export function run() { return {version:"sbproxy-envelope/v1",decision:"allow"}; }"#,
+    );
+    let config = local_config(base.path());
+    let error = DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new()).unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("has not granted"),
+        "the refusal must say what is missing: {text}"
+    );
+    assert!(
+        text.contains("https://api.example.test:443"),
+        "the refusal must name the ungranted destination: {text}"
+    );
+    assert!(
+        text.contains("grants nothing"),
+        "the refusal must name the granted set: {text}"
+    );
+}
+
+#[test]
+fn a_granted_destination_loads_and_an_extra_grant_is_harmless() {
+    let base = tempfile::TempDir::new().unwrap();
+    write_bundle(
+        base.path(),
+        "prober",
+        &outbound_manifest("prober", "https://api.example.test"),
+        br#"export function run() { return {version:"sbproxy-envelope/v1",decision:"allow"}; }"#,
+    );
+    let mut config = local_config(base.path());
+    config.grants.insert(
+        "prober".to_owned(),
+        vec![
+            "net:outbound=https://api.example.test".to_owned(),
+            "net:outbound=https://unused.example.test".to_owned(),
+        ],
+    );
+    DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new())
+        .expect("a fully granted declaration must load");
+}
+
+#[test]
+fn a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses() {
+    // A one-shot local HTTP listener stands in for the destination.
+    // Loopback grants are literal-address grants, which is exactly the
+    // operator-typed internal-service case the allowlist admits.
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0u8; 4096];
+        let _ = stream.read(&mut buffer);
+        let body = b"granted-destination-body";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+    });
+
+    let base = tempfile::TempDir::new().unwrap();
+    let source = format!(
+        r#"export function run() {{
+  const granted = JSON.parse(sbproxy_fetch(JSON.stringify({{url: "http://127.0.0.1:{port}/probe"}})));
+  const refused = JSON.parse(sbproxy_fetch(JSON.stringify({{url: "https://never-granted.example.test/"}})));
+  return {{version:"sbproxy-envelope/v1",decision:"deny",status:451,message:(granted.body_base64 || "none") + "|" + (refused.error || "none")}};
+}}"#
+    );
+    write_bundle(
+        base.path(),
+        "prober",
+        &outbound_manifest("prober", &format!("http://127.0.0.1:{port}")),
+        source.as_bytes(),
+    );
+    let mut config = local_config(base.path());
+    config.grants.insert(
+        "prober".to_owned(),
+        vec![format!("net:outbound=http://127.0.0.1:{port}")],
+    );
+    let registry = DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new())
+        .expect("granted bundle loads");
+
+    let policy = registry
+        .policy("outbound_probe")
+        .expect("policy hook present");
+    let adapter = crate::bundle::javascript::build_javascript_policy(policy, serde_json::json!({}))
+        .expect("adapter builds");
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://origin.test/")
+        .body(bytes::Bytes::new())
+        .unwrap();
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use sbproxy_plugin::PolicyEnforcer as _;
+            let mut context: Box<dyn std::any::Any> = Box::new(());
+            adapter.enforce(&request, context.as_mut()).await
+        })
+        .expect("hook evaluates");
+    served.join().unwrap();
+
+    let message = format!("{outcome:?}");
+    // base64("granted-destination-body")
+    use base64::Engine as _;
+    let expected = base64::engine::general_purpose::STANDARD.encode(b"granted-destination-body");
+    assert!(
+        message.contains(&expected),
+        "the granted fetch's body must reach the guest: {message}"
+    );
+    assert!(
+        message.contains("egress_denied"),
+        "the undeclared fetch must refuse with a bounded reason: {message}"
+    );
+}

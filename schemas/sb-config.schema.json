@@ -20,6 +20,7 @@
       "description": "Extension bundle discovery sources. Paths stay unresolved in this parsed representation and are interpreted only by the runtime loader.",
       "default": {
         "bundles_dir": null,
+        "grants": {},
         "sources": []
       },
       "allOf": [
@@ -347,6 +348,17 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/BundleSourceConfig"
+          }
+        },
+        "grants": {
+          "description": "Capability grants, keyed by bundle manifest `name`.\n\nA bundle's hooks may declare capabilities in their manifest (`net:outbound=<scheme>://<host>[:port]`); nothing is granted by declaration alone. The operator grants here, with the same entry syntax, and a candidate whose declared set exceeds its granted set refuses at load naming both sets. An empty or absent grant list means the bundle gets no capabilities, which is the default every bundle had before this key existed.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },

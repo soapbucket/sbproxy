@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-14*
 
 Dynamic bundles add policies, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -23,6 +23,18 @@ extensions:
 ```
 
 A relative `bundles_dir` uses the directory containing `sb.yml` as its base. The loader visits each child directory, reads its `bundle.yaml`, then reads the declared entry artifact without following a path outside that bundle. The runnable layout is in [examples/extension-bundles](../examples/extension-bundles/).
+
+The same `extensions:` block carries capability grants, keyed by bundle manifest name:
+
+```yaml
+extensions:
+  bundles_dir: bundles
+  grants:
+    jwks-refresher:
+      - "net:outbound=https://issuer.example.com"
+```
+
+A bundle's hooks declare the destinations they want (see the manifest section below); the grant here is what makes any of them usable. The two lists must agree at load: a declared destination without a matching grant refuses the candidate, naming both sets, and a grant nothing declares is harmless. An absent grant list is an empty one.
 
 Git sources use the same bundle layout from a verified checkout:
 
@@ -96,7 +108,9 @@ permissions: []
 - `masked_vars` names `config_schema` properties to keep out of logs, errors, and diagnostics without resolving them, for a sensitive literal that is not a secret reference (a tenant ID, an internal hostname). Both lists require the named property to exist in `config_schema`, and a property cannot appear in both.
 - `failure_posture` defaults to `closed`. `open`, `degraded`, and `observe` are only valid where that hook contract defines them. An `action` hook is terminal and accepts only `closed`, because there is nothing to fall through to when it fails.
 - `sandbox` bounds wall time, memory, stack, buffered input, output, and WASM fuel. The values shown are the defaults.
-- `permissions` must remain empty in this release. Bundle code receives no filesystem or network capability. That empty list is what makes the guarantee true, so under `digest_scope: bundle_v1` it is inside the signed content along with the rest of the manifest.
+- The manifest-level `permissions` list stays reserved and must remain empty. Capabilities are declared per hook: a JavaScript hook may list `permissions:` entries of the form `net:outbound=https://api.example.com` or `net:outbound=http://internal.example.com:8080` (http or https, one exact hostname, optional port). Declaring is asking, not having: nothing works until the operator grants the same destinations in `sb.yml` under `extensions.grants.<bundle-name>`, and a candidate declaring destinations the operator has not granted refuses at load naming both sets. The wasm runtimes have no host-call surface, so a declaration there refuses at parse. Both the per-hook declarations and the empty reserved list sit inside the `digest_scope: bundle_v1` signed content, so the capabilities an operator audits are the capabilities the artifact was signed with.
+
+A granted hook calls `sbproxy_fetch(JSON.stringify({url, method, headers, body_base64}))` and receives a JSON envelope string back: `{"status", "headers", "body_base64"}` on success, `{"error": "<bounded reason>"}` on refusal. The host authorizes every call against the granted destinations, pins resolution (the address the guard checked is the address dialed), follows no redirects (a redirect is a destination that was never granted), runs the whole call inside the hook's remaining `budget_ms`, and caps the response at `sandbox.max_buffer_bytes`. Grants naming only literal addresses (or `localhost`) may reach private address space, because the operator typed the address and no DNS answer is involved; grants naming hostnames refuse resolutions into private space, which is what stops a rebinding answer from steering a public name inward. The call is synchronous from the guest's view and occupies one JavaScript worker for its duration, so a hook doing outbound work should set `sandbox.budget_ms` accordingly.
 
 Hook types cannot replace a built-in or linked registration of the same kind. Duplicate claims fail candidate construction instead of choosing a winner by load order.
 
@@ -114,7 +128,7 @@ Writing nothing on the attachment is not the same as writing `open` there. A bun
 
 `digest_scope: entry` is the default and covers the exact bytes of the single file named by `entry`. Nothing else: not `bundle.yaml`, not the WAT or TypeScript source used to build the entry, not any other file in the directory. Every manifest written before `digest_scope` existed means this, which is why it stays the default.
 
-Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, and `permissions` live, and an empty `permissions: []` is the line that guarantees guest code gets no filesystem or network capability. Pinning the code while leaving the file that grants its capabilities unpinned is the verification the wrong way round.
+Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, and `permissions` live, and the permission lines are what decide which destinations guest code may ask for. Pinning the code while leaving the file that declares its capabilities unpinned is the verification the wrong way round.
 
 `digest_scope: bundle_v1` covers `bundle.yaml` and every other file the bundle ships:
 

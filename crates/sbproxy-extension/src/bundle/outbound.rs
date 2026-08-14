@@ -70,6 +70,16 @@ impl BundleOutbound {
             schemes.insert(destination.scheme.clone());
             ports.insert(destination.port);
         }
+        // The private-address refusal exists to stop a DNS answer from
+        // steering a granted public hostname into private space. A
+        // grant whose every host is a literal address (or localhost)
+        // involves no lookup an attacker can influence, and the
+        // operator typed the address; refusing it would only forbid
+        // the legitimate internal-service case. Mixed grants keep the
+        // strict posture, because one allowlist carries one flag.
+        let every_host_is_literal = hosts
+            .iter()
+            .all(|host| host == "localhost" || host.parse::<std::net::IpAddr>().is_ok());
         let mut config = EgressConfig::default();
         config.purposes.insert(
             EgressPurpose::BundleHook,
@@ -77,7 +87,7 @@ impl BundleOutbound {
                 hosts,
                 schemes,
                 ports,
-                allow_private: false,
+                allow_private: every_host_is_literal,
             },
         );
         Arc::new(Self {

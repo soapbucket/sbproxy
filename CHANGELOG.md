@@ -12,6 +12,17 @@ the next version cut.
 
 ### Added
 
+- **Bundles can make granted outbound HTTP calls.** A JavaScript hook
+  may declare `net:outbound=<scheme>://<host>[:port]` destinations in
+  its manifest `permissions`, the operator grants them per bundle under
+  `extensions.grants`, and a declared destination without a grant
+  refuses the candidate at load naming both sets. Granted hooks call
+  the synchronous `sbproxy_fetch` host function; every call is
+  authorized against the grant, resolution-pinned, redirect-free,
+  bounded by the hook's remaining budget, and capped at the sandbox
+  buffer limit. The wasm runtimes have no host-call surface and refuse
+  declarations at parse.
+
 - **`ai_tool_call` hooks can rewrite tool calls.** A bundle hook
   declaring `execution.mutates: true` on `ai_tool_call` may return a
   `mutate` decision whose rewritten call replaces the held argument
