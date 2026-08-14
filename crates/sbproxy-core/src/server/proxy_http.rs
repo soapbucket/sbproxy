@@ -1156,14 +1156,6 @@ fn cap_idle_for_service_discovery(
     }
 }
 
-/// Run the origin's `cache.admit` event, or return the static default.
-///
-/// The returned plan is always usable: a declined event, an absent one,
-/// and a faulted one all yield `store: true` with no TTL override, which
-/// is exactly what a deployment without the event does. The three are
-/// distinguished on the metric rather than in the return value, because
-/// the caller's behavior is identical and only the operator's
-/// interpretation differs.
 /// Dispatch the response-cache store for a completed body.
 ///
 /// `final_body` is what a later hit will replay: the raw upstream
@@ -1264,6 +1256,14 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
     }
 }
 
+/// Run the origin's `cache.admit` event, or return the static default.
+///
+/// The returned plan is always usable: a declined event, an absent one,
+/// and a faulted one all yield `store: true` with no TTL override, which
+/// is exactly what a deployment without the event does. The three are
+/// distinguished on the metric rather than in the return value, because
+/// the caller's behavior is identical and only the operator's
+/// interpretation differs.
 fn evaluate_cache_admit(
     ctx: &crate::context::RequestContext,
     status: u16,

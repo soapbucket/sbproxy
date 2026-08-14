@@ -1018,7 +1018,7 @@ origins:
                 .is_ok_and(|text| text.contains("plain text, not json"));
             assert!(
                 response.status >= 500 || !intact,
-                "{label}: the raw body must not reach the client intact                  (status {})",
+                "{label}: the raw body must not reach the client intact (status {})",
                 response.status
             );
         }

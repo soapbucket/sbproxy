@@ -2311,7 +2311,10 @@ impl CompiledPipeline {
                     .find(|compiled| compiled.transform.request_dependent())
                 {
                     anyhow::bail!(
-                        "origin `{}`: transform `{}` reads request state, so its output                          cannot be stored in the response cache or recomputed by the                          stale-while-revalidate refresh; remove the transform, disable                          `response_cache`, or split the cached content onto its own origin",
+                        "origin `{}`: transform `{}` reads request state, so its output cannot be \
+                         stored in the response cache or recomputed by the stale-while-revalidate \
+                         refresh; remove the transform, disable `response_cache`, or split the \
+                         cached content onto its own origin",
                         origin.origin_id,
                         dependent.transform.transform_type()
                     );
