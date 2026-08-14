@@ -603,18 +603,31 @@ impl BundleManifest {
             if hook.execution.mutates
                 && !matches!(
                     hook.kind,
-                    BundleHookKind::AiGuardrailInput | BundleHookKind::AiGuardrailOutput
+                    BundleHookKind::AiGuardrailInput
+                        | BundleHookKind::AiGuardrailOutput
+                        | BundleHookKind::AiToolCall
                 )
             {
-                // Tool-call and stream chunks are content-bearing too,
-                // but the host has no write-back for their wire frames
-                // yet: a declared mutation there would be applied to
-                // the in-memory event and silently absent from what
-                // ships, which is worse than a refusal at config load.
+                // Stream chunks are content-bearing too, but their
+                // wire write-back does not exist yet: the relay would
+                // apply the rewrite to the in-memory event and ship
+                // the original frames, which is worse than a refusal
+                // at config load. Guardrail and tool-call hooks have
+                // end-to-end write-back and accept the declaration.
                 return invalid(format!(
-                    "mutates is not supported for {} hooks; only ai.guardrail_input and ai.guardrail_output hooks may mutate",
+                    "mutates is not supported for {} hooks; ai.guardrail_input, \
+                     ai.guardrail_output, and ai.tool_call hooks may mutate",
                     hook_kind_label(hook.kind)
                 ));
+            }
+            if hook.execution.mutates && hook.enforcement_mode == EnforcementMode::Observe {
+                // Observation hooks receive a cloned event and their
+                // decisions are discarded, so a declared mutation
+                // would load cleanly and silently never apply.
+                return invalid(
+                    "mutates requires enforcement_mode block; an observe hook's \
+                     decisions are discarded, so its mutation could never apply",
+                );
             }
             if let Some(schema) = &hook.config_schema {
                 validate_schema(schema)?;

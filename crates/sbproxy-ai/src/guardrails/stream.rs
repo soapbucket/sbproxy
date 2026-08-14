@@ -42,6 +42,11 @@ pub struct CompletedToolCall {
     /// Concatenated argument fragments (raw JSON text, possibly
     /// truncated at the buffer cap).
     pub args_json: String,
+    /// Whether `args_json` is a truncated prefix rather than the full
+    /// argument text. A consumer that would rewrite the arguments must
+    /// refuse when this is set: an edit of a prefix shipped as if
+    /// complete is worse than the truncation itself.
+    pub truncated: bool,
 }
 
 /// Verdict for one completed streamed tool call.
@@ -354,6 +359,7 @@ impl StreamGuardSession {
             id: call.id,
             name: call.name,
             args_json: call.args,
+            truncated: call.truncated,
         };
         for &i in &self.tool_call {
             let Guardrail::AgentAlignment(g) = &self.pipeline.output[i] else {

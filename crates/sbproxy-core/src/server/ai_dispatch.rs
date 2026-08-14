@@ -10376,6 +10376,7 @@ async fn dispatch_ai_hub_events(
     extensions: &mut crate::ai_extensions::AiRequestExtensions,
     events: &[sbproxy_ai::format::HubChunk],
     completed: &[(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)],
+    released: &mut Vec<sbproxy_ai::format::HubChunk>,
 ) -> Result<(), crate::ai_extensions::AiExtensionBlock> {
     let mut completed_index = 0;
     for (event_index, event) in events.iter().enumerate() {
@@ -10383,9 +10384,10 @@ async fn dispatch_ai_hub_events(
             .get(completed_index)
             .is_some_and(|(at, _)| *at == event_index)
         {
-            extensions
+            let rewritten = extensions
                 .tool_calls(std::slice::from_ref(&completed[completed_index].1))
                 .await?;
+            apply_tool_call_rewrites(released, &rewritten);
             completed_index += 1;
         }
         extensions
@@ -10393,10 +10395,43 @@ async fn dispatch_ai_hub_events(
             .await?;
     }
     while let Some((_, call)) = completed.get(completed_index) {
-        extensions.tool_calls(std::slice::from_ref(call)).await?;
+        let rewritten = extensions.tool_calls(std::slice::from_ref(call)).await?;
+        apply_tool_call_rewrites(released, &rewritten);
         completed_index += 1;
     }
     Ok(())
+}
+
+/// Re-encode hook-rewritten tool calls into the frames about to ship.
+///
+/// A rewritten call is one complete value; the wire held it as N
+/// argument fragments. The fragments for that call's index are
+/// dropped and one canonical delta carrying the whole rewrite takes
+/// their place, which both stream emitters accept as a single frame.
+/// An enforcing tool hook always holds frames, so every fragment of a
+/// judged call is in `released` by the time its verdict dispatches;
+/// there is no partially-shipped call to chase.
+fn apply_tool_call_rewrites(
+    released: &mut Vec<sbproxy_ai::format::HubChunk>,
+    rewritten: &[sbproxy_plugin::AiExtensionToolCall],
+) {
+    for call in rewritten {
+        released.retain(|chunk| {
+            !matches!(
+                chunk,
+                sbproxy_ai::format::HubChunk::ToolCallDelta { index, .. }
+                    if *index == call.index
+            )
+        });
+        released.push(sbproxy_ai::format::HubChunk::ToolCallDelta {
+            index: call.index,
+            delta: sbproxy_ai::format::HubToolCallDelta {
+                id: call.id.clone(),
+                name: Some(call.name.clone()),
+                arguments_chunk: Some(call.arguments_json.clone()),
+            },
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -11393,8 +11428,13 @@ pub(super) async fn relay_ai_stream(
                 if let (Some(extensions), Some(events)) =
                     (ai_extensions.as_mut(), decoded.as_deref())
                 {
-                    if let Err(block) =
-                        dispatch_ai_hub_events(extensions, events, &completed_tool_calls).await
+                    if let Err(block) = dispatch_ai_hub_events(
+                        extensions,
+                        events,
+                        &completed_tool_calls,
+                        &mut released_tool_chunks,
+                    )
+                    .await
                     {
                         warn!(
                             extension_code = %block.code,
@@ -11610,10 +11650,14 @@ pub(super) async fn relay_ai_stream(
                     break;
                 }
                 if let Some(extensions) = ai_extensions.as_mut() {
-                    let decision =
-                        dispatch_ai_hub_events(extensions, &tail_events, &completed_tool_calls)
-                            .await
-                            .and(extensions.close().await);
+                    let decision = dispatch_ai_hub_events(
+                        extensions,
+                        &tail_events,
+                        &completed_tool_calls,
+                        &mut close_released,
+                    )
+                    .await
+                    .and(extensions.close().await);
                     if let Err(block) = decision {
                         warn!(
                             extension_code = %block.code,
@@ -13731,6 +13775,100 @@ mod external_guardrail_context_tests {
         assert!(!response.contains("text/event-stream"), "{response}");
         assert!(!response.contains("dangerous_lookup"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_tool_mutation_reaches_the_wire() {
+        // The seam by name: a mutating tool hook's rewritten arguments
+        // must be what the client stream carries, and the original
+        // arguments must not ship. The held fragments are replaced by
+        // one canonical frame synthesized from the rewrite.
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-rewrite\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: rewrite_tool\n    export: inspect\n    execution:\n      mutates: true\n",
+            // base64 of {"index":0,"id":"call-1","name":"dangerous_lookup","arguments_json":"{\"id\":\"[SAFE]\"}"}
+            r#"export function inspect(input) { const call=input.event.call; if (call.arguments_json !== "{\"id\":42}") throw new Error("hook saw " + call.arguments_json); return {version:"sbproxy-envelope/v1",decision:"mutate",code:"args_rewritten",body_base64:"eyJpbmRleCI6MCwiaWQiOiJjYWxsLTEiLCJuYW1lIjoiZGFuZ2Vyb3VzX2xvb2t1cCIsImFyZ3VtZW50c19qc29uIjoie1wiaWRcIjpcIltTQUZFXVwifSJ9"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("bundled tool mutation is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("[SAFE]"),
+            "the rewrite must ship: {response}"
+        );
+        assert!(
+            !response.contains(":42"),
+            "the original arguments must not ship: {response}"
+        );
+        assert!(response.contains("dangerous_lookup"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_tool_mutation_with_broken_arguments_refuses() {
+        // Rewritten arguments that do not parse as JSON have no place
+        // in a function.arguments field a client will parse; the
+        // response refuses rather than shipping them.
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-breaker\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: break_tool\n    export: inspect\n    execution:\n      mutates: true\n",
+            // base64 of {"index":0,"id":"call-1","name":"dangerous_lookup","arguments_json":"not json"}
+            r#"export function inspect(input) { return {version:"sbproxy-envelope/v1",decision:"mutate",code:"broken",body_base64:"eyJpbmRleCI6MCwiaWQiOiJjYWxsLTEiLCJuYW1lIjoiZGFuZ2Vyb3VzX2xvb2t1cCIsImFyZ3VtZW50c19qc29uIjoibm90IGpzb24ifQ=="}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(
+            response.contains("ai_extension_mutation_unrepresentable"),
+            "{response}"
+        );
+        assert!(
+            !response.contains("not json"),
+            "the broken rewrite must not ship: {response}"
+        );
     }
 
     #[tokio::test]

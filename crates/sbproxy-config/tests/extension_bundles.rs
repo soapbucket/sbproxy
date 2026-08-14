@@ -246,10 +246,10 @@ fn payment_hook_manifest_uses_no_body_contract() {
 }
 
 #[test]
-fn mutates_is_accepted_only_on_the_wired_guardrail_kinds() {
-    // The two kinds with host write-back accept the declaration and
+fn mutates_is_accepted_only_on_the_wired_kinds() {
+    // The kinds with host write-back accept the declaration and
     // default to inspect-only when it is absent.
-    for kind in ["ai_guardrail_input", "ai_guardrail_output"] {
+    for kind in ["ai_guardrail_input", "ai_guardrail_output", "ai_tool_call"] {
         let yaml = JAVASCRIPT_MANIFEST
             .replace("kind: policy", &format!("kind: {kind}"))
             .replace(
@@ -265,17 +265,11 @@ fn mutates_is_accepted_only_on_the_wired_guardrail_kinds() {
         parse_manifest(&JAVASCRIPT_MANIFEST.replace("kind: policy", "kind: ai_guardrail_output"));
     assert!(!manifest.hooks[0].execution.mutates);
 
-    // Tool-call and stream hooks are content-bearing but have no wire
-    // write-back yet: declaring mutation there must refuse at load, not
-    // silently drop the rewrite at dispatch. Lifecycle and non-AI kinds
-    // refuse for the simpler reason that they carry nothing to mutate.
-    for kind in [
-        "ai_tool_call",
-        "ai_stream_event",
-        "ai_close",
-        "ai_failure",
-        "policy",
-    ] {
+    // Stream hooks are content-bearing but have no wire write-back
+    // yet: declaring mutation there must refuse at load, not silently
+    // drop the rewrite at dispatch. Lifecycle and non-AI kinds refuse
+    // for the simpler reason that they carry nothing to mutate.
+    for kind in ["ai_stream_event", "ai_close", "ai_failure", "policy"] {
         let mut yaml = JAVASCRIPT_MANIFEST
             .replace("kind: policy", &format!("kind: {kind}"))
             .replace(
@@ -311,6 +305,21 @@ abi: 0.2.1",
             "{kind}: {error}"
         );
     }
+}
+
+#[test]
+fn a_mutating_hook_cannot_run_in_observe_mode() {
+    // Observation hooks get a cloned event and their decisions are
+    // discarded, so mutates+observe would load cleanly and silently
+    // never apply.
+    let yaml = JAVASCRIPT_MANIFEST
+        .replace("kind: policy", "kind: ai_tool_call")
+        .replace(
+            "    export: enforce",
+            "    export: enforce\n    enforcement_mode: observe\n    execution:\n      mutates: true",
+        );
+    let error = manifest_error(&yaml);
+    assert!(error.contains("enforcement_mode block"), "{error}");
 }
 
 #[test]

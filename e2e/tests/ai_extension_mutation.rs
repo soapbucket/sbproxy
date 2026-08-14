@@ -221,3 +221,94 @@ fn undeclared_mutation_refuses_under_the_closed_default() {
         "the model output must not leak through the refusal: {text}"
     );
 }
+
+// --- Tool-call mutation (WOR-2419) ---
+
+fn sse_frames(events: &[String]) -> Vec<String> {
+    events.to_vec()
+}
+
+fn tool_frame(index: usize, id: Option<&str>, name: Option<&str>, args: &str) -> String {
+    let mut tc = serde_json::Map::new();
+    tc.insert("index".into(), json!(index));
+    if let Some(id) = id {
+        tc.insert("id".into(), json!(id));
+    }
+    let mut f = serde_json::Map::new();
+    if let Some(name) = name {
+        f.insert("name".into(), json!(name));
+    }
+    f.insert("arguments".into(), json!(args));
+    tc.insert("function".into(), serde_json::Value::Object(f));
+    json!({"choices":[{"index":0,"delta":{"tool_calls":[serde_json::Value::Object(tc)]},"finish_reason":null}]})
+        .to_string()
+}
+
+const TOOL_REWRITER_MANIFEST: &str = "\
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: tool-rewriter
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_tool_call
+    type: rewrite_tool
+    export: rewrite
+    execution:
+      mutates: true
+";
+
+// base64 of {"index":0,"id":"call_1","name":"lookup_user","arguments_json":"{\"table\":\"[MASKED]\"}"}
+const TOOL_REWRITER_JS: &str = r#"export function rewrite(input) {
+  const call = input.event.call;
+  if (call.arguments_json.indexOf("secret_users") === -1) {
+    return {version:"sbproxy-envelope/v1",decision:"release"};
+  }
+  return {version:"sbproxy-envelope/v1",decision:"mutate",code:"table_masked",body_base64:"eyJpbmRleCI6MCwiaWQiOiJjYWxsXzEiLCJuYW1lIjoibG9va3VwX3VzZXIiLCJhcmd1bWVudHNfanNvbiI6IntcInRhYmxlXCI6XCJbTUFTS0VEXVwifSJ9"};
+}"#;
+
+#[test]
+fn tool_call_mutation_reaches_the_client_stream() {
+    // The upstream fragments the call's arguments across two frames;
+    // the hook sees the assembled call and rewrites it; the client
+    // stream carries the rewrite as one canonical frame and never the
+    // original fragments.
+    let events = sse_frames(&[
+        tool_frame(0, Some("call_1"), Some("lookup_user"), ""),
+        tool_frame(0, None, None, r#"{"table":"secret"#),
+        tool_frame(0, None, None, r#"_users"}"#),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}).to_string(),
+        "[DONE]".to_string(),
+    ]);
+    let upstream = MockUpstream::start_sse(events).unwrap();
+    let files = [
+        ("bundles/tool-rewriter/bundle.yaml", TOOL_REWRITER_MANIFEST),
+        ("bundles/tool-rewriter/entry.js", TOOL_REWRITER_JS),
+    ];
+    let harness =
+        ProxyHarness::start_with_workspace(&config(&upstream.base_url()), &files).unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "look them up"}]
+    });
+    let resp = harness
+        .post_json("/v1/chat/completions", "ai.localhost", &body, &[])
+        .unwrap();
+    assert_eq!(resp.status, 200, "{:?}", resp.text().unwrap_or_default());
+    let text = String::from_utf8_lossy(&resp.body);
+    assert!(
+        text.contains("[MASKED]"),
+        "the rewritten arguments must reach the client stream: {text}"
+    );
+    assert!(
+        !text.contains("secret_users"),
+        "the original arguments must not reach the client: {text}"
+    );
+    assert!(
+        text.contains("lookup_user"),
+        "the call itself still ships: {text}"
+    );
+}

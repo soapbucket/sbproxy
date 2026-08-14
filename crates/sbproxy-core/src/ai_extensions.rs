@@ -272,17 +272,22 @@ impl AiRequestExtensions {
     }
 
     /// Enforce complete tool calls before held frames are released.
+    /// Returns the calls a hook rewrote, identified by their stream
+    /// `index`. The caller owns re-encoding a rewritten call into the
+    /// frames it releases; an empty vec means every call passed
+    /// through unmodified.
     pub(crate) async fn tool_calls(
         &mut self,
         calls: &[CompletedToolCall],
-    ) -> Result<(), AiExtensionBlock> {
+    ) -> Result<Vec<AiExtensionToolCall>, AiExtensionBlock> {
         self.stats.tool_call_count = self
             .stats
             .tool_call_count
             .saturating_add(u64::try_from(calls.len()).unwrap_or(u64::MAX));
         if !self.kinds.tool {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut rewritten = Vec::new();
         for call in calls {
             if call.args_json.len() > MAX_EVENT_TEXT_BYTES {
                 if self.kinds.enforcing_tool {
@@ -301,9 +306,33 @@ impl AiRequestExtensions {
                     },
                 })
                 .await?;
-            self.expect_unmutated(mutated)?;
+            let Some(AiExtensionEventPayload::ToolCall { call: replacement }) = mutated else {
+                if mutated.is_some() {
+                    // Kind-preserving by construction; see `guard_input`.
+                    return Err(AiExtensionBlock::runtime_failure());
+                }
+                continue;
+            };
+            // Three rewrites no frame can faithfully carry, each
+            // refused rather than shipped approximately. The index is
+            // host-owned identity (it keys held frames and content
+            // blocks); the arguments must be JSON because the wire
+            // frames carry them into a `function.arguments` field a
+            // client will parse; and a call whose assembled arguments
+            // were truncated at the buffer cap must not have an edit
+            // of the prefix shipped as if it were the whole value.
+            if replacement.index != call.index {
+                return Err(AiExtensionBlock::mutation_unrepresentable());
+            }
+            if serde_json::from_str::<serde_json::Value>(&replacement.arguments_json).is_err() {
+                return Err(AiExtensionBlock::mutation_unrepresentable());
+            }
+            if call.truncated {
+                return Err(AiExtensionBlock::mutation_unrepresentable());
+            }
+            rewritten.push(replacement);
         }
-        Ok(())
+        Ok(rewritten)
     }
 
     /// Report a failed upstream call to any `ai.failure` hooks.
