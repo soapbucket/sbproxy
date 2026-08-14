@@ -31,6 +31,7 @@ pub mod discovery;
 pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
+pub mod protocol;
 pub mod quarantine;
 /// Tool rollout plane: multiple live versions of one tool with
 /// per-consumer resolution (call `_meta`, session requirements,
@@ -66,5 +67,10 @@ pub use federation::{
     ToolVersioningGate, VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
+pub use protocol::{
+    DecodedMcpRequest, Legacy2025_06_18Codec, McpImplementation, McpProtocolCodec,
+    McpProtocolContext, McpProtocolEra, McpRoutingHeaders, McpServerDescription, McpWireError,
+    McpWireResponse,
+};
 pub use stdio::{encode_stdio_url, StdioCommand};
 pub use types::*;

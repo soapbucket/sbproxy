@@ -17,12 +17,17 @@ pub const INTERNAL_ERROR: i32 = -32603;
 
 // --- Protocol version negotiation (WOR-1641) ---
 
+/// Legacy MCP protocol revision retained for existing callers.
+pub const LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Modern MCP protocol revision used by the dual-era protocol layer.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// MCP protocol revisions this gateway can serve, newest first. One
 /// entry today: `2025-03-26` is deliberately absent because that
 /// revision requires servers to accept JSON-RPC batches, which the
 /// gateway does not, and advertising a version whose MUSTs we break
 /// is the exact capability lie this list exists to prevent.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18"];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[LEGACY_PROTOCOL_VERSION];
 
 /// Newest protocol revision the gateway serves.
 pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
@@ -144,13 +149,23 @@ impl JsonRpcResponse {
 
     /// Build an error JSON-RPC 2.0 response with the given code and message.
     pub fn error(id: Option<serde_json::Value>, code: i32, message: &str) -> Self {
+        Self::error_with_data(id, code, message, None)
+    }
+
+    /// Build an error JSON-RPC 2.0 response with optional error data.
+    pub fn error_with_data(
+        id: Option<serde_json::Value>,
+        code: i32,
+        message: &str,
+        data: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(JsonRpcError {
                 code,
                 message: message.to_string(),
-                data: None,
+                data,
             }),
             id,
         }
