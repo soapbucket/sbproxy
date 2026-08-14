@@ -1,8 +1,8 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use sbproxy_plugin::{
-    ActionOutcome, AiExtensionDecision, PaymentExtensionDecision, PolicyDecision,
-    UNSUPPORTED_ACTION_OUTCOME_CODE,
+    ActionOutcome, AiExtensionDecision, AuthDecision, AuthSubjectSource, PaymentExtensionDecision,
+    PolicyDecision, UNSUPPORTED_ACTION_OUTCOME_CODE,
 };
 use sbproxy_security::{hkdf_derive_purpose, HkdfPurpose};
 use serde::Deserialize;
@@ -16,6 +16,11 @@ pub(crate) const ENVELOPE_VERSION: &str = sbproxy_config::BUNDLE_ENVELOPE_ABI;
 const MAX_POLICY_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_EVENT_CODE_BYTES: usize = 64;
 const MAX_ACTION_HEADERS: usize = 64;
+/// Upper bound on a bundle auth hook's resolved subject. A `sub` is a
+/// user identifier (a JWT `sub`, a username, an API-key label), not a
+/// payload, so a value past this is a malformed decision rather than a
+/// legitimate identity.
+const MAX_AUTH_SUBJECT_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EnvelopeError(&'static str);
@@ -33,6 +38,7 @@ impl EnvelopeError {
 pub(crate) const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
     match kind {
         BundleHookKind::Policy => "policy",
+        BundleHookKind::Auth => "auth",
         BundleHookKind::Transform => "transform",
         BundleHookKind::Action => "action",
         BundleHookKind::AiToolCall => "ai_tool_call",
@@ -370,6 +376,97 @@ fn validate_headers(headers: &[(String, String)]) -> Result<(), EnvelopeError> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AuthWire {
+    version: String,
+    decision: String,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+}
+
+/// Map a bundle auth hook's `source` label to the subject-origin enum
+/// the observability layer stamps. Unknown labels are rejected so a
+/// typo does not silently become an untracked origin.
+fn decode_auth_source(label: &str) -> Result<AuthSubjectSource, EnvelopeError> {
+    match label {
+        "header" => Ok(AuthSubjectSource::Header),
+        "jwt" => Ok(AuthSubjectSource::Jwt),
+        "forward_auth" => Ok(AuthSubjectSource::ForwardAuth),
+        "cookie" => Ok(AuthSubjectSource::Cookie),
+        _ => Err(EnvelopeError::new("invalid_envelope")),
+    }
+}
+
+pub(crate) fn decode_auth(bytes: &[u8]) -> Result<AuthDecision, EnvelopeError> {
+    let response: AuthWire =
+        serde_json::from_slice(bytes).map_err(|_| EnvelopeError::new("invalid_envelope"))?;
+    if response.version != ENVELOPE_VERSION {
+        return Err(EnvelopeError::new("invalid_version"));
+    }
+    match response.decision.as_str() {
+        "allow" if response.status.is_none() && response.message.is_none() => {
+            if !response.headers.is_empty() {
+                return Err(EnvelopeError::new("invalid_envelope"));
+            }
+            // A resolved subject and its origin travel together: a `sub`
+            // with no `source` is unattributable, a `source` with no
+            // `sub` labels nothing. Both-present or both-absent only.
+            match (response.sub, response.source) {
+                (None, None) => Ok(AuthDecision::allow_anonymous()),
+                (Some(sub), Some(source)) => {
+                    if sub.len() > MAX_AUTH_SUBJECT_BYTES {
+                        return Err(EnvelopeError::new("invalid_envelope"));
+                    }
+                    let source = decode_auth_source(&source)?;
+                    Ok(AuthDecision::allow_with_subject(sub, source))
+                }
+                _ => Err(EnvelopeError::new("invalid_envelope")),
+            }
+        }
+        "deny" if response.sub.is_none() && response.source.is_none() => {
+            if !response.headers.is_empty() {
+                return Err(EnvelopeError::new("invalid_envelope"));
+            }
+            let (status, message) = decode_auth_denial(response.status, response.message)?;
+            Ok(AuthDecision::Deny { status, message })
+        }
+        "deny_with_headers" if response.sub.is_none() && response.source.is_none() => {
+            let (status, message) = decode_auth_denial(response.status, response.message)?;
+            validate_headers(&response.headers)?;
+            Ok(AuthDecision::DenyWithHeaders {
+                status,
+                message,
+                headers: response.headers,
+            })
+        }
+        _ => Err(EnvelopeError::new("invalid_envelope")),
+    }
+}
+
+/// Shared status/message validation for both auth denial variants: a
+/// 4xx/5xx status and a bounded message are mandatory.
+fn decode_auth_denial(
+    status: Option<u16>,
+    message: Option<String>,
+) -> Result<(u16, String), EnvelopeError> {
+    let status = status
+        .filter(|status| (400..=599).contains(status))
+        .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+    let message = message
+        .filter(|message| message.len() <= MAX_POLICY_MESSAGE_BYTES)
+        .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+    Ok((status, message))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransformWire {
     version: String,
     body_base64: String,
@@ -567,6 +664,113 @@ mod tests {
         .expect_err("bundle actions have no upstream to proxy to");
 
         assert_eq!(error.code(), "unsupported_action_outcome");
+    }
+
+    #[test]
+    fn auth_wire_allow_carries_subject_and_origin_together() {
+        assert_eq!(
+            decode_auth(br#"{"version":"sbproxy-envelope/v1","decision":"allow"}"#).unwrap(),
+            AuthDecision::allow_anonymous()
+        );
+        assert_eq!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"allow","sub":"alice","source":"header"}"#
+            )
+            .unwrap(),
+            AuthDecision::allow_with_subject("alice", AuthSubjectSource::Header)
+        );
+        assert_eq!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"allow","sub":"u-7","source":"jwt"}"#
+            )
+            .unwrap(),
+            AuthDecision::allow_with_subject("u-7", AuthSubjectSource::Jwt)
+        );
+        // A subject with no origin, or an origin with no subject, is a
+        // malformed decision: neither can be stamped coherently.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow","sub":"alice"}"#
+        )
+        .is_err());
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow","source":"header"}"#
+        )
+        .is_err());
+        // An unknown origin label is a typo, not an untracked source.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow","sub":"a","source":"query"}"#
+        )
+        .is_err());
+        // Allow does not carry a denial status/message or headers.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow","status":401,"message":"no"}"#
+        )
+        .is_err());
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow","headers":[["x","y"]]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn auth_wire_deny_and_challenge_are_strict_and_bounded() {
+        assert_eq!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"deny","status":401,"message":"bad signature"}"#
+            )
+            .unwrap(),
+            AuthDecision::Deny {
+                status: 401,
+                message: "bad signature".to_owned(),
+            }
+        );
+        assert_eq!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"deny_with_headers","status":401,"message":"login","headers":[["WWW-Authenticate","Bearer"]]}"#
+            )
+            .unwrap(),
+            AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "login".to_owned(),
+                headers: vec![("WWW-Authenticate".to_owned(), "Bearer".to_owned())],
+            }
+        );
+        // A denial needs a 4xx/5xx status and a message.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"deny","status":200,"message":"ok"}"#
+        )
+        .is_err());
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"deny","status":401}"#
+        )
+        .is_err());
+        // A denial never resolves a subject, and a plain deny carries no headers.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"deny","status":401,"message":"x","sub":"a","source":"header"}"#
+        )
+        .is_err());
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"deny","status":401,"message":"x","headers":[["a","b"]]}"#
+        )
+        .is_err());
+        // Wrong ABI version and unknown decisions refuse.
+        assert!(decode_auth(br#"{"version":"sbproxy-envelope/v2","decision":"allow"}"#).is_err());
+        assert!(decode_auth(br#"{"version":"sbproxy-envelope/v1","decision":"maybe"}"#).is_err());
+        // Oversized subject and message are malformed, not identities.
+        let long_sub = json!({
+            "version": ENVELOPE_VERSION,
+            "decision": "allow",
+            "sub": "a".repeat(MAX_AUTH_SUBJECT_BYTES + 1),
+            "source": "header",
+        });
+        assert!(decode_auth(long_sub.to_string().as_bytes()).is_err());
+        let long_message = json!({
+            "version": ENVELOPE_VERSION,
+            "decision": "deny",
+            "status": 403,
+            "message": "m".repeat(MAX_POLICY_MESSAGE_BYTES + 1),
+        });
+        assert!(decode_auth(long_message.to_string().as_bytes()).is_err());
     }
 
     #[test]

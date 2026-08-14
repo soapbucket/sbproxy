@@ -705,6 +705,7 @@ const fn plugin_hook_kind(kind: PluginKind) -> ExtensionHookKind {
 const fn bundle_hook_kind(kind: ExtensionHookKind) -> Option<BundleHookKind> {
     match kind {
         ExtensionHookKind::Policy => Some(BundleHookKind::Policy),
+        ExtensionHookKind::Auth => Some(BundleHookKind::Auth),
         ExtensionHookKind::Transform => Some(BundleHookKind::Transform),
         ExtensionHookKind::Action => Some(BundleHookKind::Action),
         ExtensionHookKind::ProxyWasmFilter => Some(BundleHookKind::ProxyWasm),
@@ -715,8 +716,7 @@ const fn bundle_hook_kind(kind: ExtensionHookKind) -> Option<BundleHookKind> {
         ExtensionHookKind::AiClose => Some(BundleHookKind::AiClose),
         ExtensionHookKind::AiFailure => Some(BundleHookKind::AiFailure),
         ExtensionHookKind::Payment => Some(BundleHookKind::Payment),
-        ExtensionHookKind::Auth
-        | ExtensionHookKind::Startup
+        ExtensionHookKind::Startup
         | ExtensionHookKind::Identity
         | ExtensionHookKind::MlClassifier
         | ExtensionHookKind::AnomalyDetector

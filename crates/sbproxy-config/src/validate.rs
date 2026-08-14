@@ -217,8 +217,8 @@ pub const KNOWN_TRANSFORM_TYPES: &[&str] = &[
 ///
 /// Dynamic bundle loaders pass this set to
 /// [`crate::extensions::BundleManifest::validate`] before constructing a
-/// candidate registry. Authentication types are absent because dynamic bundles
-/// do not export authentication hooks in this release.
+/// candidate registry, so a bundle cannot shadow a built-in hook type of
+/// any kind, authentication included (WOR-2426).
 #[must_use]
 pub fn reserved_builtin_hook_names(
 ) -> std::collections::BTreeSet<(crate::extensions::BundleHookKind, String)> {
@@ -238,6 +238,12 @@ pub fn reserved_builtin_hook_names(
     reservations.extend(KNOWN_ACTION_TYPES.iter().map(|type_name| {
         (
             crate::extensions::BundleHookKind::Action,
+            (*type_name).to_owned(),
+        )
+    }));
+    reservations.extend(KNOWN_AUTH_TYPES.iter().map(|type_name| {
+        (
+            crate::extensions::BundleHookKind::Auth,
             (*type_name).to_owned(),
         )
     }));

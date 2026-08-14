@@ -1,7 +1,7 @@
 # Extension Bundles
 *Last modified: 2026-08-14*
 
-Dynamic bundles add policies, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
+Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
 
 ```text
 examples/extension-bundles/
@@ -207,6 +207,7 @@ JavaScript and TypeScript entries are ES modules with named exports. The host pa
 | Hook | Input field | Valid result |
 |---|---|---|
 | `policy` | `request` plus `config` | `allow` or `deny`, with bounded status, message, and headers |
+| `auth` | `request` plus `config` | `allow` (with an optional resolved subject), `deny`, or `deny_with_headers` |
 | `transform` | `body.body_base64`, `body.content_type`, `body.origin`, plus `config` | A replacement `body_base64` |
 | `action` | `request` plus `config` | A bounded local `response` with status, headers, and `body_base64` |
 
@@ -224,6 +225,20 @@ An action bundle finishes the request locally. Its attachment has no upstream co
 A `.ts` entry is parsed and stripped to ES2020 JavaScript exactly once while a candidate loads. Every declared export is preflighted then. TypeScript is a source convenience; the runtime is still JavaScript.
 
 sbproxy adds no TypeScript CLI, package manager, install command, module loader, or runtime dependency resolution. Imports, re-exports, and dynamic `import()` are rejected. If the extension uses dependencies, resolve them in your own build and ship one prebuilt flat `.js` artifact. Point `entry` at that final artifact and calculate its digest from those final bytes.
+
+## Authentication
+
+An `auth` hook runs before the origin action and decides whether the request is authenticated. It attaches through the origin's `auth:` block, the same slot a built-in provider like `jwt` or `api_key` uses, and a bundle type never shadows a built-in of the same name: the built-in wins and the bundle name is only reached when nothing built-in or linked claims it.
+
+The hook returns one of three results. `allow` admits the request and may carry a resolved subject as `sub` with a `source` label (`header`, `jwt`, `forward_auth`, or `cookie`), which the observability layer stamps as the request's user; `sub` and `source` travel together or not at all. `deny` rejects with a bounded 4xx or 5xx status and message. `deny_with_headers` rejects and appends response headers, which is how a hook returns a `WWW-Authenticate` challenge.
+
+An auth hook always fails closed: a hook that throws (it could not reach a decision, or its runtime faulted) denies the request, and `failure_posture` does not change that. Because a non-closed posture would be silently inert, a bundle whose manifest declares an `auth` hook must set `failure_posture: closed`; any other value is refused at load.
+
+One classification detail matters for detection. A header-bearing denial (`deny_with_headers`) is scored as an authentication challenge, not a failed credential, so it does not raise the request's suspicious-trust tier. Use it for the "no credentials presented" case, and return a plain `deny` for a wrong credential so failed attempts stay visible to trust scoring. Letting a bundle author label a header-bearing denial as a failed credential is tracked as a follow-up.
+
+Auth hooks are JavaScript-only this release. A wasm bundle that declares an `auth` hook is refused at load with a named error rather than compiling to a handler that does not exist.
+
+The sandbox exposes no crypto primitive, so a hook that checks a signature carries its own. The worked `hmac-auth-javascript` bundle under `examples/extension-bundles/` ships a compact HMAC-SHA256 in pure JavaScript: the client signs `${keyId}.${timestamp}` with a shared secret and sends the key id, timestamp, and hex signature as headers, and the hook recomputes the HMAC and compares in constant time. The shared secret arrives through the hook's `secret_vars`, so the operator stores it as a reference and the plaintext never appears in config.
 
 ## Envelope WASM
 

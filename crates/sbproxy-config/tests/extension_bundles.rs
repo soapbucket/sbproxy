@@ -491,6 +491,86 @@ fn envelope_wasm_runtime_rejects_ai_stream_event_hooks() {
 }
 
 #[test]
+fn javascript_runtime_accepts_an_auth_hook() {
+    // WOR-2426: a bundle auth hook is a JavaScript hook like policy or
+    // transform. It parses, and its `type:` is free to name a new auth
+    // provider so long as it does not collide with a built-in.
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "  - kind: policy\n",
+        "  - kind: auth\n",
+    );
+    let manifest = parse_manifest(&yaml);
+    assert_eq!(manifest.hooks[0].kind, BundleHookKind::Auth);
+    manifest
+        .validate(&reserved_builtin_hook_names())
+        .expect("a JavaScript auth hook with a free type validates");
+}
+
+#[test]
+fn envelope_wasm_runtime_rejects_auth_hooks() {
+    // WOR-2426: bundle auth ships JavaScript-only this release, so a wasm
+    // auth hook refuses at load with a named error rather than compiling
+    // to an adapter that does not exist.
+    let yaml = JAVASCRIPT_MANIFEST
+        .replace(
+            "runtime: javascript",
+            "runtime: wasm\nabi: sbproxy-envelope/v1",
+        )
+        .replace("entry: src/index.ts", "entry: dist/bundle.wasm")
+        .replace("  - kind: policy\n", "  - kind: auth\n")
+        .replace("    export: enforce\n", "");
+
+    let error = manifest_error(&yaml);
+    assert!(error.contains("wasm") && error.contains("auth"), "{error}");
+}
+
+#[test]
+fn auth_hooks_require_closed_failure_posture() {
+    // WOR-2426: a failed auth hook denies at runtime regardless of
+    // posture, so a non-closed posture is refused at load rather than
+    // read as "fail the request open".
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "  - kind: policy\n",
+        "  - kind: auth\n",
+    )
+    .replace("failure_posture: closed", "failure_posture: open");
+    let error = manifest_error(&yaml);
+    assert!(
+        error.contains("auth") && error.contains("closed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn built_in_auth_types_are_reserved_against_bundle_shadowing() {
+    // WOR-2426: a bundle must not claim a built-in auth `type:` (jwt,
+    // api_key, ...). The reservation is kind-aware, so an auth-kind
+    // reservation does not touch a policy of the same name.
+    let reservations = reserved_builtin_hook_names();
+    assert!(reservations.contains(&(BundleHookKind::Auth, "jwt".to_owned())));
+    assert!(reservations.contains(&(BundleHookKind::Auth, "api_key".to_owned())));
+    assert!(!reservations.contains(&(BundleHookKind::Policy, "jwt".to_owned())));
+
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "  - kind: policy\n",
+        "  - kind: auth\n",
+    )
+    .replace("rate_limit_by_plan", "jwt");
+    let manifest = parse_manifest(&yaml);
+    let error = manifest
+        .validate(&reservations)
+        .expect_err("built-in auth collision must fail")
+        .to_string();
+    assert!(
+        error.contains("reserved") && error.contains("jwt"),
+        "{error}"
+    );
+}
+
+#[test]
 fn manifest_rejects_inactive_permissions_and_unsafe_schemas() {
     let permissions = replace_once(
         JAVASCRIPT_MANIFEST,

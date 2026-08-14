@@ -38,7 +38,7 @@ use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
 use sbproxy_modules::compile::{
     compile_action_for_origin, compile_action_for_origin_for_validation,
     compile_action_for_origin_with_registry, compile_action_with_registry, compile_auth,
-    compile_policy, compile_policy_with_registry, compile_transform,
+    compile_auth_with_registry, compile_policy, compile_policy_with_registry, compile_transform,
     compile_transform_with_registry,
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
@@ -2201,9 +2201,20 @@ impl CompiledPipeline {
             proxy_wasm_filters.push(proxy_wasm_filter);
             actions.push(action);
 
-            // Compile auth (optional per origin).
+            // Compile auth (optional per origin). Route through the
+            // registry-aware compile only when the `type:` names a loaded
+            // bundle auth hook, so built-ins and linked plugins keep their
+            // exact existing path (WOR-2426).
             let auth = match &origin.auth_config {
-                Some(cfg) => Some(compile_auth(cfg)?),
+                Some(cfg) => Some(
+                    if configured_type(cfg)
+                        .is_some_and(|name| extension_registry.auth(name).is_some())
+                    {
+                        compile_auth_with_registry(cfg, extension_registry.as_ref())?
+                    } else {
+                        compile_auth(cfg)?
+                    },
+                ),
                 None => None,
             };
             auths.push(auth);
@@ -3855,6 +3866,34 @@ hooks:
         config
     }
 
+    fn write_dynamic_auth_bundle(root: &std::path::Path) {
+        let bundle = root.join("bundles").join("generation-auth");
+        std::fs::create_dir_all(&bundle).expect("create extension auth bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"export function run() {
+                return { version: "sbproxy-envelope/v1", decision: "allow" };
+            }
+"#,
+        )
+        .expect("write extension auth artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: generation-auth
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: auth
+    type: bundle_auth
+    export: run
+"#,
+        )
+        .expect("write extension auth manifest");
+    }
+
     fn write_lifecycle_inventory_bundle(root: &std::path::Path) {
         let bundle = root.join("bundles").join("lifecycle-inventory");
         std::fs::create_dir_all(&bundle).expect("create lifecycle bundle directory");
@@ -4144,6 +4183,33 @@ hooks:
         assert_eq!(pipeline.auths[0].as_ref().unwrap().auth_type(), "api_key");
         assert_eq!(pipeline.policies[0].len(), 1);
         assert_eq!(pipeline.policies[0][0].policy_type(), "rate_limiting");
+    }
+
+    #[test]
+    fn pipeline_compiles_an_origin_authed_by_a_bundle_hook() {
+        // WOR-2426: the per-origin auth site routes a `type:` naming a
+        // loaded bundle auth hook through the registry-aware compile. A
+        // built-in auth type never reaches here, so without that routing
+        // the origin would bail with "unknown auth type".
+        let directory = TempDir::new().expect("temporary config directory");
+        write_dynamic_auth_bundle(directory.path());
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            Some(serde_json::json!({"type": "bundle_auth"})),
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+
+        let pipeline = CompiledPipeline::from_config_at(config, directory.path())
+            .expect("an origin authed by a loaded bundle hook should compile");
+
+        assert!(pipeline.extension_registry().auth("bundle_auth").is_some());
+        assert!(pipeline.auths[0].is_some());
+        assert_eq!(
+            pipeline.auths[0].as_ref().unwrap().auth_type(),
+            "bundle_auth"
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ use rquickjs::promise::MaybePromise;
 use rquickjs::{Context, Function, Module, Object, Runtime, Value as JavascriptValue};
 use sbproxy_config::{BundleHook, BundleHookKind, BundleRuntime, BundleSandbox};
 use sbproxy_plugin::{
-    ActionHandler, ActionOutcome, PluginError, PluginResult, PolicyDecision, PolicyEnforcer,
-    TransformContext, TransformHandler,
+    ActionHandler, ActionOutcome, AuthDecision, AuthProvider, PluginError, PluginResult,
+    PolicyDecision, PolicyEnforcer, TransformContext, TransformHandler,
 };
 use serde_json::{json, Value};
 use swc_common::{sync::Lrc, FileName, Globals, Mark, SourceMap, GLOBALS};
@@ -666,6 +666,10 @@ fn decode_policy(bytes: &[u8]) -> Result<PolicyDecision, RuntimeFailure> {
     envelope::decode_policy(bytes).map_err(Into::into)
 }
 
+fn decode_auth(bytes: &[u8]) -> Result<AuthDecision, RuntimeFailure> {
+    envelope::decode_auth(bytes).map_err(Into::into)
+}
+
 fn decode_body(bytes: &[u8], maximum: usize) -> Result<Vec<u8>, RuntimeFailure> {
     envelope::decode_body(bytes, maximum).map_err(Into::into)
 }
@@ -723,6 +727,59 @@ impl PolicyEnforcer for JavascriptPolicyAdapter {
             )
             .await?;
             decode_policy(&output).map_err(RuntimeFailure::into_plugin_error)
+        })
+    }
+}
+
+/// Buffered JavaScript auth adapter backed by the shared worker pool.
+pub struct JavascriptAuthAdapter {
+    type_name: String,
+    program: JavascriptProgram,
+}
+
+impl std::fmt::Debug for JavascriptAuthAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JavascriptAuthAdapter")
+            .field("type_name", &self.type_name)
+            .field("program", &self.program)
+            .finish()
+    }
+}
+
+/// Build an auth adapter from a validated JavaScript bundle hook.
+///
+/// # Errors
+///
+/// Returns a bounded load error for a mismatched hook, invalid attachment
+/// config, invalid source, missing export, or failed module initialization.
+pub fn build_javascript_auth(
+    hook: &LoadedBundleHook,
+    config: Value,
+) -> Result<JavascriptAuthAdapter, BundleLoadError> {
+    let (type_name, program) = prepare_program(hook, BundleHookKind::Auth, config)?;
+    Ok(JavascriptAuthAdapter { type_name, program })
+}
+
+impl AuthProvider for JavascriptAuthAdapter {
+    fn auth_type(&self) -> &str {
+        &self.type_name
+    }
+
+    fn authenticate(
+        &self,
+        req: &http::Request<Bytes>,
+        _ctx: &mut dyn std::any::Any,
+    ) -> Pin<Box<dyn std::future::Future<Output = PluginResult<AuthDecision>> + Send + '_>> {
+        let request = request_value(req, self.program.limits.max_input_bytes);
+        Box::pin(async move {
+            let request = request.map_err(RuntimeFailure::into_plugin_error)?;
+            let output = invoke_program(
+                &self.program,
+                hook_envelope("request", &self.program, request),
+            )
+            .await?;
+            decode_auth(&output).map_err(RuntimeFailure::into_plugin_error)
         })
     }
 }
@@ -853,16 +910,16 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use sbproxy_config::{BundleHookKind, ExtensionBundlesConfig};
     use sbproxy_plugin::{
-        ActionHandler, ActionOutcome, PolicyDecision, PolicyEnforcer, TransformContext,
-        TransformHandler,
+        ActionHandler, ActionOutcome, AuthDecision, AuthProvider, AuthSubjectSource,
+        PolicyDecision, PolicyEnforcer, TransformContext, TransformHandler,
     };
     use serde_json::{json, Value};
     use tempfile::TempDir;
 
     use super::{
-        build_javascript_action, build_javascript_policy, build_javascript_transform,
-        decode_policy, hook_envelope, prepare_program, request_value, serialize_envelope,
-        transpile_typescript, JavascriptExecutor, JAVASCRIPT_ENVELOPE_VERSION,
+        build_javascript_action, build_javascript_auth, build_javascript_policy,
+        build_javascript_transform, decode_policy, hook_envelope, prepare_program, request_value,
+        serialize_envelope, transpile_typescript, JavascriptExecutor, JAVASCRIPT_ENVELOPE_VERSION,
     };
     use crate::bundle::{BundleRegistry, DynamicBundleRegistry, LoadedBundleHook};
 
@@ -877,6 +934,7 @@ mod tests {
         fn hook(&self) -> &LoadedBundleHook {
             match self.kind {
                 BundleHookKind::Policy => self.registry.policy(&self.type_name),
+                BundleHookKind::Auth => self.registry.auth(&self.type_name),
                 BundleHookKind::Transform => self.registry.transform(&self.type_name),
                 BundleHookKind::Action => self.registry.action(&self.type_name),
                 _ => unreachable!("fixture supports request hooks only"),
@@ -907,6 +965,7 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         let kind_name = match kind {
             BundleHookKind::Policy => "policy",
+            BundleHookKind::Auth => "auth",
             BundleHookKind::Transform => "transform",
             BundleHookKind::Action => "action",
             _ => unreachable!("fixture supports request hooks only"),
@@ -1097,6 +1156,65 @@ mod tests {
         assert_eq!(
             adapter.enforce(&paid, &mut context).await.unwrap(),
             PolicyDecision::Allow
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_auth_allows_with_subject_and_denies_with_challenge() {
+        // An HMAC-shaped auth hook: a request carrying the shared token in
+        // `x-plan` authenticates and resolves a subject; anything else is
+        // challenged with a `WWW-Authenticate` header.
+        let fixture = fixture(
+            BundleHookKind::Auth,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    const token = input.request.headers.find(
+                        ([name]) => name === "x-plan"
+                    );
+                    if (token && token[1] === "paid") {
+                        return { version: "sbproxy-envelope/v1", decision: "allow", sub: "acct-42", source: "header" };
+                    }
+                    return {
+                        version: "sbproxy-envelope/v1",
+                        decision: "deny_with_headers",
+                        status: 401,
+                        message: "authentication required",
+                        headers: [["WWW-Authenticate", "Bearer realm=\"sbproxy\""]],
+                    };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_auth(fixture.hook(), json!({})).unwrap();
+        assert_eq!(adapter.auth_type(), "javascript_auth_fixture");
+        let mut context = ();
+
+        let challenged = adapter
+            .authenticate(&request(b"hello"), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(
+            challenged,
+            AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "authentication required".to_owned(),
+                headers: vec![(
+                    "WWW-Authenticate".to_owned(),
+                    "Bearer realm=\"sbproxy\"".to_owned()
+                )],
+            }
+        );
+
+        let paid = http::Request::builder()
+            .uri("https://test.sbproxy.dev/widgets")
+            .header("x-plan", "paid")
+            .body(Bytes::new())
+            .unwrap();
+        assert_eq!(
+            adapter.authenticate(&paid, &mut context).await.unwrap(),
+            AuthDecision::allow_with_subject("acct-42", AuthSubjectSource::Header)
         );
     }
 

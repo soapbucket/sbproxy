@@ -1,0 +1,37 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: hmac-auth-javascript
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+sha256: 12628bfd5b600d41fef942b94bd81ade9d58aff9d723d626476c15c2b78a8303
+hooks:
+  - kind: auth
+    type: hmac_signature
+    export: run
+    config_schema:
+      type: object
+      additionalProperties: false
+      required: [signing_secret]
+      properties:
+        signing_secret:
+          type: string
+        key_header:
+          type: string
+          default: x-key-id
+        timestamp_header:
+          type: string
+          default: x-timestamp
+        signature_header:
+          type: string
+          default: x-signature
+    secret_vars: [signing_secret]
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

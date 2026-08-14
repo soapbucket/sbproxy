@@ -160,6 +160,9 @@ fn export_example_env_dummies_once() {
         ("ENV_VAR", "dummy"),
         ("VAR", "dummy"),
         ("REDIS_PASSWORD", "redis-example-dummy"),
+        // The extension-bundles HMAC auth hook resolves its shared secret
+        // at pipeline construction, so building that example needs a value.
+        ("SBPROXY_HMAC_SECRET", "worked-example-secret"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);

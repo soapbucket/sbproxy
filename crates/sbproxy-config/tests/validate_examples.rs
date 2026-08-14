@@ -175,6 +175,9 @@ fn export_example_env_dummies_once() {
         // as a reference rather than an inline token, the way the
         // README tells a reader to.
         ("SB_CONFIG_AUTHORITY_TOKEN", "sbca1.example.dummy-token"),
+        // The extension-bundles HMAC auth hook reads its shared secret
+        // from a reference, so the sweep needs a value to resolve.
+        ("SBPROXY_HMAC_SECRET", "worked-example-secret"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);
