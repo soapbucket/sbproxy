@@ -7,7 +7,8 @@ use super::{
 };
 use crate::mcp::types::{
     JsonRpcRequest, JsonRpcResponse, HEADER_MISMATCH, META_CLIENT_CAPABILITIES, META_CLIENT_INFO,
-    META_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, UNSUPPORTED_PROTOCOL_VERSION,
+    META_PROTOCOL_VERSION, META_SERVER_INFO, MISSING_REQUIRED_CLIENT_CAPABILITY,
+    MODERN_PROTOCOL_VERSION, UNSUPPORTED_PROTOCOL_VERSION,
 };
 
 const PROTECTED_HEADERS: &[&str] = &[
@@ -21,6 +22,65 @@ const PROTECTED_HEADERS: &[&str] = &[
 /// Codec for strict MCP 2026-07-28 request ingress.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Modern2026_07_28Codec;
+
+/// Build the modern capability object from the core surfaces the gateway serves.
+pub fn modern_server_capabilities(
+    has_tools: bool,
+    has_resources: bool,
+    has_prompts: bool,
+) -> serde_json::Value {
+    let mut capabilities = serde_json::Map::new();
+    if has_tools {
+        capabilities.insert("tools".into(), serde_json::json!({"listChanged": false}));
+    }
+    if has_resources {
+        capabilities.insert(
+            "resources".into(),
+            serde_json::json!({"listChanged": false}),
+        );
+    }
+    if has_prompts {
+        capabilities.insert("prompts".into(), serde_json::json!({"listChanged": false}));
+    }
+    serde_json::Value::Object(capabilities)
+}
+
+/// Build a private, zero-TTL modern server discovery result.
+pub fn build_discover_result(server: &McpServerDescription) -> serde_json::Value {
+    let capabilities = modern_server_capabilities(
+        server.capabilities.get("tools").is_some(),
+        server.capabilities.get("resources").is_some(),
+        server.capabilities.get("prompts").is_some(),
+    );
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        META_SERVER_INFO.into(),
+        serde_json::to_value(&server.implementation).expect("implementation is serializable"),
+    );
+    let mut result = serde_json::json!({
+        "resultType": "complete",
+        "supportedVersions": [
+            MODERN_PROTOCOL_VERSION,
+            crate::mcp::types::LEGACY_PROTOCOL_VERSION,
+        ],
+        "capabilities": capabilities,
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "_meta": meta,
+    });
+    if let Some(instructions) = &server.instructions {
+        result["instructions"] = serde_json::Value::String(instructions.clone());
+    }
+    result
+}
+
+/// Return whether a response carries a recognized modern protocol error.
+pub fn is_recognized_modern_error(response: &JsonRpcResponse) -> bool {
+    response
+        .error
+        .as_ref()
+        .is_some_and(|error| matches!(error.code, -32020 | -32021 | -32022))
+}
 
 impl McpProtocolCodec for Modern2026_07_28Codec {
     fn era(&self) -> McpProtocolEra {
@@ -140,15 +200,68 @@ impl McpProtocolCodec for Modern2026_07_28Codec {
 
     fn encode_success(
         &self,
-        _method: &str,
+        method: &str,
         id: Option<serde_json::Value>,
         result: serde_json::Value,
-        _server: &McpServerDescription,
+        server: &McpServerDescription,
     ) -> Result<McpWireResponse, McpWireError> {
+        if id.is_none() {
+            return Ok(McpWireResponse {
+                status: http::StatusCode::ACCEPTED,
+                headers: http::HeaderMap::new(),
+                body: None,
+            });
+        }
+
+        let mut result = result.as_object().cloned().ok_or_else(|| {
+            internal_error(id.clone(), "modern MCP success result must be an object")
+        })?;
+        match result.entry("resultType") {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::String("complete".into()));
+            }
+            serde_json::map::Entry::Occupied(entry)
+                if entry.get() == &serde_json::Value::String("complete".into()) => {}
+            serde_json::map::Entry::Occupied(_) => {
+                return Err(internal_error(
+                    id,
+                    "modern MCP input-required results are not supported",
+                ));
+            }
+        }
+
+        let meta = match result.entry("_meta") {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::Object(serde_json::Map::new()))
+            }
+            serde_json::map::Entry::Occupied(entry) if entry.get().is_object() => entry.into_mut(),
+            serde_json::map::Entry::Occupied(_) => {
+                return Err(internal_error(
+                    id,
+                    "modern MCP result _meta must be an object",
+                ));
+            }
+        };
+        meta.as_object_mut()
+            .expect("modern MCP result metadata is an object")
+            .insert(
+                META_SERVER_INFO.into(),
+                serde_json::to_value(&server.implementation)
+                    .expect("implementation is serializable"),
+            );
+
+        if requires_cache_metadata(method) {
+            result.insert("ttlMs".into(), serde_json::json!(0));
+            result.insert("cacheScope".into(), serde_json::json!("private"));
+        }
+
         Ok(McpWireResponse {
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
-            body: Some(JsonRpcResponse::success(id, result)),
+            body: Some(JsonRpcResponse::success(
+                id,
+                serde_json::Value::Object(result),
+            )),
         })
     }
 
@@ -160,11 +273,46 @@ impl McpProtocolCodec for Modern2026_07_28Codec {
         data: Option<serde_json::Value>,
     ) -> McpWireResponse {
         McpWireResponse {
-            status: http::StatusCode::OK,
+            status: modern_error_status(code),
             headers: http::HeaderMap::new(),
             body: Some(JsonRpcResponse::error_with_data(id, code, message, data)),
         }
     }
+}
+
+fn requires_cache_metadata(method: &str) -> bool {
+    matches!(
+        method,
+        "server/discover"
+            | "tools/list"
+            | "prompts/list"
+            | "resources/list"
+            | "resources/read"
+            | "resources/templates/list"
+    )
+}
+
+fn modern_error_status(code: i32) -> http::StatusCode {
+    match code {
+        crate::mcp::types::PARSE_ERROR
+        | crate::mcp::types::INVALID_REQUEST
+        | crate::mcp::types::INVALID_PARAMS
+        | HEADER_MISMATCH
+        | MISSING_REQUIRED_CLIENT_CAPABILITY
+        | UNSUPPORTED_PROTOCOL_VERSION => http::StatusCode::BAD_REQUEST,
+        crate::mcp::types::METHOD_NOT_FOUND => http::StatusCode::NOT_FOUND,
+        _ => http::StatusCode::OK,
+    }
+}
+
+fn internal_error(id: Option<serde_json::Value>, message: &str) -> McpWireError {
+    McpWireError::json(
+        http::StatusCode::OK,
+        id,
+        crate::mcp::types::INTERNAL_ERROR,
+        message,
+        None,
+    )
 }
 
 fn validate_content_type(

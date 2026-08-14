@@ -6,7 +6,10 @@ pub mod modern;
 
 pub use headers::{decode_header_value, encode_header_value, HeaderValueError};
 pub use legacy::Legacy2025_06_18Codec;
-pub use modern::Modern2026_07_28Codec;
+pub use modern::{
+    build_discover_result, is_recognized_modern_error, modern_server_capabilities,
+    Modern2026_07_28Codec,
+};
 
 /// MCP wire-protocol era.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

@@ -1,7 +1,7 @@
 use http::HeaderMap;
 use sbproxy_extension::mcp::{
     JsonRpcRequest, Legacy2025_06_18Codec, McpImplementation, McpProtocolCodec, McpProtocolEra,
-    McpServerDescription,
+    McpServerDescription, Modern2026_07_28Codec,
 };
 use serde_json::{json, Value};
 
@@ -38,6 +38,200 @@ fn modern_request(method: &str, params: Value) -> Value {
         }),
     );
     json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
+}
+
+fn test_server_description() -> McpServerDescription {
+    McpServerDescription {
+        implementation: McpImplementation {
+            name: "sbproxy-mcp".into(),
+            version: "1.2.3".into(),
+        },
+        capabilities: sbproxy_extension::mcp::protocol::modern_server_capabilities(
+            true, true, true,
+        ),
+        instructions: Some("Federated gateway".into()),
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_discover_is_private_zero_ttl_and_truthful() {
+    let server = McpServerDescription {
+        implementation: McpImplementation {
+            name: "sbproxy-mcp".into(),
+            version: "1.2.3".into(),
+        },
+        capabilities: json!({
+            "tools": {"listChanged": false},
+            "resources": {"listChanged": false}
+        }),
+        instructions: Some("Federated gateway".into()),
+    };
+    let result = sbproxy_extension::mcp::protocol::build_discover_result(&server);
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(
+        result["supportedVersions"],
+        json!(["2026-07-28", "2025-06-18"])
+    );
+    assert_eq!(result["ttlMs"], 0);
+    assert_eq!(result["cacheScope"], "private");
+    assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+    assert!(result["capabilities"].get("extensions").is_none());
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "sbproxy-mcp"
+    );
+}
+
+#[test]
+fn mcp_protocol_modern_discovery_filters_unimplemented_capabilities() {
+    let server = McpServerDescription {
+        implementation: McpImplementation {
+            name: "sbproxy-mcp".into(),
+            version: "1.2.3".into(),
+        },
+        capabilities: json!({
+            "tools": {"listChanged": true},
+            "experimental": {"legacy": true},
+            "mcpApps": {"ui": true},
+            "extensions": {"subscriptions": true},
+            "tasks": {"listChanged": true}
+        }),
+        instructions: None,
+    };
+    let result = sbproxy_extension::mcp::protocol::build_discover_result(&server);
+    assert_eq!(
+        result["capabilities"]["tools"],
+        json!({"listChanged": false})
+    );
+    for capability in [
+        "experimental",
+        "mcpApps",
+        "extensions",
+        "tasks",
+        "subscriptions",
+    ] {
+        assert!(
+            result["capabilities"].get(capability).is_none(),
+            "{capability} must not be advertised"
+        );
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_list_result_gets_required_cache_fields() {
+    let response = Modern2026_07_28Codec
+        .encode_success(
+            "tools/list",
+            Some(json!(9)),
+            json!({"tools": []}),
+            &test_server_description(),
+        )
+        .expect("encode");
+    let result = response.body.unwrap().result.unwrap();
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["ttlMs"], 0);
+    assert_eq!(result["cacheScope"], "private");
+}
+
+#[test]
+fn mcp_protocol_modern_call_result_omits_list_cache_fields() {
+    let response = Modern2026_07_28Codec
+        .encode_success(
+            "tools/call",
+            Some(json!(13)),
+            json!({"content": []}),
+            &test_server_description(),
+        )
+        .expect("encode");
+    let result = response.body.unwrap().result.unwrap();
+    assert!(result.get("ttlMs").is_none());
+    assert!(result.get("cacheScope").is_none());
+}
+
+#[test]
+fn mcp_protocol_modern_preserves_result_fields_and_meta_when_shaping() {
+    let response = Modern2026_07_28Codec
+        .encode_success(
+            "resources/read",
+            Some(json!(12)),
+            json!({
+                "contents": [],
+                "_meta": {"vendor.example/trace": "preserve"}
+            }),
+            &test_server_description(),
+        )
+        .expect("encode");
+    let result = response.body.unwrap().result.unwrap();
+    assert_eq!(result["contents"], json!([]));
+    assert_eq!(result["_meta"]["vendor.example/trace"], "preserve");
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+        "1.2.3"
+    );
+}
+
+#[test]
+fn mcp_protocol_modern_unknown_method_is_http_404() {
+    let response = Modern2026_07_28Codec.encode_error(
+        Some(json!(10)),
+        -32601,
+        "unknown MCP method: no/such",
+        None,
+    );
+    assert_eq!(response.status, http::StatusCode::NOT_FOUND);
+    assert_eq!(response.body.unwrap().error.unwrap().code, -32601);
+}
+
+#[test]
+fn mcp_protocol_modern_refuses_unadvertised_input_required_result() {
+    let error = Modern2026_07_28Codec
+        .encode_success(
+            "tools/call",
+            Some(json!(11)),
+            json!({"resultType": "input_required", "inputRequests": []}),
+            &test_server_description(),
+        )
+        .expect_err("MRTR generation is not supported");
+    assert_eq!(error.0.body.unwrap().error.unwrap().code, -32603);
+}
+
+#[test]
+fn mcp_protocol_modern_maps_errors_and_notification_responses() {
+    let cases = [
+        (-32700, http::StatusCode::BAD_REQUEST),
+        (-32600, http::StatusCode::BAD_REQUEST),
+        (-32602, http::StatusCode::BAD_REQUEST),
+        (-32020, http::StatusCode::BAD_REQUEST),
+        (-32021, http::StatusCode::BAD_REQUEST),
+        (-32022, http::StatusCode::BAD_REQUEST),
+        (-32601, http::StatusCode::NOT_FOUND),
+        (-32603, http::StatusCode::OK),
+    ];
+    for (code, status) in cases {
+        let response = Modern2026_07_28Codec.encode_error(Some(json!(4)), code, "error", None);
+        assert_eq!(response.status, status, "{code}");
+    }
+
+    let notification = Modern2026_07_28Codec
+        .encode_success(
+            "notifications/tools/list_changed",
+            None,
+            json!({}),
+            &test_server_description(),
+        )
+        .expect("notification encode");
+    assert_eq!(notification.status, http::StatusCode::ACCEPTED);
+    assert!(notification.body.is_none());
+}
+
+#[test]
+fn mcp_protocol_modern_recognizes_only_modern_protocol_errors() {
+    let recognized =
+        sbproxy_extension::mcp::JsonRpcResponse::error(Some(json!(1)), -32020, "mismatch");
+    let unrelated =
+        sbproxy_extension::mcp::JsonRpcResponse::error(Some(json!(1)), -32602, "invalid params");
+    assert!(sbproxy_extension::mcp::protocol::is_recognized_modern_error(&recognized));
+    assert!(!sbproxy_extension::mcp::protocol::is_recognized_modern_error(&unrelated));
 }
 
 #[test]
