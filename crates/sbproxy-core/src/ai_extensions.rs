@@ -541,6 +541,139 @@ fn canonical_message(value: &serde_json::Value) -> Result<AiExtensionMessage, ()
     })
 }
 
+/// Splice a hook-rewritten canonical message list back into the
+/// provider-shaped request body.
+///
+/// The canonical view is lossy: [`AiExtensionMessage`] carries no
+/// `tool_calls`, drops non-text content parts, and folds provider role
+/// spellings (`developer`, `function`) into their canonical roles.
+/// Reconstructing the body from it would therefore destroy fields the
+/// hook never touched. The original body stays authoritative instead,
+/// and only the content of messages the hook actually changed is
+/// spliced in, by position:
+///
+/// - message identity must be unchanged: same count, same roles, same
+///   `name` and `tool_call_id` per position; a rewrite that adds,
+///   removes, reorders, or relabels messages refuses;
+/// - a message whose content is unchanged is left byte-for-byte alone,
+///   `tool_calls`, image parts, and provider role spellings included;
+/// - a changed message's text lands in the one slot its canonical
+///   content came from (a string `content`, the single text part of a
+///   parts array, or a bare `text` field); a changed message with
+///   several text parts has no single slot for the joined replacement
+///   and refuses.
+///
+/// `Some(block)` is the refusal; shipping the original behind a hook
+/// that believes it rewrote the input is the outcome it prevents.
+pub(crate) fn write_mutated_input_messages(
+    body: &mut serde_json::Value,
+    mutated: &[AiExtensionMessage],
+) -> Option<AiExtensionBlock> {
+    let refuse = || Some(AiExtensionBlock::mutation_unrepresentable());
+    let Ok(original) = canonical_input_messages(body) else {
+        return refuse();
+    };
+    if original.len() != mutated.len() {
+        return refuse();
+    }
+    if original
+        .iter()
+        .zip(mutated)
+        .any(|(o, m)| o.role != m.role || o.name != m.name || o.tool_call_id != m.tool_call_id)
+    {
+        return refuse();
+    }
+    let changed: Vec<(usize, &str)> = original
+        .iter()
+        .zip(mutated)
+        .enumerate()
+        .filter(|(_, (o, m))| o.content != m.content)
+        .map(|(index, (_, m))| (index, m.content.as_str()))
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    // Locate the array or single-string field the canonical view was
+    // built from, in exactly `canonical_input_messages`' shape order.
+    if let Some(messages) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        return splice_changed_entries(messages, &changed);
+    }
+    if let Some(input) = body.get_mut("input") {
+        if let Some(entries) = input.as_array_mut() {
+            return splice_changed_entries(entries, &changed);
+        }
+        if input.is_string() {
+            // A single user message by construction (identity matched
+            // above against the canonical single-message view).
+            *input = serde_json::Value::String(changed[0].1.to_owned());
+            return None;
+        }
+    }
+    for field in ["prompt", "query"] {
+        if body.get(field).is_some_and(serde_json::Value::is_string) {
+            body[field] = serde_json::Value::String(changed[0].1.to_owned());
+            return None;
+        }
+    }
+    refuse()
+}
+
+fn splice_changed_entries(
+    entries: &mut [serde_json::Value],
+    changed: &[(usize, &str)],
+) -> Option<AiExtensionBlock> {
+    for (index, content) in changed {
+        let representable = entries
+            .get_mut(*index)
+            .is_some_and(|entry| splice_entry_content(entry, content));
+        if !representable {
+            return Some(AiExtensionBlock::mutation_unrepresentable());
+        }
+    }
+    None
+}
+
+/// Write replacement text into the one slot this entry's canonical
+/// content was read from, mirroring `canonical_message`: `content` as
+/// a string, `content` as a parts array (text parts joined), then a
+/// bare `text` field. Only entries the hook changed reach here, so a
+/// multi-text-part refusal never blocks a message that was left alone.
+fn splice_entry_content(entry: &mut serde_json::Value, content: &str) -> bool {
+    if let Some(slot) = entry.get_mut("content") {
+        match slot {
+            serde_json::Value::String(text) => {
+                *text = content.to_owned();
+                return true;
+            }
+            serde_json::Value::Array(parts) => {
+                let mut text_parts = parts
+                    .iter_mut()
+                    .filter(|part| part.get("text").is_some_and(serde_json::Value::is_string));
+                if let Some(first) = text_parts.next() {
+                    if text_parts.next().is_some() {
+                        // Several text parts were joined on extraction;
+                        // the joined replacement has no single home.
+                        return false;
+                    }
+                    first["text"] = serde_json::Value::String(content.to_owned());
+                    return true;
+                }
+                // No text part: extraction fell through to the bare
+                // `text` field below.
+            }
+            _ => {}
+        }
+    }
+    if entry.get("text").is_some_and(serde_json::Value::is_string) {
+        entry["text"] = serde_json::Value::String(content.to_owned());
+        return true;
+    }
+    false
+}
+
 fn content_text(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => Some(text.clone()),
@@ -689,6 +822,179 @@ mod tests {
         let block = request.close().await.unwrap_err();
         assert_eq!(block.status, 409);
         assert_eq!(block.code, "fixture_close");
+    }
+}
+
+#[cfg(test)]
+mod input_splice_tests {
+    use super::write_mutated_input_messages;
+    use sbproxy_plugin::{AiExtensionMessage, AiExtensionRole};
+
+    fn message(role: AiExtensionRole, content: &str) -> AiExtensionMessage {
+        AiExtensionMessage {
+            role,
+            content: content.to_owned(),
+            name: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// The reviewer-found blocker case: a multi-turn tool-calling
+    /// conversation with a developer-role message and an image part.
+    /// Redacting one user message must not disturb any of it.
+    #[test]
+    fn splice_preserves_fields_the_canonical_view_cannot_carry() {
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "developer", "content": "be safe"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call-1", "type": "function",
+                     "function": {"name": "search", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "my card is 4111"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
+                ]}
+            ],
+            "temperature": 0.2,
+        });
+        let expected_untouched = body.clone();
+        let mutated = [
+            message(AiExtensionRole::System, "be safe"),
+            message(AiExtensionRole::Assistant, ""),
+            AiExtensionMessage {
+                role: AiExtensionRole::Tool,
+                content: "result".to_owned(),
+                name: None,
+                tool_call_id: Some("call-1".to_owned()),
+            },
+            message(AiExtensionRole::User, "my card is [REDACTED]"),
+        ];
+        assert!(write_mutated_input_messages(&mut body, &mutated).is_none());
+        // Only the changed user message's text slot moved.
+        assert_eq!(
+            body["messages"][3]["content"][0]["text"],
+            "my card is [REDACTED]"
+        );
+        // The image part survived next to it.
+        assert_eq!(
+            body["messages"][3]["content"][1],
+            expected_untouched["messages"][3]["content"][1]
+        );
+        // Untouched messages are byte-identical: the developer role
+        // spelling, the assistant's tool_calls, the tool linkage.
+        assert_eq!(body["messages"][0], expected_untouched["messages"][0]);
+        assert_eq!(body["messages"][1], expected_untouched["messages"][1]);
+        assert_eq!(body["messages"][2], expected_untouched["messages"][2]);
+        assert_eq!(body["temperature"], expected_untouched["temperature"]);
+    }
+
+    #[test]
+    fn identity_changes_refuse() {
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "raw"}],
+        });
+        // Added message.
+        let mut body = base.clone();
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[
+                message(AiExtensionRole::System, "injected"),
+                message(AiExtensionRole::User, "raw"),
+            ],
+        )
+        .is_some());
+        // Removed message.
+        let mut body = base.clone();
+        assert!(write_mutated_input_messages(&mut body, &[]).is_some());
+        // Relabeled role.
+        let mut body = base.clone();
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[message(AiExtensionRole::System, "raw")]
+        )
+        .is_some());
+        // Every refusal left the body untouched.
+        assert_eq!(body, base);
+    }
+
+    #[test]
+    fn changed_multi_text_part_message_refuses_but_unchanged_one_passes() {
+        // Two text parts joined on extraction have no single slot for
+        // the joined replacement.
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"}
+            ]}],
+        });
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[message(AiExtensionRole::User, "clean")]
+        )
+        .is_some());
+        // The same shape passes when the hook left it alone and changed
+        // a different message (the joined canonical view of the two
+        // text parts, with a newline between them).
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": "b"}
+                ]},
+                {"role": "user", "content": "raw"}
+            ],
+        });
+        let mutated = [
+            message(AiExtensionRole::User, "a\nb"),
+            message(AiExtensionRole::User, "clean"),
+        ];
+        assert!(write_mutated_input_messages(&mut body, &mutated).is_none());
+        assert_eq!(body["messages"][1]["content"], "clean");
+        assert_eq!(body["messages"][0]["content"][1]["text"], "b");
+    }
+
+    #[test]
+    fn single_string_shapes_splice_content_and_refuse_more() {
+        for field in ["input", "prompt", "query"] {
+            let mut body = serde_json::json!({"model": "m", field: "raw"});
+            assert!(write_mutated_input_messages(
+                &mut body,
+                &[message(AiExtensionRole::User, "clean")]
+            )
+            .is_none());
+            assert_eq!(body[field], "clean");
+
+            let mut body = serde_json::json!({"model": "m", field: "raw"});
+            let block = write_mutated_input_messages(
+                &mut body,
+                &[
+                    message(AiExtensionRole::User, "clean"),
+                    message(AiExtensionRole::User, "second"),
+                ],
+            )
+            .expect("two messages cannot land in one string field");
+            assert_eq!(block.code, "ai_extension_mutation_unrepresentable");
+            assert_eq!(body[field], "raw");
+        }
+    }
+
+    #[test]
+    fn no_op_and_unknown_shapes() {
+        // An identical list is a no-op, whatever the shape.
+        let mut body = serde_json::json!({"model": "m", "embedding_input": ["a"]});
+        let before = body.clone();
+        assert!(write_mutated_input_messages(&mut body, &[]).is_none());
+        assert_eq!(body, before);
+        // A rewrite against a shape with no message list refuses.
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[message(AiExtensionRole::User, "clean")]
+        )
+        .is_some());
     }
 }
 

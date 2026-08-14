@@ -5577,7 +5577,9 @@ pub(super) async fn handle_ai_proxy(
                 {
                     Ok(None) => {}
                     Ok(Some(messages)) => {
-                        if let Some(block) = write_mutated_input_messages(&mut body, &messages) {
+                        if let Some(block) =
+                            crate::ai_extensions::write_mutated_input_messages(&mut body, &messages)
+                        {
                             send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
                             return Ok(());
                         }
@@ -5759,7 +5761,9 @@ pub(super) async fn handle_ai_proxy(
                                         Ok(None) => {}
                                         Ok(Some(messages)) => {
                                             if let Some(block) =
-                                                write_mutated_input_messages(&mut body, &messages)
+                                                crate::ai_extensions::write_mutated_input_messages(
+                                                    &mut body, &messages,
+                                                )
                                             {
                                                 send_ai_extension_block_response(
                                                     session, ctx, &ai_span, block,
@@ -9254,9 +9258,15 @@ pub(super) async fn relay_ai_response_with_cache(
                             // bypass mode the two share a wire shape,
                             // so the mutation must land on both or the
                             // client receives bytes the hook never
-                            // approved.
+                            // approved. The direct body was already
+                            // PII-restored at construction and the
+                            // deferred restore below skips it, so the
+                            // rebuilt one must restore again or the
+                            // client receives placeholder tokens
+                            // instead of their own values.
                             if direct_client_body.is_some() {
-                                direct_client_body = Some(new_body.clone());
+                                direct_client_body =
+                                    Some(restore_reversible_pii(&new_body, &reversible_pairs));
                             }
                             resp_body = new_body;
                         }
@@ -10320,71 +10330,6 @@ fn process_guard_events(
     (None, released, completed)
 }
 
-/// Write a hook-rewritten canonical message list back into the
-/// provider-shaped request body.
-///
-/// The inverse of `canonical_input_messages`, per body shape: a
-/// `messages` or `input` array takes the canonical list wholesale
-/// (roles serialize to the provider wire spelling), while the
-/// single-string shapes (`input`, `prompt`, `query`) can only carry
-/// one plain user message back. `Some(block)` is the refusal for a
-/// rewrite the shape cannot represent; shipping the original behind a
-/// hook that believes it rewrote the input is the outcome this
-/// refusal exists to prevent.
-fn write_mutated_input_messages(
-    body: &mut serde_json::Value,
-    messages: &[sbproxy_plugin::AiExtensionMessage],
-) -> Option<crate::ai_extensions::AiExtensionBlock> {
-    use crate::ai_extensions::AiExtensionBlock;
-    let refuse = || Some(AiExtensionBlock::mutation_unrepresentable());
-    let single_user_text = || match messages {
-        [message]
-            if message.role == sbproxy_plugin::AiExtensionRole::User
-                && message.name.is_none()
-                && message.tool_call_id.is_none() =>
-        {
-            Some(message.content.clone())
-        }
-        _ => None,
-    };
-    if body
-        .get("messages")
-        .is_some_and(serde_json::Value::is_array)
-    {
-        let Ok(wire) = serde_json::to_value(messages) else {
-            return refuse();
-        };
-        body["messages"] = wire;
-        return None;
-    }
-    if let Some(input) = body.get("input") {
-        if input.is_array() {
-            let Ok(wire) = serde_json::to_value(messages) else {
-                return refuse();
-            };
-            body["input"] = wire;
-            return None;
-        }
-        if input.is_string() {
-            let Some(text) = single_user_text() else {
-                return refuse();
-            };
-            body["input"] = serde_json::Value::String(text);
-            return None;
-        }
-    }
-    for field in ["prompt", "query"] {
-        if body.get(field).is_some_and(serde_json::Value::is_string) {
-            let Some(text) = single_user_text() else {
-                return refuse();
-            };
-            body[field] = serde_json::Value::String(text);
-            return None;
-        }
-    }
-    refuse()
-}
-
 /// Splice hook-rewritten output text back into the response body.
 ///
 /// Mirrors `canonical_output_text`'s extraction: a JSON body takes
@@ -10403,70 +10348,7 @@ fn apply_ai_output_mutation(original: &[u8], content: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod mutation_write_back_tests {
-    use super::{apply_ai_output_mutation, write_mutated_input_messages};
-    use sbproxy_plugin::{AiExtensionMessage, AiExtensionRole};
-
-    fn user(content: &str) -> AiExtensionMessage {
-        AiExtensionMessage {
-            role: AiExtensionRole::User,
-            content: content.to_owned(),
-            name: None,
-            tool_call_id: None,
-        }
-    }
-
-    #[test]
-    fn messages_array_takes_the_full_canonical_list() {
-        let mut body = serde_json::json!({
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "raw"}],
-            "temperature": 0.2,
-        });
-        let messages = [
-            AiExtensionMessage {
-                role: AiExtensionRole::System,
-                content: "be safe".to_owned(),
-                name: None,
-                tool_call_id: None,
-            },
-            user("clean"),
-        ];
-        assert!(write_mutated_input_messages(&mut body, &messages).is_none());
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "model": "gpt-4o",
-                "messages": [
-                    {"role": "system", "content": "be safe"},
-                    {"role": "user", "content": "clean"},
-                ],
-                "temperature": 0.2,
-            })
-        );
-    }
-
-    #[test]
-    fn single_string_shapes_take_one_user_message_and_refuse_more() {
-        for field in ["input", "prompt", "query"] {
-            let mut body = serde_json::json!({"model": "m", field: "raw"});
-            assert!(write_mutated_input_messages(&mut body, &[user("clean")]).is_none());
-            assert_eq!(body[field], "clean");
-
-            // A message list a plain-string field cannot carry.
-            let mut body = serde_json::json!({"model": "m", field: "raw"});
-            let block = write_mutated_input_messages(&mut body, &[user("clean"), user("second")])
-                .expect("two messages cannot land in one string field");
-            assert_eq!(block.code, "ai_extension_mutation_unrepresentable");
-            // The refused rewrite left the body untouched.
-            assert_eq!(body[field], "raw");
-        }
-    }
-
-    #[test]
-    fn unknown_body_shapes_refuse_rather_than_guess() {
-        let mut body = serde_json::json!({"model": "m", "embedding_input": ["a"]});
-        assert!(write_mutated_input_messages(&mut body, &[user("clean")]).is_some());
-    }
+    use super::apply_ai_output_mutation;
 
     #[test]
     fn output_mutation_splices_json_and_replaces_plain_text() {

@@ -635,8 +635,12 @@ pub enum AiExtensionDecision {
     },
     /// Release the operation with a modified payload.
     ///
-    /// Only the content-bearing hooks accept this: guardrail input and
-    /// output, tool calls, and stream events. The host revalidates the
+    /// The payload contract is defined for the four content-bearing
+    /// hooks (guardrail input and output, tool calls, and stream
+    /// events), but a host only honors it where it can write the
+    /// rewrite back into what actually ships: today that is guardrail
+    /// input and output, and declaring `mutates` on a tool-call or
+    /// stream hook refuses at config load. The host revalidates the
     /// replacement against the same limits the original passed, and the
     /// hook after this one in the chain sees the modified payload, so a
     /// redactor followed by a classifier classifies what will actually
