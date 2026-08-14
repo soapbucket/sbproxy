@@ -910,8 +910,8 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use sbproxy_config::{BundleHookKind, ExtensionBundlesConfig};
     use sbproxy_plugin::{
-        ActionHandler, ActionOutcome, AuthDecision, AuthProvider, AuthSubjectSource,
-        PolicyDecision, PolicyEnforcer, TransformContext, TransformHandler,
+        ActionHandler, ActionOutcome, AuthDecision, AuthDenialKind, AuthProvider,
+        AuthSubjectSource, PolicyDecision, PolicyEnforcer, TransformContext, TransformHandler,
     };
     use serde_json::{json, Value};
     use tempfile::TempDir;
@@ -1204,6 +1204,7 @@ mod tests {
                     "WWW-Authenticate".to_owned(),
                     "Bearer realm=\"sbproxy\"".to_owned()
                 )],
+                kind: AuthDenialKind::Challenge,
             }
         );
 

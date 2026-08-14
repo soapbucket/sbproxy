@@ -4,7 +4,7 @@ name: hmac-auth-javascript
 version: 1.0.0
 runtime: javascript
 entry: entry.js
-sha256: 12628bfd5b600d41fef942b94bd81ade9d58aff9d723d626476c15c2b78a8303
+sha256: 2ddf63025b2d88f4e1cabcd99b563088897ffb3f80a3b0595f8c578efa37afbb
 hooks:
   - kind: auth
     type: hmac_signature

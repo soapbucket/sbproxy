@@ -181,6 +181,31 @@ pub enum AuthDenialKind {
 }
 
 /// Auth decision returned by an [`AuthProvider`].
+///
+/// # Migrating from 0.4
+///
+/// [`Self::DenyWithHeaders`] gained a `kind: AuthDenialKind` field in
+/// `sbproxy-plugin` 0.5, so a header-bearing denial now carries its own
+/// trust classification instead of the dispatcher always scoring it as a
+/// neutral challenge. Two things break for an out-of-tree provider written
+/// against 0.4:
+///
+/// 1. **A literal `DenyWithHeaders { status, message, headers }` no longer
+///    compiles.** Add `kind: AuthDenialKind::Challenge` to reproduce the old
+///    behavior, or call the new [`Self::deny_with_headers`] constructor,
+///    which fills in `Challenge` for the RFC 9728 challenge case. Use
+///    `kind: AuthDenialKind::InvalidProof` when the denial rejects an
+///    offered credential (a `WWW-Authenticate: ... error="invalid_token"`
+///    per RFC 6750) so it reaches the suspicious trust tier.
+/// 2. **An exhaustive `match` on `DenyWithHeaders { status, message, headers }`
+///    stops compiling.** Add the field or a `..`; a provider that already
+///    overrode [`AuthProvider::denial_kind`] keeps its behavior, since an
+///    override still wins over the carried field.
+///
+/// The default [`AuthProvider::denial_kind`] now reads the carried `kind`
+/// rather than inferring a class from the presence of headers, so a provider
+/// that only ever returned `Challenge`-classified header denials needs no
+/// code change beyond the field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthDecision {
     /// Request is allowed to proceed.
@@ -226,6 +251,17 @@ pub enum AuthDecision {
         message: String,
         /// `(name, value)` pairs to append to the response.
         headers: Vec<(String, String)>,
+        /// How this header-bearing denial is scored for trust. A bare
+        /// challenge (the client presented nothing) is
+        /// [`AuthDenialKind::Challenge`] and neutral; a header-bearing
+        /// denial of an offered credential (a `WWW-Authenticate` with
+        /// `error="invalid_token"` per RFC 6750) is
+        /// [`AuthDenialKind::InvalidProof`] and feeds the suspicious
+        /// trust tier. The default [`AuthProvider::denial_kind`] returns
+        /// this value verbatim, so the provider that built the decision
+        /// owns the classification rather than the dispatcher inferring
+        /// it from the presence of headers.
+        kind: AuthDenialKind,
     },
 }
 
@@ -247,6 +283,46 @@ impl AuthDecision {
         Self::Allow {
             sub: Some(sub.into()),
             source: Some(source),
+        }
+    }
+
+    /// Construct a header-bearing denial scored as a neutral
+    /// [`AuthDenialKind::Challenge`]. This is the RFC 9728 protected-
+    /// resource-metadata case a provider reaches for when the client
+    /// presented no credential and is being pointed at a discovery
+    /// document; a denial of an offered credential should use
+    /// [`Self::deny_with_invalid_proof`] instead.
+    pub fn deny_with_headers(
+        status: u16,
+        message: impl Into<String>,
+        headers: Vec<(String, String)>,
+    ) -> Self {
+        Self::DenyWithHeaders {
+            status,
+            message: message.into(),
+            headers,
+            kind: AuthDenialKind::Challenge,
+        }
+    }
+
+    /// Construct a header-bearing denial of an offered credential, scored
+    /// as [`AuthDenialKind::InvalidProof`] so it reaches the suspicious
+    /// trust tier. Use this when a presented credential failed and the
+    /// response still carries a standard challenge header (an RFC 6750
+    /// `WWW-Authenticate: ... error="invalid_token"`), the case the neutral
+    /// [`Self::deny_with_headers`] would misclassify. Pairing the two
+    /// constructors keeps a caller off the bare struct literal, so a later
+    /// field on the variant does not re-break every invalid-proof provider.
+    pub fn deny_with_invalid_proof(
+        status: u16,
+        message: impl Into<String>,
+        headers: Vec<(String, String)>,
+    ) -> Self {
+        Self::DenyWithHeaders {
+            status,
+            message: message.into(),
+            headers,
+            kind: AuthDenialKind::InvalidProof,
         }
     }
 }
@@ -375,18 +451,21 @@ pub trait AuthProvider: Send + Sync + 'static {
     ///
     /// The dispatcher calls this only for [`AuthDecision::Deny`] and
     /// [`AuthDecision::DenyWithHeaders`] results below status 500.
-    /// Plain denials default to [`AuthDenialKind::InvalidProof`].
-    /// Header-bearing denials default to [`AuthDenialKind::Challenge`]
-    /// because their documented purpose is to carry protocol-mandated
-    /// challenge headers. Providers that attach headers to an invalid-proof
-    /// response must override this method and return
-    /// [`AuthDenialKind::InvalidProof`] for that decision.
+    /// Plain denials are [`AuthDenialKind::InvalidProof`]. Header-bearing
+    /// denials carry their own [`AuthDenialKind`] in the decision, so the
+    /// provider that built the decision owns the classification: a bare
+    /// challenge sets [`AuthDenialKind::Challenge`], a denial of an offered
+    /// credential sets [`AuthDenialKind::InvalidProof`]. The default reads
+    /// that field rather than inferring the class from the presence of
+    /// headers, which would misread a `WWW-Authenticate: ... error="invalid_token"`
+    /// (RFC 6750) rejection of a bad credential as a neutral challenge.
+    /// A provider may still override this method for a bespoke rule.
     ///
     /// The explicit classification keeps trust decisions independent of
     /// credential placement in request headers, cookies, or query parameters.
     fn denial_kind(&self, decision: &AuthDecision) -> AuthDenialKind {
         match decision {
-            AuthDecision::DenyWithHeaders { .. } => AuthDenialKind::Challenge,
+            AuthDecision::DenyWithHeaders { kind, .. } => *kind,
             AuthDecision::Allow { .. } | AuthDecision::Deny { .. } => AuthDenialKind::InvalidProof,
         }
     }
@@ -626,6 +705,50 @@ mod tests {
                 expires_at: None,
             }),
             "confirm"
+        );
+    }
+
+    #[test]
+    fn default_denial_kind_reads_the_decisions_carried_class() {
+        struct DefaultProvider;
+        impl AuthProvider for DefaultProvider {
+            fn auth_type(&self) -> &str {
+                "default"
+            }
+            fn authenticate(
+                &self,
+                _req: &http::Request<bytes::Bytes>,
+                _ctx: &mut dyn std::any::Any,
+            ) -> Pin<Box<dyn Future<Output = PluginResult<AuthDecision>> + Send + '_>> {
+                Box::pin(async { Ok(AuthDecision::allow_anonymous()) })
+            }
+        }
+        let provider = DefaultProvider;
+
+        // A plain deny is always an invalid-proof denial.
+        assert_eq!(
+            provider.denial_kind(&AuthDecision::Deny {
+                status: 401,
+                message: "bad".into(),
+            }),
+            AuthDenialKind::InvalidProof
+        );
+        // The header-bearing helper is a neutral challenge.
+        assert_eq!(
+            provider.denial_kind(&AuthDecision::deny_with_headers(401, "login", Vec::new())),
+            AuthDenialKind::Challenge
+        );
+        // A header-bearing decision built as invalid proof keeps that class
+        // under the default classifier, without the provider overriding
+        // `denial_kind`. This is what a bundle auth hook relies on, and the
+        // constructor is the symmetric partner to `deny_with_headers`.
+        assert_eq!(
+            provider.denial_kind(&AuthDecision::deny_with_invalid_proof(
+                401,
+                "bad token",
+                Vec::new()
+            )),
+            AuthDenialKind::InvalidProof
         );
     }
 }

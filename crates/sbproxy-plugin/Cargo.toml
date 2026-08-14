@@ -20,7 +20,7 @@ name = "sbproxy-plugin"
 # context is `IdentityResolverHook` (plus `MlClassifierHook` and
 # `AnomalyDetectorHook`), which are dispatched and take a typed
 # `RequestContextView` rather than a type-erased context.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license.workspace = true
 publish = false

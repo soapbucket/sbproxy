@@ -14,8 +14,8 @@ use sbproxy_extension::bundle::{
 };
 use sbproxy_plugin::{
     ActionHandler, ActionOutcome, AiExtensionEvent, AiExtensionEventPayload, AiExtensionMessage,
-    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, AuthDecision, AuthProvider,
-    AuthSubjectSource, ExtensionHookKind, ExtensionRuntime, PaymentExtensionDecision,
+    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, AuthDecision, AuthDenialKind,
+    AuthProvider, AuthSubjectSource, ExtensionHookKind, ExtensionRuntime, PaymentExtensionDecision,
     PaymentExtensionEvent, PaymentExtensionOutcome, PaymentExtensionPhase, PolicyDecision,
     PolicyEnforcer, TransformContext, TransformHandler, AI_EXTENSION_EVENT_SCHEMA_VERSION,
 };
@@ -240,9 +240,14 @@ async fn published_javascript_typescript_and_envelope_wasm_hooks_execute() {
         .unwrap();
     assert_eq!(
         hmac.authenticate(&tampered, &mut ()).await.unwrap(),
-        AuthDecision::Deny {
+        AuthDecision::DenyWithHeaders {
             status: 401,
             message: "invalid request signature".to_owned(),
+            headers: vec![(
+                "WWW-Authenticate".to_owned(),
+                "HMAC error=\"invalid_token\"".to_owned()
+            )],
+            kind: AuthDenialKind::InvalidProof,
         }
     );
     let unsigned = Request::builder()
@@ -258,6 +263,7 @@ async fn published_javascript_typescript_and_envelope_wasm_hooks_execute() {
                 "WWW-Authenticate".to_owned(),
                 "HMAC realm=\"sbproxy\"".to_owned()
             )],
+            kind: AuthDenialKind::Challenge,
         }
     );
 

@@ -1,8 +1,8 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use sbproxy_plugin::{
-    ActionOutcome, AiExtensionDecision, AuthDecision, AuthSubjectSource, PaymentExtensionDecision,
-    PolicyDecision, UNSUPPORTED_ACTION_OUTCOME_CODE,
+    ActionOutcome, AiExtensionDecision, AuthDecision, AuthDenialKind, AuthSubjectSource,
+    PaymentExtensionDecision, PolicyDecision, UNSUPPORTED_ACTION_OUTCOME_CODE,
 };
 use sbproxy_security::{hkdf_derive_purpose, HkdfPurpose};
 use serde::Deserialize;
@@ -389,6 +389,8 @@ struct AuthWire {
     message: Option<String>,
     #[serde(default)]
     headers: Vec<(String, String)>,
+    #[serde(default)]
+    denial_kind: Option<String>,
 }
 
 /// Map a bundle auth hook's `source` label to the subject-origin enum
@@ -404,6 +406,19 @@ fn decode_auth_source(label: &str) -> Result<AuthSubjectSource, EnvelopeError> {
     }
 }
 
+/// Map a header-bearing denial's `denial_kind` label to the trust
+/// classification. Absent defaults to a neutral challenge, preserving the
+/// behavior header-bearing denials had before the label existed; an
+/// explicit `invalid_proof` marks a rejected credential so it reaches the
+/// suspicious trust tier. An unknown label is a typo, not a silent default.
+fn decode_auth_denial_kind(label: Option<&str>) -> Result<AuthDenialKind, EnvelopeError> {
+    match label {
+        None | Some("challenge") => Ok(AuthDenialKind::Challenge),
+        Some("invalid_proof") => Ok(AuthDenialKind::InvalidProof),
+        Some(_) => Err(EnvelopeError::new("invalid_envelope")),
+    }
+}
+
 pub(crate) fn decode_auth(bytes: &[u8]) -> Result<AuthDecision, EnvelopeError> {
     let response: AuthWire =
         serde_json::from_slice(bytes).map_err(|_| EnvelopeError::new("invalid_envelope"))?;
@@ -412,7 +427,9 @@ pub(crate) fn decode_auth(bytes: &[u8]) -> Result<AuthDecision, EnvelopeError> {
     }
     match response.decision.as_str() {
         "allow" if response.status.is_none() && response.message.is_none() => {
-            if !response.headers.is_empty() {
+            // `denial_kind` classifies a denial; it has no meaning on an
+            // allow, so its presence here is a malformed decision.
+            if !response.headers.is_empty() || response.denial_kind.is_some() {
                 return Err(EnvelopeError::new("invalid_envelope"));
             }
             // A resolved subject and its origin travel together: a `sub`
@@ -431,7 +448,10 @@ pub(crate) fn decode_auth(bytes: &[u8]) -> Result<AuthDecision, EnvelopeError> {
             }
         }
         "deny" if response.sub.is_none() && response.source.is_none() => {
-            if !response.headers.is_empty() {
+            // A plain deny is already an invalid-proof denial and carries
+            // no headers, so it takes no `denial_kind`; a header-bearing
+            // classification without headers is a contradiction.
+            if !response.headers.is_empty() || response.denial_kind.is_some() {
                 return Err(EnvelopeError::new("invalid_envelope"));
             }
             let (status, message) = decode_auth_denial(response.status, response.message)?;
@@ -439,11 +459,13 @@ pub(crate) fn decode_auth(bytes: &[u8]) -> Result<AuthDecision, EnvelopeError> {
         }
         "deny_with_headers" if response.sub.is_none() && response.source.is_none() => {
             let (status, message) = decode_auth_denial(response.status, response.message)?;
+            let kind = decode_auth_denial_kind(response.denial_kind.as_deref())?;
             validate_headers(&response.headers)?;
             Ok(AuthDecision::DenyWithHeaders {
                 status,
                 message,
                 headers: response.headers,
+                kind,
             })
         }
         _ => Err(EnvelopeError::new("invalid_envelope")),
@@ -733,6 +755,7 @@ mod tests {
                 status: 401,
                 message: "login".to_owned(),
                 headers: vec![("WWW-Authenticate".to_owned(), "Bearer".to_owned())],
+                kind: AuthDenialKind::Challenge,
             }
         );
         // A denial needs a 4xx/5xx status and a message.
@@ -771,6 +794,66 @@ mod tests {
             "message": "m".repeat(MAX_POLICY_MESSAGE_BYTES + 1),
         });
         assert!(decode_auth(long_message.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn auth_wire_denial_kind_classifies_header_bearing_denials() {
+        // A header-bearing denial defaults to a neutral challenge, keeping
+        // the behavior these decisions had before the label existed.
+        assert_eq!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"deny_with_headers","status":401,"message":"login","headers":[["WWW-Authenticate","Bearer realm=\"api\""]]}"#
+            )
+            .unwrap(),
+            AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "login".to_owned(),
+                headers: vec![(
+                    "WWW-Authenticate".to_owned(),
+                    "Bearer realm=\"api\"".to_owned()
+                )],
+                kind: AuthDenialKind::Challenge,
+            }
+        );
+        // An explicit `invalid_proof` marks a rejected credential so it
+        // reaches the suspicious trust tier even though it carries a header.
+        assert_eq!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"deny_with_headers","status":401,"message":"bad token","headers":[["WWW-Authenticate","Bearer error=\"invalid_token\""]],"denial_kind":"invalid_proof"}"#
+            )
+            .unwrap(),
+            AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "bad token".to_owned(),
+                headers: vec![(
+                    "WWW-Authenticate".to_owned(),
+                    "Bearer error=\"invalid_token\"".to_owned()
+                )],
+                kind: AuthDenialKind::InvalidProof,
+            }
+        );
+        // An explicit `challenge` is accepted and matches the default.
+        assert!(matches!(
+            decode_auth(
+                br#"{"version":"sbproxy-envelope/v1","decision":"deny_with_headers","status":401,"message":"login","headers":[["WWW-Authenticate","Bearer"]],"denial_kind":"challenge"}"#
+            )
+            .unwrap(),
+            AuthDecision::DenyWithHeaders { kind: AuthDenialKind::Challenge, .. }
+        ));
+        // An unknown label is a typo, not a silent default.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"deny_with_headers","status":401,"message":"x","headers":[["a","b"]],"denial_kind":"maybe"}"#
+        )
+        .is_err());
+        // `denial_kind` is meaningless on an allow or a header-less deny.
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow","denial_kind":"challenge"}"#
+        )
+        .is_err());
+        assert!(decode_auth(
+            br#"{"version":"sbproxy-envelope/v1","decision":"deny","status":401,"message":"x","denial_kind":"invalid_proof"}"#
+        )
+        .is_err());
     }
 
     #[test]

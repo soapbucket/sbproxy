@@ -1088,6 +1088,7 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
             status: 401,
             message: "missing token".to_string(),
             headers: vec![("WWW-Authenticate".to_string(), www_auth.to_string())],
+            kind: AuthDenialKind::Challenge,
         },
         calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -1141,6 +1142,7 @@ async fn plugin_protocol_challenge_is_neutral_independent_of_request_shape() {
                     "WWW-Authenticate".to_string(),
                     "Bearer realm=\"api\"".to_string(),
                 )],
+                kind: AuthDenialKind::Challenge,
             },
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -1207,6 +1209,10 @@ async fn plugin_explicit_invalid_proof_is_suspicious_independent_of_request_shap
 
     for (case, headers, query) in cases {
         let provider = InvalidProofAuthProvider {
+            // The carried kind is deliberately `Challenge` so the
+            // `Suspicious` outcome below can only come from the provider's
+            // `denial_kind` override winning over the field, not the field
+            // itself. This is what isolates the override-precedence property.
             decision: AuthDecision::DenyWithHeaders {
                 status: 401,
                 message: "invalid token".to_string(),
@@ -1214,6 +1220,7 @@ async fn plugin_explicit_invalid_proof_is_suspicious_independent_of_request_shap
                     "WWW-Authenticate".to_string(),
                     "Bearer error=\"invalid_token\"".to_string(),
                 )],
+                kind: AuthDenialKind::Challenge,
             },
         };
         let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
@@ -1258,6 +1265,43 @@ async fn plugin_explicit_invalid_proof_is_suspicious_independent_of_request_shap
 }
 
 #[tokio::test]
+async fn header_bearing_denial_carrying_invalid_proof_reaches_the_suspicious_tier() {
+    // WOR-2429: the classification rides on the decision, so a provider
+    // that uses the DEFAULT `denial_kind` (no override) still lands a
+    // header-bearing failed-credential denial in the suspicious tier by
+    // building the decision with `kind: InvalidProof`. This is the path a
+    // bundle auth hook takes: `decode_auth` sets the carried kind and the
+    // adapter inherits the trait default.
+    let provider = StubAuthProvider {
+        type_name: "stub-invalid-proof-headers",
+        decision: AuthDecision::DenyWithHeaders {
+            status: 401,
+            message: "invalid signature".to_string(),
+            headers: vec![(
+                "WWW-Authenticate".to_string(),
+                "Bearer error=\"invalid_token\"".to_string(),
+            )],
+            kind: AuthDenialKind::InvalidProof,
+        },
+        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
+    let headers = http::HeaderMap::new();
+
+    let (_result, _principal, trust_outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    let mut ctx = RequestContext::new();
+    crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+    assert_eq!(
+        ctx.trust_tier,
+        sbproxy_modules::auth::TrustTier::Suspicious,
+        "a carried invalid-proof kind must raise the suspicious tier without an override"
+    );
+}
+
+#[tokio::test]
 async fn plugin_authenticate_error_denies_with_500() {
     // A plugin that returns Err must NOT fall through to Allow;
     // the engine must surface a generic 500 deny so a flaky
@@ -1292,6 +1336,9 @@ async fn plugin_header_denial_5xx_is_backend_failure() {
             status: 503,
             message: "identity service unavailable".to_string(),
             headers: vec![("Retry-After".to_string(), "30".to_string())],
+            // Carried kind is irrelevant here: a 5xx short-circuits to
+            // BackendFailure before `denial_kind` is consulted.
+            kind: AuthDenialKind::Challenge,
         },
     };
     let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));

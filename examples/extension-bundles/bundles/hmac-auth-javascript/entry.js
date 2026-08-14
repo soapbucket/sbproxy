@@ -19,13 +19,15 @@
 //     production hook should reject a timestamp outside a short window
 //     (and, for stricter replay defense, track seen nonces).
 //
-//   - A wrong signature returns a plain `deny`, not `deny_with_headers`.
-//     The host classifies a header-bearing denial as an authentication
-//     challenge (not a failed credential), which keeps a brute-force
-//     attempt out of the suspicious-trust tier. Reserving
-//     `deny_with_headers` for the "no credentials presented" case, and
-//     using plain `deny` for a bad credential, is what keeps failed
-//     attempts visible to trust scoring.
+//   - The two denials are classified differently for trust scoring. A
+//     request with no credentials is a neutral `deny_with_headers`
+//     challenge (the default classification). A request whose signature
+//     failed is a `deny_with_headers` with `denial_kind: "invalid_proof"`
+//     and an RFC 6750 `WWW-Authenticate: ... error="invalid_token"`
+//     header, so it carries the standard challenge header AND still
+//     raises the suspicious-trust tier. Marking a failed credential
+//     explicitly is what keeps a brute-force attempt visible; a bare
+//     `deny_with_headers` would be scored as a benign challenge.
 
 const K = [
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -213,9 +215,11 @@ export function run(input) {
   if (!timingSafeEqual(expected, signature.toLowerCase())) {
     return {
       version: "sbproxy-envelope/v1",
-      decision: "deny",
+      decision: "deny_with_headers",
       status: 401,
       message: "invalid request signature",
+      headers: [["WWW-Authenticate", 'HMAC error="invalid_token"']],
+      denial_kind: "invalid_proof",
     };
   }
 
