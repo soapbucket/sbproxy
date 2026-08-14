@@ -1198,6 +1198,11 @@ pub struct RequestContext {
     /// to the usage sinks (including the verifiable ledger) so policy
     /// decisions are queryable in the spend record. `None` by default.
     pub ai_policy_sink_tag: Option<String>,
+    /// WOR-2366: the reason an operator routing policy gave for its plan
+    /// (or the `ai_policy` override note). Bound to the access log so a
+    /// routing decision is diagnosable. `None` when no routing policy
+    /// produced a plan for this request.
+    pub ai_route_reason: Option<String>,
     /// WOR-1543: labels of the guardrails that flagged the request, set by
     /// the guardrail mesh when configured. Fed into the AI policy plane's
     /// `ai.guardrails.*` namespace so a policy rule can fuse the verdict
@@ -1809,6 +1814,7 @@ impl RequestContext {
             ai_guardrail_action: None,
             ai_usage_sinks: None,
             ai_policy_sink_tag: None,
+            ai_route_reason: None,
             ai_guardrail_labels: Vec::new(),
             ai_record_routing_feedback: false,
             ai_budget_fraction: 0.0,

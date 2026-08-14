@@ -105,6 +105,14 @@ pub enum CelSurface {
     /// is populated, so `request.*` here is a typo to refuse at load,
     /// not a binding that reads empty.
     AiPolicy,
+    /// An `ai_proxy` action's `ai_routing_policy.expression` (WOR-2366).
+    ///
+    /// Shares [`Self::AiPolicy`]'s vocabulary exactly: the same
+    /// gateway-computed `ai` decision view, no request-shaped bindings.
+    /// It is a distinct site so a routing policy and a security policy
+    /// each get their own label and can diverge later without one reading
+    /// the other's empty bindings.
+    AiRouting,
 }
 
 /// Bindings shared by every site that starts from `build_request_context`.
@@ -132,6 +140,7 @@ impl CelSurface {
             Self::ForwardRuleWhen => "forward rule `when`",
             Self::WafPersistent => "waf persistent rule",
             Self::AiPolicy => "ai_policy `expression`",
+            Self::AiRouting => "ai_routing_policy `expression`",
         }
     }
 
@@ -198,8 +207,9 @@ impl CelSurface {
                 vec!["envelope", "features", "request.key_id"]
             }
             // The evaluator sets exactly one variable: `ai`, from
-            // `AiDecisionView::to_cel`. See ai-policy-cel.md.
-            Self::AiPolicy => vec!["ai"],
+            // `AiDecisionView::to_cel`. See ai-policy-cel.md. The routing
+            // policy reads the same decision view.
+            Self::AiPolicy | Self::AiRouting => vec!["ai"],
             // custom_log builds its own JSON context rather than using
             // the shared builders, which is why its shape is unlike the
             // rest. It is the only site with `attribution` and the only
@@ -238,7 +248,7 @@ impl CelSurface {
     const fn uses_shared_request_context(self) -> bool {
         !matches!(
             self,
-            Self::CustomLogField | Self::TransformCel | Self::AiPolicy
+            Self::CustomLogField | Self::TransformCel | Self::AiPolicy | Self::AiRouting
         )
     }
 
@@ -575,6 +585,17 @@ mod tests {
         assert_eq!(
             CelSurface::WafPersistent.available(),
             CelSurface::RateLimitKey.available()
+        );
+    }
+
+    #[test]
+    fn the_ai_routing_surface_offers_exactly_what_ai_policy_offers() {
+        // Both read the same gateway-computed `ai` decision view. If one
+        // is widened without the other, a routing policy and a security
+        // policy would see different vocabularies at the same phase.
+        assert_eq!(
+            CelSurface::AiRouting.available(),
+            CelSurface::AiPolicy.available()
         );
     }
 

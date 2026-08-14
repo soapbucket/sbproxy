@@ -202,7 +202,10 @@ pub struct AiDecisionView {
 
 impl AiDecisionView {
     /// Build the `ai` CEL namespace map from this view.
-    fn to_cel(&self) -> CelValue {
+    ///
+    /// `pub(crate)` so the routing-policy surface (WOR-2366) can bind the
+    /// same `ai` decision view a security policy sees.
+    pub(crate) fn to_cel(&self) -> CelValue {
         let guardrails = HashMap::from([
             (
                 "flagged".to_string(),
