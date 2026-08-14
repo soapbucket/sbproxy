@@ -245,6 +245,22 @@ static AI_ROUTING_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Operator routing-policy (WOR-2366) decisions by outcome and the
+/// normalized reason code. `outcome` is a closed set (`plan`, `decline`,
+/// `error`); `reason_code` is bounded by the policy's `reason_codes`
+/// allowlist (`policy` / `other` / an allowlisted code, or `none` for a
+/// decline or error), so neither label can grow unbounded from a request.
+static AI_ROUTING_POLICY_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_routing_policy_decisions_total",
+            "Operator AI routing-policy decisions by outcome and reason code"
+        ),
+        &["outcome", "reason_code"]
+    )
+    .unwrap()
+});
+
 /// Prefix-affinity selections by observed-cache outcome.
 static AI_PREFIX_AFFINITY_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
@@ -777,6 +793,18 @@ pub fn record_routing_fallback(strategy: &str, reason: &str) {
     };
     AI_ROUTING_FALLBACKS
         .with_label_values(&[strategy, reason])
+        .inc();
+}
+
+/// Record an operator routing-policy decision (WOR-2366).
+///
+/// `outcome` must be one of `plan`, `decline`, `error`. `reason_code` is
+/// the already-normalized code (`policy` / `other` / an allowlisted value,
+/// or `none` for a decline or error); the caller owns normalization so
+/// this function never sees a request-controlled string.
+pub fn record_routing_policy_decision(outcome: &str, reason_code: &str) {
+    AI_ROUTING_POLICY_DECISIONS
+        .with_label_values(&[outcome, reason_code])
         .inc();
 }
 

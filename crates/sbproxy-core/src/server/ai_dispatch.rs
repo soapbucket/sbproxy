@@ -5853,6 +5853,94 @@ pub(super) async fn handle_ai_proxy(
     // configured and compiled. A policy bug fails open (see `on_error`).
     let mut cel_compression_selector = None;
     let mut cel_compression_selector_invalid = false;
+
+    // WOR-2366: the operator routing policy runs before the security
+    // policy. It returns a plan the request dispatches through the cascade
+    // executor; a firing `ai_policy` `route_to` below then clears the plan
+    // (safety over optimization). Declining is the common, cheap path and
+    // leaves the configured `RoutingStrategy` untouched.
+    let mut routing_policy_cascade: Option<sbproxy_ai::routing::CascadeConfig> = None;
+    if let Some(routing_policy) = config.ai_routing_policy() {
+        let routing_view = sbproxy_ai::ai_policy::AiDecisionView {
+            surface: surface_label.to_string(),
+            model: model.clone(),
+            provider: config
+                .providers
+                .first()
+                .map(|p| p.name.to_string())
+                .unwrap_or_default(),
+            tenant: ctx.tenant_id.to_string(),
+            api_key_id: ctx.principal.api_key_id().to_string(),
+            tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
+            guardrail_labels: ctx.ai_guardrail_labels.clone(),
+            guardrail_flagged_count,
+            budget_fraction: ctx.ai_budget_fraction,
+            budget_exceeded: ctx.ai_budget_fraction >= 1.0,
+            input_tokens_est: ai_policy_input_tokens_est(&model, &body),
+        };
+        let configured_providers: Vec<String> = config
+            .providers
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect();
+        match routing_policy.evaluate(&routing_view, &configured_providers) {
+            sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Plan {
+                cascade,
+                reason,
+                reason_code,
+            } => {
+                ctx.ai_route_reason = Some(reason);
+                routing_policy_cascade = Some(cascade);
+                sbproxy_ai::ai_metrics::record_routing_policy_decision("plan", reason_code);
+                sbproxy_observe::decision::record_decision(
+                    sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                    sbproxy_observe::decision::DecisionEngine::Cel,
+                    sbproxy_observe::decision::DecisionOutcome::Mutate,
+                    route_origin_label(ctx),
+                    ctx.tenant_id.as_str(),
+                );
+            }
+            sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Decline => {
+                sbproxy_ai::ai_metrics::record_routing_policy_decision("decline", "none");
+                sbproxy_observe::decision::record_decision(
+                    sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                    sbproxy_observe::decision::DecisionEngine::Cel,
+                    sbproxy_observe::decision::DecisionOutcome::Decline,
+                    route_origin_label(ctx),
+                    ctx.tenant_id.as_str(),
+                );
+            }
+            sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Error { detail, on_error } => {
+                warn!(
+                    ai.surface = surface_label,
+                    error = %detail,
+                    "AI routing policy: evaluation error"
+                );
+                sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
+                sbproxy_observe::decision::record_decision(
+                    sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                    sbproxy_observe::decision::DecisionEngine::Cel,
+                    sbproxy_observe::decision::DecisionOutcome::Error,
+                    route_origin_label(ctx),
+                    ctx.tenant_id.as_str(),
+                );
+                if on_error == sbproxy_ai::ai_routing_policy::AiRoutingOnError::Block {
+                    ctx.ai_outcome = Some("routing_policy_error".to_string());
+                    let body_bytes = ErrorEnvelope::new(
+                        "ai_routing_policy_error",
+                        "AI routing policy failed to produce a decision",
+                    )
+                    .request_id(ctx.request_id.as_str())
+                    .to_bytes();
+                    send_response(session, 503, "application/json", &body_bytes).await?;
+                    return Ok(());
+                }
+                // `decline` posture (the default): fall through to the
+                // configured routing strategy, the same as a decline.
+            }
+        }
+    }
+
     if let Some(policy) = config.ai_policy() {
         // This estimate must be computed before CEL runs. The request-path
         // accounting estimate below intentionally runs after compression and
@@ -5985,6 +6073,12 @@ pub(super) async fn handle_ai_proxy(
                 set_body_model(&mut body, &candidate.model);
                 ctx.ai_model = Some(candidate.model.clone());
                 model = candidate.model.clone();
+                // WOR-2366: a security-driven `route_to` override wins over
+                // an optimization routing plan. Drop the plan so dispatch
+                // follows the hard model pin, not the cascade the routing
+                // policy computed.
+                routing_policy_cascade = None;
+                ctx.ai_route_reason = Some("ai_policy route_to override".to_owned());
                 // The event rewrote the payload, which is `Mutate` in this
                 // vocabulary (OCSF disposition 13, Corrected) rather than
                 // `Allow` (disposition 1). A SIEM rule keyed on "a control
@@ -6982,7 +7076,11 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::normalize_prefix(&body, namespace)
         })
         .flatten();
-    if !is_failover && router.cascade_config().is_none() && router.cost_quality_config().is_none() {
+    if !is_failover
+        && routing_policy_cascade.is_none()
+        && router.cascade_config().is_none()
+        && router.cost_quality_config().is_none()
+    {
         // Prefix-affinity consults the bounded observed-holder directory over
         // the exact candidates this dispatch can run. Other strategies use
         // their ordinary selection path.
@@ -6998,7 +7096,14 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
-    ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+    ctx.admin_load_balancer_strategy = Some(if routing_policy_cascade.is_some() {
+        // A routing-policy plan supersedes the configured strategy for
+        // this request; the admin view should say so rather than name a
+        // strategy that did not decide.
+        "ai_routing_policy".to_string()
+    } else {
+        router.strategy_name().to_string()
+    });
     ctx.admin_load_balancer_target = provider_order
         .first()
         .map(|&index| config.providers[index].name.to_string());
@@ -7006,7 +7111,11 @@ pub(super) async fn handle_ai_proxy(
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
     // applied to the request body below in the per-provider loop.
-    if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
+    if let Some(cascade_cfg) = routing_policy_cascade
+        .as_ref()
+        .or_else(|| router.cascade_config())
+        .filter(|_| !disallow_training)
+    {
         if is_stream {
             if let Some(first_tier) = cascade_cfg.tiers.first() {
                 if let Some(idx) = provider_order
@@ -7059,8 +7168,9 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
-    if let Some(cascade_cfg) = router
-        .cascade_config()
+    if let Some(cascade_cfg) = routing_policy_cascade
+        .as_ref()
+        .or_else(|| router.cascade_config())
         .filter(|_| !disallow_training && !has_managed_local)
     {
         if !is_stream {
@@ -7283,7 +7393,10 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
-    if !is_stream && has_managed_local && router.cascade_config().is_some() {
+    if !is_stream
+        && has_managed_local
+        && (routing_policy_cascade.is_some() || router.cascade_config().is_some())
+    {
         warn!(
             "AI proxy: confidence cascade includes a managed local provider; using the normal \
              failover path so local admission and engine lifecycle remain governed"
