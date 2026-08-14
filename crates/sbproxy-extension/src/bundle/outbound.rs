@@ -25,15 +25,23 @@ use sbproxy_security::egress::{
 /// blocking on a channel), so the synchronous host function drives the
 /// async client here. Process-lifetime, like the key plane's runtime,
 /// so a fetch never pays runtime construction.
-fn fetch_runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .thread_name("sbproxy-bundle-fetch")
-            .build()
-            .expect("the bundle fetch runtime must build")
-    })
+///
+/// `None` when the runtime could not be built, which fails the fetch
+/// closed (a refused call) rather than ending the process: a bundle
+/// hook must never be able to panic the proxy, and a runtime that will
+/// not build is a host resource condition the guest cannot be trusted
+/// to have caused or to recover from.
+fn fetch_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name("sbproxy-bundle-fetch")
+                .build()
+                .ok()
+        })
+        .as_ref()
 }
 
 /// Compiled outbound capability for one hook: its granted destinations
@@ -152,6 +160,7 @@ impl BundleOutbound {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| "budget_exhausted".to_owned())?;
+        let runtime = fetch_runtime().ok_or_else(|| "fetch_runtime_unavailable".to_owned())?;
 
         let max_bytes = self.max_response_bytes;
         let url = destination.url.clone();
@@ -172,7 +181,13 @@ impl BundleOutbound {
             })
             .unwrap_or_default();
 
-        fetch_runtime().block_on(async move {
+        runtime.block_on(async move {
+            // One deadline bounds the whole call, connect through the
+            // last byte, so a slow-trickle upstream cannot hold the
+            // worker past the hook's budget by resetting a per-chunk
+            // timer. `timeout_at` on a single instant is that bound; the
+            // client-level timeouts are the fast-path backstop.
+            let overall = tokio::time::Instant::now() + remaining;
             // The pinned addresses are the whole point: the client
             // resolves the checked host to the verified set and never
             // performs its own lookup, so a rebinding DNS answer
@@ -192,7 +207,7 @@ impl BundleOutbound {
             if let Some(body) = body {
                 outgoing = outgoing.body(body);
             }
-            let response = tokio::time::timeout(remaining, outgoing.send())
+            let response = tokio::time::timeout_at(overall, outgoing.send())
                 .await
                 .map_err(|_| "budget_exhausted".to_owned())?
                 .map_err(|_| "request_failed".to_owned())?;
@@ -207,7 +222,7 @@ impl BundleOutbound {
             let mut collected: Vec<u8> = Vec::new();
             let mut stream = response;
             loop {
-                let chunk = tokio::time::timeout(remaining, stream.chunk())
+                let chunk = tokio::time::timeout_at(overall, stream.chunk())
                     .await
                     .map_err(|_| "budget_exhausted".to_owned())?
                     .map_err(|_| "request_failed".to_owned())?;
