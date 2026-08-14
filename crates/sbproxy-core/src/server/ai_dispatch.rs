@@ -497,6 +497,27 @@ fn ai_policy_prompt_difficulty(body: &serde_json::Value) -> f64 {
     f64::from(sbproxy_ai::cost_quality::heuristic_difficulty(&text))
 }
 
+/// Build the `ai.providers` view: each configured provider's live runtime
+/// state read from the router, index-aligned by position with `providers`.
+///
+/// The read is a lock-free atomic snapshot per provider (see
+/// [`sbproxy_ai::Router::provider_runtime_states`]), so this is safe on the
+/// request path before an `ai_routing_policy` runs. The provider name comes
+/// from the config, which the router's index-keyed state does not carry.
+fn ai_provider_state_views(
+    router: &sbproxy_ai::Router,
+    providers: &[sbproxy_ai::ProviderConfig],
+) -> Vec<sbproxy_ai::ai_policy::ProviderStateView> {
+    let states = router.provider_runtime_states();
+    providers
+        .iter()
+        .zip(states)
+        .map(|(p, s)| {
+            sbproxy_ai::ai_policy::ProviderStateView::from_runtime(p.name.to_string(), &s)
+        })
+        .collect()
+}
+
 /// Whether one attempt may replay the original native request bytes to the
 /// upstream instead of the governed canonical body. Streaming, any request
 /// transform, and any selected RAG runtime (which pins the request to the
@@ -5900,6 +5921,7 @@ pub(super) async fn handle_ai_proxy(
                 budget_exceeded: ctx.ai_budget_fraction >= 1.0,
                 input_tokens_est: ai_policy_input_tokens_est(&model, &body),
                 prompt_difficulty: ai_policy_prompt_difficulty(&body),
+                providers: ai_provider_state_views(router.as_ref(), &config.providers),
             };
             let configured_providers: Vec<String> = config
                 .providers
@@ -6032,6 +6054,7 @@ pub(super) async fn handle_ai_proxy(
             budget_exceeded: ctx.ai_budget_fraction >= 1.0,
             input_tokens_est: policy_input_tokens_est,
             prompt_difficulty: ai_policy_prompt_difficulty(&body),
+            providers: ai_provider_state_views(router.as_ref(), &config.providers),
         };
         let decision = policy.evaluate(&view);
 

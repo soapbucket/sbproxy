@@ -211,3 +211,70 @@ fn prompt_difficulty_lets_easy_prompts_fall_through() {
         "the frontier provider must be untouched when the policy declines"
     );
 }
+
+/// A routing policy that reads `ai.providers`: plan to `frontier` when it is
+/// present, healthy, and its circuit is closed. On a fresh proxy every provider
+/// is healthy (no probe = unknown = healthy) with a closed circuit, so this
+/// deterministically fires. If `ai.providers` were empty (wiring broken) the
+/// comprehension would find nobody, the policy would decline, and round_robin
+/// would pick `cheap` (index 0) instead.
+fn provider_state_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        expression: |
+          ai.providers.exists(x, x.name == "frontier" && x.healthy && x.circuit == "closed")
+            ? {{"candidates": [{{"provider_id": "frontier", "model": "gpt-4o"}}], "reason": "frontier healthy", "reason_code": "provider_state"}}
+            : null
+        reason_codes: [provider_state]
+"#
+    )
+}
+
+#[test]
+fn provider_state_is_visible_to_the_routing_policy() {
+    // Proves the live `ai.providers` view reaches the routing policy: the
+    // comprehension reads each provider's name, health, and circuit state, and
+    // plans to the healthy frontier. Without the wiring the list is empty, the
+    // policy declines, and cheap (round_robin index 0) would serve instead.
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy = ProxyHarness::start_with_yaml(&provider_state_config(
+        &cheap.base_url(),
+        &frontier.base_url(),
+    ))
+    .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "the policy must read ai.providers and plan to the healthy frontier provider"
+    );
+    assert!(
+        cheap.captured().is_empty(),
+        "cheap must be untouched: the plan named frontier"
+    );
+}

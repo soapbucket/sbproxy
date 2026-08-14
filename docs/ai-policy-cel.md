@@ -101,6 +101,15 @@ for the shared grammar and rejection rules.
 | `ai.budget.exceeded` | bool | Whether a budget window is already exceeded. |
 | `ai.tokens.input_est` | int | Target-model input estimate for the current uncompressed JSON messages. |
 | `ai.prompt.difficulty` | double | Heuristic prompt-difficulty in `[0.0, 1.0]`, blending prompt length with code, math, and multi-step-reasoning signals; zero when the body carries no scorable text. This is the score the built-in `cost_quality` strategy routes on, so a routing policy can author that decision instead. |
+| `ai.providers` | list | Per-provider live runtime state, index-aligned with the configured providers; each element is a map with the fields below. Read it with a comprehension, e.g. `ai.providers.exists(p, p.healthy && p.latency_ms < 500)`. Empty when the request path gathered no router state. |
+| `ai.providers[i].name` | string | Provider name (its stable id). |
+| `ai.providers[i].healthy` | bool | `false` only when an active probe marked the provider unhealthy; a provider with no probe configured reads healthy (that axis abstains). |
+| `ai.providers[i].health` | string | `healthy`, `unhealthy`, or `unknown`. |
+| `ai.providers[i].latency_ms` | double | Observed p50 latency in milliseconds; `0` before the first observation. |
+| `ai.providers[i].in_flight` | int | In-flight request count. |
+| `ai.providers[i].tokens_used` | int | Tokens charged to the current minute. |
+| `ai.providers[i].circuit_open` | bool | `true` when the circuit breaker is open (requests are being rejected). |
+| `ai.providers[i].circuit` | string | `closed`, `open`, or `half_open`. |
 
 `ai.tokens.input_est` is computed before CEL and before compression. Known
 OpenAI model families use their registered tokenizer; other model names use

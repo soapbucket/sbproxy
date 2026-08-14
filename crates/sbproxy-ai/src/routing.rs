@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use sbproxy_platform::circuitbreaker::CircuitBreaker;
+use sbproxy_platform::circuitbreaker::{CircuitBreaker, CircuitState};
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -302,6 +302,31 @@ pub struct CascadeTier {
 /// after a restart.
 const MAX_STICKY_SESSIONS: usize = 100_000;
 
+/// A point-in-time snapshot of one provider's live runtime state, as read
+/// from the [`Router`]'s per-provider atomics and circuit breaker.
+///
+/// Returned index-aligned by [`Router::provider_runtime_states`] and surfaced
+/// to a routing policy as `ai.providers[i]`. Every field is a plain scalar so
+/// the AI decision view can bind it without depending on router internals.
+#[derive(Debug, Clone)]
+pub struct ProviderRuntimeState {
+    /// Observed p50 latency in microseconds; `0` before the first observation.
+    pub latency_us: u64,
+    /// In-flight request count.
+    pub in_flight: u32,
+    /// Tokens charged to the current minute.
+    pub tokens_used: u64,
+    /// `false` only when an active probe marked the provider unhealthy;
+    /// `unknown` (no probe) reads as healthy, matching selection.
+    pub healthy: bool,
+    /// Health as a stable label: `healthy`, `unhealthy`, or `unknown`.
+    pub health: &'static str,
+    /// `true` when the circuit breaker is open (requests are being rejected).
+    pub circuit_open: bool,
+    /// Circuit state as a stable label: `closed`, `open`, or `half_open`.
+    pub circuit: &'static str,
+}
+
 /// Router that selects a provider for each request.
 pub struct Router {
     strategy: RoutingStrategy,
@@ -494,6 +519,52 @@ impl Router {
     /// admin diagnostics and tests).
     pub fn breakers(&self) -> &[Arc<CircuitBreaker>] {
         &self.breakers
+    }
+
+    /// A cheap, lock-free snapshot of every provider's live runtime state,
+    /// index-aligned with the providers passed to [`Router::new`].
+    ///
+    /// Reads each per-provider atomic with `Relaxed` ordering and each
+    /// breaker's decoded state; it holds no lock and does no I/O, so it is
+    /// safe to call on the request path before an `ai_routing_policy` runs.
+    /// It exposes the same signals the built-in latency/load/health-aware
+    /// strategies select on, so a routing policy can read them as
+    /// `ai.providers` and author that decision itself.
+    ///
+    /// `health` follows the router's own selection semantics: a provider
+    /// with no probe configured (or no result yet) is `unknown`, which reads
+    /// as healthy because that axis simply abstains. `circuit` is `closed`
+    /// when no breaker is configured.
+    ///
+    /// Reading `circuit` is not perfectly side-effect-free: like every other
+    /// caller of [`CircuitBreaker::state`], it lazily transitions a breaker
+    /// whose open duration has elapsed from open to half-open. That only
+    /// advances a cooled-down breaker toward recovery (the same transition
+    /// selection would make), so it is safe to call here, but it is why this
+    /// is "no lock, no I/O" rather than "pure read".
+    pub fn provider_runtime_states(&self) -> Vec<ProviderRuntimeState> {
+        (0..self.latencies.len())
+            .map(|i| {
+                let (healthy, health) = match self.health[i].load(Ordering::Relaxed) {
+                    1 => (true, "healthy"),
+                    2 => (false, "unhealthy"),
+                    _ => (true, "unknown"),
+                };
+                let circuit = self
+                    .breakers
+                    .get(i)
+                    .map_or(CircuitState::Closed, |b| b.state());
+                ProviderRuntimeState {
+                    latency_us: self.latencies[i].load(Ordering::Relaxed),
+                    in_flight: self.connections[i].load(Ordering::Relaxed),
+                    tokens_used: self.tokens_used[i].load(Ordering::Relaxed),
+                    healthy,
+                    health,
+                    circuit_open: matches!(circuit, CircuitState::Open),
+                    circuit: circuit.as_str(),
+                }
+            })
+            .collect()
     }
 
     /// Mark a provider's last response as a success (for outlier
@@ -1519,6 +1590,36 @@ mod tests {
         assert_eq!(counts[0], 10);
         assert_eq!(counts[1], 10);
         assert_eq!(counts[2], 10);
+    }
+
+    #[test]
+    fn provider_runtime_states_reflects_recorded_signals() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 2);
+        router.record_latency(0, 5_000); // 5ms, stored directly (no EWMA)
+        router.record_tokens(0, 42);
+        router.set_provider_health(1, false); // provider 1 unhealthy
+        let guard = router.track_in_flight(0); // one in-flight on provider 0
+
+        let states = router.provider_runtime_states();
+        assert_eq!(states.len(), 2);
+
+        // Provider 0: recorded latency + tokens + one in-flight; no probe so
+        // health is unknown (reads healthy); no breaker so circuit is closed.
+        assert_eq!(states[0].latency_us, 5_000);
+        assert_eq!(states[0].tokens_used, 42);
+        assert_eq!(states[0].in_flight, 1);
+        assert!(states[0].healthy);
+        assert_eq!(states[0].health, "unknown");
+        assert!(!states[0].circuit_open);
+        assert_eq!(states[0].circuit, "closed");
+
+        // Provider 1: probe marked it unhealthy.
+        assert!(!states[1].healthy);
+        assert_eq!(states[1].health, "unhealthy");
+
+        // Dropping the guard releases the in-flight slot.
+        drop(guard);
+        assert_eq!(router.provider_runtime_states()[0].in_flight, 0);
     }
 
     #[test]

@@ -172,6 +172,51 @@ impl AiPolicyDecision {
     }
 }
 
+/// One configured provider's live runtime state, exposed to a routing policy
+/// as `ai.providers[i]`.
+///
+/// A plain-data mirror of [`crate::routing::ProviderRuntimeState`] with the
+/// provider name attached and latency converted to milliseconds, so a policy
+/// can write `ai.providers.filter(p, p.healthy && p.latency_ms < 500)`
+/// directly.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderStateView {
+    /// Provider name (its stable id).
+    pub name: String,
+    /// `false` only when an active probe marked the provider unhealthy.
+    pub healthy: bool,
+    /// Health label: `healthy`, `unhealthy`, or `unknown`.
+    pub health: String,
+    /// Observed p50 latency in milliseconds; `0.0` before the first
+    /// observation.
+    pub latency_ms: f64,
+    /// In-flight request count.
+    pub in_flight: i64,
+    /// Tokens charged to the current minute.
+    pub tokens_used: i64,
+    /// `true` when the circuit breaker is open (requests are being rejected).
+    pub circuit_open: bool,
+    /// Circuit label: `closed`, `open`, or `half_open`.
+    pub circuit: String,
+}
+
+impl ProviderStateView {
+    /// Build a policy-facing view from a router snapshot and the provider's
+    /// configured name, converting the p50 latency to milliseconds.
+    pub fn from_runtime(name: String, s: &crate::routing::ProviderRuntimeState) -> Self {
+        Self {
+            name,
+            healthy: s.healthy,
+            health: s.health.to_string(),
+            latency_ms: s.latency_us as f64 / 1000.0,
+            in_flight: i64::from(s.in_flight),
+            tokens_used: i64::try_from(s.tokens_used).unwrap_or(i64::MAX),
+            circuit_open: s.circuit_open,
+            circuit: s.circuit.to_string(),
+        }
+    }
+}
+
 /// Borrowed snapshot of the AI decision signals exposed to the policy as
 /// the `ai.*` CEL namespace.
 #[derive(Debug, Clone, Default)]
@@ -205,6 +250,11 @@ pub struct AiDecisionView {
     /// strategy routes on, exposed so a routing policy can author that
     /// decision. Bound as `ai.prompt.difficulty`.
     pub prompt_difficulty: f64,
+    /// Per-provider live runtime state (health, latency, in-flight, tokens
+    /// used, circuit state), index-aligned with the configured providers.
+    /// Bound as the `ai.providers` list. Empty when no router state is
+    /// gathered (the default).
+    pub providers: Vec<ProviderStateView>,
 }
 
 impl AiDecisionView {
@@ -247,6 +297,23 @@ impl AiDecisionView {
             "difficulty".to_string(),
             CelValue::Float(self.prompt_difficulty),
         )]);
+        let providers = CelValue::List(
+            self.providers
+                .iter()
+                .map(|p| {
+                    CelValue::Map(HashMap::from([
+                        ("name".to_string(), CelValue::String(p.name.clone())),
+                        ("healthy".to_string(), CelValue::Bool(p.healthy)),
+                        ("health".to_string(), CelValue::String(p.health.clone())),
+                        ("latency_ms".to_string(), CelValue::Float(p.latency_ms)),
+                        ("in_flight".to_string(), CelValue::Int(p.in_flight)),
+                        ("tokens_used".to_string(), CelValue::Int(p.tokens_used)),
+                        ("circuit_open".to_string(), CelValue::Bool(p.circuit_open)),
+                        ("circuit".to_string(), CelValue::String(p.circuit.clone())),
+                    ]))
+                })
+                .collect(),
+        );
         let principal = HashMap::from([
             ("tenant".to_string(), CelValue::String(self.tenant.clone())),
             (
@@ -269,6 +336,7 @@ impl AiDecisionView {
             ("budget".to_string(), CelValue::Map(budget)),
             ("tokens".to_string(), CelValue::Map(tokens)),
             ("prompt".to_string(), CelValue::Map(prompt)),
+            ("providers".to_string(), providers),
             ("principal".to_string(), CelValue::Map(principal)),
         ]);
         CelValue::Map(ai)
@@ -621,6 +689,86 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&easy).route_model(), None);
+    }
+
+    #[test]
+    fn provider_state_is_bound_and_filters_on_health_and_latency() {
+        // Operator-authored latency/health-aware routing: allow only when a
+        // healthy, fast, non-tripped provider exists. Proves `ai.providers`
+        // binds as a list of maps a comprehension can filter.
+        let p = policy(
+            r#"ai.providers.exists(x, x.healthy && x.latency_ms < 500.0 && !x.circuit_open)
+               ? "allow" : "block""#,
+        );
+        let healthy_fast = ProviderStateView {
+            name: "a".into(),
+            healthy: true,
+            health: "healthy".into(),
+            latency_ms: 120.0,
+            circuit: "closed".into(),
+            ..Default::default()
+        };
+        let view = AiDecisionView {
+            providers: vec![healthy_fast],
+            ..Default::default()
+        };
+        assert!(!p.evaluate(&view).is_block());
+
+        // A single slow, unhealthy, tripped provider: the comprehension finds
+        // nobody, so the expression blocks.
+        let slow_sick = ProviderStateView {
+            name: "b".into(),
+            healthy: false,
+            health: "unhealthy".into(),
+            latency_ms: 2000.0,
+            circuit_open: true,
+            circuit: "open".into(),
+            ..Default::default()
+        };
+        let view2 = AiDecisionView {
+            providers: vec![slow_sick],
+            ..Default::default()
+        };
+        assert!(p.evaluate(&view2).is_block());
+    }
+
+    #[test]
+    fn from_runtime_converts_latency_and_carries_state() {
+        use crate::routing::ProviderRuntimeState;
+        let healthy = ProviderRuntimeState {
+            latency_us: 2_500, // 2.5 ms
+            in_flight: 3,
+            tokens_used: 100,
+            healthy: true,
+            health: "unknown",
+            circuit_open: false,
+            circuit: "closed",
+        };
+        let v = ProviderStateView::from_runtime("a".into(), &healthy);
+        assert_eq!(v.name, "a");
+        assert_eq!(v.latency_ms, 2.5);
+        assert_eq!(v.in_flight, 3);
+        assert_eq!(v.tokens_used, 100);
+        assert!(v.healthy);
+        assert_eq!(v.health, "unknown");
+        assert!(!v.circuit_open);
+        assert_eq!(v.circuit, "closed");
+
+        let degraded = ProviderRuntimeState {
+            latency_us: 0,
+            in_flight: 0,
+            tokens_used: 0,
+            healthy: false,
+            health: "unhealthy",
+            circuit_open: true,
+            circuit: "open",
+        };
+        let v2 = ProviderStateView::from_runtime("b".into(), &degraded);
+        assert_eq!(v2.latency_ms, 0.0);
+        assert!(!v2.healthy);
+        assert_eq!(v2.health, "unhealthy");
+        assert!(v2.circuit_open);
+        assert_eq!(v2.circuit, "open");
     }
 
     #[test]
