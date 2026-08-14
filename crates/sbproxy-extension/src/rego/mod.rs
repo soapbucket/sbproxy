@@ -163,7 +163,9 @@ impl CompiledRego {
             // (`data.sbproxy.roles` next to an `allow` rule) is fine.
             if data_defines_query_path(&data, &query) {
                 return Err(anyhow::anyhow!(
-                    "{site}: base data defines `{query}`, the rule the query names, so it                      would override the rule's own value; put base data under a different                      key than the queried rule"
+                    "{site}: base data defines `{query}`, the rule the query names, so it \
+                     would override the rule's own value; put base data under a different \
+                     key than the queried rule"
                 ));
             }
             let value = regorus::Value::from_json_str(&data.to_string())
