@@ -38,6 +38,27 @@ use serde::Deserialize;
 use sbproxy_extension::cel::CelContext;
 use sbproxy_extension::rego::CompiledRego;
 
+/// Maximum serialized size of an inline base-data document.
+///
+/// Base data is a config-embedded allowlist or role table, not a bulk
+/// dataset: a megabyte cap keeps a mistyped or generated blob from
+/// bloating every config render and reload while leaving ample room
+/// for a realistic table. A document larger than this belongs behind a
+/// data source, not inline in `sb.yml`.
+const MAX_REGO_DATA_BYTES: usize = 1024 * 1024;
+
+/// Name the JSON kind of a value for a config-load error message.
+fn json_type_label(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Default rule evaluated when a policy does not name one.
 ///
 /// Matches the shape most Rego examples use, so a policy pasted from
@@ -115,15 +136,38 @@ impl RegoPolicy {
             deny_message: String,
             #[serde(default = "default_budget_ms")]
             budget_ms: u64,
+            /// OPA-style base data: a JSON object the rule reads as
+            /// `data.<name>`, separate from the module (WOR-2420). An
+            /// operator edits this allowlist or role table without
+            /// touching the policy logic.
+            #[serde(default)]
+            data: Option<serde_json::Value>,
         }
 
         let cfg: Config = serde_json::from_value(value)?;
+        // Base data must be a JSON object: `data` is a namespace the
+        // rule indexes into (`data.roles`, `data.allowed_cidrs`), and a
+        // scalar or array top level has nowhere for a named lookup to
+        // land. A caller who meant an array wraps it in one field.
+        if let Some(data) = cfg.data.as_ref() {
+            anyhow::ensure!(
+                data.is_object(),
+                "policy `rego`: `data` must be a JSON object whose keys the rule reads as                  `data.<key>`, not a {}",
+                json_type_label(data)
+            );
+            let size = data.to_string().len();
+            anyhow::ensure!(
+                size <= MAX_REGO_DATA_BYTES,
+                "policy `rego`: `data` is {size} bytes, over the {MAX_REGO_DATA_BYTES}-byte                  base-data cap; move a document this large behind a data source"
+            );
+        }
         Self::new(
             cfg.module,
             cfg.query,
             cfg.deny_status,
             cfg.deny_message,
             cfg.budget_ms,
+            cfg.data,
         )
     }
 
@@ -139,13 +183,14 @@ impl RegoPolicy {
         deny_status: u16,
         deny_message: String,
         budget_ms: u64,
+        data: Option<serde_json::Value>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             budget_ms > 0,
             "policy `rego`: budget_ms must be greater than zero; a zero budget would refuse \
              every request before the rule ran"
         );
-        let compiled = CompiledRego::compile("policy `rego`", &module, query, budget_ms)?;
+        let compiled = CompiledRego::compile("policy `rego`", &module, query, budget_ms, data)?;
         Ok(Self {
             deny_status,
             deny_message,
@@ -222,6 +267,49 @@ allow if {
             .expect("policy compiles");
         assert!(policy.evaluate(&context("GET")));
         assert!(!policy.evaluate(&context("POST")));
+    }
+
+    #[test]
+    fn from_config_accepts_and_applies_inline_base_data() {
+        const METHOD_GATE: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if { input.request.method == data.allowed_methods[_] }
+"#;
+        let policy = RegoPolicy::from_config(serde_json::json!({
+            "module": METHOD_GATE,
+            "data": { "allowed_methods": ["GET"] },
+        }))
+        .expect("a policy with inline base data compiles");
+        assert!(policy.evaluate(&context("GET")), "GET is in the table");
+        assert!(!policy.evaluate(&context("POST")), "POST is not");
+    }
+
+    #[test]
+    fn base_data_that_is_not_an_object_refuses() {
+        let error = RegoPolicy::from_config(serde_json::json!({
+            "module": MODULE,
+            "data": ["not", "an", "object"],
+        }))
+        .expect_err("a non-object data document must refuse");
+        assert!(
+            error.to_string().contains("must be a JSON object"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn base_data_over_the_cap_refuses() {
+        // A string field padded past the 1 MiB serialized cap.
+        let big = "x".repeat(MAX_REGO_DATA_BYTES + 16);
+        let error = RegoPolicy::from_config(serde_json::json!({
+            "module": MODULE,
+            "data": { "blob": big },
+        }))
+        .expect_err("an oversized data document must refuse");
+        assert!(error.to_string().contains("base-data cap"), "{error}");
     }
 
     #[test]

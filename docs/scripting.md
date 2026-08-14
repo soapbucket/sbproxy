@@ -49,7 +49,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
 | `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
-| `policies[] type: rego`, fields `module` + `query` | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message` |
+| `policies[] type: rego`, fields `module` + `query` (+ optional `data`) | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message`; `data` is a JSON object the rule reads as `data.<key>` |
 | `forward_rules[].rules[].when` | CEL | Boolean predicate over the arriving request; an evaluation error means the rule does not match |
 | `observability.log.custom_fields[]` with `engine: lua` or `engine: js` | Lua or JavaScript | Returns the value of one operator-defined access-log field |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
@@ -545,6 +545,23 @@ policies:
 The exact binding set of `policy: expression` in [the table above](#32-what-each-config-site-offers), converted to JSON. `request.trust_tier` in CEL is `input.request.trust_tier` in Rego; both engines read the same assembled context, so the vocabulary cannot drift between them. A decision is portable in both directions by translating syntax alone, with two exceptions below.
 
 `input.jwt.claims` deserves the same warning it carries on the CEL side, and it matters more here because Rego is what people reach for to write authorization: the claims are **decoded, not verified**. `input.jwt.claims.role == "admin"` trusts whatever the client sent. Signature verification belongs to the `jwt` auth provider under `authentication:`; gate the route there first, then use the claims for authorization.
+
+### Base data: the table the rule reads
+
+Rego splits what a policy decides from the data it decides against: the rule is `input`, the reference data is `data`. `policy: rego` carries that split with an optional `data` field, a JSON object the rule reads as `data.<key>`:
+
+```yaml
+policies:
+  - type: rego
+    module: |
+      package sbproxy
+      default allow := false
+      allow if { input.request.method == data.allowed_methods[_] }
+    data:
+      allowed_methods: ["GET", "HEAD"]
+```
+
+The point is that the allowlist, role table, or routing map lives in its own config value, separate from the module. An operator edits `data.allowed_methods` without reading a line of Rego, and the policy logic never changes when the table does. `data` must be a JSON object (the rule indexes into it by key), and it is capped at one megabyte serialized: base data is a config-embedded table, not a bulk dataset, and a document that large belongs behind a data source rather than inline. Because `data` is ordinary config, editing it is a config change like any other, applied on the next reload.
 
 ### The two things Rego does not inherit
 

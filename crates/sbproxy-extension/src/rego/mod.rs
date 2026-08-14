@@ -107,6 +107,7 @@ impl CompiledRego {
         module: &str,
         query: impl Into<String>,
         budget_ms: u64,
+        data: Option<serde_json::Value>,
     ) -> Result<Self> {
         let site = site.into();
         let query = query.into();
@@ -117,6 +118,22 @@ impl CompiledRego {
                 sbproxy_observe::metrics::record_script_compile("rego", "parse_error");
             })
             .with_context(|| format!("{site}: invalid Rego module"))?;
+
+        // Base data (the OPA `data` document, WOR-2420): a static
+        // allowlist, role table, or routing map the rule reads as
+        // `data.<name>`, kept separate from the module so an operator
+        // edits the table without touching the policy logic. Added once
+        // here, not per request: the document is fixed for the life of
+        // this engine (a config reload rebuilds it), so evaluation pays
+        // no clone. A malformed document is a config-load error, not a
+        // runtime one.
+        if let Some(data) = data {
+            let value = regorus::Value::from_json_str(&data.to_string())
+                .with_context(|| format!("{site}: base data is not valid JSON"))?;
+            engine
+                .add_data(value)
+                .with_context(|| format!("{site}: base data could not be loaded"))?;
+        }
 
         // Bound evaluation before anything is evaluated, including the
         // trial below. Without this a policy is unbounded on the request
@@ -314,6 +331,7 @@ allow if {
             "this is not rego !!!",
             "data.x",
             50,
+            None,
         )
         .expect_err("a malformed module must not compile");
         assert!(error.to_string().contains("policy `rego` (authz)"));
@@ -321,9 +339,14 @@ allow if {
 
     #[test]
     fn a_rule_decides_from_the_shared_context() {
-        let mut policy =
-            CompiledRego::compile("policy `rego`", ALLOW_ENGINEERS, "data.sbproxy.allow", 50)
-                .expect("module compiles");
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            None,
+        )
+        .expect("module compiles");
         let mut ctx = context();
         assert!(
             !policy.eval_bool(&ctx).expect("evaluates"),
@@ -334,6 +357,54 @@ allow if {
         assert!(
             policy.eval_bool(&ctx).expect("evaluates"),
             "a strong trust tier matches the first rule"
+        );
+    }
+
+    #[test]
+    fn a_rule_reads_a_base_data_document() {
+        // The OPA data/input split: the module logic references
+        // `data.allowed_methods` while the table lives in a separate
+        // config value. A request whose method is in the table passes;
+        // one that is not is denied.
+        const METHOD_ALLOWLIST: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    input.request.method == data.allowed_methods[_]
+}
+"#;
+        let data = serde_json::json!({ "allowed_methods": ["GET", "HEAD"] });
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            METHOD_ALLOWLIST,
+            "data.sbproxy.allow",
+            50,
+            Some(data),
+        )
+        .expect("a module reading base data compiles");
+        // context() builds a GET, which is in the table.
+        let ctx = context();
+        assert!(
+            policy.eval_bool(&ctx).expect("evaluates"),
+            "GET is in the base-data allowlist"
+        );
+
+        // A method not in the table is denied, proving the rule really
+        // consulted `data` rather than passing everything.
+        let mut post_ctx = crate::cel::context::build_request_context(
+            "POST",
+            "/v1/chat",
+            &http::HeaderMap::new(),
+            None,
+            Some("203.0.113.7"),
+            "api.example.com",
+        );
+        crate::cel::context::populate_trust_tier_namespace(&mut post_ctx, "anonymous");
+        assert!(
+            !policy.eval_bool(&post_ctx).expect("evaluates"),
+            "POST is not in the base-data allowlist"
         );
     }
 
@@ -375,6 +446,7 @@ allow := {"reason": "because"}
             RETURNS_A_DOCUMENT,
             "data.sbproxy.allow",
             50,
+            None,
         )
         .expect("module compiles");
         let error = policy
@@ -396,6 +468,7 @@ allow := {"reason": "because"}
             ALLOW_ENGINEERS,
             "data.sbproxy.nonexistent",
             50,
+            None,
         )
         .expect_err("a query naming no rule must not load");
     }
@@ -413,8 +486,9 @@ allow if {
     x == 1
 }
 "#;
-        let error = CompiledRego::compile("policy `rego`", UNSAFE_VAR, "data.sbproxy.allow", 50)
-            .expect_err("an unsafe variable must not load");
+        let error =
+            CompiledRego::compile("policy `rego`", UNSAFE_VAR, "data.sbproxy.allow", 50, None)
+                .expect_err("an unsafe variable must not load");
         let message = format!("{error:#}");
         assert!(message.contains("semantic fault"), "{message}");
     }
