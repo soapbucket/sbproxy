@@ -198,13 +198,13 @@ pub fn decode_http_request(
     let id = object.get("id").cloned();
     if id
         .as_ref()
-        .is_some_and(|value| !value.is_string() && !value.is_number())
+        .is_some_and(|value| !value.is_string() && !value.is_number() && !value.is_null())
     {
         return Err(McpWireError::json(
             http::StatusCode::BAD_REQUEST,
             None,
             crate::mcp::types::INVALID_REQUEST,
-            "JSON-RPC request id must be a string or number",
+            "JSON-RPC request id must be a string, number, or null",
             None,
         ));
     }

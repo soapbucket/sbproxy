@@ -92,11 +92,32 @@ impl McpProtocolCodec for Modern2026_07_28Codec {
                 "Mcp-Method does not match JSON-RPC method",
             ));
         }
-        let decoded_name = if request.method == "tools/call" {
+        let selector_key = match request.method.as_str() {
+            "tools/call" | "prompts/get" => Some("name"),
+            "resources/read" => Some("uri"),
+            _ => None,
+        };
+        let decoded_name = if let Some(selector_key) = selector_key {
             let name = required_header(headers, "mcp-name", request.id.clone())?;
-            Some(decode_header_value(name).map_err(|_| {
+            let decoded_name = decode_header_value(name).map_err(|_| {
                 header_mismatch(request.id.clone(), "invalid Mcp-Name header value")
-            })?)
+            })?;
+            let body_selector = request
+                .params
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(|params| params.get(selector_key))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    header_mismatch(request.id.clone(), "missing or invalid MCP body selector")
+                })?;
+            if decoded_name != body_selector {
+                return Err(header_mismatch(
+                    request.id.clone(),
+                    "Mcp-Name does not match the JSON-RPC body selector",
+                ));
+            }
+            Some(decoded_name)
         } else {
             None
         };

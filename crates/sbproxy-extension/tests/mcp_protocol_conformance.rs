@@ -334,6 +334,126 @@ fn mcp_protocol_modern_header_sentinels_preserve_failure_classes() {
 }
 
 #[test]
+fn mcp_protocol_modern_validates_mcp_name_against_each_body_selector() {
+    struct SelectorCase {
+        method: &'static str,
+        key: &'static str,
+        value: &'static str,
+        case_mismatch: &'static str,
+        mismatch: &'static str,
+    }
+
+    let cases = [
+        SelectorCase {
+            method: "tools/call",
+            key: "name",
+            value: "weather",
+            case_mismatch: "Weather",
+            mismatch: "forecast",
+        },
+        SelectorCase {
+            method: "prompts/get",
+            key: "name",
+            value: "summary",
+            case_mismatch: "Summary",
+            mismatch: "outline",
+        },
+        SelectorCase {
+            method: "resources/read",
+            key: "uri",
+            value: "file:///workspace/readme.md",
+            case_mismatch: "file:///workspace/README.md",
+            mismatch: "file:///workspace/other.md",
+        },
+    ];
+
+    for case in cases {
+        let body = modern_request(
+            case.method,
+            selector_params(case.key, Value::String(case.value.to_string())),
+        );
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let decoded = sbproxy_extension::mcp::decode_http_request(
+            &body_bytes,
+            &modern_headers(case.method, Some(case.value)),
+        )
+        .expect("matching selector is valid");
+        assert_eq!(decoded.routing_headers.name.as_deref(), Some(case.value));
+
+        let mut missing_header = modern_headers(case.method, Some(case.value));
+        missing_header.remove("mcp-name");
+        assert_modern_header_mismatch(
+            sbproxy_extension::mcp::decode_http_request(&body_bytes, &missing_header),
+            "missing selector header",
+        );
+
+        assert_modern_header_mismatch(
+            sbproxy_extension::mcp::decode_http_request(
+                &body_bytes,
+                &modern_headers(case.method, Some(case.mismatch)),
+            ),
+            "mismatched selector header",
+        );
+        assert_modern_header_mismatch(
+            sbproxy_extension::mcp::decode_http_request(
+                &body_bytes,
+                &modern_headers(case.method, Some(case.case_mismatch)),
+            ),
+            "case-mismatched selector header",
+        );
+
+        let missing_selector = modern_request(case.method, json!({}));
+        assert_modern_header_mismatch(
+            sbproxy_extension::mcp::decode_http_request(
+                &serde_json::to_vec(&missing_selector).unwrap(),
+                &modern_headers(case.method, Some(case.value)),
+            ),
+            "missing selector body value",
+        );
+        let non_string_selector =
+            modern_request(case.method, selector_params(case.key, json!(true)));
+        assert_modern_header_mismatch(
+            sbproxy_extension::mcp::decode_http_request(
+                &serde_json::to_vec(&non_string_selector).unwrap(),
+                &modern_headers(case.method, Some(case.value)),
+            ),
+            "non-string selector body value",
+        );
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_accepts_explicit_null_request_ids() {
+    let mut body = modern_request("tools/list", json!({}));
+    body["id"] = Value::Null;
+    let decoded = sbproxy_extension::mcp::decode_http_request(
+        &serde_json::to_vec(&body).unwrap(),
+        &modern_headers("tools/list", None),
+    )
+    .expect("explicit null JSON-RPC id is valid");
+    assert!(decoded.request.id.is_none());
+}
+
+fn selector_params(key: &str, value: Value) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert(key.to_string(), value);
+    Value::Object(params)
+}
+
+fn assert_modern_header_mismatch(
+    result: Result<sbproxy_extension::mcp::DecodedMcpRequest, sbproxy_extension::mcp::McpWireError>,
+    context: &str,
+) {
+    let error = result.expect_err(context);
+    assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST, "{context}");
+    assert_eq!(
+        error.0.body.unwrap().error.unwrap().code,
+        -32020,
+        "{context}"
+    );
+}
+
+#[test]
 fn mcp_protocol_legacy_initialize_request_round_trips_exactly() {
     let raw = include_str!("fixtures/mcp/legacy-initialize-request.json").trim();
     let request: JsonRpcRequest = serde_json::from_str(raw).expect("legacy request");
