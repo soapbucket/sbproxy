@@ -93,6 +93,29 @@ impl std::fmt::Debug for CompiledRego {
     }
 }
 
+/// Whether a base-data document already defines a value at the rule
+/// path a query names.
+///
+/// The query is `data.<seg>.<seg>...`; the data document is rooted at
+/// `data`, so the query's path after the `data.` prefix indexes
+/// straight into it. A defined value there is the shadowing Regorus
+/// resolves in the base document's favor.
+fn data_defines_query_path(data: &serde_json::Value, query: &str) -> bool {
+    let Some(path) = query.strip_prefix("data.") else {
+        // A query not rooted at `data` (rare) cannot be shadowed by a
+        // `data` document; nothing to refuse.
+        return false;
+    };
+    let mut cursor = data;
+    for segment in path.split('.') {
+        match cursor.get(segment) {
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    !cursor.is_null()
+}
+
 impl CompiledRego {
     /// Parse `module` and pin `query` as the rule this policy evaluates.
     ///
@@ -128,6 +151,21 @@ impl CompiledRego {
         // no clone. A malformed document is a config-load error, not a
         // runtime one.
         if let Some(data) = data {
+            // A base-data document that defines a value at the queried
+            // rule's own path silently overrides the rule: Regorus
+            // prefers the base document over a rule's computed value at
+            // the same path, so `data.sbproxy.allow: true` would clobber
+            // the `allow` rule and make every request identical while
+            // the rule body still runs and spends the budget. Refuse it
+            // at load, because nothing downstream can tell the operator
+            // their policy logic is dead. The check is at the query
+            // path specifically, so base data at a sibling path
+            // (`data.sbproxy.roles` next to an `allow` rule) is fine.
+            if data_defines_query_path(&data, &query) {
+                return Err(anyhow::anyhow!(
+                    "{site}: base data defines `{query}`, the rule the query names, so it                      would override the rule's own value; put base data under a different                      key than the queried rule"
+                ));
+            }
             let value = regorus::Value::from_json_str(&data.to_string())
                 .with_context(|| format!("{site}: base data is not valid JSON"))?;
             engine
@@ -406,6 +444,38 @@ allow if {
             !policy.eval_bool(&post_ctx).expect("evaluates"),
             "POST is not in the base-data allowlist"
         );
+    }
+
+    #[test]
+    fn base_data_shadowing_the_queried_rule_refuses_at_load() {
+        // The Regorus base-over-virtual override: a data key at the
+        // query path silently clobbers the rule. Refuse it at load.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "allow": true } })),
+        )
+        .expect_err("base data at the query path must refuse");
+        assert!(
+            error.to_string().contains("would override the rule"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn base_data_at_a_sibling_path_is_allowed() {
+        // Data under the same package but a different leaf than the
+        // queried rule does not shadow it and must load.
+        CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "roles": ["admin"] } })),
+        )
+        .expect("sibling base data does not shadow the rule");
     }
 
     #[test]

@@ -563,6 +563,8 @@ policies:
 
 The point is that the allowlist, role table, or routing map lives in its own config value, separate from the module. An operator edits `data.allowed_methods` without reading a line of Rego, and the policy logic never changes when the table does. `data` must be a JSON object (the rule indexes into it by key), and it is capped at one megabyte serialized: base data is a config-embedded table, not a bulk dataset, and a document that large belongs behind a data source rather than inline. Because `data` is ordinary config, editing it is a config change like any other, applied on the next reload.
 
+One shape is refused at config load: a `data` document that defines a value at the exact path the query names. Rego resolves the base document over a rule's own value at the same path, so a `data` of `{sbproxy: {allow: true}}` under a `data.sbproxy.allow` query would silently override the `allow` rule and make every request identical while the rule body still runs. Keep base data under a key the queried rule does not produce; a sibling like `data.sbproxy.roles` next to an `allow` rule is fine.
+
 ### The two things Rego does not inherit
 
 **Typos are not caught at config load.** A CEL expression naming a binding its surface does not provide is refused when the config loads. Rego cannot offer that: `input.request.trust_teir` is not an error, it is `undefined`, which is a value the language is designed to reason about. A misspelled binding is a rule that never fires, discovered from traffic behavior rather than from an error message. This is the strongest reason to prefer `expression` when either engine would do.

@@ -126,7 +126,14 @@ impl RegoPolicy {
     /// policy is a config error, so boot and reload both refuse it.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Config {
+            /// The dispatch key, captured so `deny_unknown_fields` does
+            /// not reject the `type: rego` the config carries. A typo
+            /// of any real field is refused rather than silently
+            /// dropped, which for `data` would apply an empty table.
+            #[serde(rename = "type")]
+            _policy_type: Option<String>,
             module: String,
             #[serde(default = "default_query")]
             query: String,
@@ -152,13 +159,15 @@ impl RegoPolicy {
         if let Some(data) = cfg.data.as_ref() {
             anyhow::ensure!(
                 data.is_object(),
-                "policy `rego`: `data` must be a JSON object whose keys the rule reads as                  `data.<key>`, not a {}",
+                "policy `rego`: `data` must be a JSON object whose keys the rule reads as \
+                 `data.<key>`, not a {}",
                 json_type_label(data)
             );
             let size = data.to_string().len();
             anyhow::ensure!(
                 size <= MAX_REGO_DATA_BYTES,
-                "policy `rego`: `data` is {size} bytes, over the {MAX_REGO_DATA_BYTES}-byte                  base-data cap; move a document this large behind a data source"
+                "policy `rego`: `data` is {size} bytes, over the {MAX_REGO_DATA_BYTES}-byte \
+                 base-data cap; move a document this large behind a data source"
             );
         }
         Self::new(
@@ -285,6 +294,21 @@ allow if { input.request.method == data.allowed_methods[_] }
         .expect("a policy with inline base data compiles");
         assert!(policy.evaluate(&context("GET")), "GET is in the table");
         assert!(!policy.evaluate(&context("POST")), "POST is not");
+    }
+
+    #[test]
+    fn a_typo_of_a_config_field_refuses_rather_than_silently_dropping() {
+        // deny_unknown_fields: `daat` is not silently ignored, which
+        // for a mistyped `data` would apply an empty table.
+        let error = RegoPolicy::from_config(serde_json::json!({
+            "module": MODULE,
+            "daat": { "allowed_methods": ["GET"] },
+        }))
+        .expect_err("an unknown field must refuse");
+        assert!(
+            error.to_string().contains("daat") || error.to_string().contains("unknown"),
+            "{error}"
+        );
     }
 
     #[test]
