@@ -23,12 +23,15 @@
 //! entries holding space until they expire. So this is a projection of
 //! one origin, not a document digest.
 //!
-//! The boundary comes from where the cache actually sits. The stored
-//! representation is the **raw upstream** one: `response_filter`
-//! captures upstream status and headers and buffers the upstream body
-//! before any response transform runs, and a hit replays those stored
-//! bytes straight to the client. So response-side config cannot change
-//! what is in an entry, and request-side config can.
+//! The boundary comes from where the cache actually sits. On an
+//! origin without transforms the stored representation is the raw
+//! upstream one: `response_filter` captures upstream status and
+//! headers and buffers the upstream body, and a hit replays those
+//! stored bytes straight to the client. On an origin **with**
+//! transforms the entry holds the transform chain's output (the
+//! ingest pass), so a hit serves the same content a miss does. Either
+//! way the transform list shapes what an entry holds, which is one of
+//! the reasons `transforms` is in the covered set below.
 //!
 //! Covered, because each one changes what the upstream returns:
 //!
@@ -47,9 +50,10 @@
 //!
 //! Deliberately not covered: response modifiers, CORS, HSTS,
 //! compression, sessions, error pages, observability, timeouts, and
-//! policies. The first group runs downstream of the cache write. The
-//! last gates whether a request proceeds at all without changing the
-//! representation it would get.
+//! policies. The first group runs downstream of the cache write
+//! (transforms moved out of that group when the ingest pass landed).
+//! The last gates whether a request proceeds at all without changing
+//! the representation it would get.
 //!
 //! Within an origin the projection errs toward covering. Rotating a
 //! credential moves the fingerprint even though the response is
@@ -69,7 +73,12 @@ use crate::snapshot::CompiledOrigin;
 /// reinterpret it: a change to what the projection covers must not let
 /// a new build open an entry the old one wrote under the same
 /// fingerprint.
-const CACHE_COMPAT_DOMAIN: &[u8] = b"sbproxy-respcache-compat-v1";
+/// v2: entries written before the ingest pass hold raw upstream
+/// bodies on transformed origins, under fingerprints this upgrade
+/// does not move (the transform *configs* did not change; what the
+/// entry holds did). Retiring the keyspace is the only way an
+/// upgraded node cannot replay a pre-transform body as a hit.
+const CACHE_COMPAT_DOMAIN: &[u8] = b"sbproxy-respcache-compat-v2";
 
 /// Hex chars of the digest that reach the cache key.
 ///

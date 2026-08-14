@@ -866,6 +866,12 @@ pub struct RequestContext {
     /// Buffer holding the upstream response body while we accumulate it for
     /// caching. Kept separate from `response_body_buf` (which the transform
     /// pipeline owns) so the two features can coexist.
+    ///
+    /// On an origin with transforms attached this stays `Some` purely as
+    /// the capture-active marker and never accumulates: the store
+    /// dispatches from the transform section's own buffer, so the entry
+    /// holds the chain's output. Read the body through the store path,
+    /// not this field.
     pub cache_body_buf: Option<bytes::BytesMut>,
     /// Upstream response status captured at `response_filter` time, used when
     /// the last body chunk arrives to construct the `CachedResponse`.

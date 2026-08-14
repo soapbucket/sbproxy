@@ -217,6 +217,56 @@ impl Transform {
         }
     }
 
+    /// Whether this transform's output depends on the incoming request.
+    ///
+    /// A request-independent transform is a pure function of the
+    /// response body, the response content type, and its static
+    /// config, so its output can be computed once and stored (the
+    /// response cache's ingest pass) or recomputed with no request in
+    /// scope (the stale-while-revalidate refresh). A request-dependent
+    /// transform reads request state, through the ctx arms of the
+    /// dispatcher in `sbproxy-core`, so caching its output would bake
+    /// one requester's context into a shared entry.
+    ///
+    /// Review this method together with `apply_transform_with_ctx` in
+    /// `sbproxy-core`: every variant with a non-wildcard arm there is
+    /// request-dependent except `Boilerplate`, whose arm only writes a
+    /// stripped-bytes metric back onto the context and reads nothing
+    /// from it. `Plugin` is conservatively dependent: the guest is
+    /// arbitrary out-of-tree code with no purity declaration, even
+    /// though the context it receives today is empty.
+    pub fn request_dependent(&self) -> bool {
+        match self {
+            Self::HtmlToMarkdown(_)
+            | Self::CitationBlock(_)
+            | Self::JsonEnvelope(_)
+            | Self::CelScript(_)
+            | Self::A2aAgentCardRewrite(_)
+            | Self::LuaJson(_)
+            | Self::JavaScript(_)
+            | Self::JsJson(_)
+            | Self::Plugin(_) => true,
+            Self::Json(_)
+            | Self::JsonProjection(_)
+            | Self::JsonSchema(_)
+            | Self::Template(_)
+            | Self::ReplaceStrings(_)
+            | Self::Normalize(_)
+            | Self::Encoding(_)
+            | Self::FormatConvert(_)
+            | Self::PayloadLimit(_)
+            | Self::Discard(_)
+            | Self::SseChunking(_)
+            | Self::Html(_)
+            | Self::OptimizeHtml(_)
+            | Self::Markdown(_)
+            | Self::Css(_)
+            | Self::Wasm(_)
+            | Self::Boilerplate(_)
+            | Self::Noop => false,
+        }
+    }
+
     /// Apply this transform to a body buffer.
     pub fn apply(&self, body: &mut BytesMut, content_type: Option<&str>) -> anyhow::Result<()> {
         match self {
@@ -866,6 +916,50 @@ impl WasmTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_dependence_split_is_pinned() {
+        // The response cache's ingest pass and the SWR refresh both
+        // rely on this split: a variant marked independent may have
+        // its output stored and replayed to other requesters, and may
+        // be recomputed with no request in scope. Moving a variant
+        // from dependent to independent is a cache-safety claim and
+        // must be made here deliberately, with the dispatcher's ctx
+        // arms in `sbproxy-core` reviewed alongside.
+        let dependent = [
+            serde_json::json!({"type": "html_to_markdown"}),
+            serde_json::json!({"type": "citation_block"}),
+            serde_json::json!({"type": "json_envelope"}),
+            serde_json::json!({"type": "cel", "headers": [
+                {"op": "set", "name": "x-test", "value_expr": "'v'"}
+            ]}),
+            serde_json::json!({"type": "a2a_agent_card_rewrite"}),
+            serde_json::json!({"type": "lua_json", "script": "function modify_json(d, c) return d end"}),
+            serde_json::json!({"type": "javascript", "script": "export function transform(b) { return b; }"}),
+            serde_json::json!({"type": "js_json", "script": "export function modify_json(d) { return d; }"}),
+        ];
+        for config in dependent {
+            let name = config["type"].as_str().unwrap().to_owned();
+            let compiled = crate::compile::compile_transform(&config)
+                .unwrap_or_else(|e| panic!("{name} should compile: {e}"));
+            assert!(compiled.request_dependent(), "{name} must be dependent");
+        }
+        let independent = [
+            serde_json::json!({"type": "json", "set": {"a": 1}}),
+            serde_json::json!({"type": "replace_strings", "replacements": [
+                {"find": "raw", "replace": "clean"}
+            ]}),
+            serde_json::json!({"type": "noop"}),
+            serde_json::json!({"type": "payload_limit", "max_size": 1024}),
+            serde_json::json!({"type": "boilerplate"}),
+        ];
+        for config in independent {
+            let name = config["type"].as_str().unwrap().to_owned();
+            let compiled = crate::compile::compile_transform(&config)
+                .unwrap_or_else(|e| panic!("{name} should compile: {e}"));
+            assert!(!compiled.request_dependent(), "{name} must be independent");
+        }
+    }
 
     // --- Transform enum basics ---
 

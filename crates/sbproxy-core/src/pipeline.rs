@@ -2293,6 +2293,30 @@ impl CompiledPipeline {
                     }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            // The response cache stores each transform's output at
+            // admission and replays it to every later requester, and
+            // the stale-while-revalidate refresh reruns the chain with
+            // no request in scope. Both are sound only for transforms
+            // whose output is a pure function of the response, so a
+            // request-dependent transform on a cached origin is
+            // refused here, where the compiled variant can answer for
+            // itself, rather than trusted to an operator promise.
+            if origin
+                .response_cache
+                .as_ref()
+                .is_some_and(|cache| cache.enabled)
+            {
+                if let Some(dependent) = origin_transforms
+                    .iter()
+                    .find(|compiled| compiled.transform.request_dependent())
+                {
+                    anyhow::bail!(
+                        "origin `{}`: transform `{}` reads request state, so its output                          cannot be stored in the response cache or recomputed by the                          stale-while-revalidate refresh; remove the transform, disable                          `response_cache`, or split the cached content onto its own origin",
+                        origin.origin_id,
+                        dependent.transform.transform_type()
+                    );
+                }
+            }
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
@@ -4306,6 +4330,69 @@ origins:
         );
         assert_eq!(pipeline.transforms[0][0].max_body_size, 10 * 1024 * 1024);
         assert!(pipeline.transforms[0][0].content_types.is_empty());
+    }
+
+    #[test]
+    fn a_cached_origin_refuses_request_dependent_transforms() {
+        // A request-dependent transform's stored output would bake one
+        // requester's context into a shared entry, and the SWR refresh
+        // could not rerun it at all (no request exists there).
+        let mut config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "proxy", "url": "http://localhost:3000"}),
+            vec![serde_json::json!({
+                "type": "lua_json",
+                "script": "function modify_json(data, ctx) return data end",
+            })],
+        );
+        config.origins[0].response_cache = Some(sbproxy_config::ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let error = match CompiledPipeline::from_config(config) {
+            Ok(_) => panic!("a request-dependent transform on a cached origin must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("lua_json"), "{error}");
+        assert!(error.contains("t.example.com"), "{error}");
+        assert!(error.contains("response cache"), "{error}");
+    }
+
+    #[test]
+    fn a_cached_origin_accepts_request_independent_transforms() {
+        let mut config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "proxy", "url": "http://localhost:3000"}),
+            vec![serde_json::json!({
+                "type": "replace_strings",
+                "replacements": [{"find": "raw", "replace": "clean"}],
+            })],
+        );
+        config.origins[0].response_cache = Some(sbproxy_config::ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let pipeline = CompiledPipeline::from_config(config).unwrap();
+        assert_eq!(pipeline.transforms[0].len(), 1);
+    }
+
+    #[test]
+    fn a_disabled_cache_does_not_refuse_dependent_transforms() {
+        // The refusal is about what the cache would store; an origin
+        // whose cache block is disabled stores nothing.
+        let mut config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "proxy", "url": "http://localhost:3000"}),
+            vec![serde_json::json!({
+                "type": "lua_json",
+                "script": "function modify_json(data, ctx) return data end",
+            })],
+        );
+        config.origins[0].response_cache = Some(sbproxy_config::ResponseCacheConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        CompiledPipeline::from_config(config).unwrap();
     }
 
     #[test]

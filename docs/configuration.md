@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-14*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -3217,7 +3217,7 @@ Every entry in the `transforms:` list is wrapped with these pipeline-level field
 | `content_types` | list | `[]` | Content-Type substrings the transform applies to. Empty matches all. |
 | `failure_posture` | string | `open` | What happens to the response when this transform fails: `closed` replaces the body with a generic error instead of forwarding it, `open` skips the failed transform and continues with the next one. `degraded` and `observe` are rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
 | `fail_on_error` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: closed`, `false` means `open`. Still parses and is used only when `failure_posture` is absent; setting both to values that disagree is a config-load error. |
-| `max_body_size` | int | 10485760 | Maximum body size, in bytes, this transform is willing to see. What a larger body does depends on `failure_posture`: under `open` the transform is skipped and the body passes through unmodified; under `closed` the response fails, because a body the transform never saw must not reach the client. On the proxied-response path the buffer is shared, sized to the largest cap across the origin's transforms, so a transform with a smaller cap still runs on bodies up to that shared size; on plugin-action responses the cap applies per transform. Responses served from the response cache were stored before transforms ran and are not re-checked; see the response-cache scope note in this document before combining `response_cache` with a `closed` transform. |
+| `max_body_size` | int | 10485760 | Maximum body size, in bytes, this transform is willing to see. What a larger body does depends on `failure_posture`: under `open` the transform is skipped and the body passes through unmodified; under `closed` the response fails, because a body the transform never saw must not reach the client. On the proxied-response path the buffer is shared, sized to the largest cap across the origin's transforms, so a transform with a smaller cap still runs on bodies up to that shared size; on plugin-action responses the cap applies per transform. On an origin with `response_cache`, a body over the cap is passed through under `open` but never stored, so the cache only ever holds bodies the chain actually processed. |
 | `disabled` | bool | false | When true, the transform is parsed but not applied. |
 
 Type-specific fields are listed below.
@@ -3594,15 +3594,24 @@ The fingerprint covers what decides the response the upstream returns:
 
 It deliberately does not cover `response_modifiers`, `cors`, `hsts`,
 `compression`, `session`, error pages, observability, timeouts, or policies.
-Cached entries hold the upstream's own response, captured before any
-response-side rewriting runs and replayed the same way, so none of those can
-change what is in an entry. That includes transforms: a hit serves the
-pre-transform body, so a `failure_posture: closed` transform's guarantee does
-not extend to cached responses. Until that is resolved (WOR-2417 tracks the
-design), do not combine `response_cache` with a `closed` transform on content
-the transform exists to withhold. Nor does it cover anything outside the origin: an
-unrelated origin, a log level, or a listener change leaves every existing entry
-readable.
+On an origin without transforms, cached entries hold the upstream's own
+response and replay it unchanged, so none of those can change what is in an
+entry. On an origin with transforms, the entry holds the transform chain's
+output: transforms run once when the response is stored (and again on each
+stale-while-revalidate refresh), a hit serves the stored transformed body, and
+a `failure_posture: closed` transform refusal blocks the store, so the closed
+guarantee extends to cached responses. Because a stored transform output is
+replayed to every later requester, a transform whose output depends on the
+incoming request (the scripted transforms, the content-negotiation family,
+`cel`, and `a2a_agent_card_rewrite`) is refused at config load when combined
+with `response_cache`; the error names the transform. The fingerprint does not
+cover anything outside the origin: an unrelated origin, a log level, or a
+listener change leaves every existing entry readable.
+
+Upgrade note: entries written by versions that stored pre-transform bodies are
+retired wholesale on upgrade (the fingerprint's domain label moved to `v2`),
+so the first request per key after upgrading is a miss. This is deliberate: it
+is the only way an upgraded node cannot replay a pre-transform body as a hit.
 
 `epoch` exists for the case the fingerprint cannot see. If an upstream starts
 returning a different response shape and nothing in your config changed, no
