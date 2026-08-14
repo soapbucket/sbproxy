@@ -798,10 +798,11 @@ pub fn record_routing_fallback(strategy: &str, reason: &str) {
 
 /// Record an operator routing-policy decision (WOR-2366).
 ///
-/// `outcome` must be one of `plan`, `decline`, `error`. `reason_code` is
-/// the already-normalized code (`policy` / `other` / an allowlisted value,
-/// or `none` for a decline or error); the caller owns normalization so
-/// this function never sees a request-controlled string.
+/// `outcome` is one of `plan` (a plan that ran), `overridden` (a plan a
+/// later `ai_policy route_to` cleared), `decline`, or `error`. `reason_code`
+/// is the already-normalized code (`policy` / `other` / an allowlisted
+/// value, or `none` for anything but a plan); the caller owns normalization
+/// so this function never sees a request-controlled string.
 pub fn record_routing_policy_decision(outcome: &str, reason_code: &str) {
     AI_ROUTING_POLICY_DECISIONS
         .with_label_values(&[outcome, reason_code])

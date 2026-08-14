@@ -5860,83 +5860,130 @@ pub(super) async fn handle_ai_proxy(
     // (safety over optimization). Declining is the common, cheap path and
     // leaves the configured `RoutingStrategy` untouched.
     let mut routing_policy_cascade: Option<sbproxy_ai::routing::CascadeConfig> = None;
-    if let Some(routing_policy) = config.ai_routing_policy() {
-        let routing_view = sbproxy_ai::ai_policy::AiDecisionView {
-            surface: surface_label.to_string(),
-            model: model.clone(),
-            provider: config
+    // The plan's reason code is held until precedence is resolved so a plan
+    // an `ai_policy route_to` overrides is not counted as one that ran.
+    let mut routing_plan_reason_code: Option<&'static str> = None;
+    // A routing plan fans a request across configured providers, which
+    // would replay a caller's own provider credential across the boundary
+    // native-key mode exists to hold. The same reason the pre-policy cascade
+    // check refuses a native-key cascade applies here: the routing policy
+    // does not run for a native-key request.
+    if ctx.inbound_key_mode != crate::context::InboundKeyMode::Native {
+        if let Some(routing_policy) = config.ai_routing_policy() {
+            let routing_view = sbproxy_ai::ai_policy::AiDecisionView {
+                surface: surface_label.to_string(),
+                model: model.clone(),
+                provider: config
+                    .providers
+                    .first()
+                    .map(|p| p.name.to_string())
+                    .unwrap_or_default(),
+                tenant: ctx.tenant_id.to_string(),
+                api_key_id: ctx.principal.api_key_id().to_string(),
+                tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
+                guardrail_labels: ctx.ai_guardrail_labels.clone(),
+                guardrail_flagged_count,
+                budget_fraction: ctx.ai_budget_fraction,
+                budget_exceeded: ctx.ai_budget_fraction >= 1.0,
+                input_tokens_est: ai_policy_input_tokens_est(&model, &body),
+            };
+            let configured_providers: Vec<String> = config
                 .providers
-                .first()
+                .iter()
                 .map(|p| p.name.to_string())
-                .unwrap_or_default(),
-            tenant: ctx.tenant_id.to_string(),
-            api_key_id: ctx.principal.api_key_id().to_string(),
-            tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
-            guardrail_labels: ctx.ai_guardrail_labels.clone(),
-            guardrail_flagged_count,
-            budget_fraction: ctx.ai_budget_fraction,
-            budget_exceeded: ctx.ai_budget_fraction >= 1.0,
-            input_tokens_est: ai_policy_input_tokens_est(&model, &body),
-        };
-        let configured_providers: Vec<String> = config
-            .providers
-            .iter()
-            .map(|p| p.name.to_string())
-            .collect();
-        match routing_policy.evaluate(&routing_view, &configured_providers) {
-            sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Plan {
-                cascade,
-                reason,
-                reason_code,
-            } => {
-                ctx.ai_route_reason = Some(reason);
-                routing_policy_cascade = Some(cascade);
-                sbproxy_ai::ai_metrics::record_routing_policy_decision("plan", reason_code);
-                sbproxy_observe::decision::record_decision(
-                    sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                    sbproxy_observe::decision::DecisionEngine::Cel,
-                    sbproxy_observe::decision::DecisionOutcome::Mutate,
-                    route_origin_label(ctx),
-                    ctx.tenant_id.as_str(),
-                );
-            }
-            sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Decline => {
-                sbproxy_ai::ai_metrics::record_routing_policy_decision("decline", "none");
-                sbproxy_observe::decision::record_decision(
-                    sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                    sbproxy_observe::decision::DecisionEngine::Cel,
-                    sbproxy_observe::decision::DecisionOutcome::Decline,
-                    route_origin_label(ctx),
-                    ctx.tenant_id.as_str(),
-                );
-            }
-            sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Error { detail, on_error } => {
-                warn!(
-                    ai.surface = surface_label,
-                    error = %detail,
-                    "AI routing policy: evaluation error"
-                );
-                sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
-                sbproxy_observe::decision::record_decision(
-                    sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                    sbproxy_observe::decision::DecisionEngine::Cel,
-                    sbproxy_observe::decision::DecisionOutcome::Error,
-                    route_origin_label(ctx),
-                    ctx.tenant_id.as_str(),
-                );
-                if on_error == sbproxy_ai::ai_routing_policy::AiRoutingOnError::Block {
-                    ctx.ai_outcome = Some("routing_policy_error".to_string());
-                    let body_bytes = ErrorEnvelope::new(
-                        "ai_routing_policy_error",
-                        "AI routing policy failed to produce a decision",
-                    )
-                    .request_id(ctx.request_id.as_str())
-                    .to_bytes();
-                    send_response(session, 503, "application/json", &body_bytes).await?;
-                    return Ok(());
+                .collect();
+            match routing_policy.evaluate(&routing_view, &configured_providers) {
+                sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Plan {
+                    cascade,
+                    reason,
+                    reason_code,
+                } => {
+                    // A routing plan must not route around the operator's
+                    // model allowlist, exactly like the `ai_policy route_to`
+                    // path below re-checks its target. Both model gates ran
+                    // against the *requested* model far upstream; the plan
+                    // substitutes a new model set, so every tier's model is
+                    // re-checked here against the origin allowlist and the
+                    // resolved key's allowlist. A disallowed model is a
+                    // config bug and is refused rather than silently served,
+                    // which would also land the request on the wrong budget
+                    // scope and past the per-model rate limit.
+                    let disallowed = cascade.tiers.iter().find(|tier| {
+                        !(config.is_model_allowed(&tier.model)
+                            && resolved_request_vk
+                                .as_ref()
+                                .is_none_or(|vk| vk.is_model_allowed(&tier.model)))
+                    });
+                    if let Some(tier) = disallowed {
+                        warn!(
+                            from = %model,
+                            to = %tier.model,
+                            "AI routing policy: plan named a model the allowlist refuses"
+                        );
+                        ctx.ai_outcome = Some("routing_policy_route_blocked".to_string());
+                        sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
+                        sbproxy_observe::decision::record_decision(
+                            sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                            sbproxy_observe::decision::DecisionEngine::Cel,
+                            sbproxy_observe::decision::DecisionOutcome::Deny,
+                            route_origin_label(ctx),
+                            ctx.tenant_id.as_str(),
+                        );
+                        let msg = format!("model '{}' is not allowed", tier.model);
+                        send_error(session, 403, &msg).await?;
+                        return Ok(());
+                    }
+                    ctx.ai_route_reason = Some(reason);
+                    routing_policy_cascade = Some(cascade);
+                    routing_plan_reason_code = Some(reason_code);
                 }
-                // `decline` posture (the default): fall through to the
-                // configured routing strategy, the same as a decline.
+                sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Decline => {
+                    sbproxy_ai::ai_metrics::record_routing_policy_decision("decline", "none");
+                    sbproxy_observe::decision::record_decision(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        sbproxy_observe::decision::DecisionOutcome::Decline,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                }
+                sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Error { detail, on_error } => {
+                    warn!(
+                        ai.surface = surface_label,
+                        error = %detail,
+                        "AI routing policy: evaluation error"
+                    );
+                    sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
+                    sbproxy_observe::decision::record_decision(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        sbproxy_observe::decision::DecisionOutcome::Error,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                    if on_error == sbproxy_ai::ai_routing_policy::AiRoutingOnError::Block {
+                        ctx.ai_outcome = Some("routing_policy_error".to_string());
+                        let body_bytes = ErrorEnvelope::new(
+                            "ai_routing_policy_error",
+                            "AI routing policy failed to produce a decision",
+                        )
+                        .request_id(ctx.request_id.as_str())
+                        .to_bytes();
+                        send_response(session, 503, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                    // `decline` posture (the default): fall through to the
+                    // configured strategy. This is a fail-open, so record it
+                    // as one; an operator alerting on routing fail-opens must
+                    // see it, and without this it is indistinguishable from a
+                    // clean decline.
+                    sbproxy_observe::decision::record_decision_fail_open(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                }
             }
         }
     }
@@ -6120,6 +6167,25 @@ pub(super) async fn handle_ai_proxy(
         } else {
             decision.compression_selector().cloned()
         };
+    }
+
+    // WOR-2366: record the routing-plan decision only once precedence is
+    // settled. A plan an `ai_policy route_to` cleared above never runs, so
+    // counting it as `plan` at evaluation time would overstate executed
+    // plans; it is recorded as `overridden` instead.
+    if let Some(reason_code) = routing_plan_reason_code {
+        if routing_policy_cascade.is_some() {
+            sbproxy_ai::ai_metrics::record_routing_policy_decision("plan", reason_code);
+            sbproxy_observe::decision::record_decision(
+                sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                sbproxy_observe::decision::DecisionEngine::Cel,
+                sbproxy_observe::decision::DecisionOutcome::Mutate,
+                route_origin_label(ctx),
+                ctx.tenant_id.as_str(),
+            );
+        } else {
+            sbproxy_ai::ai_metrics::record_routing_policy_decision("overridden", "none");
+        }
     }
 
     ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
