@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-14*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -253,6 +253,20 @@ cargo test -p sbproxy-e2e --locked --no-fail-fast \
 parallelism (WOR-2295). Build that binary once and `SBPROXY_CHECK_E2E=1
 bash scripts/check.sh` picks both files up on every later gate. Without
 it the gate lists them under `SKIPPED PHASES`.
+
+## Code review
+
+Every branch gets an adversarial review against
+`.github/code-review-rubric.md` before it becomes a PR, run by an agent
+with shell access, and a verification round on the fixes when the first
+round finds anything. The rubric file carries its own "How to run it"
+instructions (give the reviewer the diff and the worktree; require
+findings with severity, file:line, and a failure scenario each). The
+findings and their resolutions go into the PR body, so the review
+history merges with the change it reviewed. The mechanical gates above
+answer "does it compile, lint, and pass"; the rubric answers "is this
+going to be a problem in six months", and this repository has merged
+nothing without both since the protocol landed.
 
 ## Workspace layout
 

@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-14*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -17,7 +17,9 @@ ten-minute build.
 |---|---|
 | Tracker placeholders | `grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'` (any hit fails) |
 | pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
+| unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
+| Env mutation | `bash scripts/check-env-mutation.sh` |
 | Doc drift | `bash scripts/check-doc-drift.sh` |
 | Tapes + GIF wiring | `make tapes-check` |
 | Doc configs | `python3 scripts/sync-doc-configs.py --check` |
@@ -170,6 +172,101 @@ Two consequences worth remembering:
   with `cargo clippy -p <crate> --all-targets`.
 - Do not conclude from a per-crate failure that `main` is red. Confirm
   with the documented workspace command before filing anything.
+
+### The same mechanism sets CI's build time
+
+Different feature unions mean different fingerprints, and different
+fingerprints mean cargo rebuilds. Inside one CI job that is expensive:
+adding a `cargo test -p sbproxy-e2e` step after a `--workspace` build
+recompiled 179 crates to run two tests, and a `cargo test -p
+sbproxy-platform` step cost another 2m07 the same way.
+
+So `.github/workflows/ci.yml` holds one invariant: **every cargo
+invocation in a job uses the same package selection.** The `test` lane
+is `--workspace --exclude sbproxy-e2e` throughout; the `obs-budgets`
+lane is `--workspace` throughout, in its own job with its own cache key
+because it needs e2e's wider union.
+
+When adding a check to CI, express it in the lane's existing selection.
+Narrow the *targets* (`--test <name>`) or the *tests*
+(nextest `-E 'test(...)'`), never the packages. If a check genuinely
+needs a different package set, give it its own job rather than paying
+the rebuild on the critical path. `scripts/lib/workspace-bin.sh` exists
+for the same reason: it execs the already-built generator binaries
+instead of re-entering cargo with a `-p` selection.
+
+### A different feature union is a different job for the same reason
+
+Fingerprints change with features, not just with packages, so a lane
+that needs a feature no default set enables gets its own job on the same
+grounds. `embed-admin-ui` and `payments` are both that, and the
+`payments` lane shows how to keep the two rules from fighting.
+
+Its package selection is the `test` lane's, `--workspace --exclude
+sbproxy-e2e`, and only the union differs. It reaches that union through
+the `sbproxy` binary's flags, `--features sbproxy/payment-x402,...`,
+rather than `sbproxy-core`'s, which makes it a strict superset of what
+`--workspace` already resolves. Going the other way and selecting `-p
+sbproxy-core` would be narrower than CI on both axes at once: fewer
+features, so dead-code failures CI never reports, and fewer packages, so
+`sbproxy-billing`'s test targets would not be built at all. Reach for
+`<binary-crate>/<feature>` when a lane needs a wider union, and let the
+package selection stay where the rest of CI has it.
+
+### Payments e2e is scheduled, not per-PR
+
+`e2e/tests/settlement_gate.rs` and `e2e/tests/usage_bridge.rs` are the
+only tests that drive a payment through a real proxy process.
+`challenge_settle_allow_and_replay_refusal` is the one that asserts the
+origin served exactly once for a settled payment and then refused the
+replay. Both files spawn a binary no other lane builds: a release
+`sbproxy` carrying
+`payment-x402,payment-mpp,payment-stripe,payment-lightning-cln`, found
+under `target/payments/` or named by `SBPROXY_E2E_PAYMENTS_BIN`.
+
+That binary, plus a spawned child on real ports, is why these two files
+are not in the required PR lane.
+`.github/workflows/payments-e2e.yml` runs them nightly at 03:40 UTC
+instead, with `workflow_dispatch` for a manual run. A red run opens or
+comments on a "Payments e2e is failing" issue and names the tests that
+failed. Two other scheduled lanes happen to run the same files,
+`release-checks.yml`'s test-isolation job nightly and `e2e.yml` weekly,
+but neither is named for them and neither says which payment test broke.
+
+What that costs: a PR can merge green having never built the binary
+these tests spawn, and the exactly-once property is confirmed the next
+morning rather than before the merge. The `payments` lane in `ci.yml`
+still runs on every PR, so the settlement code compiles and its unit
+tests run there. What waits for the night is the proof that an assembled
+proxy serves a paid request once.
+
+So run the pair locally before merging anything that reaches settlement:
+
+```bash
+CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --locked \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln
+cargo test -p sbproxy-e2e --locked --no-fail-fast \
+  --test settlement_gate --test usage_bridge -- --test-threads=1
+```
+
+`--test-threads=1` is load bearing: settlement_gate is red under
+parallelism (WOR-2295). Build that binary once and `SBPROXY_CHECK_E2E=1
+bash scripts/check.sh` picks both files up on every later gate. Without
+it the gate lists them under `SKIPPED PHASES`.
+
+## Code review
+
+Every branch gets an adversarial review against
+`.github/code-review-rubric.md` before it becomes a PR, run by an agent
+with shell access, and a verification round on the fixes when the first
+round finds anything. The rubric file carries its own "How to run it"
+instructions (give the reviewer the diff and the worktree; require
+findings with severity, file:line, and a failure scenario each). The
+findings and their resolutions go into the PR body, so the review
+history merges with the change it reviewed. The mechanical gates above
+answer "does it compile, lint, and pass"; the rubric answers "is this
+going to be a problem in six months", and this repository has merged
+nothing without both since the protocol landed.
 
 ## Workspace layout
 
