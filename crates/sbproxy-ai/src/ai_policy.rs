@@ -198,6 +198,13 @@ pub struct AiDecisionView {
     pub budget_exceeded: bool,
     /// Estimated prompt tokens, when computed.
     pub input_tokens_est: i64,
+    /// Heuristic prompt-difficulty score in `[0.0, 1.0]`, blending prompt
+    /// length with code, math, and multi-step-reasoning signals. Low means
+    /// "route cheap", high means "route frontier"; zero when the body carries
+    /// no scorable prompt text. This is the score the built-in `cost_quality`
+    /// strategy routes on, exposed so a routing policy can author that
+    /// decision. Bound as `ai.prompt.difficulty`.
+    pub prompt_difficulty: f64,
 }
 
 impl AiDecisionView {
@@ -236,6 +243,10 @@ impl AiDecisionView {
             "input_est".to_string(),
             CelValue::Int(self.input_tokens_est),
         )]);
+        let prompt = HashMap::from([(
+            "difficulty".to_string(),
+            CelValue::Float(self.prompt_difficulty),
+        )]);
         let principal = HashMap::from([
             ("tenant".to_string(), CelValue::String(self.tenant.clone())),
             (
@@ -257,6 +268,7 @@ impl AiDecisionView {
             ("guardrails".to_string(), CelValue::Map(guardrails)),
             ("budget".to_string(), CelValue::Map(budget)),
             ("tokens".to_string(), CelValue::Map(tokens)),
+            ("prompt".to_string(), CelValue::Map(prompt)),
             ("principal".to_string(), CelValue::Map(principal)),
         ]);
         CelValue::Map(ai)
@@ -592,6 +604,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&view).route_model(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn prompt_difficulty_is_bound_and_drives_upgrade() {
+        // The operator-authored `cost_quality`: a hard prompt routes frontier,
+        // an easy one falls through to the configured strategy.
+        let p = policy(r#"ai.prompt.difficulty > 0.7 ? "route_to:gpt-4o" : "allow""#);
+        let hard = AiDecisionView {
+            prompt_difficulty: 0.85,
+            ..Default::default()
+        };
+        assert_eq!(p.evaluate(&hard).route_model(), Some("gpt-4o"));
+        let easy = AiDecisionView {
+            prompt_difficulty: 0.1,
+            ..Default::default()
+        };
+        assert_eq!(p.evaluate(&easy).route_model(), None);
     }
 
     #[test]

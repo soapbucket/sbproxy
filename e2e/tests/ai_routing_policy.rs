@@ -57,6 +57,47 @@ fn chat() -> serde_json::Value {
     json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
 }
 
+fn chat_with(content: &str) -> serde_json::Value {
+    json!({"model": "gpt-4o", "messages": [{"role": "user", "content": content}]})
+}
+
+/// A routing policy that keys on `ai.prompt.difficulty`: a hard prompt plans
+/// to `frontier`, an easy one declines to the `round_robin` default (which,
+/// on a fresh proxy's first request, deterministically picks `cheap`, the
+/// first provider). This is the operator-authored `cost_quality`.
+fn difficulty_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        expression: |
+          ai.prompt.difficulty > 0.3
+            ? {{"candidates": [{{"provider_id": "frontier", "model": "gpt-4o"}}], "reason": "hard prompt", "reason_code": "difficulty"}}
+            : null
+        reason_codes: [difficulty]
+"#
+    )
+}
+
 #[test]
 fn a_routing_plan_dispatches_to_the_named_provider() {
     // The default strategy is round_robin, so without the plan the request
@@ -113,5 +154,60 @@ fn a_plan_naming_a_blocked_model_is_refused_before_dispatch() {
     assert!(
         frontier.captured().is_empty() && cheap.captured().is_empty(),
         "no provider may be called when the plan is refused"
+    );
+}
+
+#[test]
+fn prompt_difficulty_routes_hard_prompts_to_frontier() {
+    // A hard prompt (code fence + step-by-step reasoning) scores well above
+    // 0.3, so the policy plans to `frontier`. Proof that the new
+    // `ai.prompt.difficulty` signal reaches the routing view and drives the
+    // plan end to end: without it the difficulty reads zero and the policy
+    // would always decline.
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy =
+        ProxyHarness::start_with_yaml(&difficulty_config(&cheap.base_url(), &frontier.base_url()))
+            .expect("proxy");
+
+    let hard =
+        chat_with("Write a function and analyze it step by step:\n```\ndef f():\n    pass\n```");
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &hard, &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "a hard prompt must plan to the frontier provider"
+    );
+    assert!(
+        cheap.captured().is_empty(),
+        "the cheap provider must be untouched for a hard prompt"
+    );
+}
+
+#[test]
+fn prompt_difficulty_lets_easy_prompts_fall_through() {
+    // A trivial prompt scores near zero, below the 0.3 threshold, so the
+    // policy declines and the configured `round_robin` default runs. On a
+    // fresh proxy the first request lands on the first provider (`cheap`).
+    // Proof the signal does not spuriously fire the plan on easy prompts.
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy =
+        ProxyHarness::start_with_yaml(&difficulty_config(&cheap.base_url(), &frontier.base_url()))
+            .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !cheap.captured().is_empty(),
+        "an easy prompt must fall through to the round_robin default (cheap)"
+    );
+    assert!(
+        frontier.captured().is_empty(),
+        "the frontier provider must be untouched when the policy declines"
     );
 }

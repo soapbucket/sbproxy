@@ -484,6 +484,19 @@ fn ai_policy_input_tokens_est(model: &str, body: &serde_json::Value) -> i64 {
     i64::try_from(tokens).unwrap_or(i64::MAX)
 }
 
+/// Heuristic prompt-difficulty in `[0.0, 1.0]` for the AI decision view.
+///
+/// Derived from the uncompressed request body's prompt text (blending prompt
+/// length with code, math, and multi-step-reasoning signals); zero when the
+/// body carries no scorable text. This is the same score the built-in
+/// `cost_quality` strategy routes on, exposed to policy as `ai.prompt.difficulty`
+/// so an operator can author the routing decision instead. See
+/// `sbproxy_ai::cost_quality`.
+fn ai_policy_prompt_difficulty(body: &serde_json::Value) -> f64 {
+    let text = sbproxy_ai::cost_quality::prompt_text_for_scoring(body);
+    f64::from(sbproxy_ai::cost_quality::heuristic_difficulty(&text))
+}
+
 /// Whether one attempt may replay the original native request bytes to the
 /// upstream instead of the governed canonical body. Streaming, any request
 /// transform, and any selected RAG runtime (which pins the request to the
@@ -5886,6 +5899,7 @@ pub(super) async fn handle_ai_proxy(
                 budget_fraction: ctx.ai_budget_fraction,
                 budget_exceeded: ctx.ai_budget_fraction >= 1.0,
                 input_tokens_est: ai_policy_input_tokens_est(&model, &body),
+                prompt_difficulty: ai_policy_prompt_difficulty(&body),
             };
             let configured_providers: Vec<String> = config
                 .providers
@@ -6017,6 +6031,7 @@ pub(super) async fn handle_ai_proxy(
             budget_fraction: ctx.ai_budget_fraction,
             budget_exceeded: ctx.ai_budget_fraction >= 1.0,
             input_tokens_est: policy_input_tokens_est,
+            prompt_difficulty: ai_policy_prompt_difficulty(&body),
         };
         let decision = policy.evaluate(&view);
 

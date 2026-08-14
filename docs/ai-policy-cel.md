@@ -100,6 +100,7 @@ for the shared grammar and rejection rules.
 | `ai.budget.fraction` | double | Fraction of the tightest active budget window consumed. |
 | `ai.budget.exceeded` | bool | Whether a budget window is already exceeded. |
 | `ai.tokens.input_est` | int | Target-model input estimate for the current uncompressed JSON messages. |
+| `ai.prompt.difficulty` | double | Heuristic prompt-difficulty in `[0.0, 1.0]`, blending prompt length with code, math, and multi-step-reasoning signals; zero when the body carries no scorable text. This is the score the built-in `cost_quality` strategy routes on, so a routing policy can author that decision instead. |
 
 `ai.tokens.input_est` is computed before CEL and before compression. Known
 OpenAI model families use their registered tokenizer; other model names use

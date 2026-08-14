@@ -412,6 +412,25 @@ and returns one of three shapes:
 - A decline: `null`, `{}`, or an empty candidate list. This is the common case and it is meant to be the cheapest thing to write. The configured `routing` strategy runs unchanged, so a policy that has an opinion about a few requests and none about the rest just declines for the rest.
 - Nothing usable: an evaluation error, a plan with no reason, or a candidate naming a provider you never configured. `on_error` decides what happens next. `decline` (the default) falls through to the strategy; `block` refuses the request. A broken optimization policy should not take the gateway down, which is why the default fails open.
 
+One input on that decision view is worth calling out, because it turns a
+built-in strategy into something you author. `ai.prompt.difficulty` is a heuristic
+in `[0.0, 1.0]` over the prompt's shape (length, code, math, multi-step
+reasoning), the same score the built-in `cost_quality` strategy routes
+on. Reading it in a policy is the operator-authored version of that
+strategy: route the hard prompts to a frontier model and let the easy
+ones fall through, on your own threshold and your own providers, without
+adopting the whole strategy.
+
+```yaml
+  ai_routing_policy:
+    expression: |
+      ai.prompt.difficulty > 0.7
+        ? {"candidates": [{"provider_id": "frontier", "model": "gpt-4o"}],
+           "reason": "hard prompt", "reason_code": "difficulty"}
+        : null
+    reason_codes: [difficulty]
+```
+
 Two things the policy is not allowed to do. It cannot route to a model
 your origin or the caller's key does not allow: every candidate's model
 is re-checked against the same allowlist the request already passed, and
@@ -1051,7 +1070,7 @@ For CEL over the AI pipeline's own signals (surface, guardrail verdicts, budget 
 
 ## AI policy plane (CEL)
 
-Where CEL guardrails and request modifiers act on the raw HTTP request, the AI policy plane is one sandboxed CEL expression over the signals the AI pipeline itself computes: `ai.surface`, `ai.principal.*`, `ai.guardrails.*`, `ai.budget.*`, `ai.tokens.*`. It runs after guardrail evaluation and before provider selection, and it can only emit actions from a closed set (allow, block, redact, `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`). Off until you add an `ai_policy` block:
+Where CEL guardrails and request modifiers act on the raw HTTP request, the AI policy plane is one sandboxed CEL expression over the signals the AI pipeline itself computes: `ai.surface`, `ai.principal.*`, `ai.guardrails.*`, `ai.budget.*`, `ai.tokens.*`, `ai.prompt.*`. It runs after guardrail evaluation and before provider selection, and it can only emit actions from a closed set (allow, block, redact, `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`). Off until you add an `ai_policy` block:
 
 ```yaml
 action:
