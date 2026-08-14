@@ -1051,6 +1051,24 @@ impl AiHandlerConfig {
                 );
             }
         }
+        // WOR-2366: a cascade tier naming a provider that is not configured
+        // is silently skipped at runtime (the cascade treats it as a failed
+        // tier), so the operator's tier never runs and nothing says why.
+        // Refuse it at load, the way a duplicate provider name is refused
+        // above. This is also the literal, checkable half of the routing
+        // policy's provider validation: a computed plan is checked per
+        // request, but a statically configured tier is checked here.
+        if let RoutingStrategy::Cascade(cascade) = &config.routing {
+            for (index, tier) in cascade.tiers.iter().enumerate() {
+                if !provider_names.contains(tier.provider_id.as_str()) {
+                    anyhow::bail!(
+                        "ai routing cascade tier {index} names provider {:?}, \
+                         which is not configured",
+                        tier.provider_id
+                    );
+                }
+            }
+        }
         for provider in &config.providers {
             provider.validate_managed_model().map_err(|error| {
                 anyhow::anyhow!("ai provider {:?} managed model: {error}", provider.name)
@@ -2832,6 +2850,32 @@ mod tests {
         assert!((cascade.tiers[0].quality_threshold - 0.75).abs() < 1e-6);
         assert_eq!(cascade.tiers[1].cost_cap, Some(50000));
         assert_eq!(cascade.max_total_cost, Some(100000));
+    }
+
+    #[test]
+    fn from_config_rejects_a_cascade_tier_naming_an_unconfigured_provider() {
+        // WOR-2366: a cascade tier naming a provider that is not
+        // configured is silently skipped at runtime, so the operator's
+        // tier never runs. Refuse it at load instead. Red before the
+        // backfill: nothing validated tier providers against `providers`.
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "cheap", "api_key": "x"}],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {"provider_id": "cheap", "model": "gpt-4o-mini", "quality_threshold": 0.7},
+                    {"provider_id": "ghost", "model": "gpt-4o", "quality_threshold": 0.9}
+                ]
+            }
+        });
+        let err = AiHandlerConfig::from_config(cfg_json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ghost"), "error names the bad provider: {err}");
+        assert!(
+            err.contains("tier 1"),
+            "error names the offending tier index: {err}"
+        );
     }
 
     #[test]
