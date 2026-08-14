@@ -977,6 +977,15 @@ This field does not control the key-owned definitions in `inject_tools` or
 allowlist** for a list. An empty allowlist intentionally denies every
 caller-supplied tool.
 
+`inject_mcp.ref` resolves an MCP action by `server_info.name` only within the
+request route's tenant and pinned configuration generation. The injected set
+is the intersection of the MCP action's tool allowlist, per-server RBAC,
+version-gate verdict, and the key's optional `inject_mcp.filter`. A reference
+cannot select another tenant's catalogue, and a rejected reload cannot replace
+the source held by an in-flight request. If that governed intersection is
+empty or the tenant-local reference is unknown, SBproxy sends an empty tool
+array; it never falls back to caller-supplied tools.
+
 ### Governed admission: strict and approximate
 
 A governed key with at least one of `max_requests_per_minute`,

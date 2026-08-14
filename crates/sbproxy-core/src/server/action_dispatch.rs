@@ -2241,23 +2241,22 @@ pub(super) async fn handle_mcp_action(
         // RBAC policy against the inbound principal (WOR-1065) so
         // the manifest never lists a tool the gateway would refuse
         // to call for this caller.
-        let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> = mcp
-            .federation
-            .list_tools()
-            .into_iter()
-            .filter(|t| mcp.is_tool_allowed(&t.name))
-            .filter(|t| match mcp.policy_for_server(&t.server_name) {
-                Some(policy) => matches!(
-                    policy.check(&ctx.principal, &t.name),
-                    sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                ),
-                None => true,
-            })
-            .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
-                name: t.name,
-                description: t.description,
-            })
-            .collect();
+        let catalog = mcp.federation.tool_catalog_snapshot();
+        let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> =
+            mcp_unblocked_catalog_tools(&catalog)
+                .filter(|t| mcp.is_tool_allowed(&t.name))
+                .filter(|t| match mcp.policy_for_server(&t.server_name) {
+                    Some(policy) => matches!(
+                        policy.check(&ctx.principal, &t.name),
+                        sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                    ),
+                    None => true,
+                })
+                .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                })
+                .collect();
         // RFC 9728 auth-discovery pointer when the gateway is
         // OAuth-protected (WOR-806).
         let authorization = mcp.oauth.as_ref().map(|_| {
@@ -2683,22 +2682,29 @@ pub(super) async fn handle_mcp_action(
                 // WOR-1065: the RBAC filter still runs per principal
                 // so the catalogue never lists a tool the gate would
                 // refuse to call for this caller.
-                let snapshot = mcp.federation.serialized_tools();
+                let catalog = mcp.federation.tool_catalog_snapshot();
+                let snapshot = catalog.serialized_tools();
                 // WOR-1635: tools blocked by the version gate are
-                // filtered out of the catalogue entirely.
-                let version_blocked = mcp.federation.version_blocked();
+                // filtered out of the catalogue entirely. Both views
+                // come from one immutable catalog publication.
+                let version_blocked = catalog.version_blocked();
                 // Rollout plane: compute the per-consumer patch
                 // (managed entries to hide, versioned entries to
-                // advertise instead) before the filter loop runs.
+                // advertise instead) before the filter loop runs. Blocked
+                // entries are excluded from its live-schema source, and
+                // synthesized entries receive a second held-target check
+                // below for inline-contract routes.
+                let rollout_session_reqs = mcp_session_id.as_deref().and_then(|sid| {
+                    mcp.sessions
+                        .as_deref()
+                        .and_then(|s| s.tool_requirements(sid))
+                });
+                let rollout_today = chrono::Utc::now().date_naive();
                 let rollout_patch = mcp.rollout_plan.as_ref().map(|plan| {
-                    let session_reqs = mcp_session_id.as_deref().and_then(|sid| {
-                        mcp.sessions
-                            .as_deref()
-                            .and_then(|s| s.tool_requirements(sid))
-                    });
                     let entries: Vec<mcp_rollout::CatalogueEntry<'_>> = snapshot
                         .entries
                         .iter()
+                        .filter(|entry| !version_blocked.contains_key(&entry.name))
                         .map(|e| mcp_rollout::CatalogueEntry {
                             name: &e.name,
                             server: &e.server_name,
@@ -2708,9 +2714,9 @@ pub(super) async fn handle_mcp_action(
                     mcp_rollout::synthesize_view(
                         plan,
                         &entries,
-                        session_reqs.as_deref(),
+                        rollout_session_reqs.as_deref(),
                         Some(&ctx.principal),
-                        chrono::Utc::now().date_naive(),
+                        rollout_today,
                     )
                 });
                 let needs_filter = mcp.tool_allowlist.is_some()
@@ -2751,18 +2757,25 @@ pub(super) async fn handle_mcp_action(
                         first = false;
                         out.push_str(&entry.json);
                     }
-                    if let Some(patch) = &rollout_patch {
+                    if let (Some(plan), Some(patch)) =
+                        (mcp.rollout_plan.as_ref(), rollout_patch.as_ref())
+                    {
                         // Versioned entries the managed tools
-                        // advertise in place of the hidden ones. RBAC
-                        // stays enforced at call time on the resolved
-                        // server; the allowlist applies here by name.
+                        // advertise in place of the hidden ones. A
+                        // synthesized inline contract is visible only when
+                        // its exact routed target exists, is unblocked, and
+                        // passes the same target-name allowlist and
+                        // target-server RBAC checks as tools/call.
                         for tool in &patch.synthesized {
-                            let allowed = tool
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|n| mcp.is_tool_allowed(n))
-                                .unwrap_or(false);
-                            if !allowed {
+                            if !mcp_synthesized_rollout_tool_is_visible_to_principal(
+                                mcp,
+                                plan,
+                                &catalog,
+                                tool,
+                                rollout_session_reqs.as_deref(),
+                                &ctx.principal,
+                                rollout_today,
+                            ) {
                                 continue;
                             }
                             if let Ok(json) = serde_json::to_string(tool) {
@@ -2844,7 +2857,11 @@ pub(super) async fn handle_mcp_action(
             // `tools/list` and `resources/list` are. Upstreams that
             // declare no prompts capability contributed nothing at
             // refresh time, so there is nothing here to skip for them.
-            let prompts = mcp_prompts_view(mcp, &ctx.principal, &mcp.federation.list_prompts());
+            let prompt_catalog = mcp.federation.prompt_catalog_snapshot();
+            let tool_catalog = mcp.federation.tool_catalog_snapshot();
+            let prompts = prompt_catalog.list_prompts();
+            let prompts =
+                mcp_prompts_view_in_snapshot(mcp, &ctx.principal, &prompts, &tool_catalog);
             JsonRpcResponse::success(
                 request.id.clone(),
                 serde_json::json!({ "prompts": prompts }),
@@ -2857,10 +2874,19 @@ pub(super) async fn handle_mcp_action(
             // `-32602` (the client asked for something that is not in
             // the catalogue) rather than the `-32603` an upstream
             // failure would earn.
-            let owner = mcp.federation.resolve_prompt(name);
+            let prompt_catalog = mcp.federation.prompt_catalog_snapshot();
+            let owner = prompt_catalog.resolve_prompt(name);
+            let tool_catalog = mcp.federation.tool_catalog_snapshot();
             let reachable = owner
                 .as_ref()
-                .map(|p| mcp_prompt_server_reachable(mcp, &ctx.principal, &p.server_name))
+                .map(|p| {
+                    mcp_prompt_server_reachable_in_snapshot(
+                        mcp,
+                        &ctx.principal,
+                        &p.server_name,
+                        &tool_catalog,
+                    )
+                })
                 .unwrap_or(false);
             if name.is_empty() {
                 JsonRpcResponse::error(
@@ -2896,7 +2922,11 @@ pub(super) async fn handle_mcp_action(
                 )
             } else {
                 let arguments = params.get("arguments").cloned();
-                match mcp.federation.get_prompt(name, arguments).await {
+                match mcp
+                    .federation
+                    .get_prompt_from_snapshot(&prompt_catalog, name, arguments)
+                    .await
+                {
                     Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
                     Err(e) => {
                         warn!(error = %e, prompt = %name, "prompts/get failed");
@@ -2979,6 +3009,12 @@ pub(super) async fn handle_mcp_action(
                         "tools/call requires a 'name' parameter",
                     ),
                     Some(name) => {
+                        // Capture one publication before rollout planning.
+                        // Both the route-to-catalogue mapping and final
+                        // block-aware resolve below must use this handle,
+                        // otherwise a refresh can pair an old server route
+                        // with a replacement entry from a different server.
+                        let tool_catalog = mcp.federation.tool_catalog_snapshot();
                         // Rollout plane: resolve the requested version
                         // before any gate runs, because the caller may
                         // use an alias (`search_v1`) or carry a `_meta`
@@ -3025,8 +3061,8 @@ pub(super) async fn handle_mcp_action(
                                     ));
                                 }
                                 mcp_rollout::CallPlan::Routed(route) => {
-                                    let mapped = mcp_rollout::catalogue_name_for(
-                                        |n| mcp.federation.resolve_tool(n).map(|t| t.server_name),
+                                    let mapped = mcp_catalogue_name_for_snapshot(
+                                        &tool_catalog,
                                         &route.server,
                                         &route.base,
                                     );
@@ -3107,6 +3143,14 @@ pub(super) async fn handle_mcp_action(
                             }
                         }
 
+                        // Load the resolved tool and version-gate
+                        // verdict from one immutable publication.
+                        // A refresh between independent reads used to
+                        // admit a newly blocked tool or pair a new
+                        // registry entry with an old verdict.
+                        let (federated, version_blocked) =
+                            tool_catalog.resolve_tool_with_version_block(&name);
+
                         // WOR-1635: version-gate check first; a
                         // blocked tool is invisible in tools/list and
                         // must fail calls with the violation detail.
@@ -3120,7 +3164,7 @@ pub(super) async fn handle_mcp_action(
                             request.id.clone(),
                         ) {
                             denial
-                        } else if let Some(detail) = mcp.federation.version_blocked().get(&name) {
+                        } else if let Some(detail) = version_blocked.as_deref() {
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,
@@ -3159,7 +3203,6 @@ pub(super) async fn handle_mcp_action(
                             // 3. Wrap `federation.call_tool` in
                             //    `tokio::time::timeout(server.timeout, ...)`
                             //    when a per-server timeout is configured.
-                            let federated = mcp.federation.resolve_tool(&name);
                             let server_policy = federated
                                 .as_ref()
                                 .and_then(|t| mcp.policy_for_server(&t.server_name));
@@ -3398,11 +3441,13 @@ pub(super) async fn handle_mcp_action(
                                         .unwrap_or("unknown"),
                                 );
                                 let call = tracing::Instrument::instrument(
-                                    mcp.federation.call_tool_with_upstream_headers(
-                                        &name,
-                                        outbound_arguments,
-                                        &upstream_headers,
-                                    ),
+                                    mcp.federation
+                                        .call_tool_with_upstream_headers_from_snapshot(
+                                            &tool_catalog,
+                                            &name,
+                                            outbound_arguments,
+                                            &upstream_headers,
+                                        ),
                                     tool_span.clone(),
                                 );
                                 let mut outcome = match timeout {
@@ -4080,6 +4125,111 @@ fn mcp_progressive_meta_tools() -> Vec<serde_json::Value> {
     ]
 }
 
+/// Resolve a rollout `(server, base tool)` pair through one held catalogue
+/// publication. The caller must retain the same snapshot for the eventual
+/// block-aware resolve and dispatch.
+fn mcp_catalogue_name_for_snapshot(
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    server: &str,
+    base: &str,
+) -> Option<String> {
+    mcp_rollout::catalogue_name_for(
+        |name| catalog.resolve_tool(name).map(|tool| tool.server_name),
+        server,
+        base,
+    )
+}
+
+/// Return every tool from one publication that is not refused by that same
+/// publication's version gate. Discovery callers must apply their own RBAC
+/// and allowlist filters after this invariant-preserving filter.
+fn mcp_unblocked_catalog_tools(
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> impl Iterator<Item = &sbproxy_extension::mcp::FederatedTool> {
+    let version_blocked = catalog.version_blocked();
+    catalog
+        .iter_tools()
+        .filter(move |tool| !version_blocked.contains_key(&tool.name))
+}
+
+/// Whether a synthesized rollout entry resolves to an existing, unblocked
+/// target through this exact held catalogue. This rejects malformed synthesis
+/// and inline contracts whose configured target is no longer safe to expose.
+#[cfg(test)]
+fn mcp_synthesized_rollout_tool_is_visible(
+    plan: &sbproxy_extension::mcp::rollout::RolloutPlan,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    tool: &serde_json::Value,
+    session_reqs: Option<&std::collections::HashMap<String, String>>,
+    principal: &sbproxy_plugin::Principal,
+    today: chrono::NaiveDate,
+) -> bool {
+    mcp_synthesized_rollout_target(plan, catalog, tool, session_reqs, principal, today).is_some()
+}
+
+fn mcp_synthesized_rollout_target(
+    plan: &sbproxy_extension::mcp::rollout::RolloutPlan,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    tool: &serde_json::Value,
+    session_reqs: Option<&std::collections::HashMap<String, String>>,
+    principal: &sbproxy_plugin::Principal,
+    today: chrono::NaiveDate,
+) -> Option<sbproxy_extension::mcp::FederatedTool> {
+    let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
+        return None;
+    };
+    let call_req = tool
+        .get("_meta")
+        .and_then(|meta| meta.get(sbproxy_extension::mcp::rollout::META_VERSION_KEY))
+        .and_then(serde_json::Value::as_str);
+    let mcp_rollout::CallPlan::Routed(route) =
+        mcp_rollout::plan_call(plan, name, call_req, session_reqs, Some(principal), today)
+    else {
+        return None;
+    };
+    let Some(catalogue_name) = mcp_catalogue_name_for_snapshot(catalog, &route.server, &route.base)
+    else {
+        return None;
+    };
+    let (tool, blocked) = catalog.resolve_tool_with_version_block(&catalogue_name);
+    if blocked.is_some() {
+        None
+    } else {
+        tool
+    }
+}
+
+/// Apply the exact call-side target authorization to a synthesized alias.
+///
+/// Rollout aliases are presentation names. The dispatcher rewrites one to its
+/// concrete catalog target before allowlist and RBAC enforcement, so discovery
+/// must decide on that same held target rather than the alias string.
+fn mcp_synthesized_rollout_tool_is_visible_to_principal(
+    mcp: &sbproxy_modules::action::McpAction,
+    plan: &sbproxy_extension::mcp::rollout::RolloutPlan,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    tool: &serde_json::Value,
+    session_reqs: Option<&std::collections::HashMap<String, String>>,
+    principal: &sbproxy_plugin::Principal,
+    today: chrono::NaiveDate,
+) -> bool {
+    let Some(target) =
+        mcp_synthesized_rollout_target(plan, catalog, tool, session_reqs, principal, today)
+    else {
+        return false;
+    };
+    if !mcp.is_tool_allowed(&target.name) {
+        return false;
+    }
+    match mcp.policy_for_server(&target.server_name) {
+        Some(policy) => matches!(
+            policy.check(principal, &target.name),
+            sbproxy_extension::mcp::ToolAccessDecision::Allow,
+        ),
+        None => true,
+    }
+}
+
 /// Search the federated tool catalogue for entries whose name or
 /// description matches `query` (case-insensitive substring), honouring
 /// the `tool_allowlist` guardrail, the per-server RBAC policy
@@ -4092,9 +4242,8 @@ fn mcp_progressive_search(
     limit: usize,
 ) -> Vec<serde_json::Value> {
     let q = query.to_ascii_lowercase();
-    mcp.federation
-        .list_tools()
-        .into_iter()
+    let catalog = mcp.federation.tool_catalog_snapshot();
+    mcp_unblocked_catalog_tools(&catalog)
         .filter(|t| mcp.is_tool_allowed(&t.name))
         .filter(|t| match mcp.policy_for_server(&t.server_name) {
             Some(policy) => matches!(
@@ -4149,17 +4298,32 @@ fn mcp_progressive_search(
 /// The `tool_allowlist` guardrail deliberately does not participate:
 /// it is a gateway-wide cap on what may be called, not a statement
 /// about who this caller is.
+#[cfg(test)]
 fn mcp_prompt_server_reachable(
     mcp: &sbproxy_modules::action::McpAction,
     principal: &sbproxy_plugin::Principal,
     server_name: &str,
 ) -> bool {
+    let catalog = mcp.federation.tool_catalog_snapshot();
+    mcp_prompt_server_reachable_in_snapshot(mcp, principal, server_name, &catalog)
+}
+
+fn mcp_prompt_server_reachable_in_snapshot(
+    mcp: &sbproxy_modules::action::McpAction,
+    principal: &sbproxy_plugin::Principal,
+    server_name: &str,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> bool {
     let Some(policy) = mcp.policy_for_server(server_name) else {
         return true;
     };
-    let snapshot = mcp.federation.serialized_tools();
+    let snapshot = catalog.serialized_tools();
+    let version_blocked = catalog.version_blocked();
     let mut saw_tool = false;
     for entry in &snapshot.entries {
+        if version_blocked.contains_key(&entry.name) {
+            continue;
+        }
         if entry.server_name != server_name {
             continue;
         }
@@ -4185,14 +4349,37 @@ fn mcp_prompt_server_reachable(
 /// `tools/list` does with denied tools and for the same reason: a
 /// catalogue that names entries the caller cannot use leaks the shape
 /// of an upstream to someone with no access to it.
+#[cfg(test)]
 fn mcp_prompts_view(
     mcp: &sbproxy_modules::action::McpAction,
     principal: &sbproxy_plugin::Principal,
     prompts: &[sbproxy_extension::mcp::FederatedPrompt],
 ) -> Vec<serde_json::Value> {
+    let catalog = mcp.federation.tool_catalog_snapshot();
+    mcp_prompts_view_in_snapshot(mcp, principal, prompts, &catalog)
+}
+
+fn mcp_prompts_view_in_snapshot(
+    mcp: &sbproxy_modules::action::McpAction,
+    principal: &sbproxy_plugin::Principal,
+    prompts: &[sbproxy_extension::mcp::FederatedPrompt],
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> Vec<serde_json::Value> {
+    let mut server_reachability = std::collections::HashMap::new();
     let mut out: Vec<serde_json::Value> = prompts
         .iter()
-        .filter(|p| mcp_prompt_server_reachable(mcp, principal, &p.server_name))
+        .filter(|prompt| {
+            *server_reachability
+                .entry(prompt.server_name.as_str())
+                .or_insert_with(|| {
+                    mcp_prompt_server_reachable_in_snapshot(
+                        mcp,
+                        principal,
+                        &prompt.server_name,
+                        catalog,
+                    )
+                })
+        })
         .map(|p| {
             let mut entry = serde_json::json!({ "name": p.name });
             if let Some(title) = &p.title {
@@ -4760,7 +4947,11 @@ mod govern_security_tests {
 
 #[cfg(test)]
 mod mcp_prompts_tests {
-    use super::{mcp_prompt_server_reachable, mcp_prompts_view};
+    use super::{
+        mcp_prompt_server_reachable, mcp_prompt_server_reachable_in_snapshot, mcp_prompts_view,
+        mcp_prompts_view_in_snapshot,
+    };
+    use sbproxy_extension::mcp::protocol::McpToolContract;
     use sbproxy_extension::mcp::{FederatedPrompt, FederatedTool};
     use sbproxy_modules::action::McpAction;
     use sbproxy_plugin::{Principal, PrincipalAttrs, PrincipalSource, TenantId};
@@ -4781,13 +4972,24 @@ mod mcp_prompts_tests {
     }
 
     fn tool(name: &str, server: &str) -> FederatedTool {
+        let input_schema = json!({"type": "object", "properties": {}});
+        let contract = McpToolContract::try_from(json!({
+            "name": name,
+            "description": format!("Tool {name}"),
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("prompt fixture contract");
         FederatedTool {
             name: name.to_string(),
             description: format!("Tool {name}"),
-            input_schema: json!({"type": "object", "properties": {}}),
+            input_schema,
             server_name: server.to_string(),
             streaming: false,
             meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
         }
     }
 
@@ -4861,11 +5063,14 @@ mod mcp_prompts_tests {
     #[test]
     fn prompt_access_follows_server_level_tool_access() {
         let mcp = action_with_rbac();
-        mcp.federation.seed_tools_for_test(HashMap::from([
-            ("search_docs".to_string(), tool("search_docs", "gh")),
-            ("delete_repo".to_string(), tool("delete_repo", "gh")),
-            ("gl.search".to_string(), tool("gl.search", "gl")),
-        ]));
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([
+                ("search_docs".to_string(), tool("search_docs", "gh")),
+                ("delete_repo".to_string(), tool("delete_repo", "gh")),
+                ("gl.search".to_string(), tool("gl.search", "gl")),
+            ]),
+            None,
+        );
 
         let reader = principal("u-reader", &["reader"]);
         // `readers` allows exactly one of gh's tools, so gh is reachable.
@@ -4880,16 +5085,83 @@ mod mcp_prompts_tests {
         assert!(!mcp_prompt_server_reachable(&mcp, &stranger, "gl"));
     }
 
+    #[test]
+    fn task_5b_prompt_reachability_ignores_version_blocked_tools() {
+        let mcp = action_with_rbac();
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([("search_docs".to_string(), tool("search_docs", "gh"))]),
+            Some(HashMap::from([(
+                "search_docs".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+
+        let reader = principal("u-reader", &["reader"]);
+        assert!(
+            !mcp_prompt_server_reachable(&mcp, &reader, "gh"),
+            "a version-blocked tool cannot make its upstream prompt surface reachable"
+        );
+    }
+
+    #[test]
+    fn task_5b_prompt_list_and_get_share_one_held_catalogue_reachability_view() {
+        let mcp = action_with_rbac();
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([("search_docs".to_string(), tool("search_docs", "gh"))]),
+            None,
+        );
+        let held_allowed = mcp.federation.tool_catalog_snapshot();
+        let prompts = vec![
+            prompt("code_review", "gh"),
+            prompt("triage", "gh"),
+            prompt("release_notes", "gh"),
+        ];
+        let reader = principal("u-reader-snapshot", &["reader"]);
+
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([("search_docs".to_string(), tool("search_docs", "gh"))]),
+            Some(HashMap::from([(
+                "search_docs".to_string(),
+                "replacement is blocked".to_string(),
+            )])),
+        );
+        let current_blocked = mcp.federation.tool_catalog_snapshot();
+
+        assert!(
+            mcp_prompt_server_reachable_in_snapshot(&mcp, &reader, "gh", &held_allowed),
+            "prompts/get authorization must retain the publication held before refresh"
+        );
+        assert!(
+            !mcp_prompt_server_reachable_in_snapshot(&mcp, &reader, "gh", &current_blocked),
+            "a later request must use the later publication's blocked verdict"
+        );
+
+        let held_view = mcp_prompts_view_in_snapshot(&mcp, &reader, &prompts, &held_allowed);
+        let current_view = mcp_prompts_view_in_snapshot(&mcp, &reader, &prompts, &current_blocked);
+        assert_eq!(
+            held_view.len(),
+            3,
+            "prompts/list must memoize one server reachability answer across its held view"
+        );
+        assert!(
+            current_view.is_empty(),
+            "prompts/list and prompts/get must agree for the same held publication"
+        );
+    }
+
     /// `prompts/list` omits the prompts of an upstream the caller
     /// cannot reach rather than reporting them as denied, which is
     /// what `tools/list` does with denied tools.
     #[test]
     fn prompts_list_hides_prompts_from_an_unreachable_upstream() {
         let mcp = action_with_rbac();
-        mcp.federation.seed_tools_for_test(HashMap::from([
-            ("search_docs".to_string(), tool("search_docs", "gh")),
-            ("gl.search".to_string(), tool("gl.search", "gl")),
-        ]));
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([
+                ("search_docs".to_string(), tool("search_docs", "gh")),
+                ("gl.search".to_string(), tool("gl.search", "gl")),
+            ]),
+            None,
+        );
 
         let reader = principal("u-reader", &["reader"]);
         let prompts = vec![
@@ -4964,5 +5236,359 @@ mod mcp_prompts_tests {
             mcp.federation.prompts_capability().is_none(),
             "no upstream has declared prompts, so nothing may be advertised"
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_catalog_snapshot_tests {
+    use super::{
+        handle_mcp_action, mcp_catalogue_name_for_snapshot,
+        mcp_synthesized_rollout_tool_is_visible,
+        mcp_synthesized_rollout_tool_is_visible_to_principal, mcp_unblocked_catalog_tools,
+    };
+    use crate::context::RequestContext;
+    use pingora_core::protocols::l4::stream::Stream;
+    use pingora_proxy::Session;
+    use sbproxy_extension::mcp::protocol::McpToolContract;
+    use sbproxy_extension::mcp::rollout::{RolloutPlan, RolloutSpec, ToolRolloutSpec, VersionSpec};
+    use sbproxy_extension::mcp::{FederatedTool, McpFederation};
+    use sbproxy_modules::action::McpAction;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn tool(name: &str, server: &str) -> FederatedTool {
+        let input_schema = json!({"type": "object", "properties": {}});
+        let contract = McpToolContract::try_from(json!({
+            "name": name,
+            "description": "snapshot fixture",
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("snapshot fixture contract");
+        FederatedTool {
+            name: name.to_string(),
+            description: "snapshot fixture".to_string(),
+            input_schema,
+            server_name: server.to_string(),
+            streaming: false,
+            meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
+        }
+    }
+
+    #[test]
+    fn task_5b_rollout_mapping_uses_the_held_catalog_snapshot() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+            None,
+        );
+        let held = federation.tool_catalog_snapshot();
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), tool("search", "replacement-server"))]),
+            Some(HashMap::from([(
+                "search".to_string(),
+                "replacement is blocked".to_string(),
+            )])),
+        );
+
+        assert_eq!(
+            mcp_catalogue_name_for_snapshot(&held, "old-server", "search"),
+            Some("search".to_string()),
+            "route mapping remains bound to the server selected before publication"
+        );
+        assert_eq!(
+            mcp_catalogue_name_for_snapshot(
+                &federation.tool_catalog_snapshot(),
+                "old-server",
+                "search",
+            ),
+            None,
+            "the current replacement belongs to a different server"
+        );
+    }
+
+    #[test]
+    fn task_5b_core_discovery_filters_version_blocked_snapshot_entries() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([
+                ("allowed".to_string(), tool("allowed", "catalog-server")),
+                ("refused".to_string(), tool("refused", "catalog-server")),
+            ]),
+            Some(HashMap::from([(
+                "refused".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+
+        let mut names: Vec<String> =
+            mcp_unblocked_catalog_tools(&federation.tool_catalog_snapshot())
+                .map(|tool| tool.name.clone())
+                .collect();
+        names.sort();
+        assert_eq!(names, vec!["allowed"]);
+    }
+
+    #[test]
+    fn task_5b_rollout_catalogue_hides_synthesized_alias_for_a_blocked_target() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+            Some(HashMap::from([(
+                "search".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+        let plan = RolloutPlan::compile(&RolloutSpec {
+            tools: HashMap::from([(
+                "search".to_string(),
+                ToolRolloutSpec {
+                    versions: vec![VersionSpec {
+                        version: "1.0.0".to_string(),
+                        server: Some("old-server".to_string()),
+                        contract: Some(json!({
+                            "name": "search",
+                            "description": "inline historical contract",
+                            "inputSchema": {"type": "object", "properties": {}}
+                        })),
+                        ..VersionSpec::default()
+                    }],
+                    default: Some("1.0.0".to_string()),
+                    aliases: true,
+                },
+            )]),
+            ..RolloutSpec::default()
+        })
+        .expect("rollout fixture compiles");
+        let synthesized_alias = json!({
+            "name": "search_v1",
+            "description": "inline historical contract",
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": {"sbproxy.dev/version": "1.0.0"}
+        });
+
+        assert!(
+            !mcp_synthesized_rollout_tool_is_visible(
+                &plan,
+                &federation.tool_catalog_snapshot(),
+                &synthesized_alias,
+                None,
+                &sbproxy_plugin::Principal::anonymous(),
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 14).expect("fixture date"),
+            ),
+            "an inline-contract alias must not re-advertise a blocked routed target"
+        );
+    }
+
+    fn rollout_action_with_authorization(allowlist: &[&str], rbac_allowed: &[&str]) -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "rollout-auth-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "reader": {
+                    "default_allow": false,
+                    "tool_access": [{"principals": [], "allowed": rbac_allowed}]
+                }
+            },
+            "federated_servers": [{
+                "origin": "https://old.example.com/mcp",
+                "prefix": "old-server",
+                "rbac": "reader"
+            }],
+            "guardrails": [{"type": "tool_allowlist", "allow": allowlist}],
+            "tool_versioning": {"rollout": {"tools": {
+                "search": {
+                    "versions": [{
+                        "version": "1.0.0",
+                        "server": "old-server",
+                        "contract": {
+                            "name": "search",
+                            "description": "inline historical contract",
+                            "inputSchema": {"type": "object", "properties": {}}
+                        }
+                    }],
+                    "default": "1.0.0",
+                    "aliases": true
+                }
+            }}}
+        }))
+        .expect("rollout authorization fixture compiles")
+    }
+
+    fn synthesized_search_v1() -> serde_json::Value {
+        json!({
+            "name": "search_v1",
+            "description": "inline historical contract",
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": {"sbproxy.dev/version": "1.0.0"}
+        })
+    }
+
+    async fn mcp_handler_exchange(
+        action: &McpAction,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::to_vec(&request).expect("MCP request JSON");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP downstream fixture");
+        let address = listener.local_addr().expect("MCP downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect MCP downstream fixture");
+            let headers = format!(
+                "POST / HTTP/1.1\r\nHost: mcp.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write MCP request headers");
+            stream
+                .write_all(&body)
+                .await
+                .expect("write MCP request body");
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read MCP response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse MCP downstream request");
+        let context = RequestContext::new();
+
+        handle_mcp_action(&mut session, action, &context, false)
+            .await
+            .expect("MCP handler response");
+        drop(session);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("MCP response timeout")
+            .expect("MCP downstream task");
+        let response = String::from_utf8(response).expect("MCP HTTP response UTF-8");
+        serde_json::from_str(
+            response
+                .split_once("\r\n\r\n")
+                .expect("MCP HTTP response body")
+                .1,
+        )
+        .expect("MCP JSON response")
+    }
+
+    #[test]
+    fn task_5b_synthesized_rollout_visibility_authorizes_the_resolved_call_target() {
+        let cases = [
+            (
+                vec!["search_v1"],
+                vec!["search"],
+                false,
+                "an alias-only allowlist must not advertise a call that resolves to a denied target",
+            ),
+            (
+                vec!["search"],
+                vec!["search_v1"],
+                false,
+                "alias-only RBAC must not advertise a call that resolves to a denied target",
+            ),
+            (
+                vec!["search"],
+                vec!["search"],
+                true,
+                "the alias is visible when its concrete call target passes every gate",
+            ),
+        ];
+
+        for (allowlist, rbac_allowed, expected, reason) in cases {
+            let action = rollout_action_with_authorization(&allowlist, &rbac_allowed);
+            action.federation.seed_tools_for_test(
+                HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+                None,
+            );
+            let catalog = action.federation.tool_catalog_snapshot();
+            let plan = action.rollout_plan.as_deref().expect("rollout plan");
+
+            assert_eq!(
+                mcp_synthesized_rollout_tool_is_visible_to_principal(
+                    &action,
+                    plan,
+                    &catalog,
+                    &synthesized_search_v1(),
+                    None,
+                    &sbproxy_plugin::Principal::anonymous(),
+                    chrono::NaiveDate::from_ymd_opt(2026, 8, 14).expect("fixture date"),
+                ),
+                expected,
+                "{reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_5b_handler_list_and_call_share_resolved_rollout_authorization() {
+        let cases = [
+            (
+                vec!["search_v1"],
+                vec!["search"],
+                "tool_allowlist",
+                "alias-only allowlist",
+            ),
+            (vec!["search"], vec!["search_v1"], "RBAC", "alias-only RBAC"),
+        ];
+
+        for (allowlist, rbac_allowed, denial, case) in cases {
+            let action = rollout_action_with_authorization(&allowlist, &rbac_allowed);
+            action.federation.seed_tools_for_test(
+                HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+                None,
+            );
+
+            let list = mcp_handler_exchange(
+                &action,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            )
+            .await;
+            assert!(
+                list["result"]["tools"]
+                    .as_array()
+                    .expect("tools/list result")
+                    .iter()
+                    .all(|tool| tool["name"] != "search_v1"),
+                "{case} must hide the synthesized alias from tools/list"
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "search_v1", "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains(denial),
+                "{case} must deny the same resolved target on tools/call, got: {message}"
+            );
+        }
     }
 }

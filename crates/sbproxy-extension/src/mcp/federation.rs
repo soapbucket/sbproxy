@@ -6,7 +6,7 @@
 //! (`resources/list` + `resources/read`) and the prompt surface
 //! (`prompts/list` + `prompts/get`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -14,10 +14,14 @@ use reqwest::Url;
 use sbproxy_plugin::mcp::{default_no_op_hook, mcp_policy_hooks, McpPolicyHook, McpToolCallCtx};
 use sbproxy_plugin::traits::PolicyDecision;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::egress::{EgressPolicy, SystemHostResolver};
+use super::protocol::{
+    compile_modern_tool_contract, CompiledMcpToolContract, McpContractError, McpSchemaLimits,
+    McpToolContract,
+};
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse, META_TRACEPARENT, SEP_414_RESERVED_META_KEYS};
@@ -143,7 +147,7 @@ fn federated_name(
 // --- Registry ---
 
 /// A tool federated from an upstream MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FederatedTool {
     /// Unique tool name (may be prefixed with server name on conflict).
     pub name: String,
@@ -168,6 +172,440 @@ pub struct FederatedTool {
     /// UI template id, version, etag, or audit-cause field unchanged.
     /// Base-MCP clients ignore the unknown key per the spec.
     pub meta: Option<serde_json::Value>,
+    /// Complete upstream tool document, with only the advertised
+    /// name rewritten during federation. A strict contract exists
+    /// only when `inputSchema` is an object, as required by the
+    /// modern wire. Its absence deliberately does not discard the
+    /// legacy-compatible entry in [`Self::legacy_document`].
+    pub contract: Option<McpToolContract>,
+    /// Original legacy-compatible upstream document, present only
+    /// when no strict contract can exist. This retains a valid
+    /// string-named tool whose inputSchema is missing or not an
+    /// object, because the frozen legacy path historically listed and
+    /// routed those definitions. The legacy convenience fields carry
+    /// the exact old wire projection, including the synthesized
+    /// schema for a missing inputSchema. Valid and OpenAPI documents
+    /// live losslessly in [`Self::contract`] without a duplicate.
+    pub legacy_document: Option<Value>,
+    /// Precompiled modern input/output validators and header
+    /// projections. `None` keeps the tool available to legacy clients
+    /// while excluding it from modern discovery and modern lookup.
+    pub modern_contract: Option<Arc<CompiledMcpToolContract>>,
+    /// Stable, safe class describing why this tool has no modern
+    /// compiled contract. This deliberately excludes raw schemas,
+    /// references, and header values so it is safe to log.
+    pub modern_incompatibility: Option<String>,
+}
+
+impl std::fmt::Debug for FederatedTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = bounded_control_free_identifier(&self.name, 96);
+        let server_name = bounded_control_free_identifier(&self.server_name, 96);
+        formatter
+            .debug_struct("FederatedTool")
+            .field("name", &name)
+            .field("server_name", &server_name)
+            .field("streaming", &self.streaming)
+            .field("has_meta", &self.meta.is_some())
+            .field("has_contract", &self.contract.is_some())
+            .field("has_legacy_document", &self.legacy_document.is_some())
+            .field("modern_compiled", &self.modern_contract.is_some())
+            .field(
+                "modern_incompatibility",
+                &self
+                    .modern_incompatibility
+                    .as_deref()
+                    .map(bounded_modern_incompatibility_class),
+            )
+            .finish()
+    }
+}
+
+/// Whether the frozen legacy projection includes an upstream `_meta`
+/// block. MCP upstreams historically preserved it; OpenAPI-derived
+/// tools historically did not.
+#[derive(Debug, Clone, Copy)]
+enum LegacyMetaProjection {
+    Preserve,
+    Omit,
+}
+
+impl FederatedTool {
+    /// Build a federated tool from the complete upstream document
+    /// before deriving routing conveniences. A non-object document
+    /// or one without a string name is fundamentally unusable. In
+    /// contrast, a missing or non-object inputSchema is retained
+    /// exactly as the frozen legacy parser handled it and marked
+    /// modern-ineligible.
+    fn from_contract_document(
+        document: Value,
+        server_name: String,
+        streaming: bool,
+    ) -> Result<Self, McpContractError> {
+        Self::from_document_with_legacy_meta(
+            document,
+            server_name,
+            streaming,
+            LegacyMetaProjection::Preserve,
+        )
+    }
+
+    /// Construct an OpenAPI-derived tool. Its complete source
+    /// document remains available to modern clients, while the
+    /// legacy projection deliberately retains the historical absence
+    /// of `_meta`.
+    fn from_openapi_document(
+        document: Value,
+        server_name: String,
+        streaming: bool,
+    ) -> Result<Self, McpContractError> {
+        Self::from_document_with_legacy_meta(
+            document,
+            server_name,
+            streaming,
+            LegacyMetaProjection::Omit,
+        )
+    }
+
+    fn from_document_with_legacy_meta(
+        document: Value,
+        server_name: String,
+        streaming: bool,
+        legacy_meta_projection: LegacyMetaProjection,
+    ) -> Result<Self, McpContractError> {
+        let object = document
+            .as_object()
+            .ok_or(McpContractError::ToolMustBeObject)?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(McpContractError::MissingStringField("name"))?
+            .to_string();
+        let description = object
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let input_schema = object
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        let modern_incompatibility = match object.get("inputSchema") {
+            None => Some("missing_input_schema".to_string()),
+            Some(schema) if !schema.is_object() => Some("non_object_input_schema".to_string()),
+            Some(_) => None,
+        };
+        let meta = match legacy_meta_projection {
+            LegacyMetaProjection::Preserve => object.get("_meta").cloned(),
+            LegacyMetaProjection::Omit => None,
+        };
+
+        // Keep strict parsing exactly where the modern representation
+        // begins. This must not be weakened to accommodate a frozen
+        // legacy malformed definition.
+        let contract = McpToolContract::try_from(document.clone()).ok();
+        debug_assert!(contract.is_some() || modern_incompatibility.is_some());
+        let legacy_document = contract.is_none().then_some(document);
+
+        Ok(Self {
+            name,
+            description,
+            input_schema,
+            server_name,
+            streaming,
+            meta,
+            contract,
+            legacy_document,
+            modern_contract: None,
+            modern_incompatibility,
+        })
+    }
+
+    /// Rewrite only the strict contract or legacy fallback name, then
+    /// keep the frozen routing conveniences in lockstep. A malformed
+    /// legacy definition has no strict contract, so its raw fallback
+    /// is the authoritative source for this rewrite.
+    fn advertise_as(&mut self, advertised_name: &str) {
+        if let Some(contract) = self.contract.as_ref() {
+            self.contract = Some(contract.with_advertised_name(advertised_name));
+            self.sync_convenience_fields();
+        } else {
+            self.name = advertised_name.to_string();
+        }
+        if let Some(document) = self.legacy_document.as_mut().and_then(Value::as_object_mut) {
+            document.insert(
+                "name".to_string(),
+                Value::String(advertised_name.to_string()),
+            );
+        }
+    }
+
+    /// Compile the modern representation once per catalogue refresh.
+    /// A compile failure does not remove a legacy-compatible tool;
+    /// it becomes modern-ineligible with a safe, stable class only.
+    fn compile_modern_contract(&mut self) {
+        let Some(contract) = self.contract.as_ref() else {
+            self.modern_contract = None;
+            if self.modern_incompatibility.is_none() {
+                self.modern_incompatibility = Some("missing_input_schema".to_string());
+            }
+            return;
+        };
+        match compile_modern_tool_contract(contract, McpSchemaLimits::default()) {
+            Ok(compiled) => {
+                self.modern_contract = Some(Arc::new(compiled));
+                self.modern_incompatibility = None;
+            }
+            Err(error) => {
+                let class = modern_incompatibility_class(&error);
+                self.modern_contract = None;
+                self.modern_incompatibility = Some(class.to_string());
+            }
+        }
+    }
+
+    fn sync_convenience_fields(&mut self) {
+        let Some(contract) = self.contract.as_ref() else {
+            return;
+        };
+        self.name = contract.name().to_string();
+        self.description = contract.description().unwrap_or_default().to_string();
+        self.input_schema = contract.input_schema().clone();
+    }
+
+    /// A strict complete document is the authoritative prerequisite for every
+    /// modern catalogue use. Compilation separately controls whether that
+    /// strict document is discoverable: an incompatible strict contract still
+    /// participates in the lossless publication digest so changes cannot be
+    /// silently suppressed.
+    fn is_modern_eligible(&self) -> bool {
+        self.contract.is_some()
+    }
+
+    /// Whether a strict modern contract also compiled for caller-facing
+    /// discovery and ingress validation.
+    fn is_modern_discoverable(&self) -> bool {
+        self.is_modern_eligible() && self.modern_contract.is_some()
+    }
+
+    /// Name CodeMode should emit. Valid tools read the strict contract;
+    /// frozen malformed legacy definitions use their preserved routing
+    /// convenience instead.
+    pub(crate) fn codemode_name(&self) -> &str {
+        match self.contract.as_ref() {
+            Some(contract) => contract.name(),
+            None => &self.name,
+        }
+    }
+
+    /// Description CodeMode should emit, preserving the old fallback
+    /// semantics when a strict modern contract is unavailable.
+    pub(crate) fn codemode_description(&self) -> &str {
+        match self.contract.as_ref() {
+            Some(contract) => contract.description().unwrap_or_default(),
+            None => &self.description,
+        }
+    }
+
+    /// Input schema CodeMode should emit. The fallback intentionally
+    /// permits a non-object schema because that is what the legacy
+    /// CodeMode behavior observed.
+    pub(crate) fn codemode_input_schema(&self) -> &Value {
+        match self.contract.as_ref() {
+            Some(contract) => contract.input_schema(),
+            None => &self.input_schema,
+        }
+    }
+}
+
+/// Convert a contract compilation error into the bounded vocabulary
+/// that is safe for a catalog-refresh log and a persisted modern
+/// incompatibility marker. Do not include the error text here: some
+/// variants carry an upstream schema or external reference.
+fn modern_incompatibility_class(error: &McpContractError) -> &'static str {
+    match error {
+        McpContractError::ToolMustBeObject => "tool_not_object",
+        McpContractError::ToolResultMustBeObject => "tool_result_not_object",
+        McpContractError::MissingStringField(_) => "missing_string_field",
+        McpContractError::MissingObjectField(_) => "missing_object_field",
+        McpContractError::MissingArrayField(_) => "missing_array_field",
+        McpContractError::UnsupportedSchemaDialect(_) => "unsupported_schema_dialect",
+        McpContractError::InvalidSchema(_) => "invalid_schema",
+        McpContractError::ExternalReference { .. } => "external_reference",
+        McpContractError::LimitExceeded { .. } => "schema_limit_exceeded",
+        McpContractError::UnreachableHeaderProjection(_) => "unreachable_header_projection",
+        McpContractError::DuplicateHeaderProjection(_) => "duplicate_header_projection",
+        McpContractError::InvalidHeaderName(_) => "invalid_header_name",
+        McpContractError::UnsupportedHeaderValueKind { .. } => "unsupported_header_value_kind",
+        McpContractError::MissingMirroredHeader(_) => "missing_mirrored_header",
+        McpContractError::UnexpectedMirroredHeader(_) => "unexpected_mirrored_header",
+        McpContractError::MirroredHeaderMismatch(_) => "mirrored_header_mismatch",
+        McpContractError::UnsafeProjectedInteger(_) => "unsafe_projected_integer",
+    }
+}
+
+/// Convert an incompatibility marker to the closed label vocabulary used for
+/// catalog-change telemetry. `FederatedTool` remains publicly constructible,
+/// so an externally assembled entry may carry an unexpected marker; it maps
+/// to one bounded bucket rather than becoming a log-cardinality label.
+fn bounded_modern_incompatibility_class(class: &str) -> &'static str {
+    match class {
+        "missing_input_schema" => "missing_input_schema",
+        "non_object_input_schema" => "non_object_input_schema",
+        "tool_not_object" => "tool_not_object",
+        "tool_result_not_object" => "tool_result_not_object",
+        "missing_string_field" => "missing_string_field",
+        "missing_object_field" => "missing_object_field",
+        "missing_array_field" => "missing_array_field",
+        "unsupported_schema_dialect" => "unsupported_schema_dialect",
+        "invalid_schema" => "invalid_schema",
+        "external_reference" => "external_reference",
+        "schema_limit_exceeded" => "schema_limit_exceeded",
+        _ => "other",
+    }
+}
+
+const MAX_MODERN_INCOMPATIBILITY_CHANGE_EVENTS: usize = 32;
+const MAX_MODERN_INCOMPATIBILITY_IDENTIFIER_BYTES: usize = 96;
+
+/// One bounded, non-secret modern eligibility transition suitable for logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModernIncompatibilityChange {
+    kind: &'static str,
+    class: &'static str,
+    tool: String,
+    server: String,
+}
+
+fn bounded_control_free_identifier(value: &str, max_bytes: usize) -> String {
+    let mut bounded = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars() {
+        let safe = if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            ) {
+            '\u{fffd}'
+        } else {
+            character
+        };
+        if bounded.len() + safe.len_utf8() > max_bytes {
+            break;
+        }
+        bounded.push(safe);
+    }
+    if bounded.is_empty() {
+        bounded.push_str("<empty>");
+    }
+    bounded
+}
+
+fn modern_incompatibility_change(
+    kind: &'static str,
+    tool: &FederatedTool,
+) -> Option<ModernIncompatibilityChange> {
+    let class = tool.modern_incompatibility.as_deref()?;
+    Some(ModernIncompatibilityChange {
+        kind,
+        class: bounded_modern_incompatibility_class(class),
+        tool: bounded_control_free_identifier(
+            &tool.name,
+            MAX_MODERN_INCOMPATIBILITY_IDENTIFIER_BYTES,
+        ),
+        server: bounded_control_free_identifier(
+            &tool.server_name,
+            MAX_MODERN_INCOMPATIBILITY_IDENTIFIER_BYTES,
+        ),
+    })
+}
+
+/// Diff incompatible entries by stable catalog identity, not aggregate count.
+/// The result is sorted and capped so a hostile catalog cannot amplify logs.
+fn modern_incompatibility_changes(
+    previous: &HashMap<String, FederatedTool>,
+    next: &HashMap<String, FederatedTool>,
+) -> Vec<ModernIncompatibilityChange> {
+    let mut identities: Vec<&String> = previous.keys().chain(next.keys()).collect();
+    identities.sort_unstable();
+    identities.dedup();
+
+    let mut changes = Vec::new();
+    for identity in identities {
+        let before = previous.get(identity);
+        let after = next.get(identity);
+        let before_state = before.and_then(|tool| {
+            tool.modern_incompatibility.as_deref().map(|class| {
+                (
+                    bounded_modern_incompatibility_class(class),
+                    tool.server_name.as_str(),
+                    tool.name.as_str(),
+                )
+            })
+        });
+        let after_state = after.and_then(|tool| {
+            tool.modern_incompatibility.as_deref().map(|class| {
+                (
+                    bounded_modern_incompatibility_class(class),
+                    tool.server_name.as_str(),
+                    tool.name.as_str(),
+                )
+            })
+        });
+
+        let change = match (before_state, after_state) {
+            (None, Some(_)) => after.and_then(|tool| modern_incompatibility_change("added", tool)),
+            (Some(_), None) => {
+                before.and_then(|tool| modern_incompatibility_change("removed", tool))
+            }
+            (Some(before_state), Some(after_state)) if before_state != after_state => {
+                after.and_then(|tool| modern_incompatibility_change("changed", tool))
+            }
+            _ => None,
+        };
+        if let Some(change) = change {
+            changes.push(change);
+            if changes.len() == MAX_MODERN_INCOMPATIBILITY_CHANGE_EVENTS {
+                break;
+            }
+        }
+    }
+    changes
+}
+
+/// Count modern-ineligible tools by a closed, non-sensitive class vocabulary.
+/// Tool names, server names, schemas, and reference values deliberately do
+/// not enter this aggregate.
+fn modern_incompatibility_summary(
+    registry: &HashMap<String, FederatedTool>,
+) -> BTreeMap<&'static str, usize> {
+    let mut summary = BTreeMap::new();
+    for tool in registry.values() {
+        let Some(class) = tool.modern_incompatibility.as_deref() else {
+            continue;
+        };
+        *summary
+            .entry(bounded_modern_incompatibility_class(class))
+            .or_default() += 1;
+    }
+    summary
+}
+
+/// Return the next aggregate only when its bounded incompatibility state
+/// changed. This is the testable guard around catalog-change-only telemetry.
+#[cfg(test)]
+fn modern_incompatibility_change_summary(
+    previous: &HashMap<String, FederatedTool>,
+    next: &HashMap<String, FederatedTool>,
+) -> Option<BTreeMap<&'static str, usize>> {
+    let previous_summary = modern_incompatibility_summary(previous);
+    let next_summary = modern_incompatibility_summary(next);
+    (previous_summary != next_summary).then_some(next_summary)
 }
 
 /// A resource federated from an upstream MCP server. Mirrors
@@ -284,11 +722,170 @@ pub struct ToolVersioningGate {
     pub judges: Vec<Arc<dyn super::compat::Judge>>,
 }
 
+/// One immutable publication of every value that must agree with a
+/// federated tool catalogue. Readers load this once, so a refresh can
+/// never expose a new tool registry under an old generation or an old
+/// version-gate verdict.
+struct ToolCatalogState {
+    /// Advertised tool name to complete federated entry.
+    tools: Arc<HashMap<String, FederatedTool>>,
+    /// Version-gate verdicts for exactly this registry.
+    version_blocked: Arc<HashMap<String, String>>,
+    /// Frozen legacy content digest for change detection.
+    legacy_digest: u64,
+    /// Collision-resistant lossless strict-contract digest for modern
+    /// publication. This is deliberately distinct from the frozen legacy
+    /// `u64` compatibility oracle.
+    modern_digest: [u8; 32],
+    /// Generation of the frozen legacy catalogue.
+    tools_generation: u64,
+    /// Generation of the complete modern catalogue.
+    modern_tools_generation: u64,
+    /// Generation of the CodeMode discovery view. It advances for a
+    /// frozen legacy tool change or a version-gate verdict change,
+    /// because either changes which tool calls CodeMode may advertise.
+    codemode_generation: u64,
+    /// Prebuilt frozen legacy catalogue for `tools/list` readers.
+    legacy_serialized: Arc<SerializedTools>,
+    /// Prebuilt complete modern catalogue for modern discovery readers.
+    modern_serialized: Arc<ModernSerializedTools>,
+}
+
+impl ToolCatalogState {
+    fn empty() -> Self {
+        Self {
+            tools: Arc::new(HashMap::new()),
+            version_blocked: Arc::new(HashMap::new()),
+            legacy_digest: 0,
+            // The empty modern publication must have the same digest as a
+            // registry containing only malformed legacy fallbacks, otherwise
+            // the first such legacy-only refresh would spuriously churn the
+            // modern generation and cache identity.
+            modern_digest: modern_tools_registry_digest(&HashMap::new()),
+            tools_generation: 0,
+            modern_tools_generation: 0,
+            codemode_generation: 0,
+            legacy_serialized: Arc::new(SerializedTools {
+                generation: 0,
+                entries: Vec::new(),
+                full_array: "[]".to_string(),
+            }),
+            modern_serialized: Arc::new(ModernSerializedTools {
+                generation: 0,
+                entries: Vec::new(),
+                full_array: "[]".to_string(),
+            }),
+        }
+    }
+}
+
+/// A coherent read handle for one immutable tool-catalogue publication.
+///
+/// Keep this handle alive while combining a listed or resolved tool with
+/// its version-gate verdict. It prevents a refresh from splitting those
+/// coupled decisions across two different catalogues.
+#[derive(Clone)]
+pub struct ToolCatalogSnapshot {
+    state: Arc<ToolCatalogState>,
+    /// Private per-federation identity. This prevents an opaque snapshot from
+    /// one federation being replayed through another federation's server
+    /// configuration.
+    owner: Arc<()>,
+}
+
+impl ToolCatalogSnapshot {
+    /// Frozen legacy `tools/list` snapshot matching this verdict map.
+    pub fn serialized_tools(&self) -> Arc<SerializedTools> {
+        Arc::clone(&self.state.legacy_serialized)
+    }
+
+    /// Complete modern `tools/list` snapshot matching this verdict map.
+    pub fn serialized_modern_tools(&self) -> Arc<ModernSerializedTools> {
+        Arc::clone(&self.state.modern_serialized)
+    }
+
+    /// Version-gate verdicts for exactly the tools in this snapshot.
+    pub fn version_blocked(&self) -> &HashMap<String, String> {
+        self.state.version_blocked.as_ref()
+    }
+
+    /// Frozen legacy generation for this publication.
+    pub fn tools_generation(&self) -> u64 {
+        self.state.tools_generation
+    }
+
+    /// Complete modern generation for this publication.
+    pub fn modern_tools_generation(&self) -> u64 {
+        self.state.modern_tools_generation
+    }
+
+    /// List every federated tool from this exact publication. Pair
+    /// the result with [`Self::version_blocked`] from this same handle
+    /// before exposing a discovery or policy surface.
+    pub fn list_tools(&self) -> Vec<FederatedTool> {
+        self.state.tools.values().cloned().collect()
+    }
+
+    /// Borrow every tool from this exact publication without cloning its
+    /// complete contract document. Discovery paths that only serialize or
+    /// inspect entries should prefer this iterator over [`Self::list_tools`].
+    pub fn iter_tools(&self) -> impl Iterator<Item = &FederatedTool> {
+        self.state.tools.values()
+    }
+
+    /// Resolve one federated tool from this exact publication. Use
+    /// [`Self::resolve_tool_with_version_block`] when the caller also
+    /// needs the matching version-gate verdict.
+    pub fn resolve_tool(&self, tool_name: &str) -> Option<FederatedTool> {
+        self.state.tools.get(tool_name).cloned()
+    }
+
+    /// Resolve a tool and its version-gate verdict from one publication.
+    pub fn resolve_tool_with_version_block(
+        &self,
+        tool_name: &str,
+    ) -> (Option<FederatedTool>, Option<String>) {
+        (
+            self.state.tools.get(tool_name).cloned(),
+            self.state.version_blocked.get(tool_name).cloned(),
+        )
+    }
+}
+
+/// A coherent read handle for one immutable prompt-catalogue publication.
+///
+/// Retain this handle from the ownership decision through dispatch. Its fields
+/// are private so callers cannot forge a server mapping after authorization.
+#[derive(Clone)]
+pub struct PromptCatalogSnapshot {
+    prompts: Arc<HashMap<String, FederatedPrompt>>,
+    owner: Arc<()>,
+}
+
+impl PromptCatalogSnapshot {
+    /// Clone every internally consistent prompt from this publication.
+    pub fn list_prompts(&self) -> Vec<FederatedPrompt> {
+        self.prompts
+            .iter()
+            .filter(|(name, prompt)| name.as_str() == prompt.name)
+            .map(|(_, prompt)| prompt.clone())
+            .collect()
+    }
+
+    /// Resolve a prompt without consulting a later live publication.
+    pub fn resolve_prompt(&self, name: &str) -> Option<&FederatedPrompt> {
+        self.prompts.get(name).filter(|prompt| prompt.name == name)
+    }
+}
+
 /// Aggregates tools from multiple upstream MCP servers into one registry.
 pub struct McpFederation {
     servers: Vec<McpServerConfig>,
-    /// tool_name -> FederatedTool
-    tools: ArcSwap<HashMap<String, FederatedTool>>,
+    /// Immutable registry, version-gate, digest, generation, and
+    /// pre-serialized catalogue publication for the tool surface.
+    tool_catalog: ArcSwap<ToolCatalogState>,
+    /// Private identity bound into every [`ToolCatalogSnapshot`].
+    tool_catalog_owner: Arc<()>,
     /// resource_uri -> FederatedResource. WOR-818: populated by
     /// `refresh_resources` so OpenAI Apps SDK clients can fetch
     /// UI templates declared on tools through the gateway.
@@ -297,6 +894,8 @@ pub struct McpFederation {
     /// from the upstreams that declare the `prompts` capability;
     /// every other upstream contributes nothing.
     prompts: ArcSwap<HashMap<String, FederatedPrompt>>,
+    /// Private identity bound into every [`PromptCatalogSnapshot`].
+    prompt_catalog_owner: Arc<()>,
     /// server_name -> the `capabilities` object the upstream returned
     /// from `initialize`, refreshed by `refresh_server_capabilities`.
     /// One probe per upstream per cycle feeds every registry that
@@ -323,20 +922,14 @@ pub struct McpFederation {
     connect_timeout: std::time::Duration,
     /// Whole-request deadline, kept for the same per-dial clients.
     request_timeout: std::time::Duration,
-    /// Monotonic catalogue generation. Bumps once per refresh that
-    /// actually changed the tool or resource registry (content
-    /// digest short-circuit), so consumers can key caches on it and
-    /// emit `list_changed` notifications only on real change.
+    /// Monotonic cross-surface change signal. It advances for a
+    /// frozen-legacy tool change or a resource change, preserving the
+    /// existing notification behavior. Tool cache identities instead
+    /// live in the immutable catalogue state's dedicated generations.
     generation: std::sync::atomic::AtomicU64,
-    /// Tool-registry-only generation, for `tools/list_changed`
-    /// notifications (WOR-1642).
-    tools_generation: std::sync::atomic::AtomicU64,
     /// Resource-registry-only generation, for
     /// `resources/list_changed` notifications (WOR-1642).
     resources_generation: std::sync::atomic::AtomicU64,
-    /// Content digest of the last stored tool registry. Zero until
-    /// the first refresh.
-    tools_digest: std::sync::atomic::AtomicU64,
     /// Content digest of the last stored resource registry (plus the
     /// mirrored mcpApps capability). Zero until the first refresh.
     resources_digest: std::sync::atomic::AtomicU64,
@@ -357,31 +950,42 @@ pub struct McpFederation {
     /// Serialises the cold-start prime so N concurrent first
     /// requests trigger exactly one upstream fan-out.
     prime_lock: tokio::sync::Mutex<()>,
+    /// Serialises tool fetch, versioning, and publication. In
+    /// particular, no digest or registry mutation happens before the
+    /// final versioning await completes, so cancellation leaves the
+    /// previous snapshot coherent and retryable.
+    tools_refresh_lock: tokio::sync::Mutex<()>,
     /// Tool-versioning gate (WOR-1635); `None` disables the oracle.
     versioning: Option<ToolVersioningGate>,
-    /// Advertised names currently blocked by the version gate, with
-    /// the violation detail (only populated in Block mode).
-    version_blocked: ArcSwap<HashMap<String, String>>,
-    /// WOR-1640: per-generation pre-serialized tool catalogue, so
-    /// `tools/list` responses are string splices instead of
-    /// per-request `FederatedTool` clones and re-serialization.
-    serialized_tools: ArcSwap<SerializedTools>,
     /// WOR-1640: per-generation codemode.ts module + ETag, so the
     /// well-known route re-emits and re-hashes only when the
     /// catalogue (or callback base) changes.
     codemode_cache: ArcSwap<CodemodeCache>,
 }
 
-/// Pre-serialized tool catalogue for one registry generation
-/// (WOR-1640). `entries` carry the routing fields needed for
-/// per-request filtering; `full_array` is the whole catalogue as a
-/// serialized JSON array for the unfiltered fast path.
+/// Pre-serialized frozen legacy tool catalogue for one legacy
+/// registry generation (WOR-1640).
 pub struct SerializedTools {
-    /// Registry generation this snapshot was built from.
+    /// Frozen legacy tool generation this snapshot was built from.
     pub generation: u64,
     /// One entry per advertised tool, sorted by name.
     pub entries: Vec<SerializedToolEntry>,
     /// The full catalogue as a serialized JSON array.
+    pub full_array: String,
+}
+
+/// Pre-serialized complete modern tool catalogue for one modern
+/// registry generation. It holds only entries with a strict,
+/// compiled caller-facing contract and never changes the legacy cache
+/// identity.
+pub struct ModernSerializedTools {
+    /// Modern-catalogue generation this snapshot was built from.
+    pub generation: u64,
+    /// One complete contract entry per modern-compatible advertised
+    /// tool, sorted by name.
+    pub entries: Vec<SerializedToolEntry>,
+    /// The complete modern-compatible catalogue as a serialized JSON
+    /// array.
     pub full_array: String,
 }
 
@@ -391,8 +995,8 @@ pub struct SerializedToolEntry {
     pub name: String,
     /// Owning upstream server name, for per-server policy lookups.
     pub server_name: String,
-    /// The serialized tool object (`{"name":...,"description":...,
-    /// "inputSchema":...}` plus `_meta` when present).
+    /// The era-specific serialized tool object. Legacy entries carry
+    /// the frozen projection; modern entries carry the full contract.
     pub json: String,
 }
 
@@ -444,9 +1048,11 @@ impl McpFederation {
             .unwrap_or_default();
         Self {
             servers,
-            tools: ArcSwap::from_pointee(HashMap::new()),
+            tool_catalog: ArcSwap::from_pointee(ToolCatalogState::empty()),
+            tool_catalog_owner: Arc::new(()),
             resources: ArcSwap::from_pointee(HashMap::new()),
             prompts: ArcSwap::from_pointee(HashMap::new()),
+            prompt_catalog_owner: Arc::new(()),
             server_capabilities: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
@@ -456,23 +1062,14 @@ impl McpFederation {
             connect_timeout: io.connect_timeout,
             request_timeout: io.request_timeout,
             generation: std::sync::atomic::AtomicU64::new(0),
-            tools_generation: std::sync::atomic::AtomicU64::new(0),
             resources_generation: std::sync::atomic::AtomicU64::new(0),
-            tools_digest: std::sync::atomic::AtomicU64::new(0),
             resources_digest: std::sync::atomic::AtomicU64::new(0),
             prompts_digest: std::sync::atomic::AtomicU64::new(0),
             refresh_task_started: std::sync::atomic::AtomicBool::new(false),
             primed: std::sync::atomic::AtomicBool::new(false),
             prime_lock: tokio::sync::Mutex::new(()),
+            tools_refresh_lock: tokio::sync::Mutex::new(()),
             versioning,
-            version_blocked: ArcSwap::from_pointee(HashMap::new()),
-            serialized_tools: ArcSwap::from_pointee(SerializedTools {
-                // u64::MAX never equals a live generation, so the
-                // first call rebuilds.
-                generation: u64::MAX,
-                entries: Vec::new(),
-                full_array: "[]".to_string(),
-            }),
             codemode_cache: ArcSwap::from_pointee(CodemodeCache {
                 generation: u64::MAX,
                 callback_base: String::new(),
@@ -489,6 +1086,7 @@ impl McpFederation {
     ///
     /// Returns the total number of federated tools.
     pub async fn refresh_tools(&self) -> anyhow::Result<usize> {
+        let _refresh_guard = self.tools_refresh_lock.lock().await;
         let mut registry: HashMap<String, FederatedTool> = HashMap::new();
         let mut peers_up: i64 = 0;
 
@@ -516,7 +1114,11 @@ impl McpFederation {
                         }
                         // Advertise the resolved name so the client sees and
                         // calls the same name `resolve_tool` routes by.
-                        tool.name = advertised.clone();
+                        tool.advertise_as(&advertised);
+                        // Compilation happens after namespacing, once per
+                        // refresh. A failure is a modern eligibility result,
+                        // never a reason to remove a legacy tool.
+                        tool.compile_modern_contract();
                         registry.insert(advertised, tool);
                     }
                 }
@@ -535,22 +1137,56 @@ impl McpFederation {
 
         let count = registry.len();
         let digest = tools_registry_digest(&registry);
-        // Swap only on real change so steady-state refreshes do not
-        // churn the ArcSwap and the generation only moves when the
-        // catalogue does.
-        if self
-            .tools_digest
-            .swap(digest, std::sync::atomic::Ordering::AcqRel)
-            != digest
-        {
+        let modern_digest = modern_tools_registry_digest(&registry);
+        // Do not mutate either digest before the versioning await.
+        // An aborted refresh must leave the prior registry, digests,
+        // generations, and cache identities coherent so the identical
+        // retry can publish. The refresh lock makes these loads a
+        // single-writer comparison rather than a best-effort race.
+        let current_catalog = self.tool_catalog.load_full();
+        let legacy_changed = current_catalog.legacy_digest != digest;
+        let modern_changed = current_catalog.modern_digest != modern_digest;
+        if legacy_changed || modern_changed {
+            let incompatibility_changes =
+                modern_incompatibility_changes(current_catalog.tools.as_ref(), &registry);
+            let incompatibility_summary = (!incompatibility_changes.is_empty())
+                .then(|| modern_incompatibility_summary(&registry));
             // WOR-1635: grade the changed catalogue against the
-            // lockfile baseline before publishing it.
-            self.evaluate_tool_versioning(&registry).await;
-            self.tools.store(Arc::new(registry));
-            self.generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            self.tools_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            // lockfile baseline before publishing it. Modern-only
+            // fields must never perturb the legacy oracle.
+            let version_blocked = if legacy_changed {
+                self.evaluate_tool_versioning_snapshot(&registry).await
+            } else {
+                None
+            };
+            self.publish_tool_refresh(
+                registry,
+                digest,
+                modern_digest,
+                legacy_changed,
+                modern_changed,
+                version_blocked,
+            );
+            for change in &incompatibility_changes {
+                warn!(
+                    target: "sbproxy::mcp::catalog",
+                    kind = change.kind,
+                    class = change.class,
+                    tool = %change.tool,
+                    server = %change.server,
+                    "MCP modern catalog incompatibility changed"
+                );
+            }
+            if let Some(classes) = incompatibility_summary {
+                let total: usize = classes.values().sum();
+                warn!(
+                    target: "sbproxy::mcp::catalog",
+                    total,
+                    emitted = incompatibility_changes.len(),
+                    classes = ?classes,
+                    "MCP modern catalog incompatibility summary changed"
+                );
+            }
             debug!(total_tools = count, "MCP federation registry refreshed");
         } else {
             debug!(
@@ -573,24 +1209,16 @@ impl McpFederation {
                 .tools
                 .iter()
                 .filter_map(|t| {
-                    let name = t.get("name")?.as_str()?.to_string();
-                    let description = t
-                        .get("description")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let input_schema = t
-                        .get("inputSchema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-                    Some(FederatedTool {
-                        name,
-                        description,
-                        input_schema,
-                        server_name: server.name.clone(),
-                        streaming: false,
-                        meta: None,
-                    })
+                    FederatedTool::from_openapi_document(
+                        t.clone(),
+                        server.name.clone(),
+                        // Preserve the existing OpenAPI behaviour:
+                        // converted REST tools are single-response
+                        // tools unless a later adapter explicitly
+                        // introduces streaming.
+                        false,
+                    )
+                    .ok()
                 })
                 .collect();
             return Ok(federated);
@@ -622,26 +1250,8 @@ impl McpFederation {
         let federated = tool_defs
             .into_iter()
             .filter_map(|t| {
-                let name = t.get("name")?.as_str()?.to_string();
-                let description = t
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let input_schema = t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
                 let streaming = tool_advertises_streaming(&t);
-                let meta = t.get("_meta").cloned();
-                Some(FederatedTool {
-                    name,
-                    description,
-                    input_schema,
-                    server_name: server.name.clone(),
-                    streaming,
-                    meta,
-                })
+                FederatedTool::from_contract_document(t, server.name.clone(), streaming).ok()
             })
             .collect();
 
@@ -649,13 +1259,72 @@ impl McpFederation {
     }
 
     /// Look up which server owns a tool.
+    ///
+    /// This compatibility accessor is unsafe to combine with a later
+    /// [`Self::version_blocked`] or serialized-catalogue read for a coupled
+    /// policy decision: a refresh may publish between independent calls. Use
+    /// [`Self::tool_catalog_snapshot`] and retain that snapshot instead.
     pub fn resolve_tool(&self, tool_name: &str) -> Option<FederatedTool> {
-        self.tools.load().get(tool_name).cloned()
+        let catalog = self.tool_catalog.load();
+        catalog.tools.get(tool_name).cloned()
+    }
+
+    /// Load one immutable tool-catalogue publication for a coupled
+    /// read. Keep this snapshot while combining a tool with its
+    /// version-gate verdict or serialized discovery view.
+    pub fn tool_catalog_snapshot(&self) -> ToolCatalogSnapshot {
+        ToolCatalogSnapshot {
+            state: self.tool_catalog.load_full(),
+            owner: Arc::clone(&self.tool_catalog_owner),
+        }
+    }
+
+    /// Resolve a tool and its version-gate verdict from the same
+    /// immutable publication. This is the dispatch-safe alternative
+    /// to separately calling [`Self::version_blocked`] and
+    /// [`Self::resolve_tool`].
+    pub fn resolve_tool_with_version_block(
+        &self,
+        tool_name: &str,
+    ) -> (Option<FederatedTool>, Option<String>) {
+        self.tool_catalog_snapshot()
+            .resolve_tool_with_version_block(tool_name)
+    }
+
+    /// Look up a tool only when it has a compiled caller-facing modern
+    /// contract. This lets modern ingress validate the resolved
+    /// advertised contract before any rollout adapter or dispatch
+    /// gate, while a legacy caller continues to use [`Self::resolve_tool`].
+    pub fn resolve_modern_tool(&self, tool_name: &str) -> Option<FederatedTool> {
+        let catalog = self.tool_catalog.load();
+        catalog
+            .tools
+            .get(tool_name)
+            .filter(|tool| tool.is_modern_discoverable())
+            .cloned()
     }
 
     /// List all federated tools.
+    ///
+    /// This compatibility accessor is unsafe to combine with a separate
+    /// version-gate or serialized-catalogue read. Coupled discovery and
+    /// policy surfaces must retain one [`Self::tool_catalog_snapshot`].
     pub fn list_tools(&self) -> Vec<FederatedTool> {
-        self.tools.load().values().cloned().collect()
+        let catalog = self.tool_catalog.load();
+        catalog.tools.values().cloned().collect()
+    }
+
+    /// List the subset of tools that have complete, compiled modern
+    /// contracts. The separate method keeps legacy discovery and
+    /// routing independent from modern eligibility.
+    pub fn list_modern_tools(&self) -> Vec<FederatedTool> {
+        let catalog = self.tool_catalog.load();
+        catalog
+            .tools
+            .values()
+            .filter(|tool| tool.is_modern_discoverable())
+            .cloned()
+            .collect()
     }
 
     /// WOR-818: fetch the `mcpApps` capability mirrored from the
@@ -961,14 +1630,32 @@ impl McpFederation {
 
     // --- Prompts ---
 
-    /// List every federated prompt currently in the registry.
-    pub fn list_prompts(&self) -> Vec<FederatedPrompt> {
-        self.prompts.load().values().cloned().collect()
+    /// Load one immutable prompt-catalogue publication.
+    ///
+    /// Keep this handle from owner authorization through
+    /// [`Self::get_prompt_from_snapshot`] so a refresh cannot replace the
+    /// selected upstream between those steps.
+    pub fn prompt_catalog_snapshot(&self) -> PromptCatalogSnapshot {
+        PromptCatalogSnapshot {
+            prompts: self.prompts.load_full(),
+            owner: Arc::clone(&self.prompt_catalog_owner),
+        }
     }
 
-    /// Look up which server owns an advertised prompt name.
+    /// List every federated prompt from one fresh registry publication.
+    ///
+    /// Callers that combine this list with another decision should retain one
+    /// [`PromptCatalogSnapshot`] instead of calling this compatibility method.
+    pub fn list_prompts(&self) -> Vec<FederatedPrompt> {
+        self.prompt_catalog_snapshot().list_prompts()
+    }
+
+    /// Look up which server owns a prompt in one fresh publication.
+    ///
+    /// Never combine this compatibility lookup with a later authorization or
+    /// dispatch. Retain one [`PromptCatalogSnapshot`] for coupled decisions.
     pub fn resolve_prompt(&self, name: &str) -> Option<FederatedPrompt> {
-        self.prompts.load().get(name).cloned()
+        self.prompt_catalog_snapshot().resolve_prompt(name).cloned()
     }
 
     /// The `prompts` capability object the gateway may honestly
@@ -1106,19 +1793,38 @@ impl McpFederation {
         Ok(federated)
     }
 
-    /// Fetch a prompt through the federation, routing by the
-    /// advertised (possibly namespaced) name.
+    /// Fetch a prompt through one fresh prompt-catalogue publication.
     ///
-    /// The upstream receives the name it advertised, so a vendor
-    /// server never has to know about the gateway's
-    /// collision-avoidance scheme. That is the contract
-    /// [`Self::read_resource`] already holds for resource URIs.
+    /// This compatibility wrapper is safe only when no separate authorization
+    /// decision preceded it. Authorization-aware callers must use
+    /// [`Self::get_prompt_from_snapshot`] with the exact held snapshot.
     pub async fn get_prompt(
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        let prompt = self
+        let catalog = self.prompt_catalog_snapshot();
+        self.get_prompt_from_snapshot(&catalog, name, arguments)
+            .await
+    }
+
+    /// Fetch a prompt using the exact immutable publication held by a prior
+    /// ownership and authorization decision.
+    ///
+    /// The upstream receives the name it advertised, so a vendor
+    /// server never has to know about the gateway's
+    /// collision-avoidance scheme. That is the contract
+    /// [`Self::read_resource`] already holds for resource URIs.
+    pub async fn get_prompt_from_snapshot(
+        &self,
+        catalog: &PromptCatalogSnapshot,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        if !Arc::ptr_eq(&self.prompt_catalog_owner, &catalog.owner) {
+            anyhow::bail!("invalid prompt catalogue snapshot");
+        }
+        let prompt = catalog
             .resolve_prompt(name)
             .ok_or_else(|| anyhow::anyhow!("unknown prompt: {name}"))?;
         let server = self
@@ -1173,9 +1879,8 @@ impl McpFederation {
     /// depend on byte-stability for Etag computation can hash the
     /// returned string.
     pub fn codemode_ts(&self, callback_base_url: &str) -> String {
-        let mut tools: Vec<FederatedTool> = self.tools.load().values().cloned().collect();
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
-        super::codemode_ts::emit_codemode_ts(&tools, callback_base_url)
+        let catalog = self.tool_catalog.load_full();
+        codemode_ts_for_catalog(&catalog, callback_base_url)
     }
 
     /// Call a tool, routing to the correct upstream server.
@@ -1209,6 +1914,51 @@ impl McpFederation {
     ) -> anyhow::Result<serde_json::Value> {
         match self
             .call_tool_with_policy_cause_and_headers(
+                tool_name,
+                arguments,
+                None,
+                "",
+                "",
+                None,
+                upstream_headers,
+            )
+            .await?
+        {
+            McpCallOutcome::Allowed(value) => Ok(value),
+            McpCallOutcome::DeniedByPolicy { code, message } => {
+                anyhow::bail!(
+                    "tool call {} denied by mcp policy hook: {} (code {})",
+                    tool_name,
+                    message,
+                    code
+                );
+            }
+        }
+    }
+
+    /// Call a tool using the exact immutable catalogue publication held by a
+    /// prior decision. The snapshot type cannot be constructed outside this
+    /// module, so callers cannot forge or mutate the server routing fields
+    /// after policy and version-gate checks. Core dispatch uses this after
+    /// those gates so publication cannot replace the selected upstream before
+    /// the outbound request.
+    pub async fn call_tool_with_upstream_headers_from_snapshot(
+        &self,
+        catalog: &ToolCatalogSnapshot,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        upstream_headers: &[(String, String)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if !Arc::ptr_eq(&self.tool_catalog_owner, &catalog.owner) {
+            anyhow::bail!("tool catalogue snapshot belongs to another federation");
+        }
+        let (held_tool, version_blocked) = catalog.resolve_tool_with_version_block(tool_name);
+        if version_blocked.is_some() {
+            anyhow::bail!("tool is blocked by the held catalogue version gate");
+        }
+        match self
+            .call_tool_with_policy_cause_and_headers_from_held_tool(
+                held_tool,
                 tool_name,
                 arguments,
                 None,
@@ -1338,9 +2088,40 @@ impl McpFederation {
         audit_cause: Option<&str>,
         upstream_headers: &[(String, String)],
     ) -> anyhow::Result<McpCallOutcome> {
-        let federated = self
-            .resolve_tool(tool_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", tool_name))?;
+        let catalog = self.tool_catalog_snapshot();
+        self.call_tool_with_policy_cause_and_headers_from_held_tool(
+            catalog.resolve_tool(tool_name),
+            tool_name,
+            arguments,
+            agent_id,
+            correlation_id,
+            workspace_id,
+            audit_cause,
+            upstream_headers,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // policy identity + held catalog entry seam
+    async fn call_tool_with_policy_cause_and_headers_from_held_tool(
+        &self,
+        federated: Option<FederatedTool>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        agent_id: Option<&str>,
+        correlation_id: &str,
+        workspace_id: &str,
+        audit_cause: Option<&str>,
+        upstream_headers: &[(String, String)],
+    ) -> anyhow::Result<McpCallOutcome> {
+        let federated = federated.ok_or_else(|| anyhow::anyhow!("unknown tool: {}", tool_name))?;
+        if federated.name != tool_name {
+            anyhow::bail!("held tool name mismatch");
+        }
+        // Once a snapshot entry was accepted, every hook, outbound
+        // request, and OpenAPI route must use its advertised name,
+        // not a separate caller-supplied string.
+        let tool_name = federated.name.as_str();
 
         let server = self
             .servers
@@ -1780,24 +2561,105 @@ impl McpFederation {
         result
     }
 
-    /// Test-only: publish a tool registry directly and bump the
-    /// generation, so a test can exercise the read path without
-    /// upstream IO. The serialized snapshot rebuilds on the next
-    /// `serialized_tools` call via the generation bump.
+    /// Test-only: publish a tool registry and its matching version-gate
+    /// verdicts directly, then bump both catalog generations. `None`
+    /// represents an unblocked publication. Production refreshes use the
+    /// same synchronous publication seam after their final await.
+    ///
+    /// Keeping one test-support entry point avoids widening the public API
+    /// every time the immutable publication gains another coupled field.
     #[doc(hidden)]
-    pub fn seed_tools_for_test(&self, tools: HashMap<String, FederatedTool>) {
-        self.tools.store(Arc::new(tools));
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.tools_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    pub fn seed_tools_for_test(
+        &self,
+        tools: HashMap<String, FederatedTool>,
+        version_blocked: Option<HashMap<String, String>>,
+    ) {
+        let legacy_digest = tools_registry_digest(&tools);
+        let modern_digest = modern_tools_registry_digest(&tools);
+        self.publish_tool_refresh(
+            tools,
+            legacy_digest,
+            modern_digest,
+            true,
+            true,
+            Some(version_blocked.unwrap_or_default()),
+        );
+        self.primed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Current catalogue generation. Starts at zero and bumps once
-    /// per refresh that actually changed the tool or resource
-    /// registry, so it is a stable cache key for anything derived
-    /// from the catalogue (serialized `tools/list` bodies, the
-    /// codemode.ts module, `list_changed` notifications).
+    /// Publish every state component of a completed refresh without
+    /// awaiting. Keeping this seam synchronous means cancellation can
+    /// only occur before publication, leaving the previous coherent
+    /// snapshot in place for an identical retry.
+    fn publish_tool_refresh(
+        &self,
+        registry: HashMap<String, FederatedTool>,
+        legacy_digest: u64,
+        modern_digest: [u8; 32],
+        legacy_changed: bool,
+        modern_changed: bool,
+        version_blocked: Option<HashMap<String, String>>,
+    ) {
+        debug_assert!(legacy_changed || modern_changed);
+
+        let previous = self.tool_catalog.load_full();
+        let version_blocked = version_blocked
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::clone(&previous.version_blocked));
+        let verdict_changed = previous.version_blocked.as_ref() != version_blocked.as_ref();
+        let tools_generation = previous.tools_generation + u64::from(legacy_changed);
+        let modern_tools_generation = previous.modern_tools_generation + u64::from(modern_changed);
+        let codemode_generation =
+            previous.codemode_generation + u64::from(legacy_changed || verdict_changed);
+        // Build both read snapshots before the one ArcSwap store.
+        // Readers that retain either the old or new state therefore
+        // always see its matching registry, verdicts, generations, and
+        // serialized bytes. There is no await after this point.
+        let legacy_serialized = if legacy_changed {
+            Arc::new(build_legacy_serialized_tools(&registry, tools_generation))
+        } else {
+            Arc::clone(&previous.legacy_serialized)
+        };
+        let modern_serialized = if modern_changed {
+            Arc::new(build_modern_serialized_tools(
+                &registry,
+                modern_tools_generation,
+            ))
+        } else {
+            Arc::clone(&previous.modern_serialized)
+        };
+        let next = ToolCatalogState {
+            tools: Arc::new(registry),
+            version_blocked,
+            legacy_digest: if legacy_changed {
+                legacy_digest
+            } else {
+                previous.legacy_digest
+            },
+            modern_digest: if modern_changed {
+                modern_digest
+            } else {
+                previous.modern_digest
+            },
+            tools_generation,
+            modern_tools_generation,
+            codemode_generation,
+            legacy_serialized,
+            modern_serialized,
+        };
+        self.tool_catalog.store(Arc::new(next));
+        if legacy_changed {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Current cross-surface generation. Starts at zero and bumps once
+    /// per frozen-legacy tool or resource refresh that actually
+    /// changes its registry. Tool caches use immutable state-local
+    /// generations, so resource changes cannot perturb tool cache
+    /// identities.
     pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1805,8 +2667,14 @@ impl McpFederation {
     /// Tool-registry generation (WOR-1642): bumps only when the tool
     /// catalogue changes, driving `tools/list_changed` notifications.
     pub fn tools_generation(&self) -> u64 {
-        self.tools_generation
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.tool_catalog.load().tools_generation
+    }
+
+    /// Modern tool-catalogue generation. It advances for a complete
+    /// modern field change even when the frozen legacy projection,
+    /// global generation, and CodeMode cache remain unchanged.
+    pub fn modern_tools_generation(&self) -> u64 {
+        self.tool_catalog.load().modern_tools_generation
     }
 
     /// Resource-registry generation (WOR-1642): bumps only when the
@@ -1816,81 +2684,93 @@ impl McpFederation {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Pre-serialized tool catalogue for the current generation
-    /// (WOR-1640). Rebuilt at most once per catalogue change; on a
-    /// warm snapshot this is a lock-free load with zero clones and
-    /// zero serialization. Concurrent rebuilds after a generation
-    /// bump are idempotent (last store wins).
+    /// Pre-serialized frozen legacy tool catalogue for the current
+    /// immutable publication. Publication builds it before swapping
+    /// the state, so this read cannot pair old bytes with a new tool.
+    ///
+    /// This compatibility accessor is unsafe to combine with a separate
+    /// [`Self::version_blocked`] read. Coupled discovery callers must retain
+    /// one [`Self::tool_catalog_snapshot`] and read both values from it.
     pub fn serialized_tools(&self) -> Arc<SerializedTools> {
-        let generation = self.generation();
-        let current = self.serialized_tools.load_full();
-        if current.generation == generation {
-            return current;
-        }
-        let tools = self.tools.load();
-        let mut entries: Vec<SerializedToolEntry> = tools
-            .values()
-            .map(|t| {
-                let mut obj = serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                });
-                if let (Some(m), Some(map)) = (&t.meta, obj.as_object_mut()) {
-                    map.insert("_meta".to_string(), m.clone());
-                }
-                SerializedToolEntry {
-                    name: t.name.clone(),
-                    server_name: t.server_name.clone(),
-                    json: obj.to_string(),
-                }
-            })
-            .collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut full_array = String::with_capacity(entries.iter().map(|e| e.json.len() + 1).sum());
-        full_array.push('[');
-        for (i, e) in entries.iter().enumerate() {
-            if i > 0 {
-                full_array.push(',');
-            }
-            full_array.push_str(&e.json);
-        }
-        full_array.push(']');
-        let built = Arc::new(SerializedTools {
-            generation,
-            entries,
-            full_array,
-        });
-        self.serialized_tools.store(Arc::clone(&built));
-        built
+        let catalog = self.tool_catalog.load_full();
+        legacy_serialized_tools_for_catalog(&catalog)
     }
 
-    /// Codemode.ts module + strong ETag for the current generation
+    /// Pre-serialized complete modern catalogue for the current
+    /// modern generation. This is intentionally distinct from
+    /// [`Self::serialized_tools`] so a title, icon, outputSchema, or
+    /// extension-only change cannot replace the frozen legacy cache.
+    ///
+    /// For a coupled discovery or policy decision, use
+    /// [`Self::tool_catalog_snapshot`] rather than combining this accessor
+    /// with a later registry or verdict read.
+    pub fn serialized_modern_tools(&self) -> Arc<ModernSerializedTools> {
+        let catalog = self.tool_catalog.load_full();
+        Arc::clone(&catalog.modern_serialized)
+    }
+
+    /// Codemode.ts module + strong ETag for the current visible generation
     /// and callback base (WOR-1640). Re-emits and re-hashes only when
     /// either changes; a warm cache hit is a lock-free load.
     pub fn codemode_ts_cached(&self, callback_base: &str) -> (Arc<String>, String) {
-        let generation = self.generation();
+        let catalog = self.tool_catalog.load_full();
+        let generation = catalog.codemode_generation;
         let current = self.codemode_cache.load_full();
         if current.generation == generation && current.callback_base == callback_base {
             return (Arc::clone(&current.module), current.etag.clone());
         }
-        let module = Arc::new(self.codemode_ts(callback_base));
+        let module = Arc::new(codemode_ts_for_catalog(&catalog, callback_base));
         let digest = <sha2::Sha256 as sha2::Digest>::digest(module.as_bytes());
         let etag = format!("\"{}\"", hex::encode(digest));
-        self.codemode_cache.store(Arc::new(CodemodeCache {
-            generation,
-            callback_base: callback_base.to_string(),
-            module: Arc::clone(&module),
-            etag: etag.clone(),
-        }));
+        // Do not cache an old module under a later state generation
+        // if publication raced this cold miss. Returning the coherent
+        // held snapshot is safe; the next reader will build the newer
+        // state from its own snapshot.
+        let still_current = self.tool_catalog.load_full();
+        if Arc::ptr_eq(&catalog, &still_current) {
+            self.codemode_cache.store(Arc::new(CodemodeCache {
+                generation,
+                callback_base: callback_base.to_string(),
+                module: Arc::clone(&module),
+                etag: etag.clone(),
+            }));
+        }
         (module, etag)
     }
 
     /// Advertised tool names currently blocked by the version gate,
     /// mapped to the violation detail (WOR-1635). Empty when the gate
     /// is off, in warn mode, or has nothing to block.
+    ///
+    /// This compatibility accessor is unsafe to combine with a separate
+    /// registry, resolve, or serialized-catalogue read. Use
+    /// [`Self::tool_catalog_snapshot`] for coupled decisions.
     pub fn version_blocked(&self) -> Arc<HashMap<String, String>> {
-        self.version_blocked.load_full()
+        let catalog = self.tool_catalog.load_full();
+        Arc::clone(&catalog.version_blocked)
+    }
+
+    /// Replace only the verdict map while retaining every other
+    /// component of one immutable publication. This is exercised by
+    /// the test-only direct versioning seam; production refreshes
+    /// publish a fresh registry and verdict map together.
+    #[cfg(test)]
+    fn publish_tool_version_blocked(&self, version_blocked: HashMap<String, String>) {
+        let current = self.tool_catalog.load_full();
+        if current.version_blocked.as_ref() == &version_blocked {
+            return;
+        }
+        self.tool_catalog.store(Arc::new(ToolCatalogState {
+            tools: Arc::clone(&current.tools),
+            version_blocked: Arc::new(version_blocked),
+            legacy_digest: current.legacy_digest,
+            modern_digest: current.modern_digest,
+            tools_generation: current.tools_generation,
+            modern_tools_generation: current.modern_tools_generation,
+            codemode_generation: current.codemode_generation + 1,
+            legacy_serialized: Arc::clone(&current.legacy_serialized),
+            modern_serialized: Arc::clone(&current.modern_serialized),
+        }));
     }
 
     /// WOR-1635: diff a freshly fetched catalogue against the
@@ -1898,9 +2778,41 @@ impl McpFederation {
     /// publish the violating tool set. Runs only when the catalogue
     /// content changed. Fail-open: an unreadable lockfile clears the
     /// blocked set and reports `lockfile_error`.
+    #[cfg(test)]
     async fn evaluate_tool_versioning(&self, registry: &HashMap<String, FederatedTool>) {
+        if let Some(blocked) = self.evaluate_tool_versioning_snapshot(registry).await {
+            let legacy_digest = tools_registry_digest(registry);
+            let modern_digest = modern_tools_registry_digest(registry);
+            let current = self.tool_catalog.load_full();
+            let legacy_changed = current.legacy_digest != legacy_digest;
+            let modern_changed = current.modern_digest != modern_digest;
+            if legacy_changed || modern_changed {
+                self.publish_tool_refresh(
+                    registry.clone(),
+                    legacy_digest,
+                    modern_digest,
+                    legacy_changed,
+                    modern_changed,
+                    Some(blocked),
+                );
+            } else {
+                // Test-only direct evaluation still keeps a matching
+                // registry and verdict in one immutable publication.
+                self.publish_tool_version_blocked(blocked);
+            }
+        }
+    }
+
+    /// Evaluate the versioning gate without publishing its result.
+    /// `refresh_tools` awaits this before it mutates any catalogue
+    /// state, then commits the returned blocked set alongside the
+    /// matching registry and digests in [`Self::publish_tool_refresh`].
+    async fn evaluate_tool_versioning_snapshot(
+        &self,
+        registry: &HashMap<String, FederatedTool>,
+    ) -> Option<HashMap<String, String>> {
         let Some(gate) = self.versioning.as_ref() else {
-            return;
+            return None;
         };
         let lockfile = match std::fs::read_to_string(&gate.lockfile_path)
             .map_err(anyhow::Error::from)
@@ -1914,8 +2826,7 @@ impl McpFederation {
                     "tool-versioning lockfile unreadable; gate fails open"
                 );
                 sbproxy_observe::metrics::record_mcp_tool_compat_verdict("none", "lockfile_error");
-                self.version_blocked.store(Arc::new(HashMap::new()));
-                return;
+                return Some(HashMap::new());
             }
         };
 
@@ -1925,11 +2836,7 @@ impl McpFederation {
                 // New tool: nothing to diff against.
                 continue;
             };
-            let live_contract = serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-            });
+            let live_contract = legacy_compatibility_contract(tool);
             let live_digest = super::compat::contract_digest(&live_contract);
             if live_digest == lock.contract_digest {
                 continue;
@@ -2062,7 +2969,7 @@ impl McpFederation {
                 );
             }
         }
-        self.version_blocked.store(Arc::new(blocked));
+        Some(blocked)
     }
 
     /// Make the federation servable: spawn the periodic refresh task
@@ -2262,6 +3169,126 @@ fn classify_io_failure(e: &anyhow::Error) -> &'static str {
     "other"
 }
 
+/// Render CodeMode from exactly one loaded catalogue state. The lazy
+/// cache uses this rather than calling back through `McpFederation`,
+/// which would otherwise permit a refresh between its generation read
+/// and its tool read.
+fn codemode_ts_for_catalog(catalog: &ToolCatalogState, callback_base_url: &str) -> String {
+    let mut tools: Vec<&FederatedTool> = catalog
+        .tools
+        .values()
+        .filter(|tool| !catalog.version_blocked.contains_key(&tool.name))
+        .collect();
+    tools.sort_by(|a, b| a.codemode_name().cmp(b.codemode_name()));
+    super::codemode_ts::emit_codemode_ts_refs(tools, callback_base_url)
+}
+
+/// Return the legacy snapshot held by one immutable publication.
+/// Kept as a helper so barrier tests exercise the same reader path as
+/// the public `serialized_tools` method.
+fn legacy_serialized_tools_for_catalog(catalog: &ToolCatalogState) -> Arc<SerializedTools> {
+    Arc::clone(&catalog.legacy_serialized)
+}
+
+/// Build the frozen legacy catalogue before its enclosing state is
+/// published. Its field order and per-entry projection intentionally
+/// stay identical to the pre-lossless serializer.
+fn build_legacy_serialized_tools(
+    registry: &HashMap<String, FederatedTool>,
+    generation: u64,
+) -> SerializedTools {
+    let mut entries: Vec<SerializedToolEntry> = registry
+        .values()
+        .map(legacy_serialized_tool_entry)
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    SerializedTools {
+        generation,
+        full_array: serialized_tool_array(&entries),
+        entries,
+    }
+}
+
+/// Build the complete modern discovery catalogue before publication.
+/// Only compiled strict contracts are visible, but all strict entries
+/// remain in the immutable registry for lossless observation.
+fn build_modern_serialized_tools(
+    registry: &HashMap<String, FederatedTool>,
+    generation: u64,
+) -> ModernSerializedTools {
+    let mut entries: Vec<SerializedToolEntry> = registry
+        .values()
+        .filter_map(modern_serialized_tool_entry)
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    ModernSerializedTools {
+        generation,
+        full_array: serialized_tool_array(&entries),
+        entries,
+    }
+}
+
+fn serialized_tool_array(entries: &[SerializedToolEntry]) -> String {
+    let mut full_array =
+        String::with_capacity(entries.iter().map(|entry| entry.json.len() + 1).sum());
+    full_array.push('[');
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            full_array.push(',');
+        }
+        full_array.push_str(&entry.json);
+    }
+    full_array.push(']');
+    full_array
+}
+
+/// Frozen legacy `tools/list` projection for one federated tool.
+///
+/// Keep this byte-for-byte equivalent to the pre-lossless serializer:
+/// clients on the 2025-06-18 wire see only name, description,
+/// inputSchema, and optional `_meta`, even when the internal modern
+/// contract carries additional fields.
+fn legacy_serialized_tool_entry(tool: &FederatedTool) -> SerializedToolEntry {
+    let mut obj = serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    });
+    if let (Some(meta), Some(map)) = (&tool.meta, obj.as_object_mut()) {
+        map.insert("_meta".to_string(), meta.clone());
+    }
+    SerializedToolEntry {
+        name: tool.name.clone(),
+        server_name: tool.server_name.clone(),
+        json: obj.to_string(),
+    }
+}
+
+/// Complete modern `tools/list` entry for one tool that has already
+/// passed modern contract compilation.
+fn modern_serialized_tool_entry(tool: &FederatedTool) -> Option<SerializedToolEntry> {
+    if !tool.is_modern_discoverable() {
+        return None;
+    }
+    let contract = tool.contract.as_ref()?;
+    Some(SerializedToolEntry {
+        name: contract.name().to_string(),
+        server_name: tool.server_name.clone(),
+        json: contract.as_value().to_string(),
+    })
+}
+
+/// The frozen legacy compatibility-oracle input. Keep this shape
+/// separate from [`FederatedTool::contract`]: modern-only Tool fields
+/// must not reclassify an existing lockfile entry.
+fn legacy_compatibility_contract(tool: &FederatedTool) -> serde_json::Value {
+    serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    })
+}
+
 /// Order-independent content digest of a tool registry. Two
 /// registries with the same tools (same names, descriptions,
 /// schemas, owners, streaming flags, and `_meta` blocks) produce the
@@ -2284,6 +3311,120 @@ fn tools_registry_digest(registry: &HashMap<String, FederatedTool>) -> u64 {
         }
     }
     h.finish()
+}
+
+/// Order-independent digest of the lossless modern representation.
+///
+/// This is deliberately separate from [`tools_registry_digest`]. It
+/// detects additions such as title, icons, outputSchema, annotations,
+/// and vendor extensions so the modern catalogue is refreshed, while
+/// the legacy versioning and notification paths continue to compare
+/// exactly their historical fields.
+fn modern_tools_registry_digest(registry: &HashMap<String, FederatedTool>) -> [u8; 32] {
+    use sha2::Digest;
+
+    // The modern digest also controls publication of the lossless
+    // registry, not only its visible serialized snapshot. Retain every
+    // strict contract even when compilation made it modern-ineligible,
+    // so a changed hidden contract or incompatibility state publishes.
+    // Exclude only malformed legacy fallbacks, which have no strict
+    // contract and no modern state to publish.
+    let mut tools: Vec<(&FederatedTool, &McpToolContract)> = registry
+        .values()
+        .filter(|tool| tool.is_modern_eligible())
+        .filter_map(|tool| tool.contract.as_ref().map(|contract| (tool, contract)))
+        .collect();
+    tools.sort_by(|(left, _), (right, _)| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.server_name.cmp(&right.server_name))
+    });
+    let mut hasher = sha2::Sha256::new();
+    hash_lossless_length(&mut hasher, tools.len());
+    for (tool, contract) in tools {
+        // Hash the advertised identity independently from the complete
+        // document. This makes the visible routing identity explicit
+        // even though the strict contract also carries its `name`.
+        hash_lossless_text(&mut hasher, 7, &tool.name);
+        hash_lossless_text(&mut hasher, 8, &tool.server_name);
+        hasher.update([9, u8::from(tool.streaming)]);
+        // Preserve the safe eligibility state separately from the
+        // complete document. This includes strict contracts that are
+        // hidden from modern discovery but still need registry updates.
+        hasher.update([10, u8::from(tool.modern_contract.is_some())]);
+        match tool.modern_incompatibility.as_deref() {
+            Some(class) => hash_lossless_text(&mut hasher, 11, class),
+            None => hasher.update([12]),
+        }
+        // Hash the lossless JSON tree directly instead of routing it
+        // through JCS. JCS coerces JSON numbers through IEEE-754,
+        // making adjacent integer values above 2^53 and -0/0 collide.
+        // This encoder sorts object keys while preserving each
+        // serde_json::Number's textual representation exactly.
+        hash_lossless_json_value(&contract.as_value(), &mut hasher);
+    }
+    let digest = hasher.finalize();
+    let mut output = [0; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+/// Hash a JSON value in deterministic object-key order without
+/// normalizing `serde_json::Number`. Type tags and byte lengths make
+/// this an unambiguous recursive encoding rather than concatenated
+/// display text. In particular, the input numbers `9007199254740992`,
+/// `9007199254740993`, `-0.0`, and `0.0` retain distinct encodings.
+fn hash_lossless_json_value(value: &Value, hasher: &mut sha2::Sha256) {
+    match value {
+        Value::Null => sha2::Digest::update(hasher, [0]),
+        Value::Bool(false) => sha2::Digest::update(hasher, [1]),
+        Value::Bool(true) => sha2::Digest::update(hasher, [2]),
+        Value::Number(number) => {
+            sha2::Digest::update(hasher, [3]);
+            hash_lossless_bytes(hasher, number.to_string().as_bytes());
+        }
+        Value::String(text) => {
+            sha2::Digest::update(hasher, [4]);
+            hash_lossless_bytes(hasher, text.as_bytes());
+        }
+        Value::Array(values) => {
+            sha2::Digest::update(hasher, [5]);
+            hash_lossless_length(hasher, values.len());
+            for value in values {
+                hash_lossless_json_value(value, hasher);
+            }
+        }
+        Value::Object(object) => {
+            sha2::Digest::update(hasher, [6]);
+            hash_lossless_length(hasher, object.len());
+            let mut members: Vec<(&String, &Value)> = object.iter().collect();
+            members.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in members {
+                hash_lossless_bytes(hasher, key.as_bytes());
+                hash_lossless_json_value(value, hasher);
+            }
+        }
+    }
+}
+
+/// Hash a text field with a distinct type tag, preserving its bytes exactly.
+fn hash_lossless_text(hasher: &mut sha2::Sha256, tag: u8, text: &str) {
+    sha2::Digest::update(hasher, [tag]);
+    hash_lossless_bytes(hasher, text.as_bytes());
+}
+
+/// Prefix a byte string with a platform-independent decimal length. The
+/// delimiter makes the encoding unambiguous without a truncating numeric cast.
+fn hash_lossless_bytes(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+    hash_lossless_length(hasher, bytes.len());
+    sha2::Digest::update(hasher, bytes);
+}
+
+/// Encode a `usize` structurally without relying on target-width casts.
+fn hash_lossless_length(hasher: &mut sha2::Sha256, length: usize) {
+    sha2::Digest::update(hasher, [0xff]);
+    sha2::Digest::update(hasher, length.to_string().as_bytes());
+    sha2::Digest::update(hasher, [0]);
 }
 
 /// Merge per-server prompt lists into one namespaced registry.
@@ -2475,14 +3616,956 @@ mod tests {
     }
 
     fn make_tool(name: &str, server: &str) -> FederatedTool {
-        FederatedTool {
-            name: name.to_string(),
-            description: format!("Tool {}", name),
-            input_schema: json!({"type": "object", "properties": {}}),
-            server_name: server.to_string(),
-            streaming: false,
-            meta: None,
+        make_tool_with_schema(
+            name,
+            &format!("Tool {name}"),
+            json!({"type": "object", "properties": {}}),
+            server,
+            false,
+        )
+    }
+
+    fn make_tool_with_schema(
+        name: &str,
+        description: &str,
+        input_schema: serde_json::Value,
+        server: &str,
+        streaming: bool,
+    ) -> FederatedTool {
+        FederatedTool::from_contract_document(
+            json!({
+                "name": name,
+                "description": description,
+                "inputSchema": input_schema,
+            }),
+            server.to_string(),
+            streaming,
+        )
+        .expect("federation fixture contract")
+    }
+
+    fn full_tool_document(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "title": "Search",
+            "description": "Search the indexed documents",
+            "inputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "results": {"type": "array"}
+                }
+            },
+            "icons": [{"src": "https://cdn.example.test/search.svg", "mimeType": "image/svg+xml"}],
+            "annotations": {"readOnlyHint": true},
+            "_meta": {"openai/widget": {"templateId": "search-card"}},
+            "vendor.example/security": {"audience": "repos"}
+        })
+    }
+
+    fn tool_list_server(tool_lists: Vec<serde_json::Value>) -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("tool-list fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("tool-list fixture address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            for tools in tool_lists {
+                let (mut stream, _) = listener
+                    .accept()
+                    .unwrap_or_else(|error| panic!("tool-list fixture accept failed: {error}"));
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "result": {"tools": tools},
+                    "id": 1,
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        mock_server("legacy-fixture", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    /// A one-call upstream fixture. It stays nonblocking until either
+    /// one request arrives or the test releases it, so a proof that a
+    /// replacement server received zero calls never leaves a thread
+    /// parked in `accept`.
+    fn tool_call_server(
+        name: &str,
+        result_text: &str,
+    ) -> (
+        McpServerConfig,
+        Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("tool-call fixture bind failed: {error}"));
+        listener
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("tool-call fixture nonblocking setup failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("tool-call fixture address")
+            .port();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_thread = Arc::clone(&calls);
+        let (stop, stop_rx) = std::sync::mpsc::channel();
+        let result_text = result_text.to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        calls_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        stream
+                            .set_nonblocking(false)
+                            .expect("tool-call fixture stream blocking setup");
+                        let mut request = [0_u8; 8192];
+                        stream
+                            .read(&mut request)
+                            .expect("tool-call fixture request read");
+                        let body = json!({
+                            "jsonrpc": "2.0",
+                            "result": {"content": [{"type": "text", "text": result_text}]},
+                            "id": 1,
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("tool-call fixture response write");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    Err(error) => panic!("tool-call fixture accept failed: {error}"),
+                }
+            }
+        });
+        (
+            mock_server(name, &format!("http://127.0.0.1:{port}/mcp")),
+            calls,
+            stop,
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn task_5b_missing_input_schema_remains_legacy_usable() {
+        let server = tool_list_server(vec![json!([{
+            "name": "missing_input",
+            "description": "Legacy missing schema"
+        }])]);
+        let federation = McpFederation::new(vec![server]);
+        let initial_modern_snapshot = federation.serialized_modern_tools();
+
+        assert_eq!(federation.refresh_tools().await.expect("refresh"), 1);
+        let tool = federation
+            .resolve_tool("missing_input")
+            .expect("missing inputSchema must remain legacy-routable");
+        assert!(tool.modern_contract.is_none());
+        assert_eq!(
+            tool.modern_incompatibility.as_deref(),
+            Some("missing_input_schema")
+        );
+        assert!(federation.resolve_modern_tool("missing_input").is_none());
+        assert_eq!(
+            federation.modern_tools_generation(),
+            0,
+            "an initial malformed legacy-only definition must not create a modern generation"
+        );
+        assert!(Arc::ptr_eq(
+            &initial_modern_snapshot,
+            &federation.serialized_modern_tools()
+        ));
+
+        let legacy = federation.serialized_tools();
+        assert_eq!(
+            legacy.full_array,
+            "[{\"description\":\"Legacy missing schema\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"missing_input\"}]"
+        );
+        assert_eq!(
+            serde_json::to_string(&legacy_compatibility_contract(&tool))
+                .expect("legacy compatibility JSON"),
+            "{\"description\":\"Legacy missing schema\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"missing_input\"}"
+        );
+        let codemode = federation.codemode_ts("https://gateway.example");
+        assert!(codemode.contains("export interface MissingInputInput"));
+        assert!(codemode.contains("['missing_input']:"));
+        assert!(codemode.contains("[key: string]: unknown;"));
+    }
+
+    #[tokio::test]
+    async fn task_5b_non_object_input_schema_remains_legacy_usable() {
+        let server = tool_list_server(vec![json!([{
+            "name": "scalar_input",
+            "description": "Legacy scalar schema",
+            "inputSchema": "opaque-schema"
+        }])]);
+        let federation = McpFederation::new(vec![server]);
+
+        assert_eq!(federation.refresh_tools().await.expect("refresh"), 1);
+        let tool = federation
+            .resolve_tool("scalar_input")
+            .expect("non-object inputSchema must remain legacy-routable");
+        assert!(tool.modern_contract.is_none());
+        assert_eq!(
+            tool.modern_incompatibility.as_deref(),
+            Some("non_object_input_schema")
+        );
+        assert!(federation.resolve_modern_tool("scalar_input").is_none());
+
+        let legacy = federation.serialized_tools();
+        assert_eq!(
+            legacy.full_array,
+            "[{\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\",\"name\":\"scalar_input\"}]"
+        );
+        assert_eq!(
+            serde_json::to_string(&legacy_compatibility_contract(&tool))
+                .expect("legacy compatibility JSON"),
+            "{\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\",\"name\":\"scalar_input\"}"
+        );
+        let codemode = federation.codemode_ts("https://gateway.example");
+        assert!(codemode.contains("export interface ScalarInputInput"));
+        assert!(codemode.contains("['scalar_input']:"));
+        assert!(codemode.contains("[key: string]: unknown;"));
+    }
+
+    #[test]
+    fn task_5b_namespacing_rewrites_the_malformed_legacy_fallback_only() {
+        let mut tool = FederatedTool::from_contract_document(
+            json!({
+                "name": "opaque",
+                "description": "Legacy-only scalar schema",
+                "inputSchema": "opaque-schema"
+            }),
+            "catalog".to_string(),
+            false,
+        )
+        .expect("a string-named legacy tool remains usable");
+
+        tool.advertise_as("catalog.opaque");
+
+        assert!(tool.contract.is_none());
+        assert_eq!(tool.name, "catalog.opaque");
+        assert_eq!(tool.input_schema, json!("opaque-schema"));
+        let fallback = tool
+            .legacy_document
+            .as_ref()
+            .expect("malformed tool retains its legacy fallback");
+        assert_eq!(fallback["name"], "catalog.opaque");
+        assert_eq!(fallback["inputSchema"], "opaque-schema");
+    }
+
+    #[tokio::test]
+    async fn task_5b_openapi_meta_is_modern_only() {
+        let backing = OpenApiBacking {
+            base_url: "https://api.example.test".to_string(),
+            tools: vec![json!({
+                "name": "search",
+                "description": "OpenAPI search",
+                "inputSchema": {"type": "object", "properties": {}},
+                "_meta": {"vendor.example/ui": "search-card"}
+            })],
+            routes: HashMap::new(),
+            headers: Vec::new(),
+            egress_policy: EgressPolicy::allow_all("test"),
+        };
+        let federation = McpFederation::new(vec![McpServerConfig {
+            name: "openapi".to_string(),
+            url: backing.base_url.clone(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: Some(backing),
+        }]);
+
+        assert_eq!(federation.refresh_tools().await.expect("refresh"), 1);
+        let tool = federation.resolve_tool("search").expect("OpenAPI tool");
+        assert!(tool.meta.is_none(), "OpenAPI _meta is modern-only");
+        assert!(tool.contract.is_some(), "OpenAPI document stays lossless");
+        assert!(
+            tool.legacy_document.is_none(),
+            "valid OpenAPI documents do not duplicate their full contract"
+        );
+        let legacy = federation.serialized_tools();
+        assert_eq!(
+            legacy.full_array,
+            "[{\"description\":\"OpenAPI search\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"search\"}]"
+        );
+        let modern: serde_json::Value =
+            serde_json::from_str(&federation.serialized_modern_tools().full_array)
+                .expect("modern catalogue JSON");
+        assert_eq!(modern[0]["_meta"]["vendor.example/ui"], "search-card");
+    }
+
+    fn prepared_tool(document: serde_json::Value, server: &str, advertised: &str) -> FederatedTool {
+        let mut tool = FederatedTool::from_contract_document(document, server.to_string(), false)
+            .expect("fixture must have a usable legacy contract");
+        tool.advertise_as(advertised);
+        tool.compile_modern_contract();
+        tool
+    }
+
+    #[test]
+    fn task_5b_retains_full_contract_and_freezes_legacy_projection() {
+        let original = full_tool_document("search");
+        let tool = prepared_tool(original.clone(), "alpha", "alpha.search");
+        let mut expected_modern = original.clone();
+        expected_modern["name"] = json!("alpha.search");
+
+        assert_eq!(tool.name, "alpha.search");
+        assert_eq!(
+            tool.contract
+                .as_ref()
+                .expect("valid fixture has a strict contract")
+                .name(),
+            "alpha.search"
+        );
+        assert_eq!(
+            tool.contract
+                .as_ref()
+                .expect("valid fixture has a strict contract")
+                .description(),
+            Some("Search the indexed documents")
+        );
+        assert_eq!(
+            tool.contract
+                .as_ref()
+                .expect("valid fixture has a strict contract")
+                .as_value(),
+            expected_modern
+        );
+        let mut before_without_name = original.as_object().cloned().expect("tool object");
+        let mut after_without_name = tool
+            .contract
+            .as_ref()
+            .expect("valid fixture has a strict contract")
+            .as_value()
+            .as_object()
+            .cloned()
+            .expect("tool object");
+        before_without_name.remove("name");
+        after_without_name.remove("name");
+        assert_eq!(
+            after_without_name, before_without_name,
+            "namespacing must change only the complete contract name"
+        );
+        assert_eq!(tool.description, "Search the indexed documents");
+        assert_eq!(tool.input_schema, original["inputSchema"]);
+        assert_eq!(tool.meta, Some(original["_meta"].clone()));
+        assert!(
+            tool.legacy_document.is_none(),
+            "valid contracts do not retain a duplicate raw fallback"
+        );
+        assert!(tool.modern_contract.is_some());
+        assert!(tool.modern_incompatibility.is_none());
+
+        const LEGACY_GOLDEN: &str = "[{\"_meta\":{\"openai/widget\":{\"templateId\":\"search-card\"}},\"description\":\"Search the indexed documents\",\"inputSchema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"],\"type\":\"object\"},\"name\":\"alpha.search\"}]";
+        let legacy_entry = legacy_serialized_tool_entry(&tool);
+        assert_eq!(format!("[{}]", legacy_entry.json), LEGACY_GOLDEN);
+        assert!(!legacy_entry.json.contains("outputSchema"));
+        assert!(!legacy_entry.json.contains("vendor.example/security"));
+
+        let expected_compatibility_contract = json!({
+            "name": "alpha.search",
+            "description": "Search the indexed documents",
+            "inputSchema": original["inputSchema"].clone(),
+        });
+        assert_eq!(
+            legacy_compatibility_contract(&tool),
+            expected_compatibility_contract
+        );
+        assert_eq!(
+            crate::mcp::compat::contract_digest(&legacy_compatibility_contract(&tool)),
+            crate::mcp::compat::contract_digest(&expected_compatibility_contract),
+            "modern-only fields must not enter the frozen compatibility oracle"
+        );
+
+        let fed = McpFederation::new(vec![]);
+        let mut registry = HashMap::new();
+        registry.insert(tool.name.clone(), tool);
+        fed.seed_tools_for_test(registry, None);
+        let serialized = fed.serialized_tools();
+        assert_eq!(serialized.full_array, LEGACY_GOLDEN);
+        assert_eq!(
+            fed.serialized_modern_tools().full_array,
+            format!("[{}]", expected_modern)
+        );
+    }
+
+    #[test]
+    fn task_5b_inconsistent_public_contract_state_fails_closed_without_panicking() {
+        let mut tool = prepared_tool(full_tool_document("search"), "alpha", "alpha.search");
+        assert!(
+            tool.modern_contract.is_some(),
+            "fixture starts as a modern-eligible strict contract"
+        );
+
+        // `FederatedTool` has public fields for compatibility with existing
+        // construction sites. A caller can therefore create this impossible
+        // internal combination. Refresh and cache paths must fail closed, not
+        // panic while serializing or hashing it.
+        tool.contract = None;
+        let original_name = tool.name.clone();
+        let original_description = tool.description.clone();
+        let original_input_schema = tool.input_schema.clone();
+        tool.sync_convenience_fields();
+        assert_eq!(tool.name, original_name);
+        assert_eq!(tool.description, original_description);
+        assert_eq!(tool.input_schema, original_input_schema);
+
+        let registry = HashMap::from([(tool.name.clone(), tool)]);
+        assert!(
+            build_modern_serialized_tools(&registry, 1)
+                .entries
+                .is_empty(),
+            "a modern marker without its authoritative contract is not serializable"
+        );
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(registry.clone(), None);
+        assert!(
+            federation.resolve_modern_tool("alpha.search").is_none(),
+            "modern lookup must reject a compiled marker without its strict contract"
+        );
+        assert!(
+            federation.list_modern_tools().is_empty(),
+            "modern listing must reject a compiled marker without its strict contract"
+        );
+        assert_eq!(
+            modern_tools_registry_digest(&registry),
+            modern_tools_registry_digest(&HashMap::new()),
+            "a missing strict contract is excluded from the modern digest"
+        );
+    }
+
+    #[test]
+    fn task_5b_modern_catalog_is_deterministic_and_keeps_complete_documents() {
+        let mut alpha_document = full_tool_document("alpha");
+        alpha_document["title"] = json!("Alpha Search");
+        let mut zeta_document = full_tool_document("zeta");
+        zeta_document["title"] = json!("Zeta Search");
+        let alpha = prepared_tool(alpha_document, "alpha-server", "alpha");
+        let zeta = prepared_tool(zeta_document, "zeta-server", "zeta");
+
+        let fed = McpFederation::new(vec![]);
+        let mut registry = HashMap::new();
+        registry.insert(zeta.name.clone(), zeta);
+        registry.insert(alpha.name.clone(), alpha);
+        fed.seed_tools_for_test(registry, None);
+
+        let serialized = fed.serialized_modern_tools();
+        let names: Vec<&str> = serialized
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        let documents: serde_json::Value =
+            serde_json::from_str(&serialized.full_array).expect("modern catalogue JSON");
+        assert_eq!(documents[0]["title"], "Alpha Search");
+        assert_eq!(
+            documents[0]["icons"][0]["src"],
+            "https://cdn.example.test/search.svg"
+        );
+        assert_eq!(
+            documents[0]["outputSchema"]["properties"]["results"]["type"],
+            "array"
+        );
+        assert_eq!(documents[0]["vendor.example/security"]["audience"], "repos");
+        assert_eq!(
+            documents[0]["_meta"]["openai/widget"]["templateId"],
+            "search-card"
+        );
+    }
+
+    #[test]
+    fn task_5b_modern_incompatible_tools_remain_legacy_usable_but_are_hidden_modernly() {
+        let valid = prepared_tool(full_tool_document("valid"), "catalog", "valid");
+        let invalid = prepared_tool(
+            json!({
+                "name": "unsafe",
+                "description": "Legacy-compatible but modern-invalid",
+                "inputSchema": {
+                    "type": "object",
+                    "$dynamicRef": "https://untrusted.example.test/schema"
+                }
+            }),
+            "catalog",
+            "unsafe",
+        );
+
+        assert!(invalid.modern_contract.is_none());
+        assert_eq!(
+            invalid.modern_incompatibility.as_deref(),
+            Some("external_reference")
+        );
+        assert!(
+            !invalid
+                .modern_incompatibility
+                .as_deref()
+                .unwrap_or_default()
+                .contains("untrusted.example.test"),
+            "the incompatibility state must be safe to log"
+        );
+
+        let fed = McpFederation::new(vec![]);
+        let mut registry = HashMap::new();
+        registry.insert(valid.name.clone(), valid);
+        registry.insert(invalid.name.clone(), invalid);
+        fed.seed_tools_for_test(registry, None);
+
+        assert!(fed.resolve_tool("unsafe").is_some());
+        assert!(fed.resolve_modern_tool("unsafe").is_none());
+        assert!(fed.resolve_modern_tool("valid").is_some());
+        let legacy = fed.serialized_tools();
+        let modern = fed.serialized_modern_tools();
+        assert_eq!(legacy.entries.len(), 2);
+        assert_eq!(modern.entries.len(), 1);
+        assert!(legacy.full_array.contains("unsafe"));
+        assert!(!modern.full_array.contains("unsafe"));
+    }
+
+    #[test]
+    fn task_5b_modern_incompatibility_telemetry_is_summary_change_only() {
+        let invalid = prepared_tool(
+            json!({
+                "name": "untrusted-upstream-tool-name",
+                "description": "Legacy-compatible but modern-invalid",
+                "inputSchema": {
+                    "type": "object",
+                    "$dynamicRef": "https://untrusted.example.test/schema"
+                }
+            }),
+            "catalog",
+            "untrusted-upstream-tool-name",
+        );
+        let original = HashMap::from([(invalid.name.clone(), invalid)]);
+        let renamed_invalid = prepared_tool(
+            json!({
+                "name": "a-different-untrusted-tool-name",
+                "description": "Legacy-compatible but modern-invalid",
+                "inputSchema": {
+                    "type": "object",
+                    "$dynamicRef": "https://another-untrusted.example.test/schema"
+                }
+            }),
+            "catalog",
+            "a-different-untrusted-tool-name",
+        );
+        let same_summary = HashMap::from([(renamed_invalid.name.clone(), renamed_invalid)]);
+
+        assert_eq!(
+            modern_incompatibility_change_summary(&HashMap::new(), &original),
+            Some(std::collections::BTreeMap::from([(
+                "external_reference",
+                1
+            )])),
+            "the aggregate records only the closed incompatibility class"
+        );
+        assert_eq!(
+            modern_incompatibility_change_summary(&original, &original),
+            None,
+            "an unchanged invalid catalogue emits no repeated change telemetry"
+        );
+        assert_eq!(
+            modern_incompatibility_change_summary(&original, &same_summary),
+            None,
+            "tool names and external references never enter the aggregate labels"
+        );
+    }
+
+    #[test]
+    fn task_5b_modern_incompatibility_telemetry_detects_same_class_entry_replacement_safely() {
+        let previous_tool = prepared_tool(
+            json!({
+                "name": "old\ncontrol\r\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}tool",
+                "description": "SCHEMA_SECRET_PREVIOUS",
+                "inputSchema": {
+                    "type": "object",
+                    "$dynamicRef": "https://schema.example/PRIVATE_REFERENCE_PREVIOUS"
+                },
+                "vendor.example/private": {
+                    "authorization": "HEADER_SECRET_PREVIOUS"
+                }
+            }),
+            "old\ncontrol\r\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}server",
+            "old\ncontrol\r\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}tool",
+        );
+        let next_tool = prepared_tool(
+            json!({
+                "name": "new\u{0007}control\t\u{2066}\u{2067}\u{2068}\u{2069}tool",
+                "description": "SCHEMA_SECRET_NEXT",
+                "inputSchema": {
+                    "type": "object",
+                    "$dynamicRef": "https://schema.example/PRIVATE_REFERENCE_NEXT"
+                },
+                "vendor.example/private": {
+                    "authorization": "HEADER_SECRET_NEXT"
+                }
+            }),
+            "new\u{0007}control\t\u{2066}\u{2067}\u{2068}\u{2069}server",
+            "new\u{0007}control\t\u{2066}\u{2067}\u{2068}\u{2069}tool",
+        );
+        let previous = HashMap::from([(previous_tool.name.clone(), previous_tool)]);
+        let next = HashMap::from([(next_tool.name.clone(), next_tool)]);
+
+        let changes = modern_incompatibility_changes(&previous, &next);
+        assert!(
+            !changes.is_empty(),
+            "replacing one incompatible entry with another of the same class is still a change"
+        );
+        assert!(
+            changes.len() <= 32,
+            "one refresh must emit a fixed bounded number of incompatibility events"
+        );
+        for change in &changes {
+            assert!(
+                matches!(change.kind, "added" | "removed" | "changed"),
+                "change kind must come from a closed vocabulary"
+            );
+            assert_eq!(
+                change.class, "external_reference",
+                "incompatibility class must use the existing closed vocabulary"
+            );
+            for identifier in [&change.tool, &change.server] {
+                assert!(
+                    !identifier.is_empty(),
+                    "change identifiers stay attributable"
+                );
+                assert!(
+                    identifier.len() <= 96,
+                    "change identifiers must have a fixed byte bound"
+                );
+                assert!(
+                    !identifier.chars().any(char::is_control),
+                    "change identifiers must strip control characters"
+                );
+                assert!(
+                    !identifier.chars().any(|character| matches!(
+                        character,
+                        '\u{061c}'
+                            | '\u{200e}'
+                            | '\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                    )),
+                    "change identifiers must strip Unicode bidi controls"
+                );
+            }
         }
+        let rendered = format!("{changes:?}");
+        for secret in [
+            "SCHEMA_SECRET_PREVIOUS",
+            "SCHEMA_SECRET_NEXT",
+            "PRIVATE_REFERENCE_PREVIOUS",
+            "PRIVATE_REFERENCE_NEXT",
+            "HEADER_SECRET_PREVIOUS",
+            "HEADER_SECRET_NEXT",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "incompatibility telemetry leaked contract data: {secret}"
+            );
+        }
+
+        let many: HashMap<String, FederatedTool> = (0..256)
+            .map(|index| {
+                let name = format!("invalid-{index}");
+                let tool = prepared_tool(
+                    json!({
+                        "name": name,
+                        "inputSchema": {
+                            "type": "object",
+                            "$dynamicRef": format!("https://schema.example/{index}")
+                        }
+                    }),
+                    "bulk-server",
+                    &format!("invalid-{index}"),
+                );
+                (tool.name.clone(), tool)
+            })
+            .collect();
+        let bounded_changes = modern_incompatibility_changes(&HashMap::new(), &many);
+        assert!(
+            !bounded_changes.is_empty(),
+            "a non-empty new incompatibility set must emit at least one change"
+        );
+        assert!(
+            bounded_changes.len() <= 32,
+            "an attacker-controlled catalogue cannot create unbounded change events"
+        );
+    }
+
+    #[test]
+    fn task_5b_federated_tool_debug_redacts_lossless_contract_documents() {
+        let tool = prepared_tool(
+            json!({
+                "name": "safe-debug-name",
+                "description": "DESCRIPTION_SECRET_MARKER",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "credential": {
+                            "type": "string",
+                            "description": "SCHEMA_SECRET_MARKER"
+                        }
+                    }
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "description": "OUTPUT_SECRET_MARKER"
+                },
+                "vendor.example/private": {
+                    "authorization": "UNKNOWN_EXTENSION_SECRET_MARKER"
+                }
+            }),
+            "safe-debug-server",
+            "safe-debug-name",
+        );
+
+        let rendered = format!("{tool:?}");
+        assert!(rendered.contains("FederatedTool"));
+        for secret in [
+            "DESCRIPTION_SECRET_MARKER",
+            "SCHEMA_SECRET_MARKER",
+            "OUTPUT_SECRET_MARKER",
+            "UNKNOWN_EXTENSION_SECRET_MARKER",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "FederatedTool Debug leaked the complete contract: {secret}"
+            );
+        }
+        assert!(
+            rendered.len() <= 512,
+            "FederatedTool Debug must stay bounded independently of schema size"
+        );
+    }
+
+    #[test]
+    fn task_5b_modern_digest_tracks_complete_fields_without_moving_legacy_digest() {
+        let baseline = prepared_tool(full_tool_document("search"), "catalog", "search");
+        let mut changed_document = full_tool_document("search");
+        changed_document["vendor.example/security"]["audience"] = json!("administrators");
+        let changed = prepared_tool(changed_document, "catalog", "search");
+
+        let mut baseline_registry = HashMap::new();
+        baseline_registry.insert("search".to_string(), baseline);
+        let mut changed_registry = HashMap::new();
+        changed_registry.insert("search".to_string(), changed);
+
+        assert_eq!(
+            tools_registry_digest(&baseline_registry),
+            tools_registry_digest(&changed_registry),
+            "legacy digest must retain its historical field set"
+        );
+        assert_ne!(
+            modern_tools_registry_digest(&baseline_registry),
+            modern_tools_registry_digest(&changed_registry),
+            "modern digest must invalidate a lossless vendor-field change"
+        );
+    }
+
+    #[test]
+    fn task_5b_modern_digest_preserves_non_jcs_numbers() {
+        let mut high_a = full_tool_document("numeric");
+        high_a["vendor.example/number"] = json!(9_007_199_254_740_992_u64);
+        let mut high_b = high_a.clone();
+        high_b["vendor.example/number"] = json!(9_007_199_254_740_993_u64);
+
+        let mut negative_zero = full_tool_document("numeric");
+        negative_zero["vendor.example/number"] = json!(-0.0_f64);
+        let mut positive_zero = negative_zero.clone();
+        positive_zero["vendor.example/number"] = json!(0.0_f64);
+
+        let registry_for = |document| {
+            let tool = prepared_tool(document, "catalog", "numeric");
+            HashMap::from([("numeric".to_string(), tool)])
+        };
+
+        assert_ne!(
+            modern_tools_registry_digest(&registry_for(high_a)),
+            modern_tools_registry_digest(&registry_for(high_b)),
+            "lossless modern digest must not IEEE-754-round adjacent integers"
+        );
+        assert_ne!(
+            modern_tools_registry_digest(&registry_for(negative_zero)),
+            modern_tools_registry_digest(&registry_for(positive_zero)),
+            "lossless modern digest must preserve a negative-zero Number"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_modern_only_refresh_keeps_legacy_generations_and_cache_identity() {
+        let baseline = full_tool_document("search");
+        let mut modern_only_change = baseline.clone();
+        modern_only_change["title"] = json!("Search v2");
+        let server = tool_list_server(vec![json!([baseline]), json!([modern_only_change])]);
+        let federation = McpFederation::new(vec![server]);
+
+        federation.refresh_tools().await.expect("baseline refresh");
+        let legacy_generation = federation.generation();
+        let legacy_tools_generation = federation.tools_generation();
+        let modern_generation = federation.modern_tools_generation();
+        let legacy_snapshot = federation.serialized_tools();
+        let modern_snapshot = federation.serialized_modern_tools();
+        let (codemode_snapshot, codemode_etag) =
+            federation.codemode_ts_cached("https://gateway.example");
+
+        federation
+            .refresh_tools()
+            .await
+            .expect("modern-only refresh");
+
+        assert_eq!(federation.generation(), legacy_generation);
+        assert_eq!(federation.tools_generation(), legacy_tools_generation);
+        assert!(federation.modern_tools_generation() > modern_generation);
+        assert!(Arc::ptr_eq(
+            &legacy_snapshot,
+            &federation.serialized_tools()
+        ));
+        assert!(!Arc::ptr_eq(
+            &modern_snapshot,
+            &federation.serialized_modern_tools()
+        ));
+        let (codemode_after, codemode_etag_after) =
+            federation.codemode_ts_cached("https://gateway.example");
+        assert!(Arc::ptr_eq(&codemode_snapshot, &codemode_after));
+        assert_eq!(codemode_etag, codemode_etag_after);
+        assert!(federation
+            .serialized_modern_tools()
+            .full_array
+            .contains("Search v2"));
+    }
+
+    #[tokio::test]
+    async fn task_5b_legacy_only_membership_does_not_churn_modern_cache() {
+        let visible = full_tool_document("visible");
+        let legacy_only = json!({
+            "name": "legacy-only",
+            "description": "Retained only by the frozen legacy projection"
+        });
+        let server = tool_list_server(vec![
+            json!([visible.clone()]),
+            json!([visible.clone(), legacy_only]),
+            json!([visible]),
+        ]);
+        let federation = McpFederation::new(vec![server]);
+
+        federation.refresh_tools().await.expect("baseline refresh");
+        let baseline_generation = federation.generation();
+        let baseline_tools_generation = federation.tools_generation();
+        let modern_generation = federation.modern_tools_generation();
+        let modern_snapshot = federation.serialized_modern_tools();
+
+        federation
+            .refresh_tools()
+            .await
+            .expect("legacy-only addition refresh");
+        assert!(federation.generation() > baseline_generation);
+        assert!(federation.tools_generation() > baseline_tools_generation);
+        assert_eq!(federation.modern_tools_generation(), modern_generation);
+        assert!(Arc::ptr_eq(
+            &modern_snapshot,
+            &federation.serialized_modern_tools()
+        ));
+        assert!(federation.resolve_tool("legacy-only").is_some());
+        assert!(federation.resolve_modern_tool("legacy-only").is_none());
+
+        let addition_generation = federation.generation();
+        let addition_tools_generation = federation.tools_generation();
+        federation
+            .refresh_tools()
+            .await
+            .expect("legacy-only removal refresh");
+        assert!(federation.generation() > addition_generation);
+        assert!(federation.tools_generation() > addition_tools_generation);
+        assert_eq!(federation.modern_tools_generation(), modern_generation);
+        assert!(Arc::ptr_eq(
+            &modern_snapshot,
+            &federation.serialized_modern_tools()
+        ));
+        assert!(federation.resolve_tool("legacy-only").is_none());
+    }
+
+    #[tokio::test]
+    async fn task_5b_strict_ineligible_change_publishes_lossless_contract() {
+        let mut baseline = full_tool_document("strict-ineligible");
+        baseline["inputSchema"] = json!({
+            "type": "object",
+            "$dynamicRef": "https://untrusted.example.test/schema"
+        });
+        let mut modern_only_change = baseline.clone();
+        modern_only_change["title"] = json!("Changed but still ineligible");
+        let server = tool_list_server(vec![json!([baseline]), json!([modern_only_change])]);
+        let federation = McpFederation::new(vec![server]);
+
+        federation.refresh_tools().await.expect("baseline refresh");
+        let legacy_generation = federation.generation();
+        let legacy_tools_generation = federation.tools_generation();
+        let modern_generation = federation.modern_tools_generation();
+        let modern_snapshot = federation.serialized_modern_tools();
+        assert!(federation
+            .resolve_modern_tool("strict-ineligible")
+            .is_none());
+
+        federation
+            .refresh_tools()
+            .await
+            .expect("strict ineligible refresh");
+
+        assert_eq!(federation.generation(), legacy_generation);
+        assert_eq!(federation.tools_generation(), legacy_tools_generation);
+        assert!(federation.modern_tools_generation() > modern_generation);
+        assert!(!Arc::ptr_eq(
+            &modern_snapshot,
+            &federation.serialized_modern_tools()
+        ));
+        let tool = federation
+            .resolve_tool("strict-ineligible")
+            .expect("strict ineligible entry remains in the registry");
+        assert!(tool.contract.is_some());
+        assert!(tool.modern_contract.is_none());
+        assert_eq!(
+            tool.modern_incompatibility.as_deref(),
+            Some("external_reference")
+        );
+        assert_eq!(
+            tool.contract
+                .as_ref()
+                .expect("strict contract remains lossless")
+                .as_value()["title"],
+            "Changed but still ineligible"
+        );
     }
 
     // --- Prompts ---
@@ -2586,6 +4669,150 @@ mod tests {
             format!("{err:#}").contains("unknown prompt"),
             "expected an unknown-prompt error, got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn task_5b_prompt_dispatch_stays_bound_to_the_authorized_snapshot_owner() {
+        let (allowed_server, allowed_calls, _allowed_stop, allowed_handle) =
+            tool_call_server("allowed", "allowed prompt owner");
+        let (denied_server, denied_calls, denied_stop, denied_handle) =
+            tool_call_server("denied", "denied replacement owner");
+        let federation = McpFederation::new(vec![allowed_server, denied_server]);
+
+        federation.prompts.store(Arc::new(HashMap::from([(
+            "shared".to_string(),
+            make_prompt("shared", "allowed"),
+        )])));
+        let authorized = federation.prompt_catalog_snapshot();
+
+        federation.prompts.store(Arc::new(HashMap::from([(
+            "shared".to_string(),
+            make_prompt("shared", "denied"),
+        )])));
+
+        let result = federation
+            .get_prompt_from_snapshot(&authorized, "shared", None)
+            .await
+            .expect("dispatch must retain the authorized prompt owner");
+        assert_eq!(result["content"][0]["text"], "allowed prompt owner");
+
+        allowed_handle.join().expect("allowed prompt fixture join");
+        let _ = denied_stop.send(());
+        denied_handle.join().expect("denied prompt fixture join");
+        assert_eq!(allowed_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            denied_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a replacement owner that was never authorized must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_foreign_prompt_snapshot_is_rejected_before_network_io() {
+        let (source_server, source_calls, source_stop, source_handle) =
+            tool_call_server("shared", "source federation");
+        let (target_server, target_calls, target_stop, target_handle) =
+            tool_call_server("shared", "target federation");
+        let source = McpFederation::new(vec![source_server]);
+        let target = McpFederation::new(vec![target_server]);
+        source.prompts.store(Arc::new(HashMap::from([(
+            "shared".to_string(),
+            make_prompt("shared", "shared"),
+        )])));
+        target.prompts.store(Arc::new(HashMap::from([(
+            "shared".to_string(),
+            make_prompt("shared", "shared"),
+        )])));
+
+        let foreign = source.prompt_catalog_snapshot();
+        let error = target
+            .get_prompt_from_snapshot(&foreign, "shared", None)
+            .await
+            .expect_err("a snapshot from another federation must fail closed");
+
+        let _ = source_stop.send(());
+        let _ = target_stop.send(());
+        source_handle.join().expect("source prompt fixture join");
+        target_handle.join().expect("target prompt fixture join");
+        assert!(
+            format!("{error:#}").contains("invalid prompt catalogue snapshot"),
+            "foreign-snapshot errors must be generic and attributable: {error:#}"
+        );
+        assert_eq!(source_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            target_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "ownership must be checked before server selection or network I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_held_prompt_snapshot_never_falls_back_to_the_live_registry() {
+        let (server, calls, stop, handle) = tool_call_server("current", "current prompt");
+        let federation = McpFederation::new(vec![server]);
+        let held_empty = federation.prompt_catalog_snapshot();
+        federation.prompts.store(Arc::new(HashMap::from([(
+            "appeared_later".to_string(),
+            make_prompt("appeared_later", "current"),
+        )])));
+
+        let error = federation
+            .get_prompt_from_snapshot(&held_empty, "appeared_later", None)
+            .await
+            .expect_err("a held snapshot must not consult a later live registry");
+
+        let _ = stop.send(());
+        handle.join().expect("held prompt fixture join");
+        assert!(format!("{error:#}").contains("unknown prompt"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a name absent from the authorized snapshot must not reach the live owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_prompt_snapshot_rejects_an_inconsistent_advertised_name() {
+        let (server, calls, stop, handle) = tool_call_server("owner", "must not dispatch");
+        let federation = McpFederation::new(vec![server]);
+        federation.prompts.store(Arc::new(HashMap::from([(
+            "advertised".to_string(),
+            make_prompt("different", "owner"),
+        )])));
+        let snapshot = federation.prompt_catalog_snapshot();
+
+        let error = federation
+            .get_prompt_from_snapshot(&snapshot, "advertised", None)
+            .await
+            .expect_err("a registry key/name mismatch must fail closed");
+
+        let _ = stop.send(());
+        handle.join().expect("inconsistent prompt fixture join");
+        assert!(format!("{error:#}").contains("unknown prompt"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an inconsistent registry entry must fail before server selection or I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_prompt_compatibility_wrapper_uses_one_current_snapshot() {
+        let (server, calls, _stop, handle) = tool_call_server("current", "current prompt");
+        let federation = McpFederation::new(vec![server]);
+        federation.prompts.store(Arc::new(HashMap::from([(
+            "current".to_string(),
+            make_prompt("current", "current"),
+        )])));
+
+        let result = federation
+            .get_prompt("current", None)
+            .await
+            .expect("compatibility dispatch uses the current prompt snapshot");
+
+        handle.join().expect("current prompt fixture join");
+        assert_eq!(result["content"][0]["text"], "current prompt");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2826,20 +5053,18 @@ mod tests {
         let fed = std::sync::Arc::new(McpFederation::new(vec![]));
         fed.refresh_tools().await.unwrap();
         let first = fed.serialized_tools();
-        assert_eq!(first.generation, fed.generation());
+        assert_eq!(first.generation, fed.tools_generation());
         assert_eq!(first.full_array, "[]");
         // Warm path returns the same snapshot Arc.
         let second = fed.serialized_tools();
         assert!(std::sync::Arc::ptr_eq(&first, &second));
 
-        // Manually store a catalogue and bump the generation the way
-        // a refresh would; the next call must rebuild.
+        // Publish a new catalogue through the same atomic seam as a
+        // refresh; the prebuilt snapshot changes with that state.
         let mut map = std::collections::HashMap::new();
         map.insert("b_tool".to_string(), make_tool("b_tool", "srv"));
         map.insert("a_tool".to_string(), make_tool("a_tool", "srv"));
-        fed.tools.store(std::sync::Arc::new(map));
-        fed.generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        fed.seed_tools_for_test(map, None);
         let rebuilt = fed.serialized_tools();
         assert_eq!(rebuilt.entries.len(), 2);
         // Sorted by name, spliced into one array.
@@ -3024,6 +5249,539 @@ mod tests {
         }
     }
 
+    struct PausingJudge {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::compat::Judge for PausingJudge {
+        async fn score(
+            &self,
+            _rubric: &str,
+            _old: &serde_json::Value,
+            _new: &serde_json::Value,
+        ) -> anyhow::Result<f64> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(1.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn task_5b_cancelled_versioning_refresh_keeps_the_previous_snapshot_retryable() {
+        let baseline_tool = json!({
+            "name": "search",
+            "description": "original description",
+            "inputSchema": {"type": "object", "properties": {}}
+        });
+        let changed_tool = json!({
+            "name": "search",
+            "description": "changed description",
+            "inputSchema": {"type": "object", "properties": {}}
+        });
+        let server = tool_list_server(vec![
+            json!([baseline_tool]),
+            json!([changed_tool.clone()]),
+            json!([changed_tool]),
+        ]);
+        let lockfile_path = write_lockfile(
+            "task-5b-cancelled-publication",
+            &gate_lockfile("original description"),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let judge: Arc<dyn crate::mcp::compat::Judge> = Arc::new(PausingJudge {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let federation = Arc::new(McpFederation::with_io_versioned(
+            vec![server],
+            FederationIoSettings::default(),
+            Some(ToolVersioningGate {
+                lockfile_path: lockfile_path.clone(),
+                declared_versions: HashMap::new(),
+                mode: VersioningMode::Block,
+                judges: vec![judge],
+            }),
+        ));
+
+        federation.refresh_tools().await.expect("baseline refresh");
+        let legacy_generation = federation.generation();
+        let tools_generation = federation.tools_generation();
+        let modern_generation = federation.modern_tools_generation();
+        let baseline_catalog = federation.tool_catalog.load_full();
+        let legacy_digest = baseline_catalog.legacy_digest;
+        let modern_digest = baseline_catalog.modern_digest;
+        let legacy_snapshot = federation.serialized_tools();
+        let modern_snapshot = federation.serialized_modern_tools();
+
+        let pending_federation = Arc::clone(&federation);
+        let pending = tokio::spawn(async move { pending_federation.refresh_tools().await });
+        entered.notified().await;
+        pending.abort();
+        assert!(pending
+            .await
+            .expect_err("refresh task was aborted")
+            .is_cancelled());
+
+        assert_eq!(federation.generation(), legacy_generation);
+        assert_eq!(federation.tools_generation(), tools_generation);
+        assert_eq!(federation.modern_tools_generation(), modern_generation);
+        let after_abort_catalog = federation.tool_catalog.load_full();
+        assert_eq!(after_abort_catalog.legacy_digest, legacy_digest);
+        assert_eq!(after_abort_catalog.modern_digest, modern_digest);
+        assert_eq!(
+            federation
+                .resolve_tool("search")
+                .expect("baseline registry remains published")
+                .description,
+            "original description"
+        );
+        assert!(Arc::ptr_eq(
+            &legacy_snapshot,
+            &federation.serialized_tools()
+        ));
+        assert!(Arc::ptr_eq(
+            &modern_snapshot,
+            &federation.serialized_modern_tools()
+        ));
+
+        let retry_federation = Arc::clone(&federation);
+        let retry = tokio::spawn(async move { retry_federation.refresh_tools().await });
+        entered.notified().await;
+        release.notify_one();
+        assert_eq!(retry.await.expect("retry join").expect("retry refresh"), 1);
+        assert_eq!(
+            federation
+                .resolve_tool("search")
+                .expect("retry publishes changed registry")
+                .description,
+            "changed description"
+        );
+
+        let _ = std::fs::remove_file(lockfile_path);
+    }
+
+    #[test]
+    fn task_5b_catalog_publication_is_atomic_for_barrier_reader() {
+        let federation = Arc::new(McpFederation::new(vec![]));
+        let mut before_registry = HashMap::new();
+        before_registry.insert("search".to_string(), make_tool("search", "catalog"));
+        federation.seed_tools_for_test(before_registry, None);
+
+        let reader_loaded = Arc::new(std::sync::Barrier::new(2));
+        let release_reader = Arc::new(std::sync::Barrier::new(2));
+        let reader_federation = Arc::clone(&federation);
+        let reader_loaded_for_thread = Arc::clone(&reader_loaded);
+        let release_reader_for_thread = Arc::clone(&release_reader);
+        let reader = std::thread::spawn(move || {
+            let snapshot = reader_federation.tool_catalog_snapshot();
+            reader_loaded_for_thread.wait();
+            release_reader_for_thread.wait();
+            let (tool, blocked) = snapshot.resolve_tool_with_version_block("search");
+            let serialized = snapshot.serialized_tools();
+            (
+                tool.expect("old tool remains present")
+                    .description
+                    .to_string(),
+                blocked.is_some(),
+                snapshot.tools_generation(),
+                snapshot.modern_tools_generation(),
+                serialized.generation,
+                serialized.full_array.clone(),
+            )
+        });
+
+        reader_loaded.wait();
+        let mut after_registry = HashMap::new();
+        after_registry.insert(
+            "search".to_string(),
+            make_tool_with_schema(
+                "search",
+                "changed after reader snapshot",
+                json!({"type": "object", "properties": {}}),
+                "catalog",
+                false,
+            ),
+        );
+        let legacy_digest = tools_registry_digest(&after_registry);
+        let modern_digest = modern_tools_registry_digest(&after_registry);
+        federation.publish_tool_refresh(
+            after_registry,
+            legacy_digest,
+            modern_digest,
+            true,
+            true,
+            Some(HashMap::from([(
+                "search".to_string(),
+                "version gate blocked changed contract".to_string(),
+            )])),
+        );
+        release_reader.wait();
+
+        let (
+            reader_description,
+            reader_blocked,
+            reader_tools_generation,
+            reader_modern_generation,
+            reader_serialized_generation,
+            reader_serialized,
+        ) = reader.join().expect("barrier reader join");
+        assert_eq!(reader_description, "Tool search");
+        assert!(!reader_blocked);
+        assert_eq!(reader_serialized_generation, reader_tools_generation);
+        assert!(reader_serialized.contains("Tool search"));
+
+        let after = federation.tool_catalog.load_full();
+        assert_eq!(
+            after
+                .tools
+                .get("search")
+                .expect("new tool is published")
+                .description,
+            "changed after reader snapshot"
+        );
+        assert!(after.version_blocked.contains_key("search"));
+        assert!(after.tools_generation > reader_tools_generation);
+        assert!(after.modern_tools_generation > reader_modern_generation);
+        let current_serialized = federation.serialized_tools();
+        assert_eq!(current_serialized.generation, after.tools_generation);
+        assert!(current_serialized
+            .full_array
+            .contains("changed after reader snapshot"));
+    }
+
+    #[test]
+    fn task_5b_snapshot_mapping_stays_stable_across_a_blocked_replacement() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), make_tool("search", "old-server"))]),
+            None,
+        );
+        let held = federation.tool_catalog_snapshot();
+
+        federation.seed_tools_for_test(
+            HashMap::from([(
+                "search".to_string(),
+                make_tool("search", "replacement-server"),
+            )]),
+            Some(HashMap::from([(
+                "search".to_string(),
+                "replacement is blocked".to_string(),
+            )])),
+        );
+
+        assert_eq!(
+            held.resolve_tool("search")
+                .expect("held snapshot retains the original entry")
+                .server_name,
+            "old-server",
+            "a publication after route planning must not replace the held server mapping"
+        );
+        assert!(
+            held.version_blocked().get("search").is_none(),
+            "the held entry retains its matching original version verdict"
+        );
+
+        let current = federation.tool_catalog_snapshot();
+        assert_eq!(
+            current
+                .resolve_tool("search")
+                .expect("replacement is current")
+                .server_name,
+            "replacement-server"
+        );
+        assert_eq!(
+            current.version_blocked().get("search").map(String::as_str),
+            Some("replacement is blocked")
+        );
+    }
+
+    #[test]
+    fn task_5b_test_seed_none_clears_a_prior_version_block_publication() {
+        let federation = McpFederation::new(vec![]);
+        let tools = HashMap::from([("search".to_string(), make_tool("search", "catalog"))]);
+        federation.seed_tools_for_test(
+            tools.clone(),
+            Some(HashMap::from([(
+                "search".to_string(),
+                "blocked first".to_string(),
+            )])),
+        );
+        assert!(federation
+            .tool_catalog_snapshot()
+            .version_blocked()
+            .contains_key("search"));
+
+        federation.seed_tools_for_test(tools, None);
+
+        assert!(
+            federation
+                .tool_catalog_snapshot()
+                .version_blocked()
+                .is_empty(),
+            "None in the test helper means an explicitly unblocked publication"
+        );
+    }
+
+    #[test]
+    fn task_5b_codemode_hides_version_blocked_tools_and_rebuilds_its_cache() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([
+                (
+                    "allowed".to_string(),
+                    make_tool("allowed", "catalog-server"),
+                ),
+                (
+                    "refused".to_string(),
+                    make_tool("refused", "catalog-server"),
+                ),
+            ]),
+            None,
+        );
+        let (before, before_etag) = federation.codemode_ts_cached("https://gateway.example");
+        assert!(before.contains("['allowed']:"));
+        assert!(before.contains("['refused']:"));
+
+        federation.publish_tool_version_blocked(HashMap::from([(
+            "refused".to_string(),
+            "version policy refuses this tool".to_string(),
+        )]));
+        let (after, after_etag) = federation.codemode_ts_cached("https://gateway.example");
+
+        assert!(after.contains("['allowed']:"));
+        assert!(
+            !after.contains("['refused']:"),
+            "CodeMode must not advertise a tool the matching version gate refuses"
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a verdict-only publication must invalidate the CodeMode cache"
+        );
+        assert_ne!(before_etag, after_etag);
+    }
+
+    #[tokio::test]
+    async fn task_5b_held_entry_dispatch_cannot_reresolve_a_blocked_replacement() {
+        let (old_server, old_calls, _old_stop, old_handle) =
+            tool_call_server("old", "old held entry");
+        let (replacement_server, replacement_calls, replacement_stop, replacement_handle) =
+            tool_call_server("replacement", "new blocked replacement");
+        let federation = McpFederation::new(vec![old_server, replacement_server]);
+
+        let mut original_registry = HashMap::new();
+        original_registry.insert("search".to_string(), make_tool("search", "old"));
+        federation.seed_tools_for_test(original_registry, None);
+        let held_catalog = federation.tool_catalog_snapshot();
+        let (held_entry, blocked) = held_catalog.resolve_tool_with_version_block("search");
+        assert!(held_entry.is_some(), "the original entry must resolve");
+        assert!(blocked.is_none(), "the original entry is not blocked");
+
+        let mut replacement_registry = HashMap::new();
+        replacement_registry.insert("search".to_string(), make_tool("search", "replacement"));
+        let legacy_digest = tools_registry_digest(&replacement_registry);
+        let modern_digest = modern_tools_registry_digest(&replacement_registry);
+        federation.publish_tool_refresh(
+            replacement_registry,
+            legacy_digest,
+            modern_digest,
+            true,
+            true,
+            Some(HashMap::from([(
+                "search".to_string(),
+                "replacement is blocked after publication".to_string(),
+            )])),
+        );
+
+        let result = federation
+            .call_tool_with_upstream_headers_from_snapshot(
+                &held_catalog,
+                "search",
+                json!({"query": "held"}),
+                &[],
+            )
+            .await
+            .expect("held entry dispatch must not re-resolve by name");
+        assert_eq!(result["content"][0]["text"], "old held entry");
+
+        old_handle.join().expect("old fixture join");
+        let _ = replacement_stop.send(());
+        replacement_handle.join().expect("replacement fixture join");
+        assert_eq!(
+            old_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the held entry's server receives the call"
+        );
+        assert_eq!(
+            replacement_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the blocked replacement is never selected after the gate"
+        );
+        assert_eq!(
+            federation
+                .resolve_tool("search")
+                .expect("replacement registry")
+                .server_name,
+            "replacement"
+        );
+        assert!(
+            federation.version_blocked().contains_key("search"),
+            "the current replacement really is blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_snapshot_dispatch_enforces_its_own_version_verdict_before_hooks_and_io() {
+        const TOOL: &str = "task_5b_blocked_held_snapshot_tool";
+        let (server, upstream_calls, _stop, handle) =
+            tool_call_server("versioned", "older held snapshot dispatched");
+        let federation = McpFederation::new(vec![server]);
+        federation.seed_tools_for_test(
+            HashMap::from([(TOOL.to_string(), make_tool(TOOL, "versioned"))]),
+            None,
+        );
+        let older_unblocked = federation.tool_catalog_snapshot();
+
+        let mut replacement = make_tool(TOOL, "versioned");
+        replacement.description = "blocked replacement".to_string();
+        federation.seed_tools_for_test(
+            HashMap::from([(TOOL.to_string(), replacement)]),
+            Some(HashMap::from([(
+                TOOL.to_string(),
+                "replacement failed the version gate".to_string(),
+            )])),
+        );
+        let newer_blocked = federation.tool_catalog_snapshot();
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        register_mcp_policy_hook(Arc::new(ToolCountingHook {
+            match_tool: TOOL,
+            calls: Arc::clone(&hook_calls),
+        }));
+
+        let error = federation
+            .call_tool_with_upstream_headers_from_snapshot(
+                &newer_blocked,
+                TOOL,
+                json!({"query": "must not leave the process"}),
+                &[],
+            )
+            .await
+            .expect_err("a version-blocked entry in the held snapshot must fail closed");
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("version") && message.contains("block"),
+            "the local version-gate rejection must be diagnosable, got {message}"
+        );
+        assert_eq!(
+            hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the held snapshot's version verdict must run before policy hooks"
+        );
+        assert_eq!(
+            upstream_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the held snapshot's version verdict must run before network dispatch"
+        );
+
+        let result = federation
+            .call_tool_with_upstream_headers_from_snapshot(
+                &older_unblocked,
+                TOOL,
+                json!({"query": "older accepted decision"}),
+                &[],
+            )
+            .await
+            .expect("an older unblocked held publication remains dispatchable");
+        assert_eq!(
+            result["content"][0]["text"],
+            "older held snapshot dispatched"
+        );
+        handle.join().expect("versioned fixture join");
+        assert_eq!(
+            hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the accepted older publication reaches the hook"
+        );
+        assert_eq!(
+            upstream_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the accepted older publication reaches the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_snapshot_dispatch_ignores_a_fabricated_mutable_tool_clone() {
+        let (selected_server, selected_calls, _selected_stop, selected_handle) =
+            tool_call_server("selected", "selected snapshot entry");
+        let (forged_server, forged_calls, forged_stop, forged_handle) =
+            tool_call_server("forged", "forged mutable clone");
+        let federation = McpFederation::new(vec![selected_server, forged_server]);
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), make_tool("search", "selected"))]),
+            None,
+        );
+        let held_catalog = federation.tool_catalog_snapshot();
+
+        // `FederatedTool` remains publicly mutable for compatibility. A clone
+        // can therefore be fabricated with another server, but the dispatch
+        // API accepts only the opaque held catalogue and never this clone.
+        let mut fabricated = held_catalog
+            .resolve_tool("search")
+            .expect("held snapshot contains the selected tool");
+        fabricated.server_name = "forged".to_string();
+        assert_eq!(fabricated.server_name, "forged");
+
+        let result = federation
+            .call_tool_with_upstream_headers_from_snapshot(
+                &held_catalog,
+                "search",
+                json!({"query": "selected"}),
+                &[],
+            )
+            .await
+            .expect("dispatch resolves only through the held snapshot");
+        assert!(
+            result["content"][0]["text"] == "selected snapshot entry",
+            "the selected held route wins over a fabricated mutable clone"
+        );
+        selected_handle.join().expect("selected fixture join");
+        let _ = forged_stop.send(());
+        forged_handle.join().expect("forged fixture join");
+        assert_eq!(selected_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(forged_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn task_5b_snapshot_dispatch_rejects_a_cross_federation_snapshot() {
+        let (target_server, target_calls, target_stop, target_handle) =
+            tool_call_server("target", "must not dispatch");
+        let target = McpFederation::new(vec![target_server]);
+        let source = McpFederation::new(vec![]);
+        source.seed_tools_for_test(
+            HashMap::from([("search".to_string(), make_tool("search", "target"))]),
+            None,
+        );
+        let foreign_snapshot = source.tool_catalog_snapshot();
+
+        let error = target
+            .call_tool_with_upstream_headers_from_snapshot(
+                &foreign_snapshot,
+                "search",
+                json!({"query": "cross-federation"}),
+                &[],
+            )
+            .await
+            .expect_err("a foreign snapshot must not select this federation's server");
+        assert!(error
+            .to_string()
+            .contains("snapshot belongs to another federation"));
+        let _ = target_stop.send(());
+        target_handle.join().expect("target fixture join");
+        assert_eq!(target_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn version_gate_judge_escalates_description_change_to_major() {
         // A patch bump covers a reworded description structurally,
@@ -3086,7 +5844,7 @@ mod tests {
         let fed = McpFederation::new(vec![mock_server("s", "http://s.test")]);
         let mut map = HashMap::new();
         map.insert("my_tool".to_string(), make_tool("my_tool", "s"));
-        fed.tools.store(Arc::new(map));
+        fed.seed_tools_for_test(map, None);
 
         let resolved = fed.resolve_tool("my_tool").unwrap();
         assert_eq!(resolved.name, "my_tool");
@@ -3107,25 +5865,24 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "search_docs".to_string(),
-            FederatedTool {
-                name: "search_docs".to_string(),
-                description: "Search documentation".to_string(),
-                input_schema: json!({
+            make_tool_with_schema(
+                "search_docs",
+                "Search documentation",
+                json!({
                     "type": "object",
                     "properties": {"query": {"type": "string"}},
                     "required": ["query"]
                 }),
-                server_name: "docs".to_string(),
-                streaming: false,
-                meta: None,
-            },
+                "docs",
+                false,
+            ),
         );
         map.insert(
             "open_pr".to_string(),
-            FederatedTool {
-                name: "open_pr".to_string(),
-                description: "Open a pull request".to_string(),
-                input_schema: json!({
+            make_tool_with_schema(
+                "open_pr",
+                "Open a pull request",
+                json!({
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
@@ -3133,17 +5890,16 @@ mod tests {
                     },
                     "required": ["title"]
                 }),
-                server_name: "gh".to_string(),
-                streaming: false,
-                meta: None,
-            },
+                "gh",
+                false,
+            ),
         );
-        fed.tools.store(Arc::new(map));
+        fed.seed_tools_for_test(map, None);
 
         let out = fed.codemode_ts("https://gw.example/.well-known/mcp");
         assert!(out.contains("export interface SearchDocsInput"));
         assert!(out.contains("export interface OpenPrInput"));
-        assert!(out.contains("search_docs:"));
+        assert!(out.contains("['search_docs']:"));
         assert!(out.contains("open_pr:"));
         assert!(out.contains("https://gw.example/.well-known/mcp/call/"));
     }
@@ -3156,7 +5912,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("z_tool".to_string(), make_tool("z_tool", "s"));
         map.insert("a_tool".to_string(), make_tool("a_tool", "s"));
-        fed.tools.store(Arc::new(map));
+        fed.seed_tools_for_test(map, None);
 
         let a = fed.codemode_ts("http://x");
         let b = fed.codemode_ts("http://x");
@@ -3174,7 +5930,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("tool_a".to_string(), make_tool("tool_a", "s1"));
         map.insert("tool_b".to_string(), make_tool("tool_b", "s2"));
-        fed.tools.store(Arc::new(map));
+        fed.seed_tools_for_test(map, None);
 
         let tools = fed.list_tools();
         assert_eq!(tools.len(), 2);
@@ -3184,14 +5940,13 @@ mod tests {
 
     #[test]
     fn test_federated_tool_fields() {
-        let tool = FederatedTool {
-            name: "search".to_string(),
-            description: "Search the web".to_string(),
-            input_schema: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
-            server_name: "web_server".to_string(),
-            streaming: false,
-            meta: None,
-        };
+        let tool = make_tool_with_schema(
+            "search",
+            "Search the web",
+            json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+            "web_server",
+            false,
+        );
         assert_eq!(tool.name, "search");
         assert_eq!(tool.server_name, "web_server");
         assert!(tool.input_schema.get("properties").is_some());
@@ -3260,16 +6015,9 @@ mod tests {
         let mut tools = HashMap::new();
         tools.insert(
             "echo".to_string(),
-            FederatedTool {
-                name: "echo".to_string(),
-                description: "echo".to_string(),
-                input_schema: json!({"type": "object"}),
-                server_name: "auth-up".to_string(),
-                streaming: false,
-                meta: None,
-            },
+            make_tool_with_schema("echo", "echo", json!({"type": "object"}), "auth-up", false),
         );
-        fed.seed_tools_for_test(tools);
+        fed.seed_tools_for_test(tools, None);
 
         let headers = vec![(
             "authorization".to_string(),
@@ -3818,24 +6566,34 @@ mod tests {
         let mut registry: HashMap<String, FederatedTool> = HashMap::new();
 
         let mut tool_a = make_tool("search", "server_a");
-        tool_a.name = federated_name(
+        let advertised_a = federated_name(
             "server_a",
             NamespaceMode::OnCollision,
             '.',
-            &tool_a.name,
+            tool_a
+                .contract
+                .as_ref()
+                .expect("fixture has a strict contract")
+                .name(),
             |n| registry.contains_key(n),
         );
+        tool_a.advertise_as(&advertised_a);
         registry.insert(tool_a.name.clone(), tool_a);
 
         // Second server also has a "search" tool: it must be disambiguated.
         let mut tool_b = make_tool("search", "server_b");
-        tool_b.name = federated_name(
+        let advertised_b = federated_name(
             "server_b",
             NamespaceMode::OnCollision,
             '.',
-            &tool_b.name,
+            tool_b
+                .contract
+                .as_ref()
+                .expect("fixture has a strict contract")
+                .name(),
             |n| registry.contains_key(n),
         );
+        tool_b.advertise_as(&advertised_b);
         registry.insert(tool_b.name.clone(), tool_b);
 
         assert!(registry.contains_key("search"));
@@ -3845,6 +6603,26 @@ mod tests {
         assert_eq!(registry.get("search").unwrap().name, "search");
         assert_eq!(
             registry.get("server_b.search").unwrap().name,
+            "server_b.search"
+        );
+        assert_eq!(
+            registry
+                .get("search")
+                .unwrap()
+                .contract
+                .as_ref()
+                .expect("fixture has a strict contract")
+                .name(),
+            "search"
+        );
+        assert_eq!(
+            registry
+                .get("server_b.search")
+                .unwrap()
+                .contract
+                .as_ref()
+                .expect("fixture has a strict contract")
+                .name(),
             "server_b.search"
         );
     }
@@ -3904,6 +6682,23 @@ mod tests {
         observed: Arc<StdMutex<Vec<ObservedCall>>>,
     }
 
+    struct ToolCountingHook {
+        match_tool: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl McpPolicyHook for ToolCountingHook {
+        fn evaluate<'a>(
+            &'a self,
+            ctx: McpToolCallCtx<'a>,
+        ) -> Pin<Box<dyn Future<Output = PolicyDecision> + Send + 'a>> {
+            if ctx.tool_name == self.match_tool {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Box::pin(async move { PolicyDecision::Allow })
+        }
+    }
+
     impl McpPolicyHook for ScopedHook {
         fn evaluate<'a>(
             &'a self,
@@ -3936,7 +6731,7 @@ mod tests {
         )]);
         let mut map = HashMap::new();
         map.insert(tool.to_string(), make_tool(tool, server));
-        fed.tools.store(Arc::new(map));
+        fed.seed_tools_for_test(map, None);
         fed
     }
 
@@ -4284,7 +7079,7 @@ mod tests {
         let fed = McpFederation::new(vec![server]);
         let mut tools = HashMap::new();
         tools.insert("echo".to_string(), make_tool("echo", "trace-up"));
-        fed.seed_tools_for_test(tools);
+        fed.seed_tools_for_test(tools, None);
 
         fed.call_tool("echo", json!({"q": 1}))
             .await

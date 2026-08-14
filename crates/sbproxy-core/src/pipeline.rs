@@ -1530,6 +1530,48 @@ pub struct CompiledIdempotency {
     pub permits: Arc<tokio::sync::Semaphore>,
 }
 
+/// Immutable MCP catalog sources owned by one compiled pipeline generation.
+///
+/// The outer key is the route-derived tenant id and the inner key is the MCP
+/// action's advertised server name. Keeping this registry on the pipeline
+/// makes request pinning cover catalog injection just like every other
+/// compiled dependency: a candidate reload cannot overwrite a live source.
+#[derive(Default)]
+pub(crate) struct McpInjectRegistry {
+    by_tenant: HashMap<String, HashMap<String, Arc<sbproxy_modules::action::McpInjectSource>>>,
+}
+
+impl McpInjectRegistry {
+    fn insert(
+        &mut self,
+        tenant_id: &str,
+        server_name: &str,
+        source: Arc<sbproxy_modules::action::McpInjectSource>,
+    ) -> anyhow::Result<()> {
+        let tenant_sources = self.by_tenant.entry(tenant_id.to_owned()).or_default();
+        if tenant_sources.contains_key(server_name) {
+            anyhow::bail!(
+                "duplicate MCP inject source for tenant '{}' and server '{}'",
+                tenant_id,
+                server_name
+            );
+        }
+        tenant_sources.insert(server_name.to_owned(), source);
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        tenant_id: &str,
+        server_name: &str,
+    ) -> Option<Arc<sbproxy_modules::action::McpInjectSource>> {
+        self.by_tenant
+            .get(tenant_id)?
+            .get(server_name)
+            .map(Arc::clone)
+    }
+}
+
 /// A compiled config with its module instances ready for request processing.
 ///
 /// Each vec is parallel to `config.origins` - index N in `actions` corresponds
@@ -1563,6 +1605,8 @@ pub struct CompiledPipeline {
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Tenant-scoped MCP injection sources pinned to this generation.
+    pub(crate) mcp_inject_registry: McpInjectRegistry,
     /// Compiled Proxy-Wasm filter chain for each origin.
     pub(crate) proxy_wasm_filters: Vec<Option<crate::proxy_wasm_http::ProxyWasmFilterChain>>,
     /// Guards the one-time activation of this generation's background tasks.
@@ -1823,6 +1867,7 @@ impl Default for CompiledPipeline {
             sensitive_header_names,
             router,
             actions: Vec::new(),
+            mcp_inject_registry: McpInjectRegistry::default(),
             proxy_wasm_filters: Vec::new(),
             background_tasks_started: AtomicBool::new(false),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
@@ -2003,6 +2048,19 @@ impl CompiledPipeline {
             .is_some_and(|inbound| inbound.is_credential_carrier(header_name))
     }
 
+    /// Resolve an injectable MCP source from this exact pipeline generation.
+    ///
+    /// `tenant_id` must come from the matched route, not from a caller-mutable
+    /// principal attribute. Returning an owned `Arc` keeps the source pinned
+    /// without borrowing the pipeline across request work.
+    pub(crate) fn mcp_inject_source(
+        &self,
+        tenant_id: &str,
+        server_name: &str,
+    ) -> Option<Arc<sbproxy_modules::action::McpInjectSource>> {
+        self.mcp_inject_registry.get(tenant_id, server_name)
+    }
+
     /// The response-cache handle the data path must use for `origin_id`.
     ///
     /// With at-rest encryption on, this is the handle bound to that
@@ -2144,6 +2202,7 @@ impl CompiledPipeline {
 
         let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
+        let mut mcp_inject_registry = McpInjectRegistry::default();
         let mut proxy_wasm_filters = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
@@ -2183,6 +2242,13 @@ impl CompiledPipeline {
                     &action_identity,
                 )?,
             };
+            if let Action::Mcp(mcp) = &action {
+                mcp_inject_registry.insert(
+                    origin.tenant_id.as_str(),
+                    &mcp.server_name,
+                    mcp.inject_source(),
+                )?;
+            }
             let proxy_wasm_filter = if origin.filters.is_empty() {
                 None
             } else {
@@ -2765,6 +2831,7 @@ impl CompiledPipeline {
             sensitive_header_names,
             router,
             actions,
+            mcp_inject_registry,
             proxy_wasm_filters,
             background_tasks_started: AtomicBool::new(false),
             compression_runtimes,
@@ -3702,6 +3769,179 @@ mod transform_posture_tests {
             &Transform::Noop,
         );
         assert_eq!(posture, FailureMode::Open);
+    }
+}
+
+#[cfg(test)]
+mod mcp_inject_registry_tests {
+    use super::CompiledPipeline;
+    use sbproxy_extension::mcp::protocol::McpToolContract;
+    use sbproxy_extension::mcp::FederatedTool;
+    use sbproxy_modules::Action;
+    use std::collections::{BTreeSet, HashMap};
+
+    fn compile_mcp_pipeline(
+        origins: &[(&str, &str, &str, &str)],
+    ) -> anyhow::Result<CompiledPipeline> {
+        let tenant_ids = origins
+            .iter()
+            .map(|(_, tenant_id, _, _)| *tenant_id)
+            .collect::<BTreeSet<_>>();
+        let mut yaml = String::from("proxy:\n  tenants:\n");
+        for tenant_id in tenant_ids {
+            yaml.push_str(&format!("    - id: {tenant_id}\n"));
+        }
+        yaml.push_str("origins:\n");
+        for (hostname, tenant_id, server_name, upstream_prefix) in origins {
+            yaml.push_str(&format!(
+                "  {hostname}:\n    tenant_id: {tenant_id}\n    action:\n      type: mcp\n      mode: gateway\n      server_info:\n        name: {server_name}\n        version: private-config-canary\n      federated_servers:\n        - origin: https://test.sbproxy.dev\n          prefix: {upstream_prefix}\n"
+            ));
+        }
+        let config = sbproxy_config::compile_config(&yaml).expect("MCP pipeline fixture compiles");
+        CompiledPipeline::from_config_for_validation(config)
+    }
+
+    fn federated_tool(name: &str, server_name: &str) -> FederatedTool {
+        let input_schema = serde_json::json!({"type": "object", "properties": {}});
+        let contract = McpToolContract::try_from(serde_json::json!({
+            "name": name,
+            "description": "tenant-scoped fixture",
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("tenant-scoped tool contract");
+        FederatedTool {
+            name: name.to_string(),
+            description: "tenant-scoped fixture".to_string(),
+            input_schema,
+            server_name: server_name.to_string(),
+            streaming: false,
+            meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
+        }
+    }
+
+    fn seed_tool(
+        pipeline: &CompiledPipeline,
+        hostname: &str,
+        upstream_prefix: &str,
+        tool_name: &str,
+    ) {
+        let origin_index = pipeline
+            .resolve_origin(hostname)
+            .expect("fixture origin resolves");
+        let Action::Mcp(action) = &pipeline.actions[origin_index] else {
+            panic!("fixture origin must compile an MCP action");
+        };
+        action.federation.seed_tools_for_test(
+            HashMap::from([(
+                tool_name.to_string(),
+                federated_tool(tool_name, upstream_prefix),
+            )]),
+            None,
+        );
+    }
+
+    fn resolved_tool_names(source: &sbproxy_modules::action::McpInjectSource) -> Vec<String> {
+        source
+            .resolve_tools(
+                &sbproxy_plugin::Principal::anonymous(),
+                &[],
+                sbproxy_ai::identity::McpToolFormat::Openai,
+            )
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")?
+                    .get("name")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn task_5b_same_mcp_server_name_coexists_across_tenants() {
+        let pipeline = compile_mcp_pipeline(&[
+            ("mcp-a.test", "tenant-a", "shared-tools", "alpha"),
+            ("mcp-b.test", "tenant-b", "shared-tools", "beta"),
+        ])
+        .expect("distinct tenant identities compile");
+        seed_tool(&pipeline, "mcp-a.test", "alpha", "alpha.lookup");
+        seed_tool(&pipeline, "mcp-b.test", "beta", "beta.lookup");
+
+        let tenant_a = pipeline
+            .mcp_inject_source("tenant-a", "shared-tools")
+            .expect("tenant A source");
+        let tenant_b = pipeline
+            .mcp_inject_source("tenant-b", "shared-tools")
+            .expect("tenant B source");
+
+        assert_eq!(resolved_tool_names(&tenant_a), ["alpha.lookup"]);
+        assert_eq!(resolved_tool_names(&tenant_b), ["beta.lookup"]);
+    }
+
+    #[test]
+    fn task_5b_duplicate_mcp_inject_identity_rejects_pipeline_compilation() {
+        let error = match compile_mcp_pipeline(&[
+            ("mcp-primary.test", "tenant-a", "shared-tools", "primary"),
+            (
+                "mcp-secondary.test",
+                "tenant-a",
+                "shared-tools",
+                "secondary",
+            ),
+        ]) {
+            Ok(_) => panic!("a duplicate tenant and MCP server identity must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("duplicate"), "{message}");
+        assert!(message.contains("tenant-a"), "{message}");
+        assert!(message.contains("shared-tools"), "{message}");
+        assert!(
+            !message.contains("private-config-canary"),
+            "the duplicate error must not echo unrelated action configuration: {message}"
+        );
+    }
+
+    #[test]
+    fn task_5b_mcp_inject_lookup_fails_closed_outside_its_tenant_or_name() {
+        let pipeline =
+            compile_mcp_pipeline(&[("mcp-a.test", "tenant-a", "tenant-a-tools", "alpha")])
+                .expect("fixture pipeline compiles");
+
+        assert!(pipeline
+            .mcp_inject_source("tenant-b", "tenant-a-tools")
+            .is_none());
+        assert!(pipeline
+            .mcp_inject_source("tenant-a", "unknown-tools")
+            .is_none());
+    }
+
+    #[test]
+    fn task_5b_mcp_inject_sources_remain_pinned_to_their_pipeline_generation() {
+        let old_pipeline =
+            compile_mcp_pipeline(&[("mcp-a.test", "tenant-a", "shared-tools", "alpha")])
+                .expect("old generation compiles");
+        seed_tool(&old_pipeline, "mcp-a.test", "alpha", "alpha.old");
+
+        let new_pipeline =
+            compile_mcp_pipeline(&[("mcp-a.test", "tenant-a", "shared-tools", "alpha")])
+                .expect("new generation compiles");
+        seed_tool(&new_pipeline, "mcp-a.test", "alpha", "alpha.new");
+
+        let old_source = old_pipeline
+            .mcp_inject_source("tenant-a", "shared-tools")
+            .expect("old generation source");
+        let new_source = new_pipeline
+            .mcp_inject_source("tenant-a", "shared-tools")
+            .expect("new generation source");
+
+        assert_eq!(resolved_tool_names(&old_source), ["alpha.old"]);
+        assert_eq!(resolved_tool_names(&new_source), ["alpha.new"]);
     }
 }
 

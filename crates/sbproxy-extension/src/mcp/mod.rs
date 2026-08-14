@@ -63,8 +63,8 @@ pub use cassette_drift::{
 pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
     FederatedPrompt, FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation,
-    McpServerConfig, NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools,
-    ToolVersioningGate, VersioningMode,
+    McpServerConfig, NamespaceMode, OpenApiBacking, PromptCatalogSnapshot, SerializedToolEntry,
+    SerializedTools, ToolVersioningGate, VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use protocol::{

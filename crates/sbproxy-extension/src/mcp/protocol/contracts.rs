@@ -86,6 +86,7 @@ pub enum McpContractError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpToolContract {
     document: serde_json::Map<String, serde_json::Value>,
+    name: String,
 }
 
 impl TryFrom<serde_json::Value> for McpToolContract {
@@ -96,29 +97,25 @@ impl TryFrom<serde_json::Value> for McpToolContract {
             .as_object()
             .cloned()
             .ok_or(McpContractError::ToolMustBeObject)?;
-        if document
+        let name = document
             .get("name")
             .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
-            return Err(McpContractError::MissingStringField("name"));
-        }
+            .ok_or(McpContractError::MissingStringField("name"))?
+            .to_owned();
         if !document
             .get("inputSchema")
             .is_some_and(serde_json::Value::is_object)
         {
             return Err(McpContractError::MissingObjectField("inputSchema"));
         }
-        Ok(Self { document })
+        Ok(Self { document, name })
     }
 }
 
 impl McpToolContract {
     /// Return the validated contract name.
     pub fn name(&self) -> &str {
-        self.document["name"]
-            .as_str()
-            .expect("constructor validates name")
+        &self.name
     }
 
     /// Return the validated input schema document.
@@ -142,7 +139,10 @@ impl McpToolContract {
     pub fn with_advertised_name(&self, name: &str) -> Self {
         let mut document = self.document.clone();
         document.insert("name".into(), serde_json::Value::String(name.into()));
-        Self { document }
+        Self {
+            document,
+            name: name.into(),
+        }
     }
 
     /// Return the complete tool document.

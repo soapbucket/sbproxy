@@ -32,7 +32,7 @@
 //!
 //! declare const codemode: {
 //!   /** Tool description from the upstream MCP server. */
-//!   search_docs: (input: SearchDocsInput) => Promise<SearchDocsOutput>;
+//!   ['search_docs']: (input: SearchDocsInput) => Promise<SearchDocsOutput>;
 //! };
 //! ```
 //!
@@ -53,7 +53,7 @@
 //! recognise rather than failing to emit. The fallback is recorded
 //! as a JSDoc `@todo` so an operator can spot the gap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 
 use super::federation::FederatedTool;
@@ -65,8 +65,26 @@ use super::federation::FederatedTool;
 /// reach the gateway (`POST {callback_base_url}/call/{tool_name}`).
 /// Trailing slashes are stripped.
 pub fn emit_codemode_ts(tools: &[FederatedTool], callback_base_url: &str) -> String {
+    emit_codemode_ts_refs(tools.iter(), callback_base_url)
+}
+
+/// Borrowing implementation used by catalogue snapshots so complete tool
+/// contracts are never cloned solely for source generation. If a caller
+/// supplies the same advertised name more than once, the first occurrence
+/// wins deterministically because one JavaScript object cannot expose two
+/// distinct members under the same own-property key.
+pub(crate) fn emit_codemode_ts_refs<'a>(
+    tools: impl IntoIterator<Item = &'a FederatedTool>,
+    callback_base_url: &str,
+) -> String {
+    let mut seen_names = HashSet::new();
+    let tools: Vec<&FederatedTool> = tools
+        .into_iter()
+        .filter(|tool| seen_names.insert(tool.codemode_name()))
+        .collect();
     let base = callback_base_url.trim_end_matches('/').to_string();
     let mut out = String::new();
+    let type_stems = codemode_type_stems(tools.iter().copied());
 
     write_header(&mut out, tools.len(), &base);
 
@@ -75,12 +93,12 @@ pub fn emit_codemode_ts(tools: &[FederatedTool], callback_base_url: &str) -> Str
     // helper interfaces (CodemodeFetchOptions, the runtime stub)
     // live after the declarations so the type surface reads top to
     // bottom.
-    for tool in tools {
-        write_tool_interfaces(&mut out, tool);
+    for (tool, type_stem) in tools.iter().zip(&type_stems) {
+        write_tool_interfaces(&mut out, tool, type_stem);
     }
 
-    write_codemode_namespace(&mut out, tools);
-    write_runtime_stub(&mut out, &base, tools);
+    write_codemode_namespace(&mut out, &tools, &type_stems);
+    write_runtime_stub(&mut out, &base, &tools);
 
     out
 }
@@ -96,24 +114,28 @@ fn write_header(out: &mut String, tool_count: usize, base_url: &str) {
     );
     let _ = writeln!(out, "//");
     let _ = writeln!(out, "// tools: {tool_count}");
-    let _ = writeln!(out, "// callback: {base_url}");
+    let _ = writeln!(out, "// callback: {}", sanitize_line_comment(base_url));
     let _ = writeln!(out);
 }
 
-fn write_tool_interfaces(out: &mut String, tool: &FederatedTool) {
-    let pascal = to_pascal_case(&tool.name);
+fn write_tool_interfaces(out: &mut String, tool: &FederatedTool, pascal: &str) {
+    let contract_description = tool.codemode_description();
     let input_name = format!("{pascal}Input");
     let output_name = format!("{pascal}Output");
 
     let _ = writeln!(out, "/**");
-    for line in tool.description.lines() {
-        let _ = writeln!(out, " * {}", line);
+    for line in contract_description.lines() {
+        let _ = writeln!(out, " * {}", sanitize_jsdoc_line(line));
     }
     let _ = writeln!(out, " *");
-    let _ = writeln!(out, " * Federated from MCP server: {}", tool.server_name);
+    let _ = writeln!(
+        out,
+        " * Federated from MCP server: {}",
+        sanitize_jsdoc_line(&tool.server_name)
+    );
     let _ = writeln!(out, " */");
 
-    emit_object_interface(out, &input_name, &tool.input_schema);
+    emit_object_interface(out, &input_name, tool.codemode_input_schema());
 
     // MCP tools do not generally publish an output_schema. We emit a
     // permissive Output interface so the call signature is typed
@@ -164,7 +186,7 @@ fn write_tool_interfaces(out: &mut String, tool: &FederatedTool) {
     let _ = writeln!(out);
 }
 
-fn write_codemode_namespace(out: &mut String, tools: &[FederatedTool]) {
+fn write_codemode_namespace(out: &mut String, tools: &[&FederatedTool], type_stems: &[String]) {
     let _ = writeln!(out, "/**");
     let _ = writeln!(out, " * Federated MCP tools exposed as a typed module.");
     let _ = writeln!(out, " *");
@@ -180,10 +202,12 @@ fn write_codemode_namespace(out: &mut String, tools: &[FederatedTool]) {
     let _ = writeln!(out, " * upstream MCP server.");
     let _ = writeln!(out, " */");
     let _ = writeln!(out, "export const codemode = {{");
-    for tool in tools {
-        let pascal = to_pascal_case(&tool.name);
-        let one_line_desc = tool.description.lines().next().unwrap_or("").trim();
-        let _ = writeln!(out, "  /** {} */", one_line_desc.replace("*/", "* /"));
+    for (tool, pascal) in tools.iter().zip(type_stems) {
+        let contract_name = tool.codemode_name();
+        let contract_description = tool.codemode_description();
+        let one_line_desc = contract_description.lines().next().unwrap_or("").trim();
+        let _ = writeln!(out, "  /** {} */", sanitize_jsdoc_line(one_line_desc));
+        let tool_literal = ts_string_literal(contract_name);
         if tool.streaming {
             // Streaming tools yield chunks rather than resolve once.
             // Emit `AsyncIterable<Output>` so the agent can
@@ -192,17 +216,15 @@ fn write_codemode_namespace(out: &mut String, tools: &[FederatedTool]) {
             // server-sent events or NDJSON.
             let _ = writeln!(
                 out,
-                "  {ident}: (input: {pascal}Input): AsyncIterable<{pascal}Output> => __codemode_call_stream('{tool}', input as unknown),",
-                ident = to_safe_ident(&tool.name),
-                tool = tool.name,
+                "  [{tool_literal}]: (input: {pascal}Input): AsyncIterable<{pascal}Output> => __codemode_call_stream({tool_literal}, input as unknown),",
+                tool_literal = tool_literal,
                 pascal = pascal,
             );
         } else {
             let _ = writeln!(
                 out,
-                "  {ident}: (input: {pascal}Input): Promise<{pascal}Output> => __codemode_call('{tool}', input as unknown),",
-                ident = to_safe_ident(&tool.name),
-                tool = tool.name,
+                "  [{tool_literal}]: (input: {pascal}Input): Promise<{pascal}Output> => __codemode_call({tool_literal}, input as unknown),",
+                tool_literal = tool_literal,
                 pascal = pascal,
             );
         }
@@ -213,8 +235,9 @@ fn write_codemode_namespace(out: &mut String, tools: &[FederatedTool]) {
     let _ = writeln!(out);
 }
 
-fn write_runtime_stub(out: &mut String, base_url: &str, tools: &[FederatedTool]) {
+fn write_runtime_stub(out: &mut String, base_url: &str, tools: &[&FederatedTool]) {
     let any_streaming = tools.iter().any(|t| t.streaming);
+    let base_url_literal = ts_string_literal(base_url);
     let _ = writeln!(out, "// --- Runtime stub ---");
     let _ = writeln!(out, "//");
     let _ = writeln!(
@@ -267,7 +290,7 @@ fn write_runtime_stub(out: &mut String, base_url: &str, tools: &[FederatedTool])
     let _ = writeln!(out, "  }}");
     let _ = writeln!(
         out,
-        "  const url = `{base_url}/call/${{encodeURIComponent(tool)}}`;"
+        "  const url = {base_url_literal} + '/call/' + encodeURIComponent(tool);"
     );
     let _ = writeln!(out, "  const response = await __codemode_fetch(url, {{");
     let _ = writeln!(out, "    method: 'POST',");
@@ -293,6 +316,7 @@ fn write_runtime_stub(out: &mut String, base_url: &str, tools: &[FederatedTool])
 }
 
 fn write_streaming_runtime_stub(out: &mut String, base_url: &str) {
+    let base_url_literal = ts_string_literal(base_url);
     let _ = writeln!(out);
     let _ = writeln!(out, "// Streaming variant. Consumes the upstream as");
     let _ = writeln!(out, "// `text/event-stream` (one JSON object per `data:`");
@@ -320,7 +344,7 @@ fn write_streaming_runtime_stub(out: &mut String, base_url: &str) {
     let _ = writeln!(out, "  }}");
     let _ = writeln!(
         out,
-        "  const url = `{base_url}/call/${{encodeURIComponent(tool)}}`;"
+        "  const url = {base_url_literal} + '/call/' + encodeURIComponent(tool);"
     );
     let _ = writeln!(out, "  const response = await __codemode_fetch(url, {{");
     let _ = writeln!(out, "    method: 'POST',");
@@ -435,7 +459,7 @@ fn emit_object_interface(out: &mut String, name: &str, schema: &serde_json::Valu
     } else {
         for (key, prop_schema) in sorted {
             if let Some(desc) = prop_schema.get("description").and_then(|v| v.as_str()) {
-                let _ = writeln!(out, "  /** {} */", desc.replace("*/", "* /"));
+                let _ = writeln!(out, "  /** {} */", sanitize_jsdoc_line(desc));
             }
             let optional_marker = if required.contains(key) { "" } else { "?" };
             let ts_type = json_schema_to_ts_type(prop_schema);
@@ -480,7 +504,7 @@ fn json_schema_to_ts_type(schema: &serde_json::Value) -> String {
                     union.push_str(" | ");
                 }
                 let s = member.as_str().unwrap_or("");
-                let _ = write!(union, "'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+                union.push_str(&ts_string_literal(s));
             }
             return union;
         }
@@ -567,11 +591,22 @@ fn json_schema_to_ts_type(schema: &serde_json::Value) -> String {
 /// Convert a snake_case or kebab-case tool name to PascalCase for
 /// the interface name (`search_docs` -> `SearchDocs`).
 fn to_pascal_case(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
+    const MAX_STEM_BYTES: usize = 64;
+    let mut out = String::with_capacity(name.len().min(MAX_STEM_BYTES));
     let mut next_upper = true;
+    let mut needs_suffix = false;
     for c in name.chars() {
         if c == '_' || c == '-' || c == '.' || c.is_whitespace() {
             next_upper = true;
+            continue;
+        }
+        if !c.is_ascii_alphanumeric() {
+            needs_suffix = true;
+            next_upper = true;
+            continue;
+        }
+        if out.len() >= MAX_STEM_BYTES {
+            needs_suffix = true;
             continue;
         }
         if next_upper {
@@ -586,7 +621,140 @@ fn to_pascal_case(name: &str) -> String {
     if out.is_empty() {
         out.push_str("Tool");
     }
+    if out
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        out.insert_str(0, "Tool");
+        needs_suffix = true;
+    }
+    if needs_suffix {
+        out.push('_');
+        out.push_str(&short_identifier_hash(name));
+    }
     out
+}
+
+fn codemode_type_stems<'a>(tools: impl IntoIterator<Item = &'a FederatedTool>) -> Vec<String> {
+    let entries: Vec<(&str, String)> = tools
+        .into_iter()
+        .map(|tool| {
+            let name = tool.codemode_name();
+            (name, to_pascal_case(name))
+        })
+        .collect();
+    let mut normalized_counts = BTreeMap::new();
+    for (_, stem) in &entries {
+        *normalized_counts.entry(stem.as_str()).or_insert(0usize) += 1;
+    }
+
+    // Preserve the historical readable short-hash disambiguation. A second
+    // deterministic rank is needed only for the rare case where both the
+    // normalized stem and its 32-bit hash collide.
+    let preliminary: Vec<String> = entries
+        .iter()
+        .map(|(name, stem)| {
+            if normalized_counts
+                .get(stem.as_str())
+                .copied()
+                .unwrap_or_default()
+                > 1
+            {
+                format!("{stem}_{}", short_identifier_hash(name))
+            } else {
+                stem.clone()
+            }
+        })
+        .collect();
+    let mut collision_groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, stem) in preliminary.iter().enumerate() {
+        collision_groups
+            .entry(stem.as_str())
+            .or_default()
+            .push(index);
+    }
+
+    let mut stems = preliminary.clone();
+    for (base, mut indices) in collision_groups {
+        if indices.len() < 2 {
+            continue;
+        }
+        // Rank by raw advertised-name bytes, never catalogue input order. A
+        // preliminary stem contains only ASCII alphanumerics plus at most one
+        // hash separator, so the reserved `__` delimiter cannot collide with
+        // an unranked stem from another group.
+        indices.sort_by(|left, right| {
+            entries[*left]
+                .0
+                .as_bytes()
+                .cmp(entries[*right].0.as_bytes())
+                .then_with(|| left.cmp(right))
+        });
+        for (rank, index) in indices.into_iter().enumerate() {
+            stems[index] = format!("{base}__{}", rank + 1);
+        }
+    }
+    stems
+}
+
+fn short_identifier_hash(value: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(value.as_bytes());
+    let mut encoded = String::with_capacity(8);
+    for byte in &digest[..4] {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Encode untrusted text as one ECMAScript single-quoted string literal.
+///
+/// Keeping this in one helper prevents a new generated-source field from
+/// accidentally growing its own incomplete escaping rules. Ordinary ASCII
+/// retains the historical CodeMode bytes; controls and both JavaScript line
+/// separators are escaped.
+fn ts_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len().saturating_add(2));
+    literal.push('\'');
+    for character in value.chars() {
+        match character {
+            '\\' => literal.push_str("\\\\"),
+            '\'' => literal.push_str("\\'"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            '\u{2028}' => literal.push_str("\\u2028"),
+            '\u{2029}' => literal.push_str("\\u2029"),
+            control if control.is_control() => {
+                let _ = write!(literal, "\\u{:04x}", u32::from(control));
+            }
+            safe => literal.push(safe),
+        }
+    }
+    literal.push('\'');
+    literal
+}
+
+fn sanitize_comment_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn sanitize_line_comment(value: &str) -> String {
+    sanitize_comment_text(value)
+}
+
+fn sanitize_jsdoc_line(value: &str) -> String {
+    sanitize_comment_text(value).replace("*/", "* /")
 }
 
 /// Quote a JSON Schema property key as a safe TypeScript property
@@ -605,21 +773,7 @@ fn to_safe_property_name(key: &str) -> String {
     if plain && !is_reserved(key) {
         key.to_string()
     } else {
-        format!("'{}'", key.replace('\\', "\\\\").replace('\'', "\\'"))
-    }
-}
-
-/// Same rules, but used when emitting the function name on the
-/// `codemode` namespace. Reserved identifiers need string-keying
-/// there too.
-fn to_safe_ident(name: &str) -> String {
-    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !is_reserved(name)
-        && !name.starts_with(|c: char| c.is_ascii_digit())
-    {
-        name.to_string()
-    } else {
-        format!("'{}'", name.replace('\\', "\\\\").replace('\'', "\\'"))
+        ts_string_literal(key)
     }
 }
 
@@ -680,16 +834,27 @@ fn is_reserved(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::protocol::McpToolContract;
     use serde_json::json;
 
     fn tool(name: &str, description: &str, input_schema: serde_json::Value) -> FederatedTool {
+        let contract = McpToolContract::try_from(json!({
+            "name": name,
+            "description": description,
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("CodeMode fixture contract");
         FederatedTool {
             name: name.to_string(),
             description: description.to_string(),
-            input_schema,
+            input_schema: input_schema.clone(),
             server_name: "test-server".to_string(),
             streaming: false,
             meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
         }
     }
 
@@ -698,13 +863,23 @@ mod tests {
         description: &str,
         input_schema: serde_json::Value,
     ) -> FederatedTool {
+        let contract = McpToolContract::try_from(json!({
+            "name": name,
+            "description": description,
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("CodeMode fixture contract");
         FederatedTool {
             name: name.to_string(),
             description: description.to_string(),
-            input_schema,
+            input_schema: input_schema.clone(),
             server_name: "test-server".to_string(),
             streaming: true,
             meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
         }
     }
 
@@ -715,6 +890,74 @@ mod tests {
         assert_eq!(to_pascal_case("searchDocs"), "SearchDocs");
         assert_eq!(to_pascal_case("a.b.c"), "ABC");
         assert_eq!(to_pascal_case(""), "Tool");
+    }
+
+    #[test]
+    fn task_5b_colliding_type_stems_receive_stable_distinct_suffixes() {
+        let schema = json!({"type": "object", "properties": {}});
+        let tools = [
+            tool("search-docs", "first", schema.clone()),
+            tool("search_docs", "second", schema),
+        ];
+        let stems = codemode_type_stems(&tools);
+
+        assert_eq!(stems.len(), 2);
+        assert_ne!(stems[0], stems[1]);
+        assert!(stems.iter().all(|stem| stem.starts_with("SearchDocs_")));
+        assert_eq!(stems, codemode_type_stems(&tools));
+    }
+
+    #[test]
+    fn task_5b_type_stems_remain_unique_after_a_truncated_hash_collision() {
+        let schema = json!({"type": "object", "properties": {}});
+        let tools = [
+            tool("search__-_---.", "first", schema.clone()),
+            tool("search.-_.._____", "second", schema),
+        ];
+        let stems = codemode_type_stems(&tools);
+
+        assert_eq!(
+            to_pascal_case(tools[0].codemode_name()),
+            to_pascal_case(tools[1].codemode_name()),
+            "fixture must exercise the known 32-bit stem collision"
+        );
+        assert_ne!(
+            stems[0], stems[1],
+            "final interface identifiers must be unique even when a short hash collides"
+        );
+        assert_eq!(stems, codemode_type_stems(&tools));
+    }
+
+    #[test]
+    fn task_5b_collision_ranks_are_stable_across_catalogue_permutations() {
+        let schema = json!({"type": "object", "properties": {}});
+        let forward = [
+            tool("search__-_---.", "first", schema.clone()),
+            tool("search.-_.._____", "second", schema.clone()),
+            tool("ordinary", "third", schema),
+        ];
+        let reverse = [forward[2].clone(), forward[1].clone(), forward[0].clone()];
+
+        let map_stems = |tools: &[FederatedTool]| {
+            tools
+                .iter()
+                .zip(codemode_type_stems(tools))
+                .map(|(tool, stem)| (tool.codemode_name().to_string(), stem))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let forward_stems = map_stems(&forward);
+        let reverse_stems = map_stems(&reverse);
+
+        assert_eq!(forward_stems, reverse_stems);
+        assert_eq!(forward_stems["search.-_.._____"], "Search_9011986b__1");
+        assert_eq!(forward_stems["search__-_---."], "Search_9011986b__2");
+        assert!(
+            forward
+                .iter()
+                .map(|tool| to_pascal_case(tool.codemode_name()))
+                .all(|base| !base.contains("__")),
+            "the ranked-stem delimiter must remain reserved from base stems"
+        );
     }
 
     #[test]
@@ -754,7 +997,7 @@ mod tests {
         assert!(out.contains("query: string;"));
         assert!(out.contains("limit?: number;"));
         assert!(out.contains("deep?: boolean;"));
-        assert!(out.contains("search_docs:"));
+        assert!(out.contains("['search_docs']:"));
     }
 
     #[test]
@@ -828,7 +1071,7 @@ mod tests {
     fn reserved_ident_in_tool_name_is_string_keyed() {
         let schema = json!({"type": "object", "properties": {}});
         let out = emit_codemode_ts(&[tool("class", "Classify", schema)], "x");
-        assert!(out.contains("'class':"));
+        assert!(out.contains("['class']:"));
     }
 
     #[test]
@@ -943,7 +1186,193 @@ mod tests {
             streaming_tool("forever", "infinite", schema),
         ];
         let out = emit_codemode_ts(&tools, "https://gw.example");
-        assert!(out.contains("once: (input: OnceInput): Promise<OnceOutput>"));
-        assert!(out.contains("forever: (input: ForeverInput): AsyncIterable<ForeverOutput>"));
+        assert!(out.contains("['once']: (input: OnceInput): Promise<OnceOutput>"));
+        assert!(out.contains("['forever']: (input: ForeverInput): AsyncIterable<ForeverOutput>"));
+    }
+
+    #[test]
+    fn task_5b_codemode_reads_the_lossless_contract_accessors() {
+        let mut fixture = tool(
+            "search_docs",
+            "Search documentation",
+            json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        );
+        // The federation keeps these conveniences synchronized in
+        // production. Deliberately desynchronize this fixture to pin
+        // that CodeMode reads the authoritative contract instead.
+        fixture.name = "stale_name".to_string();
+        fixture.description = "stale description".to_string();
+        fixture.input_schema =
+            json!({"type": "object", "properties": {"stale": {"type": "boolean"}}});
+
+        let out = emit_codemode_ts(&[fixture], "https://gateway.example");
+        assert!(out.contains("export interface SearchDocsInput"));
+        assert!(out.contains("Search documentation"));
+        assert!(out.contains("query: string;"));
+        assert!(out.contains("['search_docs']:"));
+        assert!(!out.contains("stale_name"));
+        assert!(!out.contains("stale description"));
+        assert!(!out.contains("stale?: boolean;"));
+    }
+
+    fn assert_codemode_module_is_valid_and_inert(source: &str, case: &str) {
+        let javascript = crate::bundle::transpile_typescript(source, "codemode-security.ts")
+            .unwrap_or_else(|error| panic!("{case} must emit valid TypeScript: {error}"));
+        let runtime = rquickjs::Runtime::new()
+            .unwrap_or_else(|error| panic!("{case} QuickJS runtime: {error}"));
+        let context = rquickjs::Context::full(&runtime)
+            .unwrap_or_else(|error| panic!("{case} QuickJS context: {error}"));
+
+        context
+            .with(|ctx| {
+                ctx.eval::<(), _>(
+                    "globalThis.fetch = () => ({}); \
+                     globalThis.__SBPROXY_CODEMODE_INJECTED = false;",
+                )?;
+                let module = rquickjs::Module::declare(
+                    ctx.clone(),
+                    "codemode-security.js",
+                    javascript.as_bytes(),
+                )?;
+                let (_module, ready) = module.eval()?;
+                ready.finish::<()>()?;
+                let planted: bool = ctx.globals().get("__SBPROXY_CODEMODE_INJECTED")?;
+                assert!(!planted, "{case} turned untrusted catalogue text into code");
+                Ok::<(), rquickjs::Error>(())
+            })
+            .unwrap_or_else(|error| panic!("{case} module evaluation: {error}"));
+    }
+
+    #[test]
+    fn task_5b_codemode_treats_hostile_names_descriptions_and_callbacks_as_data() {
+        let schema = json!({"type": "object", "properties": {}});
+        let planted = "globalThis.__SBPROXY_CODEMODE_INJECTED = true;";
+        let hostile_name =
+            format!("search');\n{planted}\n/* \\\"quoted\\\" \\\\ `tick` */\u{2028}\u{2029}");
+        let hostile_description =
+            format!("close comment */\n{planted}\n/* \\\"quoted\\\" \\\\ `tick` \u{2028}\u{2029}");
+        let hostile_callback = format!(
+            "https://gateway.example/`;\n{planted}\n// \\\"quoted\\\" \\\\ `tick` \u{2028}\u{2029}"
+        );
+
+        let hostile_name_module = emit_codemode_ts(
+            &[tool(&hostile_name, "safe description", schema.clone())],
+            "https://gateway.example",
+        );
+        assert_codemode_module_is_valid_and_inert(&hostile_name_module, "hostile tool name");
+
+        let hostile_description_module = emit_codemode_ts(
+            &[tool("safe_tool", &hostile_description, schema)],
+            "https://gateway.example",
+        );
+        assert_codemode_module_is_valid_and_inert(
+            &hostile_description_module,
+            "hostile description",
+        );
+
+        let hostile_callback_module = emit_codemode_ts(&[], &hostile_callback);
+        assert_codemode_module_is_valid_and_inert(&hostile_callback_module, "hostile callback URL");
+    }
+
+    #[test]
+    fn task_5b_codemode_uses_computed_own_keys_for_empty_and_proto_names() {
+        let schema = json!({"type": "object", "properties": {}});
+        let module = emit_codemode_ts(
+            &[
+                tool("", "empty name", schema.clone()),
+                tool("__proto__", "prototype trap", schema),
+            ],
+            "https://gateway.example",
+        );
+
+        assert!(
+            module.contains("  ['']:"),
+            "empty name must be a valid computed key"
+        );
+        assert!(
+            module.contains("  ['__proto__']:"),
+            "__proto__ must be an own data property, not an object-literal prototype setter"
+        );
+        assert_codemode_module_is_valid_and_inert(&module, "computed hostile tool names");
+
+        let javascript = crate::bundle::transpile_typescript(&module, "codemode-own-keys.ts")
+            .expect("computed hostile keys must transpile");
+        let runtime = rquickjs::Runtime::new().expect("computed-key QuickJS runtime");
+        let context = rquickjs::Context::full(&runtime).expect("computed-key QuickJS context");
+        context
+            .with(|ctx| {
+                ctx.eval::<(), _>(
+                    "globalThis.__SBPROXY_FETCH_URL = ''; \
+                     globalThis.fetch = (url) => { \
+                       globalThis.__SBPROXY_FETCH_URL = String(url); \
+                       return Promise.resolve({ \
+                         ok: true, \
+                         json: () => Promise.resolve({content: []}) \
+                       }); \
+                     };",
+                )?;
+                let declared = rquickjs::Module::declare(
+                    ctx.clone(),
+                    "codemode-own-keys.js",
+                    javascript.as_bytes(),
+                )?;
+                let (evaluated, ready) = declared.eval()?;
+                ready.finish::<()>()?;
+                let codemode: rquickjs::Object = evaluated.get("codemode")?;
+                ctx.globals().set("__SBPROXY_CODEMODE", codemode)?;
+
+                let empty_is_own: bool = ctx.eval(
+                    "Object.prototype.hasOwnProperty.call(globalThis.__SBPROXY_CODEMODE, '')",
+                )?;
+                let proto_is_own: bool = ctx.eval(
+                    "Object.prototype.hasOwnProperty.call(globalThis.__SBPROXY_CODEMODE, '__proto__')",
+                )?;
+                let prototype_unchanged: bool = ctx.eval(
+                    "Object.getPrototypeOf(globalThis.__SBPROXY_CODEMODE) === Object.prototype",
+                )?;
+                assert!(empty_is_own, "the empty tool name must remain an own key");
+                assert!(proto_is_own, "__proto__ must remain an own key");
+                assert!(
+                    prototype_unchanged,
+                    "an advertised name must never mutate the namespace prototype"
+                );
+
+                let call: rquickjs::Promise =
+                    ctx.eval("globalThis.__SBPROXY_CODEMODE['__proto__']({})")?;
+                let _: rquickjs::Value = call.finish()?;
+                let url: String = ctx.globals().get("__SBPROXY_FETCH_URL")?;
+                assert_eq!(
+                    url,
+                    "https://gateway.example/call/__proto__",
+                    "the exact advertised tool name must reach dispatch only as URL data"
+                );
+                Ok::<(), rquickjs::Error>(())
+            })
+            .expect("computed hostile key module evaluation");
+    }
+
+    #[test]
+    fn task_5b_duplicate_advertised_names_emit_one_deterministic_member() {
+        let schema = json!({"type": "object", "properties": {}});
+        let module = emit_codemode_ts(
+            &[
+                tool("duplicate", "first occurrence", schema.clone()),
+                tool("duplicate", "later occurrence", schema),
+            ],
+            "https://gateway.example",
+        );
+
+        assert!(module.contains("// tools: 1"));
+        assert_eq!(
+            module.matches("  ['duplicate']:").count(),
+            1,
+            "a public caller cannot make one JavaScript namespace claim the same key twice"
+        );
+        assert!(module.contains("first occurrence"));
+        assert!(!module.contains("later occurrence"));
     }
 }

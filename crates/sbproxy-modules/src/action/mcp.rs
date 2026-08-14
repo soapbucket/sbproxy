@@ -999,19 +999,6 @@ impl McpAction {
 
         let has_principal_scoped_tools = prefixes.values().any(|p| p.rbac.is_some());
 
-        // WOR-1646: publish an injectable source so a virtual key can
-        // reference this gateway's live catalogue by its
-        // `server_info.name`. Cloned data (cheap) so the action still
-        // owns its fields.
-        register_inject_source(
-            &server_name,
-            Arc::new(McpInjectSource {
-                federation: Arc::clone(&federation),
-                prefixes: prefixes.clone(),
-                rbac_policies: cfg.rbac_policies.clone(),
-            }),
-        );
-
         let dual_llm_quarantine = cfg.dual_llm_quarantine.filter(|c| c.enabled);
         let tool_output_judge = match dual_llm_quarantine.as_ref() {
             Some(qcfg) => {
@@ -1129,6 +1116,23 @@ impl McpAction {
             None => true,
             Some(set) => set.contains(tool_name),
         }
+    }
+
+    /// Build the immutable catalogue source a pipeline may expose to an AI
+    /// virtual key for this MCP action.
+    ///
+    /// Construction is pure. The owning compiled pipeline installs the
+    /// returned source under its route tenant only after the entire candidate
+    /// generation has compiled successfully. Keeping
+    /// registration out of action construction prevents a rejected reload
+    /// from mutating the live request path.
+    pub fn inject_source(&self) -> Arc<McpInjectSource> {
+        Arc::new(McpInjectSource {
+            federation: Arc::clone(&self.federation),
+            prefixes: self.prefixes.clone(),
+            rbac_policies: self.rbac_policies.clone(),
+            tool_allowlist: self.tool_allowlist.clone(),
+        })
     }
 
     /// Look up the per-server prefix entry by name.
@@ -1392,6 +1396,7 @@ pub struct McpInjectSource {
     federation: Arc<McpFederation>,
     prefixes: HashMap<String, McpServerPrefix>,
     rbac_policies: HashMap<String, ToolAccessPolicy>,
+    tool_allowlist: Option<HashSet<String>>,
 }
 
 impl McpInjectSource {
@@ -1410,9 +1415,24 @@ impl McpInjectSource {
         filter: &[String],
         format: sbproxy_ai::identity::McpToolFormat,
     ) -> Vec<serde_json::Value> {
-        let snapshot = self.federation.serialized_tools();
+        // Discovery and the version-gate verdict must come from one
+        // publication. A fresh verdict lookup after this list load could
+        // otherwise expose a refused entry during a catalogue refresh.
+        let catalog = self.federation.tool_catalog_snapshot();
+        let snapshot = catalog.serialized_tools();
+        let version_blocked = catalog.version_blocked();
         let mut out = Vec::new();
         for entry in &snapshot.entries {
+            if version_blocked.contains_key(&entry.name) {
+                continue;
+            }
+            if self
+                .tool_allowlist
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&entry.name))
+            {
+                continue;
+            }
             // RBAC: skip a tool the owning upstream's policy denies.
             if let Some(policy) = self.policy_for_server(&entry.server_name) {
                 if !matches!(
@@ -1471,42 +1491,32 @@ fn to_provider_tool(
     }
 }
 
-/// Process-global registry of injectable MCP sources, keyed by the
-/// gateway's `server_info.name` (WOR-1646). An `McpAction` registers
-/// itself on compile; a virtual key's `inject_mcp.ref` looks it up at
-/// request time. A mutex guards the read-modify-write so concurrent
-/// registrations (parallel config compiles, tests) cannot lose an
-/// entry to a lost update.
-fn inject_registry() -> &'static std::sync::Mutex<HashMap<String, Arc<McpInjectSource>>> {
-    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<McpInjectSource>>>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-/// Register an injectable source under `name`, replacing any prior
-/// entry (a hot reload rebuilds the action).
-pub fn register_inject_source(name: &str, source: Arc<McpInjectSource>) {
-    let mut map = match inject_registry().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    map.insert(name.to_string(), source);
-}
-
-/// Look up an injectable MCP source by name (WOR-1646). `None` when no
-/// `mcp` action has registered under that name yet.
-pub fn lookup_inject_source(name: &str) -> Option<Arc<McpInjectSource>> {
-    let map = match inject_registry().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    map.get(name).cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn federated_tool(name: &str, server: &str) -> sbproxy_extension::mcp::FederatedTool {
+        let input_schema = json!({"type": "object", "properties": {}});
+        let contract = sbproxy_extension::mcp::protocol::McpToolContract::try_from(json!({
+            "name": name,
+            "description": "injected fixture",
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("injected fixture contract");
+        sbproxy_extension::mcp::FederatedTool {
+            name: name.to_string(),
+            description: "injected fixture".to_string(),
+            input_schema,
+            server_name: server.to_string(),
+            streaming: false,
+            meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
+        }
+    }
 
     // --- Tool rollout plane ---
 
@@ -1952,10 +1962,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_source_registers_and_resolves_rbac_filtered() {
+    fn inject_source_builds_and_resolves_rbac_filtered() {
         // A gateway with a default-deny policy allowing only `search`
-        // registers under its server name; resolving the source for an
-        // anonymous principal yields just the allowed tool.
+        // builds an immutable source; resolving it for an anonymous
+        // principal yields just the allowed tool.
         let value = json!({
             "type": "mcp",
             "mode": "gateway",
@@ -1972,21 +1982,11 @@ mod tests {
         // resolve path has a catalogue to filter.
         let mut map = std::collections::HashMap::new();
         for name in ["gh.search", "gh.delete_repo"] {
-            map.insert(
-                name.to_string(),
-                sbproxy_extension::mcp::FederatedTool {
-                    name: name.to_string(),
-                    description: "t".to_string(),
-                    input_schema: json!({"type": "object"}),
-                    server_name: "gh".to_string(),
-                    streaming: false,
-                    meta: None,
-                },
-            );
+            map.insert(name.to_string(), federated_tool(name, "gh"));
         }
-        action.federation.seed_tools_for_test(map);
+        action.federation.seed_tools_for_test(map, None);
 
-        let source = lookup_inject_source("toolhub_test_1646").expect("source registered");
+        let source = action.inject_source();
         let principal = sbproxy_plugin::Principal::anonymous();
         let tools =
             source.resolve_tools(&principal, &[], sbproxy_ai::identity::McpToolFormat::Openai);
@@ -1998,6 +1998,108 @@ mod tests {
             names,
             vec!["gh.search"],
             "RBAC-denied tool must be filtered out"
+        );
+    }
+
+    #[test]
+    fn task_5b_injected_catalogue_omits_version_blocked_tools() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "task-5b-version-blocked-injection", "version": "1.0.0"},
+            "federated_servers": [
+                {"origin": "test.sbproxy.dev", "prefix": "gh"}
+            ]
+        }))
+        .expect("fixture config compiles");
+        action.federation.seed_tools_for_test(
+            std::collections::HashMap::from([(
+                "gh.search".to_string(),
+                federated_tool("gh.search", "gh"),
+            )]),
+            Some(std::collections::HashMap::from([(
+                "gh.search".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+
+        let source = action.inject_source();
+        let tools = source.resolve_tools(
+            &sbproxy_plugin::Principal::anonymous(),
+            &[],
+            sbproxy_ai::identity::McpToolFormat::Openai,
+        );
+        assert!(
+            tools.is_empty(),
+            "an injected catalogue must not expose a tool the version gate refuses"
+        );
+    }
+
+    #[test]
+    fn task_5b_injected_catalogue_composes_allowlist_rbac_and_version_gate() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "task-5b-composed-injection", "version": "1.0.0"},
+            "rbac_policies": {
+                "reader": {
+                    "default_allow": false,
+                    "tool_access": [{
+                        "principals": [],
+                        "allowed": [
+                            "gh.allowed",
+                            "gh.not_allowlisted",
+                            "gh.blocked_version"
+                        ]
+                    }]
+                }
+            },
+            "federated_servers": [{
+                "origin": "test.sbproxy.dev",
+                "prefix": "gh",
+                "rbac": "reader"
+            }],
+            "guardrails": [{
+                "type": "tool_allowlist",
+                "allow": ["gh.allowed", "gh.denied_rbac", "gh.blocked_version"]
+            }]
+        }))
+        .expect("composed injection fixture compiles");
+        action.federation.seed_tools_for_test(
+            std::collections::HashMap::from([
+                ("gh.allowed".to_string(), federated_tool("gh.allowed", "gh")),
+                (
+                    "gh.not_allowlisted".to_string(),
+                    federated_tool("gh.not_allowlisted", "gh"),
+                ),
+                (
+                    "gh.denied_rbac".to_string(),
+                    federated_tool("gh.denied_rbac", "gh"),
+                ),
+                (
+                    "gh.blocked_version".to_string(),
+                    federated_tool("gh.blocked_version", "gh"),
+                ),
+            ]),
+            Some(std::collections::HashMap::from([(
+                "gh.blocked_version".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+
+        let tools = action.inject_source().resolve_tools(
+            &sbproxy_plugin::Principal::anonymous(),
+            &["gh.*".to_string()],
+            sbproxy_ai::identity::McpToolFormat::Openai,
+        );
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["gh.allowed"],
+            "virtual-key injection must expose the intersection of the request filter, action allowlist, RBAC, and held version verdict"
         );
     }
 

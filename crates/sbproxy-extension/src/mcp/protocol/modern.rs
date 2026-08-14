@@ -19,6 +19,13 @@ const PROTECTED_HEADERS: &[&str] = &[
     "mcp-name",
 ];
 
+fn implementation_value(implementation: &McpImplementation) -> serde_json::Value {
+    serde_json::json!({
+        "name": implementation.name,
+        "version": implementation.version,
+    })
+}
+
 /// Codec for strict MCP 2026-07-28 request ingress.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Modern2026_07_28Codec;
@@ -55,7 +62,7 @@ pub fn build_discover_result(server: &McpServerDescription) -> serde_json::Value
     let mut meta = serde_json::Map::new();
     meta.insert(
         META_SERVER_INFO.into(),
-        serde_json::to_value(&server.implementation).expect("implementation is serializable"),
+        implementation_value(&server.implementation),
     );
     let mut result = serde_json::json!({
         "resultType": "complete",
@@ -232,23 +239,30 @@ impl McpProtocolCodec for Modern2026_07_28Codec {
 
         let meta = match result.entry("_meta") {
             serde_json::map::Entry::Vacant(entry) => {
-                entry.insert(serde_json::Value::Object(serde_json::Map::new()))
+                match entry.insert(serde_json::Value::Object(serde_json::Map::new())) {
+                    serde_json::Value::Object(meta) => meta,
+                    _ => {
+                        return Err(internal_error(
+                            id,
+                            "modern MCP result _meta must be an object",
+                        ));
+                    }
+                }
             }
-            serde_json::map::Entry::Occupied(entry) if entry.get().is_object() => entry.into_mut(),
-            serde_json::map::Entry::Occupied(_) => {
-                return Err(internal_error(
-                    id,
-                    "modern MCP result _meta must be an object",
-                ));
-            }
+            serde_json::map::Entry::Occupied(entry) => match entry.into_mut() {
+                serde_json::Value::Object(meta) => meta,
+                _ => {
+                    return Err(internal_error(
+                        id,
+                        "modern MCP result _meta must be an object",
+                    ));
+                }
+            },
         };
-        meta.as_object_mut()
-            .expect("modern MCP result metadata is an object")
-            .insert(
-                META_SERVER_INFO.into(),
-                serde_json::to_value(&server.implementation)
-                    .expect("implementation is serializable"),
-            );
+        meta.insert(
+            META_SERVER_INFO.into(),
+            implementation_value(&server.implementation),
+        );
 
         if requires_cache_metadata(method) {
             result.insert("ttlMs".into(), serde_json::json!(0));
