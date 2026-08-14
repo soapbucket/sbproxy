@@ -43,6 +43,17 @@ pub struct ExtensionBundlesConfig {
     /// Additional bundle sources, consumed in declaration order.
     #[serde(default)]
     pub sources: Vec<BundleSourceConfig>,
+    /// Capability grants, keyed by bundle manifest `name`.
+    ///
+    /// A bundle's hooks may declare capabilities in their manifest
+    /// (`net:outbound=<scheme>://<host>[:port]`); nothing is granted by
+    /// declaration alone. The operator grants here, with the same
+    /// entry syntax, and a candidate whose declared set exceeds its
+    /// granted set refuses at load naming both sets. An empty or
+    /// absent grant list means the bundle gets no capabilities, which
+    /// is the default every bundle had before this key existed.
+    #[serde(default)]
+    pub grants: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl ExtensionBundlesConfig {
@@ -62,6 +73,21 @@ impl ExtensionBundlesConfig {
             return Err(ExtensionConfigError::Invalid(
                 "extensions.bundles_dir cannot be empty".into(),
             ));
+        }
+
+        for (bundle, entries) in &self.grants {
+            if bundle.trim().is_empty() {
+                return Err(ExtensionConfigError::Invalid(
+                    "extensions.grants keys are bundle manifest names and cannot be empty".into(),
+                ));
+            }
+            for entry in entries {
+                if let Err(reason) = parse_permission_entry(entry) {
+                    return Err(ExtensionConfigError::Invalid(format!(
+                        "extensions.grants.{bundle}: {reason}"
+                    )));
+                }
+            }
         }
 
         for source in &self.sources {
@@ -321,6 +347,83 @@ pub struct BundleHook {
     /// Body access requirements used by pipeline planning.
     #[serde(default)]
     pub execution: BundleExecution,
+    /// Capabilities this hook asks for, each naming its full grant.
+    ///
+    /// The only recognized capability is outbound HTTP to a declared
+    /// destination: `net:outbound=https://host` or
+    /// `net:outbound=http://host:port`. Declaring is asking, not
+    /// having: the operator grants per bundle in `sb.yml`
+    /// (`extensions.grants`), and a declared set exceeding the granted
+    /// set refuses the candidate at load. The declaration lives here,
+    /// inside the digest-covered manifest, so the grant an operator
+    /// audits is the grant the artifact was signed with.
+    #[serde(default)]
+    pub permissions: Vec<String>,
+}
+
+/// One parsed `net:outbound` destination from a hook's `permissions`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutboundDestination {
+    /// `http` or `https`; nothing else parses.
+    pub scheme: String,
+    /// Exact hostname; no wildcards.
+    pub host: String,
+    /// Explicit port, or the scheme default (80/443).
+    pub port: u16,
+}
+
+impl std::fmt::Display for OutboundDestination {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
+/// Parse one `permissions` entry.
+///
+/// # Errors
+///
+/// Returns a message naming the malformed part: an unrecognized
+/// capability, a scheme other than http/https, an empty or
+/// wildcarded host, or an unparseable port.
+pub fn parse_permission_entry(entry: &str) -> Result<OutboundDestination, String> {
+    let Some(destination) = entry.strip_prefix("net:outbound=") else {
+        return Err(format!(
+            "unrecognized capability `{entry}`; the only capability this release \
+             grants is `net:outbound=<scheme>://<host>[:port]`"
+        ));
+    };
+    let (scheme, rest) = destination
+        .split_once("://")
+        .ok_or_else(|| format!("destination `{destination}` is missing `<scheme>://`"))?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        other => {
+            return Err(format!(
+                "destination scheme `{other}` is not grantable; use http or https"
+            ));
+        }
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port_text)) => {
+            let port: u16 = port_text
+                .parse()
+                .map_err(|_| format!("destination port `{port_text}` is not a port"))?;
+            (host, port)
+        }
+        None => (rest, default_port),
+    };
+    if host.is_empty() || host.contains('*') || host.contains('/') {
+        return Err(format!(
+            "destination host `{host}` must be one exact hostname; wildcards and \
+             paths are not grantable"
+        ));
+    }
+    Ok(OutboundDestination {
+        scheme: scheme.to_owned(),
+        host: host.to_ascii_lowercase(),
+        port,
+    })
 }
 
 /// Resource limits enforced by bundle runtimes.
@@ -633,6 +736,29 @@ impl BundleManifest {
                 validate_schema(schema)?;
             }
             validate_secret_and_masked_vars(hook)?;
+            if !hook.permissions.is_empty() {
+                // The envelope-WASM ABI is stdin/stdout with no host
+                // imports, and Proxy-Wasm registers no outbound host
+                // function; a capability neither runtime can deliver
+                // must refuse at load, not read as granted.
+                if self.runtime != BundleRuntime::Javascript {
+                    return invalid(format!(
+                        "hook `{}` declares capabilities, but runtime {} has no host \
+                         call surface; net:outbound is available to javascript bundles",
+                        hook.type_name,
+                        match self.runtime {
+                            BundleRuntime::Javascript => "javascript",
+                            BundleRuntime::Wasm => "wasm",
+                            BundleRuntime::ProxyWasm => "proxy_wasm",
+                        }
+                    ));
+                }
+                for entry in &hook.permissions {
+                    if let Err(reason) = parse_permission_entry(entry) {
+                        return invalid(format!("hook `{}`: {reason}", hook.type_name));
+                    }
+                }
+            }
         }
 
         self.validate_runtime_contract()

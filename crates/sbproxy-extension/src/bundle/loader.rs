@@ -181,7 +181,7 @@ impl DynamicBundleRegistry {
         config
             .validate()
             .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
-        let mut candidate = Candidate::new(reserved_names);
+        let mut candidate = Candidate::new(reserved_names, &config.grants);
         let mut source_index = 0u32;
 
         if let Some(path) = config.bundles_dir.as_deref() {
@@ -317,6 +317,10 @@ impl BundleRegistry for DynamicBundleRegistry {
 
 struct Candidate<'a> {
     reserved_names: &'a BTreeSet<(BundleHookKind, String)>,
+    /// Operator capability grants from `extensions.grants`, keyed by
+    /// bundle manifest name. Consulted at load so a declared-but-not-
+    /// granted capability refuses the candidate before any hook runs.
+    grants: &'a std::collections::BTreeMap<String, Vec<String>>,
     hooks: BTreeMap<(BundleHookKind, String), Arc<LoadedBundleHook>>,
     bundles: Vec<ExtensionBundleRecord>,
     inventory_hooks: Vec<ExtensionHookRecord>,
@@ -324,9 +328,13 @@ struct Candidate<'a> {
 }
 
 impl<'a> Candidate<'a> {
-    fn new(reserved_names: &'a BTreeSet<(BundleHookKind, String)>) -> Self {
+    fn new(
+        reserved_names: &'a BTreeSet<(BundleHookKind, String)>,
+        grants: &'a std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Self {
         Self {
             reserved_names,
+            grants,
             hooks: BTreeMap::new(),
             bundles: Vec::new(),
             inventory_hooks: Vec::new(),
@@ -384,6 +392,55 @@ impl<'a> Candidate<'a> {
         hooks.sort_by(|left, right| {
             (left.kind, left.type_name.as_str()).cmp(&(right.kind, right.type_name.as_str()))
         });
+        // Two-key consent: the manifest declares, the operator grants.
+        // The manifest already validated every entry's syntax, so the
+        // set arithmetic here is over parsed destinations, and a
+        // declared set exceeding the granted set refuses the whole
+        // candidate naming both sides. Nothing is granted silently: an
+        // absent grant list is an empty one.
+        {
+            let granted: std::collections::BTreeSet<String> = self
+                .grants
+                .get(&manifest.name)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    sbproxy_config::parse_permission_entry(entry)
+                        .ok()
+                        .map(|destination| destination.to_string())
+                })
+                .collect();
+            let mut ungranted: Vec<String> = Vec::new();
+            for hook in &hooks {
+                for entry in &hook.permissions {
+                    let Ok(destination) = sbproxy_config::parse_permission_entry(entry) else {
+                        continue;
+                    };
+                    let label = destination.to_string();
+                    if !granted.contains(&label) && !ungranted.contains(&label) {
+                        ungranted.push(label);
+                    }
+                }
+            }
+            if !ungranted.is_empty() {
+                let granted_display = if granted.is_empty() {
+                    "nothing".to_owned()
+                } else {
+                    granted.iter().cloned().collect::<Vec<_>>().join(", ")
+                };
+                return Err(BundleLoadError::new(
+                    "permissions",
+                    format!(
+                        "bundle `{}` declares destinations the operator has not granted: \
+                         [{}]; `extensions.grants.{}` grants {}",
+                        manifest.name,
+                        ungranted.join(", "),
+                        manifest.name,
+                        granted_display
+                    ),
+                ));
+            }
+        }
         for hook in &hooks {
             let key = (hook.kind, hook.type_name.clone());
             if self.reserved_names.contains(&key) {
