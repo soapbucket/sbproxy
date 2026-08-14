@@ -318,6 +318,11 @@ impl BundleOutbound {
                 };
                 reply_headers.push((name.as_str().to_owned(), value.to_owned()));
             }
+            // The body shares the one buffer cap with the headers: the
+            // ceiling here is what the headers left, not a fresh
+            // `max_bytes`, so headers plus body together never exceed
+            // one `sandbox.max_buffer_bytes`.
+            let body_budget = header_budget;
             let mut collected: Vec<u8> = Vec::new();
             let mut stream = response;
             loop {
@@ -326,7 +331,7 @@ impl BundleOutbound {
                     .map_err(|_| "budget_exhausted".to_owned())?
                     .map_err(|_| "request_failed".to_owned())?;
                 let Some(chunk) = chunk else { break };
-                if collected.len().saturating_add(chunk.len()) > max_bytes {
+                if collected.len().saturating_add(chunk.len()) > body_budget {
                     return Err("response_over_buffer_cap".to_owned());
                 }
                 collected.extend_from_slice(&chunk);
