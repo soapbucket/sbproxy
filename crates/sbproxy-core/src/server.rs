@@ -1315,6 +1315,8 @@ fn spawn_swr_revalidation(
     revalidation_request: SwrRevalidationRequest,
     path_and_query: String,
     cacheable_status: Vec<u16>,
+    pipeline: std::sync::Arc<crate::pipeline::CompiledPipeline>,
+    origin_idx: usize,
 ) {
     let full_url = format!("{}{}", revalidation_request.upstream_url, path_and_query);
 
@@ -1468,6 +1470,77 @@ fn spawn_swr_revalidation(
             }
             body.extend_from_slice(&chunk);
         }
+
+        // Ingest transforms (WOR-2417): the entry must hold the
+        // transform chain's output, exactly as the live store path
+        // does, or a refresh would quietly swap a transformed body
+        // for a raw one. Every transform on a cached origin is
+        // request-independent by construction (config load refuses
+        // the combination otherwise), so the context-free apply path
+        // is sufficient here, where no request exists.
+        let transforms = pipeline
+            .transforms
+            .get(origin_idx)
+            .map_or(&[][..], Vec::as_slice);
+        if !transforms.is_empty() {
+            let content_type_owned = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.clone());
+            let content_type = content_type_owned.as_deref();
+            let mut buf = bytes::BytesMut::from(&body[..]);
+            for compiled in transforms {
+                if !compiled.matches_content_type(content_type) {
+                    continue;
+                }
+                if buf.len() > compiled.max_body_size {
+                    // The live path passes an oversized body through
+                    // untransformed and, on a cached origin, stores
+                    // nothing; the refresh mirrors that by keeping the
+                    // stale entry.
+                    tracing::warn!(
+                        url = %full_url,
+                        transform = compiled.transform.transform_type(),
+                        cap = compiled.max_body_size,
+                        "swr: refresh body exceeds a transform cap, leaving stale"
+                    );
+                    return;
+                }
+                if let Err(error) = compiled.transform.apply(&mut buf, content_type) {
+                    match compiled.failure_posture {
+                        sbproxy_config::FailureMode::Closed => {
+                            // The live path refuses the response; with
+                            // no response to refuse, the refresh keeps
+                            // the stale entry and lets it age out.
+                            tracing::warn!(
+                                url = %full_url,
+                                transform = compiled.transform.transform_type(),
+                                error = %error,
+                                "swr: closed transform failed on refresh, leaving stale"
+                            );
+                            return;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                url = %full_url,
+                                transform = compiled.transform.transform_type(),
+                                error = %error,
+                                "swr: transform failed on refresh, continuing with next"
+                            );
+                        }
+                    }
+                }
+            }
+            body = buf.to_vec();
+            // The refresh response's Content-Length describes the raw
+            // upstream body; the chain may have changed the length,
+            // and a stored header that disagrees with the stored body
+            // truncates every later hit. The live path strips it for
+            // transformed origins before its header snapshot; mirror
+            // that here.
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+        }
+
         let entry = sbproxy_cache::CachedResponse {
             generation: sbproxy_cache::new_cache_generation(),
             status,

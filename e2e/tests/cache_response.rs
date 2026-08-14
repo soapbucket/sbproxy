@@ -908,3 +908,236 @@ origins:
         "POST to /users/42 must not evict /users/99"
     );
 }
+
+// --- Ingest transforms (WOR-2417) ---
+//
+// On an origin with transforms attached, the cache stores the
+// transform chain's output: a hit serves exactly what a miss ships,
+// and a closed transform refusal blocks admission entirely.
+
+fn transform_cache_config(upstream_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cache.localhost":
+    action:
+      type: proxy
+      url: "{upstream_url}"
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: "SECRET-TOKEN"
+            replace: "[REDACTED]"
+    response_cache:
+      enabled: true
+      ttl: 60
+      cacheable_methods: [GET]
+      cacheable_status: [200]
+"#
+    )
+}
+
+#[test]
+fn a_hit_serves_the_transformed_body_a_miss_shipped() {
+    let upstream =
+        MockUpstream::start(json!({"note": "the value is SECRET-TOKEN today"})).expect("upstream");
+    let proxy = ProxyHarness::start_with_yaml(&transform_cache_config(&upstream.base_url()))
+        .expect("start proxy");
+
+    let miss = proxy.get("/doc", "cache.localhost").expect("miss GET");
+    assert_eq!(miss.status, 200);
+    let miss_text = miss.text().expect("miss body");
+    assert!(
+        miss_text.contains("[REDACTED]") && !miss_text.contains("SECRET-TOKEN"),
+        "the miss must ship the transformed body: {miss_text}"
+    );
+
+    let hit = wait_for_cache_hit(&proxy, "/doc");
+    let hit_text = hit.text().expect("hit body");
+    assert!(
+        hit_text.contains("[REDACTED]") && !hit_text.contains("SECRET-TOKEN"),
+        "the hit must serve the same transformed body the miss shipped: {hit_text}"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "the hit must come from the cache, not the upstream"
+    );
+}
+
+#[test]
+fn a_closed_transform_refusal_blocks_cache_admission() {
+    // A json transform under `closed` fails on a non-JSON body. The
+    // response must refuse, and nothing may be admitted to the cache:
+    // every retry keeps reaching the upstream and refusing.
+    let upstream =
+        MockUpstream::start_raw(b"plain text, not json".to_vec(), "text/plain").expect("upstream");
+    let config = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cache.localhost":
+    action:
+      type: proxy
+      url: "{}"
+    transforms:
+      - type: json
+        set:
+          injected: true
+        failure_posture: closed
+    response_cache:
+      enabled: true
+      ttl: 60
+      cacheable_methods: [GET]
+      cacheable_status: [200]
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&config).expect("start proxy");
+
+    // The refusal's client-visible shape depends on flush timing: when
+    // the abort lands before headers flush the client sees a 502, and
+    // when the response was already committed the client sees the 200
+    // header with a truncated body (often surfacing as a read error).
+    // The invariants this test pins are timing-free: the raw upstream
+    // content never arrives intact, and nothing is admitted to the
+    // cache, so every request keeps reaching the upstream.
+    let assert_refused = |label: &str| match proxy.get("/doc", "cache.localhost") {
+        Err(_) => {}
+        Ok(response) => {
+            assert_ne!(
+                response.headers.get("x-sbproxy-cache").map(String::as_str),
+                Some("HIT"),
+                "{label}: a refused response must never be served from cache"
+            );
+            let intact = response
+                .text()
+                .is_ok_and(|text| text.contains("plain text, not json"));
+            assert!(
+                response.status >= 500 || !intact,
+                "{label}: the raw body must not reach the client intact                  (status {})",
+                response.status
+            );
+        }
+    };
+    assert_refused("first request");
+    assert_refused("second request");
+    assert_eq!(
+        upstream.captured().len(),
+        2,
+        "every request must reach the upstream because nothing was stored"
+    );
+}
+
+#[test]
+fn a_request_dependent_transform_on_a_cached_origin_refuses_at_boot() {
+    let config = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cache.localhost":
+    action:
+      type: proxy
+      url: "http://127.0.0.1:9"
+    transforms:
+      - type: lua_json
+        script: "function modify_json(data, ctx) return data end"
+    response_cache:
+      enabled: true
+      ttl: 60
+"#;
+    let error = ProxyHarness::start_with_yaml(config)
+        .err()
+        .map(|e| e.to_string())
+        .expect("a request-dependent transform on a cached origin must refuse to boot");
+    assert!(
+        error.contains("lua_json") || error.contains("request state"),
+        "the refusal must name the transform: {error}"
+    );
+}
+
+#[test]
+fn swr_refresh_stores_the_transformed_refresh_body() {
+    // TTL=2s, SWR=60s, with a redacting transform attached. Prime the
+    // cache, wait past TTL, take the STALE serve that triggers the
+    // background refresh, then poll until a fresh HIT appears. The
+    // refreshed entry must hold the transform chain's output: the
+    // refresh path runs with no request in scope, so this is the one
+    // test that proves the ingest pass runs there and not just on the
+    // live store path.
+    let upstream =
+        MockUpstream::start(json!({"note": "the value is SECRET-TOKEN today"})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cache.localhost":
+    action:
+      type: proxy
+      url: "{upstream}"
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: "SECRET-TOKEN"
+            replace: "[REDACTED]"
+    response_cache:
+      enabled: true
+      ttl: 2
+      stale_while_revalidate: 60
+      cacheable_methods: [GET]
+      cacheable_status: [200]
+"#,
+        upstream = upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_workspace(&yaml, &[]).expect("start proxy");
+
+    let cache_hdr = |r: &sbproxy_e2e::Response| {
+        r.headers
+            .get("x-sbproxy-cache")
+            .map(|s| s.as_str().to_string())
+    };
+
+    // Prime and wait for the warm HIT so the async store has landed.
+    let _ = proxy.get("/swr-ingest", "cache.localhost").expect("prime");
+    let _ = wait_for_cache_hit(&proxy, "/swr-ingest");
+
+    // Past TTL, inside SWR: the stale serve triggers the refresh.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let stale = proxy
+        .get("/swr-ingest", "cache.localhost")
+        .expect("stale serve");
+    let stale_text = stale.text().expect("stale body");
+    assert!(
+        !stale_text.contains("SECRET-TOKEN"),
+        "even the stale serve must hold transformed content: {stale_text}"
+    );
+
+    // Poll until the refresh lands as a fresh HIT, then assert the
+    // refreshed entry holds the transformed body. A refresh that
+    // stored the raw upstream bytes would leak SECRET-TOKEN here.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let refreshed = loop {
+        let r = proxy
+            .get("/swr-ingest", "cache.localhost")
+            .expect("refresh poll");
+        if cache_hdr(&r).as_deref() == Some("HIT") {
+            break r;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background refresh did not land as a fresh HIT; last: {:?} {:?}",
+            r.status,
+            r.headers
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let refreshed_text = refreshed.text().expect("refreshed body");
+    assert!(
+        refreshed_text.contains("[REDACTED]") && !refreshed_text.contains("SECRET-TOKEN"),
+        "the refreshed entry must hold the transform chain's output: {refreshed_text}"
+    );
+}

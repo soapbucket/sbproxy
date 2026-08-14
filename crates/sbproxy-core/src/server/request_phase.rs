@@ -4220,6 +4220,8 @@ pub(super) async fn request_filter(
                                         revalidation_request,
                                         path_and_query,
                                         cacheable_status,
+                                        pipeline.clone(),
+                                        origin_idx,
                                     );
                                 }
                             }

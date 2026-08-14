@@ -1164,6 +1164,106 @@ fn cap_idle_for_service_discovery(
 /// distinguished on the metric rather than in the return value, because
 /// the caller's behavior is identical and only the operator's
 /// interpretation differs.
+/// Dispatch the response-cache store for a completed body.
+///
+/// `final_body` is what a later hit will replay: the raw upstream
+/// bytes on an origin without transforms, or the transform chain's
+/// output on an origin with them (ingest semantics: the entry holds
+/// what this miss ships, so hits and misses answer alike). Consumes
+/// the capture state off the context; safe to call once per request.
+fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
+    let key = ctx.cache_key.take();
+    let status = ctx.cache_status.take();
+    let headers = ctx.cache_headers.take();
+    let (Some(key), Some(status), Some(headers)) = (key, status, headers) else {
+        return;
+    };
+    // WOR-2367: `cache.admit`. This is the earliest point where the
+    // question the event answers is answerable: whether a response is
+    // worth storing depends on its status, size, and content, and the
+    // body is only complete here. On a transformed origin the length
+    // it sees is the transformed one, because that is what would be
+    // stored.
+    //
+    // Declining leaves `ttl_secs` and the static `cacheable_status`
+    // gate in charge, which is what a deployment without the event
+    // already does.
+    let static_ttl = {
+        let pipeline_guard = ctx.pipeline.clone();
+        ctx.origin_idx
+            .and_then(|idx| pipeline_guard.config.origins.get(idx))
+            .and_then(|o| o.response_cache.as_ref())
+            .map(|c| c.ttl_secs)
+            .unwrap_or(300)
+    };
+    let admit = evaluate_cache_admit(ctx, status, &headers, final_body.len());
+    let ttl = admit.ttl_secs.unwrap_or(static_ttl);
+    let pipeline_for_write = ctx.pipeline.clone();
+    // The write-back must seal under the same origin the lookup opened
+    // under, so resolve the per-origin handle rather than the shared
+    // one.
+    let write_origin_id = ctx
+        .origin_idx
+        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
+        .map(|o| o.origin_id.to_string())
+        .unwrap_or_default();
+    // WOR-2407: stamp the config this entry belongs to. Redundant
+    // against the key on an exact-keyed backend, load bearing on
+    // memcached, which matches a digest of the key rather than the
+    // key.
+    let write_config_fp = ctx
+        .origin_idx
+        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
+        .map(|o| o.cache_config_fingerprint.to_string())
+        .unwrap_or_default();
+    // `admit.store` gates the write and nothing else. Returning early
+    // here would skip work the caller still owes, so the event refuses
+    // to *store* without refusing to serve.
+    if let Some(cache_store) = pipeline_for_write
+        .cache_store_for(&write_origin_id)
+        .cloned()
+        .filter(|_| admit.store)
+    {
+        let entry = sbproxy_cache::CachedResponse {
+            generation: sbproxy_cache::new_cache_generation(),
+            status,
+            headers,
+            body: final_body.to_vec(),
+            cached_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ttl_secs: ttl,
+            config_fp: write_config_fp,
+        };
+        // --- Cache Reserve admission ---
+        // Mirror into the cold tier subject to the configured admission
+        // filter. The reserve write fires before the hot-cache write
+        // moves `entry` so we don't have to round-trip through serde to
+        // clone it.
+        if let (Some(reserve), Some(admission)) = (
+            pipeline_for_write.cache_reserve.clone(),
+            pipeline_for_write.cache_reserve_admission,
+        ) {
+            let origin_id_for_reserve = write_origin_id.clone();
+            maybe_admit_to_reserve(
+                reserve,
+                admission,
+                key.clone(),
+                &entry,
+                origin_id_for_reserve,
+            );
+        }
+        // Dispatch the actual write in a blocking task so the Redis TCP
+        // I/O doesn't run on the reactor thread.
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = cache_store.put(&key, &entry) {
+                tracing::warn!(error = %e, "cache write failed");
+            }
+        });
+    }
+}
+
 fn evaluate_cache_admit(
     ctx: &crate::context::RequestContext,
     status: u16,
@@ -5347,103 +5447,32 @@ impl ProxyHttp for SbProxy {
         // `tokio::spawn`. The write is best-effort; failures are logged but
         // don't affect the response we deliver to the client.
         if ctx.cache_body_buf.is_some() {
-            if let Some(chunk) = body.as_ref() {
-                if let Some(buf) = &mut ctx.cache_body_buf {
-                    buf.extend_from_slice(chunk);
+            // An origin with transforms attached stores the transform
+            // chain's output, not the raw upstream bytes: the entry
+            // holds what this miss ships, so a hit serves the same
+            // content a miss does and a `closed` transform's guarantee
+            // extends to cached responses. For those origins the store
+            // dispatch lives in the transform section below, after the
+            // chain has run; `cache_body_buf` stays `Some` as the
+            // capture-active marker but accumulates nothing, so the
+            // body is not buffered twice. A body that bypasses the
+            // transform section entirely (an oversized pass-through, a
+            // committed fallback or replacement) is deliberately not
+            // stored: it did not go through the chain, so the cache
+            // must not replay it.
+            let origin_stores_transformed = ctx
+                .origin_idx
+                .and_then(|idx| ctx.pipeline.transforms.get(idx))
+                .is_some_and(|transforms| !transforms.is_empty());
+            if !origin_stores_transformed {
+                if let Some(chunk) = body.as_ref() {
+                    if let Some(buf) = &mut ctx.cache_body_buf {
+                        buf.extend_from_slice(chunk);
+                    }
                 }
-            }
-            if end_of_stream {
-                let key = ctx.cache_key.take();
-                let body_buf = ctx.cache_body_buf.take();
-                let status = ctx.cache_status.take();
-                let headers = ctx.cache_headers.take();
-                if let (Some(key), Some(body_buf), Some(status), Some(headers)) =
-                    (key, body_buf, status, headers)
-                {
-                    // WOR-2367: `cache.admit`. This is the earliest point
-                    // where the question the event answers is answerable:
-                    // whether a response is worth storing depends on its
-                    // status, size, and content, and the body is only
-                    // complete here.
-                    //
-                    // Declining leaves `ttl_secs` and the static
-                    // `cacheable_status` gate in charge, which is what a
-                    // deployment without the event already does.
-                    let static_ttl = {
-                        let pipeline_guard = ctx.pipeline.clone();
-                        ctx.origin_idx
-                            .and_then(|idx| pipeline_guard.config.origins.get(idx))
-                            .and_then(|o| o.response_cache.as_ref())
-                            .map(|c| c.ttl_secs)
-                            .unwrap_or(300)
-                    };
-                    let admit = evaluate_cache_admit(ctx, status, &headers, body_buf.len());
-                    let ttl = admit.ttl_secs.unwrap_or(static_ttl);
-                    let pipeline_for_write = ctx.pipeline.clone();
-                    // The write-back must seal under the same origin the
-                    // lookup opened under, so resolve the per-origin
-                    // handle rather than the shared one.
-                    let write_origin_id = ctx
-                        .origin_idx
-                        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
-                        .map(|o| o.origin_id.to_string())
-                        .unwrap_or_default();
-                    // WOR-2407: stamp the config this entry belongs to.
-                    // Redundant against the key on an exact-keyed
-                    // backend, load bearing on memcached, which matches
-                    // a digest of the key rather than the key.
-                    let write_config_fp = ctx
-                        .origin_idx
-                        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
-                        .map(|o| o.cache_config_fingerprint.to_string())
-                        .unwrap_or_default();
-                    // `admit.store` gates the write and nothing else.
-                    // Returning early here would skip the idempotency
-                    // capture further down this same filter, so the event
-                    // refuses to *store* without refusing to serve.
-                    if let Some(cache_store) = pipeline_for_write
-                        .cache_store_for(&write_origin_id)
-                        .cloned()
-                        .filter(|_| admit.store)
-                    {
-                        let entry = sbproxy_cache::CachedResponse {
-                            generation: sbproxy_cache::new_cache_generation(),
-                            status,
-                            headers,
-                            body: body_buf.to_vec(),
-                            cached_at: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            ttl_secs: ttl,
-                            config_fp: write_config_fp,
-                        };
-                        // --- Cache Reserve admission ---
-                        // Mirror into the cold tier subject to the
-                        // configured admission filter. The reserve
-                        // write fires before the hot-cache write moves
-                        // `entry` so we don't have to round-trip
-                        // through serde to clone it.
-                        if let (Some(reserve), Some(admission)) = (
-                            pipeline_for_write.cache_reserve.clone(),
-                            pipeline_for_write.cache_reserve_admission,
-                        ) {
-                            let origin_id_for_reserve = write_origin_id.clone();
-                            maybe_admit_to_reserve(
-                                reserve,
-                                admission,
-                                key.clone(),
-                                &entry,
-                                origin_id_for_reserve,
-                            );
-                        }
-                        // Dispatch the actual write in a blocking task so the
-                        // Redis TCP I/O doesn't run on the reactor thread.
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = cache_store.put(&key, &entry) {
-                                tracing::warn!(error = %e, "cache write failed");
-                            }
-                        });
+                if end_of_stream {
+                    if let Some(body_buf) = ctx.cache_body_buf.take() {
+                        dispatch_response_cache_store(ctx, &body_buf);
                     }
                 }
             }
@@ -5762,6 +5791,19 @@ impl ProxyHttp for SbProxy {
                             }
                         }
                     }
+                }
+
+                // --- Response cache: store the transform chain's output ---
+                //
+                // Ingest semantics (WOR-2417): the capture block above
+                // left `cache_body_buf` as a marker on origins with
+                // transforms, and this is the one point where the
+                // final body exists after every transform and before
+                // compression, which hits do not replay. A closed
+                // transform failure returned above, so nothing unsafe
+                // reaches this store.
+                if has_transforms && ctx.cache_body_buf.take().is_some() {
+                    dispatch_response_cache_store(ctx, &buf);
                 }
 
                 // SRI scan runs after transforms so it sees the same
