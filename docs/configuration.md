@@ -3602,9 +3602,9 @@ stale-while-revalidate refresh), a hit serves the stored transformed body, and
 a `failure_posture: closed` transform refusal blocks the store, so the closed
 guarantee extends to cached responses. Because a stored transform output is
 replayed to every later requester, a transform whose output depends on the
-incoming request (the scripted transforms, the content-negotiation family, and
-`a2a_agent_card_rewrite`) is refused at config load when combined with
-`response_cache`; the error names the transform. The fingerprint does not
+incoming request (the scripted transforms, the content-negotiation family,
+`cel`, and `a2a_agent_card_rewrite`) is refused at config load when combined
+with `response_cache`; the error names the transform. The fingerprint does not
 cover anything outside the origin: an unrelated origin, a log level, or a
 listener change leaves every existing entry readable.
 
