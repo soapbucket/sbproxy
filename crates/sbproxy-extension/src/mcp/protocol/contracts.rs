@@ -6,6 +6,9 @@ use std::collections::HashSet;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// The root JSON value has depth one; nested values add one and object keys do not count.
+const ROOT_VALUE_DEPTH: usize = 1;
+
 /// Error vocabulary for MCP contract parsing, schema compilation, and headers.
 #[derive(Debug, thiserror::Error)]
 pub enum McpContractError {
@@ -227,7 +230,7 @@ impl<'de> Deserialize<'de> for McpToolResultDocument {
 pub struct McpSchemaLimits {
     /// Maximum serialized schema bytes.
     pub max_bytes: usize,
-    /// Maximum nested JSON value depth.
+    /// Maximum JSON value depth, with the root value at depth one and object keys excluded.
     pub max_depth: usize,
     /// Maximum JSON values visited.
     pub max_nodes: usize,
@@ -470,6 +473,12 @@ fn analyze_schema(
     analyze_schema_inner(schema, limits, collect_headers, &mut projections).map(|_| ())
 }
 
+#[derive(Clone, Copy)]
+enum SchemaTraversalPosition {
+    Schema,
+    PropertiesContainer,
+}
+
 fn analyze_schema_inner(
     schema: &serde_json::Value,
     limits: McpSchemaLimits,
@@ -485,12 +494,35 @@ fn analyze_schema_inner(
     let mut subschemas = 0usize;
     let mut total_pattern_bytes = 0usize;
     let mut seen_headers = HashSet::new();
-    let mut stack = vec![(schema, 1usize, true, Vec::<String>::new())];
+    let mut stack = vec![(
+        schema,
+        ROOT_VALUE_DEPTH,
+        true,
+        Vec::<String>::new(),
+        SchemaTraversalPosition::Schema,
+    )];
 
-    while let Some((value, depth, reachable, path)) = stack.pop() {
+    while let Some((value, depth, reachable, path, position)) = stack.pop() {
         nodes += 1;
         check_limit("nodes", nodes, limits.max_nodes)?;
         check_limit("depth", depth, limits.max_depth)?;
+
+        if matches!(position, SchemaTraversalPosition::PropertiesContainer) {
+            if let serde_json::Value::Object(properties) = value {
+                for (property, property_schema) in properties {
+                    let mut property_path = path.clone();
+                    property_path.push(property.clone());
+                    stack.push((
+                        property_schema,
+                        depth + 1,
+                        reachable,
+                        property_path,
+                        SchemaTraversalPosition::Schema,
+                    ));
+                }
+                continue;
+            }
+        }
 
         match value {
             serde_json::Value::Object(object) => {
@@ -590,21 +622,35 @@ fn analyze_schema_inner(
 
                 for (keyword, child) in object {
                     if keyword == "properties" {
-                        if let serde_json::Value::Object(properties) = child {
-                            for (property, property_schema) in properties {
-                                let mut property_path = path.clone();
-                                property_path.push(property.clone());
-                                stack.push((property_schema, depth + 1, reachable, property_path));
-                            }
+                        if child.is_object() {
+                            stack.push((
+                                child,
+                                depth + 1,
+                                reachable,
+                                path.clone(),
+                                SchemaTraversalPosition::PropertiesContainer,
+                            ));
                             continue;
                         }
                     }
-                    stack.push((child, depth + 1, false, path.clone()));
+                    stack.push((
+                        child,
+                        depth + 1,
+                        false,
+                        path.clone(),
+                        SchemaTraversalPosition::Schema,
+                    ));
                 }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    stack.push((item, depth + 1, false, path.clone()));
+                    stack.push((
+                        item,
+                        depth + 1,
+                        false,
+                        path.clone(),
+                        SchemaTraversalPosition::Schema,
+                    ));
                 }
             }
             _ => {}

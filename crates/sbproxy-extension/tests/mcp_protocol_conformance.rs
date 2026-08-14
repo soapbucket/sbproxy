@@ -67,6 +67,79 @@ fn contract_with_schema(input_schema: serde_json::Value) -> McpToolContract {
     .expect("fixture tool contract")
 }
 
+fn schema_with_exact_serialized_bytes(bytes: usize) -> Value {
+    let mut schema = json!({"type": "object", "description": ""});
+    let fixed_bytes = serde_json::to_vec(&schema).unwrap().len();
+    assert!(bytes >= fixed_bytes);
+    schema["description"] = Value::String("x".repeat(bytes - fixed_bytes));
+    assert_eq!(serde_json::to_vec(&schema).unwrap().len(), bytes);
+    schema
+}
+
+fn schema_with_property_entries(count: usize) -> Value {
+    let properties = (0..count)
+        .map(|index| (format!("property_{index}"), Value::Bool(true)))
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "examples": [null]
+    })
+}
+
+fn schema_with_definitions(count: usize) -> Value {
+    let definitions = (0..count)
+        .map(|index| (format!("definition_{index}"), Value::Bool(true)))
+        .collect::<serde_json::Map<_, _>>();
+    json!({"type": "object", "$defs": definitions})
+}
+
+fn schema_with_pattern_property_keys(lengths: &[usize]) -> Value {
+    let pattern_properties = lengths
+        .iter()
+        .enumerate()
+        .map(|(index, length)| {
+            assert!(*length > 0);
+            let suffix = char::from(b'a' + u8::try_from(index).unwrap());
+            (
+                format!("{}{}", "x".repeat(length - 1), suffix),
+                Value::Bool(true),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({"type": "object", "patternProperties": pattern_properties})
+}
+
+fn schema_with_header_projections(count: usize) -> Value {
+    let properties = (0..count)
+        .map(|index| {
+            (
+                format!("field_{index}"),
+                json!({"type": "string", "x-mcp-header": format!("Field-{index}")}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({"type": "object", "properties": properties})
+}
+
+fn schema_with_property_chain_depth(depth: usize) -> Value {
+    assert!(matches!(depth, 32 | 33));
+    // With root depth one, 15 property-map and property-schema pairs place
+    // this leaf at depth 31. Its `type` string is depth 32; the optional
+    // examples null is then depth 33.
+    let mut leaf = json!({"type": "string"});
+    if depth == 33 {
+        leaf["examples"] = json!([null]);
+    }
+    for _ in 0..15 {
+        leaf = json!({
+            "type": "object",
+            "properties": {"next": leaf}
+        });
+    }
+    leaf
+}
+
 #[test]
 fn mcp_protocol_contract_round_trip_preserves_every_field() {
     let raw = json!({
@@ -91,6 +164,12 @@ fn mcp_protocol_contract_round_trip_preserves_every_field() {
     assert_eq!(serde_json::to_value(&contract).expect("serialize"), raw);
     let decoded: McpToolContract = serde_json::from_value(raw.clone()).expect("deserialize");
     assert_eq!(decoded.as_value(), raw);
+
+    let advertised = contract.with_advertised_name("gateway.weather");
+    let mut expected = raw.clone();
+    expected["name"] = json!("gateway.weather");
+    assert_eq!(advertised.as_value(), expected);
+    assert_eq!(contract.as_value(), raw);
 }
 
 #[test]
@@ -160,6 +239,143 @@ fn mcp_protocol_schema_accepts_only_the_supported_dialects() {
 }
 
 #[test]
+fn mcp_protocol_schema_rejects_non_object_input_schemas() {
+    assert!(matches!(
+        McpToolContract::try_from(json!({
+            "name": "fixture.tool",
+            "inputSchema": []
+        })),
+        Err(McpContractError::MissingObjectField("inputSchema"))
+    ));
+
+    let contract = contract_with_schema(json!({"type": "string"}));
+    assert!(matches!(
+        compile_modern_tool_contract(&contract, McpSchemaLimits::default()),
+        Err(McpContractError::InvalidSchema(_))
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_enforces_serialized_byte_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    let exact = contract_with_schema(schema_with_exact_serialized_bytes(limits.max_bytes));
+    compile_modern_tool_contract(&exact, limits).expect("exact byte limit is accepted");
+
+    let one_over = contract_with_schema(schema_with_exact_serialized_bytes(limits.max_bytes + 1));
+    assert!(matches!(
+        compile_modern_tool_contract(&one_over, limits),
+        Err(McpContractError::LimitExceeded {
+            limit: "bytes",
+            actual,
+            maximum,
+        }) if actual == limits.max_bytes + 1 && maximum == limits.max_bytes
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_enforces_node_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    // Root, type, properties map, examples array, and examples null are five values.
+    let exact = contract_with_schema(schema_with_property_entries(limits.max_nodes - 5));
+    compile_modern_tool_contract(&exact, limits).expect("exact node limit is accepted");
+
+    let one_over = contract_with_schema(schema_with_property_entries(limits.max_nodes - 4));
+    assert!(matches!(
+        compile_modern_tool_contract(&one_over, limits),
+        Err(McpContractError::LimitExceeded {
+            limit: "nodes",
+            actual,
+            maximum,
+        }) if actual == limits.max_nodes + 1 && maximum == limits.max_nodes
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_enforces_subschema_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    let exact = contract_with_schema(schema_with_definitions(limits.max_subschemas));
+    compile_modern_tool_contract(&exact, limits).expect("exact subschema limit is accepted");
+
+    let one_over = contract_with_schema(schema_with_definitions(limits.max_subschemas + 1));
+    assert!(matches!(
+        compile_modern_tool_contract(&one_over, limits),
+        Err(McpContractError::LimitExceeded {
+            limit: "subschemas",
+            actual,
+            maximum,
+        }) if actual == limits.max_subschemas + 1 && maximum == limits.max_subschemas
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_enforces_per_pattern_byte_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    let exact = contract_with_schema(json!({
+        "type": "object",
+        "pattern": "x".repeat(limits.max_pattern_bytes)
+    }));
+    compile_modern_tool_contract(&exact, limits).expect("exact pattern limit is accepted");
+
+    let one_over = contract_with_schema(json!({
+        "type": "object",
+        "pattern": "x".repeat(limits.max_pattern_bytes + 1)
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&one_over, limits),
+        Err(McpContractError::LimitExceeded {
+            limit: "pattern_bytes",
+            actual,
+            maximum,
+        }) if actual == limits.max_pattern_bytes + 1 && maximum == limits.max_pattern_bytes
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_enforces_total_pattern_byte_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    let exact = contract_with_schema(schema_with_pattern_property_keys(&[
+        limits.max_pattern_bytes,
+        limits.max_pattern_bytes,
+        limits.max_pattern_bytes,
+        limits.max_pattern_bytes,
+    ]));
+    compile_modern_tool_contract(&exact, limits).expect("exact total pattern limit is accepted");
+
+    let one_over = contract_with_schema(schema_with_pattern_property_keys(&[
+        limits.max_pattern_bytes,
+        limits.max_pattern_bytes,
+        limits.max_pattern_bytes,
+        limits.max_pattern_bytes,
+        1,
+    ]));
+    assert!(matches!(
+        compile_modern_tool_contract(&one_over, limits),
+        Err(McpContractError::LimitExceeded {
+            limit: "total_pattern_bytes",
+            actual,
+            maximum,
+        }) if actual == limits.max_total_pattern_bytes + 1 && maximum == limits.max_total_pattern_bytes
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_enforces_depth_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    let exact = contract_with_schema(schema_with_property_chain_depth(limits.max_depth));
+    compile_modern_tool_contract(&exact, limits).expect("root-depth 32 is accepted");
+
+    let one_over = contract_with_schema(schema_with_property_chain_depth(limits.max_depth + 1));
+    assert!(matches!(
+        compile_modern_tool_contract(&one_over, limits),
+        Err(McpContractError::LimitExceeded {
+            limit: "depth",
+            actual,
+            maximum,
+        }) if actual == limits.max_depth + 1 && maximum == limits.max_depth
+    ));
+}
+
+#[test]
 fn mcp_protocol_schema_rejects_external_refs_and_complexity() {
     let external = contract_with_schema(json!({
         "type": "object",
@@ -168,6 +384,18 @@ fn mcp_protocol_schema_rejects_external_refs_and_complexity() {
     assert!(matches!(
         compile_modern_tool_contract(&external, McpSchemaLimits::default()),
         Err(McpContractError::ExternalReference { .. })
+    ));
+
+    let dynamic = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"x": {"$dynamicRef": "https://attacker.test/schema.json"}}
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&dynamic, McpSchemaLimits::default()),
+        Err(McpContractError::ExternalReference {
+            keyword: "$dynamicRef",
+            ..
+        })
     ));
 
     let deep = contract_with_schema((0..34).fold(
@@ -266,25 +494,27 @@ fn mcp_protocol_schema_rejects_unreachable_or_invalid_header_projections() {
 }
 
 #[test]
-fn mcp_protocol_schema_rejects_header_projection_count_over_limit() {
-    let properties = (0..65)
-        .map(|index| {
-            (
-                format!("field_{index}"),
-                json!({"type": "string", "x-mcp-header": format!("Field-{index}")}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let contract = contract_with_schema(json!({
-        "type": "object",
-        "properties": properties,
-    }));
+fn mcp_protocol_schema_enforces_header_projection_limit_at_boundary() {
+    let limits = McpSchemaLimits::default();
+    let exact = contract_with_schema(schema_with_header_projections(
+        limits.max_header_projections,
+    ));
+    let compiled = compile_modern_tool_contract(&exact, limits).expect("exact projection limit");
+    assert_eq!(
+        compiled.header_projections.len(),
+        limits.max_header_projections
+    );
+
+    let contract = contract_with_schema(schema_with_header_projections(
+        limits.max_header_projections + 1,
+    ));
     assert!(matches!(
-        compile_modern_tool_contract(&contract, McpSchemaLimits::default()),
+        compile_modern_tool_contract(&contract, limits),
         Err(McpContractError::LimitExceeded {
             limit: "header_projections",
-            ..
-        })
+            actual,
+            maximum,
+        }) if actual == limits.max_header_projections + 1 && maximum == limits.max_header_projections
     ));
 }
 
@@ -317,6 +547,42 @@ fn mcp_protocol_header_projection_rejects_missing_mismatched_and_null_values() {
             &json!({"region": null})
         ),
         Err(McpContractError::UnexpectedMirroredHeader(_))
+    ));
+}
+
+#[test]
+fn mcp_protocol_header_projection_rejects_header_for_absent_body_property() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"region": {"type": "string", "x-mcp-header": "Region"}}
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("mcp-param-region", "east".parse().unwrap());
+
+    assert!(matches!(
+        validate_mirrored_headers(&headers, &compiled.header_projections, &json!({})),
+        Err(McpContractError::UnexpectedMirroredHeader(_))
+    ));
+}
+
+#[test]
+fn mcp_protocol_header_projection_rejects_uppercase_boolean_values() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"dry_run": {"type": "boolean", "x-mcp-header": "Dry-Run"}}
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("mcp-param-dry-run", "TRUE".parse().unwrap());
+
+    assert!(matches!(
+        validate_mirrored_headers(
+            &headers,
+            &compiled.header_projections,
+            &json!({"dry_run": true})
+        ),
+        Err(McpContractError::MirroredHeaderMismatch(_))
     ));
 }
 
