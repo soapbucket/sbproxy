@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-14*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -49,6 +49,9 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
 | `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
+| `policies[] type: rego`, fields `module` + `query` | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message` |
+| `forward_rules[].rules[].when` | CEL | Boolean predicate over the arriving request; an evaluation error means the rule does not match |
+| `observability.log.custom_fields[]` with `engine: lua` or `engine: js` | Lua or JavaScript | Returns the value of one operator-defined access-log field |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
 | `origins.<host>.response_cache.key_event`, field `source` | Lua or JavaScript | Returns `{vary, skip_lookup, reason}` before the cache lookup; adds dimensions to the cache key |
 | `origins.<host>.response_cache.admit_event`, field `source` | Lua or JavaScript | Returns `{store, ttl_secs, reason}` once the response body is complete; decides whether it is stored |
@@ -1120,6 +1123,14 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 - Non-Turing-complete: no loops, no side effects, no I/O.
 - No access to secrets. Evaluation typically completes in microseconds.
 - User-supplied regex patterns (`regex_match`) are capped at 1024 bytes and a bounded compile size; oversized or invalid patterns evaluate false.
+- Deliberately has no wall-clock budget, fuel, or memory cap at evaluation time, and no `proxy.scripting.cel` block to set one. The language terminates by construction (no loops, no recursion), so the only unbounded work a CEL expression can request is regex compilation, and that is what the two regex caps bound. The `cel` transform logs when one header rule takes longer than a millisecond, but that budget is advisory: it is measured after the evaluation, and cannot preempt one.
+
+### Rego
+
+- One evaluation runs under `budget_ms` (default 50 ms, matching the extension-bundle sandbox default), enforced by the Regorus execution timer, which checks the deadline every thousand work units. `budget_ms: 0` is refused at config load.
+- Deliberately has no memory or stack cap and no fuel: the execution timer bounds total work, and a policy is one bounded evaluation over an already-bounded input document rather than a body-sized stream.
+- Configured per policy (`policies[] type: rego`, field `budget_ms`), not under `proxy.scripting`. Modules are compiled and semantically checked at config load, including one trial evaluation, so authoring mistakes cannot defer to request time.
+- Every fault denies the request; there is no `failure_posture` knob on this surface. See [§3a](#failure-posture).
 
 ### Lua
 
@@ -1127,6 +1138,7 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 - Nil'd out: `os`, `io`, `loadfile`, `dofile`, `require`, `rawset`, `rawget`, `load`, `loadstring`, `debug`, `package`.
 - No network operations.
 - Wall-clock budget (default 100 ms) enforced via the Luau interrupt callback; memory cap (default 8 MB) enforced by the allocator.
+- Deliberately has no instruction metering: the interrupt callback bounds an infinite loop by wall clock, so counting instructions would duplicate a bound that already holds. Setting `max_execution_ms: 0` disables the timer and is not recommended.
 - Available standard library: `string.*` (pattern functions gated by `allow_patterns`), `table.*`, `math.*`, `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `select`, `pcall`, `error`.
 
 ### JavaScript
@@ -1141,6 +1153,23 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 - Per-request `Store` so module state never leaks between requests; the compiled `Module` is shared across calls so per-invocation cost is one instantiate plus one `_start`.
 - `timeout_ms` is enforced via epoch interruption; `max_memory_pages` caps linear memory.
 - There is no host allowlist because there is nothing to allow: modules get no sockets. An authored `allowed_hosts:` is refused at config compile rather than accepted as a boundary nothing checks.
+
+### Capability matrix
+
+One row per engine; every empty cell is a decision, not an omission, and the notes above say why. Extension bundles appear as their own row because their limits come from the bundle manifest rather than from `sb.yml`.
+
+| Engine | Wall clock | Memory | Stack | Fuel | Output cap | Limits configured in |
+|---|---|---|---|---|---|---|
+| CEL | none (terminates by construction; regex caps only) | none | none | none | none | nowhere: the regex caps are fixed |
+| Rego | `budget_ms`, default 50 ms | none | none | none | none | per policy (`budget_ms`) |
+| Lua | 100 ms interrupt | 8 MB allocator | none | none (wall clock covers it) | none | `proxy.scripting.lua.sandbox` |
+| JavaScript (inline) | 100 ms watchdog | 16 MB heap | 1 MB native | none (wall clock covers it) | none | `proxy.scripting.javascript.sandbox` |
+| WASM (`transform: wasm`) | `timeout_ms`, default 1 s, epoch interruption | `max_memory_pages`, default 256 pages (16 MiB) | module-internal | `max_fuel`, default 10^9 | none | the transform's own config block |
+| Bundle hooks (JS / envelope WASM) | `budget_ms`, default 50 ms, max 1 s | `memory_mb`, default 16 MB, max 64 MB | `stack_kb`, default 512 KB, max 2 MB | `max_fuel` (WASM only), default 10^8 | `max_output_bytes`, default 1 MiB, max 16 MiB; input capped by `max_buffer_bytes` | the bundle manifest's `sandbox:` block |
+
+Two absences worth naming across the whole table. No inline engine caps its output size; the surfaces they attach to bound the result instead (a header value, a JSON body already capped by `max_body_size`, a log field). And no engine gets network, filesystem, or clock access anywhere in this table; the only I/O an extension can request is the declared, host-mediated kind documented in [extension-bundles.md](extension-bundles.md).
+
+Where each engine attaches is section 2's table; what each surface hands the script is [§3.2](#32-what-each-config-site-offers) for CEL and the per-engine sections above for the rest; what happens when a script fails is the error table in [§11](#error-behavior).
 
 ---
 
@@ -1190,13 +1219,16 @@ With debug logging on, script failures are logged with the engine, the error mes
 | rate-limit `key:` | A CEL parse error rejects the config at compile time; an empty or null result falls back to the default client key; an evaluation error buckets the request under the `__cel_key_error__:` namespace and logs |
 | WAF `persistent_block.key` | A CEL parse error, or `track_by: cel` with no `key:`, rejects the config at compile time; an evaluation error leaves the request untracked (no strike, no block) |
 | `engine: cel` custom log field | A CEL parse error rejects the config at compile time; an evaluation error is logged at debug and the field is omitted from the line |
+| `rego` policy | A module that fails to parse or a semantic fault (unsafe variable, `query` naming no rule) rejects the config at compile time; a rule error, non-boolean result, or exceeded `budget_ms` denies the request with `deny_status` |
+| forward-rule `when:` | A CEL parse error rejects the config at compile time; an evaluation error means the rule does not match, logged per request |
+| WAF custom rule (Lua / JS) | A rule whose script errors is skipped and counted; if no rule blocked but at least one went unevaluated, the pass reports a WAF failure and the policy's `failure_posture` decides (default closed) |
 | Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | `response_cache.key_event` | An `engine` of `cel` or `wasm`, any other unknown engine, or an empty `source` fails config compile; an engine fault or a document that cannot be decoded is logged and bypasses the cache for that request, with no read and no write |
 | `response_cache.admit_event` | The same config-compile checks, plus a refusal when the origin also sets `stale_while_revalidate`; an engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
-| JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate |
+| JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate. One exception today: a policy hook running in the header phase (`body_mode: none`) that faults returns a 500 regardless of posture |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
 | Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |
 
