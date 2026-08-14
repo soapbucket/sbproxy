@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-14*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -370,6 +370,68 @@ The strategy blends learned picks with deterministic round-robin during
 warm-up instead of waiting for a hard threshold. The scoring formula,
 confidence schedule, and feedback lifetime are in
 [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+
+## Routing policy
+
+The strategies above are a fixed menu. `ai_routing_policy` lets you write
+the routing decision yourself: a CEL expression that returns an ordered
+list of provider/model candidates, and the request runs down that list
+through the same executor the `cascade` strategy uses. The point is to
+route on things a menu cannot express, like the caller's tier or how much
+of their budget is already spent, without shipping a fork of the proxy.
+
+```yaml
+action:
+  type: ai_proxy
+  routing: least_token_usage      # runs whenever the policy declines
+  providers:
+    - name: cheap
+      provider_type: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o-mini]
+    - name: frontier
+      provider_type: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o]
+  ai_routing_policy:
+    expression: |
+      ai.principal.tier == "free"
+        ? {"candidates": [{"provider_id": "cheap", "model": "gpt-4o-mini"}],
+           "reason": "free tier downgrade", "reason_code": "tier"}
+        : null
+    reason_codes: [tier]
+    on_error: decline
+```
+
+The expression reads the same `ai.*` decision view the
+[AI policy plane](ai-policy-cel.md) reads (`ai.principal.tier`,
+`ai.model`, `ai.budget.fraction`, the guardrail verdicts, and the rest),
+and returns one of three shapes:
+
+- A plan, `{"candidates": [{"provider_id", "model", "quality_threshold"?, "cost_cap"?}], "reason", "reason_code"?}`. The candidates are tried in order, and a `quality_threshold` or `cost_cap` on one means exactly what it means on a `cascade` tier. `reason` is required and reaches the access log, so you can see why a request routed the way it did rather than guessing.
+- A decline: `null`, `{}`, or an empty candidate list. This is the common case and it is meant to be the cheapest thing to write. The configured `routing` strategy runs unchanged, so a policy that has an opinion about a few requests and none about the rest just declines for the rest.
+- Nothing usable: an evaluation error, a plan with no reason, or a candidate naming a provider you never configured. `on_error` decides what happens next. `decline` (the default) falls through to the strategy; `block` refuses the request. A broken optimization policy should not take the gateway down, which is why the default fails open.
+
+Two things the policy is not allowed to do. It cannot route to a model
+your origin or the caller's key does not allow: every candidate's model
+is re-checked against the same allowlist the request already passed, and
+a plan that names a blocked model is refused with a 403 instead of
+served. And it does not run at all for a bring-your-own-key (native)
+request, because fanning that request across your providers would replay
+the caller's own credential somewhere it was never meant to go. A
+security `route_to:` from the AI policy plane also wins over the plan: if
+a guardrail downgrades the model, that downgrade is what ships.
+
+`reason_code` is only for the metric. Each decision increments
+`sbproxy_ai_routing_policy_decisions_total{outcome, reason_code}`, and
+only codes you list in `reason_codes` pass through as themselves.
+Anything else collapses to `other`, and an absent code reads as `policy`,
+which keeps a policy from filling the label with unbounded distinct
+values.
+
+CEL is the only engine today. The plan format is shared with the
+document engines, so the same decision will accept Lua, JavaScript,
+WebAssembly, and Rego once those land.
 
 ## Resilience
 
