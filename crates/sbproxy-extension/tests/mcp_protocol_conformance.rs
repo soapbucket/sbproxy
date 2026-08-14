@@ -5,6 +5,11 @@ use sbproxy_extension::mcp::{
 };
 use serde_json::{json, Value};
 
+use sbproxy_extension::mcp::protocol::{
+    build_mirrored_headers, compile_modern_tool_contract, validate_mirrored_headers,
+    McpContractError, McpSchemaLimits, McpToolContract, McpToolResultDocument,
+};
+
 fn fixture(raw: &str) -> Value {
     serde_json::from_str(raw).expect("fixture is valid JSON")
 }
@@ -51,6 +56,304 @@ fn test_server_description() -> McpServerDescription {
         ),
         instructions: Some("Federated gateway".into()),
     }
+}
+
+fn contract_with_schema(input_schema: serde_json::Value) -> McpToolContract {
+    McpToolContract::try_from(serde_json::json!({
+        "name": "fixture.tool",
+        "description": "schema fixture",
+        "inputSchema": input_schema,
+    }))
+    .expect("fixture tool contract")
+}
+
+#[test]
+fn mcp_protocol_contract_round_trip_preserves_every_field() {
+    let raw = json!({
+        "name": "weather",
+        "title": "Weather",
+        "description": "Forecast",
+        "icons": [{"src": "data:image/png;base64,AA==", "mimeType": "image/png"}],
+        "inputSchema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "$defs": {"city": {"type": "string"}},
+            "properties": {"city": {"$ref": "#/$defs/city"}},
+            "unevaluatedProperties": false
+        },
+        "outputSchema": {"prefixItems": [{"type": "string"}]},
+        "annotations": {"readOnlyHint": true, "destructiveHint": false},
+        "_meta": {"vendor.example/ui": "card"},
+        "vendor.example/security": {"audience": "weather-api"}
+    });
+    let contract = McpToolContract::try_from(raw.clone()).expect("contract");
+    assert_eq!(contract.as_value(), raw);
+    assert_eq!(serde_json::to_value(&contract).expect("serialize"), raw);
+    let decoded: McpToolContract = serde_json::from_value(raw.clone()).expect("deserialize");
+    assert_eq!(decoded.as_value(), raw);
+}
+
+#[test]
+fn mcp_protocol_tool_result_round_trip_preserves_all_channels() {
+    let raw = json!({
+        "content": [
+            {"type": "text", "text": "ok", "annotations": {"audience": ["assistant"]}},
+            {"type": "audio", "data": "AA==", "mimeType": "audio/wav"},
+            {"type": "resource_link", "uri": "file:///safe", "name": "safe"},
+            {"type": "resource", "resource": {"uri": "file:///x", "text": "x"}}
+        ],
+        "structuredContent": [1, {"ok": true}],
+        "isError": false,
+        "_meta": {"vendor.example/result": 1}
+    });
+    let result = McpToolResultDocument::try_from(raw.clone()).expect("result");
+    assert_eq!(result.clone().into_value(), raw);
+    assert_eq!(serde_json::to_value(&result).expect("serialize"), raw);
+    let decoded: McpToolResultDocument = serde_json::from_value(raw.clone()).expect("deserialize");
+    assert_eq!(decoded.into_value(), raw);
+}
+
+#[test]
+fn mcp_protocol_schema_accepts_2020_12_and_local_refs() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "$defs": {"label": {"type": "string", "minLength": 1}},
+        "properties": {"labels": {"type": "array", "prefixItems": [{"$ref": "#/$defs/label"}]}},
+        "unevaluatedProperties": false
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default())
+        .expect("valid 2020-12 contract");
+    assert!(compiled.input.is_valid(&json!({"labels": ["safe"]})));
+}
+
+#[test]
+fn mcp_protocol_schema_accepts_only_the_supported_dialects() {
+    for dialect in [
+        "http://json-schema.org/draft-04/schema#",
+        "http://json-schema.org/draft-06/schema#",
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2019-09/schema",
+        "https://json-schema.org/draft/2020-12/schema",
+    ] {
+        let contract = contract_with_schema(json!({
+            "$schema": dialect,
+            "type": "object",
+            "properties": {"region": {"type": "string"}}
+        }));
+        compile_modern_tool_contract(&contract, McpSchemaLimits::default())
+            .unwrap_or_else(|error| panic!("{dialect} should compile: {error}"));
+    }
+
+    for dialect in [
+        json!("https://json-schema.org/draft/2020-12/schema#"),
+        json!(false),
+    ] {
+        let contract = contract_with_schema(json!({
+            "$schema": dialect,
+            "type": "object"
+        }));
+        assert!(matches!(
+            compile_modern_tool_contract(&contract, McpSchemaLimits::default()),
+            Err(McpContractError::UnsupportedSchemaDialect(_))
+        ));
+    }
+}
+
+#[test]
+fn mcp_protocol_schema_rejects_external_refs_and_complexity() {
+    let external = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"x": {"$ref": "https://attacker.test/schema.json"}}
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&external, McpSchemaLimits::default()),
+        Err(McpContractError::ExternalReference { .. })
+    ));
+
+    let deep = contract_with_schema((0..34).fold(
+        json!({"type": "string"}),
+        |inner, _| json!({"type": "object", "properties": {"x": inner}}),
+    ));
+    assert!(matches!(
+        compile_modern_tool_contract(&deep, McpSchemaLimits::default()),
+        Err(McpContractError::LimitExceeded { limit: "depth", .. })
+    ));
+}
+
+#[test]
+fn mcp_protocol_header_projection_enforces_nested_primitive_values() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {
+            "routing": {
+                "type": "object",
+                "properties": {
+                    "region": {"type": "string", "x-mcp-header": "Region"},
+                    "retries": {"type": "integer", "x-mcp-header": "Retries"},
+                    "dry_run": {"type": "boolean", "x-mcp-header": "Dry-Run"}
+                }
+            }
+        }
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let args = json!({"routing": {"region": "東京", "retries": 2, "dry_run": true}});
+    let headers = build_mirrored_headers(&compiled.header_projections, &args).unwrap();
+    validate_mirrored_headers(&headers, &compiled.header_projections, &args).unwrap();
+    assert!(headers["mcp-param-region"]
+        .to_str()
+        .unwrap()
+        .starts_with("=?base64?"));
+}
+
+#[test]
+fn mcp_protocol_schema_rejects_unreachable_or_invalid_header_projections() {
+    let unreachable = [
+        json!({
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": {"type": "string", "x-mcp-header": "Item"}}}
+        }),
+        json!({
+            "type": "object",
+            "oneOf": [{"properties": {"region": {"type": "string", "x-mcp-header": "Region"}}}]
+        }),
+        json!({
+            "type": "object",
+            "$defs": {"route": {"type": "object", "properties": {"region": {"type": "string", "x-mcp-header": "Region"}}}},
+            "properties": {"routing": {"$ref": "#/$defs/route"}}
+        }),
+    ];
+    for schema in unreachable {
+        let contract = contract_with_schema(schema);
+        let result = compile_modern_tool_contract(&contract, McpSchemaLimits::default());
+        assert!(
+            matches!(
+                &result,
+                Err(McpContractError::UnreachableHeaderProjection(_))
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    let duplicate = contract_with_schema(json!({
+        "type": "object",
+        "properties": {
+            "a": {"type": "string", "x-mcp-header": "Region"},
+            "b": {"type": "string", "x-mcp-header": "region"}
+        }
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&duplicate, McpSchemaLimits::default()),
+        Err(McpContractError::DuplicateHeaderProjection(_))
+    ));
+
+    let number = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"ratio": {"type": "number", "x-mcp-header": "Ratio"}}
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&number, McpSchemaLimits::default()),
+        Err(McpContractError::UnsupportedHeaderValueKind { .. })
+    ));
+
+    let token = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"region": {"type": "string", "x-mcp-header": "bad header"}}
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&token, McpSchemaLimits::default()),
+        Err(McpContractError::InvalidHeaderName(_))
+    ));
+}
+
+#[test]
+fn mcp_protocol_schema_rejects_header_projection_count_over_limit() {
+    let properties = (0..65)
+        .map(|index| {
+            (
+                format!("field_{index}"),
+                json!({"type": "string", "x-mcp-header": format!("Field-{index}")}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": properties,
+    }));
+    assert!(matches!(
+        compile_modern_tool_contract(&contract, McpSchemaLimits::default()),
+        Err(McpContractError::LimitExceeded {
+            limit: "header_projections",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn mcp_protocol_header_projection_rejects_missing_mismatched_and_null_values() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"region": {"type": "string", "x-mcp-header": "Region"}}
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let args = json!({"region": "east"});
+    assert!(matches!(
+        validate_mirrored_headers(&HeaderMap::new(), &compiled.header_projections, &args),
+        Err(McpContractError::MissingMirroredHeader(_))
+    ));
+
+    let mut mismatch = build_mirrored_headers(&compiled.header_projections, &args).unwrap();
+    mismatch.insert("mcp-param-region", "west".parse().unwrap());
+    assert!(matches!(
+        validate_mirrored_headers(&mismatch, &compiled.header_projections, &args),
+        Err(McpContractError::MirroredHeaderMismatch(_))
+    ));
+
+    let mut unexpected = HeaderMap::new();
+    unexpected.insert("mcp-param-region", "east".parse().unwrap());
+    assert!(matches!(
+        validate_mirrored_headers(
+            &unexpected,
+            &compiled.header_projections,
+            &json!({"region": null})
+        ),
+        Err(McpContractError::UnexpectedMirroredHeader(_))
+    ));
+}
+
+#[test]
+fn mcp_protocol_header_projection_rejects_unsafe_integer_values() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"retries": {"type": "integer", "x-mcp-header": "Retries"}}
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let args = json!({"retries": 9_007_199_254_740_992u64});
+
+    assert!(matches!(
+        build_mirrored_headers(&compiled.header_projections, &args),
+        Err(McpContractError::UnsafeProjectedInteger(_))
+    ));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("mcp-param-retries", "9007199254740992".parse().unwrap());
+    assert!(matches!(
+        validate_mirrored_headers(&headers, &compiled.header_projections, &args),
+        Err(McpContractError::UnsafeProjectedInteger(_))
+    ));
+}
+
+#[test]
+fn mcp_protocol_header_projection_compares_integral_numbers_numerically() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"retries": {"type": "integer", "x-mcp-header": "Retries"}}
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let args = json!({"retries": 2.0});
+    let headers = build_mirrored_headers(&compiled.header_projections, &args).unwrap();
+
+    assert_eq!(headers["mcp-param-retries"], "2");
+    validate_mirrored_headers(&headers, &compiled.header_projections, &args).unwrap();
 }
 
 #[test]

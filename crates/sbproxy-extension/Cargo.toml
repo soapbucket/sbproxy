@@ -109,6 +109,7 @@ arc-swap.workspace = true
 # Logging
 tracing.workspace = true
 jsonschema.workspace = true
+jsonschema-modern.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

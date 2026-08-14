@@ -1,9 +1,15 @@
 //! Protocol-neutral MCP wire codec interfaces.
 
+pub mod contracts;
 pub mod headers;
 pub mod legacy;
 pub mod modern;
 
+pub use contracts::{
+    build_mirrored_headers, compile_modern_tool_contract, validate_mirrored_headers,
+    CompiledMcpToolContract, McpContractError, McpHeaderProjection, McpHeaderValueKind,
+    McpSchemaDialect, McpSchemaLimits, McpToolContract, McpToolResultDocument,
+};
 pub use headers::{decode_header_value, encode_header_value, HeaderValueError};
 pub use legacy::Legacy2025_06_18Codec;
 pub use modern::{
