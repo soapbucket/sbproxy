@@ -1,8 +1,12 @@
 //! Protocol-neutral MCP wire codec interfaces.
 
+pub mod headers;
 pub mod legacy;
+pub mod modern;
 
+pub use headers::{decode_header_value, encode_header_value, HeaderValueError};
 pub use legacy::Legacy2025_06_18Codec;
+pub use modern::Modern2026_07_28Codec;
 
 /// MCP wire-protocol era.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -143,4 +147,89 @@ pub trait McpProtocolCodec: Send + Sync {
         message: &str,
         data: Option<serde_json::Value>,
     ) -> McpWireResponse;
+}
+
+/// Select an MCP protocol era from corroborating HTTP and JSON-RPC carriers.
+pub fn classify_http_era(
+    request: &crate::mcp::types::JsonRpcRequest,
+    headers: &http::HeaderMap,
+) -> McpProtocolEra {
+    let body_version = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get(crate::mcp::types::META_PROTOCOL_VERSION))
+        .and_then(serde_json::Value::as_str);
+    let header_version = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok());
+
+    if body_version.is_some() || header_version == Some(crate::mcp::types::MODERN_PROTOCOL_VERSION)
+    {
+        McpProtocolEra::Modern2026_07_28
+    } else {
+        McpProtocolEra::Legacy2025_06_18
+    }
+}
+
+/// Decode an MCP HTTP body through exactly one protocol-era codec.
+pub fn decode_http_request(
+    body: &[u8],
+    headers: &http::HeaderMap,
+) -> Result<DecodedMcpRequest, McpWireError> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
+        McpWireError::json(
+            http::StatusCode::BAD_REQUEST,
+            None,
+            crate::mcp::types::INVALID_REQUEST,
+            "MCP request must be a JSON object",
+            None,
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        McpWireError::json(
+            http::StatusCode::BAD_REQUEST,
+            None,
+            crate::mcp::types::INVALID_REQUEST,
+            "MCP request must be a JSON object",
+            None,
+        )
+    })?;
+    let id = object.get("id").cloned();
+    if id
+        .as_ref()
+        .is_some_and(|value| !value.is_string() && !value.is_number())
+    {
+        return Err(McpWireError::json(
+            http::StatusCode::BAD_REQUEST,
+            None,
+            crate::mcp::types::INVALID_REQUEST,
+            "JSON-RPC request id must be a string or number",
+            None,
+        ));
+    }
+    let request: crate::mcp::types::JsonRpcRequest =
+        serde_json::from_value(value).map_err(|_| {
+            McpWireError::json(
+                http::StatusCode::BAD_REQUEST,
+                id,
+                crate::mcp::types::INVALID_REQUEST,
+                "invalid JSON-RPC request",
+                None,
+            )
+        })?;
+    if request.jsonrpc != "2.0" {
+        return Err(McpWireError::json(
+            http::StatusCode::BAD_REQUEST,
+            request.id,
+            crate::mcp::types::INVALID_REQUEST,
+            "JSON-RPC version must be 2.0",
+            None,
+        ));
+    }
+
+    match classify_http_era(&request, headers) {
+        McpProtocolEra::Legacy2025_06_18 => Legacy2025_06_18Codec.decode_http(request, headers),
+        McpProtocolEra::Modern2026_07_28 => Modern2026_07_28Codec.decode_http(request, headers),
+    }
 }

@@ -22,6 +22,22 @@ pub const LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Modern MCP protocol revision used by the dual-era protocol layer.
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// `_meta` key carrying the modern MCP protocol version.
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+/// `_meta` key carrying modern MCP client capabilities.
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+/// `_meta` key carrying modern MCP client implementation information.
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+/// `_meta` key carrying modern MCP server implementation information.
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// JSON-RPC error code for inconsistent protected HTTP carriers.
+pub const HEADER_MISMATCH: i32 = -32020;
+/// JSON-RPC error code reserved for a required client capability.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32021;
+/// JSON-RPC error code for unsupported MCP protocol versions.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+
 /// MCP protocol revisions this gateway can serve, newest first. One
 /// entry today: `2025-03-26` is deliberately absent because that
 /// revision requires servers to accept JSON-RPC batches, which the
