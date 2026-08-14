@@ -615,8 +615,8 @@ impl BundleManifest {
                 // at config load. Guardrail and tool-call hooks have
                 // end-to-end write-back and accept the declaration.
                 return invalid(format!(
-                    "mutates is not supported for {} hooks; ai.guardrail_input, \
-                     ai.guardrail_output, and ai.tool_call hooks may mutate",
+                    "mutates is not supported for {} hooks; ai_guardrail_input, \
+                     ai_guardrail_output, and ai_tool_call hooks may mutate",
                     hook_kind_label(hook.kind)
                 ));
             }

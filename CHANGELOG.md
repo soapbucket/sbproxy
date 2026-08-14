@@ -10,6 +10,18 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Added
+
+- **`ai_tool_call` hooks can rewrite tool calls.** A bundle hook
+  declaring `execution.mutates: true` on `ai_tool_call` may return a
+  `mutate` decision whose rewritten call replaces the held argument
+  fragments on the wire as one canonical frame. Rewrites that change
+  the call's index, produce non-JSON arguments, or edit a call whose
+  arguments were truncated at the stream buffer cap refuse instead of
+  shipping approximately. `mutates` combined with
+  `enforcement_mode: observe` now refuses at config load, since an
+  observe hook's decisions are discarded.
+
 ### Changed, and worth checking before you upgrade
 
 - **A broken `ai_policy.expression` now refuses the config instead of
