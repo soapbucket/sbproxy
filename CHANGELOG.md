@@ -12,6 +12,20 @@ the next version cut.
 
 ### Changed, and worth checking before you upgrade
 
+- **A broken `ai_policy.expression` now refuses the config instead of
+  disabling itself.** A syntax error, or a reference to a binding
+  outside the `ai` namespace, previously logged one error and booted
+  the proxy with the policy silently absent; it now fails boot and
+  reload with a message naming the expression, like every other CEL
+  surface. If your config stops loading on upgrade, the expression was
+  never running; fix the typo and the policy starts enforcing.
+- **The response cache now stores the transform chain's output.** On an
+  origin combining `response_cache` with `transforms`, entries hold the
+  transformed body, hits serve what misses ship, a closed transform
+  refusal blocks admission, and a request-dependent transform on a
+  cached origin refuses at config load. All existing response-cache
+  entries are retired on upgrade (one cold start per key), so an
+  upgraded node can never replay a pre-transform body as a hit.
 - **A configured origin now owns `/health` on the data plane.** Until
   now the proxy answered `GET /health` itself with a fixed
   `{"status":"ok"}` before any origin routing ran. It now proxies the

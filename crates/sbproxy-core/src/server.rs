@@ -4048,6 +4048,11 @@ async fn check_policies(
                     target: "sbproxy::policy",
                     error = %err,
                     policy = %policy_id,
+                    bundle = compiled
+                        .dynamic_hook
+                        .as_ref()
+                        .map(|metadata| metadata.bundle_id())
+                        .unwrap_or("built_in"),
                     failure_posture = posture.map(|p| p.as_label()).unwrap_or("none"),
                     "policy enforce() returned error"
                 );

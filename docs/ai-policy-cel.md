@@ -1,6 +1,6 @@
 # AI policy plane (CEL)
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-14*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -62,9 +62,10 @@ before.
 | `audit:<priority>` | Emit a structured audit event at the given priority. |
 
 The action set is closed: an unrecognized token at evaluation time falls
-back to `on_error`. The expression itself is compiled (syntax-checked) when
-the policy is first built; a syntax error is logged and the policy is
-disabled (fail-open).
+back to `on_error`. The expression itself is compiled at config load, like
+every other CEL surface: a syntax error, or a reference to a binding
+outside the `ai` namespace, refuses the config at boot and reload rather
+than booting a proxy whose policy is silently absent.
 
 Compression selectors use lowercase ASCII profile names of up to 64 bytes,
 with `_` and `-` allowed after the first letter or digit. A malformed

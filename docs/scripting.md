@@ -262,7 +262,7 @@ That one is not expressible without it. Entries in a `rules:` list OR, and match
 
 A predicate that fails to evaluate does not match, and the rule is skipped. Routing past a gate an operator wrote would be the worse failure.
 
-One related surface is not in the table. `ai_policy.expression` evaluates over a single `ai` namespace and is documented in [ai-policy-cel.md](ai-policy-cel.md); it does not share this context and is not checked against it.
+One related surface is not in the table. `ai_policy.expression` evaluates over a single `ai` namespace and is documented in [ai-policy-cel.md](ai-policy-cel.md); it does not share this context, and its expressions are checked at config load against that one-namespace vocabulary rather than this table.
 
 A binding marked `no` is refused when the config loads, whether you write it as `request.trust_tier` or as `request["trust_tier"]`. The message names the site and lists what that site does provide, so the fix is usually visible without opening this page:
 
