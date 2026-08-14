@@ -428,6 +428,14 @@ const EXEMPT: &[Exemption] = &[
                  subcommands all run in a one-shot process with no request and no tracer \
                  installed. WOR-2318.",
     },
+    Exemption {
+        file: "crates/sbproxy-extension/src/bundle/outbound.rs",
+        reason: "A bundle hook's granted `net:outbound` call, built from a guest-supplied \
+                 request on a blocking pool thread detached from the request's ambient \
+                 span. Whether a guest-initiated fetch should carry the end user's trace \
+                 into a third-party destination is a deliberate propagation question, not \
+                 a plumbing oversight. WOR-2318.",
+    },
 ];
 
 /// One production file that owns or drives an outbound HTTP client.
