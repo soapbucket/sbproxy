@@ -21,6 +21,20 @@ use sbproxy_security::egress::{
     PurposeAllowlist,
 };
 
+/// Count and log one refusal on the shared egress family, then return
+/// the guest-facing reason string. Free-standing so a refusal can be
+/// recorded from inside the deadline-bounded async block, which owns
+/// only the bundle name rather than a `&self`.
+fn refuse_for(bundle: &str, denied: EgressDenied) -> String {
+    sbproxy_security::egress::record_egress_refused(
+        EgressPurpose::BundleHook,
+        denied,
+        "__bundle__",
+        bundle,
+    );
+    format!("egress_denied:{denied:?}")
+}
+
 /// Multi-worker runtime driving bundle fetches. The JS worker threads
 /// have no tokio reactor of their own (they are plain OS threads
 /// blocking on a channel), so the synchronous host function drives the
@@ -156,13 +170,7 @@ impl BundleOutbound {
     }
 
     fn refuse(&self, denied: EgressDenied) -> String {
-        sbproxy_security::egress::record_egress_refused(
-            EgressPurpose::BundleHook,
-            denied,
-            "__bundle__",
-            &self.bundle,
-        );
-        format!("egress_denied:{denied:?}")
+        refuse_for(&self.bundle, denied)
     }
 
     /// Serve one guest fetch. Never panics and never returns guest
@@ -208,27 +216,12 @@ impl BundleOutbound {
         // product of the component sets the authorizer matches against.
         self.admit_destination(&parsed)?;
 
-        let destination = self
-            .authorizer
-            .authorize(EgressPurpose::BundleHook, url, &self.resolver)
-            .map_err(|denied| self.refuse(denied))?;
-        let addrs = self
-            .authorizer
-            .verify_dial_addrs(&destination, &self.resolver)
-            .map_err(|denied| self.refuse(denied))?;
-        let host = destination
-            .url
-            .host_str()
-            .ok_or_else(|| "egress_denied:MissingHost".to_owned())?
-            .to_owned();
-
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| "budget_exhausted".to_owned())?;
         let runtime = fetch_runtime().ok_or_else(|| "fetch_runtime_unavailable".to_owned())?;
 
         let max_bytes = self.max_response_bytes;
-        let url = destination.url.clone();
         let headers: Vec<(String, String)> = request
             .get("headers")
             .and_then(serde_json::Value::as_array)
@@ -246,13 +239,47 @@ impl BundleOutbound {
             })
             .unwrap_or_default();
 
+        // Authorization resolves DNS through a blocking syscall
+        // (`getaddrinfo`), which has no timeout of its own and would
+        // otherwise pin the worker past the budget if the granted
+        // host's DNS hangs. Run it, and the whole fetch, under one
+        // deadline: the authorize/verify pair goes on a blocking pool
+        // thread bounded by `timeout_at`, so a hung resolver fails the
+        // call at the deadline rather than holding the JS worker
+        // indefinitely. The authorizer and resolver are cheap to clone
+        // into the task (a small config map and a unit handle over a
+        // process-wide cache).
+        let authorizer = self.authorizer.clone();
+        let resolver = self.resolver;
+        let url = url.to_owned();
+        let bundle = self.bundle.clone();
         runtime.block_on(async move {
+            let overall = tokio::time::Instant::now() + remaining;
+            let (destination, addrs) = tokio::time::timeout_at(
+                overall,
+                tokio::task::spawn_blocking(move || {
+                    let destination =
+                        authorizer.authorize(EgressPurpose::BundleHook, &url, &resolver)?;
+                    let addrs = authorizer.verify_dial_addrs(&destination, &resolver)?;
+                    Ok::<_, EgressDenied>((destination, addrs))
+                }),
+            )
+            .await
+            .map_err(|_| "budget_exhausted".to_owned())?
+            .map_err(|_| "request_failed".to_owned())?
+            .map_err(|denied| refuse_for(&bundle, denied))?;
+            let host = destination
+                .url
+                .host_str()
+                .ok_or_else(|| refuse_for(&bundle, EgressDenied::MissingHost))?
+                .to_owned();
+            let url = destination.url.clone();
             // One deadline bounds the whole call, connect through the
             // last byte, so a slow-trickle upstream cannot hold the
             // worker past the hook's budget by resetting a per-chunk
             // timer. `timeout_at` on a single instant is that bound; the
             // client-level timeouts are the fast-path backstop.
-            let overall = tokio::time::Instant::now() + remaining;
+            //
             // The pinned addresses are the whole point: the client
             // resolves the checked host to the verified set and never
             // performs its own lookup, so a rebinding DNS answer
@@ -277,13 +304,20 @@ impl BundleOutbound {
                 .map_err(|_| "budget_exhausted".to_owned())?
                 .map_err(|_| "request_failed".to_owned())?;
             let status = response.status().as_u16();
-            let reply_headers: Vec<(String, String)> = response
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| {
-                    Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
-                })
-                .collect();
+            // Reply headers count against the same buffer cap as the
+            // body, so a granted-but-hostile upstream cannot hand the
+            // guest an unbounded header set the body cap would miss.
+            let mut header_budget = max_bytes;
+            let mut reply_headers: Vec<(String, String)> = Vec::new();
+            for (name, value) in response.headers() {
+                let Ok(value) = value.to_str() else { continue };
+                let cost = name.as_str().len().saturating_add(value.len());
+                header_budget = match header_budget.checked_sub(cost) {
+                    Some(remaining) => remaining,
+                    None => return Err("response_over_buffer_cap".to_owned()),
+                };
+                reply_headers.push((name.as_str().to_owned(), value.to_owned()));
+            }
             let mut collected: Vec<u8> = Vec::new();
             let mut stream = response;
             loop {
