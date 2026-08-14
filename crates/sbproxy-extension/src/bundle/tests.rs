@@ -1216,8 +1216,12 @@ fn bundle_v1_digest_is_stable_across_two_computations() {
 // --- net:outbound (WOR-2424) ---
 
 fn outbound_manifest(name: &str, destination: &str) -> String {
+    // A generous budget: an outbound hook does real network work, so
+    // the default 50 ms is not the right ceiling for one, and the docs
+    // tell authors to raise it. 900 ms stays under the 1000 ms cap and
+    // keeps the wired listener test off the timeout edge under load.
     format!(
-        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: policy\n    type: outbound_probe\n    export: run\n    permissions:\n      - \"net:outbound={destination}\"\n"
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nsandbox:\n  budget_ms: 900\nhooks:\n  - kind: policy\n    type: outbound_probe\n    export: run\n    permissions:\n      - \"net:outbound={destination}\"\n"
     )
 }
 
@@ -1266,6 +1270,37 @@ fn a_granted_destination_loads_and_an_extra_grant_is_harmless() {
     );
     DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new())
         .expect("a fully granted declaration must load");
+}
+
+#[test]
+fn a_cross_product_of_two_grants_is_refused() {
+    // A hook granted host A on port P and host B on port Q must not be
+    // able to reach host A on port Q: the grant is per exact tuple, not
+    // the cross product of the component sets.
+    let destinations = vec![
+        sbproxy_config::parse_permission_entry("net:outbound=http://10.0.0.5:9090").unwrap(),
+        sbproxy_config::parse_permission_entry("net:outbound=https://public.example.test").unwrap(),
+    ];
+    let outbound = crate::bundle::outbound::BundleOutbound::new("prober", &destinations, 4096);
+    // The exact granted tuples pass the destination gate; the cross
+    // product (10.0.0.5 over 443, public host over 9090) does not.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let refused = outbound.fetch(
+        &serde_json::json!({"url": "https://10.0.0.5:443/"}).to_string(),
+        deadline,
+    );
+    assert!(
+        refused.contains("egress_denied"),
+        "the cross-product tuple must refuse: {refused}"
+    );
+    let refused_other = outbound.fetch(
+        &serde_json::json!({"url": "http://public.example.test:9090/"}).to_string(),
+        deadline,
+    );
+    assert!(
+        refused_other.contains("egress_denied"),
+        "the other cross-product tuple must refuse: {refused_other}"
+    );
 }
 
 #[test]

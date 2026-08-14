@@ -17,14 +17,20 @@ use std::time::Instant;
 use base64::Engine as _;
 use sbproxy_config::OutboundDestination;
 use sbproxy_security::egress::{
-    CachedSystemResolver, EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist,
+    CachedSystemResolver, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
+    PurposeAllowlist,
 };
 
-/// One-thread runtime driving bundle fetches. The JS worker threads
+/// Multi-worker runtime driving bundle fetches. The JS worker threads
 /// have no tokio reactor of their own (they are plain OS threads
 /// blocking on a channel), so the synchronous host function drives the
-/// async client here. Process-lifetime, like the key plane's runtime,
-/// so a fetch never pays runtime construction.
+/// async client here. It is multi-threaded on purpose: a
+/// current-thread runtime polls one future at a time, so concurrent
+/// `block_on` calls from separate JS workers would serialize, turning
+/// N parallel fetches into a sum rather than a max. Two worker threads
+/// let the (at most four) JS workers' fetches make progress at once
+/// without spawning a thread per hook. Process-lifetime, so a fetch
+/// never pays runtime construction.
 ///
 /// `None` when the runtime could not be built, which fails the fetch
 /// closed (a refused call) rather than ending the process: a bundle
@@ -35,7 +41,8 @@ fn fetch_runtime() -> Option<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
     RUNTIME
         .get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .thread_name("sbproxy-bundle-fetch")
                 .build()
@@ -45,10 +52,19 @@ fn fetch_runtime() -> Option<&'static tokio::runtime::Runtime> {
 }
 
 /// Compiled outbound capability for one hook: its granted destinations
-/// as a purpose allowlist, plus the shared resolver.
+/// and the shared resolver.
 pub(super) struct BundleOutbound {
     authorizer: EgressAuthorizer,
     resolver: CachedSystemResolver,
+    /// The exact granted `(scheme, host, port)` tuples. The egress
+    /// authorizer matches a request against three independent sets, so
+    /// on its own a hook granted two destinations would authorize
+    /// their cross product (host A's IP over host B's port). This set
+    /// is the precise gate: a request is refused unless its canonical
+    /// tuple is a member, checked before the authorizer runs.
+    granted: HashSet<OutboundDestination>,
+    /// Bundle name, for the egress-refused metric's origin label.
+    bundle: String,
     /// Response body cap, from the manifest sandbox's buffer limit.
     max_response_bytes: usize,
 }
@@ -57,6 +73,8 @@ impl std::fmt::Debug for BundleOutbound {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BundleOutbound")
+            .field("bundle", &self.bundle)
+            .field("granted", &self.granted.len())
             .field("max_response_bytes", &self.max_response_bytes)
             .finish()
     }
@@ -67,13 +85,15 @@ impl BundleOutbound {
     /// already proven every declared destination is operator-granted,
     /// so this set is both the declared and the effective one.
     pub(super) fn new(
+        bundle: &str,
         destinations: &[OutboundDestination],
         max_response_bytes: usize,
     ) -> Arc<Self> {
+        let granted: HashSet<OutboundDestination> = destinations.iter().cloned().collect();
         let mut hosts = HashSet::new();
         let mut schemes = HashSet::new();
         let mut ports = HashSet::new();
-        for destination in destinations {
+        for destination in &granted {
             hosts.insert(destination.host.clone());
             schemes.insert(destination.scheme.clone());
             ports.insert(destination.port);
@@ -84,7 +104,10 @@ impl BundleOutbound {
         // involves no lookup an attacker can influence, and the
         // operator typed the address; refusing it would only forbid
         // the legitimate internal-service case. Mixed grants keep the
-        // strict posture, because one allowlist carries one flag.
+        // strict posture, because one allowlist carries one flag. The
+        // exact-tuple gate above already refuses a cross-product
+        // request, so this flag only relaxes the private-IP check for
+        // the literal destinations the operator actually named.
         let every_host_is_literal = hosts
             .iter()
             .all(|host| host == "localhost" || host.parse::<std::net::IpAddr>().is_ok());
@@ -101,8 +124,45 @@ impl BundleOutbound {
         Arc::new(Self {
             authorizer: EgressAuthorizer::new(config),
             resolver: CachedSystemResolver,
+            granted,
+            bundle: bundle.to_owned(),
             max_response_bytes,
         })
+    }
+
+    /// Refuse a request whose canonical destination is not one the
+    /// operator granted, before the authorizer's independent-set match
+    /// could admit a cross-product tuple. Counts and logs the refusal
+    /// on the shared egress family so an operator sees a bundle probing
+    /// outside its grant.
+    fn admit_destination(&self, url: &url::Url) -> Result<(), String> {
+        let scheme = url.scheme();
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return Err(self.refuse(EgressDenied::MissingHost));
+        };
+        let requested = OutboundDestination {
+            scheme: scheme.to_owned(),
+            host: host.to_ascii_lowercase(),
+            port,
+        };
+        if self.granted.contains(&requested) {
+            return Ok(());
+        }
+        // Not one of the exact tuples the operator granted. UnlistedHost
+        // is the closest closed-set reason (the request named a
+        // destination the allowlist does not carry); it keeps the metric
+        // vocabulary bounded rather than inventing a bundle-only label.
+        Err(self.refuse(EgressDenied::UnlistedHost))
+    }
+
+    fn refuse(&self, denied: EgressDenied) -> String {
+        sbproxy_security::egress::record_egress_refused(
+            EgressPurpose::BundleHook,
+            denied,
+            "__bundle__",
+            &self.bundle,
+        );
+        format!("egress_denied:{denied:?}")
     }
 
     /// Serve one guest fetch. Never panics and never returns guest
@@ -143,14 +203,19 @@ impl BundleOutbound {
             None => None,
         };
 
+        let parsed = url::Url::parse(url).map_err(|_| self.refuse(EgressDenied::InvalidUrl))?;
+        // The precise gate: exactly one granted tuple, not the cross
+        // product of the component sets the authorizer matches against.
+        self.admit_destination(&parsed)?;
+
         let destination = self
             .authorizer
             .authorize(EgressPurpose::BundleHook, url, &self.resolver)
-            .map_err(|denied| format!("egress_denied:{denied:?}"))?;
+            .map_err(|denied| self.refuse(denied))?;
         let addrs = self
             .authorizer
             .verify_dial_addrs(&destination, &self.resolver)
-            .map_err(|denied| format!("egress_denied:{denied:?}"))?;
+            .map_err(|denied| self.refuse(denied))?;
         let host = destination
             .url
             .host_str()

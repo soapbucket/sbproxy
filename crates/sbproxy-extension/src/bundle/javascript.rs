@@ -608,8 +608,13 @@ pub(super) fn prepare_program(
         .iter()
         .filter_map(|entry| sbproxy_config::parse_permission_entry(entry).ok())
         .collect();
-    let outbound = (!destinations.is_empty())
-        .then(|| super::outbound::BundleOutbound::new(&destinations, limits.max_input_bytes));
+    let outbound = (!destinations.is_empty()).then(|| {
+        super::outbound::BundleOutbound::new(
+            &hook.manifest().name,
+            &destinations,
+            limits.max_input_bytes,
+        )
+    });
     Ok((
         type_name.clone(),
         JavascriptProgram {
