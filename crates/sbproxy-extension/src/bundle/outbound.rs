@@ -92,7 +92,7 @@ impl BundleOutbound {
         );
         Arc::new(Self {
             authorizer: EgressAuthorizer::new(config),
-            resolver: CachedSystemResolver::default(),
+            resolver: CachedSystemResolver,
             max_response_bytes,
         })
     }
