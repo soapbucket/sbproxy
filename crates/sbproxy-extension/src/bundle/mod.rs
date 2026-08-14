@@ -11,6 +11,7 @@ mod envelope_wasm;
 mod events;
 mod javascript;
 mod loader;
+mod outbound;
 mod payments;
 mod proxy_wasm;
 mod registry;

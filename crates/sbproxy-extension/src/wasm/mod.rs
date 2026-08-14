@@ -954,6 +954,16 @@ fn prepare_bundle_instance(
     // and `proc_exit` immediately raises I32Exit. None can wait on host I/O.
     // In particular, poll_oneoff and every filesystem or socket operation are
     // rejected before the module reaches an executor worker.
+    //
+    // This walk is also the manifest-vs-artifact capability check
+    // (WOR-2364 item 2, via WOR-2424): manifest validation refuses any
+    // capability declaration on a wasm-runtime bundle (the envelope ABI
+    // carries no host imports), so for every loadable wasm bundle the
+    // complete legal import set is exactly this list, and a module
+    // importing anything else is refused here regardless of what its
+    // manifest claims. When a wasm-grantable capability ships (an ABI
+    // v2 host function), this check takes the declared set as input
+    // rather than a constant.
     const NONBLOCKING_WASI_IMPORTS: &[&str] = &["fd_read", "fd_write", "proc_exit"];
     if module.imports().any(|import| {
         import.module() != "wasi_snapshot_preview1"

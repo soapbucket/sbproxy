@@ -75,6 +75,10 @@ pub(super) struct JavascriptProgram {
     masked_names: Arc<Vec<String>>,
     limits: RuntimeLimits,
     executor: Arc<JavascriptExecutor>,
+    /// Host-mediated outbound HTTP, present only when this hook
+    /// declared `net:outbound` destinations (all operator-granted by
+    /// the time a program exists; load refused anything else).
+    outbound: Option<Arc<super::outbound::BundleOutbound>>,
 }
 
 impl std::fmt::Debug for JavascriptProgram {
@@ -297,6 +301,10 @@ impl WorkerRuntime {
                         &program.export,
                         input,
                         program.limits.max_output_bytes,
+                        program
+                            .outbound
+                            .as_ref()
+                            .map(|outbound| (Arc::clone(outbound), deadline)),
                     )
                 })
             })
@@ -321,10 +329,26 @@ fn invoke_in_context(
     export: &str,
     input: &[u8],
     max_output_bytes: usize,
+    outbound: Option<(Arc<super::outbound::BundleOutbound>, Instant)>,
 ) -> Result<Vec<u8>, InvokeFailure> {
     let globals = context.globals();
     globals.remove("eval")?;
     globals.remove("Function")?;
+    if let Some((outbound, deadline)) = outbound {
+        // Synchronous by design: the worker thread blocks in the host
+        // for the duration of the call, bounded by the invocation's
+        // remaining budget. The QuickJS interrupt watchdog cannot
+        // preempt a host function, so the fetch's own deadline-derived
+        // timeouts are the enforcement while control is out of the
+        // interpreter. The reply is always a JSON envelope string;
+        // refusals arrive as `{"error": "..."}` rather than
+        // exceptions, so a guest cannot distinguish refusal shapes
+        // beyond the bounded reason label.
+        let host_fetch = rquickjs::function::Func::from(move |request: String| -> String {
+            outbound.fetch(&request, deadline)
+        });
+        globals.set("sbproxy_fetch", host_fetch)?;
+    }
 
     let module = Module::declare(context.clone(), "sbproxy-bundle.js", source.as_bytes())?;
     let (module, ready) = module.eval()?;
@@ -578,6 +602,14 @@ pub(super) fn prepare_program(
         .chain(&hook.hook().masked_vars)
         .cloned()
         .collect();
+    let destinations: Vec<sbproxy_config::OutboundDestination> = hook
+        .hook()
+        .permissions
+        .iter()
+        .filter_map(|entry| sbproxy_config::parse_permission_entry(entry).ok())
+        .collect();
+    let outbound = (!destinations.is_empty())
+        .then(|| super::outbound::BundleOutbound::new(&destinations, limits.max_input_bytes));
     Ok((
         type_name.clone(),
         JavascriptProgram {
@@ -589,6 +621,7 @@ pub(super) fn prepare_program(
             masked_names: Arc::new(masked_names),
             limits,
             executor: Arc::clone(&JAVASCRIPT_EXECUTOR),
+            outbound,
         },
     ))
 }

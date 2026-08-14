@@ -100,6 +100,8 @@ pub enum EgressPurpose {
     ModelArtifact,
     /// Engine artifact download.
     EngineArtifact,
+    /// Extension bundle hook outbound call (`net:outbound` grant).
+    BundleHook,
 }
 
 impl EgressPurpose {
@@ -115,6 +117,7 @@ impl EgressPurpose {
             Self::UsageSink => "usage_sink",
             Self::ModelArtifact => "model_artifact",
             Self::EngineArtifact => "engine_artifact",
+            Self::BundleHook => "bundle_hook",
         }
     }
 }
