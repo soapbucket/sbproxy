@@ -2339,15 +2339,12 @@ pub(super) async fn handle_mcp_action(
             uri_authority.as_deref(),
             &request_headers,
         ) {
-            let status = match rejection {
-                sbproxy_modules::action::mcp::McpModernHttpRejection::Origin => {
-                    http::StatusCode::FORBIDDEN
-                }
-                sbproxy_modules::action::mcp::McpModernHttpRejection::MissingTrustAnchor
-                | sbproxy_modules::action::mcp::McpModernHttpRejection::Authority => {
-                    http::StatusCode::MISDIRECTED_REQUEST
-                }
-            };
+            let status = mcp_modern_rejection_status(
+                rejection,
+                &mcp.server_name,
+                connection_scheme,
+                uri_authority.as_deref(),
+            );
             return write_mcp_wire_response(
                 session,
                 McpWireResponse {
@@ -2439,15 +2436,12 @@ pub(super) async fn handle_mcp_action(
             uri_authority.as_deref(),
             &request_headers,
         ) {
-            let status = match rejection {
-                sbproxy_modules::action::mcp::McpModernHttpRejection::Origin => {
-                    http::StatusCode::FORBIDDEN
-                }
-                sbproxy_modules::action::mcp::McpModernHttpRejection::MissingTrustAnchor
-                | sbproxy_modules::action::mcp::McpModernHttpRejection::Authority => {
-                    http::StatusCode::MISDIRECTED_REQUEST
-                }
-            };
+            let status = mcp_modern_rejection_status(
+                rejection,
+                &mcp.server_name,
+                connection_scheme,
+                uri_authority.as_deref(),
+            );
             return write_mcp_wire_response(
                 session,
                 McpWireResponse {
@@ -2545,17 +2539,11 @@ pub(super) async fn handle_mcp_action(
             DecodedRequestId::Modern(id) if id.is_absent()
         );
         if request_id_is_absent {
-            let recognized_request = matches!(
-                request.method.as_str(),
-                "server/discover"
-                    | "tools/list"
-                    | "tools/call"
-                    | "resources/list"
-                    | "resources/read"
-                    | "prompts/list"
-                    | "prompts/get"
-            );
-            let (code, message) = if recognized_request {
+            // Same predicate as `supported_method`: a method this era knows
+            // but that arrived without an id is a malformed request, not an
+            // unknown method. Keeping one list means the two answers cannot
+            // drift apart.
+            let (code, message) = if supported_method {
                 (INVALID_REQUEST, "modern MCP request methods require an id")
             } else {
                 (METHOD_NOT_FOUND, "unknown modern MCP method")
@@ -4560,6 +4548,38 @@ fn mcp_catalogue_name_for_snapshot(
 /// base tool. Modern PR1 deliberately exposes neither these per-server targets
 /// nor synthesized aliases because the rollout transforms do not yet carry an
 /// independently compiled caller-facing modern contract.
+/// Map a modern transport-trust rejection to its HTTP status, and record why.
+///
+/// The refusal body is deliberately empty so a disallowed Origin learns
+/// nothing about the endpoint, which leaves this log as the only place an
+/// operator can see why modern traffic is being refused. Everything recorded
+/// here is safe to log: the rejection class is a closed enum, the scheme is
+/// server-derived, and the authority is a parsed header value, which cannot
+/// carry control characters. No credential is in scope at this point.
+fn mcp_modern_rejection_status(
+    rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
+    server_name: &str,
+    connection_scheme: &str,
+    authority: Option<&str>,
+) -> http::StatusCode {
+    use sbproxy_modules::action::mcp::McpModernHttpRejection;
+    let status = match rejection {
+        McpModernHttpRejection::Origin => http::StatusCode::FORBIDDEN,
+        McpModernHttpRejection::MissingTrustAnchor | McpModernHttpRejection::Authority => {
+            http::StatusCode::MISDIRECTED_REQUEST
+        }
+    };
+    warn!(
+        mcp_server = %server_name,
+        rejection = ?rejection,
+        connection_scheme = %connection_scheme,
+        authority = authority.unwrap_or("<none>"),
+        status = status.as_u16(),
+        "refused MCP 2026-07-28 request at the transport trust boundary"
+    );
+    status
+}
+
 fn mcp_modern_rollout_hidden_names(
     mcp: &sbproxy_modules::action::McpAction,
     catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,

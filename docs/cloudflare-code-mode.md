@@ -1,5 +1,5 @@
 # Cloudflare Code Mode
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-15*
 
 SBproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code

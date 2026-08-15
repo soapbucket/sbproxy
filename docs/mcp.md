@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-15*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -136,6 +136,81 @@ the spec's assumed-version rule. `2025-03-26` is deliberately absent:
 that revision requires servers to accept JSON-RPC batches, which this
 gateway does not, so a batch body returns a specific invalid-request
 error rather than a silent mis-negotiation.
+
+## The 2026-07-28 era
+
+One endpoint serves both the established `2025-06-18` protocol and the
+stateless `2026-07-28` one. A request selects the newer era by showing
+positive evidence for it, and anything else is served exactly as it was
+before this split existed:
+
+- an `MCP-Protocol-Version: 2026-07-28` header, or
+- an `Mcp-Method`, `Mcp-Name`, or `Mcp-Param-*` routing header, or
+- an `io.modelcontextprotocol/*` marker in the request's `params._meta`.
+
+An older or unrecognized revision in `MCP-Protocol-Version` is not
+evidence of the newer era. It stays on the established path and gets the
+same `400` it always did, so a client can still negotiate down through
+`initialize`.
+
+A `2026-07-28` request is stateless. It never receives an
+`Mcp-Session-Id`, and it carries its own context on every call:
+`io.modelcontextprotocol/protocolVersion` and
+`io.modelcontextprotocol/clientCapabilities` in `params._meta`, plus
+`MCP-Protocol-Version` and `Mcp-Method` as headers. `tools/call`,
+`resources/read`, and `prompts/get` also send `Mcp-Name`. Header names
+compare case-insensitively and values case-sensitively. A header that
+disagrees with the body is refused rather than reconciled.
+
+Successful results carry `resultType: "complete"` and
+`io.modelcontextprotocol/serverInfo`. List and discovery results carry
+`ttlMs: 0` and `cacheScope: "private"`, and every `listChanged` is
+`false` because subscriptions are not implemented. Three error codes are
+specific to this era: `-32020` for a malformed or missing routing
+carrier, `-32021` for a rejected envelope, and `-32022` for an
+unsupported protocol version.
+
+The gateway deliberately does not advertise or serve subscriptions,
+Tasks, MCP Apps, MRTR generation, or arbitrary protocol extensions on
+this era. It answers `server/discover`, the tool, resource, and prompt
+method set, and nothing beyond that.
+
+### Trusting the endpoint's own origin
+
+The newer era validates the browser `Origin` and the request authority
+before it authenticates, reads a catalog, or contacts an upstream. That
+check needs to know the endpoint's real public origin, so declare it:
+
+```yaml
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      modern_http:
+        public_origin: "https://mcp.example.com"
+        allowed_origins:
+          - "https://console.example.com"
+      federated_servers:
+        - origin: https://tools.internal
+          prefix: tools
+```
+
+An origin with an exact hostname derives its own anchor, so
+`modern_http` is optional there. A wildcard hostname cannot, and without
+`public_origin` every `2026-07-28` request to it is refused with a
+`421`. That refusal is logged with the reason and the authority that was
+rejected; the response body is empty on purpose so a disallowed origin
+learns nothing about the endpoint.
+
+Behind a TLS-terminating load balancer, list the balancer in
+`proxy.trusted_proxies`. The gateway takes the external scheme from
+`X-Forwarded-Proto` only for peers in that list, and strips the header
+from everyone else.
+
+Misspelling a key inside `modern_http` fails config compilation rather
+than being ignored, because every key here turns on a protection and a
+typo would otherwise read as hardening that is not in effect.
 
 ## Minimal config
 

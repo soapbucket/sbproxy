@@ -830,9 +830,13 @@ fn integer_at_header_boundary(
         if !value.is_finite() || value.fract() != 0.0 {
             return Err(McpContractError::MirroredHeaderMismatch(header.to_string()));
         }
+        // 2^53 - 1 is exactly representable in f64, so this bound is exact
+        // rather than rounded, and the cast below cannot widen the range.
         if value.abs() > MAX_SAFE_INTEGER as f64 {
             return Err(McpContractError::UnsafeProjectedInteger(header.to_string()));
         }
+        // Checked finite, integral, and within +/-(2^53 - 1) above, so the
+        // truncating cast is exact and cannot saturate.
         return Ok(value as i128);
     }
     Err(McpContractError::MirroredHeaderMismatch(header.to_string()))
