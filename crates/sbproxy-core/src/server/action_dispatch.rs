@@ -2065,21 +2065,29 @@ pub(super) async fn handle_mcp_action(
     let listener_is_tls = ctx.tls_terminated;
     let connection_scheme = if listener_is_tls { "https" } else { "http" };
 
-    // Transport trust for a modern non-POST request runs before anything
-    // else this function can serve, because the well-known routes below
-    // read the tool catalogue and start the federation. Refusing later
-    // would mean a disallowed Origin had already learned the catalogue and
-    // caused upstream work, which is the thing the check exists to stop.
+    // Transport trust runs before anything else this function can do,
+    // whatever the method. The well-known routes below read the tool
+    // catalogue and start the federation, and a POST reaches authentication
+    // before its body is ever scanned, so refusing later would mean a
+    // disallowed Origin had already learned the catalogue, caused upstream
+    // work, or been handed an authentication challenge. All three are what
+    // this check exists to prevent.
     //
-    // Only the refusal is hoisted. Whether a modern request may use this
-    // method at all is decided after the well-known routes, so a trusted
-    // modern client still fetches them exactly as it did before.
+    // Classification here is header-only on purpose, and it is complete for
+    // any conforming caller: the era makes `MCP-Protocol-Version` and
+    // `Mcp-Method` mandatory on every request precisely so an intermediary
+    // can classify without parsing the body. A body-only marker is malformed
+    // rather than modern and is still refused further down, once there is a
+    // body to read.
+    //
+    // Only the refusal is hoisted. Whether a modern request may use a given
+    // method is decided after the well-known routes, so a trusted modern
+    // client still fetches them exactly as it did before, and a trusted
+    // modern POST falls through here untouched.
     //
     // Marker-free legacy traffic never enters this branch and reaches the
     // routes below unchanged.
-    if method != http::Method::POST
-        && classify_http_era(None, &request_headers) == McpProtocolEra::Modern2026_07_28
-    {
+    if classify_http_era(None, &request_headers) == McpProtocolEra::Modern2026_07_28 {
         if let Err(rejection) = mcp.validate_modern_http_request(
             connection_scheme,
             uri_authority.as_deref(),
@@ -4576,7 +4584,7 @@ fn mcp_catalogue_name_for_snapshot(
 /// here is safe to log: the rejection class is a closed enum, the scheme is
 /// server-derived, and the authority is a parsed header value, which cannot
 /// carry control characters. No credential is in scope at this point.
-fn mcp_modern_rejection_status(
+pub(super) fn mcp_modern_rejection_status(
     rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
     server_name: &str,
     connection_scheme: &str,
@@ -4965,7 +4973,7 @@ async fn write_mcp_application_response(
 }
 
 /// Serialize and write an era-specific MCP transport response.
-async fn write_mcp_wire_response(
+pub(super) async fn write_mcp_wire_response(
     session: &mut Session,
     response: sbproxy_extension::mcp::McpWireResponse,
 ) -> Result<()> {

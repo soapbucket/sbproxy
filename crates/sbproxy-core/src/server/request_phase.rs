@@ -3008,6 +3008,60 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- MCP 2026-07-28 transport trust, ahead of authentication ---
+    //
+    // A request addressed to an origin this gateway does not serve must not
+    // reach the auth backend, be handed an authentication challenge, or cause
+    // federation work. Authentication runs immediately below and action
+    // dispatch runs much later, so this is the only place that gets ahead of
+    // both.
+    //
+    // Classification is header-only, and that is complete for any conforming
+    // caller: the era makes `MCP-Protocol-Version` and `Mcp-Method` mandatory
+    // on every request precisely so an intermediary can classify without
+    // reading a body. A marker-free legacy request and every non-MCP origin
+    // skip this in one enum match. `handle_mcp_action` keeps the same check
+    // for an MCP action reached through a forward rule, which this
+    // origin-indexed lookup cannot see.
+    let mcp_modern_rejection = match pipeline.actions.get(origin_idx) {
+        Some(Action::Mcp(mcp)) => {
+            let request = session.req_header();
+            if sbproxy_extension::mcp::classify_http_era(None, &request.headers)
+                == sbproxy_extension::mcp::McpProtocolEra::Modern2026_07_28
+            {
+                let authority = request
+                    .uri
+                    .authority()
+                    .map(|authority| authority.as_str().to_string());
+                let scheme = if ctx.tls_terminated { "https" } else { "http" };
+                mcp.validate_modern_http_request(scheme, authority.as_deref(), &request.headers)
+                    .err()
+                    .map(|rejection| (rejection, scheme, authority, mcp.server_name.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some((rejection, scheme, authority, server_name)) = mcp_modern_rejection {
+        let status = super::action_dispatch::mcp_modern_rejection_status(
+            rejection,
+            &server_name,
+            scheme,
+            authority.as_deref(),
+        );
+        super::action_dispatch::write_mcp_wire_response(
+            session,
+            sbproxy_extension::mcp::McpWireResponse {
+                status,
+                headers: http::HeaderMap::new(),
+                body: None,
+            },
+        )
+        .await?;
+        return Ok(true);
+    }
+
     // --- Auth check ---
     // A resolved minted key already authenticated this request, so the origin's
     // configured provider is skipped. That makes the two front doors

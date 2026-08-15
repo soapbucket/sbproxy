@@ -1367,15 +1367,27 @@ fn modern_disallowed_origin_is_403_empty_before_oauth_challenge_and_federation_p
     );
 }
 
+/// A conforming 2026-07-28 request with a disallowed Origin is refused before
+/// authentication runs and before the federation is primed.
+///
+/// The scope of "conforming" is deliberate and load bearing. The era makes
+/// `MCP-Protocol-Version` and `Mcp-Method` mandatory on every HTTP request
+/// precisely so an intermediary can classify and route without parsing the
+/// body, so every request a conforming client sends is header-detectable and
+/// is covered here. A body-only marker is malformed rather than modern; it is
+/// still refused, but only once the body has been read, which is necessarily
+/// after the authentication phase. Buying the earlier refusal for that shape
+/// would mean buffering and scanning every MCP request body before auth, and
+/// no conforming client sends it.
 #[test]
-fn body_selected_modern_origin_rejection_precedes_forward_auth_and_priming() {
+fn modern_origin_rejection_precedes_forward_auth_and_priming() {
     let upstream = MockMcpUpstream::legacy();
     let auth = MockUpstream::start(json!({"ok": true})).expect("start forward-auth fixture");
     let harness = start_forward_auth_gateway(&upstream, &auth);
     let auth_before = auth.captured().len();
     let discoveries_before = upstream.discoveries();
     let body = modern_wire_body("tools/list", Some("422"), "");
-    let mut headers = base_json_headers();
+    let mut headers = modern_wire_headers("tools/list", None);
     headers.push(raw_header("Origin", "https://evil.example"));
 
     let response = raw_modern_post(harness.port(), headers, body);
@@ -1389,12 +1401,37 @@ fn body_selected_modern_origin_rejection_precedes_forward_auth_and_priming() {
     assert_eq!(
         auth.captured().len(),
         auth_before,
-        "a body-only modern marker must be classified before forward auth"
+        "a disallowed Origin must be refused before forward auth is consulted"
     );
     assert_eq!(
         upstream.discoveries(),
         discoveries_before,
         "transport rejection must not prime federation"
+    );
+}
+
+/// The malformed shape the test above excludes: modern metadata in the body
+/// with none of the mandatory routing headers. It is still refused, and it
+/// still must not reach an upstream, but the refusal lands after the
+/// authentication phase because nothing before that point has read the body.
+#[test]
+fn body_only_modern_marker_is_refused_without_reaching_an_upstream() {
+    let upstream = MockMcpUpstream::legacy();
+    let harness = start_gateway(&upstream, false);
+    let tool_calls_before = upstream.tool_calls();
+    let body = modern_wire_body("tools/list", Some("423"), "");
+    let headers = base_json_headers();
+
+    let response = raw_modern_post(harness.port(), headers, body);
+
+    assert_ne!(
+        response.status, 200,
+        "body-only modern marker: {response:?}"
+    );
+    assert_eq!(
+        upstream.tool_calls(),
+        tool_calls_before,
+        "a refused request must not dispatch a tool call"
     );
 }
 
