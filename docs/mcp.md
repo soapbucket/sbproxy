@@ -396,6 +396,98 @@ Multiple `tool_allowlist` entries are unioned. An empty `allow` list
 denies every call. No guardrails means open access. Source:
 `crates/sbproxy-modules/src/action/mcp.rs:McpGuardrailEntry`.
 
+## Watching the catalog for tampering
+
+A federated tool's name, title, and description reach the model at
+`tools/list`, before anything is called. That makes the catalog itself a
+place an upstream can influence behavior, and it is why approving
+individual calls does not cover it: by the time a call is approved, the
+text has already been read.
+
+The gateway reports two classes of finding when it publishes a refreshed
+catalog. Both are reports, not refusals. They change no bytes on the
+wire, so they run for every deployment without being configured.
+
+### Text a reviewer cannot see
+
+Several Unicode ranges are invisible in a rendered catalog and plain
+text to a model. The Unicode TAG block is the sharpest: every code point
+in `U+E0000` to `U+E007F` mirrors an ASCII character and displays as
+nothing at all, so a description can carry a full sentence past the
+person approving it.
+
+A finding names the tool, the field, and what it found:
+
+```
+WARN mcp.catalog kind=added field=description classes=tag_block
+     tool=search server=alpha
+     MCP advertised tool text conceals content from a reader
+```
+
+Counted on `sbproxy_mcp_concealed_text_findings_total{field, class,
+kind}`, where `class` is one of `tag_block`, `bidi_control`,
+`zero_width`, or `other_control`.
+
+Ordinary text in any language is never a finding. An Arabic or Hebrew
+description contains right-to-left characters by nature; only the
+explicit controls that reorder or hide are reported.
+
+### Descriptions that read as instructions
+
+The second class is the static tool-poisoning indicators: a path that
+holds credentials, an instruction inside a markup comment that renders
+as nothing, or text addressed to the model rather than to a reader.
+
+```
+WARN mcp.catalog kind=added field=description
+     indicators=credential_path,model_directive
+     tool=search server=alpha
+     MCP advertised tool text carries a poisoning indicator
+```
+
+Counted on `sbproxy_mcp_poison_indicators_total{field, indicator,
+kind}`.
+
+**This is not injection detection, and nothing is blocked by it.**
+Measured catch rates for content-based injection detectors on realistic
+traffic are single digit, and attacks written against a published
+defense break it. Treating this as a boundary would be a false sense of
+one. What it gives you is a named, countable signal to review, and a
+reason to look at a specific tool from a specific upstream.
+
+The controls that *are* enforced are the deterministic ones: contract
+pinning, which refuses a tool whose definition moved
+([tool versioning](tool-versioning.md)); argument schemas, which refuse a
+call whose arguments do not match what the tool declared; and the
+namespacing below.
+
+Both reports are edge triggered. A catalog that keeps advertising the
+same finding says so once, when it appears and again when it clears, not
+on every refresh.
+
+### Keeping one upstream from speaking for another
+
+A description from one server can name a tool belonging to a different
+server, so that a model reading both is steered across the boundary. The
+answer is structural rather than a scan: give every upstream its own
+namespace, so a name always carries its owner and no description can
+borrow another server's identity.
+
+```yaml
+federated_servers:
+  - origin: "tools.internal"
+    prefix: internal
+    namespace: always
+  - origin: "partner.example"
+    prefix: partner
+    namespace: always
+```
+
+With `namespace: always`, `internal.search` and `partner.search` are
+distinct names from the moment they are advertised, rather than only
+once they collide. Prefer it whenever more than one upstream is
+federated and they are not equally trusted.
+
 ## Progressive discovery
 
 Set `progressive_discovery: true` and `tools/list` advertises exactly
