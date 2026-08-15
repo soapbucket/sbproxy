@@ -739,7 +739,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          and nothing publishes on one, so a configured bus moved no events between replicas. \
          `compile_config` rejects the whole block and points at `proxy.config_authority` for \
          config distribution and `POST /admin/cache/purge` for cache invalidation. WOR-2310 \
-         deleted the backend implementations, so no driver name can ever be honored.",
+         deleted the backend implementations, so no driver name can ever be honored. WOR-2192: \
+         do not restore GCP Pub/Sub or SQS without an async Stream that acks after yield and \
+         stops when cancelled.",
     ),
     unsupported(
         "proxy.messenger_settings.params.*",

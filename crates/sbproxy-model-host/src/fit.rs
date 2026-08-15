@@ -686,6 +686,32 @@ impl MemoryEstimate {
     }
 }
 
+/// Allowed live RSS overshoot versus a planned memory envelope (WOR-2200).
+///
+/// The plan reserves weight + KV + overhead + margin. A Metal llama.cpp
+/// process RSS can sit well below that (KV pages not touched) and a
+/// little above it (allocator plus Metal working set). 25% overshoot is
+/// the documented ceiling; undershoot is expected and is not a failure.
+pub const LIVE_MEMORY_OVERSHOOT: f64 = 0.25;
+
+/// True when `observed_rss_bytes` is a live process that fits the
+/// planned envelope: non-zero, and at most `1 + overshoot` times
+/// `planned_bytes`.
+pub fn live_rss_within_planned_envelope(
+    planned_bytes: u64,
+    observed_rss_bytes: u64,
+    overshoot: f64,
+) -> bool {
+    if planned_bytes == 0 || observed_rss_bytes == 0 {
+        return false;
+    }
+    if !overshoot.is_finite() || overshoot < 0.0 {
+        return false;
+    }
+    let cap = (planned_bytes as f64 * (1.0 + overshoot)).ceil() as u64;
+    observed_rss_bytes <= cap
+}
+
 /// Why no quant could be fit.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum FitError {
@@ -2601,5 +2627,39 @@ mod tests {
         let plan = synthetic_plan(1_000_000_000);
         let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn live_rss_at_the_planned_envelope_agrees() {
+        assert!(live_rss_within_planned_envelope(
+            1_000,
+            1_000,
+            LIVE_MEMORY_OVERSHOOT
+        ));
+        assert!(live_rss_within_planned_envelope(
+            1_000,
+            1_250,
+            LIVE_MEMORY_OVERSHOOT
+        ));
+        assert!(!live_rss_within_planned_envelope(
+            1_000,
+            1_251,
+            LIVE_MEMORY_OVERSHOOT
+        ));
+        assert!(live_rss_within_planned_envelope(
+            1_000,
+            1,
+            LIVE_MEMORY_OVERSHOOT
+        ));
+        assert!(!live_rss_within_planned_envelope(
+            1_000,
+            0,
+            LIVE_MEMORY_OVERSHOOT
+        ));
+        assert!(!live_rss_within_planned_envelope(
+            0,
+            1_000,
+            LIVE_MEMORY_OVERSHOOT
+        ));
     }
 }

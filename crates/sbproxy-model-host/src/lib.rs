@@ -152,11 +152,11 @@ pub use engine_driver::{
     ProvisionRequest, ProvisionedEngine, RunningEngine,
 };
 pub use fit::{
-    estimate_throughput, fp8_supported, memory_occupancy, plan_fit_auto_kv_with_margin,
-    plan_fit_auto_kv_with_margin_and_concurrency, plan_fit_kv_with_margin,
-    plan_fit_kv_with_margin_and_concurrency, plan_fit_over_set, plan_replica_fits, FitError,
-    FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant,
-    StaticGpuProbe, ThroughputEstimate,
+    estimate_throughput, fp8_supported, live_rss_within_planned_envelope, memory_occupancy,
+    plan_fit_auto_kv_with_margin, plan_fit_auto_kv_with_margin_and_concurrency,
+    plan_fit_kv_with_margin, plan_fit_kv_with_margin_and_concurrency, plan_fit_over_set,
+    plan_replica_fits, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate,
+    ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate, LIVE_MEMORY_OVERSHOOT,
 };
 pub use foreign_cache::{
     discover as discover_foreign_models, ForeignCacheSource, ForeignModelFile,

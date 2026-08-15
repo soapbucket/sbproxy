@@ -1,6 +1,6 @@
 # Model host hardware certification
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-08-15*
 
 This page is the evidence ledger for the self-host matrix, and the procedure
 that reproduces it. Passing a simulated GPU test is never recorded as live
@@ -24,16 +24,18 @@ scripts/certify-selfhost.sh list          # the lane table and what each asserts
 scripts/certify-selfhost.sh metadata      # what this host would record
 scripts/certify-selfhost.sh run local     # every lane needing no accelerator
 scripts/certify-selfhost.sh run all       # add the hardware lanes
-scripts/certify-selfhost.sh run apple_metal nvidia_single_gpu
+scripts/certify-selfhost.sh run apple_metal_probe apple_metal nvidia_single_gpu
 ```
 
 Evidence lands in `.cert-evidence/<utc-timestamp>/`: a `metadata.json` with the
 git revision and dirty flag, binary version, OS, kernel, driver, CUDA,
-container runtime, and visible device count; a `summary.tsv` with one row per
-lane; and a `<lane>.log` per lane carrying the exact command, the expected
-result, and the full output. The runner exits non-zero if any lane failed. An
-`unsupported` lane does not fail the run, because a missing accelerator is a
-gap to report, not a regression.
+container runtime, and visible device count; a `record.json` on live Apple
+and release lanes with the seven certification fields (macOS version, chip,
+memory, engine version, artifact digest, time to ready, first-token result);
+a `summary.tsv` with one row per lane; and a `<lane>.log` per lane carrying
+the exact command, the expected result, and the full output. The runner exits
+non-zero if any lane failed. An `unsupported` lane does not fail the run,
+because a missing accelerator is a gap to report, not a regression.
 
 `run local` is the pre-hardware gate. It must be green before a GPU box is
 billed.
@@ -44,7 +46,8 @@ billed.
 |---|---|---|
 | Deterministic model-host suites | passed 2026-07-30 | Artifact, driver, fit, admission, reconcile, reload, capability, and CLI suites. |
 | CPU admission | passed 2026-07-30 | Local admission and cold-start policy on an accelerator-free path. |
-| Apple Silicon Metal | passed 2026-08-02 | Apple M4 Max, macOS 26.5.2 (25F84), 36 GiB, revision `e2858994` on a clean tree. All 12 checks: cold start ready in 17s, nonempty completion, public model name echoed, truthful status (`llama_cpp b9905`, digest `830f2915`), stop reaped the engine, clean SIGTERM in 61s with no orphan and the public port released, and a second run that downloaded nothing and matched the digest. The 2026-07-30 run's one failure was the listener release; that check now passes against the widened exit window. |
+| Apple Metal probe | named lane `apple_metal_probe` | Compiles `probe_metal.rs` with `--features gpu-apple` and asserts one unified-memory device plus a 0.5B Q4 plan that fits the working-set budget. Invoked by `run apple_metal_probe` or `run all`. Off Apple Silicon the lane records `unsupported`. Linux CI does not run it (`run local` omits it; every GitHub CI job is ubuntu-latest). |
+| Apple Silicon Metal | passed 2026-08-02 | Apple M4 Max, macOS 26.5.2 (25F84), 36 GiB, revision `e2858994` on a clean tree. All 12 checks: cold start ready in 17s, nonempty completion, public model name echoed, truthful status (`llama_cpp b9905`, digest `830f2915`), stop reaped the engine, clean SIGTERM in 61s with no orphan and the public port released, and a second run that downloaded nothing and matched the digest. The 2026-07-30 run's one failure was the listener release; that check now passes against the widened exit window. Live RSS must stay within 25% overshoot of the planned `memory.total_bytes` envelope (WOR-2200); that comparison is recorded in `record.json` on subsequent runs. |
 | NVIDIA CUDA single GPU | passed 2026-07-30 | Live vLLM container completion on an NVIDIA L4: NVML probe, fit plan, public model echo, full status, and a stop that returned the device to 0 MiB. |
 | NVIDIA multi-GPU | unsupported | Needs two visible devices. The billing account this project runs under is capped at one GPU, so the lane has never had hardware to run on. Detail below. |
 | Air-gapped | passed 2026-07-30 | Offline, manual, and file pull policies short-circuit transport; a digest mismatch fails closed. |
@@ -90,6 +93,19 @@ pass until the updated lane reruns on Apple hardware.
 - Cache reuse: zero download lines on the second run, same artifact digest
 - **Failing check:** the public port was still bound 60 seconds after
   shutdown, by a surviving `sbproxy` process
+
+### Certified Mac classes (WOR-2200)
+
+Two pinned llama.cpp builds exist. They are not interchangeable, and only
+one currently has a dated live record:
+
+| Class | Engine pin | Host | Status |
+|---|---|---|---|
+| macOS 26 arm64 | `b9905` (requires macOS >= 26.0) | Local Apple M4 Max, macOS 26.5.2 | Certified 2026-08-02, evidence above |
+| macOS 14 arm64 | `b9415` (requires macOS >= 14.0) | GitHub `macos-14` release runner | The automated release lane runs here and writes `record.json` into the uploaded artifact. Until that artifact names `engine_version: b9415`, this class is exercised but not promoted in the table above. |
+
+A host on macOS 15 still selects `b9415`. There is no dated live record for
+that minor either; do not read the M4 Max row as covering it.
 
 ### Lifecycle fix awaiting live Apple rerun
 
@@ -285,19 +301,34 @@ selected. A generic engine error is not acceptable evidence.
 
 ## Evidence retention
 
-`scripts/certify-selfhost.sh` records most of this automatically. For every
-live run, retain:
+`scripts/certify-selfhost.sh` writes the machine-readable record. Do not
+reconstruct these fields by grepping lane logs.
 
-- git revision and dirty status;
-- binary version and feature set;
-- operating system, kernel, driver, CUDA, container runtime, and engine versions;
-- catalog revision, logical model, variant, source revision, and artifact digest;
-- generated config with secrets removed;
-- readiness, completion, status, stop, and restart output;
-- relevant `sbproxy_model_host_*` metrics;
-- failure logs for every expected refusal;
-- GCP machine type, accelerator type, zone, and teardown confirmation.
+On every run, `metadata.json` records git revision, dirty flag, binary
+version, OS, kernel, driver, CUDA, container runtime, and visible device
+count. On a live Apple Metal run, `record.json` is the single file that
+answers what was certified. It always contains:
 
-Do not promote a capability from this checklist alone. Promotion requires
-retained output tied to the tested revision, and a deterministic regression
-test for any bug the hardware run found.
+| Field | Source |
+|---|---|
+| `macos_version` | `sw_vers -productVersion` |
+| `chip` | `sysctl machdep.cpu.brand_string` |
+| `memory_bytes` | `sysctl hw.memsize` |
+| `engine_version` | `models ps` `engine_version` |
+| `artifact_digest` | `models ps` `artifact_digest` |
+| `time_to_ready_seconds` | cold-start ready banner |
+| `first_token_result` | completion `choices[0].message.content` |
+
+Live Metal runs also record `planned_memory_bytes`, `observed_rss_bytes`,
+`probe_budget_bytes`, and `memory_overshoot` (0.25). RSS may undershoot the
+plan; overshoot above the documented ceiling fails the lane.
+
+The GitHub release Apple job writes the same `record.json` into the
+`model-host-cert-apple-silicon-log` artifact, next to the boot log. That is
+the retained record for the `b9415` / macos-14 class.
+
+Lane logs, `summary.tsv`, generated configs with secrets removed, metrics,
+failure logs, and GCP teardown notes stay in the evidence directory as
+supporting material. Do not promote a capability from those alone.
+Promotion requires a `record.json` tied to the tested revision, and a
+deterministic regression test for any bug the hardware run found.
