@@ -1156,9 +1156,18 @@ impl McpFederation {
             let incompatibility_summary = (!incompatibility_changes.is_empty())
                 .then(|| modern_incompatibility_summary(&registry));
             // WOR-1635: grade the changed catalogue against the
-            // lockfile baseline before publishing it. Modern-only
-            // fields must never perturb the legacy oracle.
-            let version_blocked = if legacy_changed {
+            // lockfile baseline before publishing it.
+            //
+            // WOR-2387: a modern-only move has to reach the oracle too. The
+            // legacy registry digest cannot see `outputSchema` or
+            // `annotations`, so gating this call on `legacy_changed` alone
+            // meant a baseline that pins those fields was never consulted when
+            // exactly those fields moved. A legacy baseline stays inert here
+            // by construction rather than by being skipped: its live
+            // projection carries the same three fields it always did, so a
+            // modern-only change still digests identically and the per-tool
+            // loop passes over it.
+            let version_blocked = if legacy_changed || modern_changed {
                 self.evaluate_tool_versioning_snapshot(&registry).await
             } else {
                 None
