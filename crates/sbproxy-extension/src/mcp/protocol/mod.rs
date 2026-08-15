@@ -324,19 +324,33 @@ pub fn classify_http_era(
     scan: Option<&RawModernScan<'_>>,
     headers: &http::HeaderMap,
 ) -> McpProtocolEra {
-    let body_marks_modern =
-        scan.is_some_and(|scan| scan.has_modern_marker() || scan.limit_exceeded().is_some());
+    // Classify on positive modern evidence only. A request that merely fails to
+    // look modern stays legacy, so the frozen 2025-06-18 path keeps answering
+    // it exactly as it did before this era split existed.
+    //
+    // A scan that hit a structural limit is deliberately NOT modern evidence.
+    // Every valid modern HTTP request carries `MCP-Protocol-Version` and
+    // `Mcp-Method`, which are headers and therefore visible whatever the body
+    // scan saw, so a limit alone cannot be the only sign of a modern request.
+    // Treating it as one turned a large-but-valid legacy call, which serde
+    // parses happily and which the 1 MiB cap already bounds, into a refusal.
+    let body_marks_modern = scan.is_some_and(RawModernScan::has_modern_marker);
     let partial_routing_header = headers.contains_key("mcp-method")
         || headers.contains_key("mcp-name")
         || headers
             .keys()
             .any(|name| name.as_str().starts_with("mcp-param-"));
-    let non_legacy_version = headers
+    // Only the exact modern revision is modern evidence. An older or unknown
+    // revision is not a 2026-07-28 request, so it belongs to the legacy codec,
+    // which answers it with the descriptive unsupported-version error it has
+    // always returned and which still exempts `initialize` so a client can
+    // negotiate down through `params.protocolVersion`.
+    let modern_version = headers
         .get_all("mcp-protocol-version")
         .iter()
-        .any(|value| value.as_bytes() != crate::mcp::types::LEGACY_PROTOCOL_VERSION.as_bytes());
+        .any(|value| value.as_bytes() == crate::mcp::types::MODERN_PROTOCOL_VERSION.as_bytes());
 
-    if body_marks_modern || partial_routing_header || non_legacy_version {
+    if body_marks_modern || partial_routing_header || modern_version {
         McpProtocolEra::Modern2026_07_28
     } else {
         McpProtocolEra::Legacy2025_06_18

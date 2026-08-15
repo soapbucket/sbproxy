@@ -2062,10 +2062,11 @@ pub(super) async fn handle_mcp_action(
         // starts the federation. Endpoint traffic is primed only after
         // transport trust and authentication have succeeded below.
         mcp.federation.ensure_ready(mcp.refresh_interval).await;
-        let listener_is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
+        // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+        // `X-Forwarded-Proto: https` stamped by a peer inside
+        // `proxy.trusted_proxies`. The request phase strips that header
+        // from untrusted peers, so an external client cannot forge it.
+        let listener_is_tls = ctx.tls_terminated;
         let scheme = if listener_is_tls { "https" } else { "http" };
         let callback_base = match session
             .req_header()
@@ -2172,10 +2173,11 @@ pub(super) async fn handle_mcp_action(
         && req_path == sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
     {
         if let Some(oauth) = mcp.oauth.as_ref() {
-            let listener_is_tls = session
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref())
-                .is_some();
+            // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+            // `X-Forwarded-Proto: https` stamped by a peer inside
+            // `proxy.trusted_proxies`. The request phase strips that header
+            // from untrusted peers, so an external client cannot forge it.
+            let listener_is_tls = ctx.tls_terminated;
             let scheme = if listener_is_tls { "https" } else { "http" };
             let resource = match session
                 .req_header()
@@ -2224,10 +2226,11 @@ pub(super) async fn handle_mcp_action(
         // Own the path now so its borrow of `session` ends before the
         // mutable `write_response_*` calls below (used only for audit).
         let path_for_log = req_path.to_string();
-        let listener_is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
+        // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+        // `X-Forwarded-Proto: https` stamped by a peer inside
+        // `proxy.trusted_proxies`. The request phase strips that header
+        // from untrusted peers, so an external client cannot forge it.
+        let listener_is_tls = ctx.tls_terminated;
         let scheme = if listener_is_tls { "https" } else { "http" };
         let endpoint = match session
             .req_header()
@@ -2317,10 +2320,11 @@ pub(super) async fn handle_mcp_action(
         .uri
         .authority()
         .map(|authority| authority.as_str().to_string());
-    let listener_is_tls = session
-        .digest()
-        .and_then(|digest| digest.ssl_digest.as_ref())
-        .is_some();
+    // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+    // `X-Forwarded-Proto: https` stamped by a peer inside
+    // `proxy.trusted_proxies`. The request phase strips that header
+    // from untrusted peers, so an external client cannot forge it.
+    let listener_is_tls = ctx.tls_terminated;
     let connection_scheme = if listener_is_tls { "https" } else { "http" };
 
     // GET and DELETE have no JSON body to classify. Any reserved modern
@@ -2701,10 +2705,11 @@ pub(super) async fn handle_mcp_action(
             // and authenticated callers see the same path; the
             // manifest itself filters by visibility at serve time.
             let experimental = if has_agent_skills {
-                let listener_is_tls = session
-                    .digest()
-                    .and_then(|d| d.ssl_digest.as_ref())
-                    .is_some();
+                // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+                // `X-Forwarded-Proto: https` stamped by a peer inside
+                // `proxy.trusted_proxies`. The request phase strips that header
+                // from untrusted peers, so an external client cannot forge it.
+                let listener_is_tls = ctx.tls_terminated;
                 let scheme = if listener_is_tls { "https" } else { "http" };
                 let url = match session
                     .req_header()

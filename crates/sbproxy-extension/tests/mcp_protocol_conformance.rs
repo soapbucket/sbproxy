@@ -376,6 +376,42 @@ fn mcp_protocol_schema_enforces_per_pattern_byte_limit_at_boundary() {
 }
 
 #[test]
+fn mcp_protocol_schema_evaluates_a_nested_quantifier_in_linear_time() {
+    // The byte caps bound how large an upstream pattern may be, never how long
+    // it may run. A federated upstream is untrusted, so a nested quantifier in
+    // `patternProperties` is evaluated against every key of a client-supplied
+    // object, and `patternProperties` does not short-circuit on a non-matching
+    // key. On a backtracking engine each of these keys burns the full
+    // backtrack budget, so one request pins a worker for tens of seconds.
+    // Compiling on the linear engine removes the backtracking entirely.
+    let limits = McpSchemaLimits::default();
+    let catastrophic = contract_with_schema(json!({
+        "type": "object",
+        "patternProperties": {"(a+)+$": {}}
+    }));
+    let compiled = compile_modern_tool_contract(&catastrophic, limits)
+        .expect("a nested quantifier still compiles on the linear engine");
+
+    // Every key matches the prefix and then fails at the anchor, which is the
+    // worst case for a backtracking matcher.
+    let hostile: serde_json::Map<String, Value> = (0..2_000)
+        .map(|index| (format!("{}X{index}", "a".repeat(40)), json!(true)))
+        .collect();
+
+    let started = std::time::Instant::now();
+    let _ = compiled.input.is_valid(&Value::Object(hostile));
+    let elapsed = started.elapsed();
+
+    // A backtracking engine needs roughly a million steps per key here, so it
+    // runs for minutes. The linear engine finishes in milliseconds; the bound
+    // is deliberately loose so only an engine regression trips it.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "nested-quantifier validation took {elapsed:?}, which means backtracking is back"
+    );
+}
+
+#[test]
 fn mcp_protocol_schema_enforces_total_pattern_byte_limit_at_boundary() {
     let limits = McpSchemaLimits::default();
     let exact = contract_with_schema(schema_with_pattern_property_keys(&[
@@ -1576,18 +1612,22 @@ fn mcp_protocol_raw_scan_inspects_each_direct_batch_request_for_modern_markers()
 }
 
 #[test]
-fn mcp_protocol_raw_scan_fails_closed_above_one_mib() {
+fn mcp_protocol_raw_scan_reports_the_one_mib_limit_without_changing_era() {
+    // The limit is reported so the modern codec can refuse on it, but a limit
+    // alone is not modern evidence: a marker-free body stays legacy so a large
+    // legacy call keeps the behavior it had before the era split. The HTTP
+    // layer caps the body at 1 MiB with a 413 before this scan runs anyway.
     let body = vec![b' '; 1_048_577];
     let scan = RawModernScan::scan(&body);
     assert_eq!(scan.limit_exceeded(), Some(RawModernScanLimit::BodyBytes));
     assert_eq!(
         classify_http_era(Some(&scan), &HeaderMap::new()),
-        McpProtocolEra::Modern2026_07_28
+        McpProtocolEra::Legacy2025_06_18
     );
 }
 
 #[test]
-fn mcp_protocol_raw_scan_fails_closed_beyond_128_container_levels() {
+fn mcp_protocol_raw_scan_reports_depth_limit_without_changing_era() {
     let body = format!("{}null{}", "[".repeat(129), "]".repeat(129));
     let scan = RawModernScan::scan(body.as_bytes());
     assert_eq!(
@@ -1596,21 +1636,25 @@ fn mcp_protocol_raw_scan_fails_closed_beyond_128_container_levels() {
     );
     assert_eq!(
         classify_http_era(Some(&scan), &HeaderMap::new()),
-        McpProtocolEra::Modern2026_07_28
+        McpProtocolEra::Legacy2025_06_18
     );
 }
 
 #[test]
-fn mcp_protocol_raw_scan_fails_closed_after_65536_visited_items() {
+fn mcp_protocol_raw_scan_reports_item_limit_without_changing_era() {
     let body = format!("[{}]", vec!["null"; 65_537].join(","));
     let scan = RawModernScan::scan(body.as_bytes());
     assert_eq!(
         scan.limit_exceeded(),
         Some(RawModernScanLimit::VisitedItems)
     );
+    // A valid 2025-06-18 tools/call carrying a 70,000-element argument array
+    // hits this limit. It must still be served as legacy, not turned into a
+    // modern refusal, because every real modern request also carries modern
+    // headers, which no body limit can hide.
     assert_eq!(
         classify_http_era(Some(&scan), &HeaderMap::new()),
-        McpProtocolEra::Modern2026_07_28
+        McpProtocolEra::Legacy2025_06_18
     );
 }
 
@@ -1621,9 +1665,22 @@ fn mcp_protocol_era_classifier_selects_modern_for_every_partial_header_marker() 
         ("mcp-name", b"weather".as_slice()),
         ("mcp-param-region", b"west".as_slice()),
         ("mcp-protocol-version", b"2026-07-28".as_slice()),
-        ("mcp-protocol-version", b"1900-01-01".as_slice()),
-        ("mcp-protocol-version", b"\xff".as_slice()),
     ];
+    // Only the exact modern revision counts. An older or unparseable revision
+    // is not a 2026-07-28 request, so it stays legacy and keeps that era's
+    // descriptive unsupported-version error instead of a modern refusal.
+    for stale in [b"2025-03-26".as_slice(), b"2024-11-05".as_slice(), b"\xff"] {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::HeaderName::from_static("mcp-protocol-version"),
+            http::HeaderValue::from_bytes(stale).unwrap(),
+        );
+        assert_eq!(
+            classify_http_era(None, &headers),
+            McpProtocolEra::Legacy2025_06_18,
+            "stale revision {stale:?} must stay legacy"
+        );
+    }
 
     for (name, value) in cases {
         let mut headers = HeaderMap::new();

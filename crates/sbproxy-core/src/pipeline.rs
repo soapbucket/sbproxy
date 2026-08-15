@@ -2420,13 +2420,16 @@ impl CompiledPipeline {
             // decidable from method, path, headers, and query alone;
             // otherwise the gateway cannot tell pre-auth whether a request
             // belongs to MCP at all.
+            // Guard through the LAST mcp rule, not up to the first. The mcp
+            // rule's own matchers decide whether MCP is selected at all, and a
+            // rule sitting between two mcp rules is still ahead of one of them.
             let guarded_rules = if origin_action_is_mcp {
                 origin_fwd_rules.len()
             } else {
                 origin_fwd_rules
                     .iter()
-                    .position(|rule| matches!(&rule.action, Action::Mcp(_)))
-                    .unwrap_or(0)
+                    .rposition(|rule| matches!(&rule.action, Action::Mcp(_)))
+                    .map_or(0, |index| index + 1)
             };
             for rule in origin_fwd_rules.iter().take(guarded_rules) {
                 if let Some(label) = rule.matchers.iter().find_map(indeterminate_matcher_label) {
@@ -4292,6 +4295,91 @@ origins:
         let error = CompiledPipeline::from_config_for_validation(config)
             .err()
             .expect("an earlier indeterminate route must not shadow MCP pre-auth selection");
+        let message = error.to_string();
+        assert!(message.contains("mcp.localhost"), "{message}");
+        assert!(message.contains("when"), "{message}");
+    }
+
+    #[test]
+    fn task_5c_an_mcp_rule_cannot_carry_its_own_indeterminate_matcher() {
+        // The mcp rule's own matchers decide whether MCP is selected at all. A
+        // body matcher here arms the route-matching body drain, so the MCP
+        // handler would re-read an already-consumed body and decode nothing.
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: proxy
+      url: https://api.example.com
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+            body: {pointer: /route, value: mcp}
+        origin:
+          id: body-selected-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("body-selected MCP config parses");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("an mcp rule must not select on the request body");
+        let message = error.to_string();
+        assert!(message.contains("mcp.localhost"), "{message}");
+        assert!(message.contains("body"), "{message}");
+    }
+
+    #[test]
+    fn task_5c_a_rule_between_two_mcp_rules_is_still_guarded() {
+        // Guarding only up to the FIRST mcp rule would let this one through.
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: proxy
+      url: https://api.example.com
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /first
+        origin:
+          id: first-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+      - rules:
+          - path:
+              prefix: /shadow
+            when: 'request.path.startsWith("/shadow")'
+        origin:
+          id: conditional-shadow
+          action:
+            type: static
+            status_code: 403
+      - rules:
+          - path:
+              prefix: /second
+        origin:
+          id: second-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("interleaved MCP config parses");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("a rule between two mcp rules must not be indeterminate");
         let message = error.to_string();
         assert!(message.contains("mcp.localhost"), "{message}");
         assert!(message.contains("when"), "{message}");

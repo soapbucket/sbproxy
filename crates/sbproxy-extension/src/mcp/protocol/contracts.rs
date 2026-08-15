@@ -510,6 +510,16 @@ fn compile_schema(
     validate_meta_schema(schema, dialect)?;
     jsonschema_modern::options()
         .with_draft(dialect.into_jsonschema_draft())
+        // Compile `pattern` and `patternProperties` on the linear `regex`
+        // engine rather than the backtracking default. The byte caps above
+        // bound how large an upstream pattern may be, not how long it may run,
+        // and `patternProperties` does not short-circuit on a non-matching key:
+        // one hostile pattern plus a wide client object would multiply
+        // catastrophic backtracking across every member. The linear engine has
+        // no backtracking to exhaust. Patterns that need backreferences or
+        // lookaround now fail to compile, which correctly marks the tool
+        // modern-incompatible instead of turning it into an amplifier.
+        .with_pattern_options(jsonschema_modern::PatternOptions::regex())
         .build(schema)
         .map_err(|error| McpContractError::InvalidSchema(error.to_string()))
 }
