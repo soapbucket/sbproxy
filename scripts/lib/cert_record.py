@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Merge host metadata and lane findings into one certification record.
 
 WOR-2201: a reader reconstructing a certification should not have to grep
@@ -116,7 +117,7 @@ def main(argv: list[str]) -> int:
             )
             return 1
         if not live_rss_within_planned_envelope(planned, observed):
-            cap = int((planned * (1.0 + LIVE_MEMORY_OVERSHOOT)).__ceil__())
+            cap = math.ceil(planned * (1.0 + LIVE_MEMORY_OVERSHOOT))
             print(
                 f"observed RSS {observed} exceeds planned {planned} "
                 f"plus {LIVE_MEMORY_OVERSHOOT:.0%} overshoot (cap {cap})",

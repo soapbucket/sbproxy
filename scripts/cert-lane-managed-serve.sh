@@ -315,11 +315,12 @@ PY
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OVERSHOOT="${OVERSHOOT:-${CERT_MEMORY_OVERSHOOT:-0.25}}"
 if [ -n "${CERT_RECORD:-}" ] && [ -n "${CERT_HOST_JSON:-}" ] && [ -f "${CERT_HOST_JSON:-}" ]; then
   python3 - "$WORK/findings.json" "$CONTENT" "$ENGINE_VERSION" "$DIGEST" \
-    "$cold_secs" "$PLANNED_BYTES" "$OBSERVED_RSS" "$PROBE_BUDGET" <<'PY'
+    "$cold_secs" "$PLANNED_BYTES" "$OBSERVED_RSS" "$PROBE_BUDGET" "$OVERSHOOT" <<'PY'
 import json, sys
-path, content, engine, digest, ready, planned, rss, budget = sys.argv[1:9]
+path, content, engine, digest, ready, planned, rss, budget, overshoot = sys.argv[1:10]
 findings = {
     "engine_version": engine,
     "artifact_digest": digest,
@@ -328,7 +329,7 @@ findings = {
     "planned_memory_bytes": int(planned or 0) or None,
     "observed_rss_bytes": int(rss or 0) or None,
     "probe_budget_bytes": int(budget or 0) or None,
-    "memory_overshoot": 0.25,
+    "memory_overshoot": float(overshoot or 0.25),
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(findings, handle)

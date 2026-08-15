@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-15*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -496,16 +496,15 @@ The body scan reads the buffered request body, which is later: by then the
 upstream request has already been assembled. It runs only when
 `enable_body_aware: true` is set; without it the body streams through
 unbuffered and unscanned. A hit there can still `block`, because the request
-has not been forwarded, but it cannot tag. Tag and log both degrade to an
-advisory log line at that phase, and the code says so directly:
-
-```
-prompt injection detected in request body (advisory; upstream already dispatched)
-```
+has not been forwarded, but it cannot tag. `log` emits an advisory warn.
+`tag` never reaches that arm on a compiled non-`ai_proxy` origin:
+compile_config refuses `action: tag` together with `enable_body_aware`.
+If a future path skipped the compiler, the body-phase arm logs an error
+rather than looking like `log`.
 
 | Action | URI + header phase | Body phase (`enable_body_aware: true`) |
 |--------|--------------------|----------------------------------------|
-| `tag` | Stamps the score and label headers on the upstream request | Nothing left to stamp; advisory log only. Refused at config compile on non-`ai_proxy` origins |
+| `tag` | Stamps the score and label headers on the upstream request | Refused at config compile on non-`ai_proxy` origins; unreachable arm logs an error |
 | `block` | Rejects with `403` before the upstream is contacted | Rejects with `403`; the buffered body never reaches the upstream |
 | `log` | Structured warn, request forwarded | Structured warn, request forwarded |
 

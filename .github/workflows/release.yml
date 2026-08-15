@@ -370,10 +370,11 @@ jobs:
           sysctl -n machdep.cpu.brand_string || true
           python3 - <<'PY'
           import json, os, subprocess
+          from datetime import datetime, timezone
           def cmd(*args):
               return subprocess.check_output(args, text=True).strip()
           host = {
-              "recorded_at": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "git_revision": cmd("git", "rev-parse", "HEAD"),
               "os": cmd("uname", "-s"),
               "os_release": cmd("uname", "-r"),
@@ -479,14 +480,13 @@ jobs:
             exit 1
           fi
 
-          READY_SECS=-1
-          for _ in $(seq 1 90); do
-            if grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
-              READY_SECS=$(( $(date +%s) - BOOT_START ))
-              break
-            fi
-            sleep 1
-          done
+          # Prefer the ready banner. HTTP-ready elapsed is the fallback so
+          # a wording change cannot leave time_to_ready_seconds unset after
+          # a successful boot.
+          READY_SECS=$(( $(date +%s) - BOOT_START ))
+          if ! grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
+            echo "ready banner not found; recording HTTP-ready elapsed ${READY_SECS}s"
+          fi
           echo "${READY_SECS}" > /tmp/sbproxy-cert-ready-secs
 
           # Derive the supervised engine from sbproxy's exact durable
@@ -519,9 +519,15 @@ jobs:
           SB_ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
             ./target/release/sbproxy models ps --format json \
             > /tmp/sbproxy-cert-ps.json || true
-          python3 - "${READY_SECS}" <<'PY'
+          OBSERVED_RSS=0
+          if [ -n "${ENGINE_PID}" ] && kill -0 "${ENGINE_PID}" 2>/dev/null; then
+            rss_kb="$(ps -o rss= -p "${ENGINE_PID}" 2>/dev/null | tr -d ' ')"
+            OBSERVED_RSS=$(( ${rss_kb:-0} * 1024 ))
+          fi
+          python3 - "${READY_SECS}" "${OBSERVED_RSS}" <<'PY'
           import json, os, sys
           ready = int(sys.argv[1])
+          observed = int(sys.argv[2])
           host = {}
           if os.path.exists("/tmp/sbproxy-cert-host.json"):
               host = json.load(open("/tmp/sbproxy-cert-host.json"))
@@ -530,6 +536,7 @@ jobs:
               findings = json.load(open("/tmp/sbproxy-cert-findings.json"))
           engine_version = None
           digest = None
+          planned = None
           if os.path.exists("/tmp/sbproxy-cert-ps.json"):
               status = json.load(open("/tmp/sbproxy-cert-ps.json"))
               payload = status.get("data") or status
@@ -537,11 +544,21 @@ jobs:
               if deployments:
                   engine_version = deployments[0].get("engine_version")
                   digest = deployments[0].get("artifact_digest")
+                  mem = deployments[0].get("memory") or {}
+                  planned = mem.get("total_bytes") or None
           findings["engine_version"] = engine_version
           findings["artifact_digest"] = digest
           findings["time_to_ready_seconds"] = ready if ready >= 0 else None
+          findings["planned_memory_bytes"] = planned
+          findings["observed_rss_bytes"] = observed or None
+          findings["memory_overshoot"] = 0.25
           sys.path.insert(0, "scripts/lib")
-          from cert_record import write_record
+          from cert_record import live_rss_within_planned_envelope, write_record
+          if planned and observed:
+              if not live_rss_within_planned_envelope(int(planned), observed):
+                  raise SystemExit(
+                      f"live RSS {observed} overshoots planned {planned} by more than 25%"
+                  )
           os.makedirs("/tmp/sbproxy-cert-artifacts", exist_ok=True)
           write_record("/tmp/sbproxy-cert-artifacts/record.json", host, findings)
           print("wrote /tmp/sbproxy-cert-artifacts/record.json")
