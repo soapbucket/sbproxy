@@ -658,12 +658,21 @@ fn write_version_baseline_lockfile() -> String {
         .into_iter()
         .find(|tool| tool["name"] == "search")
         .expect("search baseline contract");
+    // The version gate digests the same three-field projection it always has
+    // (`name`, `description`, `inputSchema`), not the complete advertised
+    // document, so a baseline built from the full tool would never match the
+    // live digest and every run would open with `search` already blocked.
+    let gate_contract = json!({
+        "name": search["name"],
+        "description": search["description"],
+        "inputSchema": search["inputSchema"],
+    });
     let mut tools = BTreeMap::new();
     tools.insert(
         "search".to_string(),
         ToolLock {
             semver: "1.0.0".parse().expect("baseline semver"),
-            contract_digest: contract_digest(&search),
+            contract_digest: contract_digest(&gate_contract),
             contract: Some(search),
         },
     );
