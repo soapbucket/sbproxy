@@ -480,12 +480,22 @@ jobs:
             exit 1
           fi
 
-          # Prefer the ready banner. HTTP-ready elapsed is the fallback so
-          # a wording change cannot leave time_to_ready_seconds unset after
-          # a successful boot.
-          READY_SECS=$(( $(date +%s) - BOOT_START ))
-          if ! grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
-            echo "ready banner not found; recording HTTP-ready elapsed ${READY_SECS}s"
+          # time_to_ready_seconds is the ready-banner elapsed
+          # (docs/model-host-certification.md). HTTP-up is only a
+          # fallback after the banner wait expires, so a wording
+          # change cannot leave the field unset after a successful boot.
+          HTTP_READY_SECS=$(( $(date +%s) - BOOT_START ))
+          READY_SECS=-1
+          for _ in $(seq 1 90); do
+            if grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
+              READY_SECS=$(( $(date +%s) - BOOT_START ))
+              break
+            fi
+            sleep 1
+          done
+          if [ "${READY_SECS}" -lt 0 ]; then
+            echo "ready banner not found; recording HTTP-ready elapsed ${HTTP_READY_SECS}s"
+            READY_SECS="${HTTP_READY_SECS}"
           fi
           echo "${READY_SECS}" > /tmp/sbproxy-cert-ready-secs
 
@@ -519,9 +529,14 @@ jobs:
           SB_ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
             ./target/release/sbproxy models ps --format json \
             > /tmp/sbproxy-cert-ps.json || true
+          # certify-model-host.sh kill -9s ENGINE_PID. Re-read the
+          # current ownership record so RSS is sampled from a live
+          # post-recovery engine, then fail closed if the envelope
+          # check cannot run.
+          LIVE_ENGINE_PID="$(ownership_pid 2>/dev/null || true)"
           OBSERVED_RSS=0
-          if [ -n "${ENGINE_PID}" ] && kill -0 "${ENGINE_PID}" 2>/dev/null; then
-            rss_kb="$(ps -o rss= -p "${ENGINE_PID}" 2>/dev/null | tr -d ' ')"
+          if [ -n "${LIVE_ENGINE_PID}" ] && kill -0 "${LIVE_ENGINE_PID}" 2>/dev/null; then
+            rss_kb="$(ps -o rss= -p "${LIVE_ENGINE_PID}" 2>/dev/null | tr -d ' ')"
             OBSERVED_RSS=$(( ${rss_kb:-0} * 1024 ))
           fi
           python3 - "${READY_SECS}" "${OBSERVED_RSS}" <<'PY'
@@ -554,11 +569,15 @@ jobs:
           findings["memory_overshoot"] = 0.25
           sys.path.insert(0, "scripts/lib")
           from cert_record import live_rss_within_planned_envelope, write_record
-          if planned and observed:
-              if not live_rss_within_planned_envelope(int(planned), observed):
-                  raise SystemExit(
-                      f"live RSS {observed} overshoots planned {planned} by more than 25%"
-                  )
+          if not planned or int(planned) <= 0 or observed <= 0:
+              raise SystemExit(
+                  f"live RSS envelope check did not run "
+                  f"(planned={planned!r} observed={observed})"
+              )
+          if not live_rss_within_planned_envelope(int(planned), observed):
+              raise SystemExit(
+                  f"live RSS {observed} overshoots planned {planned} by more than 25%"
+              )
           os.makedirs("/tmp/sbproxy-cert-artifacts", exist_ok=True)
           write_record("/tmp/sbproxy-cert-artifacts/record.json", host, findings)
           print("wrote /tmp/sbproxy-cert-artifacts/record.json")
