@@ -110,11 +110,17 @@ class NoticeCoverageTests(unittest.TestCase):
             with open(notice, "w", encoding="utf-8") as handle:
                 handle.write("pingora-core\n")
             stdin = io.StringIO(json.dumps(metadata))
-            with mock.patch("sys.stdin", stdin):
+            captured = io.StringIO()
+            with mock.patch("sys.stdin", stdin), mock.patch(
+                "sys.stderr", captured
+            ):
                 rc = self.mod.main(
                     ["notice_coverage.py", "--notice", notice]
                 )
             self.assertEqual(rc, 1)
+            diagnostic = captured.getvalue()
+            self.assertIn("from_variant", diagnostic)
+            self.assertIn("WOR-2449", diagnostic)
 
 
 if __name__ == "__main__":
