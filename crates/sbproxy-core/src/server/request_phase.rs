@@ -3029,10 +3029,7 @@ pub(super) async fn request_filter(
             if sbproxy_extension::mcp::classify_http_era(None, &request.headers)
                 == sbproxy_extension::mcp::McpProtocolEra::Modern2026_07_28
             {
-                let authority = request
-                    .uri
-                    .authority()
-                    .map(|authority| authority.as_str().to_string());
+                let authority = super::action_dispatch::mcp_request_target_authority(&request.uri);
                 let scheme = if ctx.tls_terminated { "https" } else { "http" };
                 mcp.validate_modern_http_request(scheme, authority.as_deref(), &request.headers)
                     .err()

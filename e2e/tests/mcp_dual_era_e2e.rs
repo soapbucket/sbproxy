@@ -1165,7 +1165,7 @@ fn modern_catalogue_and_calls_exclude_rollout_managed_names() {
         );
     }
 
-    let captured_before = upstream.captured_requests().len();
+    let tool_calls_before = upstream.tool_calls();
     for managed in ["search", "search_v1", "search_v2"] {
         let response = modern_rpc(
             &harness,
@@ -1181,9 +1181,14 @@ fn modern_catalogue_and_calls_exclude_rollout_managed_names() {
             "managed modern call must fail: {body}"
         );
     }
+    // Count tool calls rather than every captured request. The federation's
+    // initial resource and prompt refreshes are still in flight while the
+    // first response is served, so a total-request count races the prime and
+    // says nothing about dispatch either way. What this test is about is that
+    // a rollout-managed name never reaches an adapter or an upstream tool.
     assert_eq!(
-        upstream.captured_requests().len(),
-        captured_before,
+        upstream.tool_calls(),
+        tool_calls_before,
         "modern rollout names must fail before adapter or upstream dispatch"
     );
 }

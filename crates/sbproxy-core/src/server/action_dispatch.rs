@@ -2053,11 +2053,7 @@ pub(super) async fn handle_mcp_action(
     // HeaderMap::clone retains repeated and non-UTF-8 values; no protected
     // routing carrier is coalesced before the protocol codec sees it.
     let request_headers = session.req_header().headers.clone();
-    let uri_authority = session
-        .req_header()
-        .uri
-        .authority()
-        .map(|authority| authority.as_str().to_string());
+    let uri_authority = mcp_request_target_authority(&session.req_header().uri);
     // Trust-bounded: `tls_terminated` is true for a TLS listener or a
     // `X-Forwarded-Proto: https` stamped by a peer inside
     // `proxy.trusted_proxies`. The request phase strips that header
@@ -4584,6 +4580,35 @@ fn mcp_catalogue_name_for_snapshot(
 /// here is safe to log: the rejection class is a closed enum, the scheme is
 /// server-derived, and the authority is a parsed header value, which cannot
 /// carry control characters. No credential is in scope at this point.
+/// Authority of the request target, including the absolute form.
+///
+/// Pingora builds the request URI with `Uri::builder().path_and_query(target)`,
+/// so an absolute-form target (RFC 9112 section 3.2.2) lands intact in the path
+/// and `Uri::authority()` is always `None`. Reading it back matters: a target
+/// naming one authority while `Host` names another is a routing-confusion
+/// vector, and without this the modern transport check compares `Host` against
+/// itself and sees nothing wrong.
+///
+/// A target is only treated as absolute form when the text before `://` is a
+/// syntactically valid scheme, so an origin-form path that merely contains
+/// `://` inside a query stays a path.
+pub(super) fn mcp_request_target_authority(uri: &http::Uri) -> Option<String> {
+    if let Some(authority) = uri.authority() {
+        return Some(authority.as_str().to_string());
+    }
+    let (scheme, rest) = uri.path().split_once("://")?;
+    let scheme_is_valid = !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    if !scheme_is_valid {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
 pub(super) fn mcp_modern_rejection_status(
     rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
     server_name: &str,
@@ -6131,6 +6156,55 @@ mod mcp_modern_contract_gate_tests {
                 "the frozen legacy error detail changed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_request_target_authority_tests {
+    use super::mcp_request_target_authority;
+
+    fn authority_of(target: &str) -> Option<String> {
+        // Built the way Pingora builds it, so the test exercises the shape the
+        // gateway actually receives rather than a URI parsed from scratch.
+        let uri = http::Uri::builder()
+            .path_and_query(target)
+            .build()
+            .expect("target parses as a path");
+        mcp_request_target_authority(&uri)
+    }
+
+    #[test]
+    fn absolute_form_target_yields_its_authority() {
+        assert_eq!(
+            authority_of("http://evil.example/"),
+            Some("evil.example".to_string())
+        );
+        assert_eq!(
+            authority_of("https://mcp.example.com:8443/mcp?x=1"),
+            Some("mcp.example.com:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn origin_form_target_has_no_authority() {
+        assert_eq!(authority_of("/"), None);
+        assert_eq!(authority_of("/mcp"), None);
+        assert_eq!(authority_of("/.well-known/mcp-server"), None);
+    }
+
+    #[test]
+    fn a_path_containing_a_scheme_like_query_is_still_a_path() {
+        // The text before `://` is not a valid scheme here, so this must not
+        // be read as an authority of `evil.example`.
+        assert_eq!(authority_of("/redirect?url=http://evil.example"), None);
+        assert_eq!(authority_of("/a/b?next=https://evil.example/x"), None);
+    }
+
+    #[test]
+    fn a_malformed_absolute_form_target_yields_nothing() {
+        assert_eq!(authority_of("://evil.example/"), None);
+        assert_eq!(authority_of("1http://evil.example/"), None);
+        assert_eq!(authority_of("http:///"), None);
     }
 }
 
