@@ -268,6 +268,13 @@ pub struct AiDecisionView {
     /// Bound as the `ai.providers` list. Empty when no router state is
     /// gathered (the default).
     pub providers: Vec<ProviderStateView>,
+    /// The origin's base-data document (per-model prices and context
+    /// windows), prebuilt in the shared form by
+    /// [`crate::routing_base_data::build_catalog_cel`] so this clone is a
+    /// reference-count bump. Bound as the `ai.catalog` map; `None` (the
+    /// default) binds an empty map, so `ai.model in ai.catalog` is the
+    /// guard either way and never an evaluation error.
+    pub catalog: Option<CelValue>,
 }
 
 impl AiDecisionView {
@@ -356,6 +363,12 @@ impl AiDecisionView {
             ("tokens".to_string(), CelValue::Map(tokens)),
             ("prompt".to_string(), CelValue::Map(prompt)),
             ("providers".to_string(), providers),
+            (
+                "catalog".to_string(),
+                self.catalog
+                    .clone()
+                    .unwrap_or_else(|| CelValue::Map(HashMap::new())),
+            ),
             ("principal".to_string(), CelValue::Map(principal)),
         ]);
         CelValue::Map(ai)
@@ -708,6 +721,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&easy).route_model(), None);
+    }
+
+    #[test]
+    fn catalog_is_bound_and_absent_catalog_is_a_guard_not_an_error() {
+        // Price-aware policy: block when the requested model's prompt price
+        // crosses a threshold. The catalog rides the shared form, exactly as
+        // production binds it.
+        let p = policy(
+            r#"ai.model in ai.catalog && ai.catalog[ai.model].input_per_million > 10.0
+               ? "block" : "allow""#,
+        );
+        let catalog = CelValue::Map(HashMap::from([(
+            "pricey".to_string(),
+            CelValue::Map(HashMap::from([(
+                "input_per_million".to_string(),
+                CelValue::Float(30.0),
+            )])),
+        )]))
+        .into_shared();
+        let view = AiDecisionView {
+            model: "pricey".into(),
+            catalog: Some(catalog),
+            ..Default::default()
+        };
+        assert!(p.evaluate(&view).is_block());
+
+        // No catalog gathered: the `in` guard reads an empty map and the
+        // policy allows, rather than erroring into on_error.
+        let bare = AiDecisionView {
+            model: "pricey".into(),
+            ..Default::default()
+        };
+        let decision = p.evaluate(&bare);
+        assert!(!decision.is_block());
+        assert!(!decision.fail_open, "an absent catalog must not fail open");
     }
 
     #[test]

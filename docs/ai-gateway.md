@@ -463,6 +463,35 @@ act on, so a policy sees the provider the way the gateway does. The signals are
 per provider (upstream), never per caller, so nothing tenant-specific crosses
 into the decision.
 
+Alongside the live signals sits `ai.catalog`, the base data a routing
+decision consults but does not own: what each of the origin's declared
+models costs (`input_per_million` and `output_per_million`, USD per million
+tokens, the unit `model_prices` is already written in) and how much context
+it holds (`context_window`). Prices resolve the way cost accounting
+resolves them, your `model_prices` and rate card first, then the built-in
+catalog, and the document rebuilds on config reload, so a price change is a
+config edit, never a policy edit. A model no layer knows is omitted, so
+`ai.model in ai.catalog` is the guard.
+
+The catalog is keyed by the models your providers declare, verbatim: a
+provider that omits `models` defers to the provider catalog and contributes
+nothing here, so an origin whose providers all defer gets an empty catalog
+and a load-time warning, because a policy reading it can never match.
+Declare `models` in the casing callers request them with:
+
+```yaml
+  ai_routing_policy:
+    # Send expensive prompts to the cheap tier unless the caller paid.
+    expression: |
+      ai.principal.tier != "pro"
+        && ai.model in ai.catalog
+        && ai.catalog[ai.model].input_per_million > 10.0
+        ? {"candidates": [{"provider_id": "cheap", "model": "gpt-4o-mini"}],
+           "reason": "pricey model on a free plan", "reason_code": "price"}
+        : null
+    reason_codes: [price]
+```
+
 Two things the policy is not allowed to do. It cannot route to a model
 your origin or the caller's key does not allow: every candidate's model
 is re-checked against the same allowlist the request already passed, and
@@ -1102,7 +1131,7 @@ For CEL over the AI pipeline's own signals (surface, guardrail verdicts, budget 
 
 ## AI policy plane (CEL)
 
-Where CEL guardrails and request modifiers act on the raw HTTP request, the AI policy plane is one sandboxed CEL expression over the signals the AI pipeline itself computes: `ai.surface`, `ai.principal.*`, `ai.guardrails.*`, `ai.budget.*`, `ai.tokens.*`, `ai.prompt.*`, `ai.providers.*`. It runs after guardrail evaluation and before provider selection, and it can only emit actions from a closed set (allow, block, redact, `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`). Off until you add an `ai_policy` block:
+Where CEL guardrails and request modifiers act on the raw HTTP request, the AI policy plane is one sandboxed CEL expression over the signals the AI pipeline itself computes: `ai.surface`, `ai.principal.*`, `ai.guardrails.*`, `ai.budget.*`, `ai.tokens.*`, `ai.prompt.*`, `ai.providers.*`, `ai.catalog`. It runs after guardrail evaluation and before provider selection, and it can only emit actions from a closed set (allow, block, redact, `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`). Off until you add an `ai_policy` block:
 
 ```yaml
 action:

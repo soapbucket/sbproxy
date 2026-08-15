@@ -27,7 +27,14 @@ impl AiProxyAction {
         value: serde_json::Value,
         prepare_runtime: bool,
     ) -> anyhow::Result<Self> {
-        let mut config = sbproxy_ai::AiHandlerConfig::from_config(value)?;
+        // A validation-only compile must not install the candidate's price
+        // table into the process-global cost-accounting table; a rejected
+        // candidate would otherwise leave live billing on its prices.
+        let mut config = if prepare_runtime {
+            sbproxy_ai::AiHandlerConfig::from_config(value)?
+        } else {
+            sbproxy_ai::AiHandlerConfig::from_config_for_validation(value)?
+        };
         if !prepare_runtime {
             // WOR-2098: validate and plan construction resolve RAG
             // credential references too when a process resolver is

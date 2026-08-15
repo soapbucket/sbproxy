@@ -390,6 +390,8 @@ fn cel_to_string(value: &sbproxy_extension::cel::CelValue) -> String {
         CelValue::Float(f) => f.to_string(),
         CelValue::Bool(b) => b.to_string(),
         CelValue::Null => String::new(),
+        // Maps, lists, and `Shared` (never a script result today) fall back
+        // to their debug form rather than pretending to be a log scalar.
         other => format!("{other:?}"),
     }
 }

@@ -624,6 +624,10 @@ fn cel_value_to_json(value: &CelValue) -> serde_json::Value {
             }
             serde_json::Value::Object(out)
         }
+        // A pre-converted shared value: materialize it and convert the
+        // owned form. Script results never are one, but a converter must
+        // not guess about an enum it does not exhaust.
+        CelValue::Shared(_) => cel_value_to_json(&value.clone().into_owned()),
     }
 }
 
