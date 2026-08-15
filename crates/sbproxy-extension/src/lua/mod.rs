@@ -212,6 +212,19 @@ impl LuaEngine {
         Ok(())
     }
 
+    /// Parse-check `script` without executing anything.
+    ///
+    /// Loads the chunk into a bare Lua state and compiles it to a
+    /// function, which surfaces syntax errors, and stops there: no call,
+    /// no globals, no sandbox needed. For config-load validation of
+    /// inline Lua (the AI routing policy, WOR-2366), so a typo refuses at
+    /// load instead of faulting on every request.
+    pub fn check_syntax(script: &str) -> Result<()> {
+        let lua = Lua::new();
+        lua.load(script).into_function()?;
+        Ok(())
+    }
+
     /// Execute a Lua script with the given globals set.
     ///
     /// Each key in `globals` is set as a Lua global variable before execution.

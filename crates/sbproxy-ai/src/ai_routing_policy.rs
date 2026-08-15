@@ -154,8 +154,11 @@ enum RoutingProgram {
     /// VM per evaluation, the decision-script cost model.
     Js { source: String },
     /// A Rego module, evaluated on a shared interpreter behind a lock;
-    /// the `ai` document is `input.ai`.
-    Rego(std::sync::Mutex<sbproxy_extension::rego::CompiledRego>),
+    /// the `ai` document is `input.ai`. Boxed because the interpreter is
+    /// an order of magnitude larger than the other variants and the
+    /// program is built once per config load, so the indirection costs
+    /// one allocation per load, not per request.
+    Rego(Box<std::sync::Mutex<sbproxy_extension::rego::CompiledRego>>),
 }
 
 impl RoutingProgram {
@@ -284,21 +287,49 @@ impl CompiledAiRoutingPolicy {
                         "ai_routing_policy `query`/`data`/`budget_ms` are Rego knobs; \
                          `engine: {engine}` takes only `source`"
                     ),
-                    "lua" => Ok(RoutingProgram::Lua {
-                        source: source.to_owned(),
-                    }),
+                    "lua" => {
+                        // Syntax errors refuse at load. Runtime faults (a nil
+                        // index, a bad return shape) still follow `on_error`.
+                        sbproxy_extension::lua::LuaEngine::check_syntax(source).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "ai_routing_policy lua `source` does not parse: {error:#}"
+                                )
+                            },
+                        )?;
+                        Ok(RoutingProgram::Lua {
+                            source: source.to_owned(),
+                        })
+                    }
+                    // JS has no compile-only seam in the embedded engine, so
+                    // a syntax error surfaces at first evaluation under
+                    // `on_error` rather than at load; the docs say so.
                     "js" => Ok(RoutingProgram::Js {
                         source: source.to_owned(),
                     }),
-                    "rego" => Ok(RoutingProgram::Rego(std::sync::Mutex::new(
-                        sbproxy_extension::rego::CompiledRego::compile(
-                            "ai_routing_policy",
-                            source,
-                            cfg.query.as_deref().unwrap_or(DEFAULT_REGO_QUERY),
-                            cfg.budget_ms.unwrap_or(DEFAULT_REGO_BUDGET_MS),
-                            cfg.data.clone(),
-                        )?,
-                    ))),
+                    "rego" => {
+                        // Same invariant the `rego` policy module holds: a zero
+                        // budget reads as "no budget" but is an instantly
+                        // expired timer. The load-time evaluability trial can
+                        // finish before regorus's first deadline check, so a
+                        // zero would load green and then abort every real
+                        // request into `on_error`.
+                        if cfg.budget_ms == Some(0) {
+                            anyhow::bail!(
+                                "ai_routing_policy `budget_ms` must be greater than zero; a \
+                                 zero budget would abort every evaluation before the rule ran"
+                            );
+                        }
+                        Ok(RoutingProgram::Rego(Box::new(std::sync::Mutex::new(
+                            sbproxy_extension::rego::CompiledRego::compile(
+                                "ai_routing_policy",
+                                source,
+                                cfg.query.as_deref().unwrap_or(DEFAULT_REGO_QUERY),
+                                cfg.budget_ms.unwrap_or(DEFAULT_REGO_BUDGET_MS),
+                                cfg.data.clone(),
+                            )?,
+                        ))))
+                    }
                     "cel" => anyhow::bail!(
                         "ai_routing_policy CEL policies are written as `expression`, not \
                          `engine: cel`"
@@ -684,6 +715,19 @@ mod tests {
         let mut bad = bad_query;
         bad.query = Some("data.sbproxy.missing".to_owned());
         assert!(CompiledAiRoutingPolicy::compile(&bad).is_err());
+
+        // A zero Rego budget would abort every evaluation before the rule
+        // ran; refuse it by name, the same invariant the rego policy
+        // module holds.
+        let mut zero = engine_config("rego", "package sbproxy\nroute := 1");
+        zero.budget_ms = Some(0);
+        let error = CompiledAiRoutingPolicy::compile(&zero).expect_err("zero budget refused");
+        assert!(error.to_string().contains("budget_ms"), "{error}");
+
+        // A Lua syntax error refuses at load, not at the first request.
+        let error = CompiledAiRoutingPolicy::compile(&engine_config("lua", "retrun nil"))
+            .expect_err("lua typo refused");
+        assert!(error.to_string().contains("does not parse"), "{error}");
     }
 
     #[test]

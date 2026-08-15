@@ -784,6 +784,11 @@ mod tests {
             // the walker sees its real structure, not an opaque leaf.
             match value.clone().into_owned() {
                 CelValue::Map(entries) => {
+                    // An empty map still contributes its own path, so a
+                    // field added empty on one side only cannot hide.
+                    if entries.is_empty() {
+                        out.insert(prefix.to_string());
+                    }
                     for (key, child) in entries {
                         cel_paths(&format!("{prefix}.{key}"), &child, out);
                     }
@@ -807,6 +812,9 @@ mod tests {
         ) {
             match value {
                 serde_json::Value::Object(entries) => {
+                    if entries.is_empty() {
+                        out.insert(prefix.to_string());
+                    }
                     for (key, child) in entries {
                         json_paths(&format!("{prefix}.{key}"), child, out);
                     }

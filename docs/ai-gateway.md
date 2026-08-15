@@ -509,9 +509,55 @@ Anything else collapses to `other`, and an absent code reads as `policy`,
 which keeps a policy from filling the label with unbounded distinct
 values.
 
-CEL is the only engine today. The plan format is shared with the
-document engines, so the same decision will accept Lua, JavaScript,
-WebAssembly, and Rego once those land.
+The policy is not tied to CEL. The `engine` + `source` form authors the
+same decision in Lua, JavaScript, or Rego, all reading the same `ai`
+document (Lua and JavaScript as an `ai` global, Rego as `input.ai`) and
+returning the same plan shape, so a policy ported between engines
+renames nothing. `on_error` and `reason_codes` work identically in every
+engine.
+
+```yaml
+  # Lua: return a plan table, or nil to decline.
+  ai_routing_policy:
+    engine: lua
+    source: |
+      if ai.prompt.difficulty < 0.3 then
+        return { candidates = {{provider_id = "cheap", model = "gpt-4o-mini"}},
+                 reason = "easy prompt", reason_code = "cost" }
+      end
+      return nil
+    reason_codes: [cost]
+```
+
+```yaml
+  # Rego: the queried rule's value is the plan; undefined declines.
+  # `data` is a base-data table the rules read as `data.*`, so the
+  # routing map changes without the policy changing.
+  ai_routing_policy:
+    engine: rego
+    source: |
+      package sbproxy
+      route := {"candidates": [{"provider_id": data.cheap_provider, "model": "gpt-4o-mini"}],
+                "reason": "over budget"} if {
+          input.ai.budget.fraction > 0.8
+      }
+    data:
+      cheap_provider: cheap
+    reason_codes: [cost]
+```
+
+Lua and JavaScript run inline source on a fresh sandboxed VM per
+evaluation, the same cost model as every other inline script surface.
+Lua source is parse-checked at config load; JavaScript has no
+compile-only seam in the embedded engine, so a JS syntax error surfaces
+at the first evaluation under `on_error` rather than at load. Rego
+evaluates on a shared in-process interpreter with a 50 ms budget
+(`budget_ms` to change it, which must be greater than zero), a `query`
+defaulting to `data.sbproxy.route`, and load-time validation: a module
+whose query names no rule refuses at config load rather than declining
+forever. A
+`wasm` routing hook is a compiled bundle rather than inline source and
+arrives through the extension-bundle registry in a later release.
 
 ## Resilience
 

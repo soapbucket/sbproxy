@@ -412,3 +412,120 @@ fn the_catalog_prices_are_visible_to_the_routing_policy() {
         "cheap must be untouched when the catalog drives the plan"
     );
 }
+
+/// A Lua routing policy: same two-provider shape as the CEL tests, the
+/// policy authored as an inline script that plans to `frontier` for a real
+/// prompt (non-empty fingerprint) and would decline otherwise. Wired ⇒
+/// frontier serves; a broken engine seam ⇒ decline ⇒ round_robin ⇒ cheap.
+fn lua_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        engine: lua
+        source: |
+          if ai.prompt.fingerprint ~= "" then
+            return {{ candidates = {{{{provider_id = "frontier", model = "gpt-4o"}}}},
+                     reason = "lua plan", reason_code = "lua" }}
+          end
+          return nil
+        reason_codes: [lua]
+"#
+    )
+}
+
+#[test]
+fn a_lua_policy_drives_the_plan_end_to_end() {
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy = ProxyHarness::start_with_yaml(&lua_config(&cheap.base_url(), &frontier.base_url()))
+        .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "the lua plan must dispatch to frontier"
+    );
+    assert!(cheap.captured().is_empty(), "cheap must be untouched");
+}
+
+/// A Rego routing policy reading base data: the rule plans to the provider
+/// named in `data.target` whenever the request carries a prompt. Wired ⇒
+/// frontier serves; broken ⇒ decline ⇒ round_robin ⇒ cheap.
+fn rego_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        engine: rego
+        source: |
+          package sbproxy
+          route := {{"candidates": [{{"provider_id": data.target, "model": "gpt-4o"}}],
+                    "reason": "rego plan"}} if {{
+              input.ai.prompt.fingerprint != ""
+          }}
+        data:
+          target: frontier
+"#
+    )
+}
+
+#[test]
+fn a_rego_policy_reads_base_data_and_drives_the_plan() {
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy =
+        ProxyHarness::start_with_yaml(&rego_config(&cheap.base_url(), &frontier.base_url()))
+            .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "the rego plan (via data.target) must dispatch to frontier"
+    );
+    assert!(cheap.captured().is_empty(), "cheap must be untouched");
+}
