@@ -13,8 +13,8 @@
 //! Vulkan-only llama.cpp prebuilt cannot take on some images.
 //!
 //! Like the llama.cpp release, `uv` is a pinned GitHub release asset,
-//! extracted with `tar`. The pure URL/target logic is unit-tested; the
-//! fetch is behind the `weights` feature.
+//! extracted in-process from a gzip tarball. The pure URL/target logic is
+//! unit-tested; the fetch is behind the `weights` feature.
 
 #[cfg(feature = "weights")]
 use std::path::PathBuf;
@@ -59,7 +59,7 @@ pub fn uv_asset_url(version: &str) -> Result<String, String> {
 
 /// Ensure a `uv` binary is available: prefer one on `PATH`, else fetch the
 /// pinned release into `cache_dir` and return the extracted path. Behind
-/// the `weights` feature; shells out to `tar`.
+/// the `weights` feature; unpacks the tarball in-process.
 #[cfg(feature = "weights")]
 pub async fn ensure_uv(cache_dir: &std::path::Path, version: &str) -> Result<PathBuf, String> {
     if let Some(p) = resolve_on_path("uv") {
@@ -90,17 +90,7 @@ pub async fn ensure_uv(cache_dir: &std::path::Path, version: &str) -> Result<Pat
         .await
         .map_err(|e| format!("write {}: {e}", archive.display()))?;
 
-    let status = tokio::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&dest_dir)
-        .status()
-        .await
-        .map_err(|e| format!("tar: {e}"))?;
-    if !status.success() {
-        return Err(format!("tar extract of {} failed", archive.display()));
-    }
+    crate::archive::extract_tar_gz_async(&archive, &dest_dir).await?;
     crate::llama_release::find_file_named(&dest_dir, "uv").ok_or_else(|| {
         format!(
             "uv not found in the extracted release under {}",

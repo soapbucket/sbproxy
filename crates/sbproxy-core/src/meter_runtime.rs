@@ -982,10 +982,12 @@ fn resolved_origin(ctx: &RequestContext) -> Option<&ResolvedOriginAttestation> {
 /// disconnect, not a hit; a refused request is a policy block that happens
 /// to carry a status, and an operator prices those separately.
 ///
-/// [`sbproxy_meter::BillableOutcome::Retry`] is deliberately not produced
-/// here. It is not an observation about one attempt, it is what the outcome
-/// table's `Collapse` answer does to several attempts sharing one
-/// `claim_id`, and the chain already dedups on that key.
+/// [`sbproxy_meter::BillableOutcome::Retry`] is the successful multi-attempt
+/// case: HTTP origin retries (`retry_count`), extra AI provider attempts, or
+/// a failover/fallback handoff. Disconnects, cache hits, refusals, and
+/// origin errors still outrank it. A retried call that ends in 500 is an
+/// origin failure, not a billed retry. Collapse then folds several such
+/// events that share a `claim_id` into one sale.
 fn classify_outcome(
     ctx: &RequestContext,
     status: u16,
@@ -1020,6 +1022,9 @@ fn classify_outcome(
     }
     if status >= 500 {
         return BillableOutcome::Origin5xx;
+    }
+    if ctx.admin_retry_count() > 0 || ctx.admin_failover_engaged() {
+        return BillableOutcome::Retry;
     }
     BillableOutcome::Delivered
 }
@@ -1594,6 +1599,50 @@ mod tests {
             classify_outcome(&ctx, 304, false),
             BillableOutcome::Delivered,
             "a redirect or a not-modified is a call that was served"
+        );
+    }
+
+    #[test]
+    fn a_successful_retry_or_failover_is_retry_not_delivered() {
+        let mut retried = RequestContext::new();
+        retried.retry_count = 1;
+        assert_eq!(
+            classify_outcome(&retried, 200, false),
+            BillableOutcome::Retry,
+            "HTTP origin retries that eventually succeed are Retry"
+        );
+
+        let mut ai_failover = RequestContext::new();
+        ai_failover.record_admin_ai_attempt("bad-key");
+        ai_failover.record_admin_ai_attempt("good-key");
+        assert_eq!(
+            classify_outcome(&ai_failover, 200, false),
+            BillableOutcome::Retry,
+            "AI fallback_chain that lands on a later provider is Retry"
+        );
+
+        let mut fallback = RequestContext::new();
+        fallback.fallback_triggered = true;
+        assert_eq!(
+            classify_outcome(&fallback, 200, false),
+            BillableOutcome::Retry
+        );
+    }
+
+    #[test]
+    fn a_retry_that_still_fails_keeps_the_origin_error() {
+        let mut ctx = RequestContext::new();
+        ctx.retry_count = 2;
+        ctx.record_admin_ai_attempt("primary");
+        ctx.record_admin_ai_attempt("backup");
+        assert_eq!(
+            classify_outcome(&ctx, 500, false),
+            BillableOutcome::Origin5xx,
+            "exhausted retries that end in 5xx are an origin failure"
+        );
+        assert_eq!(
+            classify_outcome(&ctx, 404, false),
+            BillableOutcome::Origin4xx
         );
     }
 

@@ -130,19 +130,20 @@ onUnmounted(stopStream);
           : 'No operation jobs. Load or evict a deployment, or pull an artifact, to see one here.'
       "
     />
-    <table class="sb-table" v-else>
-      <thead>
-        <tr>
-          <th>Job</th>
-          <th>Kind</th>
-          <th>Deployment</th>
-          <th>State</th>
-          <th>Progress</th>
-          <th>Started</th>
-          <th>Updated</th>
-        </tr>
-      </thead>
-      <tbody>
+    <div class="sb-table-wrap" v-else>
+      <table class="sb-table">
+        <thead>
+          <tr>
+            <th>Job</th>
+            <th>Kind</th>
+            <th>Deployment</th>
+            <th>State</th>
+            <th>Progress</th>
+            <th>Started</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
         <template v-for="job in filteredJobs" :key="job.id">
           <tr class="job-row" @click="selectJob(job)" :class="{ 'job-row--active': selectedJobId === job.id }">
             <td class="sb-mono" :title="job.id">{{ shortId(job.id) }}</td>
@@ -199,8 +200,9 @@ onUnmounted(stopStream);
             </td>
           </tr>
         </template>
-      </tbody>
-    </table>
+        </tbody>
+      </table>
+    </div>
   </template>
 </template>
 

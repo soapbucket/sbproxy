@@ -76,6 +76,11 @@ nvml-wrapper = { version = "0.10", optional = true }
 # right backend but not real chunk-level dedup, which needs the Xet CAS
 # protocol itself -- see the `hf-xet-transport` feature below.
 reqwest = { workspace = true, optional = true }
+# Engine-release tarballs (llama.cpp, mistral.rs, uv) unpack in-process so
+# Model Host works on the distroless gateway image, which has no `tar`
+# binary (WOR-2412). Already in the workspace lockfile via sbproxy-modules.
+tar = "0.4"
+flate2 = "1"
 # `hf-xet-transport` feature only: hf-hub 1.0 speaks the Xet
 # chunk-deduplication protocol transparently through its managed,
 # content-addressed download client (`HF_HUB_CACHE`); the sbproxy
