@@ -213,9 +213,10 @@ impl LedgerPayload for ChainedReceipt {
     /// and it is the only payload in this workspace that meets it. Both
     /// sides of `sbproxy_meter_divergence_total` count the same quantity
     /// because they are computed once and used twice: [`record_response`]
-    /// calls `sbproxy_meter::OutcomeTable::billable_units` a single time,
-    /// hands that slice to `sbproxy_meter::metrics::observe_settled_event`
-    /// for the counted side, and maps the same slice through
+    /// calls `sbproxy_meter::OutcomeTable::settle` once over the sale and
+    /// any collapsed retry attempts, which reports each attempt through
+    /// `sbproxy_meter::metrics::observe_settled_event` and yields the billed
+    /// units mapped through
     /// `sbproxy_modules::policy::receipt_token::ReceiptUnit::from` into the
     /// document this reads back. A payload that answered one side and not
     /// the other would manufacture a disagreement instead of detecting one,
@@ -739,38 +740,31 @@ pub(crate) fn record_response(
 
     let tenant = ctx.tenant_id.as_str();
     let outcome = classify_outcome(ctx, status, client_disconnected);
-
-    let event = MeteredEvent {
-        subject: Subject {
-            tenant: tenant.to_string(),
-            key_id: ctx.accountable_key_id().map(str::to_string),
-            agent: None,
-        },
-        route: path.to_string(),
-        // A plain `String` on this type, and empty because there is no
-        // request-side digest to put in it. See `ReceiptFacts::claims`.
-        request_digest: String::new(),
-        response_digest: None,
-        outcome,
-        units: resolve_units(runtime, ctx, method, path),
-        claim_id: ctx.request_id.to_string(),
-    };
-
-    let billable = runtime.outcomes.billable(outcome);
-    let billed = runtime.outcomes.billable_units(&event);
-    // Reported before anything is written, and reported whatever happens to
-    // the chain afterwards. The counters describe what the meter saw; the
-    // chain describes what it managed to record. When those two disagree,
-    // `sbproxy_meter_divergence_total` is how anybody finds out.
-    sbproxy_meter::metrics::observe_settled_event(&event, billable, &billed);
+    let accrued = resolve_units(runtime, ctx, method, path);
+    // Prior attempts are their own events so `billable.retry: collapse`
+    // has something to fold. The sale is still `outcome`: a successful
+    // retry is delivered once, not a lone Retry that collapse zeros.
+    // `settle` reports each attempt; do not observe the sale a second time.
+    let events = attempt_events(ctx, method, path, outcome, accrued);
+    let billed = runtime
+        .outcomes
+        .settle(&events)
+        .into_iter()
+        .next()
+        .map(|claim| claim.units)
+        .unwrap_or_default();
 
     let facts = ReceiptFacts {
-        claim_id: event.claim_id.clone(),
+        claim_id: ctx.request_id.to_string(),
         // `agreement_id` is a plain `String` on the wire, so an origin that
         // names no contract records consumption under an empty one rather
         // than changing the shape of the document.
         agreement_id: origin.agreement_id.clone().unwrap_or_default(),
-        subject: ReceiptSubject::from(&event.subject),
+        subject: ReceiptSubject::from(&Subject {
+            tenant: tenant.to_string(),
+            key_id: ctx.accountable_key_id().map(str::to_string),
+            agent: None,
+        }),
         route: path.to_string(),
         config_revision: ctx.pipeline.config_revision.clone(),
     };
@@ -982,12 +976,12 @@ fn resolved_origin(ctx: &RequestContext) -> Option<&ResolvedOriginAttestation> {
 /// disconnect, not a hit; a refused request is a policy block that happens
 /// to carry a status, and an operator prices those separately.
 ///
-/// [`sbproxy_meter::BillableOutcome::Retry`] is the successful multi-attempt
-/// case: HTTP origin retries (`retry_count`), extra AI provider attempts, or
-/// a failover/fallback handoff. Disconnects, cache hits, refusals, and
-/// origin errors still outrank it. A retried call that ends in 500 is an
-/// origin failure, not a billed retry. Collapse then folds several such
-/// events that share a `claim_id` into one sale.
+/// [`sbproxy_meter::BillableOutcome::Retry`] is not produced here. It is
+/// one attempt of a call that was retried, not the sale. `record_response`
+/// emits those attempts as their own events so the outcome table's
+/// Collapse answer can fold them under the same `claim_id`. The event this
+/// function names is the final attempt: a 200 after failover is delivered,
+/// and a retried call that ends in 500 is an origin failure.
 fn classify_outcome(
     ctx: &RequestContext,
     status: u16,
@@ -1023,10 +1017,82 @@ fn classify_outcome(
     if status >= 500 {
         return BillableOutcome::Origin5xx;
     }
-    if ctx.admin_retry_count() > 0 || ctx.admin_failover_engaged() {
-        return BillableOutcome::Retry;
-    }
     BillableOutcome::Delivered
+}
+
+/// Extra origin or provider attempts after the first.
+///
+/// `admin_retry_count` already folds HTTP origin retries and extra AI
+/// attempts. A failover flag with that count still at zero is a handoff
+/// that never incremented a counter, and still costs one collapsed
+/// attempt.
+fn prior_retry_count(ctx: &RequestContext) -> u32 {
+    let retried = ctx.admin_retry_count();
+    if retried > 0 {
+        retried
+    } else if ctx.admin_failover_engaged() {
+        1
+    } else {
+        0
+    }
+}
+
+/// One metered pass: the tenant, the route, the claim, the units, and
+/// which attempt this was.
+fn metered_event(
+    ctx: &RequestContext,
+    path: &str,
+    outcome: BillableOutcome,
+    units: Vec<Unit>,
+) -> MeteredEvent {
+    MeteredEvent {
+        subject: Subject {
+            tenant: ctx.tenant_id.to_string(),
+            key_id: ctx.accountable_key_id().map(str::to_string),
+            agent: None,
+        },
+        route: path.to_string(),
+        // A plain `String` on this type, and empty because there is no
+        // request-side digest to put in it. See `ReceiptFacts::claims`.
+        request_digest: String::new(),
+        response_digest: None,
+        outcome,
+        units,
+        claim_id: ctx.request_id.to_string(),
+    }
+}
+
+/// The final attempt, preceded by one Retry event per extra attempt.
+///
+/// Disconnects, cache hits, and proxy refusals are not origin retries, so
+/// they stay a single event even if a counter happened to be set.
+fn attempt_events(
+    ctx: &RequestContext,
+    _method: &str,
+    path: &str,
+    outcome: BillableOutcome,
+    units: Vec<Unit>,
+) -> Vec<MeteredEvent> {
+    let retries = if ctx.deny_reason.is_some()
+        || matches!(
+            outcome,
+            BillableOutcome::ClientDisconnected | BillableOutcome::CacheHit
+        ) {
+        0
+    } else {
+        prior_retry_count(ctx)
+    };
+    let mut events = Vec::with_capacity(retries as usize + 1);
+    for _ in 0..retries {
+        events.push(metered_event(
+            ctx,
+            path,
+            BillableOutcome::Retry,
+            units.clone(),
+        ));
+    }
+    events.push(metered_event(ctx, path, outcome, units));
+    events
 }
 
 /// Resolve every configured unit rule against this request.
@@ -1603,13 +1669,13 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_retry_or_failover_is_retry_not_delivered() {
+    fn a_successful_retry_or_failover_is_still_delivered() {
         let mut retried = RequestContext::new();
         retried.retry_count = 1;
         assert_eq!(
             classify_outcome(&retried, 200, false),
-            BillableOutcome::Retry,
-            "HTTP origin retries that eventually succeed are Retry"
+            BillableOutcome::Delivered,
+            "Retry is an intermediate attempt, not the sale"
         );
 
         let mut ai_failover = RequestContext::new();
@@ -1617,15 +1683,90 @@ mod tests {
         ai_failover.record_admin_ai_attempt("good-key");
         assert_eq!(
             classify_outcome(&ai_failover, 200, false),
-            BillableOutcome::Retry,
-            "AI fallback_chain that lands on a later provider is Retry"
+            BillableOutcome::Delivered,
+            "AI fallback_chain that lands on a later provider still sold the answer"
         );
 
         let mut fallback = RequestContext::new();
         fallback.fallback_triggered = true;
         assert_eq!(
             classify_outcome(&fallback, 200, false),
-            BillableOutcome::Retry
+            BillableOutcome::Delivered
+        );
+    }
+
+    #[test]
+    fn extra_attempts_are_retry_events_folded_under_the_same_claim() {
+        let mut retried = RequestContext::new();
+        retried.retry_count = 2;
+        retried.request_id = compact_str::CompactString::new("claim-retry");
+        let events = attempt_events(
+            &retried,
+            METHOD,
+            PATH,
+            BillableOutcome::Delivered,
+            Vec::new(),
+        );
+        assert_eq!(
+            events.iter().map(|event| event.outcome).collect::<Vec<_>>(),
+            vec![
+                BillableOutcome::Retry,
+                BillableOutcome::Retry,
+                BillableOutcome::Delivered,
+            ],
+            "prior attempts exist so collapse has something to fold"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.claim_id == retried.request_id.as_str()),
+            "retries share the claim so they settle as one sale"
+        );
+
+        let mut failed = RequestContext::new();
+        failed.retry_count = 1;
+        let exhausted = attempt_events(
+            &failed,
+            METHOD,
+            PATH,
+            BillableOutcome::Origin5xx,
+            Vec::new(),
+        );
+        assert_eq!(
+            exhausted
+                .iter()
+                .map(|event| event.outcome)
+                .collect::<Vec<_>>(),
+            vec![BillableOutcome::Retry, BillableOutcome::Origin5xx],
+            "a call that never succeeded keeps the origin error as the sale"
+        );
+    }
+
+    #[test]
+    fn a_successful_retry_still_bills_under_collapse() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let mut ctx = context(runtime(&ledger_path, FailureMode::Degraded));
+        ctx.retry_count = 1;
+
+        let settled = record_response(&ctx, METHOD, PATH, 200, false)
+            .expect("a receipt-writing origin settles something");
+
+        assert_eq!(
+            settled.outcome,
+            BillableOutcome::Delivered,
+            "the signed receipt names the sale, not the collapsed attempts"
+        );
+        assert!(
+            !settled.billed.is_empty(),
+            "billable.retry: collapse drops Retry attempts, not the delivered sale"
+        );
+        let written = entries(&ledger_path);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].event.0.outcome, "delivered");
+        assert!(
+            !written[0].event.0.units.is_empty(),
+            "the chain entry carries the billed units, not an emptied collapse"
         );
     }
 

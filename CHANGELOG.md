@@ -71,10 +71,12 @@ the next version cut.
   refusals and upstream auth failures were one value and are now
   distinguishable; dashboards keyed on `outcome="auth_denied"` need
   updating. Usage rollups keep the legacy mapping.
-- **Meter receipts now record `retry` for a successful multi-attempt
-  call.** Provider fallback and HTTP origin retries previously always
-  classified as `delivered`, so `billable.retry: collapse` never ran.
-  Exhausted retries that still end in 4xx/5xx keep those outcomes.
+- **Meter receipts now fold extra attempts under `billable.retry: collapse`.**
+  Provider fallback and HTTP origin retries previously billed only the
+  final attempt as `delivered`, so the `retry` outcome never ran. Extra
+  attempts are recorded as `retry` and collapse; the receipt that bills
+  remains `delivered`. Exhausted retries that still end in 4xx/5xx keep
+  those outcomes.
 - **The Kubernetes operator image builds inside Docker.**
   `crates/sbproxy-k8s-operator/Dockerfile.ci` compiled on the host and
   copied a `target/` binary that `.dockerignore` excluded (and that was
