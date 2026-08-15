@@ -1247,6 +1247,17 @@ fn reload_compiled_config_locked(
     Ok(outcome)
 }
 
+/// Digest of the config file's bytes, or `None` when it cannot be read.
+///
+/// `None` never compares equal to itself here, so an unreadable file always
+/// attempts the reload and lets that path report the real error rather than
+/// being silently swallowed as "unchanged".
+fn config_file_digest(path: &std::path::Path) -> Option<[u8; 32]> {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).ok()?;
+    Some(sha2::Sha256::digest(&bytes).into())
+}
+
 pub(super) fn start_config_watcher(config_path: String) {
     use notify::{RecursiveMode, Watcher};
 
@@ -1284,19 +1295,53 @@ pub(super) fn start_config_watcher(config_path: String) {
 
         tracing::info!(path = %config_path, dir = %watch_dir.display(), "config file watcher started");
 
+        // Watching the directory is what makes an atomic-rename save visible,
+        // but it also reports every unrelated file in that directory. A
+        // config sharing a directory with logs, editor swap files, or a
+        // Kubernetes ConfigMap's `..data` churn would otherwise reload the
+        // pipeline on activity that has nothing to do with it, and a reload
+        // is not free: it replaces the compiled origin chain, which discards
+        // every live MCP session and makes callers re-initialize.
+        //
+        // So narrow twice. First to events that name the config file, which
+        // covers the rename case because the rename creates that name. Then
+        // to a content change, because an editor or config-management tool
+        // can rewrite a file byte-for-byte and a no-op reload should stay a
+        // no-op rather than cost sessions.
+        let config_file_name = cfg_path.file_name().map(std::ffi::OsString::from);
+        let names_config_file = |event: &notify::Event| {
+            event
+                .paths
+                .iter()
+                .any(|path| path == &cfg_path || path.file_name() == config_file_name.as_deref())
+        };
+        let mut loaded_digest = config_file_digest(&cfg_path);
+
         for event in rx {
             match event {
                 Ok(event)
-                    if event.kind.is_modify()
+                    if (event.kind.is_modify()
                         || event.kind.is_create()
-                        || event.kind.is_remove() =>
+                        || event.kind.is_remove())
+                        && names_config_file(&event) =>
                 {
-                    tracing::info!("config directory changed, reloading...");
+                    let current_digest = config_file_digest(&cfg_path);
+                    if current_digest.is_some() && current_digest == loaded_digest {
+                        tracing::debug!(
+                            path = %config_path,
+                            "config file touched but its contents are unchanged; not reloading"
+                        );
+                        continue;
+                    }
+                    tracing::info!(path = %config_path, "config file changed, reloading...");
                     // The outcome's degraded list is already logged by
                     // the reload itself; the watcher only needs to know
                     // whether the reload was refused outright.
-                    if let Err(e) = reload_from_config_path(&config_path) {
-                        tracing::error!(error = %e, "reload failed; serving prior pipeline");
+                    match reload_from_config_path(&config_path) {
+                        Ok(_) => loaded_digest = current_digest,
+                        Err(e) => {
+                            tracing::error!(error = %e, "reload failed; serving prior pipeline");
+                        }
                     }
                 }
                 Err(e) => {

@@ -1030,7 +1030,88 @@ fn modern_request_never_enters_legacy_session_or_stream_paths() {
             &[("Mcp-Session-Id", session_id.as_str())],
         )
         .expect("reuse legacy session after modern requests");
-    assert_eq!(legacy_list.status, 200);
+    assert_eq!(
+        legacy_list.status,
+        200,
+        "session={session_id} body={}",
+        String::from_utf8_lossy(&legacy_list.body)
+    );
+}
+
+/// Unrelated file activity beside the config must not reload the pipeline.
+///
+/// The config watcher watches the parent directory, because that is the only
+/// way to see an atomic-rename save or a Kubernetes ConfigMap swap. It used to
+/// reload on any create, modify, or remove in that directory, and a reload
+/// replaces the compiled origin chain and discards every live MCP session. A
+/// config sharing a directory with logs, editor swap files, or another
+/// process's temp files therefore dropped sessions on activity that had
+/// nothing to do with it.
+///
+/// This is also what made the surrounding tests flaky: the harness writes its
+/// config to the shared temp directory, so every other test's temp file was
+/// reloading this gateway.
+#[test]
+fn unrelated_file_activity_beside_the_config_keeps_sessions_alive() {
+    let upstream = MockMcpUpstream::legacy();
+    let harness = start_gateway(&upstream, true);
+    let init = harness
+        .post_json(
+            "/",
+            "mcp.localhost",
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}}
+            }),
+            &[],
+        )
+        .expect("initialize legacy session");
+    let session_id = init
+        .headers
+        .get("mcp-session-id")
+        .expect("legacy initialize issues a session")
+        .to_string();
+
+    // Churn the directory the config lives in, the way any co-located log,
+    // editor swap file, or neighbouring process would.
+    let config_dir = harness
+        .config_path()
+        .parent()
+        .expect("config has a parent directory")
+        .to_path_buf();
+    for index in 0..8 {
+        let neighbour = config_dir.join(format!(
+            "sbproxy-watcher-neighbour-{}-{index}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&neighbour, b"not the config").expect("write neighbour file");
+        std::fs::remove_file(&neighbour).expect("remove neighbour file");
+    }
+
+    // Also rewrite the config with its own bytes: a no-op save must not cost
+    // sessions either.
+    let config = std::fs::read(harness.config_path()).expect("read config");
+    std::fs::write(harness.config_path(), &config).expect("rewrite config unchanged");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let reuse = harness
+        .post_json(
+            "/",
+            "mcp.localhost",
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            &[("Mcp-Session-Id", session_id.as_str())],
+        )
+        .expect("reuse session after unrelated directory activity");
+    assert_eq!(
+        reuse.status,
+        200,
+        "session must survive unrelated file activity: {}",
+        String::from_utf8_lossy(&reuse.body)
+    );
 }
 
 #[test]
