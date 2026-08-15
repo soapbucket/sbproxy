@@ -708,6 +708,20 @@ pub fn build_javascript_policy(
     Ok(JavascriptPolicyAdapter { type_name, program })
 }
 
+#[cfg(test)]
+impl JavascriptPolicyAdapter {
+    /// Run this policy on a private worker so a workspace-wide
+    /// nextest run cannot queue it behind other JavaScript hooks and
+    /// eat its sandbox budget (WOR-2445). The generous budget is
+    /// test-only: two loopback fetches plus JS under load exceed the
+    /// 1000 ms config cap that production manifests cannot raise.
+    pub(crate) fn with_isolated_executor_and_generous_budget(mut self) -> Self {
+        self.program.executor = Arc::new(JavascriptExecutor::start(1, 1));
+        self.program.limits.budget_ms = 5_000;
+        self
+    }
+}
+
 impl PolicyEnforcer for JavascriptPolicyAdapter {
     fn policy_type(&self) -> &str {
         &self.type_name

@@ -86,6 +86,16 @@ the next version cut.
 
 ### Fixed
 
+- **Anthropic multi-tool-call streams now close every content block.**
+  The Messages SSE emitter opened a `content_block_start` per tool call
+  but always emitted `content_block_stop` at `index: 0`, so a native
+  Anthropic client watching a stream with two or more tool calls saw a
+  mismatched block lifecycle.
+- **Gemini error bodies no longer look like empty successes.** A
+  generateContent response with no `candidates` (404, rate limit, or
+  a safety block carried only in `promptFeedback`) was translated into
+  an OpenAI completion with empty content and `finish_reason: stop`.
+  Those bodies now surface as an error envelope.
 - **llama.cpp and mistral.rs Model Host provisioning on the official
   Docker image.** Engine release extract shelled out to `tar`, which the
   distroless gateway image does not contain. Archives unpack in-process.

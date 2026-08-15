@@ -1219,10 +1219,10 @@ fn bundle_v1_digest_is_stable_across_two_computations() {
 // --- net:outbound (WOR-2424) ---
 
 fn outbound_manifest(name: &str, destination: &str) -> String {
-    // A generous budget: an outbound hook does real network work, so
-    // the default 50 ms is not the right ceiling for one, and the docs
-    // tell authors to raise it. 900 ms stays under the 1000 ms cap and
-    // keeps the wired listener test off the timeout edge under load.
+    // A generous documented budget for outbound fixtures. The wired
+    // listener test still isolates its executor (WOR-2445); 900 ms is
+    // the production-shaped ceiling the docs tell authors to raise
+    // toward, and stays under the 1000 ms config cap.
     format!(
         "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nsandbox:\n  budget_ms: 900\nhooks:\n  - kind: policy\n    type: outbound_probe\n    export: run\n    permissions:\n      - \"net:outbound={destination}\"\n"
     )
@@ -1353,7 +1353,8 @@ fn a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses() {
         .policy("outbound_probe")
         .expect("policy hook present");
     let adapter = crate::bundle::javascript::build_javascript_policy(policy, serde_json::json!({}))
-        .expect("adapter builds");
+        .expect("adapter builds")
+        .with_isolated_executor_and_generous_budget();
     let request = http::Request::builder()
         .method("GET")
         .uri("http://origin.test/")

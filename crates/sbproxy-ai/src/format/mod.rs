@@ -288,12 +288,16 @@ pub trait ChatFormat: Send + Sync + 'static {
     /// updates only) or several wire frames; the return is a vector
     /// of already-framed `data: ...\n\n` strings ready to write.
     ///
+    /// `ctx` is per-stream: an emitter may record open content-block
+    /// indexes there so later chunks (especially `MessageStop`) can
+    /// close every one. The format object itself stays stateless.
+    ///
     /// Implementors that do not yet wire streaming end to end return
     /// `ChatError::not_implemented` pointing at the follow-up ticket.
     fn from_hub_stream(
         &self,
         chunk: &HubChunk,
-        ctx: &BridgeContext,
+        ctx: &mut BridgeContext,
     ) -> Result<Vec<String>, ChatError>;
 }
 

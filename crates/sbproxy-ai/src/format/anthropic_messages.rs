@@ -142,9 +142,9 @@ impl ChatFormat for AnthropicMessagesFormat {
     fn from_hub_stream(
         &self,
         chunk: &HubChunk,
-        _ctx: &BridgeContext,
+        ctx: &mut BridgeContext,
     ) -> Result<Vec<String>, ChatError> {
-        Ok(hub_chunk_to_anthropic_sse(chunk))
+        Ok(hub_chunk_to_anthropic_sse(chunk, ctx))
     }
 }
 
@@ -155,10 +155,11 @@ impl ChatFormat for AnthropicMessagesFormat {
 /// The Anthropic shape is more frame-heavy than the hub vocabulary:
 /// `MessageStart` expands to `event: message_start` *and* an opening
 /// `event: content_block_start` so a first `text_delta` always lands
-/// at a known content block. `MessageStop` emits both a
+/// at a known content block. `MessageStop` emits a
+/// `event: content_block_stop` for every still-open block, then a
 /// `event: message_delta` carrying `stop_reason` and the terminal
 /// `event: message_stop` frame.
-pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
+pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk, ctx: &mut BridgeContext) -> Vec<String> {
     match chunk {
         HubChunk::MessageStart { id, model } => {
             let start = json!({
@@ -179,6 +180,7 @@ pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
                 "index": 0,
                 "content_block": {"type": "text", "text": ""}
             });
+            record_open_block(ctx, 0);
             vec![
                 format!("event: message_start\ndata: {start}\n\n"),
                 format!("event: content_block_start\ndata: {block_open}\n\n"),
@@ -214,6 +216,7 @@ pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
                     "index": index,
                     "content_block": Value::Object(block),
                 });
+                record_open_block(ctx, *index);
                 frames.push(format!("event: content_block_start\ndata: {body}\n\n"));
             }
             if let Some(arg) = &delta.arguments_chunk {
@@ -249,19 +252,58 @@ pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
                 FinishReason::ContentFilter => "stop_sequence",
                 FinishReason::Other(s) => s.as_str(),
             };
-            let block_close = json!({"type": "content_block_stop", "index": 0});
+            let mut frames = Vec::new();
+            for index in take_open_block_indexes(ctx) {
+                let block_close = json!({"type": "content_block_stop", "index": index});
+                frames.push(format!(
+                    "event: content_block_stop\ndata: {block_close}\n\n"
+                ));
+            }
             let mdelta = json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
                 "usage": {"output_tokens": 0}
             });
             let mstop = json!({"type": "message_stop"});
-            vec![
-                format!("event: content_block_stop\ndata: {block_close}\n\n"),
-                format!("event: message_delta\ndata: {mdelta}\n\n"),
-                format!("event: message_stop\ndata: {mstop}\n\n"),
-            ]
+            frames.push(format!("event: message_delta\ndata: {mdelta}\n\n"));
+            frames.push(format!("event: message_stop\ndata: {mstop}\n\n"));
+            frames
         }
+    }
+}
+
+const OPEN_BLOCK_INDEXES: &str = "anthropic.open_block_indexes";
+
+fn record_open_block(ctx: &mut BridgeContext, index: usize) {
+    let indexes = ctx
+        .extras
+        .entry(OPEN_BLOCK_INDEXES.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(arr) = indexes.as_array_mut() {
+        let value = json!(index);
+        if !arr.contains(&value) {
+            arr.push(value);
+        }
+    }
+}
+
+fn take_open_block_indexes(ctx: &mut BridgeContext) -> Vec<usize> {
+    let indexes = ctx
+        .extras
+        .remove(OPEN_BLOCK_INDEXES)
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let parsed: Vec<usize> = indexes
+        .iter()
+        .filter_map(|value| value.as_u64().map(|n| n as usize))
+        .collect();
+    // Isolated MessageStop fixtures (and a stream that never opened a
+    // block) still need the historical index-0 terminator so single-tool
+    // and text-only clients keep a well-formed block lifecycle.
+    if parsed.is_empty() {
+        vec![0]
+    } else {
+        parsed
     }
 }
 
@@ -1011,7 +1053,7 @@ mod tests {
                     id: "msg_1".into(),
                     model: "claude-3-5-sonnet".into(),
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(frames.len(), 2);
@@ -1027,7 +1069,7 @@ mod tests {
                     index: 0,
                     delta: super::super::ContentPartDelta::Text("hi".into()),
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(frames.len(), 1);
@@ -1042,13 +1084,79 @@ mod tests {
                 &HubChunk::MessageStop {
                     finish_reason: FinishReason::ToolCalls,
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(frames.len(), 3);
         assert!(frames[0].contains("content_block_stop"));
         assert!(frames[1].contains("\"stop_reason\":\"tool_use\""));
         assert!(frames[2].contains("message_stop"));
+    }
+
+    #[test]
+    fn streaming_stop_closes_every_open_tool_block_index() {
+        // WOR-2425: MessageStart opens text at 0, and each tool-call
+        // opening delta opens its own index. The terminator has to
+        // close every one of those, not just index 0.
+        let mut ctx = BridgeContext::default();
+        let _ = fmt()
+            .from_hub_stream(
+                &HubChunk::MessageStart {
+                    id: "msg_1".into(),
+                    model: "claude-3-5-sonnet".into(),
+                },
+                &mut ctx,
+            )
+            .unwrap();
+        for (index, (id, name)) in [
+            (1usize, ("toolu_1", "get_weather")),
+            (2usize, ("toolu_2", "get_time")),
+        ] {
+            let _ = fmt()
+                .from_hub_stream(
+                    &HubChunk::ToolCallDelta {
+                        index,
+                        delta: super::super::HubToolCallDelta {
+                            id: Some(id.into()),
+                            name: Some(name.into()),
+                            arguments_chunk: Some("{}".into()),
+                        },
+                    },
+                    &mut ctx,
+                )
+                .unwrap();
+        }
+        let frames = fmt()
+            .from_hub_stream(
+                &HubChunk::MessageStop {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+                &mut ctx,
+            )
+            .unwrap();
+        let stop_indexes: Vec<u64> = frames
+            .iter()
+            .filter(|frame| frame.contains("content_block_stop"))
+            .map(|frame| {
+                let data = frame
+                    .split("data: ")
+                    .nth(1)
+                    .and_then(|rest| rest.split('\n').next())
+                    .expect("sse data line");
+                serde_json::from_str::<Value>(data).unwrap()["index"]
+                    .as_u64()
+                    .expect("stop index")
+            })
+            .collect();
+        assert_eq!(
+            stop_indexes,
+            vec![0, 1, 2],
+            "every opened block must close: {frames:?}"
+        );
+        assert!(frames
+            .iter()
+            .any(|f| f.contains("\"stop_reason\":\"tool_use\"")));
+        assert!(frames.iter().any(|f| f.contains("message_stop")));
     }
 
     #[test]
@@ -1064,7 +1172,7 @@ mod tests {
                         arguments_chunk: None,
                     },
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(f1.len(), 1);
@@ -1081,7 +1189,7 @@ mod tests {
                         arguments_chunk: Some("{\"ci".into()),
                     },
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(f2.len(), 1);

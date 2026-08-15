@@ -318,6 +318,11 @@ pub fn response_to_openai(body: Value) -> Value {
         .and_then(|c| c.as_array())
         .cloned()
         .unwrap_or_default();
+    // WOR-1537: no candidates is an upstream failure (404, rate
+    // limit, safety block), not an empty successful completion.
+    if candidates.is_empty() {
+        return empty_candidates_error(&m);
+    }
     let first = candidates.first().cloned().unwrap_or(Value::Null);
 
     let (content_text, tool_calls) = extract_content_and_tools(&first);
@@ -414,6 +419,26 @@ fn extract_content_and_tools(candidate: &Value) -> (Value, Vec<Value>) {
         }
     }
     (Value::String(texts.join("")), tool_calls)
+}
+
+fn empty_candidates_error(body: &Map<String, Value>) -> Value {
+    let block_reason = body
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(|reason| reason.as_str());
+    let message = match block_reason {
+        Some(reason) => {
+            format!("Gemini returned no candidates (promptFeedback.blockReason={reason})")
+        }
+        None => "Gemini returned no candidates".to_string(),
+    };
+    json!({
+        "error": {
+            "message": message,
+            "type": "api_error",
+            "code": "no_candidates",
+        }
+    })
 }
 
 #[cfg(test)]
@@ -612,6 +637,32 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["city"], "SF");
+    }
+
+    #[test]
+    fn response_without_candidates_is_an_error_not_an_empty_success() {
+        // WOR-1537: a 404 / rate-limit / safety-blocked Gemini body
+        // with no candidates must not become choices[0] with
+        // model: null, content: "", finish_reason: stop.
+        let body = json!({
+            "modelVersion": "gemini-1.5-pro",
+            "candidates": [],
+            "promptFeedback": {"blockReason": "SAFETY"}
+        });
+        let out = response_to_openai(body);
+        assert!(
+            out.get("choices").is_none(),
+            "empty candidates must not look like a completion: {out}"
+        );
+        assert!(
+            out["error"].is_object(),
+            "expected an error envelope: {out}"
+        );
+        let message = out["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("SAFETY"),
+            "block reason should surface: {message}"
+        );
     }
 
     #[test]

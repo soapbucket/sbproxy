@@ -11511,7 +11511,7 @@ pub(super) async fn relay_ai_stream(
     // violation terminates the stream.
     let mut held_tool_chunks: std::collections::BTreeMap<usize, Vec<sbproxy_ai::format::HubChunk>> =
         std::collections::BTreeMap::new();
-    let bridge_ctx = sbproxy_ai::format::BridgeContext {
+    let mut bridge_ctx = sbproxy_ai::format::BridgeContext {
         inbound_format: format_args
             .inbound_format
             .clone()
@@ -11778,7 +11778,7 @@ pub(super) async fn relay_ai_stream(
                             && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
                     });
                     for hub in emit_now.chain(released_tool_chunks.iter()) {
-                        match emitter.from_hub_stream(hub, &bridge_ctx) {
+                        match emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             Ok(frames) => {
                                 for f in frames {
                                     translated.push_str(&f);
@@ -11990,7 +11990,7 @@ pub(super) async fn relay_ai_stream(
                     });
                     let mut translated = String::new();
                     for hub in emit_now.chain(close_released.iter()) {
-                        if let Ok(frames) = emitter.from_hub_stream(hub, &bridge_ctx) {
+                        if let Ok(frames) = emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             for f in frames {
                                 translated.push_str(&f);
                             }
