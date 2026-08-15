@@ -661,7 +661,7 @@ fn evaluate_cache_key(
                     (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.as_str()),
                     (!origin.is_empty()).then_some(origin),
                 ) {
-                    crate::policy_bus::emit_decision_audit(
+                    crate::policy_bus::emit_decision_audit_detailed(
                         DecisionEvent::CacheKey,
                         engine,
                         DecisionOutcome::Allow,
@@ -670,6 +670,10 @@ fn evaluate_cache_key(
                         &ctx.hostname,
                         &ctx.tenant_id,
                         &plan.reason,
+                        sbproxy_observe::decision::DecisionDetails::cache_key(
+                            plan.skip_lookup,
+                            plan.vary.len(),
+                        ),
                     );
                 }
                 (Some(plan), false)

@@ -153,6 +153,36 @@ origins:
 }
 
 #[cfg(unix)]
+/// Whether the proxy is serving on `port`, not merely listening.
+///
+/// A prepared-but-unattended socket still completes a TCP handshake, so
+/// `TcpStream::connect` returning `Ok` proves only that the port is
+/// bound. One HTTP exchange proves the run loop is up, which is the
+/// state the rest of this test depends on.
+fn serves_ok(port: u16) -> bool {
+    use std::io::{Read as _, Write as _};
+
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .is_err()
+    {
+        return false;
+    }
+    if stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: listener.test\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::new();
+    // A short read is enough: the status line arrives first.
+    let _ = stream.read_to_end(&mut response);
+    response.starts_with(b"HTTP/1.1 200")
+}
+
 #[test]
 fn sigterm_cleanly_releases_a_prepared_public_listener() {
     let root = temp_dir("sigterm");
@@ -203,7 +233,16 @@ origins:
                 .expect("start sbproxy");
             let startup_deadline = Instant::now() + Duration::from_secs(15);
             let ready = loop {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                // Served, not merely connectable. sbproxy prepares its
+                // public listener before Pingora's `Server::run` installs
+                // the SIGTERM handler, and a bare `TcpStream::connect`
+                // succeeds the moment the socket is listening because the
+                // kernel completes the handshake into the backlog. Probing
+                // that way declared the proxy ready while a SIGTERM would
+                // still kill it by default disposition, and the test then
+                // failed on `status.success()` with `signal: 15`. Waiting
+                // for a response means the run loop is actually serving.
+                if serves_ok(port) {
                     break true;
                 }
                 if let Some(status) = child.try_wait().expect("poll startup") {

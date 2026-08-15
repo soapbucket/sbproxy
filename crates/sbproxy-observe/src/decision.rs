@@ -184,6 +184,47 @@ impl DecisionEvent {
         Self::ALL.iter().copied().find(|e| e.as_label() == label)
     }
 
+    /// Whether this event has a production call site that publishes an
+    /// audit record today.
+    ///
+    /// An operator can enable any event in
+    /// `observability.log.decision_audit`, and the config accepts every
+    /// known label because refusing one would block pre-configuring an
+    /// event a later release wires. That leaves a gap the config cannot
+    /// close: an event enabled here but unwired publishes nothing, and
+    /// silence from an audit feed is indistinguishable from a feed with
+    /// nothing to report. Boot reads this to warn instead (WOR-2446).
+    ///
+    /// **Hand-maintained, and it will drift if you let it.** Wiring a
+    /// new emitter means flipping its arm here in the same change.
+    /// `every_wired_event_is_listed_here` pins the three that exist so a
+    /// removed emitter is caught; nothing yet catches an *added* emitter
+    /// whose arm was not flipped, which is the direction a scanner
+    /// guard would need to cover.
+    pub const fn has_emitter(self) -> bool {
+        match self {
+            // cache.admit: proxy_http.rs, the response-side plan arm.
+            // cache.key: request_phase.rs, the request-side plan arm.
+            // route.decide: ai_dispatch.rs, the accepted-plan arm.
+            Self::CacheAdmit | Self::CacheKey | Self::RouteDecide => true,
+            Self::Auth
+            | Self::Policy
+            | Self::RateLimit
+            | Self::Waf
+            | Self::AiGuardrailInput
+            | Self::AiGuardrailOutput
+            | Self::AiToolCall
+            | Self::AiStreamEvent
+            | Self::AiClose
+            | Self::AiFailure
+            | Self::Transform
+            | Self::Action
+            | Self::LogCustomField
+            | Self::McpTool
+            | Self::PaymentLifecycle => false,
+        }
+    }
+
     /// OCSF `activity_id` for this event on the API Activity class.
     ///
     /// OCSF models API Activity (6003) with CRUD-shaped activities. A
@@ -745,6 +786,23 @@ pub struct DecisionDetails {
     /// it. Non-zero means this is not the plan the operator wrote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dropped: Option<usize>,
+    /// Whether a cache decision stored the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored: Option<bool>,
+    /// TTL the decision settled on, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    /// Stale-while-revalidate window the decision settled on, in
+    /// seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swr_secs: Option<u64>,
+    /// Whether a cache-key decision skipped the lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_lookup: Option<bool>,
+    /// How many extra dimensions a cache-key decision folded into the
+    /// key. Zero means the policy ran and added nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vary_count: Option<usize>,
 }
 
 impl DecisionDetails {
@@ -766,6 +824,36 @@ impl DecisionDetails {
             selected_provider: selected_provider.map(ToOwned::to_owned),
             tier_count: Some(tier_count),
             dropped: Some(dropped),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for a cache-admission decision.
+    ///
+    /// `ttl_secs` and `swr_secs` are the values the decision settled on
+    /// rather than what the script asked for, so a record shows what the
+    /// cache will actually do. `None` on either means the origin's
+    /// configured value applies.
+    pub fn cache_admit(stored: bool, ttl_secs: Option<u64>, swr_secs: Option<u64>) -> Self {
+        Self {
+            stored: Some(stored),
+            ttl_secs,
+            swr_secs,
+            ..Self::default()
+        }
+    }
+
+    /// Detail for a cache-key decision.
+    ///
+    /// `vary_count` rather than the dimension names: the names can carry
+    /// header values an operator chose to key on, and this object is not
+    /// scrubbed the way `reason` is. A count answers "did the policy
+    /// narrow this key" without carrying what it narrowed on.
+    pub fn cache_key(skip_lookup: bool, vary_count: usize) -> Self {
+        Self {
+            skip_lookup: Some(skip_lookup),
+            vary_count: Some(vary_count),
+            ..Self::default()
         }
     }
 
@@ -777,6 +865,11 @@ impl DecisionDetails {
             && self.selected_provider.is_none()
             && self.tier_count.is_none()
             && self.dropped.is_none()
+            && self.stored.is_none()
+            && self.ttl_secs.is_none()
+            && self.swr_secs.is_none()
+            && self.skip_lookup.is_none()
+            && self.vary_count.is_none()
     }
 
     /// Whether the decision moved the request off what it asked for, or
@@ -1023,6 +1116,75 @@ mod tests {
             degraded.changed_route(),
             "a degraded plan is not the plan the operator wrote, so it counts"
         );
+    }
+
+    #[test]
+    fn every_wired_event_carries_structured_detail() {
+        // WOR-2448: detail existed on exactly one event, so a SIEM rule
+        // could select on routing decisions and had only prose for the
+        // cache ones. All three wired events carry fields now.
+        let admit = DecisionDetails::cache_admit(false, Some(300), Some(30));
+        assert!(!admit.is_empty());
+        assert_eq!(admit.stored, Some(false));
+        assert_eq!(admit.ttl_secs, Some(300));
+        assert_eq!(admit.swr_secs, Some(30));
+
+        let key = DecisionDetails::cache_key(true, 2);
+        assert!(!key.is_empty());
+        assert_eq!(key.skip_lookup, Some(true));
+        assert_eq!(key.vary_count, Some(2));
+    }
+
+    #[test]
+    fn a_cache_key_record_carries_a_count_not_the_dimension_names() {
+        // The names can carry header values an operator chose to key on,
+        // and this object is not scrubbed the way `reason` is. A count
+        // answers "did the policy narrow this key" without carrying
+        // what it narrowed on.
+        let key = DecisionDetails::cache_key(false, 3);
+        let rendered = serde_json::to_string(&key).expect("serializes");
+        assert!(rendered.contains("\"vary_count\":3"), "{rendered}");
+        assert!(
+            !rendered.contains("vary\":["),
+            "dimension names must not ride along: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cache_detail_omits_what_the_decision_did_not_settle() {
+        // `None` means the origin's configured value applies. Emitting
+        // a zero would read as "this decision chose no TTL", which is a
+        // different and false claim.
+        let admit = DecisionDetails::cache_admit(true, None, None);
+        let rendered = serde_json::to_string(&admit).expect("serializes");
+        assert!(rendered.contains("\"stored\":true"), "{rendered}");
+        assert!(!rendered.contains("ttl_secs"), "{rendered}");
+        assert!(!rendered.contains("swr_secs"), "{rendered}");
+    }
+
+    #[test]
+    fn every_wired_event_is_listed_here() {
+        // Pins the three emitters that exist. A removed call site whose
+        // arm was not flipped shows up here; an *added* one still needs
+        // a human to flip its arm, which is the drift this cannot see.
+        let wired: Vec<&str> = DecisionEvent::ALL
+            .iter()
+            .filter(|e| e.has_emitter())
+            .map(|e| e.as_label())
+            .collect();
+        assert_eq!(
+            wired,
+            vec!["cache.key", "cache.admit", "route.decide"],
+            "the wired set changed; update has_emitter and the docs that state coverage"
+        );
+    }
+
+    #[test]
+    fn the_per_chunk_event_is_never_wired() {
+        // It cannot be: it is refused before the config map or the
+        // master switch is consulted, so an emitter for it would be
+        // unreachable and claiming one would be a lie.
+        assert!(!DecisionEvent::AiStreamEvent.has_emitter());
     }
 
     #[test]
