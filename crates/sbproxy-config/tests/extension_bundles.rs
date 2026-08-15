@@ -246,6 +246,38 @@ fn payment_hook_manifest_uses_no_body_contract() {
 }
 
 #[test]
+fn a_stream_hook_may_declare_mutation_now_that_it_has_write_back() {
+    // WOR-2365. Removing `ai_stream_event` from the refusal set is only
+    // half the claim; this is the half that proves the declaration is
+    // actually accepted. Streamed AI events are Proxy-Wasm-only, so the
+    // manifest is that shape rather than the JavaScript one, and the
+    // mode is `block`: an observe hook's decisions are discarded, so a
+    // mutation there could never apply and is refused separately.
+    let manifest = parse_manifest(
+        r#"
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: stream-redactor
+version: 1.0.0
+runtime: proxy_wasm
+abi: 0.2.1
+entry: redactor.wasm
+hooks:
+  - kind: ai_stream_event
+    type: stream_redactor
+    enforcement_mode: block
+    execution:
+      body_mode: streamed
+      mutates: true
+"#,
+    );
+    assert!(
+        manifest.hooks[0].execution.mutates,
+        "a stream hook has end-to-end write-back now, so the declaration must load"
+    );
+}
+
+#[test]
 fn mutates_is_accepted_only_on_the_wired_kinds() {
     // The kinds with host write-back accept the declaration and
     // default to inspect-only when it is absent.
@@ -265,12 +297,13 @@ fn mutates_is_accepted_only_on_the_wired_kinds() {
         parse_manifest(&JAVASCRIPT_MANIFEST.replace("kind: policy", "kind: ai_guardrail_output"));
     assert!(!manifest.hooks[0].execution.mutates);
 
-    // Stream hooks are content-bearing but have no wire write-back
-    // yet: declaring mutation there must refuse at load, not silently
-    // drop the rewrite at dispatch. Lifecycle and non-AI kinds refuse
-    // for the simpler reason that they carry nothing to mutate.
-    for kind in ["ai_stream_event", "ai_close", "ai_failure", "policy"] {
-        let mut yaml = JAVASCRIPT_MANIFEST
+    // WOR-2365 gave stream hooks their wire write-back, so they moved
+    // to the accepting set above. Lifecycle and non-AI kinds still
+    // refuse, for the simpler reason that they carry nothing to mutate:
+    // `ai_close` and `ai_failure` report aggregate facts about work
+    // already done, and mutating a fact is not a decision.
+    for kind in ["ai_close", "ai_failure", "policy"] {
+        let yaml = JAVASCRIPT_MANIFEST
             .replace("kind: policy", &format!("kind: {kind}"))
             .replace(
                 "    export: enforce",
@@ -278,27 +311,6 @@ fn mutates_is_accepted_only_on_the_wired_kinds() {
     execution:
       mutates: true",
             );
-        if kind == "ai_stream_event" {
-            // Streamed AI events are Proxy-Wasm-only; keep the refusal
-            // under test the mutates one.
-            yaml = yaml
-                .replace(
-                    "runtime: javascript",
-                    "runtime: proxy_wasm
-abi: 0.2.1",
-                )
-                .replace("entry: src/index.ts", "entry: filter.wasm")
-                .replace(
-                    "      mutates: true",
-                    "      mutates: true
-      body_mode: streamed",
-                )
-                .replace(
-                    "    export: enforce
-",
-                    "",
-                );
-        }
         let error = manifest_error(&yaml);
         assert!(
             error.contains("mutates is not supported"),

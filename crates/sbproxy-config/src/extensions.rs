@@ -749,17 +749,18 @@ impl BundleManifest {
                     BundleHookKind::AiGuardrailInput
                         | BundleHookKind::AiGuardrailOutput
                         | BundleHookKind::AiToolCall
+                        | BundleHookKind::AiStreamEvent
                 )
             {
-                // Stream chunks are content-bearing too, but their
-                // wire write-back does not exist yet: the relay would
-                // apply the rewrite to the in-memory event and ship
-                // the original frames, which is worse than a refusal
-                // at config load. Guardrail and tool-call hooks have
-                // end-to-end write-back and accept the declaration.
+                // WOR-2365: stream chunks gained their wire write-back,
+                // so they join the content-bearing set. A stream hook
+                // may rewrite content text only; usage and the control
+                // frames are refused at the hook seam rather than here,
+                // because the refusal depends on which chunk arrived
+                // rather than on how the hook was declared.
                 return invalid(format!(
                     "mutates is not supported for {} hooks; ai_guardrail_input, \
-                     ai_guardrail_output, and ai_tool_call hooks may mutate",
+                     ai_guardrail_output, ai_tool_call, and ai_stream_event hooks may mutate",
                     hook_kind_label(hook.kind)
                 ));
             }
