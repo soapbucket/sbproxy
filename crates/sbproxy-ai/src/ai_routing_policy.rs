@@ -470,7 +470,7 @@ fn interned_reason_code(code: &str) -> &'static str {
 /// A non-finite float has no JSON representation and becomes `null`;
 /// `decode_route_plan` then treats it as an absent optional or a missing
 /// field, which is the same as any other malformed number.
-fn cel_to_json(value: &CelValue) -> serde_json::Value {
+pub(crate) fn cel_to_json(value: &CelValue) -> serde_json::Value {
     match value {
         CelValue::String(string) => serde_json::Value::String(string.clone()),
         CelValue::Int(int) => serde_json::Value::from(*int),
@@ -484,6 +484,9 @@ fn cel_to_json(value: &CelValue) -> serde_json::Value {
         ),
         CelValue::List(list) => serde_json::Value::Array(list.iter().map(cel_to_json).collect()),
         CelValue::Null => serde_json::Value::Null,
+        // A pre-converted shared value (the catalog binds as one): the policy
+        // result never is, but materialize and convert rather than guess.
+        CelValue::Shared(_) => cel_to_json(&value.clone().into_owned()),
     }
 }
 

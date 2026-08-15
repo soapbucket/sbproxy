@@ -272,6 +272,13 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) ai_routing_policy_compiled:
         OnceLock<Option<std::sync::Arc<crate::ai_routing_policy::CompiledAiRoutingPolicy>>>,
+    /// Lazy-built `ai.catalog` base-data document (WOR-2366): per-model
+    /// prices and context windows for this origin's declared models,
+    /// converted once to the shared CEL form so each request binds it by
+    /// reference-count bump. Rebuilt with the handler on config reload,
+    /// after `from_config` has installed the price table.
+    #[serde(skip)]
+    ai_catalog_cel: OnceLock<sbproxy_extension::cel::CelValue>,
     /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
     #[serde(skip)]
     quota_pool_store: OnceLock<std::sync::Arc<CachedQuotaPoolStore>>,
@@ -431,6 +438,16 @@ impl AiHandlerConfig {
                 })
             })
             .as_ref()
+    }
+
+    /// The `ai.catalog` base-data document for this origin's declared
+    /// models (WOR-2366): per-model prices and context windows, built once
+    /// per config generation and returned in the shared CEL form, so the
+    /// clone this returns is a reference-count bump, not a document copy.
+    pub fn ai_catalog_cel(&self) -> sbproxy_extension::cel::CelValue {
+        self.ai_catalog_cel
+            .get_or_init(|| crate::routing_base_data::build_catalog_cel(&self.providers))
+            .clone()
     }
 
     /// Return the compiled routing policy for this handler, compiling it
@@ -985,6 +1002,23 @@ impl AiHandlerConfig {
     /// An authored `context_overflow:` block is refused. See the inline
     /// note below for why refusing beats ignoring it.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
+        Self::from_config_inner(value, true)
+    }
+
+    /// [`Self::from_config`] for validation-only compiles: identical
+    /// checks, but the candidate's price table is built (so a bad rate
+    /// card still warns) and then dropped rather than installed into the
+    /// process-global cost-accounting table. Without this split, validating
+    /// a config that is then rejected left live cost accounting reading the
+    /// rejected candidate's prices until the next successful load.
+    pub fn from_config_for_validation(value: serde_json::Value) -> anyhow::Result<Self> {
+        Self::from_config_inner(value, false)
+    }
+
+    fn from_config_inner(
+        value: serde_json::Value,
+        install_price_table: bool,
+    ) -> anyhow::Result<Self> {
         // WOR-2309: `context_overflow:` was never a field on this struct,
         // but ai-gateway.md named the block by that spelling and told
         // operators it was "ignored", which is an invitation to write it
@@ -1303,10 +1337,14 @@ impl AiHandlerConfig {
         // external rate card) into the process-global consulted by cost
         // estimation. Runs on every config (re)load so prices update
         // with the config; a missing/bad rate card warns and is skipped.
-        crate::budget::set_price_table(crate::budget::build_price_table(
-            &config.model_prices,
-            config.rate_card.as_deref(),
-        ));
+        // Validation-only compiles build the table (so its warnings still
+        // fire) but never install it: a rejected candidate must not leave
+        // live cost accounting on its prices.
+        let price_table =
+            crate::budget::build_price_table(&config.model_prices, config.rate_card.as_deref());
+        if install_price_table {
+            crate::budget::set_price_table(price_table);
+        }
         Ok(config)
     }
 
@@ -1617,6 +1655,44 @@ mod tests {
     use super::*;
     use crate::reasoning::ReasoningPolicy;
 
+    #[test]
+    fn a_validation_compile_does_not_install_the_candidate_price_table() {
+        let _guard = crate::budget::PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        // Install a known table through the real load path.
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "p", "api_key": "k"}],
+            "model_prices": {
+                "validation-split-model": {"input_per_million": 3.0, "output_per_million": 6.0}
+            }
+        }))
+        .expect("valid config");
+        assert_eq!(
+            crate::budget::catalog_price("validation-split-model").map(|p| p.input_per_million),
+            Some(3.0)
+        );
+
+        // A validation-only compile carrying different prices must leave the
+        // installed table untouched: neither overriding the known model nor
+        // introducing its new one.
+        AiHandlerConfig::from_config_for_validation(serde_json::json!({
+            "providers": [{"name": "p", "api_key": "k"}],
+            "model_prices": {
+                "validation-split-model": {"input_per_million": 999.0, "output_per_million": 999.0},
+                "validation-split-other": {"input_per_million": 1.0, "output_per_million": 1.0}
+            }
+        }))
+        .expect("valid config");
+        assert_eq!(
+            crate::budget::catalog_price("validation-split-model").map(|p| p.input_per_million),
+            Some(3.0),
+            "a rejected candidate's prices must not reach live accounting"
+        );
+        assert!(
+            crate::budget::catalog_price("validation-split-other").is_none(),
+            "a validation compile must not install anything"
+        );
+    }
+
     // --- Resilience wiring (WOR-2233) ---
     //
     // The defect these pin is not that ejection was wrong, it is that
@@ -1895,6 +1971,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1941,6 +2018,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1987,6 +2065,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -2034,6 +2113,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),

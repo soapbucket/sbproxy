@@ -5953,6 +5953,7 @@ pub(super) async fn handle_ai_proxy(
                 prompt_difficulty: ai_policy_prompt_difficulty(&body),
                 prompt_fingerprint: ai_policy_prompt_fingerprint(&model, &body),
                 providers: ai_provider_state_views(router.as_ref(), &config.providers),
+                catalog: Some(config.ai_catalog_cel()),
             };
             let configured_providers: Vec<String> = config
                 .providers
@@ -6088,6 +6089,7 @@ pub(super) async fn handle_ai_proxy(
             prompt_difficulty: ai_policy_prompt_difficulty(&body),
             prompt_fingerprint: ai_policy_prompt_fingerprint(&model, &body),
             providers: ai_provider_state_views(router.as_ref(), &config.providers),
+            catalog: Some(config.ai_catalog_cel()),
         };
         let decision = policy.evaluate(&view);
 
