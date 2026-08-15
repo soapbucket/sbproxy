@@ -32,6 +32,7 @@ pub mod discovery;
 pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
+pub mod poisoned_text;
 pub mod protocol;
 pub mod quarantine;
 /// Tool rollout plane: multiple live versions of one tool with

@@ -2120,6 +2120,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_poison_indicators_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_poison_indicator"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["field", "indicator", "kind"],
+        description: "Static tool-poisoning indicators in advertised MCP tool text, by field and indicator.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_concealed_text_findings_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_concealed_text_finding"),
