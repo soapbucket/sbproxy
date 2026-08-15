@@ -850,10 +850,13 @@ out. The body selects the scope: `{"key": "..."}` for one entry,
 [`l2_cache_settings`](#l2_cache_settings) and
 [the admin API guide](admin-api-guide.md).
 
-The bus implementations have been removed from the tree. The block is still
-accepted by the parser so that a configuration carrying it gets the
-explanation above rather than an unknown-key error, but the rejection is
-permanent: there is no backend left for any driver name to select.
+The bus implementations have been removed from the tree. GCP Pub/Sub and SQS
+also acknowledged a message before yielding it, treated any error as a clean
+end of stream, and could not stop when their owner was dropped, so a future
+consumer cannot bring them back as they were. The block is still accepted by
+the parser so that a configuration carrying it gets the explanation above
+rather than an unknown-key error, but the rejection is permanent: there is no
+backend left for any driver name to select.
 
 ---
 

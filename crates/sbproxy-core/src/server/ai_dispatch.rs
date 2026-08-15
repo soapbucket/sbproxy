@@ -10706,7 +10706,9 @@ async fn dispatch_ai_hub_events(
     events: &[sbproxy_ai::format::HubChunk],
     completed: &[(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)],
     released: &mut Vec<sbproxy_ai::format::HubChunk>,
-) -> Result<(), crate::ai_extensions::AiExtensionBlock> {
+) -> Result<Vec<crate::ai_extensions::StreamContentRewrite>, crate::ai_extensions::AiExtensionBlock>
+{
+    let mut content_rewrites = Vec::new();
     let mut completed_index = 0;
     for (event_index, event) in events.iter().enumerate() {
         while completed
@@ -10719,16 +10721,18 @@ async fn dispatch_ai_hub_events(
             apply_tool_call_rewrites(released, &rewritten);
             completed_index += 1;
         }
-        extensions
-            .stream_chunks(std::slice::from_ref(event))
-            .await?;
+        content_rewrites.extend(
+            extensions
+                .stream_chunks(std::slice::from_ref(event))
+                .await?,
+        );
     }
     while let Some((_, call)) = completed.get(completed_index) {
         let rewritten = extensions.tool_calls(std::slice::from_ref(call)).await?;
         apply_tool_call_rewrites(released, &rewritten);
         completed_index += 1;
     }
-    Ok(())
+    Ok(content_rewrites)
 }
 
 /// Re-encode hook-rewritten tool calls into the frames about to ship.
@@ -11754,10 +11758,12 @@ pub(super) async fn relay_ai_stream(
                         break 'relay;
                     }
                 }
+                let mut stream_content_rewrites: Vec<crate::ai_extensions::StreamContentRewrite> =
+                    Vec::new();
                 if let (Some(extensions), Some(events)) =
                     (ai_extensions.as_mut(), decoded.as_deref())
                 {
-                    if let Err(block) = dispatch_ai_hub_events(
+                    match dispatch_ai_hub_events(
                         extensions,
                         events,
                         &completed_tool_calls,
@@ -11765,33 +11771,36 @@ pub(super) async fn relay_ai_stream(
                     )
                     .await
                     {
-                        warn!(
-                            extension_code = %block.code,
-                            "AI proxy: extension hook blocked a streamed event"
-                        );
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &block.message,
-                        );
-                        if send_ai_stream_extension_block_before_headers(
-                            session,
-                            &mut pending_stream_header,
-                            &mut ctx,
-                            &ai_span,
-                            &block,
-                        )
-                        .await?
-                        {
-                            extension_response_sent = true;
+                        Ok(rewrites) => stream_content_rewrites = rewrites,
+                        Err(block) => {
+                            warn!(
+                                extension_code = %block.code,
+                                "AI proxy: extension hook blocked a streamed event"
+                            );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                &block.message,
+                            );
+                            if send_ai_stream_extension_block_before_headers(
+                                session,
+                                &mut pending_stream_header,
+                                &mut ctx,
+                                &ai_span,
+                                &block,
+                            )
+                            .await?
+                            {
+                                extension_response_sent = true;
+                                output_guard_blocked = true;
+                                break 'relay;
+                            }
+                            if let Some(context) = ctx.as_deref_mut() {
+                                mark_guardrail_block(context, block.code);
+                            }
                             output_guard_blocked = true;
                             break 'relay;
                         }
-                        if let Some(context) = ctx.as_deref_mut() {
-                            mark_guardrail_block(context, block.code);
-                        }
-                        output_guard_blocked = true;
-                        break 'relay;
                     }
                 }
 
@@ -11800,11 +11809,29 @@ pub(super) async fn relay_ai_stream(
                 // error. The recorder guard's `Drop` impl will then
                 // emit a terminal `End { complete: false }` on the way
                 // out of this function.
+                // WOR-2365: a stream hook's content rewrite has to reach
+                // the client on both lanes, and they carry content
+                // differently. The translate lane re-encodes from
+                // `decoded`, so the rewrite is applied to the parsed
+                // chunk and the emitter renders it in the client's
+                // format for free. The passthrough lane ships the
+                // upstream frame verbatim, so the rewrite is a
+                // substitution inside those bytes.
+                let rewritten_decoded = if stream_content_rewrites.is_empty() {
+                    None
+                } else {
+                    decoded.as_deref().map(|chunks| {
+                        apply_stream_content_rewrites(chunks, &stream_content_rewrites)
+                    })
+                };
                 let outbound_bytes = if let Some(emitter) = inbound_emitter
                     .as_ref()
                     .filter(|_| native_translator.is_some())
                 {
-                    let hub_chunks = decoded.as_deref().unwrap_or(&[]);
+                    let hub_chunks = rewritten_decoded
+                        .as_deref()
+                        .or(decoded.as_deref())
+                        .unwrap_or(&[]);
                     let mut translated = String::new();
                     // In hold-back mode, tool-call frames for calls
                     // still awaiting a verdict stay out of the client
@@ -11833,8 +11860,10 @@ pub(super) async fn relay_ai_stream(
                         continue;
                     }
                     Bytes::from(translated)
-                } else {
+                } else if stream_content_rewrites.is_empty() {
                     chunk_bytes
+                } else {
+                    rewrite_stream_chunk_content(chunk_bytes, &stream_content_rewrites)
                 };
                 // WOR-1811: served-local lanes rewrite each frame's
                 // `model` field to the public serve-entry name so
@@ -12525,6 +12554,191 @@ fn rewrite_response_model(body: bytes::Bytes, model: &str) -> bytes::Bytes {
             }
         }
         _ => body,
+    }
+}
+
+#[cfg(test)]
+mod stream_content_rewrite_tests {
+    use super::*;
+    use crate::ai_extensions::StreamContentRewrite;
+
+    fn rewrite(index: usize, from: &str, to: &str) -> StreamContentRewrite {
+        StreamContentRewrite {
+            index,
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_passthrough_lane_splices_the_rewrite_into_the_raw_frame() {
+        // The lane that ships upstream bytes verbatim. Without this the
+        // hook rewrites an in-memory event and the client still receives
+        // the original text, which is the failure the config refusal
+        // used to prevent by refusing the feature outright.
+        let frame = bytes::Bytes::from(
+            r#"data: {"choices":[{"delta":{"content":"my card is 4111"},"index":0}]}"#.to_owned(),
+        );
+        let out =
+            rewrite_stream_chunk_content(frame, &[rewrite(0, "my card is 4111", "[REDACTED]")]);
+        let text = std::str::from_utf8(&out).expect("utf8");
+        assert!(text.contains("[REDACTED]"), "{text}");
+        assert!(!text.contains("4111"), "the original must not ship: {text}");
+    }
+
+    #[test]
+    fn a_frame_the_hook_did_not_touch_is_returned_unchanged() {
+        let original = r#"data: {"choices":[{"delta":{"content":"hello"},"index":0}]}"#;
+        let frame = bytes::Bytes::from(original.to_owned());
+        let out = rewrite_stream_chunk_content(frame, &[rewrite(0, "goodbye", "[X]")]);
+        assert_eq!(
+            std::str::from_utf8(&out).expect("utf8"),
+            original,
+            "a non-matching rewrite must not disturb the frame"
+        );
+    }
+
+    #[test]
+    fn escaped_text_matches_the_frames_escaping() {
+        // The frame holds JSON-escaped text. Matching the raw string
+        // would miss every delta containing a quote or newline, which
+        // is most prose.
+        let frame = bytes::Bytes::from(
+            r#"data: {"choices":[{"delta":{"content":"she said \"hi\""},"index":0}]}"#.to_owned(),
+        );
+        let out = rewrite_stream_chunk_content(frame, &[rewrite(0, "she said \"hi\"", "ok")]);
+        let text = std::str::from_utf8(&out).expect("utf8");
+        assert!(text.contains(r#""content":"ok""#), "{text}");
+    }
+
+    #[test]
+    fn the_translate_lane_rewrites_only_the_matching_delta() {
+        // One content block streams as many deltas sharing an index, so
+        // matching on index alone would apply one delta's replacement to
+        // every delta in the block.
+        let chunks = vec![
+            sbproxy_ai::format::HubChunk::ContentDelta {
+                index: 0,
+                delta: sbproxy_ai::format::ContentPartDelta::Text("secret".to_owned()),
+            },
+            sbproxy_ai::format::HubChunk::ContentDelta {
+                index: 0,
+                delta: sbproxy_ai::format::ContentPartDelta::Text("keep me".to_owned()),
+            },
+        ];
+        let out = apply_stream_content_rewrites(&chunks, &[rewrite(0, "secret", "[REDACTED]")]);
+        let texts: Vec<&str> = out
+            .iter()
+            .filter_map(|c| match c {
+                sbproxy_ai::format::HubChunk::ContentDelta {
+                    delta: sbproxy_ai::format::ContentPartDelta::Text(t),
+                    ..
+                } => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["[REDACTED]", "keep me"]);
+    }
+
+    #[test]
+    fn the_translate_lane_leaves_usage_and_control_frames_alone() {
+        // Usage feeds cost tracking, the budget path, and the metering
+        // ledger. A rewrite must never reach it, and the seam refuses
+        // one before it gets here; this pins the second line of defence.
+        let chunks = vec![
+            sbproxy_ai::format::HubChunk::Usage(sbproxy_ai::format::HubUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                ..Default::default()
+            }),
+            sbproxy_ai::format::HubChunk::MessageStop {
+                finish_reason: sbproxy_ai::format::FinishReason::Stop,
+            },
+        ];
+        let out = apply_stream_content_rewrites(&chunks, &[rewrite(0, "10", "999999")]);
+        assert_eq!(out, chunks, "no rewrite may alter usage or control frames");
+    }
+}
+
+/// Apply a stream hook's content rewrites to the parsed chunks.
+///
+/// The translate lane re-encodes the client's stream from these, so a
+/// rewrite applied here is rendered in the client's own SSE shape by the
+/// emitter, and this function needs to know nothing about provider
+/// formats. Only `ContentDelta` is touched: usage and the control frames
+/// are refused at the hook seam, so a rewrite for one cannot arrive.
+fn apply_stream_content_rewrites(
+    chunks: &[sbproxy_ai::format::HubChunk],
+    rewrites: &[crate::ai_extensions::StreamContentRewrite],
+) -> Vec<sbproxy_ai::format::HubChunk> {
+    chunks
+        .iter()
+        .map(|chunk| match chunk {
+            sbproxy_ai::format::HubChunk::ContentDelta {
+                index,
+                delta: sbproxy_ai::format::ContentPartDelta::Text(text),
+            } => {
+                // Matched on the text the hook was shown, not on index
+                // alone: one content block streams as many deltas that
+                // all share an index, so index alone would rewrite every
+                // delta in the block with one delta's replacement.
+                let hit = rewrites
+                    .iter()
+                    .find(|r| r.index == *index && r.from == *text);
+                match hit {
+                    Some(r) => sbproxy_ai::format::HubChunk::ContentDelta {
+                        index: *index,
+                        delta: sbproxy_ai::format::ContentPartDelta::Text(r.to.clone()),
+                    },
+                    None => chunk.clone(),
+                }
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Substitute a stream hook's content rewrites inside a raw SSE frame.
+///
+/// The passthrough lane ships upstream bytes verbatim, so a rewrite has
+/// to be spliced into the frame rather than re-encoded. The text sits
+/// JSON-escaped inside the frame, so both sides of the substitution are
+/// escaped the same way before matching, which also keeps the search
+/// from straying outside a JSON string.
+///
+/// Zero-copy when nothing matches, matching the shape
+/// [`rewrite_stream_chunk_model`] uses: a frame the hook did not touch
+/// costs one substring scan.
+fn rewrite_stream_chunk_content(
+    chunk: bytes::Bytes,
+    rewrites: &[crate::ai_extensions::StreamContentRewrite],
+) -> bytes::Bytes {
+    let Ok(text) = std::str::from_utf8(&chunk) else {
+        return chunk;
+    };
+    let mut out: Option<String> = None;
+    for rewrite in rewrites {
+        // `to_string` on a serde string yields the quoted, escaped form;
+        // trimming the quotes leaves exactly the bytes the frame holds.
+        let Ok(from_json) = serde_json::to_string(&rewrite.from) else {
+            continue;
+        };
+        let Ok(to_json) = serde_json::to_string(&rewrite.to) else {
+            continue;
+        };
+        let from_escaped = from_json.trim_matches('"');
+        let to_escaped = to_json.trim_matches('"');
+        if from_escaped.is_empty() {
+            continue;
+        }
+        let current = out.as_deref().unwrap_or(text);
+        if current.contains(from_escaped) {
+            out = Some(current.replacen(from_escaped, to_escaped, 1));
+        }
+    }
+    match out {
+        Some(rewritten) => bytes::Bytes::from(rewritten),
+        None => chunk,
     }
 }
 

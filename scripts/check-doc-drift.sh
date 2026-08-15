@@ -12,6 +12,10 @@
 #     PrefixAffinity, PeakEwma, Sticky, Race, Cascade, CostQuality).
 #   - crates/sbproxy-modules/src/action/routing/ ships two built-in
 #     RoutingStrategy implementations: first-healthy and lora-aware.
+#   - crates/sbproxy-observe/src/decision.rs defines 8 decision engines
+#     (built_in, plugin, cel, lua, js, rego, wasm, proxy_wasm) and 18
+#     decision events, so any documented cardinality product that
+#     multiplies by the engine count uses 8, not 7.
 #   - crates/sbproxy-security/ exposes crypto, hostfilter, ip, pii, ssrf,
 #     and the optional headless_detect / agent_verify modules. There is
 #     no certpin module: per-upstream SPKI pinning is not implemented
@@ -66,6 +70,14 @@ STALE_STRINGS=(
   "one trivial built-in strategy"
   "36 OpenAI-compatible"
   "certpin"
+  # WOR-2447: the decision-engine list and the cardinality product that
+  # multiplies by it. `rego` landed with the multi-engine routing policy
+  # and both went stale, which understated the label ceiling operators
+  # size their Prometheus against. `DecisionEngine::ALL` has 8 variants
+  # and `DecisionEvent::ALL` has 18, so the product is 18 x 8 x 7 = 1008.
+  "18 x 7 x 7"
+  "882 before tenancy"
+  "\`js\`, \`wasm\`, \`proxy_wasm\`"
 )
 
 rc=0

@@ -53,7 +53,8 @@ SUMMARY=""
 LANES="
 deterministic|Every no-hardware model-host suite passes: artifact selection, engine argv, container isolation, per-device capacity, bounded queues, atomic rollback, status shape, CLI contracts.
 cpu|The CPU admission path serves and refuses correctly with no accelerator present.
-apple_metal|A managed GGUF model reaches ready on Metal, returns nonempty assistant content through the gateway, reports truthful status, stops cleanly, and reuses the cache on a second run.
+apple_metal_probe|The Metal probe compiles with gpu-apple, reports one unified-memory device, and a 0.5B Q4 plan fits the working-set budget.
+apple_metal|A managed GGUF model reaches ready on Metal, returns nonempty assistant content through the gateway, reports truthful status, the planned memory envelope contains live RSS within 25% overshoot, stops cleanly, and reuses the cache on a second run.
 nvidia_single_gpu|One NVIDIA device serves a real completion through the gateway; the NVML probe, fit plan, and FP8 gate agree with the hardware.
 nvidia_multi_gpu|A deployment spanning two or more NVIDIA devices places disjoint device groups and serves. Requires two visible devices.
 air_gapped|Offline, manual, and file pull policies short-circuit transport, and a digest mismatch fails closed.
@@ -198,12 +199,24 @@ lane_cpu() {
       --test local_admission --test cold_start_policy --no-fail-fast
 }
 
+lane_apple_metal_probe() {
+  if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
+    record apple_metal_probe unsupported "not an Apple Silicon host (found $(uname -s)/$(uname -m))"
+    return
+  fi
+  simple_lane apple_metal_probe "$REPO_ROOT/scripts/cert-lane-metal-probe.sh"
+}
+
 lane_apple_metal() {
   if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
     record apple_metal unsupported "not an Apple Silicon host (found $(uname -s)/$(uname -m))"
     return
   fi
-  simple_lane apple_metal "$REPO_ROOT/scripts/cert-lane-managed-serve.sh" \
+  simple_lane apple_metal env \
+    CERT_RECORD="$CERT_DIR/record.json" \
+    CERT_HOST_JSON="$CERT_DIR/metadata.json" \
+    PATH="$HOME/.cargo/bin:$PATH" \
+    "$REPO_ROOT/scripts/cert-lane-managed-serve.sh" \
     "$CERT_MODEL" "$CERT_VARIANT" metal
 }
 

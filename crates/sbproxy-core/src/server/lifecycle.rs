@@ -1191,6 +1191,7 @@ fn reload_compiled_config_locked(
             outcome.degrade(DegradedSubsystem::SinkDispatcher);
         }
         install_usage_rollups_from_config(compiled);
+        warn_unwired_decision_audit_events(compiled);
 
         // Rebuild the AI client alongside the catalog. It lives behind an
         // `ArcSwap`, so this is a lock-free atomic swap from the reload
@@ -1815,6 +1816,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // WOR-1875: this is the startup path (the earlier call site runs
     // on reload); the installer is set-once so both calling is safe.
     install_usage_rollups_from_config(&compiled);
+    warn_unwired_decision_audit_events(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -3667,6 +3669,55 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
     tracing::info!(
         count = sinks.len(),
         "WOR-1045 PR1: parsed sinks block; dispatch wiring lands in PR2"
+    );
+}
+
+/// Warn about decision-audit events an operator enabled that nothing
+/// publishes yet (WOR-2446).
+///
+/// The config accepts every known event label on purpose: refusing an
+/// unwired one would block pre-configuring an event a later release
+/// wires, and would fail a correct config because of a gap in our own
+/// instrumentation. That leaves the operator with no signal at the
+/// moment the mistake is made, and a silent audit feed reads exactly
+/// like a feed with nothing to report.
+///
+/// So this warns rather than refuses, once at boot, naming each event
+/// so the message is actionable rather than a count.
+fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig) {
+    use sbproxy_observe::decision::DecisionEvent;
+
+    let scopes = &compiled.decision_audit;
+    if scopes.is_empty() {
+        return;
+    }
+    // Any scope enabling an event is worth naming, because the operator
+    // asked for it somewhere. Reporting per scope would repeat the same
+    // missing emitter once per tenant and origin.
+    let unwired: Vec<&str> = DecisionEvent::ALL
+        .iter()
+        .filter(|event| !event.has_emitter())
+        .filter(|event| {
+            let label = event.as_label();
+            scopes.publishes(label, None, None)
+                || scopes
+                    .tenants
+                    .keys()
+                    .any(|tenant| scopes.publishes(label, Some(tenant), None))
+                || scopes
+                    .origins
+                    .keys()
+                    .any(|origin| scopes.publishes(label, None, Some(origin)))
+        })
+        .map(|event| event.as_label())
+        .collect();
+    if unwired.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        events = %unwired.join(", "),
+        "decision_audit enables events that nothing publishes yet; they emit no records until \
+         their emitters ship. cache.key, cache.admit, and route.decide are wired today"
     );
 }
 

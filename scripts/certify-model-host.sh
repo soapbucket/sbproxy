@@ -37,8 +37,14 @@ echo "== Model-host certification against $SB_URL ($MODEL) =="
 
 # 1. First call returns tokens (cold: allow a long timeout for load).
 read -r code t1 < <(req 600)
+FIRST_TOKEN=""
 if [ "$code" = "200" ] && grep -q '"content"' /tmp/cert-resp.json; then
   ok "cold first call returns tokens (${t1}s)"
+  cp /tmp/cert-resp.json /tmp/cert-first.json
+  FIRST_TOKEN="$(python3 -c "
+import json
+print((json.load(open('/tmp/cert-first.json'))['choices'][0]['message'].get('content') or '').strip())
+" 2>/dev/null || true)"
 else
   bad "cold first call (http $code)"; cat /tmp/cert-resp.json | head -c 400; echo
 fi
@@ -87,4 +93,18 @@ if [ -n "$CAP" ]; then
 fi
 
 echo "== $pass passed, $fail failed =="
+
+FINDINGS="${CERT_FINDINGS:-/tmp/sbproxy-cert-findings.json}"
+python3 - "$FINDINGS" "${FIRST_TOKEN:-}" "${t1:-}" <<'PY'
+import json, sys
+path, token, t1 = sys.argv[1], sys.argv[2], sys.argv[3]
+findings = {
+    "first_token_result": token or None,
+    "first_response_seconds": float(t1) if t1 else None,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(findings, handle)
+    handle.write("\n")
+PY
+
 [ "$fail" -eq 0 ]
