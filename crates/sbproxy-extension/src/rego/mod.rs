@@ -266,6 +266,48 @@ impl CompiledRego {
         outcome
     }
 
+    /// Evaluate the query against an arbitrary JSON `input` document and
+    /// return the rule's value as JSON.
+    ///
+    /// The document form of [`Self::eval_bool`], for callers whose rule
+    /// returns a structured decision (the AI routing plan, WOR-2366)
+    /// rather than an allow/deny. A rule that is defined but undefined for
+    /// this input returns JSON `null`, which such callers read as "the
+    /// policy declined"; it is not an error. Stamps the same script
+    /// metrics as the boolean form.
+    pub fn eval_value(&mut self, input: serde_json::Value) -> Result<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let outcome = self.eval_value_inner(input);
+        sbproxy_observe::metrics::record_script_duration("rego", start.elapsed().as_secs_f64());
+        sbproxy_observe::metrics::record_script_invocation(
+            "rego",
+            if outcome.is_ok() {
+                "ok"
+            } else {
+                "runtime_error"
+            },
+        );
+        outcome
+    }
+
+    fn eval_value_inner(&mut self, input: serde_json::Value) -> Result<serde_json::Value> {
+        use serde::Deserialize;
+        let input = regorus::Value::deserialize(input)
+            .with_context(|| format!("{}: input document rejected", self.site))?;
+        self.engine.set_input(input);
+        let value = self
+            .engine
+            .eval_rule(self.query.clone())
+            .with_context(|| format!("{}: rule `{}` did not evaluate", self.site, self.query))?;
+        if value == regorus::Value::Undefined {
+            // An undefined rule value is the policy having no opinion for
+            // this input, not a fault.
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::to_value(&value)
+            .with_context(|| format!("{}: rule `{}` value is not JSON", self.site, self.query))
+    }
+
     fn eval_bool_inner(&mut self, ctx: &CelContext) -> Result<bool> {
         use serde::Deserialize;
         // Feed regorus the tree directly rather than serialising to a

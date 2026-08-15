@@ -360,6 +360,52 @@ impl AiDecisionView {
         ]);
         CelValue::Map(ai)
     }
+
+    /// Build the same `ai` namespace as [`Self::to_cel`], as plain JSON.
+    ///
+    /// This is the interchange form for the document engines (Lua,
+    /// JavaScript, Rego): every engine reads one vocabulary, so a policy
+    /// ported between engines renames nothing. A hand-written mirror
+    /// rather than a `Serialize` derive because the CEL binding nests
+    /// (`ai.prompt.difficulty`, `ai.guardrails.labels`) where the struct
+    /// is flat; the `to_cel_and_to_json_offer_the_same_paths` test keeps
+    /// the two from drifting.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "surface": self.surface,
+            "model": self.model,
+            "provider": self.provider,
+            "guardrails": {
+                "flagged": self.guardrail_flagged_count > 0,
+                "flagged_count": self.guardrail_flagged_count,
+                "labels": self.guardrail_labels,
+            },
+            "budget": {
+                "fraction": self.budget_fraction,
+                "exceeded": self.budget_exceeded,
+            },
+            "tokens": { "input_est": self.input_tokens_est },
+            "prompt": {
+                "difficulty": self.prompt_difficulty,
+                "fingerprint": self.prompt_fingerprint,
+            },
+            "principal": {
+                "tenant": self.tenant,
+                "api_key_id": self.api_key_id,
+                "tier": self.tier,
+            },
+            "providers": self.providers.iter().map(|p| serde_json::json!({
+                "name": p.name,
+                "healthy": p.healthy,
+                "health": p.health,
+                "latency_ms": p.latency_ms,
+                "in_flight": p.in_flight,
+                "tokens_used": p.tokens_used,
+                "circuit_open": p.circuit_open,
+                "circuit": p.circuit,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// Declarative config for the AI policy plane, set as
@@ -708,6 +754,73 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&easy).route_model(), None);
+    }
+
+    #[test]
+    fn to_cel_and_to_json_offer_the_same_paths() {
+        // The document engines read `to_json`; CEL reads `to_cel`. A field
+        // added to one and not the other would give the engines different
+        // vocabularies for the same request, so compare the full path sets.
+        fn cel_paths(prefix: &str, value: &CelValue, out: &mut std::collections::BTreeSet<String>) {
+            match value {
+                CelValue::Map(entries) => {
+                    for (key, child) in entries {
+                        cel_paths(&format!("{prefix}.{key}"), child, out);
+                    }
+                }
+                CelValue::List(items) => {
+                    if let Some(first) = items.first() {
+                        cel_paths(&format!("{prefix}[]"), first, out);
+                    } else {
+                        out.insert(format!("{prefix}[]"));
+                    }
+                }
+                _ => {
+                    out.insert(prefix.to_string());
+                }
+            }
+        }
+        fn json_paths(
+            prefix: &str,
+            value: &serde_json::Value,
+            out: &mut std::collections::BTreeSet<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(entries) => {
+                    for (key, child) in entries {
+                        json_paths(&format!("{prefix}.{key}"), child, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    if let Some(first) = items.first() {
+                        json_paths(&format!("{prefix}[]"), first, out);
+                    } else {
+                        out.insert(format!("{prefix}[]"));
+                    }
+                }
+                _ => {
+                    out.insert(prefix.to_string());
+                }
+            }
+        }
+
+        // Populate every collection so nested paths are exercised.
+        let view = AiDecisionView {
+            guardrail_labels: vec!["pii".into()],
+            providers: vec![ProviderStateView {
+                name: "p".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut cel = std::collections::BTreeSet::new();
+        cel_paths("ai", &view.to_cel(), &mut cel);
+        let mut json = std::collections::BTreeSet::new();
+        json_paths("ai", &view.to_json(), &mut json);
+        assert_eq!(
+            cel, json,
+            "to_cel and to_json must expose identical path sets"
+        );
     }
 
     #[test]
