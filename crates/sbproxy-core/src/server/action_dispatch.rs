@@ -2048,6 +2048,61 @@ pub(super) async fn handle_mcp_action(
     };
 
     let method = session.req_header().method.clone();
+
+    // Preserve every received field line for modern duplicate detection.
+    // HeaderMap::clone retains repeated and non-UTF-8 values; no protected
+    // routing carrier is coalesced before the protocol codec sees it.
+    let request_headers = session.req_header().headers.clone();
+    let uri_authority = session
+        .req_header()
+        .uri
+        .authority()
+        .map(|authority| authority.as_str().to_string());
+    // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+    // `X-Forwarded-Proto: https` stamped by a peer inside
+    // `proxy.trusted_proxies`. The request phase strips that header
+    // from untrusted peers, so an external client cannot forge it.
+    let listener_is_tls = ctx.tls_terminated;
+    let connection_scheme = if listener_is_tls { "https" } else { "http" };
+
+    // Transport trust for a modern non-POST request runs before anything
+    // else this function can serve, because the well-known routes below
+    // read the tool catalogue and start the federation. Refusing later
+    // would mean a disallowed Origin had already learned the catalogue and
+    // caused upstream work, which is the thing the check exists to stop.
+    //
+    // Only the refusal is hoisted. Whether a modern request may use this
+    // method at all is decided after the well-known routes, so a trusted
+    // modern client still fetches them exactly as it did before.
+    //
+    // Marker-free legacy traffic never enters this branch and reaches the
+    // routes below unchanged.
+    if method != http::Method::POST
+        && classify_http_era(None, &request_headers) == McpProtocolEra::Modern2026_07_28
+    {
+        if let Err(rejection) = mcp.validate_modern_http_request(
+            connection_scheme,
+            uri_authority.as_deref(),
+            &request_headers,
+        ) {
+            let status = mcp_modern_rejection_status(
+                rejection,
+                &mcp.server_name,
+                connection_scheme,
+                uri_authority.as_deref(),
+            );
+            return write_mcp_wire_response(
+                session,
+                McpWireResponse {
+                    status,
+                    headers: http::HeaderMap::new(),
+                    body: None,
+                },
+            )
+            .await;
+        }
+    }
+
     let req_path = session.req_header().uri.path();
 
     // WOR-483: serve the federated tool catalogue as a typed
@@ -2311,50 +2366,15 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
-    // Preserve every received field line for modern duplicate detection.
-    // HeaderMap::clone retains repeated and non-UTF-8 values; no protected
-    // routing carrier is coalesced before the protocol codec sees it.
-    let request_headers = session.req_header().headers.clone();
-    let uri_authority = session
-        .req_header()
-        .uri
-        .authority()
-        .map(|authority| authority.as_str().to_string());
-    // Trust-bounded: `tls_terminated` is true for a TLS listener or a
-    // `X-Forwarded-Proto: https` stamped by a peer inside
-    // `proxy.trusted_proxies`. The request phase strips that header
-    // from untrusted peers, so an external client cannot forge it.
-    let listener_is_tls = ctx.tls_terminated;
-    let connection_scheme = if listener_is_tls { "https" } else { "http" };
-
-    // GET and DELETE have no JSON body to classify. Any reserved modern
-    // routing carrier selects the modern endpoint, whose trusted authority
-    // and Origin are validated before the method is rejected. Marker-free
-    // traffic retains the frozen legacy stream/session lifecycle.
+    // GET and DELETE have no JSON body to classify. Transport trust for a
+    // modern non-POST request was already validated at the top of this
+    // function, before any well-known route could read the catalogue, so
+    // what remains here is the method itself: the modern era serves no GET
+    // or DELETE endpoint. Marker-free traffic retains the frozen legacy
+    // stream and session lifecycle.
     if method != http::Method::POST
         && classify_http_era(None, &request_headers) == McpProtocolEra::Modern2026_07_28
     {
-        if let Err(rejection) = mcp.validate_modern_http_request(
-            connection_scheme,
-            uri_authority.as_deref(),
-            &request_headers,
-        ) {
-            let status = mcp_modern_rejection_status(
-                rejection,
-                &mcp.server_name,
-                connection_scheme,
-                uri_authority.as_deref(),
-            );
-            return write_mcp_wire_response(
-                session,
-                McpWireResponse {
-                    status,
-                    headers: http::HeaderMap::new(),
-                    body: None,
-                },
-            )
-            .await;
-        }
         return write_mcp_wire_response(
             session,
             McpWireResponse {
