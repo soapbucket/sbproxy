@@ -91,11 +91,13 @@ the next version cut.
   but always emitted `content_block_stop` at `index: 0`, so a native
   Anthropic client watching a stream with two or more tool calls saw a
   mismatched block lifecycle.
-- **Gemini error bodies no longer look like empty successes.** A
-  generateContent response with no `candidates` (404, rate limit, or
-  a safety block carried only in `promptFeedback`) was translated into
-  an OpenAI completion with empty content and `finish_reason: stop`.
-  Those bodies now surface as an error envelope.
+- **Gemini empty generateContent bodies no longer look like successes.**
+  A 2xx response with no `candidates` (typically a prompt-level safety
+  block carried in `promptFeedback`) was translated into an OpenAI
+  completion with empty content and `finish_reason: stop`. Those bodies
+  now surface as an error envelope, keep the billed `usage` counts, and
+  use the `content_filter` taxonomy when Gemini named a safety block.
+  HTTP 4xx/5xx Gemini envelopes were already relayed unchanged.
 - **llama.cpp and mistral.rs Model Host provisioning on the official
   Docker image.** Engine release extract shelled out to `tar`, which the
   distroless gateway image does not contain. Archives unpack in-process.

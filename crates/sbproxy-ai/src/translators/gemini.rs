@@ -281,6 +281,11 @@ fn message_to_content(m: &Value) -> Value {
 ///     `candidatesTokenCount` -> OpenAI `usage.prompt_tokens` /
 ///     `completion_tokens`.
 ///   * `modelVersion` (when present) -> OpenAI `model`.
+///   * A 2xx body with no `candidates` -> OpenAI `error` envelope
+///     (WOR-1537). Prompt-level `SAFETY` / `RECITATION` / `BLOCKLIST` /
+///     `PROHIBITED_CONTENT` map to `type: content_filter`; billed
+///     `usageMetadata` is preserved as OpenAI `usage`. HTTP 4xx/5xx
+///     bodies never reach this function.
 pub fn response_to_openai(body: Value) -> Value {
     // WOR-2054: Gemini failures use a top-level `error` envelope. Check
     // this before shape-based embedding dispatch because an upstream can
@@ -318,8 +323,11 @@ pub fn response_to_openai(body: Value) -> Value {
         .and_then(|c| c.as_array())
         .cloned()
         .unwrap_or_default();
-    // WOR-1537: no candidates is an upstream failure (404, rate
-    // limit, safety block), not an empty successful completion.
+    // WOR-1537: no candidates on a translated 2xx body is an upstream
+    // failure (prompt block, empty generateContent), not a successful
+    // empty completion. HTTP 4xx/5xx never reach this function:
+    // translate_success_response_bytes relays those bodies unchanged,
+    // and a top-level Gemini `error` envelope is already returned above.
     if candidates.is_empty() {
         return empty_candidates_error(&m);
     }
@@ -350,19 +358,7 @@ pub fn response_to_openai(body: Value) -> Value {
         }
     }
 
-    let usage_meta = m.get("usageMetadata");
-    let prompt_tokens = usage_meta
-        .and_then(|u| u.get("promptTokenCount"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let completion_tokens = usage_meta
-        .and_then(|u| u.get("candidatesTokenCount"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let total_tokens = usage_meta
-        .and_then(|u| u.get("totalTokenCount"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(prompt_tokens + completion_tokens);
+    let (prompt_tokens, completion_tokens, total_tokens) = gemini_usage_tokens(&m);
 
     let id = m
         .get("responseId")
@@ -421,23 +417,55 @@ fn extract_content_and_tools(candidate: &Value) -> (Value, Vec<Value>) {
     (Value::String(texts.join("")), tool_calls)
 }
 
+fn gemini_usage_tokens(body: &Map<String, Value>) -> (u64, u64, u64) {
+    let usage_meta = body.get("usageMetadata");
+    let prompt_tokens = usage_meta
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = usage_meta
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let total_tokens = usage_meta
+        .and_then(|u| u.get("totalTokenCount"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+    (prompt_tokens, completion_tokens, total_tokens)
+}
+
 fn empty_candidates_error(body: &Map<String, Value>) -> Value {
     let block_reason = body
         .get("promptFeedback")
         .and_then(|feedback| feedback.get("blockReason"))
         .and_then(|reason| reason.as_str());
+    let content_filter = matches!(
+        block_reason,
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT")
+    );
+    let (err_type, code) = if content_filter {
+        ("content_filter", "content_filter")
+    } else {
+        ("api_error", "no_candidates")
+    };
     let message = match block_reason {
         Some(reason) => {
             format!("Gemini returned no candidates (promptFeedback.blockReason={reason})")
         }
         None => "Gemini returned no candidates".to_string(),
     };
+    let (prompt_tokens, completion_tokens, total_tokens) = gemini_usage_tokens(body);
     json!({
         "error": {
             "message": message,
-            "type": "api_error",
-            "code": "no_candidates",
-        }
+            "type": err_type,
+            "code": code,
+        },
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
     })
 }
 
@@ -641,28 +669,35 @@ mod tests {
 
     #[test]
     fn response_without_candidates_is_an_error_not_an_empty_success() {
-        // WOR-1537: a 404 / rate-limit / safety-blocked Gemini body
-        // with no candidates must not become choices[0] with
-        // model: null, content: "", finish_reason: stop.
+        // WOR-1537: a 2xx Gemini body with no candidates (prompt-level
+        // safety block) must not become choices[0] with empty content
+        // and finish_reason: stop. HTTP 4xx/5xx never reach this
+        // translator.
         let body = json!({
             "modelVersion": "gemini-1.5-pro",
             "candidates": [],
-            "promptFeedback": {"blockReason": "SAFETY"}
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {
+                "promptTokenCount": 8000,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 8000
+            }
         });
         let out = response_to_openai(body);
         assert!(
             out.get("choices").is_none(),
             "empty candidates must not look like a completion: {out}"
         );
-        assert!(
-            out["error"].is_object(),
-            "expected an error envelope: {out}"
-        );
+        assert_eq!(out["error"]["type"], "content_filter");
+        assert_eq!(out["error"]["code"], "content_filter");
         let message = out["error"]["message"].as_str().unwrap_or("");
         assert!(
             message.contains("SAFETY"),
             "block reason should surface: {message}"
         );
+        assert_eq!(out["usage"]["prompt_tokens"], 8000);
+        assert_eq!(out["usage"]["completion_tokens"], 0);
+        assert_eq!(out["usage"]["total_tokens"], 8000);
     }
 
     #[test]
