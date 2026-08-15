@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-08-15*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -193,6 +193,32 @@ ergonomic as a schema-diff gate in a pull request.
 The baseline is a committed lockfile, one contract digest and semver per tool,
 and the declared versions live in a registry the operator edits. The oracle
 diffs the live tools against the lockfile and lints each declared bump.
+
+### What `contract_digest` is
+
+`sha256:<hex>` over the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)
+canonical JSON form of the tool's **contract projection**, which is the tool
+object reduced to `name`, `title`, `description`, `inputSchema`,
+`outputSchema`, and `annotations`. Fields absent from the tool are absent from
+the projection rather than null, and everything outside that set, `_meta`
+included, is dropped so unrelated metadata churn does not move the digest.
+Canonical form means key order and whitespace do not matter either.
+
+One pinned recipe rather than a per-caller one is the whole point: two
+implementations that hash the same tool and disagree give you a gate that
+fires on nothing an operator changed. In this codebase `contract_of` is the
+only function that turns a live tool into a contract, and `contract_digest` is
+the only one that hashes it.
+
+A worked baseline is in `examples/mcp-tool-versioning/tool-versions.lock.yaml`,
+and a test asserts its digest is the one the gateway computes, so the example
+cannot drift into the permanently-blocked state a hand-written digest lands in.
+
+Today the lockfile is hand-assembled from a tool's advertised contract. A
+`sbproxy mcp lock` subcommand that discovers a live catalog and writes the
+baseline is not shipped yet, so the practical path is to copy each tool's
+contract into the lockfile and let the test above, or a first `mode: warn`
+run, tell you the digest.
 
 ## The description judge
 

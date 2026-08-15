@@ -35,6 +35,31 @@ pub fn contract_digest(tool: &Value) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
 }
 
+/// The contract projection of a live federated tool.
+///
+/// The one place a live tool becomes a contract, so the gate and any
+/// lockfile generator cannot construct different inputs for the same
+/// tool and disagree about its digest (WOR-2443). Before this existed
+/// the projection was built inline at the call site, which meant the
+/// recipe was defined by whichever caller you happened to read.
+///
+/// [`FederatedTool`] carries three of the six contract fields today:
+/// `title`, `outputSchema`, and `annotations` have no home on it, so
+/// they are absent from the projection rather than null. That is the
+/// intended behavior, since the projection includes only fields that
+/// are present, but it does mean a digest over a live tool is not
+/// interchangeable with a digest over a raw upstream `tools/list` entry
+/// that carries the other three. Generate baselines from this function.
+///
+/// [`FederatedTool`]: crate::mcp::federation::FederatedTool
+pub fn contract_of(tool: &crate::mcp::federation::FederatedTool) -> Value {
+    serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    })
+}
+
 /// Project a tool value down to its contract fields, dropping everything else.
 fn project_contract(tool: &Value) -> Value {
     let mut out = Map::new();
@@ -52,6 +77,38 @@ fn project_contract(tool: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The shipped example must not be permanently in the
+    /// "contract moved" state.
+    ///
+    /// `examples/mcp-tool-versioning/` carried a zeroed placeholder
+    /// digest that could never match, so an operator following the
+    /// example got a gate that fires on every refresh and learns the
+    /// wrong lesson about what a drift verdict means (WOR-2443).
+    ///
+    /// Reads the committed file rather than a copy, so the example and
+    /// the recipe cannot drift apart again without this failing.
+    #[test]
+    fn the_shipped_example_lockfile_digests_match_the_recipe() {
+        let yaml =
+            include_str!("../../../../../examples/mcp-tool-versioning/tool-versions.lock.yaml");
+        let lockfile: crate::mcp::compat::Lockfile =
+            serde_yaml::from_str(yaml).expect("the shipped example must parse");
+        assert!(
+            !lockfile.tools.is_empty(),
+            "an example with no tools proves nothing"
+        );
+        for (name, lock) in &lockfile.tools {
+            let contract = lock.contract.as_ref().unwrap_or_else(|| {
+                panic!("example tool `{name}` must embed its contract so this can be checked")
+            });
+            assert_eq!(
+                contract_digest(contract),
+                lock.contract_digest,
+                "example tool `{name}` has a digest the gate would not compute; regenerate it"
+            );
+        }
+    }
 
     #[test]
     fn digest_is_stable_under_key_reordering() {

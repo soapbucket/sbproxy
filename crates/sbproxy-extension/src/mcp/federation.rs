@@ -1925,11 +1925,7 @@ impl McpFederation {
                 // New tool: nothing to diff against.
                 continue;
             };
-            let live_contract = serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-            });
+            let live_contract = super::compat::contract_of(tool);
             let live_digest = super::compat::contract_digest(&live_contract);
             if live_digest == lock.contract_digest {
                 continue;

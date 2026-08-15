@@ -20,7 +20,7 @@ pub mod semantics;
 pub mod structural;
 
 pub use behavioral::behavioral_findings;
-pub use digest::contract_digest;
+pub use digest::{contract_digest, contract_of};
 pub use lint::{lint_bump, BumpVerdict};
 pub use lockfile::{Lockfile, ToolLock};
 pub use oracle::{evaluate_compatibility, evaluate_compatibility_full, OracleInputs};
