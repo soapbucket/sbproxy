@@ -169,7 +169,7 @@ impl ChatFormat for OpenAiResponsesFormat {
     fn from_hub_stream(
         &self,
         chunk: &HubChunk,
-        _ctx: &BridgeContext,
+        _ctx: &mut BridgeContext,
     ) -> Result<Vec<String>, ChatError> {
         Ok(hub_chunk_to_responses_sse(chunk))
     }
@@ -645,7 +645,7 @@ mod tests {
                     id: "resp_1".into(),
                     model: "gpt-4o".into(),
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(frames.len(), 1);
@@ -661,7 +661,7 @@ mod tests {
                     index: 0,
                     delta: super::super::ContentPartDelta::Text("hello".into()),
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(frames.len(), 1);
@@ -676,7 +676,7 @@ mod tests {
                 &HubChunk::MessageStop {
                     finish_reason: FinishReason::Stop,
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(frames.len(), 1);
@@ -696,7 +696,7 @@ mod tests {
                         arguments_chunk: None,
                     },
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(f1.len(), 1);
@@ -712,7 +712,7 @@ mod tests {
                         arguments_chunk: Some("{\"city".into()),
                     },
                 },
-                &BridgeContext::default(),
+                &mut BridgeContext::default(),
             )
             .unwrap();
         assert_eq!(f2.len(), 1);

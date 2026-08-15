@@ -167,7 +167,7 @@ impl ChatFormat for OpenAiChatFormat {
     fn from_hub_stream(
         &self,
         chunk: &HubChunk,
-        _ctx: &BridgeContext,
+        _ctx: &mut BridgeContext,
     ) -> Result<Vec<String>, ChatError> {
         Ok(hub_chunk_to_openai_sse(chunk))
     }
@@ -569,7 +569,7 @@ mod tests {
                         id: "resp_1".into(),
                         model: "gpt-4o-mini".into(),
                     },
-                    &BridgeContext::default(),
+                    &mut BridgeContext::default(),
                 )
                 .unwrap(),
         );
@@ -579,7 +579,7 @@ mod tests {
                     &HubChunk::MessageStop {
                         finish_reason: FinishReason::Stop,
                     },
-                    &BridgeContext::default(),
+                    &mut BridgeContext::default(),
                 )
                 .unwrap(),
         );
