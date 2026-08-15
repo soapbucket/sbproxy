@@ -2120,6 +2120,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_concealed_text_findings_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_concealed_text_finding"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["field", "class", "kind"],
+        description: "Advertised MCP tool text carrying characters hidden from a reader, by field and class.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_tool_compat_verdicts_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_tool_compat_verdict"),

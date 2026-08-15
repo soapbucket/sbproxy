@@ -27,6 +27,7 @@ pub mod auth;
 pub mod cassette_drift;
 pub mod codemode_ts;
 pub mod compat;
+pub mod concealed_text;
 pub mod discovery;
 pub mod egress;
 pub mod federation;

@@ -222,6 +222,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_mcp_federation_peers_up` | Gauge | `stable` | `beta` | none | Live MCP federation peers as of the last refresh. |
 | `sbproxy_mcp_policy_hook_invocations_total` | Counter | `stable` | `beta` | `verdict`, `mcp_server`, `tool_name` | MCP pre-tool-call policy hook invocations by verdict, upstream MCP server, and tool. |
 | `sbproxy_mcp_resource_fetch_total` | Counter | `stable` | `beta` | `result` | MCP resource-fetch attempts, by outcome. |
+| `sbproxy_mcp_concealed_text_findings_total` | Counter | `stable` | `beta` | `field`, `class`, `kind` | Advertised MCP tool text carrying characters hidden from a reader, by field and class. |
 | `sbproxy_mcp_tool_compat_verdicts_total` | Counter | `stable` | `beta` | `grade`, `outcome` | Tool-versioning oracle verdicts, by computed grade and outcome. |
 | `sbproxy_mcp_tool_cost_usd_total` | Counter | `stable` | `beta` | `tool`, `server` | MCP tool-call cost in USD, by tool and owning server. |
 | `sbproxy_mcp_tool_dispatch_duration_seconds` | Histogram | `stable` | `beta` | `tool` | MCP tool dispatch duration, by tool name. |
