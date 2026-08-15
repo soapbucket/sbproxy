@@ -5925,6 +5925,8 @@ pub(super) async fn handle_ai_proxy(
     // The plan's reason code is held until precedence is resolved so a plan
     // an `ai_policy route_to` overrides is not counted as one that ran.
     let mut routing_plan_reason_code: Option<&'static str> = None;
+    // The plan's engine label, stashed with it for the deferred record.
+    let mut routing_plan_engine: Option<sbproxy_observe::decision::DecisionEngine> = None;
     // A routing plan fans a request across configured providers, which
     // would replay a caller's own provider credential across the boundary
     // native-key mode exists to hold. The same reason the pre-policy cascade
@@ -5990,7 +5992,7 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
                         sbproxy_observe::decision::record_decision(
                             sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                            sbproxy_observe::decision::DecisionEngine::Cel,
+                            routing_policy.decision_engine(),
                             sbproxy_observe::decision::DecisionOutcome::Deny,
                             route_origin_label(ctx),
                             ctx.tenant_id.as_str(),
@@ -6002,12 +6004,13 @@ pub(super) async fn handle_ai_proxy(
                     ctx.ai_route_reason = Some(reason);
                     routing_policy_cascade = Some(cascade);
                     routing_plan_reason_code = Some(reason_code);
+                    routing_plan_engine = Some(routing_policy.decision_engine());
                 }
                 sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Decline => {
                     sbproxy_ai::ai_metrics::record_routing_policy_decision("decline", "none");
                     sbproxy_observe::decision::record_decision(
                         sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        routing_policy.decision_engine(),
                         sbproxy_observe::decision::DecisionOutcome::Decline,
                         route_origin_label(ctx),
                         ctx.tenant_id.as_str(),
@@ -6022,7 +6025,7 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
                     sbproxy_observe::decision::record_decision(
                         sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        routing_policy.decision_engine(),
                         sbproxy_observe::decision::DecisionOutcome::Error,
                         route_origin_label(ctx),
                         ctx.tenant_id.as_str(),
@@ -6045,7 +6048,7 @@ pub(super) async fn handle_ai_proxy(
                     // clean decline.
                     sbproxy_observe::decision::record_decision_fail_open(
                         sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        routing_policy.decision_engine(),
                         route_origin_label(ctx),
                         ctx.tenant_id.as_str(),
                     );
@@ -6248,7 +6251,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::ai_metrics::record_routing_policy_decision("plan", reason_code);
             sbproxy_observe::decision::record_decision(
                 sbproxy_observe::decision::DecisionEvent::RouteDecide,
-                sbproxy_observe::decision::DecisionEngine::Cel,
+                routing_plan_engine.unwrap_or(sbproxy_observe::decision::DecisionEngine::Cel),
                 sbproxy_observe::decision::DecisionOutcome::Mutate,
                 route_origin_label(ctx),
                 ctx.tenant_id.as_str(),
