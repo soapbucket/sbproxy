@@ -480,13 +480,14 @@ jobs:
             exit 1
           fi
 
-          # time_to_ready_seconds is the ready-banner elapsed
-          # (docs/model-host-certification.md). HTTP-up is only a
-          # fallback after the banner wait expires, so a wording
-          # change cannot leave the field unset after a successful boot.
-          HTTP_READY_SECS=$(( $(date +%s) - BOOT_START ))
+          # time_to_ready_seconds is the ready-banner elapsed, matching
+          # the local apple_metal lane. HTTP-up is not a substitute: the
+          # port can answer while the managed run is still loading, and
+          # a wording change would then store a stale number after a
+          # later successful cert. Wait as long as start_run does (900s)
+          # and fail closed if the banner never appears.
           READY_SECS=-1
-          for _ in $(seq 1 90); do
+          for _ in $(seq 1 900); do
             if grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
               READY_SECS=$(( $(date +%s) - BOOT_START ))
               break
@@ -494,8 +495,9 @@ jobs:
             sleep 1
           done
           if [ "${READY_SECS}" -lt 0 ]; then
-            echo "ready banner not found; recording HTTP-ready elapsed ${HTTP_READY_SECS}s"
-            READY_SECS="${HTTP_READY_SECS}"
+            echo "ready banner never appeared; failing closed" >&2
+            cat /tmp/sbproxy-cert-boot.log >&2 || true
+            exit 1
           fi
           echo "${READY_SECS}" > /tmp/sbproxy-cert-ready-secs
 
@@ -523,6 +525,14 @@ jobs:
           fi
 
           READY_SECS="$(cat /tmp/sbproxy-cert-ready-secs 2>/dev/null || echo -1)"
+          if [ "${READY_SECS}" -lt 0 ]; then
+            echo "time_to_ready_seconds was not sampled from the ready banner" >&2
+            exit 1
+          fi
+          if ! grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
+            echo "ready banner missing at record time; failing closed" >&2
+            exit 1
+          fi
           ADMIN_PASSWORD="$(grep -m1 'Admin password:' /tmp/sbproxy-cert-boot.log | awk '{print $3}')"
           SB_ADMIN_URL="http://127.0.0.1:48124" \
           SB_ADMIN_USERNAME=admin \
