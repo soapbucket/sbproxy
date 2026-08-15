@@ -90,12 +90,24 @@ pub enum CelValue {
     List(Vec<CelValue>),
     /// Null / absent value.
     Null,
+    /// A pre-converted value that binds by reference-count bump.
+    ///
+    /// Every other variant is deep-cloned and re-walked into a
+    /// [`cel::Value`] on each context build, which is the right trade for
+    /// small per-request values and the wrong one for a large shared
+    /// document (a model catalog, a price table) that never changes between
+    /// requests. Build such a value once with [`CelValue::into_shared`] and
+    /// bind the result on every request: the containers inside
+    /// [`cel::Value`] are `Arc`-backed, so each bind clones a handful of
+    /// reference counts instead of the document.
+    Shared(cel::Value),
 }
 
 impl CelValue {
     /// Convert this value into the cel crate's native Value type.
     fn into_cel_value(self) -> cel::Value {
         match self {
+            CelValue::Shared(v) => v,
             CelValue::String(s) => cel::Value::String(Arc::new(s)),
             CelValue::Int(i) => cel::Value::Int(i),
             CelValue::Float(f) => cel::Value::Float(f),
@@ -115,6 +127,29 @@ impl CelValue {
                     map: Arc::new(cel_map),
                 })
             }
+        }
+    }
+
+    /// Convert once, bind cheaply forever after.
+    ///
+    /// Performs the full conversion walk now and returns a
+    /// [`CelValue::Shared`] whose later binds are reference-count bumps.
+    /// Idempotent: a value that is already `Shared` is returned unchanged.
+    pub fn into_shared(self) -> CelValue {
+        match self {
+            already @ CelValue::Shared(_) => already,
+            other => CelValue::Shared(other.into_cel_value()),
+        }
+    }
+
+    /// The inverse of [`CelValue::into_shared`]: materialize a `Shared`
+    /// value back into the plain owned variants so callers that walk the
+    /// enum (JSON converters, tests) see ordinary maps and lists. Every
+    /// other variant is returned unchanged.
+    pub fn into_owned(self) -> CelValue {
+        match self {
+            CelValue::Shared(v) => from_cel_value(&v),
+            other => other,
         }
     }
 }
@@ -276,6 +311,54 @@ impl Default for CelEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_value_binds_and_evaluates_like_the_owned_form() {
+        let engine = CelEngine::new();
+        let catalog = CelValue::Map(HashMap::from([(
+            "gpt-4o".to_string(),
+            CelValue::Map(HashMap::from([
+                ("price_per_1k_input".to_string(), CelValue::Float(2.5)),
+                ("context_window".to_string(), CelValue::Int(128_000)),
+            ])),
+        )]));
+        let mut ctx = CelContext::new();
+        ctx.set("catalog", catalog.into_shared());
+        assert!(engine
+            .eval_bool_source(
+                r#"catalog["gpt-4o"].price_per_1k_input < 3.0
+                   && catalog["gpt-4o"].context_window == 128000
+                   && !("nope" in catalog)"#,
+                &ctx,
+            )
+            .expect("a shared map must evaluate like an owned one"));
+    }
+
+    #[test]
+    fn cloning_a_shared_value_bumps_a_refcount_instead_of_copying() {
+        let big = CelValue::Map(HashMap::from([(
+            "k".to_string(),
+            CelValue::List(vec![CelValue::Int(1); 64]),
+        )]));
+        let shared = big.into_shared();
+        let cloned = shared.clone();
+        let (CelValue::Shared(cel::Value::Map(a)), CelValue::Shared(cel::Value::Map(b))) =
+            (&shared, &cloned)
+        else {
+            panic!("into_shared must produce Shared(Map)");
+        };
+        assert!(
+            Arc::ptr_eq(&a.map, &b.map),
+            "a cloned Shared must point at the same underlying map"
+        );
+    }
+
+    #[test]
+    fn into_shared_is_idempotent() {
+        let shared = CelValue::Int(7).into_shared();
+        let again = shared.clone().into_shared();
+        assert!(matches!(again, CelValue::Shared(cel::Value::Int(7))));
+    }
 
     #[test]
     fn test_compile_valid_expression() {

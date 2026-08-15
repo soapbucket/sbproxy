@@ -291,6 +291,9 @@ fn cel_to_json(value: &CelValue) -> serde_json::Value {
         ),
         CelValue::List(list) => serde_json::Value::Array(list.iter().map(cel_to_json).collect()),
         CelValue::Null => serde_json::Value::Null,
+        // A pre-converted shared value (the catalog binds as one): the policy
+        // result never is, but materialize and convert rather than guess.
+        CelValue::Shared(_) => cel_to_json(&value.clone().into_owned()),
     }
 }
 

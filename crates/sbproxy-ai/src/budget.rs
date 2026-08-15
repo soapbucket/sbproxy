@@ -809,6 +809,15 @@ fn resolve_price(model: &str) -> Option<(ModelPrice, PriceSource)> {
     lookup_price(model).map(|p| (p, PriceSource::Catalog))
 }
 
+/// The effective price for `model` without the source layer, for the
+/// `ai.catalog` base-data document (WOR-2366). Same resolution order as
+/// cost accounting: operator table first, then the built-in catalog;
+/// `None` when neither layer knows the model (the catalog omits it, it
+/// does not apply the pessimistic accounting fallback).
+pub(crate) fn catalog_price(model: &str) -> Option<ModelPrice> {
+    resolve_price(model).map(|(price, _)| price)
+}
+
 /// A config-supplied model price (WOR-1707). Rates are per-million USD
 /// so operators write human numbers (`input_per_million: 3.0`), not
 /// per-token fractions.

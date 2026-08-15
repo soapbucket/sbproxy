@@ -365,7 +365,9 @@ pub(crate) fn rate_limit_key_from_cel(
         CelValue::Float(f) => f.to_string(),
         CelValue::Bool(b) => b.to_string(),
         CelValue::Null => return CelKeyOutcome::NoKey,
-        CelValue::Map(_) | CelValue::List(_) => {
+        // `Shared` is a bind-side optimization; an evaluation result is never
+        // one. Refuse it like the other non-scalar shapes rather than guess.
+        CelValue::Map(_) | CelValue::List(_) | CelValue::Shared(_) => {
             tracing::warn!(
                 site = expr.site(),
                 expression = expr.source(),

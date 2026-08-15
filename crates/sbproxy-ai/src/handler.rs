@@ -272,6 +272,13 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) ai_routing_policy_compiled:
         OnceLock<Option<std::sync::Arc<crate::ai_routing_policy::CompiledAiRoutingPolicy>>>,
+    /// Lazy-built `ai.catalog` base-data document (WOR-2366): per-model
+    /// prices and context windows for this origin's declared models,
+    /// converted once to the shared CEL form so each request binds it by
+    /// reference-count bump. Rebuilt with the handler on config reload,
+    /// after `from_config` has installed the price table.
+    #[serde(skip)]
+    ai_catalog_cel: OnceLock<sbproxy_extension::cel::CelValue>,
     /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
     #[serde(skip)]
     quota_pool_store: OnceLock<std::sync::Arc<CachedQuotaPoolStore>>,
@@ -437,6 +444,16 @@ impl AiHandlerConfig {
     /// once (WOR-2366). `None` when no routing policy is configured. The
     /// failure arm is defensive for the same reason as [`Self::ai_policy`]:
     /// `from_config` already refused any expression that does not compile.
+    /// The `ai.catalog` base-data document for this origin's declared
+    /// models (WOR-2366): per-model prices and context windows, built once
+    /// per config generation and returned in the shared CEL form, so the
+    /// clone this returns is a reference-count bump, not a document copy.
+    pub fn ai_catalog_cel(&self) -> sbproxy_extension::cel::CelValue {
+        self.ai_catalog_cel
+            .get_or_init(|| crate::routing_base_data::build_catalog_cel(&self.providers))
+            .clone()
+    }
+
     pub fn ai_routing_policy(
         &self,
     ) -> Option<&std::sync::Arc<crate::ai_routing_policy::CompiledAiRoutingPolicy>> {
@@ -1895,6 +1912,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1941,6 +1959,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1987,6 +2006,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -2034,6 +2054,7 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             ai_routing_policy_compiled: OnceLock::new(),
+            ai_catalog_cel: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),

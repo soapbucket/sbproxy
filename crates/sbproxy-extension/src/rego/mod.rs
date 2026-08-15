@@ -318,6 +318,9 @@ fn cel_to_json(value: &CelValue) -> serde_json::Value {
         CelValue::Null => serde_json::Value::Null,
         CelValue::List(items) => serde_json::Value::Array(items.iter().map(cel_to_json).collect()),
         CelValue::Map(entries) => convert_map(entries),
+        // A pre-converted shared value: materialize it (an Arc walk, not a
+        // document copy at the top) and convert the owned form.
+        CelValue::Shared(_) => cel_to_json(&value.clone().into_owned()),
     }
 }
 
