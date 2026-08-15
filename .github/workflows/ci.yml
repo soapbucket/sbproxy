@@ -315,6 +315,13 @@ jobs:
       - name: no process-global env mutation outside test helpers
         run: bash scripts/check-env-mutation.sh
 
+      # Apache 2.0 section 4(d): every Apache-2.0-only crate must be
+      # named in NOTICE. Shares one script with scripts/check.sh.
+      # cargo metadata does not compile and does not change this job's
+      # package selection.
+      - name: NOTICE covers Apache-2.0-only crates (WOR-2449)
+        run: bash scripts/check-notice.sh
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

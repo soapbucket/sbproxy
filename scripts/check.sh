@@ -194,6 +194,12 @@ bash "$ROOT/scripts/check-spec-citations.sh"
 step "no process-global env mutation outside test helpers"
 bash "$ROOT/scripts/check-env-mutation.sh"
 
+# WOR-2449: Apache 2.0 section 4(d) attribution for Apache-2.0-only
+# crates. cargo metadata, no compile. Shares one script with the CI
+# lint lane. The CLAUDE.md / AGENTS.md snippet is no longer the check.
+step "NOTICE covers Apache-2.0-only crates"
+bash "$ROOT/scripts/check-notice.sh"
+
 # WOR-2287: guardrail for the WOR-2282 secret-resolver convergence. Pure
 # python source scan, no CI job of its own yet (not currently mirrored in
 # .github/workflows/ci.yml), so this local gate is presently the only
@@ -211,6 +217,8 @@ bash "$ROOT/scripts/tests/workspace_bin_test.sh"
 bash "$ROOT/scripts/tests/runner_disk_test.sh"
 python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
+python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
+python3 "$ROOT/scripts/tests/test_notice_coverage.py"
 
 # CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs.
