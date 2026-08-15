@@ -54,11 +54,6 @@ pub fn compile_action_for_validation(config: &serde_json::Value) -> Result<Actio
     compile_action_for_origin_with_runtime(config, "", false, None)
 }
 
-/// Compile an action with the stable identity of its owning origin.
-pub fn compile_action_for_origin(config: &serde_json::Value, origin_id: &str) -> Result<Action> {
-    compile_action_for_origin_with_runtime(config, origin_id, true, None)
-}
-
 /// Compile an origin action with dynamic bundle lookup after built-ins and linked plugins.
 pub fn compile_action_for_origin_with_registry(
     config: &serde_json::Value,
@@ -68,12 +63,21 @@ pub fn compile_action_for_origin_with_registry(
     compile_action_for_origin_with_runtime(config, origin_id, true, Some(registry))
 }
 
-/// Compile an origin action for validation without constructing runtime clients.
-pub fn compile_action_for_origin_for_validation(
+/// Compile an origin action for validation with the extension-bundle
+/// registry in scope.
+///
+/// Validation still builds no runtime clients and resolves no
+/// credentials; the registry only lets an action prove that a bundle
+/// hook it names actually exists. Without this, `sbproxy validate`,
+/// `plan`, and `doctor` refuse a config whose `ai_routing_policy` names
+/// a real `ai_routing` hook, because the action never sees the registry
+/// that holds it (WOR-2366).
+pub fn compile_action_for_origin_for_validation_with_registry(
     config: &serde_json::Value,
     origin_id: &str,
+    registry: &dyn BundleRegistry,
 ) -> Result<Action> {
-    compile_action_for_origin_with_runtime(config, origin_id, false, None)
+    compile_action_for_origin_with_runtime(config, origin_id, false, Some(registry))
 }
 
 // The registry stays in scope across the built-in arms, not just the
@@ -100,10 +104,13 @@ fn compile_action_for_origin_with_runtime(
             LoadBalancerAction::from_config_for_origin(config.clone(), origin_id)?,
         ))),
         "ai_proxy" => {
+            // The registry rides along so an `ai_routing_policy` with
+            // `engine: wasm` can resolve its bundle hook at compile
+            // time (WOR-2366); without one, the wasm form refuses.
             let action = if prepare_runtime {
-                AiProxyAction::from_config(config.clone())?
+                AiProxyAction::from_config_with_registry(config.clone(), registry)?
             } else {
-                AiProxyAction::from_config_for_validation(config.clone())?
+                AiProxyAction::from_config_for_validation_with_registry(config.clone(), registry)?
             };
             Ok(Action::AiProxy(Box::new(action)))
         }
@@ -1162,7 +1169,7 @@ hooks:
             ]
         });
 
-        let action = compile_action_for_origin(&json, "origin-alpha")
+        let action = compile_action_for_origin_with_runtime(&json, "origin-alpha", true, None)
             .expect("origin-aware action should compile");
 
         assert_eq!(action.action_type(), "load_balancer");

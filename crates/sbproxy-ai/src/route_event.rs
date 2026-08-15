@@ -80,6 +80,15 @@ pub const MAX_ROUTE_REASON_BYTES: usize = 512;
 /// Mirrors [`crate::routing::CascadeTier`] deliberately: a plan should
 /// be able to express what the built-in cascade already expresses, or it
 /// is again less capable than the thing it extends.
+///
+/// Both limit fields read a JSON `null` as absent, which is worth knowing
+/// when the limit is computed rather than written literally: JSON cannot
+/// spell NaN or infinity, so a CEL expression whose arithmetic goes
+/// non-finite arrives here as `null` and produces a candidate with no
+/// limit rather than a refusal. An operator computing a cap should guard
+/// the expression against NaN and infinity, because the decoder cannot
+/// tell that null from the one every guest encoder emits for an unset
+/// optional.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RouteCandidate {
     /// Name of the provider in `AiHandlerConfig::providers`.
@@ -215,6 +224,33 @@ impl RoutePlan {
             }
         }
         Ok(())
+    }
+
+    /// Drop the candidates that name no configured provider; keep the rest.
+    ///
+    /// The runtime disposition for a plan naming unconfigured providers
+    /// (WOR-2366 D6): drop the dead tiers and continue on the survivors.
+    /// The caller errors only when nothing survives; a partially wrong
+    /// plan still routes on the tiers that can dispatch, which is strictly
+    /// better for the request than refusing the whole plan over one typo.
+    ///
+    /// Removed candidates' provider ids are returned in plan order so the
+    /// caller can warn with them. A blank `provider_id` is dropped too,
+    /// for the reason [`Self::require_known_providers`] refuses it: a plan
+    /// headed into the cascade executor has nothing to dispatch a blank
+    /// provider to.
+    pub fn retain_known_providers(&mut self, configured: &[String]) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.candidates.retain(|candidate| {
+            if !candidate.provider_id.is_empty()
+                && configured.iter().any(|p| p == &candidate.provider_id)
+            {
+                return true;
+            }
+            dropped.push(candidate.provider_id.clone());
+            false
+        });
+        dropped
     }
 
     /// Convert this plan into a [`crate::routing::CascadeConfig`] so it
@@ -635,14 +671,22 @@ mod tests {
     fn an_explicit_null_is_absent_rather_than_wrongly_typed() {
         // JSON encoders emit null for an absent optional constantly, so
         // refusing it would reject documents nobody considers malformed.
+        // The limit fields are where that bites hardest: a guest written
+        // in Rust serializes an unset `Option<u64>` as `"cost_cap": null`
+        // on every candidate, as do a Go pointer field and Python's
+        // `json.dumps(None)`, so refusing a present null would make every
+        // plan those guests return an error and the policy silently inert.
         let RouteDecision::Plan(plan) = decode_route_plan(&json!({
-            "candidates": [{"model": "m", "provider_id": null, "quality_threshold": null}]
+            "candidates": [
+                {"model": "m", "provider_id": null, "quality_threshold": null, "cost_cap": null}
+            ]
         }))
         .unwrap() else {
             panic!("expected a plan");
         };
         assert_eq!(plan.candidates[0].provider_id, "");
         assert_eq!(plan.candidates[0].quality_threshold, None);
+        assert_eq!(plan.candidates[0].cost_cap, None);
     }
 
     #[test]
@@ -909,5 +953,58 @@ mod tests {
             panic!("expected a plan");
         };
         assert!(ok.require_known_providers(&["openai".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn retain_known_providers_keeps_order_and_returns_the_dropped_ids() {
+        // WOR-2366 D6: dead tiers drop, survivors run, and the caller
+        // gets the dropped ids in plan order so its warning reads the
+        // way the operator wrote the plan.
+        let RouteDecision::Plan(mut plan) = decode_route_plan(&json!({
+            "candidates": [
+                {"provider_id": "ghost", "model": "m1"},
+                {"provider_id": "openai", "model": "m2"},
+                {"provider_id": "phantom", "model": "m3"},
+                {"provider_id": "anthropic", "model": "m4"},
+            ],
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        let dropped = plan.retain_known_providers(&["openai".to_owned(), "anthropic".to_owned()]);
+        assert_eq!(dropped, vec!["ghost".to_owned(), "phantom".to_owned()]);
+        let survivors: Vec<_> = plan
+            .candidates
+            .iter()
+            .map(|c| c.provider_id.as_str())
+            .collect();
+        assert_eq!(survivors, ["openai", "anthropic"]);
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|c| c.model.as_str())
+                .collect::<Vec<_>>(),
+            ["m2", "m4"],
+            "each survivor keeps its own model"
+        );
+    }
+
+    #[test]
+    fn retaining_against_no_match_leaves_an_empty_plan() {
+        // Nothing survives: the plan empties and every id comes back, so
+        // the caller can take its error path naming all of them.
+        let RouteDecision::Plan(mut plan) = decode_route_plan(&json!({
+            "candidates": [
+                {"provider_id": "ghost", "model": "m1"},
+                {"provider_id": "phantom", "model": "m2"},
+            ],
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        let dropped = plan.retain_known_providers(&["openai".to_owned()]);
+        assert_eq!(dropped, vec!["ghost".to_owned(), "phantom".to_owned()]);
+        assert!(plan.candidates.is_empty());
+        assert!(plan.primary().is_none());
     }
 }

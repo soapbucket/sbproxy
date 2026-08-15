@@ -1,7 +1,7 @@
 # Extension Bundles
 *Last modified: 2026-08-14*
 
-Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
+Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, provider-neutral event hooks, and AI routing decisions without linking a new proxy binary. A local installation is a directory of bundle directories:
 
 ```text
 examples/extension-bundles/
@@ -303,8 +303,9 @@ AI hooks receive a provider-neutral event with `schema_version: 1`, a monotonica
 | `ai_guardrail_output` | Canonical buffered assistant text |
 | `ai_stream_event` | Normalized message-start, text-delta, usage, or message-stop chunk |
 | `ai_close` | One terminal summary with finish reason, byte and delta counts, tool-call count, and token usage when known |
+| `ai_routing` | Not an event. The hook attaches by `type` from a routing policy and answers with a routing plan; see [Routing hooks](#routing-hooks) |
 
-JavaScript and envelope WASM AI hooks return `release`, `flag`, `block`, or `mutate`. A `block` carries an HTTP status from 400 through 599 plus a bounded code and client-safe message. A `flag` carries the code and message but does not stop traffic. `enforcement_mode: observe` moves a hook onto a bounded observation lane; the default `block` mode waits for the decision before releasing the corresponding operation or bytes.
+JavaScript and envelope WASM event hooks return `release`, `flag`, `block`, or `mutate`. A `block` carries an HTTP status from 400 through 599 plus a bounded code and client-safe message. A `flag` carries the code and message but does not stop traffic. `enforcement_mode: observe` moves a hook onto a bounded observation lane; the default `block` mode waits for the decision before releasing the corresponding operation or bytes.
 
 A `mutate` rewrites the event's content in place and releases it. The decision carries a bounded `code` and a `body_base64` payload holding the replacement content: plain UTF-8 text for `ai_guardrail_output`, the JSON of the canonical message list for `ai_guardrail_input`, and the JSON of the complete call object for `ai_tool_call`. The host applies the rewrite before the next hook runs, so hooks compose: a redactor followed by a classifier classifies the redacted content. What ships is the rewritten content, spliced back into the provider-shaped body; a rewrite the body shape cannot faithfully carry (for example, one replacement text against a multi-choice completion) refuses the response rather than shipping the original.
 
@@ -313,6 +314,57 @@ A rewritten tool call replaces the held argument fragments with one canonical fr
 The input splice is content-only. The canonical message list is a lossy view (it carries no tool calls, drops non-text content parts, and folds provider role spellings), so the host never rebuilds the body from it: the original request stays authoritative, and only the text of messages the rewrite actually changed lands back in its original slot. Tool calls, images, and role spellings on untouched messages survive byte for byte. A rewrite that adds, removes, reorders, or relabels messages, or changes a message whose content has more than one text part, refuses as unrepresentable.
 
 Mutation is declared, not inferred. A hook may return `mutate` only when its manifest entry sets `execution.mutates: true`, which is accepted on `ai_guardrail_input`, `ai_guardrail_output`, and `ai_tool_call` hooks; declaring it elsewhere, or combining it with `enforcement_mode: observe` (whose decisions are discarded), refuses at config load. An undeclared or oversized rewrite (the payload is capped by `sandbox.max_buffer_bytes`) is an engine fault handled under the bundle's failure posture: refused under `closed`, released unmodified under an admitting posture. Identity fields such as `sequence` and `request_id` are host-owned and cannot be rewritten.
+
+### Routing hooks
+
+An `ai_routing` hook picks which provider and model serve one AI request. It rides no event chain: it attaches by name from an origin's `ai_routing_policy`, so it evaluates on every request through that origin without appearing in the guardrail, tool-call, or stream lanes.
+
+```yaml
+hooks:
+  - kind: ai_routing
+    type: acme_router
+    execution:
+      body_mode: none
+```
+
+Four constraints hold on the kind, each refused at candidate load rather than at the first request:
+
+- Envelope WASM only. A JavaScript bundle cannot declare it, because a JavaScript hook holding a `net:outbound` grant gains the `sbproxy_fetch` host function, and that would put I/O inside a routing decision.
+- No capabilities. Everything the decision needs arrives in the request envelope, so a declared capability is refused on the kind before the runtime is even considered.
+- `body_mode: none`, declared explicitly. The hook receives the routing document, never a request or response body, and `buffered` is the field default, so silence would promise data the host never delivers.
+- `enforcement_mode: observe` is refused too. Declining to return a plan already is the observe posture, so the knob would load cleanly and change nothing.
+
+The request envelope carries the `ai` decision document, the same vocabulary the CEL, Lua, JavaScript, and Rego forms of the policy read:
+
+```json
+{
+  "version": "sbproxy-envelope/v1",
+  "hook": {"kind": "ai_routing", "type": "acme_router"},
+  "config": {"aggressiveness": 2},
+  "ai": {"model": "gpt-4o", "principal": {"tier": "free"}, "budget": {"fraction": 0.82}}
+}
+```
+
+`config` is the attachment's `vars` with the hook's `config_schema` defaults applied and its declared `secret_vars` resolved. The fields of the `ai` document are listed in [ai-gateway.md](ai-gateway.md).
+
+The response envelope carries exactly two fields:
+
+```json
+{
+  "version": "sbproxy-envelope/v1",
+  "plan": {
+    "candidates": [{"provider_id": "cheap", "model": "gpt-4o-mini"}],
+    "reason": "budget over 80 percent",
+    "reason_code": "cost"
+  }
+}
+```
+
+- `"plan": null` declines, and so do `{}` and a plan with an empty candidate list. The gateway falls through to the configured `routing` strategy, exactly as a decline from any other engine does.
+- A missing `plan` field is a malformed envelope, not a decline. Declining is a decision the hook makes on purpose and writes down; a response that never mentions `plan` is a guest that did not answer, so it is refused as `invalid_envelope` and handled as a fault under the policy's `on_error` and the bundle's failure posture rather than read as "no opinion".
+- Any other top-level field is refused, and so is a `version` that is not `sbproxy-envelope/v1`, which fails as `invalid_version`.
+
+The plan's own shape (`candidates`, the required `reason`, the optional `reason_code`, and the per-candidate `quality_threshold` and `cost_cap`) is engine-neutral and documented in [ai-gateway.md](ai-gateway.md). The bundle runtime never inspects it: the envelope decoder hands the plan through untouched and the gateway decodes it, so a plan that is valid JSON but wrong for the gateway fails there as a routing error rather than here as a bundle fault.
 
 ## Payment and x402 events
 

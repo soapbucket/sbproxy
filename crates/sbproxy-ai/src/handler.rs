@@ -1002,7 +1002,7 @@ impl AiHandlerConfig {
     /// An authored `context_overflow:` block is refused. See the inline
     /// note below for why refusing beats ignoring it.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Self::from_config_inner(value, true)
+        Self::from_config_inner(value, true, None)
     }
 
     /// [`Self::from_config`] for validation-only compiles: identical
@@ -1012,12 +1012,47 @@ impl AiHandlerConfig {
     /// a config that is then rejected left live cost accounting reading the
     /// rejected candidate's prices until the next successful load.
     pub fn from_config_for_validation(value: serde_json::Value) -> anyhow::Result<Self> {
-        Self::from_config_inner(value, false)
+        Self::from_config_inner(value, false, None)
+    }
+
+    /// [`Self::from_config`] with a prepared WASM routing program.
+    ///
+    /// An `ai_routing_policy` with `engine: wasm` names a hook inside an
+    /// extension bundle, and the bundle registry is only visible to the
+    /// action-compile layer. That layer resolves the hook against the
+    /// registry, prepares the program, and hands it in here; the eager
+    /// compile threads it into
+    /// [`crate::ai_routing_policy::CompiledAiRoutingPolicy`] via
+    /// `compile_with_program`. Passing `None` alongside an `engine: wasm`
+    /// config makes the eager compile fail with the requires-a-bundle
+    /// error, which is the load-time refusal the design wants: a wasm
+    /// hook nothing resolved must refuse the config rather than boot with
+    /// the policy silently absent.
+    pub fn from_config_with_wasm_routing(
+        value: serde_json::Value,
+        wasm_routing: Option<crate::ai_routing_policy::WasmRoutingResolution>,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_inner(value, true, wasm_routing)
+    }
+
+    /// [`Self::from_config_for_validation`] with a prepared WASM routing
+    /// program: identical checks to
+    /// [`Self::from_config_with_wasm_routing`], but the candidate's price
+    /// table is built and then dropped rather than installed into the
+    /// process-global cost-accounting table. As there, `None` plus an
+    /// `engine: wasm` config refuses at load with the requires-a-bundle
+    /// error.
+    pub fn from_config_for_validation_with_wasm_routing(
+        value: serde_json::Value,
+        wasm_routing: Option<crate::ai_routing_policy::WasmRoutingResolution>,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_inner(value, false, wasm_routing)
     }
 
     fn from_config_inner(
         value: serde_json::Value,
         install_price_table: bool,
+        wasm_routing: Option<crate::ai_routing_policy::WasmRoutingResolution>,
     ) -> anyhow::Result<Self> {
         // WOR-2309: `context_overflow:` was never a field on this struct,
         // but ai-gateway.md named the block by that spelling and told
@@ -1071,10 +1106,17 @@ impl AiHandlerConfig {
         // here rather than disabling the policy at first use. The compiled
         // program pre-warms the lazy cell rather than being dropped, so a
         // Rego module is parsed and proved once per load, not twice (and
-        // the script-compile metric counts one compile per load).
+        // the script-compile metric counts one compile per load). An
+        // `engine: wasm` policy consumes the program the action-compile
+        // layer resolved and passed through `wasm_routing`; with `None`
+        // here, `compile_with_program` fails with the requires-a-bundle
+        // error, so an unresolved wasm hook refuses the config at load.
         if let Some(policy) = config.ai_routing_policy.as_ref() {
-            let compiled = crate::ai_routing_policy::CompiledAiRoutingPolicy::compile(policy)
-                .map_err(|error| anyhow::anyhow!("ai ai_routing_policy: {error}"))?;
+            let compiled = crate::ai_routing_policy::CompiledAiRoutingPolicy::compile_with_program(
+                policy,
+                wasm_routing,
+            )
+            .map_err(|error| anyhow::anyhow!("ai ai_routing_policy: {error}"))?;
             let _ = config
                 .ai_routing_policy_compiled
                 .set(Some(std::sync::Arc::new(compiled)));
@@ -2355,6 +2397,25 @@ mod tests {
         });
         let config = AiHandlerConfig::from_config(json).expect("a valid routing policy must load");
         assert!(config.ai_routing_policy().is_some());
+    }
+
+    #[test]
+    fn from_config_refuses_a_wasm_routing_policy_without_a_bundle_program() {
+        // WOR-2366: plain `from_config` carries no resolved bundle
+        // program, and only the action-compile layer can see the bundle
+        // registry that would supply one. An `engine: wasm` hook must
+        // therefore refuse the config at load rather than boot green with
+        // the policy silently absent. The positive path (a real prepared
+        // program threaded through `from_config_with_wasm_routing`) is
+        // covered where a bundle fixture exists, not here.
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_routing_policy": {"engine": "wasm", "type": "x"},
+        });
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("a wasm routing hook with no resolved program must refuse the config")
+            .to_string();
+        assert!(error.contains("extension bundle"), "{error}");
     }
 
     #[test]

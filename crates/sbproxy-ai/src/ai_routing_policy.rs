@@ -10,22 +10,25 @@
 //! same cascade executor the built-in `Cascade` strategy uses, so a
 //! policy is never less capable than the strategy it extends.
 //!
-//! The engine is CEL for now. CEL returns a scalar, not a document, so
-//! this surface exists to prove the shape; the document engines (Lua,
-//! JavaScript, WASM, Rego) slot in later behind the same
-//! [`crate::route_event`] decoder without changing the plan type or the
-//! dispatch wiring.
+//! The engines are CEL (`expression`), the inline document engines
+//! (`engine: lua`, `js`, `rego`), and compiled WASM bundle hooks
+//! (`engine: wasm` + `type`). Every document engine feeds the same
+//! [`crate::route_event`] decoder, so the plan type and the dispatch
+//! wiring never vary by engine.
 //!
 //! ## Three outcomes, not two
 //!
-//! - [`AiRoutingOutcome::Plan`] executes the plan.
+//! - [`AiRoutingOutcome::Plan`] executes the plan, and carries the ids of
+//!   any tiers dropped on the way so the caller can record the re-route.
 //! - [`AiRoutingOutcome::Decline`] is the common, cheap path: the policy
 //!   had no opinion, so the configured [`crate::routing::RoutingStrategy`]
 //!   runs unchanged. A null, an empty document, or an absent `candidates`
 //!   key all decline.
 //! - [`AiRoutingOutcome::Error`] is an evaluation fault, a malformed
-//!   document, a missing reason, or a plan naming an unconfigured
-//!   provider. `on_error` governs it, and it is counted separately from a
+//!   document, a missing reason, or a plan whose every candidate names an
+//!   unconfigured provider. A partially unknown plan is not an error: the
+//!   dead tiers drop with a warning and the survivors run (WOR-2366 D6).
+//!   `on_error` governs the error, and it is counted separately from a
 //!   decline so "the policy had no opinion" and "the policy broke" are
 //!   never the same line on a dashboard.
 
@@ -80,15 +83,18 @@ impl AiRoutingOnError {
 
 /// Config for the operator-authored routing policy.
 ///
-/// Two mutually exclusive authoring forms:
+/// Three mutually exclusive authoring forms:
 ///
 /// - `expression`: a CEL expression (the original form, unchanged).
 /// - `engine` + `source`: an inline document engine, `lua`, `js`, or
 ///   `rego`. Rego additionally accepts `query` (default
 ///   `data.sbproxy.route`), `data` (a base-data document, WOR-2420), and
-///   `budget_ms`. A `wasm` routing hook is a compiled bundle, not inline
-///   source, and arrives through the extension-bundle registry in a later
-///   slice, mirroring the decision-script rule.
+///   `budget_ms`.
+/// - `engine: wasm` + `type`: a compiled bundle hook of kind
+///   `ai_routing`, resolved from the loaded extension bundles when the
+///   config compiles, with `vars` as its optional per-policy
+///   configuration. Not inline source: the wasm form takes none of the
+///   inline knobs, mirroring the decision-script rule.
 ///
 /// `on_error` and `reason_codes` are engine-neutral.
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +123,18 @@ pub struct AiRoutingPolicyConfig {
     /// same bound the `rego` policy module uses.
     #[serde(default)]
     pub budget_ms: Option<u64>,
+    /// Wasm only: the bundle hook's `type:` name. Names an `ai_routing`
+    /// hook in a loaded extension bundle; the hook is resolved when the
+    /// config compiles, so a typo refuses at load rather than at the
+    /// first request.
+    #[serde(rename = "type", default)]
+    pub hook_type: Option<String>,
+    /// Wasm only: per-policy configuration handed to the hook. Validated
+    /// against the hook's own `config_schema` (defaults applied, declared
+    /// `secret_vars` resolved) when the bundle program is built, the same
+    /// prepare path every other envelope adapter takes.
+    #[serde(default)]
+    pub vars: Option<serde_json::Value>,
     /// What to do when the expression faults or returns a malformed plan.
     /// `decline` (default) or `block`.
     #[serde(default = "default_on_error")]
@@ -139,6 +157,23 @@ const DEFAULT_REGO_BUDGET_MS: u64 = 50;
 /// Default Rego rule for a routing policy.
 const DEFAULT_REGO_QUERY: &str = "data.sbproxy.route";
 
+/// How a wasm routing hook was resolved by the layer that owns the
+/// extension-bundle registry.
+///
+/// A runtime compile prepares the program (schema defaults, secrets,
+/// sandbox limits) and hands it over. A validation compile deliberately
+/// stops at the lookup, because preparing would resolve the hook's
+/// declared secrets and `sbproxy validate` must not reach a secret
+/// backend; it reports that the hook exists so the policy still compiles
+/// and every other refusal in this file still runs (WOR-2366).
+pub enum WasmRoutingResolution {
+    /// The hook was resolved and prepared; this program runs the policy.
+    Prepared(Box<sbproxy_extension::bundle::WasmAiRoutingProgram>),
+    /// The hook was found in the registry but deliberately not prepared.
+    /// A policy compiled this way validates but cannot evaluate.
+    ValidatedOnly,
+}
+
 /// The compiled program behind one routing policy, one variant per engine.
 ///
 /// Every variant produces the same routing-plan JSON document; everything
@@ -153,12 +188,26 @@ enum RoutingProgram {
     /// An inline JavaScript script; the `ai` document is a global. Fresh
     /// VM per evaluation, the decision-script cost model.
     Js { source: String },
+    /// A wasm hook proven to exist but never prepared, the shape a
+    /// validation-only compile produces. Evaluating it is a fault
+    /// (`on_error` governs), which no production path reaches because
+    /// only a runtime compile serves requests.
+    WasmValidatedOnly,
     /// A Rego module, evaluated on a shared interpreter behind a lock;
     /// the `ai` document is `input.ai`. Boxed because the interpreter is
     /// an order of magnitude larger than the other variants and the
     /// program is built once per config load, so the indirection costs
     /// one allocation per load, not per request.
     Rego(Box<std::sync::Mutex<sbproxy_extension::rego::CompiledRego>>),
+    /// A compiled bundle hook of kind `ai_routing`, resolved at config
+    /// compile. The program was prepared through the bundle's
+    /// schema/secrets path (its `config_schema` defaults and declared
+    /// `secret_vars` applied to `vars`, the sandbox budget attached), so
+    /// by the time it lands here it is ready to invoke per request.
+    /// Boxed because the program holds an engine handle far larger than
+    /// the inline variants, the same `large_enum_variant` reasoning as
+    /// `Rego`.
+    Wasm(Box<sbproxy_extension::bundle::WasmAiRoutingProgram>),
 }
 
 impl RoutingProgram {
@@ -167,7 +216,9 @@ impl RoutingProgram {
             Self::Cel(_) => "cel",
             Self::Lua { .. } => "lua",
             Self::Js { .. } => "js",
+            Self::WasmValidatedOnly => "wasm",
             Self::Rego(_) => "rego",
+            Self::Wasm(_) => "wasm",
         }
     }
 }
@@ -200,6 +251,19 @@ pub enum AiRoutingOutcome {
         reason: String,
         /// The normalized reason code, bound for the routing metric label.
         reason_code: &'static str,
+        /// Provider ids dropped from the plan because they named no
+        /// configured provider, in plan order. Empty when the plan ran
+        /// whole, which is the ordinary case.
+        ///
+        /// Carried on the outcome rather than left to the warning line
+        /// because the dispatcher, not this module, owns what a routing
+        /// decision records: a drop changes which tiers run, so a log
+        /// line that rotates away cannot be the only trace of it. The
+        /// caller is expected to count the drops and reflect them in
+        /// whatever it records for the decision, since `reason` and
+        /// `reason_code` still describe the plan the policy returned
+        /// rather than the one that ran.
+        dropped: Vec<String>,
     },
     /// The policy had no opinion; the configured strategy applies.
     Decline,
@@ -213,19 +277,45 @@ pub enum AiRoutingOutcome {
 }
 
 impl CompiledAiRoutingPolicy {
-    /// Compile and validate a routing policy at config load.
+    /// Compile and validate a routing policy at config load, with no
+    /// bundle program.
+    ///
+    /// A thin wrapper over [`Self::compile_with_program`] passing `None`:
+    /// every non-wasm form compiles identically through either entry, and
+    /// an `engine: wasm` config refuses through this one because there is
+    /// no loaded bundle to resolve the hook against.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::compile_with_program`] refuses.
+    pub fn compile(cfg: &AiRoutingPolicyConfig) -> anyhow::Result<Self> {
+        Self::compile_with_program(cfg, None)
+    }
+
+    /// Compile and validate a routing policy at config load, resolving an
+    /// `engine: wasm` form against an already-built bundle program.
+    ///
+    /// `wasm` is the hook program the caller resolved from the loaded
+    /// extension bundles, prepared through the bundle's schema/secrets
+    /// path; `None` means no bundle program was supplied, which only an
+    /// `engine: wasm` config notices.
     ///
     /// # Errors
     ///
     /// Returns an error when neither or both authoring forms are present,
-    /// when the engine is not one of `lua`/`js`/`rego` (with a
-    /// self-explaining refusal for `cel` and `wasm`), when a Rego-only
-    /// knob accompanies a non-Rego form, when the program itself does not
-    /// compile (CEL against the routing surface; a Rego module through
-    /// parse plus the evaluability proof), when `on_error` is not a
-    /// recognized posture, or when `reason_codes` exceeds its bounds.
-    pub fn compile(cfg: &AiRoutingPolicyConfig) -> anyhow::Result<Self> {
-        let program = Self::compile_program(cfg)?;
+    /// when the engine is not one of `lua`/`js`/`rego`/`wasm` (with a
+    /// self-explaining refusal for `cel`), when a Rego-only knob
+    /// accompanies a non-Rego form, when `type`/`vars` accompany a
+    /// non-wasm form, when the wasm form is missing its `type` or its
+    /// bundle program, when the program itself does not compile (CEL
+    /// against the routing surface; a Rego module through parse plus the
+    /// evaluability proof), when `on_error` is not a recognized posture,
+    /// or when `reason_codes` exceeds its bounds.
+    pub fn compile_with_program(
+        cfg: &AiRoutingPolicyConfig,
+        wasm: Option<WasmRoutingResolution>,
+    ) -> anyhow::Result<Self> {
+        let program = Self::compile_program(cfg, wasm)?;
         let on_error = AiRoutingOnError::parse(&cfg.on_error)?;
         if cfg.reason_codes.len() > MAX_REASON_CODES {
             anyhow::bail!(
@@ -250,7 +340,24 @@ impl CompiledAiRoutingPolicy {
     }
 
     /// Resolve the authoring form and compile the engine-specific program.
-    fn compile_program(cfg: &AiRoutingPolicyConfig) -> anyhow::Result<RoutingProgram> {
+    ///
+    /// `wasm` is consumed only by the `engine: wasm` arm; every other
+    /// form ignores it.
+    fn compile_program(
+        cfg: &AiRoutingPolicyConfig,
+        wasm: Option<WasmRoutingResolution>,
+    ) -> anyhow::Result<RoutingProgram> {
+        // The wasm knobs are refused on every other form up front, the
+        // same posture as the Rego-only knobs: a knob that silently does
+        // nothing is a config the operator cannot trust.
+        if cfg.engine.as_deref().map(str::trim) != Some("wasm")
+            && (cfg.hook_type.is_some() || cfg.vars.is_some())
+        {
+            anyhow::bail!(
+                "ai_routing_policy `type`/`vars` belong to `engine: wasm`; no other form \
+                 takes them"
+            );
+        }
         match (&cfg.expression, &cfg.engine) {
             (Some(_), Some(_)) => anyhow::bail!(
                 "ai_routing_policy takes either `expression` (CEL) or `engine` + `source`, \
@@ -277,6 +384,11 @@ impl CompiledAiRoutingPolicy {
                 )?))
             }
             (None, Some(engine)) => {
+                // The wasm form is not an inline engine, so it branches
+                // before the `source` requirement rather than after it.
+                if engine.trim() == "wasm" {
+                    return Self::compile_wasm_program(cfg, wasm);
+                }
                 let source = cfg.source.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("ai_routing_policy `engine: {engine}` needs an inline `source`")
                 })?;
@@ -334,17 +446,47 @@ impl CompiledAiRoutingPolicy {
                         "ai_routing_policy CEL policies are written as `expression`, not \
                          `engine: cel`"
                     ),
-                    "wasm" => anyhow::bail!(
-                        "ai_routing_policy `engine: wasm` is a compiled bundle, not inline \
-                         source; a WASM routing hook arrives through the extension-bundle \
-                         registry in a later release"
-                    ),
                     other => anyhow::bail!(
-                        "ai_routing_policy `engine` must be `lua`, `js`, or `rego`, got \
-                         {other:?}"
+                        "ai_routing_policy `engine` must be `lua`, `js`, `rego`, or `wasm`, \
+                         got {other:?}"
                     ),
                 }
             }
+        }
+    }
+
+    /// Compile the `engine: wasm` form: a bundle hook named by `type`.
+    ///
+    /// The config-shape refusals come first so a malformed wasm form
+    /// fails the same way whether or not a bundle program was supplied;
+    /// the missing-program bail is the defensive last arm, because
+    /// production resolution happens where the action compiles and hands
+    /// the program in.
+    fn compile_wasm_program(
+        cfg: &AiRoutingPolicyConfig,
+        wasm: Option<WasmRoutingResolution>,
+    ) -> anyhow::Result<RoutingProgram> {
+        if cfg.hook_type.is_none() {
+            anyhow::bail!("ai_routing_policy `engine: wasm` needs a bundle hook `type` to resolve");
+        }
+        if cfg.source.is_some()
+            || cfg.query.is_some()
+            || cfg.data.is_some()
+            || cfg.budget_ms.is_some()
+        {
+            anyhow::bail!(
+                "ai_routing_policy `source`/`query`/`data`/`budget_ms` are inline-engine \
+                 knobs; `engine: wasm` names a compiled bundle hook by `type` and takes \
+                 none of them"
+            );
+        }
+        match wasm {
+            Some(WasmRoutingResolution::Prepared(program)) => Ok(RoutingProgram::Wasm(program)),
+            Some(WasmRoutingResolution::ValidatedOnly) => Ok(RoutingProgram::WasmValidatedOnly),
+            None => anyhow::bail!(
+                "ai_routing_policy `engine: wasm` requires a loaded extension bundle; the \
+                 hook is resolved when the config compiles"
+            ),
         }
     }
 
@@ -354,7 +496,9 @@ impl CompiledAiRoutingPolicy {
             RoutingProgram::Cel(_) => sbproxy_observe::decision::DecisionEngine::Cel,
             RoutingProgram::Lua { .. } => sbproxy_observe::decision::DecisionEngine::Lua,
             RoutingProgram::Js { .. } => sbproxy_observe::decision::DecisionEngine::JavaScript,
+            RoutingProgram::WasmValidatedOnly => sbproxy_observe::decision::DecisionEngine::Wasm,
             RoutingProgram::Rego(_) => sbproxy_observe::decision::DecisionEngine::Rego,
+            RoutingProgram::Wasm(_) => sbproxy_observe::decision::DecisionEngine::Wasm,
         }
     }
 
@@ -376,16 +520,20 @@ impl CompiledAiRoutingPolicy {
     /// Evaluate the policy for one request.
     ///
     /// `configured_providers` is the set of provider names the plan's
-    /// candidates must resolve against; a plan naming an unconfigured
-    /// provider is an [`AiRoutingOutcome::Error`] this release (a strictly
-    /// safer disposition than the runtime drop-and-continue a later slice
-    /// may adopt).
-    pub fn evaluate(
+    /// candidates resolve against. A candidate naming an unconfigured
+    /// provider is a dead tier: it is dropped with a warning and the
+    /// survivors run (WOR-2366 D6). The outcome is an
+    /// [`AiRoutingOutcome::Error`] only when no candidate survives.
+    ///
+    /// The dropped ids come back on [`AiRoutingOutcome::Plan`] as
+    /// `dropped`, in plan order, so the caller can record the re-route
+    /// rather than depend on the warning surviving log rotation.
+    pub async fn evaluate(
         &self,
         view: &AiDecisionView,
         configured_providers: &[String],
     ) -> AiRoutingOutcome {
-        let document = match self.produce_document(view) {
+        let document = match self.produce_document(view).await {
             Ok(document) => document,
             Err(detail) => return self.error(detail),
         };
@@ -393,15 +541,34 @@ impl CompiledAiRoutingPolicy {
             Ok(decision) => decision,
             Err(error) => return self.error(error.to_string()),
         };
-        let plan = match decision {
+        let mut plan = match decision {
             RouteDecision::Decline => return AiRoutingOutcome::Decline,
             RouteDecision::Plan(plan) => plan,
         };
         if plan.reason.trim().is_empty() {
             return self.error("a non-empty plan must carry a `reason`".to_owned());
         }
-        if let Err(error) = plan.require_known_providers(configured_providers) {
-            return self.error(error.to_string());
+        // WOR-2366 D6: drop the dead tiers and continue on the survivors;
+        // error only when nothing survives.
+        let dropped = plan.retain_known_providers(configured_providers);
+        if plan.candidates.is_empty() {
+            return self.error(format!(
+                "route.decide named only unconfigured providers: {}",
+                quoted_provider_list(&dropped)
+            ));
+        }
+        if !dropped.is_empty() {
+            // Attributed to the principal the plan was computed for: a
+            // warning naming only the dead providers cannot tell an
+            // operator whose traffic re-routed, and one tenant's policy
+            // typo looks exactly like every other tenant's in the log.
+            tracing::warn!(
+                dropped = %quoted_provider_list(&dropped),
+                tenant = %view.tenant,
+                api_key_id = %view.api_key_id,
+                model = %view.model,
+                "ai_routing_policy: plan named unconfigured providers; dropped those tiers"
+            );
         }
         let reason_code = self.normalize_reason_code(reason_code_of(&document));
         AiRoutingOutcome::Plan {
@@ -410,6 +577,7 @@ impl CompiledAiRoutingPolicy {
             cascade: plan.to_cascade_config(None),
             reason: plan.reason,
             reason_code,
+            dropped,
         }
     }
 
@@ -418,9 +586,10 @@ impl CompiledAiRoutingPolicy {
     /// Every engine reads the same `ai` vocabulary: CEL binds
     /// [`AiDecisionView::to_cel`], the document engines read
     /// [`AiDecisionView::to_json`] (Lua/JS as an `ai` global, Rego as
-    /// `input.ai`), and the parity test keeps the two forms identical. An
-    /// `Err` here is an evaluation fault, bounded to a debug detail.
-    fn produce_document(&self, view: &AiDecisionView) -> Result<serde_json::Value, String> {
+    /// `input.ai`, WASM as the invocation document), and the parity test
+    /// keeps the two forms identical. An `Err` here is an evaluation
+    /// fault, bounded to a debug detail.
+    async fn produce_document(&self, view: &AiDecisionView) -> Result<serde_json::Value, String> {
         match &self.program {
             RoutingProgram::Cel(cel) => {
                 let mut ctx = CelContext::new();
@@ -448,6 +617,13 @@ impl CompiledAiRoutingPolicy {
                     .execute(source, globals)
                     .map_err(|error| format!("js evaluation failed: {error}"))
             }
+            // Unreachable in production: only a runtime compile serves
+            // requests, and it always carries a prepared program.
+            RoutingProgram::WasmValidatedOnly => Err(
+                "wasm routing hook was validated but never prepared; this config was built \
+                 for validation only"
+                    .to_owned(),
+            ),
             RoutingProgram::Rego(program) => {
                 let mut guard = program
                     .lock()
@@ -456,6 +632,12 @@ impl CompiledAiRoutingPolicy {
                     .eval_value(serde_json::json!({ "ai": view.to_json() }))
                     .map_err(|error| format!("rego evaluation failed: {error:#}"))
             }
+            // A Null document declines through the shared decode tail,
+            // the same as any other engine returning null.
+            RoutingProgram::Wasm(program) => program
+                .plan(view.to_json())
+                .await
+                .map_err(|error| format!("wasm evaluation failed: {error}")),
         }
     }
 
@@ -472,6 +654,19 @@ fn reason_code_of(document: &serde_json::Value) -> Option<&str> {
     document
         .get("reason_code")
         .and_then(serde_json::Value::as_str)
+}
+
+/// Join dropped provider ids for a warning or error detail, each in
+/// backticks so a blank id stays visible.
+///
+/// Bounded by construction rather than by truncation: a decoded plan has
+/// at most [`crate::route_event::MAX_ROUTE_CANDIDATES`] candidates, each
+/// id at most [`crate::route_event::MAX_ROUTE_NAME_BYTES`] bytes.
+fn quoted_provider_list(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| format!("`{id}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Intern an allowlisted reason code as a `'static` string.
@@ -498,9 +693,12 @@ fn interned_reason_code(code: &str) -> &'static str {
 /// Convert a [`CelValue`] into a [`serde_json::Value`] so the shared
 /// [`decode_route_plan`] decoder can read it.
 ///
-/// A non-finite float has no JSON representation and becomes `null`;
-/// `decode_route_plan` then treats it as an absent optional or a missing
-/// field, which is the same as any other malformed number.
+/// A non-finite float has no JSON representation and becomes `null`, and
+/// the decoder reads a null limit as an absent one. An expression whose
+/// arithmetic goes NaN or infinite therefore yields a candidate with no
+/// `quality_threshold` or `cost_cap` rather than a refusal, which is why
+/// [`crate::route_event::RouteCandidate`] tells an operator computing a
+/// cap to guard the expression instead.
 pub(crate) fn cel_to_json(value: &CelValue) -> serde_json::Value {
     match value {
         CelValue::String(string) => serde_json::Value::String(string.clone()),
@@ -533,6 +731,8 @@ mod tests {
             query: None,
             data: None,
             budget_ms: None,
+            hook_type: None,
+            vars: None,
             on_error: default_on_error(),
             reason_codes: Vec::new(),
         }
@@ -547,6 +747,24 @@ mod tests {
             query: None,
             data: None,
             budget_ms: None,
+            hook_type: None,
+            vars: None,
+            on_error: default_on_error(),
+            reason_codes: Vec::new(),
+        }
+    }
+
+    /// A config in the `engine: wasm` + `type` form.
+    fn wasm_config(hook_type: Option<&str>) -> AiRoutingPolicyConfig {
+        AiRoutingPolicyConfig {
+            expression: None,
+            engine: Some("wasm".to_owned()),
+            source: None,
+            query: None,
+            data: None,
+            budget_ms: None,
+            hook_type: hook_type.map(str::to_owned),
+            vars: None,
             on_error: default_on_error(),
             reason_codes: Vec::new(),
         }
@@ -567,13 +785,14 @@ mod tests {
                 cascade,
                 reason,
                 reason_code,
+                ..
             } => (cascade, reason, reason_code),
             other => panic!("expected a plan, got {other:?}"),
         }
     }
 
-    #[test]
-    fn a_lua_policy_plans_declines_and_labels_its_engine() {
+    #[tokio::test]
+    async fn a_lua_policy_plans_declines_and_labels_its_engine() {
         let planning = CompiledAiRoutingPolicy::compile(&engine_config(
             "lua",
             r#"
@@ -591,7 +810,7 @@ mod tests {
         );
 
         let easy = AiDecisionView::default(); // difficulty 0.0
-        let (cascade, reason, code) = expect_plan(planning.evaluate(&easy, &providers()));
+        let (cascade, reason, code) = expect_plan(planning.evaluate(&easy, &providers()).await);
         assert_eq!(cascade.tiers[0].provider_id, "openai");
         assert_eq!(reason, "easy prompt");
         assert_eq!(code, "policy");
@@ -601,13 +820,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            planning.evaluate(&hard, &providers()),
+            planning.evaluate(&hard, &providers()).await,
             AiRoutingOutcome::Decline
         );
     }
 
-    #[test]
-    fn a_js_policy_plans_and_declines() {
+    #[tokio::test]
+    async fn a_js_policy_plans_and_declines() {
         let policy = CompiledAiRoutingPolicy::compile(&engine_config(
             "js",
             r#"
@@ -627,19 +846,21 @@ mod tests {
             budget_fraction: 0.95,
             ..Default::default()
         };
-        let (cascade, _, code) = expect_plan(policy.evaluate(&pressed, &providers()));
+        let (cascade, _, code) = expect_plan(policy.evaluate(&pressed, &providers()).await);
         assert_eq!(cascade.tiers[0].provider_id, "anthropic");
         // `cost` is not in the (empty) allowlist, so it collapses.
         assert_eq!(code, "other");
 
         assert_eq!(
-            policy.evaluate(&AiDecisionView::default(), &providers()),
+            policy
+                .evaluate(&AiDecisionView::default(), &providers())
+                .await,
             AiRoutingOutcome::Decline
         );
     }
 
-    #[test]
-    fn a_rego_policy_plans_declines_and_reads_base_data() {
+    #[tokio::test]
+    async fn a_rego_policy_plans_declines_and_reads_base_data() {
         let mut cfg = engine_config(
             "rego",
             r#"
@@ -661,13 +882,15 @@ mod tests {
             budget_fraction: 0.9,
             ..Default::default()
         };
-        let (cascade, reason, _) = expect_plan(policy.evaluate(&pressed, &providers()));
+        let (cascade, reason, _) = expect_plan(policy.evaluate(&pressed, &providers()).await);
         assert_eq!(cascade.tiers[0].provider_id, "openai");
         assert_eq!(reason, "over budget");
 
         // Rule undefined for this input: the policy declines, not errors.
         assert_eq!(
-            policy.evaluate(&AiDecisionView::default(), &providers()),
+            policy
+                .evaluate(&AiDecisionView::default(), &providers())
+                .await,
             AiRoutingOutcome::Decline
         );
     }
@@ -731,6 +954,52 @@ mod tests {
     }
 
     #[test]
+    fn a_wasm_form_without_a_hook_type_is_refused_naming_type() {
+        let error = CompiledAiRoutingPolicy::compile(&wasm_config(None)).expect_err("no hook type");
+        assert!(
+            error.to_string().contains("`type`"),
+            "the refusal names the missing knob: {error}"
+        );
+
+        // The inline knobs are refused on the wasm form even when `type`
+        // is present: they belong to the inline engines.
+        let mut inline = wasm_config(Some("router"));
+        inline.source = Some("return nil".to_owned());
+        let error = CompiledAiRoutingPolicy::compile(&inline).expect_err("inline knob refused");
+        assert!(error.to_string().contains("inline-engine"), "{error}");
+    }
+
+    #[test]
+    fn the_wasm_knobs_are_refused_on_every_other_form() {
+        // `type` on an inline engine.
+        let mut lua = engine_config("lua", "return nil");
+        lua.hook_type = Some("router".to_owned());
+        let error = CompiledAiRoutingPolicy::compile(&lua).expect_err("type on lua refused");
+        assert!(error.to_string().contains("engine: wasm"), "{error}");
+
+        // `vars` on the CEL form.
+        let mut cel = config("null");
+        cel.vars = Some(serde_json::json!({"tier": "cheap"}));
+        let error = CompiledAiRoutingPolicy::compile(&cel).expect_err("vars on cel refused");
+        assert!(error.to_string().contains("engine: wasm"), "{error}");
+    }
+
+    #[test]
+    fn a_wasm_form_through_plain_compile_requires_a_bundle() {
+        // `compile` passes no bundle program, so a wasm form through it
+        // hits the defensive arm: production resolution happens where the
+        // action compiles and hands the program in.
+        let error = CompiledAiRoutingPolicy::compile(&wasm_config(Some("router")))
+            .expect_err("no bundle program");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a loaded extension bundle"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn compile_rejects_a_bad_on_error_and_oversized_reason_codes() {
         let mut cfg = config("null");
         cfg.on_error = "explode".to_owned();
@@ -745,8 +1014,8 @@ mod tests {
         assert!(CompiledAiRoutingPolicy::compile(&cfg).is_err());
     }
 
-    #[test]
-    fn a_plan_becomes_a_cascade_with_reason_and_normalized_code() {
+    #[tokio::test]
+    async fn a_plan_becomes_a_cascade_with_reason_and_normalized_code() {
         let mut cfg = config(
             r#"{"candidates": [{"provider_id": "openai", "model": "gpt-4o"}], "reason": "cheap tier", "reason_code": "cost"}"#,
         );
@@ -758,7 +1027,8 @@ mod tests {
             cascade,
             reason,
             reason_code,
-        } = policy.evaluate(&view, &providers())
+            dropped,
+        } = policy.evaluate(&view, &providers()).await
         else {
             panic!("expected a plan");
         };
@@ -767,15 +1037,20 @@ mod tests {
         assert_eq!(reason, "cheap tier");
         // An allowlisted code passes through verbatim.
         assert_eq!(reason_code, "cost");
+        assert!(
+            dropped.is_empty(),
+            "a plan that ran whole reports no drops: {dropped:?}"
+        );
     }
 
-    #[test]
-    fn an_unlisted_code_is_other_and_an_absent_code_is_policy() {
+    #[tokio::test]
+    async fn an_unlisted_code_is_other_and_an_absent_code_is_policy() {
         let listed = compile(
             r#"{"candidates": [{"provider_id": "openai", "model": "m"}], "reason": "r", "reason_code": "surprise"}"#,
         );
-        let AiRoutingOutcome::Plan { reason_code, .. } =
-            listed.evaluate(&AiDecisionView::default(), &providers())
+        let AiRoutingOutcome::Plan { reason_code, .. } = listed
+            .evaluate(&AiDecisionView::default(), &providers())
+            .await
         else {
             panic!("expected a plan");
         };
@@ -783,8 +1058,9 @@ mod tests {
 
         let absent =
             compile(r#"{"candidates": [{"provider_id": "openai", "model": "m"}], "reason": "r"}"#);
-        let AiRoutingOutcome::Plan { reason_code, .. } =
-            absent.evaluate(&AiDecisionView::default(), &providers())
+        let AiRoutingOutcome::Plan { reason_code, .. } = absent
+            .evaluate(&AiDecisionView::default(), &providers())
+            .await
         else {
             panic!("expected a plan");
         };
@@ -794,49 +1070,90 @@ mod tests {
         );
     }
 
-    #[test]
-    fn declining_spellings_all_leave_the_strategy_alone() {
+    #[tokio::test]
+    async fn declining_spellings_all_leave_the_strategy_alone() {
         for expression in ["null", "{}", r#"{"candidates": []}"#] {
             assert_eq!(
-                compile(expression).evaluate(&AiDecisionView::default(), &providers()),
+                compile(expression)
+                    .evaluate(&AiDecisionView::default(), &providers())
+                    .await,
                 AiRoutingOutcome::Decline,
                 "{expression} must decline"
             );
         }
     }
 
-    #[test]
-    fn a_plan_with_no_reason_is_an_error() {
+    #[tokio::test]
+    async fn a_plan_with_no_reason_is_an_error() {
         let outcome = compile(r#"{"candidates": [{"provider_id": "openai", "model": "m"}]}"#)
-            .evaluate(&AiDecisionView::default(), &providers());
+            .evaluate(&AiDecisionView::default(), &providers())
+            .await;
         assert!(
             matches!(outcome, AiRoutingOutcome::Error { .. }),
             "a non-empty plan must carry a reason, got {outcome:?}"
         );
     }
 
-    #[test]
-    fn a_plan_naming_an_unconfigured_provider_is_an_error_not_a_decline() {
-        let outcome =
-            compile(r#"{"candidates": [{"provider_id": "ghost", "model": "m"}], "reason": "r"}"#)
-                .evaluate(&AiDecisionView::default(), &providers());
+    #[tokio::test]
+    async fn a_plan_naming_only_unconfigured_providers_is_an_error_not_a_decline() {
+        // WOR-2366 D6: when nothing survives the drop there is nothing to
+        // route, so the whole plan is an error, and the detail names every
+        // dropped provider so the operator sees all the typos at once.
+        let outcome = compile(
+            r#"{"candidates": [{"provider_id": "ghost", "model": "m"},
+                               {"provider_id": "phantom", "model": "m2"}], "reason": "r"}"#,
+        )
+        .evaluate(&AiDecisionView::default(), &providers())
+        .await;
         let AiRoutingOutcome::Error { detail, .. } = outcome else {
-            panic!("an unconfigured provider must be an error, not a decline");
+            panic!("a fully unconfigured plan must be an error, not a decline");
         };
         assert!(
-            detail.contains("ghost"),
-            "detail names the provider: {detail}"
+            detail.contains("ghost") && detail.contains("phantom"),
+            "detail names every dropped provider: {detail}"
         );
     }
 
-    #[test]
-    fn an_expression_fault_is_an_error_carrying_the_on_error_posture() {
+    #[tokio::test]
+    async fn a_partially_unconfigured_plan_proceeds_on_the_survivors() {
+        // WOR-2366 D6: the dead tier drops with a warning and the
+        // survivor runs, rather than the whole plan erroring over one
+        // unconfigured name.
+        let outcome = compile(
+            r#"{"candidates": [{"provider_id": "ghost", "model": "m1"},
+                               {"provider_id": "openai", "model": "m2"}], "reason": "r"}"#,
+        )
+        .evaluate(&AiDecisionView::default(), &providers())
+        .await;
+        let AiRoutingOutcome::Plan {
+            cascade,
+            reason,
+            dropped,
+            ..
+        } = outcome
+        else {
+            panic!("a partially unconfigured plan must still route");
+        };
+        assert_eq!(cascade.tiers.len(), 1, "the dead tier is gone");
+        assert_eq!(cascade.tiers[0].provider_id, "openai");
+        assert_eq!(cascade.tiers[0].model, "m2");
+        assert_eq!(reason, "r", "the surviving plan keeps its reason");
+        // The drop reaches the caller as data, not only as a log line the
+        // next rotation takes away: `reason` still describes the plan the
+        // policy returned, so the outcome is the only place the dispatcher
+        // can learn which tiers actually ran.
+        assert_eq!(dropped, vec!["ghost".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_expression_fault_is_an_error_carrying_the_on_error_posture() {
         let mut cfg = config(r#"{"candidates": [{"model": 7}], "reason": "r"}"#);
         cfg.on_error = "block".to_owned();
         // A numeric model is a decode fault (model must be a non-empty string).
         let outcome = CompiledAiRoutingPolicy::compile(&cfg)
             .expect("compiles")
-            .evaluate(&AiDecisionView::default(), &providers());
+            .evaluate(&AiDecisionView::default(), &providers())
+            .await;
         assert!(matches!(
             outcome,
             AiRoutingOutcome::Error {

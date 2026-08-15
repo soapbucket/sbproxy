@@ -28,6 +28,18 @@
     drop)
   (func $is_decline (param $length i32) (result i32)
     (local $i i32)
+    ;; An input shorter than the 7-byte needle cannot contain it, and
+    ;; `length - 7` would underflow into a scan that walks past the
+    ;; buffer, so answer no before the loop.
+    local.get $length
+    i32.const 7
+    i32.lt_u
+    (if
+      (then
+        i32.const 0
+        return
+      )
+    )
     (block $not_found
       (loop $scan
         local.get $i
