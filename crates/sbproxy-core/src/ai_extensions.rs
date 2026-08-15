@@ -439,12 +439,19 @@ impl AiRequestExtensions {
 
     /// Refuse a mutation on a seam with no write-back.
     ///
-    /// Config validation refuses `mutates: true` on stream and
-    /// tool-call hooks precisely because their wire frames have no
-    /// write-back yet, so this cannot fire today. If that invariant
-    /// ever breaks, the failure mode to prevent is shipping original
-    /// bytes behind a hook that believes it rewrote them, so the seam
-    /// fails closed rather than logging and continuing.
+    /// Config validation refuses `mutates: true` on stream hooks
+    /// precisely because their wire frames have no write-back yet, so
+    /// this cannot fire today. If that invariant ever breaks, the
+    /// failure mode to prevent is shipping original bytes behind a hook
+    /// that believes it rewrote them, so the seam fails closed rather
+    /// than logging and continuing.
+    ///
+    /// Tool-call hooks are **not** in that set. They have end-to-end
+    /// write-back and are on the allowlist beside the two guardrail
+    /// hooks; `bundled_ai_tool_mutation_reaches_the_wire` pins that a
+    /// rewritten tool call reaches the client. This guard protects the
+    /// one seam that still lacks a write-back, which is why its only
+    /// call site is the stream relay.
     #[allow(clippy::unused_self)] // reads as a seam method at call sites
     fn expect_unmutated(
         &self,

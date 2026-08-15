@@ -105,6 +105,10 @@ impl ReserveMetadata {
             body: body.to_vec(),
             cached_at,
             ttl_secs,
+            // The manifest does not carry the window either, and a
+            // recomposed entry has no admit decision behind it, so the
+            // origin's configured default applies.
+            swr_secs: None,
             // The reserve manifest carries no fingerprint. The key this
             // entry is recomposed under already does, so unstamped is
             // the honest value rather than a guess.
@@ -192,6 +196,7 @@ mod tests {
             body: br#"{"version":1}"#.to_vec(),
             cached_at: 10,
             ttl_secs: 60,
+            swr_secs: None,
             config_fp: String::new(),
         };
 

@@ -41,3 +41,17 @@ test-group = 'sbproxy-e2e'
 [[profile.ci.overrides]]
 filter = 'package(sbproxy-e2e)'
 test-group = 'sbproxy-e2e'
+
+# WOR-2445: the granted-fetch bundle test does two loopback HTTP
+# calls inside a JavaScript hook. Keep it off the shared JS worker
+# pile in CI so a timeout cannot red an unrelated PR.
+[test-groups.js-outbound-fetch]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses)'
+test-group = 'js-outbound-fetch'
+
+[[profile.ci.overrides]]
+filter = 'test(a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses)'
+test-group = 'js-outbound-fetch'

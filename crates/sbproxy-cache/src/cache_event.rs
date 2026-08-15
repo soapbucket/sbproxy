@@ -154,11 +154,18 @@ pub struct CacheKeyPlan {
     pub skip_lookup: bool,
     /// Why this plan was chosen.
     ///
-    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then it
-    /// goes nowhere. Nothing in this workspace builds an audit record
-    /// yet, and the `cache.key` call site records the outcome without
-    /// ever reading this field. Wiring it to the audit record is
-    /// outstanding, not done.
+    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`] here, then
+    /// scrubbed again on the way into the audit record: the secrets
+    /// floor, the operator's `redact.patterns:` masks and PII rules for
+    /// the request's scope, and a 512-byte bound, in that order
+    /// (WOR-2405). The `cache.key` call site publishes it when
+    /// `observability.log.decision_audit` names this event, and drops it
+    /// otherwise.
+    ///
+    /// Treat it as operator-authored text that reaches a customer's
+    /// SIEM. A script explaining itself by quoting the request is a
+    /// script quoting the request, and the scrub is a floor rather than
+    /// a guarantee about arbitrary content.
     ///
     /// It is kept because a reason is what makes a cache decision
     /// diagnosable, and a debug line is not somewhere to keep one:
@@ -180,6 +187,17 @@ pub struct CacheAdmitPlan {
     /// `None` keeps the configured `ttl_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
+    /// Stale-while-revalidate window override in seconds, clamped to
+    /// [`MAX_CACHE_TTL_SECS`]. `None` keeps the origin's configured
+    /// `stale_while_revalidate`.
+    ///
+    /// Carried on the stored entry rather than re-read from config on
+    /// every hit, so a response admitted with a short window keeps it
+    /// even as the origin's default moves. A response worth caching for
+    /// an hour is not automatically worth serving stale for one, and
+    /// this is the field that lets a policy say so per response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swr_secs: Option<u64>,
     /// Why this response was admitted or refused.
     ///
     /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then, when
@@ -216,6 +234,7 @@ impl Default for CacheAdmitPlan {
         Self {
             store: true,
             ttl_secs: None,
+            swr_secs: None,
             reason: String::new(),
         }
     }
@@ -393,6 +412,10 @@ pub fn decode_cache_admit(
         .get("ttl_secs")
         .and_then(serde_json::Value::as_u64)
         .map(|ttl| ttl.min(MAX_CACHE_TTL_SECS));
+    let swr_secs = object
+        .get("swr_secs")
+        .and_then(serde_json::Value::as_u64)
+        .map(|swr| swr.min(MAX_CACHE_TTL_SECS));
     let reason = object
         .get("reason")
         .and_then(serde_json::Value::as_str)
@@ -401,6 +424,7 @@ pub fn decode_cache_admit(
     Ok(CacheDecision::Plan(CacheAdmitPlan {
         store,
         ttl_secs,
+        swr_secs,
         reason,
     }))
 }
@@ -585,6 +609,57 @@ mod tests {
         assert_eq!(
             decode_cache_admit(&json!({"reason": "why"})),
             Err(CacheEventError::AdmitMissingStore)
+        );
+    }
+
+    #[test]
+    fn admit_decodes_a_per_response_swr_window() {
+        // WOR-2367: the window a policy chooses for one response, which
+        // the entry then carries so a later widening of the origin's
+        // default cannot loosen it retroactively.
+        let plan = match decode_cache_admit(&serde_json::json!({
+            "store": true,
+            "ttl_secs": 300,
+            "swr_secs": 30,
+            "reason": "deterministic completion"
+        }))
+        .expect("decodes")
+        {
+            CacheDecision::Plan(plan) => plan,
+            CacheDecision::Decline => panic!("a store:true document is a plan"),
+        };
+        assert_eq!(plan.ttl_secs, Some(300));
+        assert_eq!(plan.swr_secs, Some(30));
+    }
+
+    #[test]
+    fn an_absent_swr_window_defers_to_the_origin() {
+        // Absence has to mean "inherit", not "zero". Zero would turn
+        // stale-while-revalidate off for every origin whose policy did
+        // not mention it, which is a silent behavior change for a key
+        // the operator never wrote.
+        let plan = match decode_cache_admit(&serde_json::json!({"store": true})).expect("decodes") {
+            CacheDecision::Plan(plan) => plan,
+            CacheDecision::Decline => panic!("a store:true document is a plan"),
+        };
+        assert_eq!(plan.swr_secs, None);
+    }
+
+    #[test]
+    fn a_runaway_swr_window_is_clamped_like_the_ttl() {
+        let plan = match decode_cache_admit(&serde_json::json!({
+            "store": true,
+            "swr_secs": u64::MAX
+        }))
+        .expect("decodes")
+        {
+            CacheDecision::Plan(plan) => plan,
+            CacheDecision::Decline => panic!("a store:true document is a plan"),
+        };
+        assert_eq!(
+            plan.swr_secs,
+            Some(MAX_CACHE_TTL_SECS),
+            "an unbounded window is as much a footgun as an unbounded TTL"
         );
     }
 

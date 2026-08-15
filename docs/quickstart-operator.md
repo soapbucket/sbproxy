@@ -1,6 +1,6 @@
 # Kubernetes operator quickstart
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-15*
 
 This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
@@ -37,7 +37,6 @@ That is the one piece of this quickstart you have to supply. Build the image fro
 export OPERATOR_REPO=registry.example.com/soapbucket/sbproxy-k8s-operator
 export OPERATOR_TAG=1.10.0
 
-cargo build --profile release-fast -p sbproxy-k8s-operator --locked
 docker build -t "$OPERATOR_REPO:$OPERATOR_TAG" \
   -f crates/sbproxy-k8s-operator/Dockerfile.ci .
 docker push "$OPERATOR_REPO:$OPERATOR_TAG"

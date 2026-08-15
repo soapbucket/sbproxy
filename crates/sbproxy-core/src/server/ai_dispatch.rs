@@ -6011,6 +6011,39 @@ pub(super) async fn handle_ai_proxy(
                         send_error(session, 403, &msg).await?;
                         return Ok(());
                     }
+                    // WOR-2405: publish the decision when the operator
+                    // asked for it. The record carries what changed, so a
+                    // SIEM rule can select the interesting ones itself
+                    // rather than having the proxy decide in config which
+                    // decisions are worth keeping.
+                    if super::proxy_http::audit_publishes(
+                        &ctx.pipeline,
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.as_str()),
+                        {
+                            let o = route_origin_label(ctx);
+                            (!o.is_empty()).then_some(o)
+                        },
+                    ) {
+                        let selected = cascade.tiers.first();
+                        crate::policy_bus::emit_decision_audit_detailed(
+                            sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                            routing_policy.decision_engine(),
+                            sbproxy_observe::decision::DecisionOutcome::Allow,
+                            &ctx.request_id,
+                            route_origin_label(ctx),
+                            &ctx.hostname,
+                            &ctx.tenant_id,
+                            &reason,
+                            sbproxy_observe::decision::DecisionDetails::routing(
+                                &model,
+                                selected.map(|t| t.model.as_str()),
+                                selected.map(|t| t.provider_id.as_str()),
+                                cascade.tiers.len(),
+                                dropped.len(),
+                            ),
+                        );
+                    }
                     ctx.ai_route_reason = Some(reason);
                     routing_policy_cascade = Some(cascade);
                     routing_plan_reason_code = Some(reason_code);
@@ -11515,7 +11548,7 @@ pub(super) async fn relay_ai_stream(
     // violation terminates the stream.
     let mut held_tool_chunks: std::collections::BTreeMap<usize, Vec<sbproxy_ai::format::HubChunk>> =
         std::collections::BTreeMap::new();
-    let bridge_ctx = sbproxy_ai::format::BridgeContext {
+    let mut bridge_ctx = sbproxy_ai::format::BridgeContext {
         inbound_format: format_args
             .inbound_format
             .clone()
@@ -11782,7 +11815,7 @@ pub(super) async fn relay_ai_stream(
                             && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
                     });
                     for hub in emit_now.chain(released_tool_chunks.iter()) {
-                        match emitter.from_hub_stream(hub, &bridge_ctx) {
+                        match emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             Ok(frames) => {
                                 for f in frames {
                                     translated.push_str(&f);
@@ -11994,7 +12027,7 @@ pub(super) async fn relay_ai_stream(
                     });
                     let mut translated = String::new();
                     for hub in emit_now.chain(close_released.iter()) {
-                        if let Ok(frames) = emitter.from_hub_stream(hub, &bridge_ctx) {
+                        if let Ok(frames) = emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             for f in frames {
                                 translated.push_str(&f);
                             }
@@ -14319,7 +14352,13 @@ origins:
             "the rewrite must ship: {response}"
         );
         assert!(
-            !response.contains(":42"),
+            // The original arguments are `{"id":42}`, and the escaped
+            // form is what would appear on the wire. Matched in full
+            // rather than as a bare `:42`, which also occurs in the
+            // response's own `Date` header at minute or second 42 and
+            // failed this test on roughly 3% of runs regardless of what
+            // the hook did (WOR-2430).
+            !response.contains(r#"{\"id\":42}"#),
             "the original arguments must not ship: {response}"
         );
         assert!(response.contains("dangerous_lookup"), "{response}");

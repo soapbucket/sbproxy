@@ -148,6 +148,7 @@ mod tests {
             body: b"hello".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
+            swr_secs: None,
             config_fp: String::new(),
         }
     }
@@ -192,6 +193,7 @@ mod tests {
             body: vec![],
             cached_at: now_secs().saturating_sub(100),
             ttl_secs: 1,
+            swr_secs: None,
             config_fp: String::new(),
         };
         store.put("expired", &entry).unwrap();
@@ -246,6 +248,7 @@ mod tests {
             body: b"stale".to_vec(),
             cached_at: now_secs().saturating_sub(500),
             ttl_secs: 60,
+            swr_secs: None,
             config_fp: String::new(),
         };
         store.put("k", &stale).unwrap();
@@ -274,6 +277,7 @@ mod tests {
             body: b"not found".to_vec(),
             cached_at: now_secs(),
             ttl_secs: 60,
+            swr_secs: None,
             config_fp: String::new(),
         };
         store.put("k1", &updated).unwrap();

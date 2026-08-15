@@ -4724,6 +4724,7 @@ origins:
             observability: Some(TenantObservabilityConfig {
                 cardinality: None,
                 log: TenantObservabilityLogConfig {
+                    decision_audit: None,
                     sinks: Vec::new(),
                     custom_fields: Vec::new(),
                     redact: TenantObservabilityRedactConfig {
@@ -4798,6 +4799,7 @@ origins:
             attestation: None,
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
+                    decision_audit: None,
                     sinks: Vec::new(),
                     custom_fields: Vec::new(),
                     redact: OriginObservabilityRedactConfig {
@@ -4822,7 +4824,7 @@ origins:
             l2_store: None,
             mesh: None,
             access_log: None,
-            decision_audit: None,
+            decision_audit: Default::default(),
             agent_classes: None,
             rate_limits: None,
             audit: None,

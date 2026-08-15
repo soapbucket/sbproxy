@@ -1375,7 +1375,7 @@ mod tests {
         use crate::format::{ChatFormat, OpenAiChatFormat};
         let mut translator = NativeStreamTranslator::new(NativeStreamFormat::Anthropic);
         let emitter = OpenAiChatFormat;
-        let ctx = crate::format::BridgeContext::default();
+        let mut ctx = crate::format::BridgeContext::default();
 
         // Feed a complete Anthropic stream in one go.
         let bytes = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-3-5\",\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
@@ -1383,7 +1383,7 @@ mod tests {
 
         let mut openai_sse = String::new();
         for chunk in &hub_chunks {
-            for frame in emitter.from_hub_stream(chunk, &ctx).unwrap() {
+            for frame in emitter.from_hub_stream(chunk, &mut ctx).unwrap() {
                 openai_sse.push_str(&frame);
             }
         }
@@ -1408,9 +1408,9 @@ mod tests {
         let chunks = t.feed(bytes);
         let emitter = OpenAiChatFormat;
         let mut sse = String::new();
-        let ctx = crate::format::BridgeContext::default();
+        let mut ctx = crate::format::BridgeContext::default();
         for c in &chunks {
-            for f in emitter.from_hub_stream(c, &ctx).unwrap() {
+            for f in emitter.from_hub_stream(c, &mut ctx).unwrap() {
                 sse.push_str(&f);
             }
         }

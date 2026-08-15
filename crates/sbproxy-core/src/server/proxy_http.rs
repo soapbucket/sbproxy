@@ -1226,6 +1226,10 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
                 .unwrap_or_default()
                 .as_secs(),
             ttl_secs: ttl,
+            // WOR-2367: the window the event chose, carried on the entry
+            // so a later config change to the origin's default does not
+            // silently widen how long this response is served stale.
+            swr_secs: admit.swr_secs,
             config_fp: write_config_fp,
         };
         // --- Cache Reserve admission ---
@@ -1262,15 +1266,22 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
 /// precedence: an absent block publishes nothing, and the per-event
 /// versus master-switch order lives on the config type itself
 /// (WOR-2405).
-fn audit_publishes(
+///
+/// `route` is the origin's **config key**, the same value the origin
+/// id carries, not the request `Host`. Under a wildcard origin those
+/// differ, and passing the `Host` would silently skip the origin-scope
+/// block the operator wrote.
+pub(super) fn audit_publishes(
     pipeline: &crate::pipeline::CompiledPipeline,
     event: sbproxy_observe::decision::DecisionEvent,
+    tenant: Option<&str>,
+    route: Option<&str>,
 ) -> bool {
-    pipeline
-        .config
-        .decision_audit
-        .as_ref()
-        .is_some_and(|cfg| cfg.publishes(event.as_label()))
+    let scopes = &pipeline.config.decision_audit;
+    if scopes.is_empty() {
+        return false;
+    }
+    scopes.publishes(event.as_label(), tenant, route)
 }
 
 /// Run the origin's `cache.admit` event, or return the static default.
@@ -1281,8 +1292,67 @@ fn audit_publishes(
 /// distinguished on the metric rather than in the return value, because
 /// the caller's behavior is identical and only the operator's
 /// interpretation differs.
+/// The request-side facts the `cache.admit` event reads.
+///
+/// Owned rather than borrowed from [`crate::context::RequestContext`],
+/// because the stale-while-revalidate refresh evaluates the same event
+/// from a detached task that outlives the request. This is the whole of
+/// what the event draws from the request side, plus the request id its
+/// audit record correlates on, and keeping it that small is what lets
+/// the refresh run the event at all (WOR-2367).
+#[derive(Debug, Clone)]
+pub(super) struct AdmitEventScope {
+    /// Index into the compiled origin list, which resolves both the
+    /// script and the origin id the decision is recorded against.
+    pub origin_idx: usize,
+    /// `request.path` in the event's context.
+    pub request_path: String,
+    /// `request.host` in the event's context.
+    pub hostname: String,
+    /// `tenant` in the event's context, and the label the decision
+    /// metrics and audit record are attributed to.
+    pub tenant_id: String,
+    /// Correlation id for the audit record.
+    ///
+    /// On a revalidation refresh this is the request that *triggered*
+    /// the refresh rather than one being served by it, because the
+    /// refresh serves nobody. It is the only request an analyst can
+    /// trace the write-back back to.
+    pub request_id: String,
+}
+
+impl AdmitEventScope {
+    /// Capture the scope from a live request.
+    ///
+    /// `None` for a request with no resolved origin, which cannot have
+    /// an `admit_event` to run.
+    pub(super) fn from_ctx(ctx: &crate::context::RequestContext) -> Option<Self> {
+        Some(Self {
+            origin_idx: ctx.origin_idx?,
+            request_path: ctx.request_path.to_string(),
+            hostname: ctx.hostname.to_string(),
+            tenant_id: ctx.tenant_id.to_string(),
+            request_id: ctx.request_id.to_string(),
+        })
+    }
+}
+
 fn evaluate_cache_admit(
     ctx: &crate::context::RequestContext,
+    status: u16,
+    headers: &[(String, String)],
+    body_len: usize,
+) -> sbproxy_cache::cache_event::CacheAdmitPlan {
+    let Some(scope) = AdmitEventScope::from_ctx(ctx) else {
+        return sbproxy_cache::cache_event::CacheAdmitPlan::default();
+    };
+    let pipeline = ctx.pipeline.clone();
+    evaluate_cache_admit_for(&pipeline, &scope, status, headers, body_len)
+}
+
+pub(super) fn evaluate_cache_admit_for(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    scope: &AdmitEventScope,
     status: u16,
     headers: &[(String, String)],
     body_len: usize,
@@ -1294,19 +1364,20 @@ fn evaluate_cache_admit(
 
     let default = CacheAdmitPlan::default();
 
-    let pipeline = ctx.pipeline.clone();
-    let Some(script) = ctx
-        .origin_idx
-        .and_then(|idx| pipeline.config.origins.get(idx))
+    let Some(script) = pipeline
+        .config
+        .origins
+        .get(scope.origin_idx)
         .and_then(|origin| origin.response_cache.as_ref())
         .and_then(|cache| cache.admit_event.as_ref())
     else {
         return default;
     };
 
-    let origin = ctx
-        .origin_idx
-        .and_then(|idx| pipeline.config.origins.get(idx))
+    let origin = pipeline
+        .config
+        .origins
+        .get(scope.origin_idx)
         .map_or("", |origin| origin.origin_id.as_str());
     let engine = crate::decision_script::engine_label(script);
     let started = std::time::Instant::now();
@@ -1324,10 +1395,10 @@ fn evaluate_cache_admit(
                 .collect::<serde_json::Map<_, _>>(),
         },
         "request": {
-            "path": ctx.request_path.as_str(),
-            "host": ctx.hostname.as_str(),
+            "path": scope.request_path.as_str(),
+            "host": scope.hostname.as_str(),
         },
-        "tenant": ctx.tenant_id.as_str(),
+        "tenant": scope.tenant_id.as_str(),
         "origin": origin,
     });
 
@@ -1352,13 +1423,13 @@ fn evaluate_cache_admit(
                 ?fault,
                 "cache.admit failed open"
             );
-            record_decision_fail_open(DecisionEvent::CacheAdmit, engine, origin, &ctx.tenant_id);
+            record_decision_fail_open(DecisionEvent::CacheAdmit, engine, origin, &scope.tenant_id);
             record_decision(
                 DecisionEvent::CacheAdmit,
                 engine,
                 DecisionOutcome::Allow,
                 origin,
-                &ctx.tenant_id,
+                &scope.tenant_id,
             );
             default
         }
@@ -1369,7 +1440,7 @@ fn evaluate_cache_admit(
                     engine,
                     DecisionOutcome::Decline,
                     origin,
-                    &ctx.tenant_id,
+                    &scope.tenant_id,
                 );
                 default
             }
@@ -1384,7 +1455,7 @@ fn evaluate_cache_admit(
                     engine,
                     outcome,
                     origin,
-                    &ctx.tenant_id,
+                    &scope.tenant_id,
                 );
                 // WOR-2405: the reason the script gave is the payload. A
                 // record saying a response was not cached is nearly
@@ -1392,15 +1463,20 @@ fn evaluate_cache_admit(
                 // investigation. Publishing is opt-in per event, so this
                 // costs a config read on a path that already did an
                 // engine evaluation.
-                if audit_publishes(&pipeline, DecisionEvent::CacheAdmit) {
+                if audit_publishes(
+                    pipeline,
+                    DecisionEvent::CacheAdmit,
+                    (!scope.tenant_id.is_empty()).then_some(scope.tenant_id.as_str()),
+                    (!origin.is_empty()).then_some(origin),
+                ) {
                     crate::policy_bus::emit_decision_audit(
                         DecisionEvent::CacheAdmit,
                         engine,
                         outcome,
-                        &ctx.request_id,
+                        &scope.request_id,
                         origin,
-                        &ctx.hostname,
-                        &ctx.tenant_id,
+                        &scope.hostname,
+                        &scope.tenant_id,
                         &plan.reason,
                     );
                 }
@@ -1421,14 +1497,14 @@ fn evaluate_cache_admit(
                     DecisionEvent::CacheAdmit,
                     engine,
                     origin,
-                    &ctx.tenant_id,
+                    &scope.tenant_id,
                 );
                 record_decision(
                     DecisionEvent::CacheAdmit,
                     engine,
                     DecisionOutcome::Allow,
                     origin,
-                    &ctx.tenant_id,
+                    &scope.tenant_id,
                 );
                 default
             }
@@ -8618,13 +8694,13 @@ origins:
             DecisionEvent::Policy,
         ] {
             assert!(
-                !audit_publishes(&never_written, event),
+                !(audit_publishes(&never_written, event, None, None)),
                 "a config with no decision_audit block publishes nothing, and `{}` is not \
                  an exception",
                 event.as_label()
             );
             assert!(
-                !audit_publishes(&log_without_audit, event),
+                !(audit_publishes(&log_without_audit, event, None, None)),
                 "a log block that never mentions decision_audit must not synthesize one; \
                  `{}` stays off",
                 event.as_label()
@@ -8654,11 +8730,11 @@ origins:
 "#,
         );
         assert!(
-            audit_publishes(&master_on, DecisionEvent::CacheAdmit),
+            (audit_publishes(&master_on, DecisionEvent::CacheAdmit, None, None)),
             "the master switch has to reach an event the events map does not name"
         );
         assert!(
-            !audit_publishes(&master_on, DecisionEvent::AiStreamEvent),
+            !(audit_publishes(&master_on, DecisionEvent::AiStreamEvent, None, None)),
             "`ai.stream.event` fires once per streamed chunk and never publishes, whatever \
              the master switch says"
         );
@@ -8674,11 +8750,11 @@ origins:
 "#,
         );
         assert!(
-            audit_publishes(&per_event_only, DecisionEvent::CacheAdmit),
+            (audit_publishes(&per_event_only, DecisionEvent::CacheAdmit, None, None)),
             "a per-event entry publishes without a master switch"
         );
         assert!(
-            !audit_publishes(&per_event_only, DecisionEvent::RouteDecide),
+            !(audit_publishes(&per_event_only, DecisionEvent::RouteDecide, None, None)),
             "an unset master switch is off, so naming one event must not turn on the rest"
         );
 
@@ -8694,11 +8770,11 @@ origins:
 "#,
         );
         assert!(
-            !audit_publishes(&event_opted_out, DecisionEvent::CacheAdmit),
+            !(audit_publishes(&event_opted_out, DecisionEvent::CacheAdmit, None, None)),
             "a per-event `false` wins over the master switch"
         );
         assert!(
-            audit_publishes(&event_opted_out, DecisionEvent::RouteDecide),
+            (audit_publishes(&event_opted_out, DecisionEvent::RouteDecide, None, None)),
             "silencing one event must not silence the master switch for the others"
         );
     }

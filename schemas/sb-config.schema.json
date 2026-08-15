@@ -6911,6 +6911,17 @@
       "description": "Tenant-scope `log:` sub-block. Mirrors the proxy-scope `ObservabilityLogConfig`; today exposes the redaction leaf plus the tenant-scoped sinks fan-out (WOR-1045 PR2). The dispatcher routes every record whose resolved `Principal.tenant_id` matches this tenant into each declared sink; cross-tenant records never reach here.",
       "type": "object",
       "properties": {
+        "decision_audit": {
+          "description": "Scoped `decision_audit:` additions, composed per event label against the wider scopes rather than replacing them.\n\nThe same shape as the proxy-scope block. Composition is per key, matching `custom_fields:`: a scope naming one event must not silence the events a wider scope turned on, because that would make enabling one tenant's routing audit quietly disable its cache audit. Precedence for a given event is origin, then tenant, then proxy, and an event no scope names is off.\n\n`enabled:` composes the same way: the most specific scope that sets it wins for the events nobody names explicitly.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DecisionAuditConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "redact": {
           "description": "Tenant-scope `redact:` sub-block. See [`TenantObservabilityRedactConfig`].",
           "default": {},
@@ -10301,6 +10312,17 @@
       "description": "Origin-scope `log:` sub-block. Mirrors the proxy-scope and tenant-scope shape; exposes redaction plus origin-scoped sinks (WOR-1045 PR2). The dispatcher routes every record whose stamped `route` matches this origin's hostname into each declared sink.",
       "type": "object",
       "properties": {
+        "decision_audit": {
+          "description": "Scoped `decision_audit:` additions, composed per event label against the wider scopes rather than replacing them.\n\nThe same shape as the proxy-scope block. Composition is per key, matching `custom_fields:`: a scope naming one event must not silence the events a wider scope turned on, because that would make enabling one tenant's routing audit quietly disable its cache audit. Precedence for a given event is origin, then tenant, then proxy, and an event no scope names is off.\n\n`enabled:` composes the same way: the most specific scope that sets it wins for the events nobody names explicitly.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DecisionAuditConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "redact": {
           "description": "Origin-scope `redact:` sub-block. See [`OriginObservabilityRedactConfig`].",
           "default": {},

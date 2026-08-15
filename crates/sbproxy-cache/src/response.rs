@@ -884,6 +884,7 @@ mod tests {
             body: vec![],
             cached_at: now,
             ttl_secs: 300,
+            swr_secs: None,
             config_fp: String::new(),
         };
         assert!(!resp.is_expired());
@@ -904,6 +905,7 @@ mod tests {
             body: vec![],
             cached_at: now.saturating_sub(500),
             ttl_secs: 100,
+            swr_secs: None,
             config_fp: String::new(),
         };
         assert!(resp.is_expired());

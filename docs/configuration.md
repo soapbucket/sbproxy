@@ -3739,7 +3739,21 @@ cacheable request, so a permissive master switch would hand a busy origin a
 per-request feed, and the usual answer to a feed nobody can afford is to
 switch the whole thing off, which takes the security-relevant events with it.
 
-`cache.admit` is the only event with an emitter in this release. A label naming
+The block also composes under a tenant and under an origin, per event label
+rather than per block. A tenant that names `route.decide` keeps the proxy's
+`cache.admit` entry instead of replacing the map, because replacing it would
+mean turning on one tenant's routing audit silently disables its cache audit.
+Precedence for a given event is origin, then tenant, then proxy.
+
+A decision that has structured facts about what it did publishes them as
+fields alongside the reason, so the filtering is your SIEM's job rather than
+this config's. A `route.decide` record carries the requested model, the
+selected model and provider, the tier count, and how many plan entries the
+host had to drop. "Only the routing decisions that moved a request" is then a
+field comparison at ingest, which is both cheaper and recoverable; a record the
+proxy declined to publish is gone. See [observability.md](observability.md).
+
+`cache.admit`, `cache.key`, and `route.decide` are the events with emitters: they are the three decision points that compute a `reason` worth carrying. A label naming
 no known event is refused when the config loads rather than ignored, because a
 typo is a feed you believe you turned on and nobody is watching.
 `ai.stream.event: true` is refused by value: it fires once per streamed chunk,
@@ -3762,7 +3776,23 @@ record is dropped and counted on
 `sbproxy_decision_audit_events_dropped_total{event, tenant}`, because a feed
 that loses records silently reads as evidence that nothing happened.
 
-An `admit_event` next to a non-zero `stale_while_revalidate` is refused for a third reason: the two do not compose yet. The revalidation refresh runs in the background with no request context, so it cannot evaluate the event, and it writes back with the static `ttl_secs` and the `cacheable_status` gate alone. A TTL override would last until the first refresh, and a response the event refused would be written by the refresh anyway. Config compile fails naming both keys; drop one of the two.
+An `admit_event` composes with `stale_while_revalidate`. The revalidation refresh runs the same event against the response it fetches, so a refusal keeps the stale entry rather than replacing it, and a TTL override survives the refresh instead of reverting to the static `ttl_secs`. These two used to be refused together at config load, because a refresh with no request context would have silently undone both halves of the policy; the refresh now carries the request-side facts the event reads.
+
+A refusal on a refresh is not a fail-open. The refresh serves nobody, so the stale entry simply stays until it ages out of the window.
+
+The plan can also set its own window:
+
+```yaml
+admit_event:
+  engine: lua
+  source: |
+    if response.status ~= 200 then
+      return {store = false, reason = "only 200s are worth caching"}
+    end
+    return {store = true, ttl_secs = 300, swr_secs = 30, reason = "deterministic completion"}
+```
+
+`swr_secs` overrides `stale_while_revalidate` for that response alone, clamped the same way `ttl_secs` is, and it rides on the stored entry rather than being re-read from config on each hit. That matters when the origin's default later widens: an entry admitted with a deliberately short window keeps it, instead of quietly being served stale for longer than the policy that admitted it intended. A response worth caching for an hour is not automatically worth serving stale for one. Entries written before this field existed carry no window and fall back to the origin's configured value.
 
 Sandbox budgets, the engine surfaces, and worked scripts are in [scripting.md](scripting.md). Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose. `cache.admit` genuinely fails open, so a fault records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`. `cache.key` fails closed on the cache, so a fault records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, and no fail-open counter: counting it there would report the opposite of what happened. See [observability.md](observability.md).
 

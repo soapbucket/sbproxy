@@ -785,13 +785,19 @@ proxy:
           cache.admit: true   # per-event override, wins over the master switch
 ```
 
-Precedence is one rule and lives in one place: a per-event entry wins outright, otherwise the master switch decides, and an absent switch or an absent block is off. `ai.stream.event` is the one exception, never published either way, because it fires once per streamed chunk; `ai.close` carries that stream's summary instead. The block belongs at `proxy.observability.log` and nowhere else this release: a `decision_audit:` under a tenant or an origin fails config load with an unknown-field error, because those log blocks reject keys they do not define. Scoped overrides are a later slice.
+Precedence is one rule and lives in one place: a per-event entry wins outright, otherwise the master switch decides, and an absent switch or an absent block is off. `ai.stream.event` is the one exception, never published either way, because it fires once per streamed chunk; `ai.close` carries that stream's summary instead.
+
+The block also composes across scopes, and it composes **per event label** rather than per block. A tenant naming `route.decide` inherits the proxy's `cache.admit` entry instead of replacing the whole map, because the replacing version means turning on one tenant's routing audit silently disables its cache audit. Precedence for a given event is origin, then tenant, then proxy. A scope that writes only `events:` says nothing about the events it did not name, so a wider scope's `enabled:` still decides those. Every scope gets the same validation: a typo'd label under a tenant fails the load exactly as it does at proxy scope.
 
 **Off by default, on purpose.** The decision events differ by orders of magnitude in how often they fire. `cache.key` runs once per cacheable request, so a permissive default would hand you a per-request SIEM feed on your busiest origin the moment you turned anything on. That is an ingest bill rather than a control, and the usual answer to a feed nobody can afford is to switch the whole thing off, which takes the security-relevant events with it. Opting in per event costs one line and keeps that choice available.
 
 Two mistakes are refused at config load rather than ignored, both because a misconfigured audit feed is silent and silence is indistinguishable from a feed with nothing to say. An `events:` key naming no decision this proxy makes fails the load, and the error lists every accepted label. `ai.stream.event: true` fails too, because that event fires once per streamed chunk; enable `ai.close` instead, which carries the stream's summary once the response finishes. Writing `ai.stream.event: false` stays legal, since saying out loud that a feed is off is a reasonable thing to want in a config.
 
-**What is wired today.** `cache.admit` is the only decision point that publishes a record in this release, and it publishes only where the origin has an `admit_event` script and that script returned a plan. A declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no operator-authored reason to carry. Every other label parses and validates and emits nothing yet: `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle` get their emitters in later releases. If you enable one of those and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
+**What is wired today.** Three events publish: `cache.admit`, `cache.key`, and `route.decide`. Those are exactly the three decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
+
+`policy` is a deliberate absence rather than a gap. That path already publishes on this same bus as a policy-verdict record, and it carries no free-text reason, so a second record for one decision would double the volume on the densest security event without adding anything an analyst can read. Converging the two shapes is its own change with its own compatibility story.
+
+The remaining labels parse and validate and emit nothing yet: `auth`, `rate_limit`, `waf`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle`. If you enable one and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
 
 **What the record promises about its reason.** The `reason` field is scrubbed before the record exists at all: the type that field carries has exactly one constructor and that constructor runs the scrub, so no emit site can publish a raw string, whatever it believes redaction means. Four passes, in this order:
 
@@ -805,6 +811,28 @@ Passes 2 and 3 are the log path's own code rather than a second implementation o
 The order is the load-bearing part. Bounding first can cut a `Bearer` token below the length its pattern needs to match, the pattern then misses what is left, and the prefix of a live credential ships to whoever reads your SIEM. Scrub, then bound.
 
 That is a floor and not a promise about arbitrary text: a reason that embeds a secret in a shape no rule knows about is a rule you have not written yet, and the scrub cannot invent it. Separately, the whole serialized line is capped at 64 KiB, and an oversized one collapses to a valid-JSON marker keeping `metadata.uid` and `metadata.correlation_uid`, so a truncation stays parseable and countable rather than corrupting the stream.
+
+**Records carry structured detail, not just prose.** The `reason` says why in the operator's own words, which is what makes a record an investigation rather than a row. But prose does not aggregate, and a SIEM rule written as a regex over English quietly stops matching the day someone rewords a script. So a decision that has structured facts about what it did publishes them as fields, under OCSF's `unmapped` object:
+
+```json
+{
+  "class_uid": 6003,
+  "policy": { "name": "route.decide", "desc": "cheaper tier available" },
+  "unmapped": {
+    "requested_model": "gpt-4o",
+    "selected_model": "claude-haiku",
+    "selected_provider": "anthropic",
+    "tier_count": 2,
+    "dropped": 1
+  }
+}
+```
+
+Every value there is proxy-authored rather than operator-authored, which is why it is not subject to the reason's scrubbing: a model id and a provider id come from the plan the proxy resolved, not from a script's free text.
+
+This is what makes filtering the SIEM's job rather than the proxy's. "Show me every routing decision that moved a request off the model it asked for" is `requested_model != selected_model`, and "show me the plans we had to degrade" is `dropped > 0`. `route.decide` fires on every AI request that reaches a routing policy and most of those decisions change nothing, so the volume is real; the answer is to publish the fields that let a rule drop the no-ops at ingest, not to have the proxy guess in config which decisions were interesting. A record left out at the proxy cannot be recovered later.
+
+The object is omitted entirely when a decision has no structured detail, rather than emitted as `{}`, so a consumer can tell "nothing to add" from "the producer forgot".
 
 **Drops are counted, never swallowed.** Publication never blocks the request path. The audit queue is bounded at 10 000 records and shared with the policy verdicts; when it is full the record is lost and `sbproxy_decision_audit_events_dropped_total{event,tenant}` increments against the tenant whose trail lost it. Counting per tenant is the whole point: a silently lossy audit feed reads as evidence that nothing was decided, which is worse than no feed at all, so a gap always has a counter behind it. Alert on any non-zero rate, and read it beside `sbproxy_decision_audit_events_total` to tell a quiet feed from a broken one.
 

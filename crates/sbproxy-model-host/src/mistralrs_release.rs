@@ -18,7 +18,7 @@
 //!
 //! Platform detection, asset naming, and URL construction are pure and
 //! unit-tested. The download + extract half is behind the `weights`
-//! feature and shells out to `tar`, mirroring
+//! feature and unpacks the tarball in-process, mirroring
 //! `crate::llama_release::ensure_llama_server`.
 
 #[cfg(any(feature = "weights", test))]
@@ -279,18 +279,7 @@ async fn install_release(
         ),
     }
 
-    // Extract: the tarball carries the `mistralrs` binary at its root.
-    let status = tokio::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(staging)
-        .status()
-        .await
-        .map_err(|e| format!("tar: {e}"))?;
-    if !status.success() {
-        return Err(format!("tar extract of {} failed", archive_path.display()));
-    }
+    crate::archive::extract_tar_gz_async(&archive_path, staging).await?;
 
     let binary = [staging.join("mistralrs"), staging.join("bin/mistralrs")]
         .into_iter()

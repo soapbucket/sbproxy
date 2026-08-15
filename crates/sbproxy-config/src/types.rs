@@ -6044,7 +6044,7 @@ pub struct DecisionAuditConfig {
 }
 
 impl DecisionAuditConfig {
-    /// Whether records for `event_label` should be published.
+    /// What this config asks for on `event_label`, at one scope.
     ///
     /// The one place the precedence lives, so no emitting site can read
     /// the two fields in its own order: a per-event entry wins outright,
@@ -6054,19 +6054,8 @@ impl DecisionAuditConfig {
     /// no block written cannot accidentally get a permissive default out
     /// of it.
     ///
-    /// One event sits outside that table.
-    /// [`sbproxy_observe::decision::DecisionEvent::AiStreamEvent`]
-    /// (`ai.stream.event`) always answers `false`, whatever the master
-    /// switch says, because it fires once per streamed chunk. See the
-    /// comment in the body.
-    ///
-    /// This method is also the only typed read of `enabled` and `events`
-    /// in the workspace, so it is what satisfies the config-reader guard
-    /// for both keys: their names are ambiguous enough that the scanner
-    /// cannot attribute a read anywhere else. Inlining it into the
-    /// emitting sites would turn that guard red and hand every site its
-    /// own copy of the precedence.
-    #[must_use]
+    /// [`DecisionAuditScopes::publishes`] is what the request path
+    /// calls; this is the single-scope form it composes.
     pub fn publishes(&self, event_label: &str) -> bool {
         use sbproxy_observe::decision::DecisionEvent;
 
@@ -6092,6 +6081,77 @@ impl DecisionAuditConfig {
             return *explicit;
         }
         self.enabled.unwrap_or(false)
+    }
+}
+
+/// The composed `decision_audit:` blocks for one compiled config.
+///
+/// Built once at compile time and read per decision, the same shape the
+/// operator redaction state uses, and for the same reason: the
+/// precedence has to live in one place or each emit site invents its
+/// own. [`DecisionAuditScopes::publishes`] is the only resolver.
+///
+/// Composition is **per event label**, not per block. A tenant that
+/// names `route.decide` inherits the proxy's `cache.admit` setting
+/// rather than replacing the whole map, because the replacing version
+/// means enabling one tenant's routing audit silently disables its
+/// cache audit, and a silently disabled audit feed is the failure this
+/// whole surface is built to avoid.
+#[derive(Debug, Clone, Default)]
+pub struct DecisionAuditScopes {
+    /// `proxy.observability.log.decision_audit`.
+    pub proxy: Option<DecisionAuditConfig>,
+    /// Keyed by tenant id.
+    pub tenants: std::collections::BTreeMap<String, DecisionAuditConfig>,
+    /// Keyed by the origin's config key, which is what
+    /// `RequestContext::hostname` carries for a non-wildcard origin.
+    pub origins: std::collections::BTreeMap<String, DecisionAuditConfig>,
+}
+
+impl DecisionAuditScopes {
+    /// Whether any scope configured anything at all.
+    ///
+    /// The emit sites test this first so a deployment that never wrote
+    /// the block pays one `bool` rather than three map lookups per
+    /// decision.
+    pub fn is_empty(&self) -> bool {
+        self.proxy.is_none() && self.tenants.is_empty() && self.origins.is_empty()
+    }
+
+    /// Whether one event publishes at one request's scope.
+    ///
+    /// `route` is the origin's config key. Passing something else (the
+    /// request `Host` under a wildcard origin, say) silently skips the
+    /// origin scope, which is the same trap the redaction resolver has
+    /// and is why both take the value from the same place.
+    pub fn publishes(&self, event_label: &str, tenant: Option<&str>, route: Option<&str>) -> bool {
+        use sbproxy_observe::decision::DecisionEvent;
+
+        // Unreachable at every scope, for the reason the proxy-scope
+        // resolver gives: it fires once per streamed chunk.
+        if event_label == DecisionEvent::AiStreamEvent.as_label() {
+            return false;
+        }
+
+        let origin = route.and_then(|r| self.origins.get(r));
+        let tenant = tenant.and_then(|t| self.tenants.get(t));
+        let scopes = [origin, tenant, self.proxy.as_ref()];
+
+        // Per-key first, most specific wins.
+        for scope in scopes.into_iter().flatten() {
+            if let Some(explicit) = scope.events.get(event_label) {
+                return *explicit;
+            }
+        }
+        // Then the master switch from the most specific scope that sets
+        // one. A scope that writes `events:` alone does not shadow a
+        // wider scope's `enabled:`.
+        for scope in scopes.into_iter().flatten() {
+            if let Some(enabled) = scope.enabled {
+                return enabled;
+            }
+        }
+        false
     }
 }
 
@@ -6684,6 +6744,20 @@ pub const TENANT_CARDINALITY_DEFAULT_MAX_SERIES: u32 = 10_000;
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantObservabilityLogConfig {
+    /// Scoped `decision_audit:` additions, composed per event label
+    /// against the wider scopes rather than replacing them.
+    ///
+    /// The same shape as the proxy-scope block. Composition is per key,
+    /// matching `custom_fields:`: a scope naming one event must not
+    /// silence the events a wider scope turned on, because that would
+    /// make enabling one tenant's routing audit quietly disable its
+    /// cache audit. Precedence for a given event is origin, then
+    /// tenant, then proxy, and an event no scope names is off.
+    ///
+    /// `enabled:` composes the same way: the most specific scope that
+    /// sets it wins for the events nobody names explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_audit: Option<DecisionAuditConfig>,
     /// Tenant-scope `redact:` sub-block. See
     /// [`TenantObservabilityRedactConfig`].
     #[serde(default)]
@@ -7342,6 +7416,20 @@ pub struct OriginObservabilityConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OriginObservabilityLogConfig {
+    /// Scoped `decision_audit:` additions, composed per event label
+    /// against the wider scopes rather than replacing them.
+    ///
+    /// The same shape as the proxy-scope block. Composition is per key,
+    /// matching `custom_fields:`: a scope naming one event must not
+    /// silence the events a wider scope turned on, because that would
+    /// make enabling one tenant's routing audit quietly disable its
+    /// cache audit. Precedence for a given event is origin, then
+    /// tenant, then proxy, and an event no scope names is off.
+    ///
+    /// `enabled:` composes the same way: the most specific scope that
+    /// sets it wins for the events nobody names explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_audit: Option<DecisionAuditConfig>,
     /// Origin-scope `redact:` sub-block. See
     /// [`OriginObservabilityRedactConfig`].
     #[serde(default)]
@@ -11923,5 +12011,133 @@ mod sweep_header_capture_tests {
                 "{bad:?} must be refused rather than defaulted"
             );
         }
+    }
+}
+
+/// How `decision_audit:` composes across scopes (WOR-2405).
+#[cfg(test)]
+mod decision_audit_scope_tests {
+    use super::*;
+
+    fn audit_cfg(yaml: &str) -> DecisionAuditConfig {
+        serde_yaml::from_str(yaml).expect("fixture parses")
+    }
+
+    #[test]
+    fn a_per_event_entry_wins_over_the_master_switch() {
+        let cfg = audit_cfg("enabled: true\nevents:\n  cache.admit: true\n  cache.key: false\n");
+        assert!(cfg.publishes("cache.admit"));
+        assert!(!cfg.publishes("cache.key"));
+        assert!(
+            cfg.publishes("route.decide"),
+            "unnamed events follow the switch"
+        );
+    }
+
+    #[test]
+    fn the_per_chunk_event_is_off_at_every_scope() {
+        // Off by construction ahead of both the map and the switch, and
+        // the scope resolver has to agree with the single-scope one or
+        // a tenant block becomes a way around it.
+        let cfg = audit_cfg("enabled: true\n");
+        assert!(!cfg.publishes("ai.stream.event"));
+
+        let scopes = DecisionAuditScopes {
+            proxy: Some(audit_cfg("enabled: true\n")),
+            tenants: [("acme".to_owned(), audit_cfg("enabled: true\n"))]
+                .into_iter()
+                .collect(),
+            origins: Default::default(),
+        };
+        assert!(!scopes.publishes("ai.stream.event", Some("acme"), None));
+    }
+
+    #[test]
+    fn a_scope_composes_per_event_rather_than_replacing_the_block() {
+        // The finding this shape exists to prevent: a tenant that turns
+        // on its routing audit must not thereby silence the cache audit
+        // the proxy scope turned on for it.
+        let scopes = DecisionAuditScopes {
+            proxy: Some(audit_cfg("events:\n  cache.admit: true\n")),
+            tenants: [(
+                "acme".to_owned(),
+                audit_cfg("events:\n  route.decide: true\n"),
+            )]
+            .into_iter()
+            .collect(),
+            origins: Default::default(),
+        };
+        assert!(
+            scopes.publishes("cache.admit", Some("acme"), None),
+            "the tenant named a different event, so the proxy's entry still stands"
+        );
+        assert!(scopes.publishes("route.decide", Some("acme"), None));
+        assert!(
+            !scopes.publishes("route.decide", Some("other"), None),
+            "another tenant does not inherit acme's entry"
+        );
+    }
+
+    #[test]
+    fn the_most_specific_scope_wins_per_event() {
+        let scopes = DecisionAuditScopes {
+            proxy: Some(audit_cfg("events:\n  cache.admit: true\n")),
+            tenants: [(
+                "acme".to_owned(),
+                audit_cfg("events:\n  cache.admit: false\n"),
+            )]
+            .into_iter()
+            .collect(),
+            origins: [(
+                "api.example.test".to_owned(),
+                audit_cfg("events:\n  cache.admit: true\n"),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(
+            scopes.publishes("cache.admit", Some("acme"), Some("api.example.test")),
+            "origin beats tenant"
+        );
+        assert!(
+            !scopes.publishes("cache.admit", Some("acme"), None),
+            "tenant beats proxy"
+        );
+        assert!(
+            scopes.publishes("cache.admit", None, None),
+            "proxy is the floor"
+        );
+    }
+
+    #[test]
+    fn a_scoped_events_map_does_not_shadow_a_wider_master_switch() {
+        // A tenant writing `events:` alone has said nothing about the
+        // events it did not name, so the proxy's `enabled:` still
+        // decides them. The other reading silently disables a feed.
+        let scopes = DecisionAuditScopes {
+            proxy: Some(audit_cfg("enabled: true\n")),
+            tenants: [(
+                "acme".to_owned(),
+                audit_cfg("events:\n  route.decide: false\n"),
+            )]
+            .into_iter()
+            .collect(),
+            origins: Default::default(),
+        };
+        assert!(
+            !scopes.publishes("route.decide", Some("acme"), None),
+            "the tenant named this one"
+        );
+        assert!(
+            scopes.publishes("cache.admit", Some("acme"), None),
+            "it named nothing about this one, so the proxy switch still applies"
+        );
+    }
+
+    #[test]
+    fn an_absent_block_is_off_and_cheap() {
+        let scopes = DecisionAuditScopes::default();
+        assert!(scopes.is_empty());
+        assert!(!scopes.publishes("cache.admit", Some("acme"), Some("api.example.test")));
     }
 }

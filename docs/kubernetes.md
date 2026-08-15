@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-15*
 
 The Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
@@ -36,7 +36,7 @@ No release publishes an operator image. The release workflow builds and pushes t
 
 So the install above cannot be completed against a stock chart. Building the image yourself is the path that works, and it is the same path the smoke test takes.
 
-`make k8s-operator-smoke` does the whole thing locally against kind: it builds the operator binary, wraps it in `sbproxy-operator:ci`, loads that image into a kind cluster, and installs this chart pointed at it. See [Local smoke test](#local-smoke-test) for what it asserts.
+`make k8s-operator-smoke` does the whole thing locally against kind: it builds the operator image (compiling inside Docker so the binary is Linux-native), loads that image into a kind cluster, and installs this chart pointed at it. See [Local smoke test](#local-smoke-test) for what it asserts.
 
 For a cluster of your own, build the image, push it somewhere your nodes can reach, and point the chart at it:
 
@@ -45,7 +45,6 @@ For a cluster of your own, build the image, push it somewhere your nodes can rea
 export OPERATOR_REPO=registry.example.com/soapbucket/sbproxy-k8s-operator
 export OPERATOR_TAG=1.10.0
 
-cargo build --profile release-fast -p sbproxy-k8s-operator --locked
 docker build -t "$OPERATOR_REPO:$OPERATOR_TAG" \
   -f crates/sbproxy-k8s-operator/Dockerfile.ci .
 docker push "$OPERATOR_REPO:$OPERATOR_TAG"
@@ -566,15 +565,13 @@ expired.
 
 The target:
 
-1. Builds the proxy and operator binaries with `cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator --locked`.
-2. Wraps each binary in a small image (`Dockerfile.ci` and `crates/sbproxy-k8s-operator/Dockerfile.ci`).
-3. Creates a kind cluster (`kindest/node:v1.30.0`), loads both images with `kind load docker-image`, helm-installs the chart, and runs `deploy/helm/sbproxy/test/smoke.sh`.
+1. Builds both images inside Docker (`Dockerfile.ci` for the data plane, `crates/sbproxy-k8s-operator/Dockerfile.ci` for the operator). The operator Dockerfile compiles in a Linux builder stage, so a macOS or Windows host still produces a runnable Linux binary.
+2. Creates a kind cluster (`kindest/node:v1.30.0`), loads both images with `kind load docker-image`, helm-installs the chart, and runs `deploy/helm/sbproxy/test/smoke.sh`.
 
 The Make target wraps the manual sequence below:
 
 ```bash
 # from the repo root
-cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator
 docker build -t sbproxy:ci -f Dockerfile.ci .
 docker build -t sbproxy-operator:ci -f crates/sbproxy-k8s-operator/Dockerfile.ci .
 kind create cluster --name sbproxy-smoke --image kindest/node:v1.30.0

@@ -1,27 +1,35 @@
-# CI smoke-test image for the sbproxy Kubernetes operator.
+# CI / local image for the sbproxy Kubernetes operator.
 #
-# Built by the `k8s-operator-smoke` Makefile target, which is local-only:
-# no CI workflow builds this image, and no release publishes it. The target
-# produces the binary on the host first, then wraps it:
+# Built by `make k8s-operator-smoke` and by operators who push their own
+# tag (see docs/kubernetes.md). Compiles inside a Linux builder stage so
+# the image is a Linux ELF binary even when `docker build` is invoked from
+# macOS or Windows (WOR-2414). That also means the build context no longer
+# needs a host `target/` artifact, which `.dockerignore` excludes anyway
+# (WOR-2413).
 #
-#   cargo build --profile release-fast -p sbproxy-k8s-operator --locked
+# Usage:
 #   docker build -t sbproxy-operator:ci \
 #     -f crates/sbproxy-k8s-operator/Dockerfile.ci \
 #     .
 #
-# It then loads `sbproxy-operator:ci` into a kind cluster and installs
-# deploy/helm/sbproxy against it. Operators who want the image in a real
-# cluster run the same two commands with their own tag and push it; see
-# docs/kubernetes.md.
-#
-# The build context is the repository root so the COPY can reach
-# `target/${CARGO_PROFILE}/sbproxy-k8s-operator` without a flat directory copy.
-# Keep this image small: kind only needs a one-shot binary that talks to
-# the in-cluster API server.
-#
 # syntax=docker/dockerfile:1.7
 ARG CARGO_PROFILE=release-fast
-FROM gcr.io/distroless/cc-debian12:nonroot
+
+# rust-version in the workspace Cargo.toml is 1.95. Match it rather than
+# the 1.94 tag used by the data-plane Dockerfiles, or cargo refuses the
+# package before the first crate compiles.
+FROM rust:1.95-bookworm AS builder
 ARG CARGO_PROFILE=release-fast
-COPY target/${CARGO_PROFILE}/sbproxy-k8s-operator /usr/local/bin/sbproxy-k8s-operator
+WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --profile "${CARGO_PROFILE}" -p sbproxy-k8s-operator --locked \
+ && cp "/src/target/${CARGO_PROFILE}/sbproxy-k8s-operator" /usr/local/bin/sbproxy-k8s-operator
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /usr/local/bin/sbproxy-k8s-operator /usr/local/bin/sbproxy-k8s-operator
 ENTRYPOINT ["/usr/local/bin/sbproxy-k8s-operator"]

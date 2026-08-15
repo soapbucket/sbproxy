@@ -1317,6 +1317,7 @@ fn spawn_swr_revalidation(
     cacheable_status: Vec<u16>,
     pipeline: std::sync::Arc<crate::pipeline::CompiledPipeline>,
     origin_idx: usize,
+    admit_scope: Option<crate::server::proxy_http::AdmitEventScope>,
 ) {
     let full_url = format!("{}{}", revalidation_request.upstream_url, path_and_query);
 
@@ -1541,6 +1542,42 @@ fn spawn_swr_revalidation(
             headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
         }
 
+        // WOR-2367: the refresh runs the origin's `admit_event` against
+        // the response it just fetched. Without this the refresh writes
+        // back with the static `ttl_secs` and stores whatever it got,
+        // silently reverting both the event's TTL override and any
+        // response the event refused, which is why the two used to be
+        // refused together at config load.
+        //
+        // The refresh serves nobody, so a refusal here is not a
+        // fail-open: the stale entry simply stays until it ages out.
+        let mut ttl_secs = ttl_secs;
+        // Preserves the window the stale entry was admitted with when
+        // the refresh runs no event, so a refresh does not quietly
+        // revert to the origin's default.
+        let mut swr_secs = stale_entry.swr_secs;
+        if let Some(scope) = admit_scope.as_ref() {
+            let plan = crate::server::proxy_http::evaluate_cache_admit_for(
+                &pipeline,
+                scope,
+                status,
+                &headers,
+                body.len(),
+            );
+            if !plan.store {
+                tracing::debug!(
+                    url = %full_url,
+                    reason = plan.reason.as_str(),
+                    "swr: admit_event refused the refreshed response; keeping the stale entry"
+                );
+                return;
+            }
+            if let Some(override_ttl) = plan.ttl_secs {
+                ttl_secs = override_ttl;
+            }
+            swr_secs = plan.swr_secs;
+        }
+
         let entry = sbproxy_cache::CachedResponse {
             generation: sbproxy_cache::new_cache_generation(),
             status,
@@ -1548,6 +1585,7 @@ fn spawn_swr_revalidation(
             body,
             cached_at: refreshed_at,
             ttl_secs,
+            swr_secs,
             // WOR-2407: a refresh replaces the exact entry it observed,
             // under the same key, so it inherits that entry's config
             // identity rather than re-deriving one. `compare_and_swap`
