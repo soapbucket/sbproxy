@@ -49,9 +49,9 @@ test-group = 'sbproxy-e2e'
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(=a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses)'
+filter = 'test(a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses)'
 test-group = 'js-outbound-fetch'
 
 [[profile.ci.overrides]]
-filter = 'test(=a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses)'
+filter = 'test(a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses)'
 test-group = 'js-outbound-fetch'
