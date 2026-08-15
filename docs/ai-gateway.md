@@ -431,6 +431,12 @@ adopting the whole strategy.
     reason_codes: [difficulty]
 ```
 
+`ai.prompt.fingerprint` sits alongside it: a salted, non-reversible
+`pf_<hex>` digest of the model plus every message, stable for an identical
+prompt and never embedding the prompt text. It is for keying on prompt
+identity, for example pinning the same prompt shape to the same provider so a
+downstream cache stays warm, without the policy ever seeing the prompt.
+
 The policy can also read each provider's live state through `ai.providers`, a
 list the gateway fills from the same per-provider health, latency, in-flight,
 token-usage, and circuit-breaker signals the built-in latency and
