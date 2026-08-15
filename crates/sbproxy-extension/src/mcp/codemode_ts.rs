@@ -1098,8 +1098,13 @@ mod tests {
     #[test]
     fn runtime_stub_includes_callback_url() {
         let out = emit_codemode_ts(&[], "https://gateway.example/.well-known/mcp/codemode/");
-        // Trailing slash stripped, then path concatenated.
-        assert!(out.contains("https://gateway.example/.well-known/mcp/codemode/call/"));
+        // Trailing slash stripped, then concatenated at runtime. The base is an
+        // escaped string literal rather than an interpolated template so a
+        // hostile callback URL stays data.
+        assert!(
+            out.contains("'https://gateway.example/.well-known/mcp/codemode' + '/call/'"),
+            "runtime stub must concatenate the escaped callback base"
+        );
     }
 
     #[test]

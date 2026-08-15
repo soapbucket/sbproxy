@@ -1,17 +1,34 @@
 use http::HeaderMap;
 use sbproxy_extension::mcp::{
-    JsonRpcRequest, Legacy2025_06_18Codec, McpImplementation, McpProtocolCodec, McpProtocolEra,
-    McpServerDescription, Modern2026_07_28Codec,
+    JsonRpcRequest, Legacy2025_06_18Codec, McpImplementation, McpInteger, McpProtocolCodec,
+    McpProtocolEra, McpServerDescription, Modern2026_07_28Codec, ModernJsonRpcResponse,
+    ModernRequestId, ModernRequestIdError,
 };
 use serde_json::{json, Value};
 
 use sbproxy_extension::mcp::protocol::{
-    build_mirrored_headers, compile_modern_tool_contract, validate_mirrored_headers,
-    McpContractError, McpSchemaLimits, McpToolContract, McpToolResultDocument,
+    build_mirrored_headers, classify_http_era, compile_modern_tool_contract,
+    validate_mirrored_headers, McpContractError, McpModernToolResultDocument, McpSchemaLimits,
+    McpToolContract, McpToolResultDocument, RawModernScan, RawModernScanLimit,
 };
 
 fn fixture(raw: &str) -> Value {
     serde_json::from_str(raw).expect("fixture is valid JSON")
+}
+
+fn wire_body_value<T: serde::Serialize>(body: Option<T>) -> Value {
+    serde_json::to_value(body.expect("wire response body")).expect("serialize wire response body")
+}
+
+fn modern_integer_id(value: u64) -> ModernRequestId {
+    ModernRequestId::Integer(McpInteger::Unsigned(value))
+}
+
+fn modern_request_with_raw_id(raw_id: &str) -> Vec<u8> {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{raw_id},"method":"tools/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{{"name":"conformance-client","version":"1.0.0"}},"io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+    )
+    .into_bytes()
 }
 
 fn modern_headers(method: &str, name: Option<&str>) -> HeaderMap {
@@ -190,6 +207,34 @@ fn mcp_protocol_tool_result_round_trip_preserves_all_channels() {
     assert_eq!(serde_json::to_value(&result).expect("serialize"), raw);
     let decoded: McpToolResultDocument = serde_json::from_value(raw.clone()).expect("deserialize");
     assert_eq!(decoded.into_value(), raw);
+}
+
+#[test]
+fn mcp_protocol_modern_tool_result_rejects_invalid_envelope_before_post_processing() {
+    for invalid in [
+        json!({"content": [], "_meta": "private-upstream-detail"}),
+        json!({"content": [], "resultType": "input_required"}),
+        json!({"content": [], "resultType": 1}),
+    ] {
+        assert!(
+            McpModernToolResultDocument::try_from(invalid).is_err(),
+            "an invalid modern result envelope reached post-processing"
+        );
+    }
+
+    for valid in [
+        json!({"content": []}),
+        json!({"content": [], "_meta": {}}),
+        json!({"content": [], "resultType": "complete"}),
+    ] {
+        McpModernToolResultDocument::try_from(valid).expect("valid modern result envelope");
+    }
+
+    let normalized = McpModernToolResultDocument::try_from(json!({"content": []}))
+        .expect("normalize modern result")
+        .into_value();
+    assert_eq!(normalized["resultType"], "complete");
+    assert_eq!(normalized["_meta"], json!({}));
 }
 
 #[test]
@@ -620,6 +665,57 @@ fn mcp_protocol_header_projection_compares_integral_numbers_numerically() {
 
     assert_eq!(headers["mcp-param-retries"], "2");
     validate_mirrored_headers(&headers, &compiled.header_projections, &args).unwrap();
+
+    let integer_body = json!({"retries": 42});
+    for header in ["42.0", "420e-1", "0.42e2", "42.000E+0"] {
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-param-retries", header.parse().unwrap());
+        validate_mirrored_headers(&headers, &compiled.header_projections, &integer_body)
+            .unwrap_or_else(|_| panic!("mathematically integral header rejected: {header}"));
+    }
+
+    let zero_body = json!({"retries": 0});
+    for header in ["-0", "-0.000", "-0e9"] {
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-param-retries", header.parse().unwrap());
+        validate_mirrored_headers(&headers, &compiled.header_projections, &zero_body)
+            .unwrap_or_else(|_| panic!("signed zero header rejected: {header}"));
+    }
+}
+
+#[test]
+fn mcp_protocol_header_projection_rejects_inexact_or_unbounded_number_lexemes() {
+    let contract = contract_with_schema(json!({
+        "type": "object",
+        "properties": {"retries": {"type": "integer", "x-mcp-header": "Retries"}}
+    }));
+    let compiled = compile_modern_tool_contract(&contract, McpSchemaLimits::default()).unwrap();
+    let args = json!({"retries": 42});
+
+    for header in [
+        "42.0000000000000000000001",
+        "1.5",
+        "42x",
+        "NaN",
+        "Infinity",
+        "9007199254740992",
+        "1e999999",
+        "0e999999",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-param-retries", header.parse().unwrap());
+        assert!(
+            validate_mirrored_headers(&headers, &compiled.header_projections, &args).is_err(),
+            "invalid numeric header accepted: {header}"
+        );
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "mcp-param-retries",
+        format!("42{}", "0".repeat(127)).parse().unwrap(),
+    );
+    assert!(validate_mirrored_headers(&headers, &compiled.header_projections, &args).is_err());
 }
 
 #[test]
@@ -691,12 +787,13 @@ fn mcp_protocol_modern_list_result_gets_required_cache_fields() {
     let response = Modern2026_07_28Codec
         .encode_success(
             "tools/list",
-            Some(json!(9)),
+            modern_integer_id(9),
             json!({"tools": []}),
             &test_server_description(),
         )
         .expect("encode");
-    let result = response.body.unwrap().result.unwrap();
+    let body = wire_body_value(response.body);
+    let result = &body["result"];
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["ttlMs"], 0);
     assert_eq!(result["cacheScope"], "private");
@@ -707,12 +804,13 @@ fn mcp_protocol_modern_call_result_omits_list_cache_fields() {
     let response = Modern2026_07_28Codec
         .encode_success(
             "tools/call",
-            Some(json!(13)),
+            modern_integer_id(13),
             json!({"content": []}),
             &test_server_description(),
         )
         .expect("encode");
-    let result = response.body.unwrap().result.unwrap();
+    let body = wire_body_value(response.body);
+    let result = &body["result"];
     assert!(result.get("ttlMs").is_none());
     assert!(result.get("cacheScope").is_none());
 }
@@ -722,7 +820,7 @@ fn mcp_protocol_modern_preserves_result_fields_and_meta_when_shaping() {
     let response = Modern2026_07_28Codec
         .encode_success(
             "resources/read",
-            Some(json!(12)),
+            modern_integer_id(12),
             json!({
                 "contents": [],
                 "_meta": {"vendor.example/trace": "preserve"}
@@ -730,7 +828,8 @@ fn mcp_protocol_modern_preserves_result_fields_and_meta_when_shaping() {
             &test_server_description(),
         )
         .expect("encode");
-    let result = response.body.unwrap().result.unwrap();
+    let body = wire_body_value(response.body);
+    let result = &body["result"];
     assert_eq!(result["contents"], json!([]));
     assert_eq!(result["_meta"]["vendor.example/trace"], "preserve");
     assert_eq!(
@@ -742,13 +841,13 @@ fn mcp_protocol_modern_preserves_result_fields_and_meta_when_shaping() {
 #[test]
 fn mcp_protocol_modern_unknown_method_is_http_404() {
     let response = Modern2026_07_28Codec.encode_error(
-        Some(json!(10)),
+        modern_integer_id(10),
         -32601,
         "unknown MCP method: no/such",
         None,
     );
     assert_eq!(response.status, http::StatusCode::NOT_FOUND);
-    assert_eq!(response.body.unwrap().error.unwrap().code, -32601);
+    assert_eq!(wire_body_value(response.body)["error"]["code"], -32601);
 }
 
 #[test]
@@ -756,12 +855,12 @@ fn mcp_protocol_modern_refuses_unadvertised_input_required_result() {
     let error = Modern2026_07_28Codec
         .encode_success(
             "tools/call",
-            Some(json!(11)),
+            modern_integer_id(11),
             json!({"resultType": "input_required", "inputRequests": []}),
             &test_server_description(),
         )
         .expect_err("MRTR generation is not supported");
-    assert_eq!(error.0.body.unwrap().error.unwrap().code, -32603);
+    assert_eq!(wire_body_value(error.0.body)["error"]["code"], -32603);
 }
 
 #[test]
@@ -777,14 +876,15 @@ fn mcp_protocol_modern_maps_errors_and_notification_responses() {
         (-32603, http::StatusCode::OK),
     ];
     for (code, status) in cases {
-        let response = Modern2026_07_28Codec.encode_error(Some(json!(4)), code, "error", None);
+        let response =
+            Modern2026_07_28Codec.encode_error(modern_integer_id(4), code, "error", None);
         assert_eq!(response.status, status, "{code}");
     }
 
     let notification = Modern2026_07_28Codec
         .encode_success(
             "notifications/tools/list_changed",
-            None,
+            ModernRequestId::Absent,
             json!({}),
             &test_server_description(),
         )
@@ -813,7 +913,7 @@ fn mcp_protocol_modern_rejects_missing_metadata_as_invalid_params() {
         sbproxy_extension::mcp::decode_http_request(&body, &modern_headers("tools/list", None))
             .expect_err("missing modern metadata");
     assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST);
-    assert_eq!(error.0.body.unwrap().error.unwrap().code, -32602);
+    assert_eq!(wire_body_value(error.0.body)["error"]["code"], -32602);
 }
 
 #[test]
@@ -823,8 +923,8 @@ fn mcp_protocol_modern_returns_supported_versions_without_downgrading() {
     headers.insert("mcp-protocol-version", "1900-01-01".parse().unwrap());
     let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
         .expect_err("unsupported version");
-    let response = error.0.body.unwrap();
-    assert_eq!(response.error.as_ref().unwrap().code, -32020);
+    let response = wire_body_value(error.0.body);
+    assert_eq!(response["error"]["code"], -32020);
 }
 
 #[test]
@@ -996,7 +1096,7 @@ fn mcp_protocol_modern_rejects_protocol_defined_failures() {
             sbproxy_extension::mcp::decode_http_request(&body, &case.headers).expect_err(case.name);
         assert_eq!(error.0.status, case.status, "{}", case.name);
         assert_eq!(
-            error.0.body.unwrap().error.unwrap().code,
+            wire_body_value(error.0.body)["error"]["code"],
             case.code,
             "{}",
             case.name
@@ -1014,19 +1114,19 @@ fn mcp_protocol_modern_unsupported_version_returns_supported_versions() {
     let error =
         sbproxy_extension::mcp::decode_http_request(&serde_json::to_vec(&body).unwrap(), &headers)
             .expect_err("unsupported modern version");
-    let response = error.0.body.unwrap();
-    assert_eq!(response.error.as_ref().unwrap().code, -32022);
+    let response = wire_body_value(error.0.body);
+    assert_eq!(response["error"]["code"], -32022);
     assert_eq!(
-        response.error.unwrap().data,
-        Some(json!({
+        response["error"]["data"],
+        json!({
             "supported": ["2026-07-28", "2025-06-18"],
             "requested": "1900-01-01",
-        }))
+        })
     );
 }
 
 #[test]
-fn mcp_protocol_modern_rejects_duplicate_routing_headers() {
+fn mcp_protocol_modern_rejects_duplicate_singleton_routing_header_lines() {
     let body = serde_json::to_vec(&modern_request(
         "tools/call",
         json!({"name": "weather", "arguments": {}}),
@@ -1034,7 +1134,6 @@ fn mcp_protocol_modern_rejects_duplicate_routing_headers() {
     .unwrap();
     let cases = [
         ("content-type", "application/json"),
-        ("accept", "application/json, text/event-stream"),
         ("mcp-protocol-version", "2026-07-28"),
         ("mcp-method", "tools/call"),
         ("mcp-name", "weather"),
@@ -1051,11 +1150,222 @@ fn mcp_protocol_modern_rejects_duplicate_routing_headers() {
             .expect_err("duplicate routing header is rejected");
         assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST, "{header}");
         assert_eq!(
-            error.0.body.unwrap().error.unwrap().code,
+            wire_body_value(error.0.body)["error"]["code"],
             -32020,
             "{header}"
         );
     }
+}
+
+#[test]
+fn mcp_protocol_modern_accept_combines_repeated_raw_field_lines() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    let mut headers = modern_headers("tools/list", None);
+    headers.remove("accept");
+    headers.append(
+        "accept",
+        "application/json; profile=complete; q=1".parse().unwrap(),
+    );
+    headers.append(
+        "accept",
+        r#"text/event-stream; note="events,ordered""#.parse().unwrap(),
+    );
+
+    sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect("Accept is a repeatable RFC 9110 list field");
+}
+
+#[test]
+fn mcp_protocol_modern_content_type_accepts_rfc_9110_case_and_parameters() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    for content_type in [
+        "application/json",
+        "Application/JSON",
+        "application/json; charset=utf-8",
+        r#"APPLICATION/JSON; Charset="UTF-8"; profile="complete,strict""#,
+    ] {
+        let mut headers = modern_headers("tools/list", None);
+        headers.insert("content-type", content_type.parse().unwrap());
+        sbproxy_extension::mcp::decode_http_request(&body, &headers)
+            .unwrap_or_else(|_| panic!("valid Content-Type rejected: {content_type}"));
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_content_type_rejects_invalid_and_lookalike_values() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    for content_type in [
+        "text/plain",
+        "application/jsonp",
+        "text/application/json",
+        "application/json, text/plain",
+        "application/json; charset =utf-8",
+        r#"application/json; profile="unterminated"#,
+    ] {
+        let mut headers = modern_headers("tools/list", None);
+        headers.insert("content-type", content_type.parse().unwrap());
+        let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+            .expect_err("invalid Content-Type");
+        assert_eq!(
+            error.0.status,
+            http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{content_type}"
+        );
+        assert_eq!(
+            wire_body_value(error.0.body)["error"]["code"],
+            -32600,
+            "{content_type}"
+        );
+    }
+
+    let mut non_utf8 = modern_headers("tools/list", None);
+    non_utf8.insert(
+        "content-type",
+        http::HeaderValue::from_bytes(b"application/json; profile=\xff").unwrap(),
+    );
+    let error = sbproxy_extension::mcp::decode_http_request(&body, &non_utf8)
+        .expect_err("non-UTF-8 Content-Type");
+    assert_eq!(error.0.status, http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[test]
+fn mcp_protocol_modern_accept_parses_parameters_qvalues_and_quoted_commas() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    for accept in [
+        "Application/JSON; Charset=utf-8; Q=0.125, TEXT/EVENT-STREAM; q=1.000",
+        r#"application/json; note="a,b\"c", text/event-stream; note="events,ordered""#,
+        "application/json;q=0, application/json;q=0.001, text/event-stream",
+    ] {
+        let mut headers = modern_headers("tools/list", None);
+        headers.insert("accept", accept.parse().unwrap());
+        sbproxy_extension::mcp::decode_http_request(&body, &headers)
+            .unwrap_or_else(|_| panic!("valid Accept rejected: {accept}"));
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_accept_requires_both_exact_positive_media_ranges() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    for accept in [
+        "application/json",
+        "text/event-stream",
+        "application/*, text/event-stream",
+        "application/json, text/*",
+        "*/*",
+        "application/json;q=0, text/event-stream",
+        "application/json, text/event-stream;q=0.000",
+        "application/jsonp, text/event-stream",
+        "application/json, text/event-streaming",
+    ] {
+        let mut headers = modern_headers("tools/list", None);
+        headers.insert("accept", accept.parse().unwrap());
+        let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+            .expect_err("both exact positive media ranges are required");
+        assert_eq!(error.0.status, http::StatusCode::NOT_ACCEPTABLE, "{accept}");
+        assert_eq!(
+            wire_body_value(error.0.body)["error"]["code"],
+            -32600,
+            "{accept}"
+        );
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_accept_rejects_invalid_or_duplicate_qvalues() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    for accept in [
+        "application/json, text/event-stream, application/xml;q=.5",
+        "application/json, text/event-stream, application/xml;q=2",
+        "application/json, text/event-stream, application/xml;q=1.001",
+        "application/json, text/event-stream, application/xml;q=0.0000",
+        "application/json, text/event-stream, application/xml;q=bogus",
+        "application/json, text/event-stream, application/xml;q=1;Q=0.5",
+        r#"application/json, text/event-stream, application/xml;q="0.5""#,
+    ] {
+        let mut headers = modern_headers("tools/list", None);
+        headers.insert("accept", accept.parse().unwrap());
+        let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+            .expect_err("invalid qvalue invalidates Accept");
+        assert_eq!(error.0.status, http::StatusCode::NOT_ACCEPTABLE, "{accept}");
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_accept_bounds_combined_field_bytes() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    let oversized = format!(
+        r#"application/json, text/event-stream, application/octet-stream; note="{}""#,
+        "x".repeat(8_192)
+    );
+    let mut headers = modern_headers("tools/list", None);
+    headers.insert("accept", oversized.parse().unwrap());
+    let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect_err("combined Accept bytes are bounded");
+    assert_eq!(error.0.status, http::StatusCode::NOT_ACCEPTABLE);
+}
+
+#[test]
+fn mcp_protocol_modern_accept_bounds_nonempty_members() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    let mut at_limit = vec!["application/json", "text/event-stream"];
+    at_limit.extend(std::iter::repeat_n("application/octet-stream", 62));
+    let mut headers = modern_headers("tools/list", None);
+    headers.insert("accept", at_limit.join(",").parse().unwrap());
+    sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect("64 non-empty Accept members are allowed");
+
+    let mut over_limit = at_limit;
+    over_limit.push("text/plain");
+    headers.insert("accept", over_limit.join(",").parse().unwrap());
+    let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect_err("65 non-empty Accept members are rejected");
+    assert_eq!(error.0.status, http::StatusCode::NOT_ACCEPTABLE);
+}
+
+#[test]
+fn mcp_protocol_modern_accept_bounds_ignored_empty_members() {
+    let body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    let mut headers = modern_headers("tools/list", None);
+    let at_limit = format!("{}application/json,text/event-stream", ",".repeat(16));
+    headers.insert("accept", at_limit.parse().unwrap());
+    sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect("16 empty Accept members are ignored");
+
+    let over_limit = format!("{}application/json,text/event-stream", ",".repeat(17));
+    headers.insert("accept", over_limit.parse().unwrap());
+    let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect_err("17 empty Accept members are rejected");
+    assert_eq!(error.0.status, http::StatusCode::NOT_ACCEPTABLE);
+
+    headers.insert("accept", ",,,".parse().unwrap());
+    let error = sbproxy_extension::mcp::decode_http_request(&body, &headers)
+        .expect_err("all-empty Accept is rejected");
+    assert_eq!(error.0.status, http::StatusCode::NOT_ACCEPTABLE);
+}
+
+#[test]
+fn mcp_protocol_modern_structural_errors_precede_media_validation() {
+    let cases = [
+        br#"{"jsonrpc":"2.0","id":1,"\u0069d":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#
+            .as_slice(),
+        br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}]"#
+            .as_slice(),
+    ];
+    let mut headers = modern_headers("tools/list", None);
+    headers.remove("content-type");
+
+    for body in cases {
+        let error = sbproxy_extension::mcp::decode_http_request(body, &headers)
+            .expect_err("structural failure");
+        assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST);
+        assert_eq!(wire_body_value(error.0.body)["error"]["code"], -32600);
+    }
+
+    let malformed = modern_request_with_raw_id("1e");
+    let error = sbproxy_extension::mcp::decode_http_request(&malformed, &headers)
+        .expect_err("syntax failure");
+    assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST);
+    assert_eq!(wire_body_value(error.0.body)["error"]["code"], -32700);
 }
 
 #[test]
@@ -1186,15 +1496,372 @@ fn mcp_protocol_modern_validates_mcp_name_against_each_body_selector() {
 }
 
 #[test]
-fn mcp_protocol_modern_accepts_explicit_null_request_ids() {
+fn mcp_protocol_modern_rejects_explicit_null_request_ids() {
     let mut body = modern_request("tools/list", json!({}));
     body["id"] = Value::Null;
-    let decoded = sbproxy_extension::mcp::decode_http_request(
+    let error = sbproxy_extension::mcp::decode_http_request(
         &serde_json::to_vec(&body).unwrap(),
         &modern_headers("tools/list", None),
     )
-    .expect("explicit null JSON-RPC id is valid");
-    assert!(decoded.request.id.is_none());
+    .expect_err("explicit null is not a modern notification id");
+    assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST);
+    let body = wire_body_value(error.0.body);
+    assert_eq!(body["error"]["code"], -32600);
+    assert!(body.get("id").is_none());
+}
+
+#[test]
+fn mcp_protocol_raw_scan_detects_protected_duplicates_at_every_routing_level() {
+    let cases = [
+        (
+            "request",
+            br#"{"jsonrpc":"2.0","id":1,"\u0069d":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#
+                .as_slice(),
+        ),
+        (
+            "params",
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"one","\u006eame":"two","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#
+                .as_slice(),
+        ),
+        (
+            "reserved metadata",
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","\u0069o.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#
+                .as_slice(),
+        ),
+    ];
+
+    for (scope, body) in cases {
+        let scan = RawModernScan::scan(body);
+        assert_eq!(
+            classify_http_era(Some(&scan), &HeaderMap::new()),
+            McpProtocolEra::Modern2026_07_28,
+            "{scope}"
+        );
+        let error =
+            sbproxy_extension::mcp::decode_http_request(body, &modern_headers("tools/list", None))
+                .expect_err("protected duplicates are rejected before metadata decoding");
+        assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST, "{scope}");
+        assert_eq!(wire_body_value(error.0.body)["error"]["code"], -32600);
+    }
+}
+
+#[test]
+fn mcp_protocol_raw_scan_decodes_escaped_keys_without_descending_into_arguments() {
+    let escaped_marker = RawModernScan::scan(
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"\u0069o.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+    );
+    assert_eq!(
+        classify_http_era(Some(&escaped_marker), &HeaderMap::new()),
+        McpProtocolEra::Modern2026_07_28
+    );
+
+    let nested_argument = RawModernScan::scan(
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","id":1,"\u0069d":2}}}"#,
+    );
+    assert_eq!(
+        classify_http_era(Some(&nested_argument), &HeaderMap::new()),
+        McpProtocolEra::Legacy2025_06_18
+    );
+}
+
+#[test]
+fn mcp_protocol_raw_scan_inspects_each_direct_batch_request_for_modern_markers() {
+    let scan = RawModernScan::scan(
+        br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}]"#,
+    );
+    assert_eq!(
+        classify_http_era(Some(&scan), &HeaderMap::new()),
+        McpProtocolEra::Modern2026_07_28
+    );
+}
+
+#[test]
+fn mcp_protocol_raw_scan_fails_closed_above_one_mib() {
+    let body = vec![b' '; 1_048_577];
+    let scan = RawModernScan::scan(&body);
+    assert_eq!(scan.limit_exceeded(), Some(RawModernScanLimit::BodyBytes));
+    assert_eq!(
+        classify_http_era(Some(&scan), &HeaderMap::new()),
+        McpProtocolEra::Modern2026_07_28
+    );
+}
+
+#[test]
+fn mcp_protocol_raw_scan_fails_closed_beyond_128_container_levels() {
+    let body = format!("{}null{}", "[".repeat(129), "]".repeat(129));
+    let scan = RawModernScan::scan(body.as_bytes());
+    assert_eq!(
+        scan.limit_exceeded(),
+        Some(RawModernScanLimit::ContainerDepth)
+    );
+    assert_eq!(
+        classify_http_era(Some(&scan), &HeaderMap::new()),
+        McpProtocolEra::Modern2026_07_28
+    );
+}
+
+#[test]
+fn mcp_protocol_raw_scan_fails_closed_after_65536_visited_items() {
+    let body = format!("[{}]", vec!["null"; 65_537].join(","));
+    let scan = RawModernScan::scan(body.as_bytes());
+    assert_eq!(
+        scan.limit_exceeded(),
+        Some(RawModernScanLimit::VisitedItems)
+    );
+    assert_eq!(
+        classify_http_era(Some(&scan), &HeaderMap::new()),
+        McpProtocolEra::Modern2026_07_28
+    );
+}
+
+#[test]
+fn mcp_protocol_era_classifier_selects_modern_for_every_partial_header_marker() {
+    let cases = [
+        ("mcp-method", b"tools/list".as_slice()),
+        ("mcp-name", b"weather".as_slice()),
+        ("mcp-param-region", b"west".as_slice()),
+        ("mcp-protocol-version", b"2026-07-28".as_slice()),
+        ("mcp-protocol-version", b"1900-01-01".as_slice()),
+        ("mcp-protocol-version", b"\xff".as_slice()),
+    ];
+
+    for (name, value) in cases {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            http::HeaderValue::from_bytes(value).unwrap(),
+        );
+        assert_eq!(
+            classify_http_era(None, &headers),
+            McpProtocolEra::Modern2026_07_28,
+            "{name}: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_protocol_era_classifier_keeps_only_marker_free_requests_legacy() {
+    let mut headers = HeaderMap::new();
+    headers.append("content-type", "application/json".parse().unwrap());
+    headers.append(
+        "accept",
+        "application/json, text/event-stream".parse().unwrap(),
+    );
+    headers.append("mcp-protocol-version", "2025-06-18".parse().unwrap());
+    let scan = RawModernScan::scan(
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"arguments":{"io.modelcontextprotocol/clientInfo":{}}}}"#,
+    );
+
+    assert_eq!(
+        classify_http_era(Some(&scan), &headers),
+        McpProtocolEra::Legacy2025_06_18
+    );
+}
+
+#[test]
+fn mcp_protocol_modern_request_id_accepts_absent_string_and_integer_boundaries() {
+    let cases = [
+        (
+            br#"{"jsonrpc":"2.0","method":"tools/list"}"#.as_slice(),
+            ModernRequestId::Absent,
+        ),
+        (
+            br#"{"jsonrpc":"2.0","id":"snowman-\u2603","method":"tools/list"}"#.as_slice(),
+            ModernRequestId::String("snowman-☃".to_string()),
+        ),
+        (
+            br#"{"jsonrpc":"2.0","id":-9223372036854775808,"method":"tools/list"}"#.as_slice(),
+            ModernRequestId::Integer(McpInteger::Signed(i64::MIN)),
+        ),
+        (
+            br#"{"jsonrpc":"2.0","id":18446744073709551615,"method":"tools/list"}"#.as_slice(),
+            ModernRequestId::Integer(McpInteger::Unsigned(u64::MAX)),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(RawModernScan::scan(body).request_id(), Ok(expected));
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_request_id_rejects_null_nonintegers_and_out_of_range() {
+    let cases = [
+        ("null", ModernRequestIdError::ExplicitNull),
+        ("true", ModernRequestIdError::InvalidType),
+        ("{}", ModernRequestIdError::InvalidType),
+        ("[]", ModernRequestIdError::InvalidType),
+        ("1.0", ModernRequestIdError::NonIntegerNumber),
+        ("1e0", ModernRequestIdError::NonIntegerNumber),
+        ("1e400", ModernRequestIdError::NonIntegerNumber),
+        (
+            "-9223372036854775809",
+            ModernRequestIdError::IntegerOutOfRange,
+        ),
+        (
+            "18446744073709551616",
+            ModernRequestIdError::IntegerOutOfRange,
+        ),
+    ];
+
+    for (raw_id, expected) in cases {
+        let body = modern_request_with_raw_id(raw_id);
+        assert_eq!(RawModernScan::scan(&body).request_id(), Err(expected));
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_decoder_uses_the_strict_raw_request_id() {
+    for raw_id in [
+        "null",
+        "false",
+        "{}",
+        "[]",
+        "1.0",
+        "1e0",
+        "1e400",
+        "-9223372036854775809",
+        "18446744073709551616",
+    ] {
+        let error = sbproxy_extension::mcp::decode_http_request(
+            &modern_request_with_raw_id(raw_id),
+            &modern_headers("tools/list", None),
+        )
+        .expect_err("unsupported modern request id");
+        assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST, "{raw_id}");
+        let body = wire_body_value(error.0.body);
+        assert_eq!(body["error"]["code"], -32600, "{raw_id}");
+        assert!(body.get("id").is_none(), "{raw_id}: {body}");
+    }
+}
+
+#[test]
+fn mcp_protocol_modern_distinguishes_malformed_json_from_unsupported_number_id() {
+    let malformed = modern_request_with_raw_id("1e");
+    let malformed_error = sbproxy_extension::mcp::decode_http_request(
+        &malformed,
+        &modern_headers("tools/list", None),
+    )
+    .expect_err("malformed JSON");
+    let malformed_body = wire_body_value(malformed_error.0.body);
+    assert_eq!(malformed_body["error"]["code"], -32700);
+    assert!(malformed_body.get("id").is_none());
+
+    let unsupported = modern_request_with_raw_id("1e400");
+    let unsupported_error = sbproxy_extension::mcp::decode_http_request(
+        &unsupported,
+        &modern_headers("tools/list", None),
+    )
+    .expect_err("unsupported numeric ID profile");
+    let unsupported_body = wire_body_value(unsupported_error.0.body);
+    assert_eq!(unsupported_body["error"]["code"], -32600);
+    assert!(unsupported_body.get("id").is_none());
+}
+
+#[test]
+fn mcp_protocol_modern_scan_reuse_is_bound_to_the_borrowed_body() {
+    let trusted_body = serde_json::to_vec(&modern_request("tools/list", json!({}))).unwrap();
+    let trusted_scan = RawModernScan::scan(&trusted_body);
+    let trusted = sbproxy_extension::mcp::decode_http_request_with_scan(
+        &trusted_scan,
+        &modern_headers("tools/list", None),
+    )
+    .expect("the scan decodes the exact body it borrows");
+    assert_eq!(trusted.request.id, Some(json!(7)));
+
+    let mut explicit_null_body = modern_request("tools/list", json!({}));
+    explicit_null_body["id"] = Value::Null;
+    let explicit_null_body = serde_json::to_vec(&explicit_null_body).unwrap();
+    let explicit_null_scan = RawModernScan::scan(&explicit_null_body);
+    sbproxy_extension::mcp::decode_http_request_with_scan(
+        &explicit_null_scan,
+        &modern_headers("tools/list", None),
+    )
+    .expect_err("a distinct body requires its own strict scan");
+}
+
+#[test]
+fn mcp_protocol_modern_typed_decoder_cannot_normalize_explicit_null_to_absent() {
+    let mut explicit_null = modern_request("tools/list", json!({}));
+    explicit_null["id"] = Value::Null;
+    let normalized: JsonRpcRequest = serde_json::from_value(explicit_null).unwrap();
+    assert!(
+        normalized.id.is_none(),
+        "fixture demonstrates the lossy typed envelope"
+    );
+
+    let error = Modern2026_07_28Codec
+        .decode_http(normalized, &modern_headers("tools/list", None))
+        .expect_err("modern decoding must require the duplicate-aware raw preflight");
+    assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST);
+    let body = wire_body_value(error.0.body);
+    assert_eq!(body["error"]["code"], -32600);
+    assert!(body.get("id").is_none());
+}
+
+#[test]
+fn mcp_protocol_modern_envelope_failure_precedes_invalid_request_id() {
+    let body = br#"{"jsonrpc":"1.0","id":null,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let error =
+        sbproxy_extension::mcp::decode_http_request(body, &modern_headers("tools/list", None))
+            .expect_err("crossed envelope and id failure");
+    let body = wire_body_value(error.0.body);
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "jsonrpc field must be \"2.0\"");
+    assert!(body.get("id").is_none());
+}
+
+#[test]
+fn mcp_protocol_modern_envelope_failure_echoes_an_independently_valid_id() {
+    let body = br#"{"jsonrpc":"1.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let error =
+        sbproxy_extension::mcp::decode_http_request(body, &modern_headers("tools/list", None))
+            .expect_err("invalid JSON-RPC envelope");
+    let body = wire_body_value(error.0.body);
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "jsonrpc field must be \"2.0\"");
+    assert_eq!(body["id"], 7);
+}
+
+#[test]
+fn mcp_protocol_modern_error_response_omits_absent_id_from_wire_bytes() {
+    let response = ModernJsonRpcResponse::error(ModernRequestId::Absent, -32601, "unknown method");
+    assert_eq!(
+        serde_json::to_string(&response).unwrap(),
+        r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"unknown method"}}"#
+    );
+}
+
+#[test]
+fn mcp_protocol_modern_response_preserves_string_and_integer_id_types() {
+    let cases = [
+        (
+            ModernRequestId::String("request-7".to_string()),
+            r#"{"jsonrpc":"2.0","result":{"ok":true},"id":"request-7"}"#,
+        ),
+        (
+            ModernRequestId::Integer(McpInteger::Signed(i64::MIN)),
+            r#"{"jsonrpc":"2.0","result":{"ok":true},"id":-9223372036854775808}"#,
+        ),
+        (
+            ModernRequestId::Integer(McpInteger::Unsigned(u64::MAX)),
+            r#"{"jsonrpc":"2.0","result":{"ok":true},"id":18446744073709551615}"#,
+        ),
+    ];
+
+    for (id, expected) in cases {
+        let response = ModernJsonRpcResponse::success(id, json!({"ok": true}));
+        assert_eq!(serde_json::to_string(&response).unwrap(), expected);
+    }
+}
+
+#[test]
+fn mcp_protocol_legacy_absent_response_id_remains_explicit_null() {
+    let response = sbproxy_extension::mcp::JsonRpcResponse::error(None, -32601, "unknown method");
+    assert_eq!(
+        serde_json::to_string(&response).unwrap(),
+        r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"unknown method"},"id":null}"#
+    );
 }
 
 fn selector_params(key: &str, value: Value) -> Value {
@@ -1210,7 +1877,7 @@ fn assert_modern_header_mismatch(
     let error = result.expect_err(context);
     assert_eq!(error.0.status, http::StatusCode::BAD_REQUEST, "{context}");
     assert_eq!(
-        error.0.body.unwrap().error.unwrap().code,
+        wire_body_value(error.0.body)["error"]["code"],
         -32020,
         "{context}"
     );

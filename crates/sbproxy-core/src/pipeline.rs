@@ -2224,7 +2224,7 @@ impl CompiledPipeline {
                 origin.origin_id.as_str(),
                 None,
             );
-            let action = match mode {
+            let mut action = match mode {
                 _ if configured_type(&origin.action_config)
                     .is_some_and(|name| extension_registry.action(name).is_some()) =>
                 {
@@ -2242,7 +2242,8 @@ impl CompiledPipeline {
                     &action_identity,
                 )?,
             };
-            if let Action::Mcp(mcp) = &action {
+            if let Action::Mcp(mcp) = &mut action {
+                mcp.bind_exact_route_authority(origin.hostname.as_str());
                 mcp_inject_registry.insert(
                     origin.tenant_id.as_str(),
                     &mcp.server_name,
@@ -2265,6 +2266,7 @@ impl CompiledPipeline {
                 )?)
             };
             proxy_wasm_filters.push(proxy_wasm_filter);
+            let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -2389,13 +2391,42 @@ impl CompiledPipeline {
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
-            let origin_fwd_rules = compile_forward_rules(
+            let mut origin_fwd_rules = compile_forward_rules(
                 &origin.forward_rules,
                 origin.workspace_id.as_str(),
                 origin.origin_id.as_str(),
                 mode,
                 extension_registry.as_ref(),
             )?;
+            for rule in &mut origin_fwd_rules {
+                if let Action::Mcp(mcp) = &mut rule.action {
+                    mcp.bind_exact_route_authority(origin.hostname.as_str());
+                }
+            }
+            // MCP picks its protocol era and trust anchor from the route
+            // before the body is buffered or auth has run. Any rule that
+            // could be selected ahead of an mcp action therefore has to be
+            // decidable from method, path, headers, and query alone;
+            // otherwise the gateway cannot tell pre-auth whether a request
+            // belongs to MCP at all.
+            let guarded_rules = if origin_action_is_mcp {
+                origin_fwd_rules.len()
+            } else {
+                origin_fwd_rules
+                    .iter()
+                    .position(|rule| matches!(&rule.action, Action::Mcp(_)))
+                    .unwrap_or(0)
+            };
+            for rule in origin_fwd_rules.iter().take(guarded_rules) {
+                if let Some(label) = rule.matchers.iter().find_map(indeterminate_matcher_label) {
+                    anyhow::bail!(
+                        "origin `{}`: forward rule matcher `{label}` cannot be decided before an \
+                         `mcp` action is selected, so it would shadow MCP route selection; drop \
+                         the `{label}` matcher or move the mcp action onto its own origin",
+                        origin.hostname
+                    );
+                }
+            }
             if !origin.filters.is_empty() {
                 if let Some((rule_index, _)) = origin_fwd_rules
                     .iter()
@@ -2413,6 +2444,20 @@ impl CompiledPipeline {
             // Compile fallback origin (optional per origin).
             let fallback =
                 compile_fallback(&origin.fallback_origin, mode, extension_registry.as_ref())?;
+            // The fallback dispatcher serves a prepared response after the
+            // primary action already failed. It has no MCP session, no
+            // negotiated era, and no trust anchor, so an `mcp` action placed
+            // here could never dispatch.
+            if fallback
+                .as_ref()
+                .is_some_and(|fallback| matches!(&fallback.action, Action::Mcp(_)))
+            {
+                anyhow::bail!(
+                    "origin `{}`: fallback_origin cannot serve an `mcp` action; the fallback \
+                     dispatcher has no negotiated MCP era or trust anchor to dispatch through",
+                    origin.hostname
+                );
+            }
             if !origin.filters.is_empty() && fallback.is_some() {
                 anyhow::bail!(
                     "origin `{}`: Proxy-Wasm filters do not support fallback_origin responses",
@@ -3147,6 +3192,22 @@ fn routing_action_identity(
         .unwrap_or_else(|| "main".to_string());
     serde_json::to_string(&(workspace_id, origin_id, scope))
         .expect("routing action identity fields are serializable")
+}
+
+/// Name the first matcher in `entry` that cannot be decided from the route
+/// alone, if there is one.
+///
+/// A `body` matcher needs buffered bytes and a `when` predicate needs the CEL
+/// context, so neither is available at the point MCP has to pick its protocol
+/// era and trust anchor.
+fn indeterminate_matcher_label(entry: &MatcherEntry) -> Option<&'static str> {
+    if entry.body.is_some() {
+        return Some("body");
+    }
+    if entry.when.is_some() {
+        return Some("when");
+    }
+    None
 }
 
 fn compile_forward_rules(
@@ -3942,6 +4003,315 @@ mod mcp_inject_registry_tests {
 
         assert_eq!(resolved_tool_names(&old_source), ["alpha.old"]);
         assert_eq!(resolved_tool_names(&new_source), ["alpha.new"]);
+    }
+}
+
+#[cfg(test)]
+mod mcp_modern_http_authority_tests {
+    use super::CompiledPipeline;
+    use http::{HeaderMap, HeaderValue};
+    use sbproxy_modules::action::mcp::{McpAction, McpModernHttpRejection};
+    use sbproxy_modules::Action;
+
+    fn compile_mcp_pipeline(
+        origin_key: &str,
+        modern_http: Option<&str>,
+    ) -> anyhow::Result<CompiledPipeline> {
+        let modern_http = modern_http.unwrap_or_default();
+        let yaml = format!(
+            r#"
+origins:
+  "{origin_key}":
+    action:
+      type: mcp
+      mode: gateway
+{modern_http}      federated_servers:
+        - origin: https://test.sbproxy.dev
+          prefix: upstream
+"#
+        );
+        let config = sbproxy_config::compile_config(&yaml)?;
+        CompiledPipeline::from_config_for_validation(config)
+    }
+
+    fn mcp_action(pipeline: &CompiledPipeline) -> &McpAction {
+        let Some(Action::Mcp(action)) = pipeline.actions.first() else {
+            panic!("fixture origin must compile an MCP action");
+        };
+        action
+    }
+
+    fn browser_headers(authority: &str, origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_str(authority).expect("fixture authority is a valid header value"),
+        );
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_str(origin).expect("fixture origin is a valid header value"),
+        );
+        headers
+    }
+
+    fn origin_header(origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_str(origin).expect("fixture origin is a valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn task_5c_exact_mcp_origin_derives_scheme_aware_default_authority() {
+        let pipeline = compile_mcp_pipeline("mcp.localhost", None)
+            .expect("exact MCP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        for (scheme, authority, origin) in [
+            ("http", "mcp.localhost", "http://mcp.localhost:80"),
+            ("http", "mcp.localhost:80", "http://mcp.localhost"),
+        ] {
+            assert_eq!(
+                action.validate_modern_http_request(
+                    scheme,
+                    None,
+                    &browser_headers(authority, origin),
+                ),
+                Ok(()),
+                "{scheme} request should canonicalize its default effective port"
+            );
+        }
+        for (authority, origin) in [
+            ("mcp.localhost", "https://mcp.localhost:443"),
+            ("mcp.localhost:443", "https://mcp.localhost"),
+        ] {
+            assert_eq!(
+                action.validate_modern_http_request(
+                    "https",
+                    Some(authority),
+                    &origin_header(origin),
+                ),
+                Ok(()),
+                "HTTP/2 authority should canonicalize its default effective port"
+            );
+        }
+    }
+
+    #[test]
+    fn task_5c_exact_mcp_origin_rejects_an_untrusted_authority() {
+        let pipeline = compile_mcp_pipeline("mcp.localhost", None)
+            .expect("exact MCP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                Some("evil.example"),
+                &browser_headers("mcp.localhost", "https://mcp.localhost"),
+            ),
+            Err(McpModernHttpRejection::Authority)
+        );
+    }
+
+    #[test]
+    fn task_5c_wildcard_mcp_origin_does_not_derive_a_trust_anchor() {
+        let pipeline = compile_mcp_pipeline("*.localhost", None)
+            .expect("wildcard MCP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "http",
+                None,
+                &browser_headers("tenant.localhost", "http://tenant.localhost"),
+            ),
+            Err(McpModernHttpRejection::MissingTrustAnchor)
+        );
+    }
+
+    #[test]
+    fn task_5c_explicit_modern_public_origin_remains_authoritative() {
+        let pipeline = compile_mcp_pipeline(
+            "mcp.localhost",
+            Some(
+                r#"      modern_http:
+        public_origin: https://mcp.localhost:8443
+"#,
+            ),
+        )
+        .expect("explicit modern HTTP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                None,
+                &browser_headers("mcp.localhost:8443", "https://mcp.localhost:8443"),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                None,
+                &browser_headers("mcp.localhost", "https://mcp.localhost:8443"),
+            ),
+            Err(McpModernHttpRejection::Authority)
+        );
+    }
+
+    #[test]
+    fn task_5c_inner_wildcard_mcp_origin_is_rejected_before_pipeline_compilation() {
+        assert!(compile_mcp_pipeline("mcp.*.localhost", None).is_err());
+    }
+
+    #[test]
+    fn task_5c_forward_rule_mcp_action_inherits_the_exact_route_authority() {
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: static
+      status_code: 404
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+        origin:
+          id: forwarded-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("forward MCP config compiles");
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("forward MCP pipeline compiles");
+        let Some(Action::Mcp(action)) = pipeline.forward_rules[0].first().map(|rule| &rule.action)
+        else {
+            panic!("forward rule must compile an MCP action");
+        };
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                Some("mcp.localhost"),
+                &origin_header("https://mcp.localhost"),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn task_5c_mcp_routes_reject_body_or_cel_dependent_forward_selection() {
+        let cases = [
+            (r#"body: {pointer: /route, value: mcp}"#, "body"),
+            (r#"when: 'request.path == "/mcp"'"#, "when"),
+        ];
+
+        for (matcher, label) in cases {
+            let yaml = format!(
+                r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: mcp
+      mode: gateway
+      federated_servers:
+        - origin: https://test.sbproxy.dev
+          prefix: upstream
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+            {matcher}
+        origin:
+          id: conditional-route
+          action:
+            type: static
+            status_code: 404
+"#
+            );
+            let config = sbproxy_config::compile_config(&yaml)
+                .unwrap_or_else(|error| panic!("{label} fixture config compiles: {error}"));
+            let error = CompiledPipeline::from_config_for_validation(config)
+                .err()
+                .unwrap_or_else(|| panic!("{label} matcher must be rejected on an MCP origin"));
+            let message = error.to_string();
+            assert!(message.contains("mcp.localhost"), "{label}: {message}");
+            assert!(message.contains(label), "{label}: {message}");
+        }
+    }
+
+    #[test]
+    fn task_5c_forward_mcp_route_rejects_an_earlier_indeterminate_rule() {
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: static
+      status_code: 404
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+            when: 'request.path.startsWith("/shadow")'
+        origin:
+          id: conditional-shadow
+          action:
+            type: static
+            status_code: 403
+      - rules:
+          - path:
+              prefix: /mcp
+        origin:
+          id: forwarded-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("forward MCP config compiles");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("an earlier indeterminate route must not shadow MCP pre-auth selection");
+        let message = error.to_string();
+        assert!(message.contains("mcp.localhost"), "{message}");
+        assert!(message.contains("when"), "{message}");
+    }
+
+    #[test]
+    fn task_5c_mcp_is_rejected_as_an_undispatchable_fallback_action() {
+        let yaml = r#"
+origins:
+  "api.localhost":
+    action:
+      type: proxy
+      url: https://api.example.com
+    fallback_origin:
+      on_error: true
+      origin:
+        id: invalid-mcp-fallback
+        action:
+          type: mcp
+          mode: gateway
+          federated_servers:
+            - origin: https://test.sbproxy.dev
+              prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("fallback MCP config parses");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("MCP cannot run through the static-only fallback dispatcher");
+        let message = error.to_string();
+        assert!(message.contains("fallback"), "{message}");
+        assert!(message.contains("mcp"), "{message}");
     }
 }
 

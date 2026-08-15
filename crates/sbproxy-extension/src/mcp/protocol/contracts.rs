@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_NUMERIC_HEADER_BYTES: usize = 128;
 
 /// The root JSON value has depth one; nested values add one and object keys do not count.
 const ROOT_VALUE_DEPTH: usize = 1;
@@ -27,6 +28,12 @@ pub enum McpContractError {
     /// A required array field was absent or not an array.
     #[error("missing required array field {0}")]
     MissingArrayField(&'static str),
+    /// A modern tool result carried a non-object `_meta` value.
+    #[error("tool result _meta must be an object")]
+    InvalidToolResultMeta,
+    /// The gateway does not implement the requested modern result flow.
+    #[error("unsupported tool resultType")]
+    UnsupportedToolResultType,
     /// The schema dialect was not in the supported allowlist.
     #[error("unsupported JSON Schema dialect {0}")]
     UnsupportedSchemaDialect(String),
@@ -195,6 +202,12 @@ impl TryFrom<serde_json::Value> for McpToolResultDocument {
 }
 
 impl McpToolResultDocument {
+    /// Return the optional structured result validated against an advertised
+    /// modern `outputSchema` before the gateway releases the response.
+    pub fn structured_content(&self) -> Option<&serde_json::Value> {
+        self.document.get("structuredContent")
+    }
+
     /// Return the complete result document.
     pub fn as_value(&self) -> serde_json::Value {
         serde_json::Value::Object(self.document.clone())
@@ -222,6 +235,66 @@ impl<'de> Deserialize<'de> for McpToolResultDocument {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated and normalized modern MCP tool-result document.
+///
+/// Construction checks every result-envelope invariant that the modern wire
+/// encoder enforces, and inserts the default `resultType` and `_meta` fields.
+/// Callers can therefore present this value to output judges, ledgers, and
+/// other post-processing without exposing a result the final encoder would
+/// later reject.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpModernToolResultDocument {
+    document: serde_json::Value,
+}
+
+impl TryFrom<serde_json::Value> for McpModernToolResultDocument {
+    type Error = McpContractError;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        let mut document = McpToolResultDocument::try_from(value)?.document;
+        match document.entry("resultType") {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::String("complete".into()));
+            }
+            serde_json::map::Entry::Occupied(entry)
+                if entry.get() == &serde_json::Value::String("complete".into()) => {}
+            serde_json::map::Entry::Occupied(_) => {
+                return Err(McpContractError::UnsupportedToolResultType);
+            }
+        }
+        match document.entry("_meta") {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::Object(serde_json::Map::new()));
+            }
+            serde_json::map::Entry::Occupied(entry) if entry.get().is_object() => {}
+            serde_json::map::Entry::Occupied(_) => {
+                return Err(McpContractError::InvalidToolResultMeta);
+            }
+        }
+        Ok(Self {
+            document: serde_json::Value::Object(document),
+        })
+    }
+}
+
+impl McpModernToolResultDocument {
+    /// Return the optional structured result validated against an advertised
+    /// modern `outputSchema` before the gateway releases the response.
+    pub fn structured_content(&self) -> Option<&serde_json::Value> {
+        self.document.get("structuredContent")
+    }
+
+    /// Borrow the normalized complete document without cloning it.
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.document
+    }
+
+    /// Consume the wrapper and return the normalized complete document.
+    pub fn into_value(self) -> serde_json::Value {
+        self.document
     }
 }
 
@@ -621,17 +694,15 @@ fn analyze_schema_inner(
                 }
 
                 for (keyword, child) in object {
-                    if keyword == "properties" {
-                        if child.is_object() {
-                            stack.push((
-                                child,
-                                depth + 1,
-                                reachable,
-                                path.clone(),
-                                SchemaTraversalPosition::PropertiesContainer,
-                            ));
-                            continue;
-                        }
+                    if keyword == "properties" && child.is_object() {
+                        stack.push((
+                            child,
+                            depth + 1,
+                            reachable,
+                            path.clone(),
+                            SchemaTraversalPosition::PropertiesContainer,
+                        ));
+                        continue;
                     }
                     stack.push((
                         child,
@@ -758,15 +829,144 @@ fn integer_at_header_boundary(
 }
 
 fn parse_safe_integer(value: &str) -> Option<i128> {
-    if let Ok(value) = value.parse::<i64>() {
-        if value.unsigned_abs() <= MAX_SAFE_INTEGER {
-            return Some(i128::from(value));
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_NUMERIC_HEADER_BYTES {
+        return None;
+    }
+
+    let mut position = 0_usize;
+    let negative = bytes[position] == b'-';
+    if negative {
+        position += 1;
+        if position == bytes.len() {
+            return None;
         }
     }
-    if let Ok(value) = value.parse::<u64>() {
-        if value <= MAX_SAFE_INTEGER {
-            return Some(i128::from(value));
+
+    // The complete coefficient fits in this stack buffer because the input is
+    // bounded above. Keeping decimal digits avoids both floating-point rounding
+    // and an attacker-controlled big-integer allocation.
+    let mut coefficient = [0_u8; MAX_NUMERIC_HEADER_BYTES];
+    let mut coefficient_len = 0_usize;
+    match bytes.get(position).copied()? {
+        b'0' => {
+            coefficient[coefficient_len] = 0;
+            coefficient_len += 1;
+            position += 1;
+            if bytes
+                .get(position)
+                .is_some_and(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+        }
+        b'1'..=b'9' => {
+            while let Some(byte @ b'0'..=b'9') = bytes.get(position).copied() {
+                coefficient[coefficient_len] = byte - b'0';
+                coefficient_len += 1;
+                position += 1;
+            }
+        }
+        _ => return None,
+    }
+
+    let mut fraction_digits = 0_usize;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let fraction_start = position;
+        while let Some(byte @ b'0'..=b'9') = bytes.get(position).copied() {
+            coefficient[coefficient_len] = byte - b'0';
+            coefficient_len += 1;
+            fraction_digits += 1;
+            position += 1;
+        }
+        if position == fraction_start {
+            return None;
         }
     }
-    None
+
+    let mut exponent = 0_i32;
+    if bytes
+        .get(position)
+        .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+    {
+        position += 1;
+        let exponent_negative = match bytes.get(position) {
+            Some(b'+') => {
+                position += 1;
+                false
+            }
+            Some(b'-') => {
+                position += 1;
+                true
+            }
+            _ => false,
+        };
+        let exponent_start = position;
+        let mut magnitude = 0_i32;
+        while let Some(byte @ b'0'..=b'9') = bytes.get(position).copied() {
+            magnitude = magnitude
+                .checked_mul(10)?
+                .checked_add(i32::from(byte - b'0'))?;
+            if magnitude > MAX_NUMERIC_HEADER_BYTES as i32 {
+                return None;
+            }
+            position += 1;
+        }
+        if position == exponent_start {
+            return None;
+        }
+        exponent = if exponent_negative {
+            -magnitude
+        } else {
+            magnitude
+        };
+    }
+
+    if position != bytes.len() {
+        return None;
+    }
+
+    // A signed zero has one canonical numeric meaning. The exponent was still
+    // parsed and bounded above, so even zero cannot hide pathological work.
+    let Some(first_nonzero) = coefficient[..coefficient_len]
+        .iter()
+        .position(|digit| *digit != 0)
+    else {
+        return Some(0);
+    };
+
+    let decimal_shift = exponent.checked_sub(i32::try_from(fraction_digits).ok()?)?;
+    let (coefficient_end, appended_zeros) = if decimal_shift < 0 {
+        let removed_digits = usize::try_from(decimal_shift.unsigned_abs()).ok()?;
+        if removed_digits > coefficient_len
+            || coefficient[coefficient_len - removed_digits..]
+                .iter()
+                .any(|digit| *digit != 0)
+        {
+            return None;
+        }
+        (coefficient_len - removed_digits, 0_usize)
+    } else {
+        (coefficient_len, usize::try_from(decimal_shift).ok()?)
+    };
+
+    let significant_digits = coefficient_end.checked_sub(first_nonzero)?;
+    if significant_digits.checked_add(appended_zeros)? > 16 {
+        return None;
+    }
+
+    let mut magnitude = 0_u64;
+    for digit in &coefficient[first_nonzero..coefficient_end] {
+        magnitude = magnitude.checked_mul(10)?.checked_add(u64::from(*digit))?;
+    }
+    for _ in 0..appended_zeros {
+        magnitude = magnitude.checked_mul(10)?;
+    }
+    if magnitude > MAX_SAFE_INTEGER {
+        return None;
+    }
+
+    let magnitude = i128::from(magnitude);
+    Some(if negative { -magnitude } else { magnitude })
 }

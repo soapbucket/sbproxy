@@ -128,6 +128,14 @@ pub struct McpActionConfig {
     /// advertises no OAuth auth-discovery surface.
     #[serde(default)]
     pub oauth: Option<McpOAuthConfig>,
+    /// Trusted public origin and browser Origin allowlist for the strict
+    /// 2026-07-28 Streamable HTTP endpoint. Marker-free legacy traffic does
+    /// not consult this block. An exact route derives its trusted host here
+    /// and binds the connection scheme and effective port per request.
+    /// Wildcard routes and actions compiled outside a route require an
+    /// explicit block; otherwise modern traffic fails closed with HTTP 421.
+    #[serde(default)]
+    pub modern_http: Option<McpModernHttpConfig>,
     /// How often the background task re-fetches upstream tool and
     /// resource catalogues. Accepts Go duration syntax (`60s`, `5m`).
     /// Defaults to 60 seconds. Inbound requests always serve the
@@ -190,6 +198,26 @@ pub struct McpActionConfig {
     /// ledger only.
     #[serde(default)]
     pub usage_sinks: Vec<sbproxy_ai::usage_sink::UsageSinkConfig>,
+}
+
+/// HTTP trust configuration for MCP 2026-07-28 requests.
+///
+/// Unknown fields are refused rather than ignored: every key here turns a
+/// protection on, so a typo that silently left one off would read as
+/// configured hardening that is not actually in effect.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpModernHttpConfig {
+    /// Exact externally visible HTTP(S) origin of this MCP action.
+    pub public_origin: String,
+    /// Additional browser origins allowed to call the endpoint. The public
+    /// origin is always included automatically.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Reject unknown `Mcp-Param-*` fields instead of transparently ignoring
+    /// them. This is an SBProxy hardening mode, not base MCP behavior.
+    #[serde(default)]
+    pub strict_parameter_headers: bool,
 }
 
 /// Tool-versioning gate config (WOR-1635).
@@ -541,6 +569,185 @@ fn default_mode() -> String {
 
 // --- Compiled action ---
 
+/// Failure class for the pre-authentication MCP 2026-07-28 HTTP security
+/// check. The gateway maps Origin failures to 403 and authority failures to
+/// 421 without constructing a JSON-RPC body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpModernHttpRejection {
+    /// No compiled trusted public origin exists for the action.
+    MissingTrustAnchor,
+    /// Host, `:authority`, connection scheme, or trusted authority disagrees.
+    Authority,
+    /// The browser Origin is malformed, duplicated, or not allowlisted.
+    Origin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CanonicalHttpOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl CanonicalHttpOrigin {
+    fn parse_config(value: &str, field: &str) -> anyhow::Result<Self> {
+        let parsed = url::Url::parse(value)
+            .map_err(|_| anyhow::anyhow!("mcp action: {field} must be an HTTP(S) origin"))?;
+        Self::from_url(&parsed)
+            .ok_or_else(|| anyhow::anyhow!("mcp action: {field} must be an HTTP(S) origin"))
+    }
+
+    fn from_authority(scheme: &str, authority: &str) -> Option<Self> {
+        if !matches!(scheme, "http" | "https") || authority.is_empty() {
+            return None;
+        }
+        let parsed = url::Url::parse(&format!("{scheme}://{authority}")).ok()?;
+        Self::from_url(&parsed)
+    }
+
+    fn from_url(parsed: &url::Url) -> Option<Self> {
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            scheme: parsed.scheme().to_ascii_lowercase(),
+            host: parsed.host_str()?.to_ascii_lowercase(),
+            port: parsed.port_or_known_default()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ModernHttpTrustAnchor {
+    Explicit(CanonicalHttpOrigin),
+    ExactRouteHost(String),
+}
+
+#[derive(Debug, Clone)]
+struct CompiledModernHttpSecurity {
+    trust_anchor: ModernHttpTrustAnchor,
+    allowed_origins: HashSet<CanonicalHttpOrigin>,
+    strict_parameter_headers: bool,
+}
+
+impl CompiledModernHttpSecurity {
+    fn compile(config: &McpModernHttpConfig) -> anyhow::Result<Self> {
+        let public_origin =
+            CanonicalHttpOrigin::parse_config(&config.public_origin, "modern_http.public_origin")?;
+        let mut allowed_origins = HashSet::with_capacity(config.allowed_origins.len() + 1);
+        allowed_origins.insert(public_origin.clone());
+        for origin in &config.allowed_origins {
+            allowed_origins.insert(CanonicalHttpOrigin::parse_config(
+                origin,
+                "modern_http.allowed_origins[]",
+            )?);
+        }
+        Ok(Self {
+            trust_anchor: ModernHttpTrustAnchor::Explicit(public_origin),
+            allowed_origins,
+            strict_parameter_headers: config.strict_parameter_headers,
+        })
+    }
+
+    fn derive_exact_route_host(route_host: &str) -> Option<Self> {
+        if route_host.contains('*') {
+            return None;
+        }
+        let parsed = url::Url::parse(&format!("http://{route_host}")).ok()?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            trust_anchor: ModernHttpTrustAnchor::ExactRouteHost(
+                parsed.host_str()?.to_ascii_lowercase(),
+            ),
+            allowed_origins: HashSet::new(),
+            strict_parameter_headers: false,
+        })
+    }
+
+    fn validate_request(
+        &self,
+        connection_scheme: &str,
+        uri_authority: Option<&str>,
+        headers: &http::HeaderMap,
+    ) -> Result<(), McpModernHttpRejection> {
+        let host_values: Vec<_> = headers.get_all("host").iter().collect();
+        if host_values.len() > 1 {
+            return Err(McpModernHttpRejection::Authority);
+        }
+        let host = host_values
+            .first()
+            .map(|value| value.to_str())
+            .transpose()
+            .map_err(|_| McpModernHttpRejection::Authority)?;
+        let host_origin = match host {
+            Some(value) => Some(
+                CanonicalHttpOrigin::from_authority(connection_scheme, value)
+                    .ok_or(McpModernHttpRejection::Authority)?,
+            ),
+            None => None,
+        };
+        let uri_origin = match uri_authority {
+            Some(value) => Some(
+                CanonicalHttpOrigin::from_authority(connection_scheme, value)
+                    .ok_or(McpModernHttpRejection::Authority)?,
+            ),
+            None => None,
+        };
+        if let (Some(host_origin), Some(uri_origin)) = (&host_origin, &uri_origin) {
+            if host_origin != uri_origin {
+                return Err(McpModernHttpRejection::Authority);
+            }
+        }
+        let request_origin = uri_origin
+            .or(host_origin)
+            .ok_or(McpModernHttpRejection::Authority)?;
+        let trusted_origin = match &self.trust_anchor {
+            ModernHttpTrustAnchor::Explicit(origin) => origin.clone(),
+            ModernHttpTrustAnchor::ExactRouteHost(host) => CanonicalHttpOrigin {
+                scheme: connection_scheme.to_string(),
+                host: host.clone(),
+                port: match connection_scheme {
+                    "http" => 80,
+                    "https" => 443,
+                    _ => return Err(McpModernHttpRejection::Authority),
+                },
+            },
+        };
+        if request_origin != trusted_origin {
+            return Err(McpModernHttpRejection::Authority);
+        }
+
+        let origin_values: Vec<_> = headers.get_all("origin").iter().collect();
+        if origin_values.len() > 1 {
+            return Err(McpModernHttpRejection::Origin);
+        }
+        if let Some(value) = origin_values.first() {
+            let value = value.to_str().map_err(|_| McpModernHttpRejection::Origin)?;
+            let origin = CanonicalHttpOrigin::parse_config(value, "Origin")
+                .map_err(|_| McpModernHttpRejection::Origin)?;
+            let is_same_origin = origin == trusted_origin;
+            if !is_same_origin && !self.allowed_origins.contains(&origin) {
+                return Err(McpModernHttpRejection::Origin);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Compiled MCP gateway action.
 ///
 /// Construction does no network IO; the upstream tool catalogue is
@@ -579,6 +786,7 @@ pub struct McpAction {
     /// OAuth Protected Resource Metadata (RFC 9728) for auth discovery,
     /// or `None` when the gateway advertises no OAuth surface (WOR-806).
     pub oauth: Option<McpOAuthConfig>,
+    modern_http: Option<CompiledModernHttpSecurity>,
     /// Process-wide sliding-window quota store for per-tool quotas
     /// declared on `rbac_policies[].tool_quotas[]` (WOR-1065). One
     /// store per action so the counters live for the lifetime of
@@ -722,6 +930,11 @@ impl McpAction {
         if cfg.federated_servers.is_empty() {
             anyhow::bail!("mcp action: federated_servers must not be empty");
         }
+        let modern_http = cfg
+            .modern_http
+            .as_ref()
+            .map(CompiledModernHttpSecurity::compile)
+            .transpose()?;
 
         // WOR-186: every per-server `rbac` label must reference a key
         // declared in the top-level `rbac_policies` map. A missing
@@ -1045,6 +1258,7 @@ impl McpAction {
             lethal_trifecta,
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
+            modern_http,
             quota_store: Arc::new(ToolQuotaStore::new()),
             refresh_interval: cfg.refresh_interval.unwrap_or(Duration::from_secs(60)),
             has_principal_scoped_tools,
@@ -1106,6 +1320,44 @@ impl McpAction {
         &self,
     ) -> Option<&dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge> {
         self.tool_output_judge.as_deref()
+    }
+
+    /// Bind an exact configured route hostname as the modern HTTP trust
+    /// anchor when the action did not declare an explicit `modern_http`
+    /// origin. Wildcard and otherwise non-canonical route keys remain
+    /// unbound and therefore fail closed for modern traffic.
+    ///
+    /// The binding is idempotent: an explicit origin or an earlier exact
+    /// route binding is never overwritten. The request's authenticated
+    /// connection scheme supplies the HTTP(S) scheme and effective default
+    /// port at validation time.
+    pub fn bind_exact_route_authority(&mut self, route_host: &str) {
+        if self.modern_http.is_none() {
+            self.modern_http = CompiledModernHttpSecurity::derive_exact_route_host(route_host);
+        }
+    }
+
+    /// Validate the trusted authority and optional browser Origin for a
+    /// 2026-07-28 HTTP request. Call this before authentication, catalogue
+    /// priming, policy evaluation, or upstream access.
+    pub fn validate_modern_http_request(
+        &self,
+        connection_scheme: &str,
+        uri_authority: Option<&str>,
+        headers: &http::HeaderMap,
+    ) -> Result<(), McpModernHttpRejection> {
+        self.modern_http
+            .as_ref()
+            .ok_or(McpModernHttpRejection::MissingTrustAnchor)?
+            .validate_request(connection_scheme, uri_authority, headers)
+    }
+
+    /// Whether the configured authoritative endpoint rejects unknown
+    /// `Mcp-Param-*` headers rather than transparently ignoring them.
+    pub fn strict_modern_parameter_headers(&self) -> bool {
+        self.modern_http
+            .as_ref()
+            .is_some_and(|security| security.strict_parameter_headers)
     }
 
     /// Returns true when the named tool is allowed by the configured
@@ -1547,6 +1799,156 @@ mod tests {
             ],
             "tool_versioning": {"rollout": rollout}
         })
+    }
+
+    fn modern_http_action(modern_http: serde_json::Value) -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "modern_http": modern_http,
+            "federated_servers": [{ "origin": "upstream.example.com" }]
+        }))
+        .expect("modern HTTP fixture must compile")
+    }
+
+    #[test]
+    fn task_5c_modern_http_compiles_exact_public_and_allowed_origins() {
+        let action = modern_http_action(json!({
+            "public_origin": "https://mcp.example.com",
+            "allowed_origins": [
+                "https://console.example.com:443",
+                "http://localhost:3000"
+            ],
+            "strict_parameter_headers": true
+        }));
+
+        let mut same_origin = http::HeaderMap::new();
+        same_origin.append("host", "mcp.example.com:443".parse().unwrap());
+        same_origin.append("origin", "https://mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", Some("mcp.example.com"), &same_origin,),
+            Ok(())
+        );
+
+        let mut allowlisted = http::HeaderMap::new();
+        allowlisted.append("host", "mcp.example.com".parse().unwrap());
+        allowlisted.append("origin", "https://console.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &allowlisted),
+            Ok(())
+        );
+
+        let mut non_browser = http::HeaderMap::new();
+        non_browser.append("host", "mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &non_browser),
+            Ok(())
+        );
+        assert!(action.strict_modern_parameter_headers());
+    }
+
+    #[test]
+    fn task_5c_modern_http_rejects_untrusted_authority_and_origin_separately() {
+        let action = modern_http_action(json!({
+            "public_origin": "https://mcp.example.com:443",
+            "allowed_origins": ["https://console.example.com"]
+        }));
+
+        let mut evil = http::HeaderMap::new();
+        evil.append("host", "evil.example".parse().unwrap());
+        evil.append("origin", "https://evil.example".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &evil),
+            Err(McpModernHttpRejection::Authority)
+        );
+
+        let mut denied_origin = http::HeaderMap::new();
+        denied_origin.append("host", "mcp.example.com".parse().unwrap());
+        denied_origin.append("origin", "https://evil.example".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &denied_origin),
+            Err(McpModernHttpRejection::Origin)
+        );
+
+        let mut conflicting = http::HeaderMap::new();
+        conflicting.append("host", "mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", Some("other.example.com"), &conflicting,),
+            Err(McpModernHttpRejection::Authority)
+        );
+
+        let mut duplicate_host = http::HeaderMap::new();
+        duplicate_host.append("host", "mcp.example.com".parse().unwrap());
+        duplicate_host.append("host", "mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &duplicate_host),
+            Err(McpModernHttpRejection::Authority)
+        );
+
+        let mut duplicate_origin = http::HeaderMap::new();
+        duplicate_origin.append("host", "mcp.example.com".parse().unwrap());
+        duplicate_origin.append("origin", "https://mcp.example.com".parse().unwrap());
+        duplicate_origin.append("origin", "https://mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &duplicate_origin),
+            Err(McpModernHttpRejection::Origin)
+        );
+    }
+
+    #[test]
+    fn task_5c_modern_http_fails_closed_without_a_trust_anchor() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{ "origin": "upstream.example.com" }]
+        }))
+        .expect("legacy-only MCP config remains valid");
+        let mut headers = http::HeaderMap::new();
+        headers.append("host", "mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &headers),
+            Err(McpModernHttpRejection::MissingTrustAnchor)
+        );
+    }
+
+    #[test]
+    fn task_5c_modern_http_rejects_non_origin_configuration() {
+        for public_origin in [
+            "ftp://mcp.example.com",
+            "https://user@mcp.example.com",
+            "https://mcp.example.com/path",
+            "https://mcp.example.com/?query=1",
+            "https://mcp.example.com/#fragment",
+        ] {
+            let error = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "modern_http": { "public_origin": public_origin },
+                "federated_servers": [{ "origin": "upstream.example.com" }]
+            }))
+            .expect_err("non-origin public value must fail config compile");
+            assert!(
+                error.to_string().contains("modern_http.public_origin"),
+                "configuration error must identify the field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_5c_modern_http_rejects_unknown_hardening_fields() {
+        let error = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "modern_http": {
+                "public_origin": "https://mcp.example.com",
+                "strict_parameter_header": true
+            },
+            "federated_servers": [{ "origin": "upstream.example.com" }]
+        }))
+        .expect_err("a misspelled hardening field must fail config compilation");
+
+        let message = error.to_string();
+        assert!(message.contains("strict_parameter_header"), "{message}");
     }
 
     #[test]

@@ -68,10 +68,11 @@ pub use federation::{
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use protocol::{
-    classify_http_era, decode_header_value, decode_http_request, encode_header_value,
-    DecodedMcpRequest, HeaderValueError, Legacy2025_06_18Codec, McpImplementation,
-    McpProtocolCodec, McpProtocolContext, McpProtocolEra, McpRoutingHeaders, McpServerDescription,
-    McpWireError, McpWireResponse, Modern2026_07_28Codec,
+    classify_http_era, decode_header_value, decode_http_request, decode_http_request_with_scan,
+    encode_header_value, DecodedMcpRequest, DecodedRequestId, HeaderValueError,
+    Legacy2025_06_18Codec, McpImplementation, McpProtocolCodec, McpProtocolContext, McpProtocolEra,
+    McpRoutingHeaders, McpServerDescription, McpWireBody, McpWireError, McpWireResponse,
+    Modern2026_07_28Codec, RawModernScan, RawModernScanLimit,
 };
 pub use stdio::{encode_stdio_url, StdioCommand};
 pub use types::*;

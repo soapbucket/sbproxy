@@ -429,6 +429,8 @@ fn modern_incompatibility_class(error: &McpContractError) -> &'static str {
         McpContractError::MissingStringField(_) => "missing_string_field",
         McpContractError::MissingObjectField(_) => "missing_object_field",
         McpContractError::MissingArrayField(_) => "missing_array_field",
+        McpContractError::InvalidToolResultMeta => "invalid_tool_result_meta",
+        McpContractError::UnsupportedToolResultType => "unsupported_tool_result_type",
         McpContractError::UnsupportedSchemaDialect(_) => "unsupported_schema_dialect",
         McpContractError::InvalidSchema(_) => "invalid_schema",
         McpContractError::ExternalReference { .. } => "external_reference",
@@ -457,6 +459,8 @@ fn bounded_modern_incompatibility_class(class: &str) -> &'static str {
         "missing_string_field" => "missing_string_field",
         "missing_object_field" => "missing_object_field",
         "missing_array_field" => "missing_array_field",
+        "invalid_tool_result_meta" => "invalid_tool_result_meta",
+        "unsupported_tool_result_type" => "unsupported_tool_result_type",
         "unsupported_schema_dialect" => "unsupported_schema_dialect",
         "invalid_schema" => "invalid_schema",
         "external_reference" => "external_reference",
@@ -2811,9 +2815,7 @@ impl McpFederation {
         &self,
         registry: &HashMap<String, FederatedTool>,
     ) -> Option<HashMap<String, String>> {
-        let Some(gate) = self.versioning.as_ref() else {
-            return None;
-        };
+        let gate = self.versioning.as_ref()?;
         let lockfile = match std::fs::read_to_string(&gate.lockfile_path)
             .map_err(anyhow::Error::from)
             .and_then(|y| super::compat::Lockfile::from_yaml(&y))
@@ -3398,7 +3400,7 @@ fn hash_lossless_json_value(value: &Value, hasher: &mut sha2::Sha256) {
             sha2::Digest::update(hasher, [6]);
             hash_lossless_length(hasher, object.len());
             let mut members: Vec<(&String, &Value)> = object.iter().collect();
-            members.sort_by(|(left, _), (right, _)| left.cmp(right));
+            members.sort_by_key(|(key, _)| *key);
             for (key, value) in members {
                 hash_lossless_bytes(hasher, key.as_bytes());
                 hash_lossless_json_value(value, hasher);
@@ -3740,7 +3742,9 @@ mod tests {
                             .set_nonblocking(false)
                             .expect("tool-call fixture stream blocking setup");
                         let mut request = [0_u8; 8192];
-                        stream
+                        // The fixture never inspects the request, so one
+                        // possibly-partial read is enough to unblock the peer.
+                        let _request_bytes = stream
                             .read(&mut request)
                             .expect("tool-call fixture request read");
                         let body = json!({
@@ -5900,8 +5904,11 @@ mod tests {
         assert!(out.contains("export interface SearchDocsInput"));
         assert!(out.contains("export interface OpenPrInput"));
         assert!(out.contains("['search_docs']:"));
-        assert!(out.contains("open_pr:"));
-        assert!(out.contains("https://gw.example/.well-known/mcp/call/"));
+        assert!(out.contains("['open_pr']:"));
+        // The callback base is emitted as an escaped string literal and
+        // concatenated at runtime, so a hostile base URL cannot close the
+        // literal and inject code.
+        assert!(out.contains("'https://gw.example/.well-known/mcp' + '/call/'"));
     }
 
     #[test]
@@ -5919,8 +5926,8 @@ mod tests {
         assert_eq!(a, b);
 
         // a_tool must appear before z_tool in the namespace block.
-        let idx_a = a.find("a_tool:").expect("a_tool present");
-        let idx_z = a.find("z_tool:").expect("z_tool present");
+        let idx_a = a.find("['a_tool']:").expect("a_tool present");
+        let idx_z = a.find("['z_tool']:").expect("z_tool present");
         assert!(idx_a < idx_z);
     }
 

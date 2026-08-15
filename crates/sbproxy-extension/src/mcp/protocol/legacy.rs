@@ -1,8 +1,8 @@
 //! Frozen MCP 2025-06-18 wire codec.
 
 use super::{
-    DecodedMcpRequest, McpProtocolCodec, McpProtocolContext, McpProtocolEra, McpRoutingHeaders,
-    McpServerDescription, McpWireError, McpWireResponse,
+    DecodedMcpRequest, DecodedRequestId, McpProtocolCodec, McpProtocolContext, McpProtocolEra,
+    McpRoutingHeaders, McpServerDescription, McpWireError, McpWireResponse,
 };
 use crate::mcp::types::{
     is_supported_protocol_version, JsonRpcRequest, JsonRpcResponse, LEGACY_PROTOCOL_VERSION,
@@ -13,6 +13,8 @@ use crate::mcp::types::{
 pub struct Legacy2025_06_18Codec;
 
 impl McpProtocolCodec for Legacy2025_06_18Codec {
+    type RequestId = Option<serde_json::Value>;
+
     fn era(&self) -> McpProtocolEra {
         McpProtocolEra::Legacy2025_06_18
     }
@@ -48,8 +50,10 @@ impl McpProtocolCodec for Legacy2025_06_18Codec {
             .and_then(|value| value.get("clientInfo"))
             .and_then(|value| serde_json::from_value(value.clone()).ok());
 
+        let request_id = request.id.clone();
         Ok(DecodedMcpRequest {
             request,
+            request_id: DecodedRequestId::Legacy(request_id),
             context: McpProtocolContext {
                 era: McpProtocolEra::Legacy2025_06_18,
                 protocol_version: LEGACY_PROTOCOL_VERSION.to_string(),
@@ -70,7 +74,7 @@ impl McpProtocolCodec for Legacy2025_06_18Codec {
         Ok(McpWireResponse {
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
-            body: Some(JsonRpcResponse::success(id, result)),
+            body: Some(JsonRpcResponse::success(id, result).into()),
         })
     }
 
@@ -84,7 +88,7 @@ impl McpProtocolCodec for Legacy2025_06_18Codec {
         McpWireResponse {
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
-            body: Some(JsonRpcResponse::error_with_data(id, code, message, data)),
+            body: Some(JsonRpcResponse::error_with_data(id, code, message, data).into()),
         }
     }
 }

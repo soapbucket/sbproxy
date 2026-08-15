@@ -152,6 +152,124 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
+/// Lossless bounded integer domain accepted by the modern MCP wire profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum McpInteger {
+    /// A negative JSON integer, including the `i64::MIN` boundary.
+    Signed(i64),
+    /// A non-negative JSON integer, including the `u64::MAX` boundary.
+    Unsigned(u64),
+}
+
+/// Request identifier used by MCP 2026-07-28 messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ModernRequestId {
+    /// The `id` member was absent, so the message has notification shape.
+    Absent,
+    /// A JSON string identifier.
+    String(String),
+    /// A bounded lexical JSON integer identifier.
+    Integer(McpInteger),
+}
+
+impl ModernRequestId {
+    /// Return whether the request omitted its `id` member.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// Convert a validated modern identifier for the shared request envelope.
+    pub fn to_legacy_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Absent => None,
+            Self::String(value) => Some(serde_json::Value::String(value.clone())),
+            Self::Integer(McpInteger::Signed(value)) => {
+                Some(serde_json::Value::Number((*value).into()))
+            }
+            Self::Integer(McpInteger::Unsigned(value)) => {
+                Some(serde_json::Value::Number((*value).into()))
+            }
+        }
+    }
+}
+
+/// Failure to decode an MCP 2026-07-28 request identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ModernRequestIdError {
+    /// The `id` member was explicitly `null` rather than absent.
+    #[error("modern MCP request id must not be null")]
+    ExplicitNull,
+    /// The `id` member was not a string or number.
+    #[error("modern MCP request id must be a string or integer")]
+    InvalidType,
+    /// The numeric token contained a fraction or exponent.
+    #[error("modern MCP numeric request id must be a lexical integer")]
+    NonIntegerNumber,
+    /// The integer was outside the exact `i64 | u64` profile.
+    #[error("modern MCP integer request id is out of range")]
+    IntegerOutOfRange,
+    /// More than one direct `id` member made the identifier ambiguous.
+    #[error("modern MCP request contains duplicate id members")]
+    DuplicateMember,
+}
+
+/// JSON-RPC response envelope for MCP 2026-07-28.
+///
+/// Unlike the frozen legacy response, an absent identifier is omitted from the
+/// wire object instead of being serialized as `"id": null`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModernJsonRpcResponse {
+    /// JSON-RPC protocol version, always the literal `"2.0"`.
+    pub jsonrpc: String,
+    /// Successful result payload, mutually exclusive with `error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Error object populated when the request fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+    /// Echo of the originating request identifier when it was present.
+    #[serde(skip_serializing_if = "ModernRequestId::is_absent")]
+    pub id: ModernRequestId,
+}
+
+impl ModernJsonRpcResponse {
+    /// Build a successful modern JSON-RPC response.
+    pub fn success(id: ModernRequestId, result: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            result: Some(result),
+            error: None,
+            id,
+        }
+    }
+
+    /// Build a modern JSON-RPC error response.
+    pub fn error(id: ModernRequestId, code: i32, message: &str) -> Self {
+        Self::error_with_data(id, code, message, None)
+    }
+
+    /// Build a modern JSON-RPC error response with optional error data.
+    pub fn error_with_data(
+        id: ModernRequestId,
+        code: i32,
+        message: &str,
+        data: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.to_string(),
+                data,
+            }),
+            id,
+        }
+    }
+}
+
 impl JsonRpcResponse {
     /// Build a successful JSON-RPC 2.0 response with the given result payload.
     pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
