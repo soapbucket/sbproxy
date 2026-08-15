@@ -206,6 +206,24 @@ pub struct McpToolVersioningConfig {
     /// `warn` (default) or `block`.
     #[serde(default)]
     pub mode: McpVersioningModeConfig,
+    /// Refuse a tool with no lockfile entry at all (WOR-2444).
+    ///
+    /// Off by default, because turning it on means every newly
+    /// advertised tool is refused until the lockfile is regenerated,
+    /// which changes behavior for anyone who adds a tool.
+    ///
+    /// On, it is what closes the rename escape. A tool renamed but
+    /// otherwise unchanged is matched back to its baseline by contract
+    /// digest and graded as a rename. A rename that also edits the
+    /// contract matches no baseline by construction, so it is
+    /// indistinguishable from a new tool, and refusing unlocked tools
+    /// is the only thing that stops it being served ungated. A pinning
+    /// gate that serves whatever it has not seen before is pinning only
+    /// the tools an upstream chooses not to rename.
+    ///
+    /// Only consulted under `mode: block`; warn mode blocks nothing.
+    #[serde(default)]
+    pub block_unlocked: bool,
     /// Operator-declared current version per advertised tool name.
     /// A changed tool absent from this map is linted as "no bump
     /// declared" against its lockfile version.
@@ -971,6 +989,7 @@ impl McpAction {
                             McpVersioningModeConfig::Warn => VersioningMode::Warn,
                             McpVersioningModeConfig::Block => VersioningMode::Block,
                         },
+                        block_unlocked: tv.block_unlocked,
                         judges,
                     })
                 }
