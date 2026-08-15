@@ -3739,7 +3739,21 @@ cacheable request, so a permissive master switch would hand a busy origin a
 per-request feed, and the usual answer to a feed nobody can afford is to
 switch the whole thing off, which takes the security-relevant events with it.
 
-`cache.admit` is the only event with an emitter in this release. A label naming
+The block also composes under a tenant and under an origin, per event label
+rather than per block. A tenant that names `route.decide` keeps the proxy's
+`cache.admit` entry instead of replacing the map, because replacing it would
+mean turning on one tenant's routing audit silently disables its cache audit.
+Precedence for a given event is origin, then tenant, then proxy.
+
+A decision that has structured facts about what it did publishes them as
+fields alongside the reason, so the filtering is your SIEM's job rather than
+this config's. A `route.decide` record carries the requested model, the
+selected model and provider, the tier count, and how many plan entries the
+host had to drop. "Only the routing decisions that moved a request" is then a
+field comparison at ingest, which is both cheaper and recoverable; a record the
+proxy declined to publish is gone. See [observability.md](observability.md).
+
+`cache.admit`, `cache.key`, and `route.decide` are the events with emitters: they are the three decision points that compute a `reason` worth carrying. A label naming
 no known event is refused when the config loads rather than ignored, because a
 typo is a feed you believe you turned on and nobody is watching.
 `ai.stream.event: true` is refused by value: it fires once per streamed chunk,

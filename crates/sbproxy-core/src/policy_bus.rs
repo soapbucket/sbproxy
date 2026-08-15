@@ -378,6 +378,50 @@ pub fn try_publish_decision(audit: DecisionAudit) -> Result<(), Box<AuditRecord>
 ///
 /// Returns whether the record reached the bus, so a caller that wants to
 /// log the loss can, though the drop is already counted here.
+/// [`emit_decision_audit`] plus structured detail about what the
+/// decision did.
+///
+/// Split from the plain form rather than folded into it because most
+/// emit sites have no structured detail to add, and an extra
+/// `DecisionDetails::default()` at each of those call sites is noise
+/// that invites someone to pass the wrong one.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decision_audit_detailed(
+    event: sbproxy_observe::decision::DecisionEvent,
+    engine: sbproxy_observe::decision::DecisionEngine,
+    outcome: sbproxy_observe::decision::DecisionOutcome,
+    request_id: &str,
+    origin_id: &str,
+    route: &str,
+    tenant: &str,
+    reason: &str,
+    details: sbproxy_observe::decision::DecisionDetails,
+) -> bool {
+    emit_decision_audit_inner(
+        event, engine, outcome, request_id, origin_id, route, tenant, reason, details,
+    )
+}
+
+/// Build, scrub, publish, and account for one decision audit record.
+///
+/// The single chokepoint every emitting decision event routes through
+/// (WOR-2405), so the four things that must happen together cannot drift
+/// apart: the operator's redaction rules are resolved for this request's
+/// scope, the reason is scrubbed by [`DecisionAudit`]'s constructor, the
+/// record is published, and the outcome is counted either as emitted or
+/// as dropped.
+///
+/// `route` is the origin **hostname** the redaction scopes are keyed by,
+/// which is not necessarily `origin_id`, the configured identity the
+/// audit record carries. They are equal in ordinary configs and the two
+/// arguments exist so a wildcard origin cannot silently skip the
+/// origin-scoped redactor.
+///
+/// Use [`emit_decision_audit_detailed`] when the decision has structured
+/// detail a SIEM should be able to select on.
+///
+/// Returns whether the record reached the bus, so a caller that wants to
+/// log the loss can, though the drop is already counted here.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_decision_audit(
     event: sbproxy_observe::decision::DecisionEvent,
@@ -388,6 +432,31 @@ pub fn emit_decision_audit(
     route: &str,
     tenant: &str,
     reason: &str,
+) -> bool {
+    emit_decision_audit_inner(
+        event,
+        engine,
+        outcome,
+        request_id,
+        origin_id,
+        route,
+        tenant,
+        reason,
+        sbproxy_observe::decision::DecisionDetails::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_decision_audit_inner(
+    event: sbproxy_observe::decision::DecisionEvent,
+    engine: sbproxy_observe::decision::DecisionEngine,
+    outcome: sbproxy_observe::decision::DecisionOutcome,
+    request_id: &str,
+    origin_id: &str,
+    route: &str,
+    tenant: &str,
+    reason: &str,
+    details: sbproxy_observe::decision::DecisionDetails,
 ) -> bool {
     // Resolved per request rather than cached: the state is swapped
     // whole on config reload, and holding it across requests would
@@ -406,7 +475,8 @@ pub fn emit_decision_audit(
         reason,
         Some(redact_state.as_ref()),
         Some(route),
-    );
+    )
+    .with_details(details);
 
     match try_publish_decision(audit) {
         Ok(()) => {

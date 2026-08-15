@@ -265,7 +265,7 @@ pub struct CompiledConfig {
     /// switch is off) lives on the type, and re-deriving it per emitting
     /// site is how two decision points end up disagreeing about whether
     /// the same config turned them on.
-    pub decision_audit: Option<crate::types::DecisionAuditConfig>,
+    pub decision_audit: crate::types::DecisionAuditScopes,
     /// Parsed top-level `agent_classes:` block. `None` means the
     /// operator did not author the block; the binary startup code
     /// constructs a resolver from defaults in that case. `Some(_)`
@@ -360,6 +360,6 @@ mod tests {
         // Off is the default for decision audits too, and `None` here is
         // the whole of it: no per-event map to consult and no master
         // switch to inherit.
-        assert!(cfg.decision_audit.is_none());
+        assert!(cfg.decision_audit.is_empty());
     }
 }

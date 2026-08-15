@@ -154,11 +154,18 @@ pub struct CacheKeyPlan {
     pub skip_lookup: bool,
     /// Why this plan was chosen.
     ///
-    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then it
-    /// goes nowhere. Nothing in this workspace builds an audit record
-    /// yet, and the `cache.key` call site records the outcome without
-    /// ever reading this field. Wiring it to the audit record is
-    /// outstanding, not done.
+    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`] here, then
+    /// scrubbed again on the way into the audit record: the secrets
+    /// floor, the operator's `redact.patterns:` masks and PII rules for
+    /// the request's scope, and a 512-byte bound, in that order
+    /// (WOR-2405). The `cache.key` call site publishes it when
+    /// `observability.log.decision_audit` names this event, and drops it
+    /// otherwise.
+    ///
+    /// Treat it as operator-authored text that reaches a customer's
+    /// SIEM. A script explaining itself by quoting the request is a
+    /// script quoting the request, and the scrub is a floor rather than
+    /// a guarantee about arbitrary content.
     ///
     /// It is kept because a reason is what makes a cache decision
     /// diagnosable, and a debug line is not somewhere to keep one:

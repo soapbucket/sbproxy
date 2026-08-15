@@ -647,6 +647,31 @@ fn evaluate_cache_key(
                     origin,
                     &ctx.tenant_id,
                 );
+                // WOR-2405: the same wiring `cache.admit` has, on the
+                // only arm that carries an operator-authored reason. A
+                // declined, faulted, or undecodable event has nothing to
+                // say that the metric does not already say.
+                //
+                // This event is the dense one, once per cacheable
+                // request, which is why the config makes it an explicit
+                // opt-in and why the master switch defaults off.
+                if super::proxy_http::audit_publishes(
+                    &pipeline,
+                    DecisionEvent::CacheKey,
+                    (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.as_str()),
+                    (!origin.is_empty()).then_some(origin),
+                ) {
+                    crate::policy_bus::emit_decision_audit(
+                        DecisionEvent::CacheKey,
+                        engine,
+                        DecisionOutcome::Allow,
+                        &ctx.request_id,
+                        origin,
+                        &ctx.hostname,
+                        &ctx.tenant_id,
+                        &plan.reason,
+                    );
+                }
                 (Some(plan), false)
             }
             Err(error) => {
@@ -6802,5 +6827,122 @@ mod inbound_key_governs_ai_tests {
         assert_eq!(stamped.allowed_models, ["gpt-4"]);
         assert_eq!(stamped.max_requests_per_minute, Some(7));
         assert_eq!(stamped.key_id, "0123456789abcdef");
+    }
+}
+
+/// The `cache.key` emit site, driven through the real function (WOR-2405).
+#[cfg(test)]
+mod cache_key_audit_tests {
+    use super::*;
+    use sbproxy_observe::decision::DecisionEvent;
+
+    /// Refuses the lookup and says why, so the plan arm runs and the
+    /// reason is something an assertion can recognise.
+    const KEY_EVENT_ORIGIN: &str = r#"
+origins:
+  "api.audit.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    response_cache:
+      enabled: true
+      key_event:
+        engine: lua
+        source: "return {skip_lookup = true, reason = 'bypassed for ACCT-1234567890'}"
+"#;
+
+    fn ctx_for(proxy_yaml: &str, request_id: &str) -> crate::context::RequestContext {
+        let config = sbproxy_config::compile_config(&format!("{proxy_yaml}{KEY_EVENT_ORIGIN}"))
+            .expect("fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(config)
+            .expect("fixture pipeline");
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.hostname = compact_str::CompactString::new("api.audit.test");
+        ctx.tenant_id = compact_str::CompactString::new("acme-corp");
+        ctx.request_id = compact_str::CompactString::new(request_id);
+        ctx
+    }
+
+    fn req() -> pingora_http::RequestHeader {
+        pingora_http::RequestHeader::build("GET", b"/v1/thing", None).expect("request header")
+    }
+
+    fn cache_cfg(ctx: &crate::context::RequestContext) -> sbproxy_config::ResponseCacheConfig {
+        ctx.pipeline.config.origins[0]
+            .response_cache
+            .clone()
+            .expect("the fixture enables the cache")
+    }
+
+    #[test]
+    fn the_cache_key_emit_site_publishes_only_when_the_config_asks() {
+        // The seam, not the helper. Every other test in this change is
+        // green with the six lines in `evaluate_cache_key` deleted: the
+        // rule has tests, the scopes have tests, the constructor has
+        // tests. This one reads a record off the bus that only the emit
+        // site could have put there.
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        let _ = crate::policy_bus::init_global_bus(bus);
+
+        let ctx = ctx_for(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        events:
+          cache.key: true
+"#,
+            "req-cache-key-on",
+        );
+        let cfg = cache_cfg(&ctx);
+        let (plan, _bypass) = evaluate_cache_key(&ctx, &req(), &cfg);
+        assert!(
+            plan.is_some(),
+            "the fixture script returns a plan, which is the arm that publishes"
+        );
+
+        let mut ours = None;
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-cache-key-on" {
+                    ours = Some(audit);
+                    break;
+                }
+            }
+        }
+        let audit = ours.expect(
+            "a config naming cache.key has to publish; a silent miss here is the hole this \
+             test exists to close",
+        );
+        assert_eq!(audit.event, DecisionEvent::CacheKey);
+        assert_eq!(audit.origin, "api.audit.test");
+        assert_eq!(audit.tenant, "acme-corp");
+        assert!(
+            audit.reason.as_str().contains("bypassed"),
+            "the script's rationale is the payload: {}",
+            audit.reason.as_str()
+        );
+
+        // And the gate is read here rather than only in isolation.
+        let ctx = ctx_for("", "req-cache-key-off");
+        let cfg = cache_cfg(&ctx);
+        let (plan, _bypass) = evaluate_cache_key(&ctx, &req(), &cfg);
+        assert!(
+            plan.is_some(),
+            "the cache decision itself does not depend on whether it is audited"
+        );
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert_ne!(
+                    audit.request_id, "req-cache-key-off",
+                    "a config with no decision_audit block published a record anyway"
+                );
+            }
+        }
     }
 }

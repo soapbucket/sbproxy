@@ -1047,7 +1047,7 @@ fn validate_decision_audit(audit: &crate::DecisionAuditConfig) -> Result<()> {
         };
         if *enabled && event == DecisionEvent::AiStreamEvent {
             anyhow::bail!(
-                "observability.log.decision_audit.events sets `ai.stream.event: true`, which is \
+                "observability.log.decision_audit.events sets `ai.stream.event: true`, and that is \
                  the one event that cannot be turned on: it fires once per streamed chunk, so a \
                  per-event audit record is an ingest bill rather than a control. Enable \
                  `ai.close` instead, which carries the stream's summary once the response \
@@ -1630,6 +1630,29 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             validate_decision_audit(audit)?;
         }
     }
+    // Every scope gets the same validation. A refusal that only covered
+    // proxy scope would let a tenant write the typo the proxy block is
+    // refused for, which is the shape of gap this guard exists to close.
+    for tenant in &config_file.proxy.tenants {
+        if let Some(audit) = tenant
+            .observability
+            .as_ref()
+            .and_then(|obs| obs.log.decision_audit.as_ref())
+        {
+            validate_decision_audit(audit)
+                .with_context(|| format!("tenant `{}` observability.log", tenant.id))?;
+        }
+    }
+    for (host, origin) in &config_file.origins {
+        if let Some(audit) = origin
+            .observability
+            .as_ref()
+            .and_then(|obs| obs.log.decision_audit.as_ref())
+        {
+            validate_decision_audit(audit)
+                .with_context(|| format!("origin `{host}` observability.log"))?;
+        }
+    }
     // Tenant- and origin-scope custom_fields use the same validation.
     for tenant in &config_file.proxy.tenants {
         if let Some(obs) = tenant.observability.as_ref() {
@@ -1694,6 +1717,24 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
 
     let mut origins = Vec::with_capacity(config_file.origins.len());
     let mut host_map = std::collections::HashMap::new();
+
+    // Collected before the loop below consumes `config_file.origins`.
+    // Keyed by the origin's config key, which is what the resolver
+    // expects and what a non-wildcard request's hostname carries.
+    let origin_decision_audit: std::collections::BTreeMap<
+        String,
+        crate::types::DecisionAuditConfig,
+    > = config_file
+        .origins
+        .iter()
+        .filter_map(|(host, origin)| {
+            origin
+                .observability
+                .as_ref()
+                .and_then(|obs| obs.log.decision_audit.clone())
+                .map(|cfg| (host.clone(), cfg))
+        })
+        .collect();
 
     for (hostname, raw_config) in config_file.origins {
         // Wildcard keys (`*.example.com`) are validated here and stored
@@ -1964,12 +2005,27 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     //
     // Cloned rather than moved because `config_file.proxy` is handed to
     // the snapshot whole as `server` below.
-    let decision_audit = config_file
-        .proxy
-        .observability
-        .as_ref()
-        .and_then(|obs| obs.log.as_ref())
-        .and_then(|log| log.decision_audit.clone());
+    let decision_audit = crate::types::DecisionAuditScopes {
+        proxy: config_file
+            .proxy
+            .observability
+            .as_ref()
+            .and_then(|obs| obs.log.as_ref())
+            .and_then(|log| log.decision_audit.clone()),
+        tenants: config_file
+            .proxy
+            .tenants
+            .iter()
+            .filter_map(|tenant| {
+                tenant
+                    .observability
+                    .as_ref()
+                    .and_then(|obs| obs.log.decision_audit.clone())
+                    .map(|cfg| (tenant.id.clone(), cfg))
+            })
+            .collect(),
+        origins: origin_decision_audit,
+    };
 
     Ok(CompiledConfig {
         extension_bundles: config_file.extensions,
@@ -4675,6 +4731,72 @@ origins:
     /// that parses and validates but never reaches the snapshot is a
     /// feed the operator configured and no decision point can see.
     #[test]
+    fn a_tenant_scope_decision_audit_is_validated_too() {
+        // The proxy-scope guard alone would let a tenant write the typo
+        // the proxy block is refused for.
+        let err = compile_config(
+            r#"
+proxy:
+  http_bind_port: 8080
+  tenants:
+    - id: acme-corp
+      observability:
+        log:
+          decision_audit:
+            events:
+              cache.admitt: true
+origins:
+  "api.example.test":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#,
+        )
+        .err()
+        .expect("a tenant-scope typo must fail the load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("acme-corp") && msg.contains("cache.admitt"),
+            "the refusal names the tenant and the bad label: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_origin_scope_decision_audit_composes_and_is_validated() {
+        let compiled = compile_config(
+            r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        events:
+          cache.admit: true
+origins:
+  "api.example.test":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    observability:
+      log:
+        decision_audit:
+          events:
+            route.decide: true
+"#,
+        )
+        .unwrap_or_else(|e| panic!("scoped blocks must compile: {e:#}"));
+        let scopes = &compiled.decision_audit;
+        assert!(
+            scopes.publishes("route.decide", None, Some("api.example.test")),
+            "the origin's own entry applies to it"
+        );
+        assert!(
+            scopes.publishes("cache.admit", None, Some("api.example.test")),
+            "and it inherits the proxy entry it said nothing about"
+        );
+    }
+
+    #[test]
     fn decision_audit_reaches_the_compiled_snapshot() {
         let yaml = r#"
 proxy:
@@ -4693,6 +4815,7 @@ origins:
         let compiled = compile_config(yaml).expect("a per-event decision audit toggle compiles");
         let audit = compiled
             .decision_audit
+            .proxy
             .as_ref()
             .expect("an authored decision_audit block must reach the snapshot");
         // The per-event entry carries this on its own: the master switch
@@ -4734,6 +4857,7 @@ origins:
         let compiled = compile_config(yaml).expect("a bare master switch compiles");
         let audit = compiled
             .decision_audit
+            .proxy
             .as_ref()
             .expect("an authored decision_audit block must reach the snapshot");
         assert!(
@@ -4765,7 +4889,7 @@ origins:
         let compiled =
             compile_config(yaml).expect("a config with no decision_audit block compiles");
         assert!(
-            compiled.decision_audit.is_none(),
+            compiled.decision_audit.is_empty(),
             "a config that never mentions decision_audit must not synthesize a block"
         );
     }

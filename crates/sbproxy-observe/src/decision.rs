@@ -698,6 +698,100 @@ pub struct DecisionAudit {
     /// Stable identifier for the rule or hook that decided, when the
     /// engine exposes one.
     pub rule_id: Option<String>,
+    /// Structured detail about what the decision did.
+    ///
+    /// The `reason` says why in the operator's words; this says what, in
+    /// fields a SIEM rule can select on. Both matter and neither
+    /// replaces the other: prose does not aggregate, and a field set
+    /// does not explain itself.
+    ///
+    /// Empty for a decision with nothing structured to add.
+    ///
+    /// `default` on purpose: a record serialized before this field
+    /// existed, or by a producer that has nothing to add, still has to
+    /// parse. Absence means "no detail", never "malformed".
+    #[serde(default, skip_serializing_if = "DecisionDetails::is_empty")]
+    pub details: DecisionDetails,
+}
+
+/// Structured, filterable detail about one decision.
+///
+/// Every value here is proxy-authored, not operator-authored, which is
+/// what separates it from [`RedactedReason`]. A model id, a provider id,
+/// and a tier count come from the routing plan the proxy resolved, so
+/// they are not free text and do not carry the leak risk the reason
+/// does. They are rendered into the OCSF record as plain fields.
+///
+/// This exists so an analyst does not have to grep prose. "Show me every
+/// routing decision that moved a request off its requested model" is a
+/// field comparison here and a regex over English without it, and a
+/// regex over English is how a SIEM rule quietly stops matching when
+/// someone rewords a script.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionDetails {
+    /// The model the request asked for, when the decision concerns one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// The model the decision selected, when it selected one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_model: Option<String>,
+    /// The provider the decision selected, when it selected one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<String>,
+    /// How many tiers the resolved plan carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier_count: Option<usize>,
+    /// How many entries the host dropped from the plan before running
+    /// it. Non-zero means this is not the plan the operator wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<usize>,
+}
+
+impl DecisionDetails {
+    /// Detail for a routing decision.
+    ///
+    /// `selected_model` and `selected_provider` are `Option` because a
+    /// plan can resolve to an empty tier list; a record that claimed a
+    /// selection in that case would be inventing one.
+    pub fn routing(
+        requested_model: &str,
+        selected_model: Option<&str>,
+        selected_provider: Option<&str>,
+        tier_count: usize,
+        dropped: usize,
+    ) -> Self {
+        Self {
+            requested_model: (!requested_model.is_empty()).then(|| requested_model.to_owned()),
+            selected_model: selected_model.map(ToOwned::to_owned),
+            selected_provider: selected_provider.map(ToOwned::to_owned),
+            tier_count: Some(tier_count),
+            dropped: Some(dropped),
+        }
+    }
+
+    /// Whether every field is absent, so the OCSF render can leave the
+    /// object out rather than emit an empty one.
+    pub fn is_empty(&self) -> bool {
+        self.requested_model.is_none()
+            && self.selected_model.is_none()
+            && self.selected_provider.is_none()
+            && self.tier_count.is_none()
+            && self.dropped.is_none()
+    }
+
+    /// Whether the decision moved the request off what it asked for, or
+    /// ran a plan the host had to degrade.
+    ///
+    /// Not a filter the proxy applies. It is here so the same question a
+    /// SIEM rule asks has one answer in this codebase too, for tests and
+    /// for anything that later wants to log it.
+    pub fn changed_route(&self) -> bool {
+        self.dropped.is_some_and(|d| d > 0)
+            || match (&self.requested_model, &self.selected_model) {
+                (Some(requested), Some(selected)) => requested != selected,
+                _ => false,
+            }
+    }
 }
 
 impl DecisionAudit {
@@ -768,7 +862,15 @@ impl DecisionAudit {
             occurred_at,
             reason,
             rule_id: None,
+            details: DecisionDetails::default(),
         }
+    }
+
+    /// Attach structured detail about what the decision did.
+    #[must_use]
+    pub fn with_details(mut self, details: DecisionDetails) -> Self {
+        self.details = details;
+        self
     }
 
     /// Attach the rule or hook identifier that produced the decision.
@@ -787,7 +889,7 @@ impl DecisionAudit {
     pub fn to_ocsf(&self) -> serde_json::Value {
         const CLASS_UID: u32 = 6003;
         let activity_id = self.event.ocsf_activity_id();
-        serde_json::json!({
+        let mut record = serde_json::json!({
             "class_uid": CLASS_UID,
             "class_name": "API Activity",
             "category_uid": 6,
@@ -827,13 +929,101 @@ impl DecisionAudit {
                 _ => 1,
             },
             "message": self.reason.as_str(),
-        })
+        });
+        // Structured detail rides under `unmapped`, which is OCSF's
+        // sanctioned home for attributes the class does not define. A
+        // SIEM rule selecting on `unmapped.selected_provider` keeps
+        // working when someone rewords the script that produced the
+        // reason; one selecting on a regex over `message` does not.
+        //
+        // Left out entirely when empty rather than emitted as `{}`, so a
+        // consumer can test for presence.
+        if !self.details.is_empty() {
+            if let Ok(detail) = serde_json::to_value(&self.details) {
+                record["unmapped"] = detail;
+            }
+        }
+        record
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_detail_reaches_the_ocsf_record() {
+        // The point of the type. A SIEM rule selecting on a field keeps
+        // working when someone rewords the script that produced the
+        // reason; one selecting on a regex over `message` does not.
+        let audit = DecisionAudit::new(
+            uuid::Uuid::new_v4(),
+            "req-detail",
+            DecisionEvent::RouteDecide,
+            DecisionEngine::Cel,
+            DecisionOutcome::Allow,
+            "api.example.test",
+            "acme-corp",
+            chrono::Utc::now(),
+            "cheaper tier available",
+            None,
+            None,
+        )
+        .with_details(DecisionDetails::routing(
+            "gpt-4o",
+            Some("claude-haiku"),
+            Some("anthropic"),
+            2,
+            1,
+        ));
+        let ocsf = audit.to_ocsf();
+        let unmapped = ocsf
+            .get("unmapped")
+            .expect("structured detail has to reach the record, not just the struct");
+        assert_eq!(unmapped["requested_model"], "gpt-4o");
+        assert_eq!(unmapped["selected_model"], "claude-haiku");
+        assert_eq!(unmapped["selected_provider"], "anthropic");
+        assert_eq!(unmapped["tier_count"], 2);
+        assert_eq!(unmapped["dropped"], 1);
+    }
+
+    #[test]
+    fn a_record_with_no_detail_omits_the_object_entirely() {
+        // Emitted as `{}` a consumer cannot tell "no detail" from "the
+        // producer forgot", so absence is spelled as absence.
+        let audit = DecisionAudit::new(
+            uuid::Uuid::new_v4(),
+            "req-plain",
+            DecisionEvent::CacheAdmit,
+            DecisionEngine::Lua,
+            DecisionOutcome::Deny,
+            "api.example.test",
+            "acme-corp",
+            chrono::Utc::now(),
+            "set-cookie present",
+            None,
+            None,
+        );
+        assert!(audit.details.is_empty());
+        assert!(audit.to_ocsf().get("unmapped").is_none());
+    }
+
+    #[test]
+    fn changed_route_reads_the_same_question_a_siem_rule_would() {
+        // Kept in the codebase so the definition has one home, even
+        // though the proxy does not filter on it.
+        let moved = DecisionDetails::routing("gpt-4o", Some("claude-haiku"), None, 1, 0);
+        assert!(moved.changed_route());
+
+        let same = DecisionDetails::routing("gpt-4o", Some("gpt-4o"), None, 1, 0);
+        assert!(!same.changed_route(), "a plan that changed nothing did not");
+
+        let degraded = DecisionDetails::routing("gpt-4o", Some("gpt-4o"), None, 2, 1);
+        assert!(
+            degraded.changed_route(),
+            "a degraded plan is not the plan the operator wrote, so it counts"
+        );
+    }
 
     #[test]
     fn every_event_label_round_trips() {

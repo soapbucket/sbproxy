@@ -1262,15 +1262,22 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
 /// precedence: an absent block publishes nothing, and the per-event
 /// versus master-switch order lives on the config type itself
 /// (WOR-2405).
-fn audit_publishes(
+///
+/// `route` is the origin's **config key**, the same value the origin
+/// id carries, not the request `Host`. Under a wildcard origin those
+/// differ, and passing the `Host` would silently skip the origin-scope
+/// block the operator wrote.
+pub(super) fn audit_publishes(
     pipeline: &crate::pipeline::CompiledPipeline,
     event: sbproxy_observe::decision::DecisionEvent,
+    tenant: Option<&str>,
+    route: Option<&str>,
 ) -> bool {
-    pipeline
-        .config
-        .decision_audit
-        .as_ref()
-        .is_some_and(|cfg| cfg.publishes(event.as_label()))
+    let scopes = &pipeline.config.decision_audit;
+    if scopes.is_empty() {
+        return false;
+    }
+    scopes.publishes(event.as_label(), tenant, route)
 }
 
 /// Run the origin's `cache.admit` event, or return the static default.
@@ -1392,7 +1399,12 @@ fn evaluate_cache_admit(
                 // investigation. Publishing is opt-in per event, so this
                 // costs a config read on a path that already did an
                 // engine evaluation.
-                if audit_publishes(&pipeline, DecisionEvent::CacheAdmit) {
+                if audit_publishes(
+                    &pipeline,
+                    DecisionEvent::CacheAdmit,
+                    (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.as_str()),
+                    (!origin.is_empty()).then_some(origin),
+                ) {
                     crate::policy_bus::emit_decision_audit(
                         DecisionEvent::CacheAdmit,
                         engine,
@@ -8618,13 +8630,13 @@ origins:
             DecisionEvent::Policy,
         ] {
             assert!(
-                !audit_publishes(&never_written, event),
+                !(audit_publishes(&never_written, event, None, None)),
                 "a config with no decision_audit block publishes nothing, and `{}` is not \
                  an exception",
                 event.as_label()
             );
             assert!(
-                !audit_publishes(&log_without_audit, event),
+                !(audit_publishes(&log_without_audit, event, None, None)),
                 "a log block that never mentions decision_audit must not synthesize one; \
                  `{}` stays off",
                 event.as_label()
@@ -8654,11 +8666,11 @@ origins:
 "#,
         );
         assert!(
-            audit_publishes(&master_on, DecisionEvent::CacheAdmit),
+            (audit_publishes(&master_on, DecisionEvent::CacheAdmit, None, None)),
             "the master switch has to reach an event the events map does not name"
         );
         assert!(
-            !audit_publishes(&master_on, DecisionEvent::AiStreamEvent),
+            !(audit_publishes(&master_on, DecisionEvent::AiStreamEvent, None, None)),
             "`ai.stream.event` fires once per streamed chunk and never publishes, whatever \
              the master switch says"
         );
@@ -8674,11 +8686,11 @@ origins:
 "#,
         );
         assert!(
-            audit_publishes(&per_event_only, DecisionEvent::CacheAdmit),
+            (audit_publishes(&per_event_only, DecisionEvent::CacheAdmit, None, None)),
             "a per-event entry publishes without a master switch"
         );
         assert!(
-            !audit_publishes(&per_event_only, DecisionEvent::RouteDecide),
+            !(audit_publishes(&per_event_only, DecisionEvent::RouteDecide, None, None)),
             "an unset master switch is off, so naming one event must not turn on the rest"
         );
 
@@ -8694,11 +8706,11 @@ origins:
 "#,
         );
         assert!(
-            !audit_publishes(&event_opted_out, DecisionEvent::CacheAdmit),
+            !(audit_publishes(&event_opted_out, DecisionEvent::CacheAdmit, None, None)),
             "a per-event `false` wins over the master switch"
         );
         assert!(
-            audit_publishes(&event_opted_out, DecisionEvent::RouteDecide),
+            (audit_publishes(&event_opted_out, DecisionEvent::RouteDecide, None, None)),
             "silencing one event must not silence the master switch for the others"
         );
     }

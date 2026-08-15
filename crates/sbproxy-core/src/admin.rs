@@ -7681,7 +7681,7 @@ origins:
             l2_store: None,
             mesh: None,
             access_log: None,
-            decision_audit: None,
+            decision_audit: Default::default(),
             agent_classes: None,
             rate_limits: None,
             audit: None,
