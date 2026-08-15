@@ -14145,7 +14145,13 @@ mod external_guardrail_context_tests {
             "the rewrite must ship: {response}"
         );
         assert!(
-            !response.contains(":42"),
+            // The original arguments are `{"id":42}`, and the escaped
+            // form is what would appear on the wire. Matched in full
+            // rather than as a bare `:42`, which also occurs in the
+            // response's own `Date` header at minute or second 42 and
+            // failed this test on roughly 3% of runs regardless of what
+            // the hook did (WOR-2430).
+            !response.contains(r#"{\"id\":42}"#),
             "the original arguments must not ship: {response}"
         );
         assert!(response.contains("dangerous_lookup"), "{response}");
