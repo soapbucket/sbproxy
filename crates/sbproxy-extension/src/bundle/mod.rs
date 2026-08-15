@@ -21,8 +21,8 @@ mod tests;
 
 pub use ai::{AiChainVerdict, AiExtensionChain, AiExtensionSession};
 pub use envelope_wasm::{
-    build_wasm_action, build_wasm_policy, build_wasm_transform, WasmActionAdapter,
-    WasmPolicyAdapter, WasmTransformAdapter,
+    build_wasm_action, build_wasm_ai_routing, build_wasm_policy, build_wasm_transform,
+    WasmActionAdapter, WasmAiRoutingProgram, WasmPolicyAdapter, WasmTransformAdapter,
 };
 pub use javascript::{
     build_javascript_action, build_javascript_auth, build_javascript_policy,

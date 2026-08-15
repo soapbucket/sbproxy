@@ -47,6 +47,7 @@ pub(crate) const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
         BundleHookKind::AiFailure => "ai_failure",
+        BundleHookKind::AiRouting => "ai_routing",
         BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
     }
@@ -671,6 +672,31 @@ pub(crate) fn decode_payment_decision(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteDocumentWire {
+    version: String,
+    plan: Value,
+}
+
+/// Decode an `ai_routing` hook's response envelope and hand back the
+/// raw routing plan carried under `plan`.
+///
+/// A JSON `null` plan is a legitimate decline (the hook chose not to
+/// route) and is returned as [`Value::Null`], not an error; a missing
+/// `plan` field is a malformed envelope, never a silent decline. The
+/// plan's internal schema is deliberately not validated here: that
+/// knowledge lives in sbproxy-ai's `decode_route_plan`, so this crate
+/// never learns what a routing plan looks like inside.
+pub(crate) fn decode_route_document(bytes: &[u8]) -> Result<Value, EnvelopeError> {
+    let response: RouteDocumentWire =
+        serde_json::from_slice(bytes).map_err(|_| EnvelopeError::new("invalid_envelope"))?;
+    if response.version != ENVELOPE_VERSION {
+        return Err(EnvelopeError::new("invalid_version"));
+    }
+    Ok(response.plan)
+}
+
 #[cfg(test)]
 mod tests {
     use sbproxy_plugin::{AiExtensionDecision, PaymentExtensionDecision};
@@ -990,6 +1016,41 @@ mod tests {
             br#"{"version":"sbproxy-envelope/v1","decision":"reject","message":"secret"}"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn route_document_wire_returns_the_raw_plan_and_null_declines() {
+        // The plan is forwarded verbatim; its internal schema belongs
+        // to sbproxy-ai's decode_route_plan, not this decoder.
+        let decoded = decode_route_document(
+            br#"{"version":"sbproxy-envelope/v1","plan":{"provider":"frontier","reason":"difficulty"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            json!({"provider": "frontier", "reason": "difficulty"})
+        );
+
+        // A JSON null plan is a legitimate decline, not an error.
+        assert_eq!(
+            decode_route_document(br#"{"version":"sbproxy-envelope/v1","plan":null}"#).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn route_document_wire_is_strict_about_version_and_fields() {
+        // Wrong ABI version refuses, exactly like the policy decoder.
+        let error =
+            decode_route_document(br#"{"version":"sbproxy-envelope/v2","plan":null}"#).unwrap_err();
+        assert_eq!(error.code(), "invalid_version");
+        // An unknown top-level field is a malformed envelope.
+        assert!(decode_route_document(
+            br#"{"version":"sbproxy-envelope/v1","plan":null,"extra":true}"#
+        )
+        .is_err());
+        // A missing plan is a malformed envelope, never a silent decline.
+        assert!(decode_route_document(br#"{"version":"sbproxy-envelope/v1"}"#).is_err());
     }
 
     // --- WOR-2289: bundle config var secret resolution + masking ---

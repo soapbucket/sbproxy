@@ -201,6 +201,8 @@ pub trait BundleRegistry {
     fn action(&self, type_name: &str) -> Option<&LoadedBundleHook>;
     /// Look up one Proxy-Wasm filter by its `type:` value.
     fn proxy_wasm_filter(&self, type_name: &str) -> Option<&LoadedBundleHook>;
+    /// Look up one dynamic `ai_routing` hook by its `type:` value (WOR-2366).
+    fn ai_routing(&self, type_name: &str) -> Option<&LoadedBundleHook>;
     /// Return all hooks of one AI event kind in deterministic order.
     fn ai_hooks(&self, kind: BundleHookKind) -> Vec<&LoadedBundleHook>;
     /// Return payment hooks in deterministic order.

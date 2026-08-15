@@ -192,6 +192,9 @@ fn local_candidate_loads_bundles_and_sorts_public_inventory() {
     assert!(registry.transform("z_transform").is_some());
     assert!(registry.action("a_policy").is_none());
     assert!(registry.proxy_wasm_filter("a_policy").is_none());
+    // Cross-kind miss: an ai_routing lookup must not resolve hooks of
+    // other kinds (WOR-2366).
+    assert!(registry.ai_routing("a_policy").is_none());
     assert!(registry.ai_hooks(BundleHookKind::AiClose).is_empty());
     assert_eq!(
         registry

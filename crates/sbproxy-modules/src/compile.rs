@@ -46,10 +46,6 @@ pub fn compile_action_with_registry(
     config: &serde_json::Value,
     registry: &dyn BundleRegistry,
 ) -> Result<Action> {
-    let type_name = extract_type(config)?;
-    if registry.action(&type_name).is_none() {
-        return compile_action(config);
-    }
     compile_action_for_origin_with_runtime(config, "", true, Some(registry))
 }
 
@@ -69,10 +65,6 @@ pub fn compile_action_for_origin_with_registry(
     origin_id: &str,
     registry: &dyn BundleRegistry,
 ) -> Result<Action> {
-    let type_name = extract_type(config)?;
-    if registry.action(&type_name).is_none() {
-        return compile_action_for_origin(config, origin_id);
-    }
     compile_action_for_origin_with_runtime(config, origin_id, true, Some(registry))
 }
 
@@ -84,6 +76,10 @@ pub fn compile_action_for_origin_for_validation(
     compile_action_for_origin_with_runtime(config, origin_id, false, None)
 }
 
+// The registry stays in scope across the built-in arms, not just the
+// unknown-type fall-through: a built-in action may attach bundle hooks
+// by `type:` at compile time. The ai_proxy wasm routing policy is the
+// first such consumer (WOR-2366); every other built-in arm ignores it.
 fn compile_action_for_origin_with_runtime(
     config: &serde_json::Value,
     origin_id: &str,

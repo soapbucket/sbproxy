@@ -715,6 +715,7 @@ const fn bundle_hook_kind(kind: ExtensionHookKind) -> Option<BundleHookKind> {
         ExtensionHookKind::AiStreamEvent => Some(BundleHookKind::AiStreamEvent),
         ExtensionHookKind::AiClose => Some(BundleHookKind::AiClose),
         ExtensionHookKind::AiFailure => Some(BundleHookKind::AiFailure),
+        ExtensionHookKind::AiRouting => Some(BundleHookKind::AiRouting),
         ExtensionHookKind::Payment => Some(BundleHookKind::Payment),
         ExtensionHookKind::Startup
         | ExtensionHookKind::Identity
@@ -742,6 +743,7 @@ const fn hook_kind_label(kind: ExtensionHookKind) -> &'static str {
         ExtensionHookKind::AiStreamEvent => "ai_stream_event",
         ExtensionHookKind::AiClose => "ai_close",
         ExtensionHookKind::AiFailure => "ai_failure",
+        ExtensionHookKind::AiRouting => "ai_routing",
         ExtensionHookKind::Payment => "payment",
     }
 }
@@ -757,6 +759,9 @@ const fn hook_phase(kind: ExtensionHookKind) -> &'static str {
         | ExtensionHookKind::AiStreamEvent
         | ExtensionHookKind::AiClose
         | ExtensionHookKind::AiFailure => "ai",
+        // Attach-by-type, not event-chain, but the phase is still the AI
+        // decision plane; kept a separate arm to mirror the loader.
+        ExtensionHookKind::AiRouting => "ai",
         ExtensionHookKind::Payment => "payment",
         ExtensionHookKind::Mcp => "mcp",
         ExtensionHookKind::ProxyWasmFilter => "http",

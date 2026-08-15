@@ -326,6 +326,17 @@ pub enum ExtensionHookKind {
     /// into a house-standard shape, attribute it to a tenant, or drive a
     /// fallback from a policy.
     AiFailure,
+    /// AI routing decision hook.
+    ///
+    /// An operator-authored hook that decides how an AI request is
+    /// routed across the configured providers. It runs under the
+    /// envelope WebAssembly runtime, receives the provider-neutral AI
+    /// decision document, and returns a routing-plan document, or
+    /// declines so the configured routing strategy applies. Unlike
+    /// the AI event hooks, it is attached by `type` name from the
+    /// routing policy configuration rather than dispatched on the
+    /// event chain.
+    AiRouting,
     /// Payment lifecycle event hook.
     Payment,
 }
