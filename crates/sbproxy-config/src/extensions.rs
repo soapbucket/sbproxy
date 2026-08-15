@@ -271,6 +271,14 @@ pub enum BundleHookKind {
     AiClose,
     /// AI call-failure hook.
     AiFailure,
+    /// AI routing-decision hook (WOR-2366).
+    ///
+    /// An attach-by-type hook that authors the AI routing decision: the
+    /// host sends the `ai` decision document through the envelope ABI
+    /// and the hook returns a routing-plan document, or declines by
+    /// returning none. Available only to the envelope WebAssembly
+    /// runtime, so the decision stays a pure function of its input.
+    AiRouting,
     /// Payment lifecycle event hook.
     Payment,
     /// Proxy-Wasm HTTP lifecycle filter.
@@ -688,6 +696,18 @@ impl BundleManifest {
             if hook.kind == BundleHookKind::Auth && self.failure_posture != FailureMode::Closed {
                 return invalid("auth hooks always fail closed and require failure_posture closed");
             }
+            // WOR-2366: a routing hook observes by declining to return a
+            // plan, so enforcement_mode observe would load cleanly and
+            // change nothing. Refuse the inert knob at load rather than
+            // let an operator believe it softened the decision.
+            if hook.kind == BundleHookKind::AiRouting
+                && hook.enforcement_mode == EnforcementMode::Observe
+            {
+                return invalid(
+                    "enforcement_mode observe is not defined for ai_routing hooks; \
+                     declining to return a plan already is the observe posture",
+                );
+            }
             if matches!(
                 hook.kind,
                 BundleHookKind::Transform | BundleHookKind::Action
@@ -710,6 +730,18 @@ impl BundleManifest {
                 && hook.execution.body_mode != BundleBodyMode::None
             {
                 return invalid("payment hooks require body_mode none");
+            }
+            // An ai_routing hook is invoked with the ai decision document,
+            // never a request or response body, so a richer declaration
+            // would promise data the host will not deliver. Buffered is
+            // the field default, so the hook must declare none explicitly.
+            if hook.kind == BundleHookKind::AiRouting
+                && hook.execution.body_mode != BundleBodyMode::None
+            {
+                return invalid(
+                    "ai_routing hooks require body_mode none; the hook receives \
+                     the ai decision document, never a request or response body",
+                );
             }
             if hook.execution.mutates
                 && !matches!(
@@ -745,6 +777,18 @@ impl BundleManifest {
             }
             validate_secret_and_masked_vars(hook)?;
             if !hook.permissions.is_empty() {
+                // WOR-2366: the routing decision is a pure function of the
+                // ai document on every runtime, so this rule sits at the
+                // kind, ahead of the runtime-level refusal below, and
+                // survives any runtime that later grows a host call
+                // surface.
+                if hook.kind == BundleHookKind::AiRouting {
+                    return invalid(
+                        "an ai_routing hook cannot declare capabilities: the \
+                         routing decision must not do I/O (WOR-2366); everything \
+                         the decision needs arrives in the ai document",
+                    );
+                }
                 // The envelope-WASM ABI is stdin/stdout with no host
                 // imports, and Proxy-Wasm registers no outbound host
                 // function; a capability neither runtime can deliver
@@ -789,6 +833,17 @@ impl BundleManifest {
                         BundleHookKind::AiStreamEvent => {
                             return invalid(
                                 "runtime javascript cannot declare an ai_stream_event hook",
+                            );
+                        }
+                        // WOR-2366: routing hooks are envelope-WASM only. A
+                        // javascript hook with a granted net:outbound gains
+                        // the sbproxy_fetch host function, and the routing
+                        // decision must stay a pure function of its input.
+                        BundleHookKind::AiRouting => {
+                            return invalid(
+                                "runtime javascript cannot declare an ai_routing hook: a \
+                                 javascript hook with net:outbound gains sbproxy_fetch, \
+                                 which would put I/O inside the routing decision",
                             );
                         }
                         _ => {}
@@ -1113,7 +1168,169 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
         BundleHookKind::AiFailure => "ai_failure",
+        BundleHookKind::AiRouting => "ai_routing",
         BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AI_ROUTING_WASM_MANIFEST: &str = r#"
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: cost-quality-router
+version: 0.1.0
+runtime: wasm
+abi: sbproxy-envelope/v1
+entry: dist/router.wasm
+hooks:
+  - kind: ai_routing
+    type: cost_quality_router
+    execution:
+      body_mode: none
+    config_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        threshold: { type: number, default: 0.3 }
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+permissions: []
+"#;
+
+    fn parse_manifest(yaml: &str) -> BundleManifest {
+        BundleManifest::parse_yaml(yaml.as_bytes()).expect("manifest parses")
+    }
+
+    fn manifest_error(yaml: &str) -> String {
+        BundleManifest::parse_yaml(yaml.as_bytes())
+            .expect_err("manifest must be rejected")
+            .to_string()
+    }
+
+    fn replace_once(source: &str, from: &str, to: &str) -> String {
+        assert!(source.contains(from), "fixture must contain {from:?}");
+        source.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn a_wasm_ai_routing_hook_validates() {
+        // WOR-2366: the envelope WebAssembly runtime is the one runtime
+        // an ai_routing hook may declare.
+        let manifest = parse_manifest(AI_ROUTING_WASM_MANIFEST);
+        assert_eq!(manifest.hooks[0].kind, BundleHookKind::AiRouting);
+        assert_eq!(manifest.hooks[0].execution.body_mode, BundleBodyMode::None);
+    }
+
+    #[test]
+    fn an_ai_routing_hook_cannot_declare_capabilities() {
+        // The kind-level refusal must fire even under runtime wasm, where
+        // the runtime-level capability refusal would otherwise cover it,
+        // so the no-I/O invariant survives a runtime that later grows a
+        // host call surface.
+        let yaml = replace_once(
+            AI_ROUTING_WASM_MANIFEST,
+            "    execution:",
+            "    permissions:\n      - net:outbound=https://pricing.example\n    execution:",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("ai_routing hook cannot declare capabilities")
+                && error.contains("must not do I/O"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ai_routing_hook_requires_body_mode_none() {
+        let explicit_buffered = replace_once(
+            AI_ROUTING_WASM_MANIFEST,
+            "      body_mode: none",
+            "      body_mode: buffered",
+        );
+        // Buffered is the field default, so omitting `execution` entirely
+        // must refuse the same way an explicit declaration does.
+        let omitted = replace_once(
+            AI_ROUTING_WASM_MANIFEST,
+            "    execution:\n      body_mode: none\n",
+            "",
+        );
+        for yaml in [explicit_buffered, omitted] {
+            let error = manifest_error(&yaml);
+            assert!(
+                error.contains("ai_routing") && error.contains("body_mode none"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ai_routing_hook_cannot_run_in_observe_mode() {
+        // Declining to return a plan already is the observe posture, so
+        // the mode would load cleanly and change nothing.
+        let yaml = replace_once(
+            AI_ROUTING_WASM_MANIFEST,
+            "    execution:",
+            "    enforcement_mode: observe\n    execution:",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("ai_routing") && error.contains("observe posture"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ai_routing_hook_cannot_declare_mutates() {
+        // Covered by the existing content-hook allowlist rather than a
+        // dedicated rule; asserted here so the routing invariant does not
+        // ride silently on that list.
+        let yaml = replace_once(
+            AI_ROUTING_WASM_MANIFEST,
+            "      body_mode: none",
+            "      body_mode: none\n      mutates: true",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("mutates is not supported for ai_routing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_javascript_rejects_ai_routing_hooks() {
+        // The kind refusal fires before the export requirement, so the
+        // converted hook does not need one.
+        let yaml = AI_ROUTING_WASM_MANIFEST
+            .replace(
+                "runtime: wasm\nabi: sbproxy-envelope/v1",
+                "runtime: javascript",
+            )
+            .replace("entry: dist/router.wasm", "entry: src/index.ts");
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("javascript") && error.contains("ai_routing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_proxy_wasm_rejects_ai_routing_hooks() {
+        // The proxy_wasm arm allows hooks by whitelist, so a new kind is
+        // refused without naming it; this assertion keeps that true.
+        let yaml = AI_ROUTING_WASM_MANIFEST
+            .replace("runtime: wasm", "runtime: proxy_wasm")
+            .replace("abi: sbproxy-envelope/v1", "abi: 0.2.1");
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("proxy_wasm may declare proxy_wasm or ai_stream_event hooks"),
+            "{error}"
+        );
     }
 }

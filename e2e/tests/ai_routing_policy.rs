@@ -529,3 +529,149 @@ fn a_rego_policy_reads_base_data_and_drives_the_plan() {
     );
     assert!(cheap.captured().is_empty(), "cheap must be untouched");
 }
+
+/// The envelope-WASM routing hook, end to end. The config's `extensions:`
+/// block loads a bundle whose `ai_routing` hook is the unit-level guest
+/// (`crates/sbproxy-extension/src/bundle/testdata/wasm/ai-routing-plan.wat`,
+/// committed alongside its compiled `.wasm`): it reads the `ai` document
+/// from stdin and answers with a plan naming `frontier` / `gpt-4o`, or
+/// declines with `plan: null` when the bytes `decline` appear in the input.
+/// A normal chat request carries no such bytes, so the plan fires. Wired ⇒
+/// frontier serves and cheap is untouched; a broken seam (hook unresolved,
+/// program not threaded, plan ignored) ⇒ decline ⇒ round_robin ⇒ cheap.
+const PLAN_ROUTER_WASM: &[u8] =
+    include_bytes!("../../crates/sbproxy-extension/src/bundle/testdata/wasm/ai-routing-plan.wasm");
+
+const PLAN_ROUTER_MANIFEST: &str = r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: plan-router
+version: 1.0.0
+runtime: wasm
+abi: sbproxy-envelope/v1
+entry: plan.wasm
+hooks:
+  - kind: ai_routing
+    type: plan_router
+    execution:
+      body_mode: none
+failure_posture: closed
+"#;
+
+fn wasm_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+extensions:
+  bundles_dir: bundles
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        engine: wasm
+        type: plan_router
+"#
+    )
+}
+
+#[test]
+fn a_wasm_bundle_policy_drives_the_plan_end_to_end() {
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let files = [
+        (
+            "bundles/plan-router/bundle.yaml",
+            PLAN_ROUTER_MANIFEST.as_bytes(),
+        ),
+        ("bundles/plan-router/plan.wasm", PLAN_ROUTER_WASM),
+    ];
+    let proxy = ProxyHarness::start_with_workspace_bytes(
+        &wasm_config(&cheap.base_url(), &frontier.base_url()),
+        &files,
+    )
+    .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "the wasm plan must dispatch to frontier"
+    );
+    assert!(cheap.captured().is_empty(), "cheap must be untouched");
+}
+
+/// A plan whose first candidate names a provider the origin does not
+/// configure (WOR-2366 D6): the dead tier is dropped with a warning and
+/// the cascade continues on the survivor rather than refusing the whole
+/// plan. `ghost` can dispatch nowhere, `frontier` can, so the request
+/// serves 200 via frontier and cheap stays untouched. The disposition is
+/// engine-independent runtime behavior, exercised through the CEL form
+/// for simplicity.
+fn ghost_plan_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        expression: |
+          {{"candidates": [{{"provider_id": "ghost", "model": "gpt-4o"}}, {{"provider_id": "frontier", "model": "gpt-4o"}}], "reason": "ghost tier first"}}
+"#
+    )
+}
+
+#[test]
+fn a_plan_dropping_an_unknown_provider_continues_on_the_survivor() {
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy =
+        ProxyHarness::start_with_yaml(&ghost_plan_config(&cheap.base_url(), &frontier.base_url()))
+            .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(
+        resp.status, 200,
+        "an unknown candidate must be dropped, not refuse the plan"
+    );
+    assert!(
+        !frontier.captured().is_empty(),
+        "the surviving candidate must serve"
+    );
+    assert!(cheap.captured().is_empty(), "cheap must be untouched");
+}

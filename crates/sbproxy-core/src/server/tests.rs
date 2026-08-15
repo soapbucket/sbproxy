@@ -4527,10 +4527,15 @@ fn the_audit_record_names_the_same_engine_the_metric_does() {
         std::time::Instant::now(),
     );
     let mut ours = None;
-    while let Ok(event) = rx.try_recv() {
-        if event.request_id == "req-3" {
-            ours = Some(event);
-            break;
+    // The bus carries both policy verdicts and decision-family audit
+    // records, so a record that is not a verdict is somebody else's
+    // traffic and is skipped rather than failing the read.
+    while let Ok(record) = rx.try_recv() {
+        if let super::super::policy_bus::AuditRecord::PolicyVerdict(event) = record {
+            if event.request_id == "req-3" {
+                ours = Some(event);
+                break;
+            }
         }
     }
     let event = ours.expect(

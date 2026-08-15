@@ -1256,6 +1256,23 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
     }
 }
 
+/// Whether this pipeline publishes audit records for `event`.
+///
+/// One reader for the compiled block so no emitting site re-derives the
+/// precedence: an absent block publishes nothing, and the per-event
+/// versus master-switch order lives on the config type itself
+/// (WOR-2405).
+fn audit_publishes(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    event: sbproxy_observe::decision::DecisionEvent,
+) -> bool {
+    pipeline
+        .config
+        .decision_audit
+        .as_ref()
+        .is_some_and(|cfg| cfg.publishes(event.as_label()))
+}
+
 /// Run the origin's `cache.admit` event, or return the static default.
 ///
 /// The returned plan is always usable: a declined event, an absent one,
@@ -1357,17 +1374,36 @@ fn evaluate_cache_admit(
                 default
             }
             Ok(CacheDecision::Plan(plan)) => {
+                let outcome = if plan.store {
+                    DecisionOutcome::Allow
+                } else {
+                    DecisionOutcome::Deny
+                };
                 record_decision(
                     DecisionEvent::CacheAdmit,
                     engine,
-                    if plan.store {
-                        DecisionOutcome::Allow
-                    } else {
-                        DecisionOutcome::Deny
-                    },
+                    outcome,
                     origin,
                     &ctx.tenant_id,
                 );
+                // WOR-2405: the reason the script gave is the payload. A
+                // record saying a response was not cached is nearly
+                // useless; one naming the rule and why is an
+                // investigation. Publishing is opt-in per event, so this
+                // costs a config read on a path that already did an
+                // engine evaluation.
+                if audit_publishes(&pipeline, DecisionEvent::CacheAdmit) {
+                    crate::policy_bus::emit_decision_audit(
+                        DecisionEvent::CacheAdmit,
+                        engine,
+                        outcome,
+                        &ctx.request_id,
+                        origin,
+                        &ctx.hostname,
+                        &ctx.tenant_id,
+                        &plan.reason,
+                    );
+                }
                 plan
             }
             Err(error) => {
@@ -8525,5 +8561,288 @@ origins:
 
         assert!(realized.is_none());
         assert!(ctx.pending_compression_value.is_none());
+    }
+
+    // --- The decision-audit gate (WOR-2405) ---
+
+    /// One static origin, so every `decision_audit` fixture below has
+    /// something to compile around.
+    const AUDIT_ORIGIN_YAML: &str = r#"
+origins:
+  "api.example.com":
+    action:
+      type: static
+      body: placeholder
+"#;
+
+    /// Compile a `proxy:` block plus [`AUDIT_ORIGIN_YAML`] into a
+    /// pipeline. An empty `proxy_yaml` is the config of an operator who
+    /// never wrote the key at all.
+    ///
+    /// Validation mode because these fixtures are read and dropped:
+    /// `audit_publishes` only asks the compiled config a question, so
+    /// there is nothing here that wants a cache directory or a
+    /// background task.
+    fn audit_pipeline(proxy_yaml: &str) -> CompiledPipeline {
+        let config = sbproxy_config::compile_config(&format!("{proxy_yaml}{AUDIT_ORIGIN_YAML}"))
+            .expect("fixture config");
+        CompiledPipeline::from_config_for_validation(config).expect("fixture pipeline")
+    }
+
+    #[test]
+    fn an_absent_decision_audit_block_publishes_nothing() {
+        use sbproxy_observe::decision::DecisionEvent;
+
+        // The default every deployment that has not asked for an audit
+        // feed is running. `audit_publishes` is the only read of the
+        // compiled block anywhere in this workspace, so a version that
+        // answered `true` here would turn a per-request SIEM feed on for
+        // everybody and every other test in this file would stay green.
+
+        // No `proxy:` block at all.
+        let never_written = audit_pipeline("");
+        // A log block that mentions everything except the audit key.
+        let log_without_audit = audit_pipeline(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      level: info
+"#,
+        );
+
+        for event in [
+            DecisionEvent::CacheAdmit,
+            DecisionEvent::CacheKey,
+            DecisionEvent::RouteDecide,
+            DecisionEvent::Policy,
+        ] {
+            assert!(
+                !audit_publishes(&never_written, event),
+                "a config with no decision_audit block publishes nothing, and `{}` is not \
+                 an exception",
+                event.as_label()
+            );
+            assert!(
+                !audit_publishes(&log_without_audit, event),
+                "a log block that never mentions decision_audit must not synthesize one; \
+                 `{}` stays off",
+                event.as_label()
+            );
+        }
+    }
+
+    #[test]
+    fn audit_publishes_reads_the_precedence_the_config_type_defines() {
+        use sbproxy_observe::decision::DecisionEvent;
+
+        // The gate that stands in front of the chokepoint. Three
+        // readings have to survive the seam: the master switch reaches
+        // an event the `events:` map does not name, a per-event entry
+        // wins over the master switch in both directions, and
+        // `ai.stream.event` stays off however the block is written.
+        // Getting any of them wrong here would silence a feed the
+        // operator turned on, or bill them for one they did not.
+
+        let master_on = audit_pipeline(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+"#,
+        );
+        assert!(
+            audit_publishes(&master_on, DecisionEvent::CacheAdmit),
+            "the master switch has to reach an event the events map does not name"
+        );
+        assert!(
+            !audit_publishes(&master_on, DecisionEvent::AiStreamEvent),
+            "`ai.stream.event` fires once per streamed chunk and never publishes, whatever \
+             the master switch says"
+        );
+
+        let per_event_only = audit_pipeline(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        events:
+          cache.admit: true
+"#,
+        );
+        assert!(
+            audit_publishes(&per_event_only, DecisionEvent::CacheAdmit),
+            "a per-event entry publishes without a master switch"
+        );
+        assert!(
+            !audit_publishes(&per_event_only, DecisionEvent::RouteDecide),
+            "an unset master switch is off, so naming one event must not turn on the rest"
+        );
+
+        let event_opted_out = audit_pipeline(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+        events:
+          cache.admit: false
+"#,
+        );
+        assert!(
+            !audit_publishes(&event_opted_out, DecisionEvent::CacheAdmit),
+            "a per-event `false` wins over the master switch"
+        );
+        assert!(
+            audit_publishes(&event_opted_out, DecisionEvent::RouteDecide),
+            "silencing one event must not silence the master switch for the others"
+        );
+    }
+
+    /// A **wildcard** origin, so the configured origin id and the
+    /// request's `Host` are different strings.
+    ///
+    /// `CompiledOrigin::origin_id` is built from the origin's config
+    /// key, so in every non-wildcard config the two hold the same bytes
+    /// and a swap at the emit site is invisible. A wildcard key is the
+    /// one shape where they diverge: the id is the pattern, the `Host`
+    /// is a concrete name under it.
+    ///
+    /// The script refuses the store so the emit site runs on the arm
+    /// that publishes, and its `reason` is what the record has to carry.
+    const WILDCARD_AUDIT_ORIGIN_YAML: &str = r#"
+origins:
+  "*.wildcard.example":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    response_cache:
+      enabled: true
+      admit_event:
+        engine: lua
+        source: "return {store = false, reason = 'declined by rule R-7'}"
+"#;
+
+    /// A context for [`WILDCARD_AUDIT_ORIGIN_YAML`] whose `Host` is a
+    /// concrete name under the pattern.
+    fn wildcard_admit_ctx(proxy_yaml: &str, request_id: &str) -> RequestContext {
+        let config =
+            sbproxy_config::compile_config(&format!("{proxy_yaml}{WILDCARD_AUDIT_ORIGIN_YAML}"))
+                .expect("fixture config");
+        let pipeline =
+            CompiledPipeline::from_config_for_validation(config).expect("fixture pipeline");
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.hostname = compact_str::CompactString::new("api.wildcard.example");
+        ctx.tenant_id = compact_str::CompactString::new("acme-corp");
+        ctx.request_id = compact_str::CompactString::new(request_id);
+        ctx.request_path = compact_str::CompactString::new("/v1/thing");
+        ctx
+    }
+
+    #[test]
+    fn the_emit_site_names_the_origin_id_and_publishes_only_when_the_config_asks() {
+        // The call site, driven end to end. Everything else about this
+        // family can be green with the six lines in `evaluate_cache_admit`
+        // deleted: the constructor has tests, the bus has tests, the
+        // config parser has tests, and `audit_publishes` now has tests.
+        // This is the one that reads a record off the bus that only the
+        // emit site could have put there.
+        //
+        // Two properties, and the first is the transposition
+        // `RedactedReason::redact`'s rustdoc warns about. `origin_id`
+        // names the record; `route` picks the operator's PII scope.
+        // Hand them over the wrong way round and the record still
+        // publishes, still validates, still reaches the SIEM, and the
+        // origin-scoped redactor is silently skipped. The wildcard
+        // fixture is what makes the swap observable at all.
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        // A sibling test in this binary may have installed a bus first.
+        // Under nextest, which is how the gate and CI run this lane,
+        // each test is its own process and this one wins.
+        let _ = crate::policy_bus::init_global_bus(bus);
+
+        let ctx = wildcard_admit_ctx(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        events:
+          cache.admit: true
+"#,
+            "req-wildcard-audit-on",
+        );
+        let plan = evaluate_cache_admit(&ctx, 200, &[], 2);
+        assert!(
+            !plan.store,
+            "the fixture script refuses the store, so the emit site runs on the arm that \
+             publishes"
+        );
+
+        // The bus carries policy verdicts as well, so a record that is
+        // not our decision is somebody else's traffic and is skipped
+        // rather than failing the read.
+        let mut ours = None;
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-wildcard-audit-on" {
+                    ours = Some(audit);
+                    break;
+                }
+            }
+        }
+        let audit = ours.expect(
+            "a config that names cache.admit has to publish; a silent miss here is exactly \
+             the hole this test exists to close",
+        );
+
+        assert_eq!(
+            audit.origin, "*.wildcard.example",
+            "the record carries the configured origin id. `api.wildcard.example` here means \
+             the emit site was handed `ctx.hostname` in the `origin_id` slot, which also \
+             hands the origin id to `route` and silently skips the operator's origin-scoped \
+             PII rules"
+        );
+        assert_eq!(audit.tenant, "acme-corp");
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::CacheAdmit
+        );
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny,
+            "a refused store is a Deny, and the metric and the record have to agree"
+        );
+        assert!(
+            audit.reason.as_str().contains("declined by rule R-7"),
+            "the script's rationale is the payload; a record that only says a response was \
+             not cached is not an investigation: {}",
+            audit.reason.as_str()
+        );
+
+        // And the gate is read here rather than only in isolation. Same
+        // origin, same script, no `decision_audit:` block anywhere.
+        let ctx = wildcard_admit_ctx("", "req-wildcard-audit-off");
+        let plan = evaluate_cache_admit(&ctx, 200, &[], 2);
+        assert!(
+            !plan.store,
+            "the cache decision itself does not depend on whether it is audited"
+        );
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert_ne!(
+                    audit.request_id, "req-wildcard-audit-off",
+                    "a config with no decision_audit block published a record anyway"
+                );
+            }
+        }
     }
 }

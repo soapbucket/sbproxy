@@ -2865,6 +2865,45 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Policy decisions emitted on the audit event bus, labeled by verdict, surface, and policy_id.",
         dead_reason: None,
     },
+    // The decision-audit pair, sitting beside the policy-audit pair it is
+    // modeled on rather than being folded into it. Widening
+    // sbproxy_policy_audit_events_dropped_total with an `event` label would
+    // have changed a Stable family's label set, which every dashboard and
+    // alert rule selecting on it would have to be rewritten for. Two new
+    // names at Alpha compat is the cheaper half of that trade.
+    MetricCapability {
+        name: "sbproxy_decision_audit_events_dropped_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_decision_audit_dropped"),
+        support: SupportLevel::Stable,
+        // Alpha, not Beta: the family is new in this release and the
+        // decision-audit surface it reports on is still settling, which is
+        // where the sibling sbproxy_decision_event_* families sit for the
+        // same reason. Beta would promise a name we have not lived with.
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["event", "tenant"],
+        description: "Decision audit records dropped before publication, by decision event and tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_decision_audit_events_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_decision_audit_emitted"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        // No `tenant`, deliberately, and the asymmetry with the drop
+        // counter above is the design. A drop has to be attributable to a
+        // tenant or an operator cannot act on it. An emit does not: this
+        // counter answers what shape the feed has, the tenant cut is
+        // already carried by the drop counter and by
+        // sbproxy_decision_event_total, and event x outcome x tenant would
+        // multiply the label budget for the dense half of the pair.
+        labels: &["event", "outcome"],
+        description: "Decision audit records published on the audit bus, by decision event and outcome.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_policy_decision_duration_seconds",
         kind: MetricKind::Histogram,
@@ -3441,6 +3480,10 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_ai_tokens_saved_total",
     "sbproxy_capture_budget_dropped_total",
     "sbproxy_capture_dropped_total",
+    // WOR-2405. Same reason as the policy-audit drop counter further
+    // down: the question this answers is whose audit trail lost
+    // records, and merged across tenants it cannot answer it at all.
+    "sbproxy_decision_audit_events_dropped_total",
     // WOR-2165. An egress refusal is a security verdict about one
     // tenant's outbound traffic. Merged across tenants it answers
     // "something was refused somewhere", which is not a question an
@@ -3840,7 +3883,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-12*\n\n\
+         *Last modified: 2026-08-15*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

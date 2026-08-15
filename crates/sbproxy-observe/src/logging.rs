@@ -661,7 +661,14 @@ impl OpRedactState {
     /// entry at all inherits the next scope up. Returns `None` when
     /// no scope has a redactor installed or the most-specific scope
     /// explicitly opted out.
-    pub fn resolve_pii(
+    ///
+    /// Deliberately not public (WOR-2405). This is one of three scrub
+    /// passes, and an outside caller reaching for it alone gets PII
+    /// rules without the operator's `redact.patterns:` masks, which is
+    /// the exact defect that shipped and had to be fixed here. Callers
+    /// outside this module want [`Self::redact_free_text`], which runs
+    /// the whole sequence in the order the log path runs it.
+    fn resolve_pii(
         &self,
         tenant_id: Option<&str>,
         route: Option<&str>,
@@ -718,6 +725,64 @@ impl OpRedactState {
         }
         &self.patterns
     }
+
+    /// Scrub one bare free-text string for a (tenant, route) scope.
+    ///
+    /// [`apply_redaction_for`] is the chokepoint for anything shaped like
+    /// a rendered log line. This is the chokepoint for the other case: a
+    /// single untrusted string that is about to be embedded in a record
+    /// built somewhere else, where there is no JSON document to walk. The
+    /// decision-audit `reason` (WOR-2405) is the caller that motivated it,
+    /// because that string is written by an operator-authored Lua, JS, or
+    /// CEL hook and lands in a customer's SIEM.
+    ///
+    /// Three passes, in the same order [`apply_redaction_for`] runs them:
+    ///
+    /// 1. [`crate::redact::redact_secrets`], the config-free floor for
+    ///    known credential shapes. Unconditional, so a deployment with no
+    ///    `redact:` block still cannot ship a Bearer token.
+    /// 2. The operator's `redact.patterns:` regex masks for this scope,
+    ///    resolved through [`Self::resolve_patterns`] (origin, then
+    ///    tenant, then proxy).
+    /// 3. The operator's PII rules for this scope, resolved the same
+    ///    way (origin, then tenant, then proxy). An explicit opt-out at
+    ///    a more-specific scope skips the pass, exactly as it does on
+    ///    the log path.
+    ///
+    /// ## The field-key denylist is deliberately not run
+    ///
+    /// [`apply_redaction_for`]'s second pass matches JSON *field keys*
+    /// against the built-in baseline plus the operator's
+    /// `redact.fields:` additions. A bare string has no field key, so
+    /// there is nothing for that pass to match on and running it would
+    /// mean inventing a key the caller never wrote. A caller that holds a
+    /// key/value pair and wants the denylist applied should render it as
+    /// JSON and go through [`apply_redaction_for`] instead.
+    ///
+    /// ## Do not truncate before calling this
+    ///
+    /// Every detection pattern in passes 1 and 2 needs a minimum body
+    /// length: `Bearer [a-zA-Z0-9._\-]{20,}` needs twenty characters
+    /// after the keyword. A caller that bounds the string first can cut a
+    /// token below that length, the pattern then stops matching, and the
+    /// surviving prefix of a live credential ships as ordinary text. Pass
+    /// the full string here and apply any length bound to the result.
+    ///
+    /// ## Picking the arguments
+    ///
+    /// `route` is the route string the log emitter stamps on
+    /// [`StructuredLog::route`], which today is the origin's **hostname**.
+    /// It is not necessarily a configured origin id, and passing the id
+    /// where the hostname is expected silently skips the origin-scope
+    /// rules. Pass `None` for a scope the caller genuinely does not have
+    /// rather than a guess: `None` falls through to the next scope up,
+    /// while a wrong key falls through to proxy scope having quietly
+    /// skipped the rules the operator wrote for the real one.
+    pub fn redact_free_text(&self, tenant: Option<&str>, route: Option<&str>, raw: &str) -> String {
+        let floor = crate::redact::redact_secrets(raw);
+        let patterns = self.resolve_patterns(tenant, route);
+        apply_op_regex_patterns_with(&floor, tenant, route, patterns, self)
+    }
 }
 
 static OP_REDACT_STATE: OnceLock<std::sync::RwLock<std::sync::Arc<OpRedactState>>> =
@@ -745,6 +810,23 @@ fn op_redact_state() -> std::sync::Arc<OpRedactState> {
     lock.read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| std::sync::Arc::new(OpRedactState::empty()))
+}
+
+/// The installed operator redaction state, for emitters outside this
+/// module that must scrub a string before it leaves the process.
+///
+/// The decision-audit path (WOR-2405) is the first such caller: a
+/// `reason` string comes from operator-authored script text, so it is
+/// scrubbed with [`OpRedactState::redact_free_text`] for the request's
+/// scope before it reaches a customer's log store. That method is the
+/// only scrub entry point this module exposes, and it is the whole
+/// sequence rather than any one pass of it: the earlier draft of this
+/// path resolved the PII rules alone and silently skipped every
+/// `redact.patterns:` mask the operator had written. Returns an owned handle because the state is
+/// swapped whole on config reload; hold it only for the length of one
+/// scrub.
+pub fn operator_redact_state() -> std::sync::Arc<OpRedactState> {
+    op_redact_state()
 }
 
 /// Apply the denylist + per-sink overrides to an in-progress JSON
@@ -817,12 +899,18 @@ pub fn apply_redaction_for(
 /// entirely.
 /// WOR-1042: variant that takes a pre-resolved pattern slice and state
 /// snapshot so `apply_redaction_for` does not re-resolve per call.
+///
+/// WOR-2405: shared with [`OpRedactState::redact_free_text`], which is
+/// why it takes `&OpRedactState` rather than the `Arc` the log path
+/// happens to hold. It is the string-level half of the pipeline, so a
+/// caller with no JSON document gets the same two passes rather than a
+/// second copy of the loop that can drift from this one.
 fn apply_op_regex_patterns_with(
     input: &str,
     tenant_id: Option<&str>,
     route: Option<&str>,
     patterns: &[(regex::Regex, String)],
-    state: &std::sync::Arc<OpRedactState>,
+    state: &OpRedactState,
 ) -> String {
     let needs_regex = !patterns.is_empty();
     let pii = state.resolve_pii(tenant_id, route);

@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-15*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -286,6 +286,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_plugin_registered_total` | Counter | `stable` | `beta` | `kind`, `plugin` | Known plugin registrations, by kind and plugin name. |
 | `sbproxy_policy_audit_events_dropped_total` | Counter | `stable` | `beta` | `tenant` | Policy verdict audit events dropped because the bus queue was full. |
 | `sbproxy_policy_audit_events_total` | Counter | `stable` | `beta` | `verdict`, `surface`, `policy_id` | Policy decisions emitted on the audit event bus, labeled by verdict, surface, and policy_id. |
+| `sbproxy_decision_audit_events_dropped_total` | Counter | `stable` | `alpha` | `event`, `tenant` | Decision audit records dropped before publication, by decision event and tenant. |
+| `sbproxy_decision_audit_events_total` | Counter | `stable` | `alpha` | `event`, `outcome` | Decision audit records published on the audit bus, by decision event and outcome. |
 | `sbproxy_policy_decision_duration_seconds` | Histogram | `stable` | `beta` | `surface` | Wall-clock latency of policy decisions. |
 | `sbproxy_policy_evaluation_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `verdict` | Wall-clock latency of one full policy-chain evaluation. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |

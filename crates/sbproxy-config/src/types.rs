@@ -5936,6 +5936,163 @@ pub struct ObservabilityLogConfig {
     /// overriding a less-specific field of the same `name`.
     #[serde(default)]
     pub custom_fields: Vec<CustomLogFieldConfig>,
+    /// Decision-event audit publication. Absent means off, which is
+    /// also what `enabled: false` means: no decision event publishes an
+    /// audit record at this scope.
+    #[serde(default)]
+    pub decision_audit: Option<DecisionAuditConfig>,
+}
+
+/// Operator control over which decision events publish an audit record.
+///
+/// Every decision point in the pipeline (cache admission, cache-key
+/// derivation, routing, auth, policy) already produces a `reason` string
+/// saying what it decided and why. This block is what turns that
+/// rationale into an OCSF audit record instead of letting it be decoded
+/// and dropped.
+///
+/// ```yaml
+/// observability:
+///   log:
+///     decision_audit:
+///       enabled: true
+///       events:
+///         cache.admit: true
+/// ```
+///
+/// Proxy scope only in this release. The tenant and origin log blocks
+/// deny unknown fields and carry no `decision_audit` key, so a block
+/// written under either one fails config load rather than composing or
+/// being ignored. When scoping does land it will compose the way
+/// `custom_fields` does, per key rather than per block: a more-specific
+/// scope naming one event must not wipe the entries a less-specific
+/// scope set for the others.
+///
+/// # This block is the only thing that decides what publishes
+///
+/// No event carries a default of its own. Every label is off until a
+/// setting here says otherwise, and there is nowhere else to look. An
+/// earlier draft kept a second per-event default outside the config,
+/// which is how an operator ends up believing a feed is on: the two
+/// disagreed, and the one nothing consulted was the one that read as
+/// authoritative.
+///
+/// The security ordering behind that draft is worth keeping, as the
+/// shape a later release should default on once the events have
+/// emitters. `auth`, `policy`, `rate_limit`, `waf`, both AI guardrail
+/// events, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle` are the
+/// security-relevant ones, and an operator who can afford only part of
+/// the feed wants those. `cache.key` is security-relevant and also the
+/// densest event in the set, once per cacheable request, so it stays an
+/// explicit opt-in rather than riding a default. `route.decide` is
+/// worth publishing when a decision crosses a provider or
+/// data-residency boundary and is noise otherwise, which is a question
+/// about the decision rather than about the event, so it needs the
+/// routing event config to carry that predicate before any default for
+/// it means anything.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionAuditConfig {
+    /// Master switch for the block. `Some(true)` publishes every event
+    /// the `events` map does not name, except `ai.stream.event`, which
+    /// is never published by any setting; `Some(false)` and `None` are
+    /// both **off**, as is an absent block.
+    ///
+    /// `proxy.observability.log.decision_audit` is the only place this
+    /// block is accepted in this release. The tenant and origin log
+    /// blocks deny unknown fields and carry no `decision_audit` key, so
+    /// writing one there fails config load with an `unknown field`
+    /// error rather than being read or quietly ignored. Scoped
+    /// overrides land in a later slice, and until they do there is no
+    /// parent for `None` to inherit from, which is why it reads as off
+    /// rather than as inherit.
+    ///
+    /// Off is the default because the decision events differ by orders
+    /// of magnitude in how often they fire. `cache.key` runs once per
+    /// cacheable request, so a master switch with permissive defaults
+    /// would hand an operator a per-request SIEM feed on their busiest
+    /// origin the moment they flipped it. That is an ingest bill rather
+    /// than a control, and the usual answer to a feed nobody can afford
+    /// is to turn the whole thing off, which takes the
+    /// security-relevant events with it. Opting in per event costs one
+    /// line and keeps that choice available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Per-event override of the master switch, keyed by the event's
+    /// stable label
+    /// ([`sbproxy_observe::decision::DecisionEvent::as_label`]):
+    /// `cache.admit`, `cache.key`, `route.decide`, `auth`, `policy`,
+    /// and the rest. `true` publishes that event's records, `false`
+    /// silences it. An event this map does not name falls back to the
+    /// master switch.
+    ///
+    /// A key naming no known event is refused at config load rather
+    /// than ignored, because a typo'd label is a feed the operator
+    /// believes they turned on and nobody is watching.
+    /// `ai.stream.event: true` is refused by value for the same reason
+    /// the block defaults off: that event fires once per streamed
+    /// chunk. `ai.close` carries the stream's summary instead. That one
+    /// label is also the single exception to the fallback above: it
+    /// never publishes, master switch or not.
+    ///
+    /// A `BTreeMap` rather than a `HashMap`, matching `custom_fields`:
+    /// the composed set is iterated to resolve the emission policy, and
+    /// a hash order would make two proxies holding identical config
+    /// walk it differently.
+    #[serde(default)]
+    pub events: std::collections::BTreeMap<String, bool>,
+}
+
+impl DecisionAuditConfig {
+    /// Whether records for `event_label` should be published.
+    ///
+    /// The one place the precedence lives, so no emitting site can read
+    /// the two fields in its own order: a per-event entry wins outright,
+    /// otherwise the master switch decides, and an absent master switch
+    /// is off. An absent block is off too, which is why this is a method
+    /// on the config rather than on an `Option` wrapper: a caller with
+    /// no block written cannot accidentally get a permissive default out
+    /// of it.
+    ///
+    /// One event sits outside that table.
+    /// [`sbproxy_observe::decision::DecisionEvent::AiStreamEvent`]
+    /// (`ai.stream.event`) always answers `false`, whatever the master
+    /// switch says, because it fires once per streamed chunk. See the
+    /// comment in the body.
+    ///
+    /// This method is also the only typed read of `enabled` and `events`
+    /// in the workspace, so it is what satisfies the config-reader guard
+    /// for both keys: their names are ambiguous enough that the scanner
+    /// cannot attribute a read anywhere else. Inlining it into the
+    /// emitting sites would turn that guard red and hand every site its
+    /// own copy of the precedence.
+    #[must_use]
+    pub fn publishes(&self, event_label: &str) -> bool {
+        use sbproxy_observe::decision::DecisionEvent;
+
+        // `ai.stream.event` is off by construction, ahead of both the
+        // per-event map and the master switch. It fires once per streamed
+        // chunk, so a per-event audit record is an ingest bill rather
+        // than a control; `ai.close` carries the same stream's summary
+        // once the response finishes.
+        //
+        // The load-time refusal in `validate_decision_audit` covers
+        // `events: {ai.stream.event: true}` and stays, because config
+        // asking for a feed it cannot have should fail loudly rather
+        // than be silently ignored. What it cannot cover is the master
+        // switch: `enabled: true` with no `events:` map names no event,
+        // compiles clean, and would fall through to `unwrap_or` here and
+        // turn the per-chunk feed on for any caller. Refusing the label
+        // in the one place the precedence lives makes it unreachable for
+        // every emitter, including the ones that do not exist yet.
+        if event_label == DecisionEvent::AiStreamEvent.as_label() {
+            return false;
+        }
+        if let Some(explicit) = self.events.get(event_label) {
+            return *explicit;
+        }
+        self.enabled.unwrap_or(false)
+    }
 }
 
 /// One operator-defined custom access-log field.
@@ -8577,6 +8734,213 @@ telemetry:
         assert_eq!(
             telemetry.resource_attrs.get("deployment.environment"),
             Some(&"dev".to_string())
+        );
+    }
+
+    #[test]
+    fn decision_audit_is_absent_when_the_operator_does_not_ask_for_it() {
+        let yaml = r#"
+log:
+  level: info
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let log = obs.log.expect("log block parses");
+        assert!(
+            log.decision_audit.is_none(),
+            "a log block that never mentions decision_audit must not synthesize one; the audit \
+             feed stays off until somebody asks for it"
+        );
+    }
+
+    #[test]
+    fn decision_audit_parses_a_per_event_toggle() {
+        let yaml = r#"
+log:
+  decision_audit:
+    enabled: true
+    events:
+      cache.admit: true
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let audit = obs
+            .log
+            .expect("log block parses")
+            .decision_audit
+            .expect("decision_audit block parses");
+        assert_eq!(audit.enabled, Some(true));
+        assert_eq!(audit.events.get("cache.admit"), Some(&true));
+    }
+
+    /// An unset master switch parses as `None`, not `Some(false)`. Both
+    /// resolve to off today, since proxy is the only scope that accepts
+    /// the block and there is no parent to inherit from. The
+    /// distinction is kept in the type because it is what a later
+    /// tenant/origin slice needs: `None` inherits and `Some(false)`
+    /// overrides, the same shape `ObservabilityPiiConfig::enabled`
+    /// carries.
+    #[test]
+    fn decision_audit_leaves_an_unset_master_switch_as_none() {
+        let yaml = r#"
+log:
+  decision_audit:
+    events:
+      cache.admit: true
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let audit = obs
+            .log
+            .expect("log block parses")
+            .decision_audit
+            .expect("decision_audit block parses");
+        assert_eq!(audit.enabled, None);
+    }
+
+    /// Parse a proxy-scoped `decision_audit` block out of a `log:` YAML
+    /// fragment, the way the neighboring parse tests do. Going through
+    /// serde rather than building the struct by hand keeps these tests
+    /// on the operator's surface: a field renamed in the schema fails
+    /// them here rather than passing against a literal nobody writes.
+    fn parse_decision_audit(yaml: &str) -> DecisionAuditConfig {
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        obs.log
+            .expect("log block parses")
+            .decision_audit
+            .expect("decision_audit block parses")
+    }
+
+    /// No block at all publishes nothing. Asserted through the same
+    /// `Option` shape the request path uses (`audit_publishes` in
+    /// `sbproxy-core`), because that is where the absent case is
+    /// decided: `publishes` is never reached, so a permissive default
+    /// could only arrive by a caller writing `unwrap_or_default()`
+    /// there.
+    #[test]
+    fn decision_audit_absent_block_publishes_nothing() {
+        let audit: Option<DecisionAuditConfig> = None;
+        assert!(
+            !audit
+                .as_ref()
+                .is_some_and(|cfg| cfg.publishes("cache.admit")),
+            "a config with no decision_audit block must publish no records"
+        );
+    }
+
+    /// An unset master switch with an empty `events` map is off. This is
+    /// the shape a config lands in after somebody deletes the last
+    /// per-event entry, and it must not read as "everything".
+    #[test]
+    fn decision_audit_unset_master_switch_publishes_nothing() {
+        let audit = parse_decision_audit(
+            r#"
+log:
+  decision_audit: {}
+"#,
+        );
+        assert_eq!(audit.enabled, None);
+        assert!(
+            !audit.publishes("cache.admit"),
+            "an unset master switch with no per-event entry is off"
+        );
+    }
+
+    /// `enabled: true` with no `events:` map turns on every event the
+    /// map does not name, with exactly one exception: `ai.stream.event`
+    /// fires once per streamed chunk and is off by construction. The
+    /// exception is the reason `publishes` refuses the label itself
+    /// rather than leaving it to the load-time validator, which only
+    /// ever sees the `events` map and so cannot see this config at all.
+    #[test]
+    fn decision_audit_master_switch_spares_the_per_chunk_stream_event() {
+        let audit = parse_decision_audit(
+            r#"
+log:
+  decision_audit:
+    enabled: true
+"#,
+        );
+        assert!(
+            audit.events.is_empty(),
+            "the fixture must exercise the master switch alone"
+        );
+        assert!(
+            audit.publishes("cache.admit"),
+            "the master switch turns on an event the map does not name"
+        );
+        assert!(
+            audit.publishes("ai.close"),
+            "the stream summary event is a normal event under the master switch"
+        );
+        assert!(
+            !audit.publishes("ai.stream.event"),
+            "the per-chunk stream event must stay off under the master switch; \
+             `ai.close` carries the summary instead"
+        );
+    }
+
+    /// A per-event `true` wins over a `false` master switch, and turns
+    /// on only the event it names.
+    #[test]
+    fn decision_audit_per_event_true_beats_a_false_master_switch() {
+        let audit = parse_decision_audit(
+            r#"
+log:
+  decision_audit:
+    enabled: false
+    events:
+      cache.admit: true
+"#,
+        );
+        assert!(
+            audit.publishes("cache.admit"),
+            "the per-event entry wins over the master switch"
+        );
+        assert!(
+            !audit.publishes("route.decide"),
+            "an event the map does not name follows the master switch, which is off"
+        );
+    }
+
+    /// And a per-event `false` wins over a `true` master switch, so the
+    /// override works in both directions rather than only as an opt-in.
+    #[test]
+    fn decision_audit_per_event_false_beats_a_true_master_switch() {
+        let audit = parse_decision_audit(
+            r#"
+log:
+  decision_audit:
+    enabled: true
+    events:
+      cache.admit: false
+"#,
+        );
+        assert!(
+            !audit.publishes("cache.admit"),
+            "the per-event entry silences the event the master switch would have turned on"
+        );
+        assert!(
+            audit.publishes("route.decide"),
+            "silencing one event must not silence the rest"
+        );
+    }
+
+    /// Writing the per-chunk event's `false` down is legal and answers
+    /// the same way the refusal does. An operator recording that a feed
+    /// is off should not get a different answer from one who never
+    /// mentioned it.
+    #[test]
+    fn decision_audit_explicit_stream_event_false_stays_off() {
+        let audit = parse_decision_audit(
+            r#"
+log:
+  decision_audit:
+    enabled: true
+    events:
+      ai.stream.event: false
+"#,
+        );
+        assert!(
+            !audit.publishes("ai.stream.event"),
+            "an explicitly silenced per-chunk feed stays silent"
         );
     }
 

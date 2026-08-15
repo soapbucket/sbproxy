@@ -250,6 +250,7 @@ mod tests {
             l2_store: None,
             mesh: None,
             access_log: None,
+            decision_audit: None,
             agent_classes: None,
             rate_limits: None,
             audit: None,

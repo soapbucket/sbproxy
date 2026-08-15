@@ -107,8 +107,10 @@ pub enum DecisionEvent {
     AiToolCall,
     /// One streamed chunk was inspected.
     ///
-    /// Fires per chunk. Never emits a per-event audit record; see
-    /// [`DecisionEvent::emits_audit_by_default`].
+    /// Fires per chunk, so it never publishes an audit record whatever
+    /// the operator configures. `ai.close` carries the stream's summary
+    /// once instead; a per-chunk SIEM feed is an ingest bill rather than
+    /// a control.
     AiStreamEvent,
     /// A streamed response finished and its aggregates were reported.
     AiClose,
@@ -180,46 +182,6 @@ impl DecisionEvent {
     /// an operator names events to scope audit emission.
     pub fn from_label(label: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|e| e.as_label() == label)
-    }
-
-    /// Whether this event emits a SIEM audit record when the operator
-    /// has not said otherwise.
-    ///
-    /// Defaulting by security relevance rather than blanket-on, because
-    /// an audit feed nobody can afford to ingest gets turned off whole,
-    /// and then the security-relevant events go with it.
-    ///
-    /// [`Self::AiStreamEvent`] is the one event that is never on by
-    /// default and cannot usefully be: it fires per chunk, so a
-    /// per-event SIEM feed is an ingest bill rather than a control.
-    /// Aggregate at [`Self::AiClose`] instead.
-    ///
-    /// [`Self::RouteDecide`] is the interesting middle case. It is worth
-    /// emitting when a decision crosses a provider or data-residency
-    /// boundary and is noise otherwise, which is a predicate over the
-    /// decision rather than a property of the event. It defaults off and
-    /// the routing event config carries the predicate.
-    pub const fn emits_audit_by_default(self) -> bool {
-        match self {
-            Self::Auth
-            | Self::Policy
-            | Self::RateLimit
-            | Self::Waf
-            | Self::AiGuardrailInput
-            | Self::AiGuardrailOutput
-            | Self::AiToolCall
-            | Self::CacheKey
-            | Self::McpTool
-            | Self::PaymentLifecycle => true,
-            Self::CacheAdmit
-            | Self::RouteDecide
-            | Self::AiStreamEvent
-            | Self::AiClose
-            | Self::AiFailure
-            | Self::Transform
-            | Self::Action
-            | Self::LogCustomField => false,
-        }
     }
 
     /// OCSF `activity_id` for this event on the API Activity class.
@@ -508,6 +470,174 @@ pub fn record_decision_fail_open(
         .inc();
 }
 
+/// A decision rationale that has already been through the scrub.
+///
+/// [`DecisionAudit::reason`] is this type rather than a `String` so
+/// "already redacted" is something the compiler checks instead of
+/// something a doc comment asks for. There is exactly one way to build
+/// one, [`RedactedReason::redact`], and it runs the scrub. There is
+/// deliberately no `new` and no `From<String>`: either would be a second
+/// door into the type with none of the guarantee behind it, and the
+/// guarantee is the only reason the type exists.
+///
+/// The text is untrusted. A `reason` comes back from an operator-authored
+/// Lua, JS, or CEL hook, and a hook is free to explain itself with
+/// `"prompt looked like " + prompt[:100]`. Wiring the audit record is
+/// therefore also the first opportunity to put prompt bodies and live
+/// credentials into a customer's SIEM, which is why the scrub is a
+/// property of the type rather than a step a call site can forget.
+///
+/// ## What the scrub does not catch
+///
+/// The floor is a regex pass over known credential shapes, plus the
+/// operator's optional `redact.patterns:` masks and PII rules. None of
+/// them sees free-form prose: "the user asked about their divorce"
+/// survives every rule in [`crate::redact`], every rule in
+/// `sbproxy_security::pii`, and any pattern an operator did not think to
+/// write. This type bounds the credential and structured-PII hazard. It
+/// does not make an arbitrary rationale safe to ship, and nothing here
+/// enforces that a hook declines to paste model output into its
+/// `reason`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RedactedReason(String);
+
+impl RedactedReason {
+    /// Upper bound in bytes.
+    ///
+    /// Matches `MAX_ROUTE_REASON_BYTES` and `MAX_CACHE_REASON_BYTES`, the
+    /// bounds the routing and cache events already apply at decode, so a
+    /// reason that survived decode passes through here unchanged rather
+    /// than being cut a second time to a different length.
+    pub const MAX_BYTES: usize = 512;
+
+    /// Scrub a raw rationale, then bound it.
+    ///
+    /// Four passes, in this order:
+    ///
+    /// 1. [`crate::redact::redact_secrets`], the config-free floor. Runs
+    ///    on every record whatever the operator configured, because a
+    ///    credential in a SIEM is a credential in a SIEM.
+    /// 2. The operator's `redact.patterns:` regex masks for `(tenant,
+    ///    route)`, when `state` is supplied.
+    /// 3. The operator's composed PII rules for the same scope.
+    /// 4. Truncation to [`Self::MAX_BYTES`], last.
+    ///
+    /// Passes 1 through 3 are exactly
+    /// [`crate::logging::OpRedactState::redact_free_text`], which is the
+    /// same code the access, audit, and trace sinks run, so a mask an
+    /// operator writes once covers every feed rather than every feed but
+    /// this one. It was every feed but this one until WOR-2405: the audit
+    /// reason ran the floor and the PII rules and skipped `patterns:`
+    /// entirely, so `patterns: [{name: acct, regex: 'ACCT-[0-9]{10}'}]`
+    /// masked an account number in the access log and published it
+    /// verbatim in the OCSF record going to the customer's SIEM.
+    ///
+    /// The field-key denylist (`redact.fields:`) is the one pass that
+    /// does not run, because a bare reason string has no field key to
+    /// match. See `redact_free_text` for why.
+    ///
+    /// **Scrubbing must precede truncation.** Every detection pattern
+    /// needs a minimum body length: `Bearer [a-zA-Z0-9._\-]{20,}` needs
+    /// twenty characters after the keyword. Bound first and a token
+    /// sitting near the boundary gets cut to nineteen, the pattern stops
+    /// matching, and the surviving prefix of a live credential ships as
+    /// ordinary text. An operator pattern is no different: an
+    /// `ACCT-[0-9]{10}` mask stops firing on `ACCT-12345`. Bounding a
+    /// string that is already scrubbed can only ever shorten a
+    /// `[REDACTED]` marker, which costs nothing.
+    ///
+    /// ## The caller supplies the redaction state
+    ///
+    /// `state` is a parameter rather than a lookup performed here
+    /// because it lives in a process-wide slot whose accessor is
+    /// [`crate::logging::operator_redact_state`], and reading it per
+    /// reason would pin a snapshot per call rather than per request.
+    /// Take one handle at the emit site, pass a borrow of it here, and
+    /// every reason in that request is scrubbed by the same policy even
+    /// if a reload lands mid-request.
+    ///
+    /// `tenant` and `route` are the scope the operator's rules are keyed
+    /// by. One trap: `route` is the route string the log emitter stamps,
+    /// which is the origin's hostname, while [`DecisionAudit::origin`] is
+    /// the configured origin id. The two hold the same bytes today and
+    /// the two fields exist precisely so they can stop doing so, so pass
+    /// the route, not the origin id, or the origin-scope rules are
+    /// silently skipped. `None` for either falls through to the next
+    /// scope up.
+    ///
+    /// `state: None` is the honest config-free floor: pass 1 and the
+    /// bound, nothing else. It is the right value only where no scope is
+    /// knowable, which in this crate means the [`Deserialize`] impl. It
+    /// is not a shortcut to skip the lookup.
+    pub fn redact(
+        raw: &str,
+        state: Option<&crate::logging::OpRedactState>,
+        tenant: Option<&str>,
+        route: Option<&str>,
+    ) -> Self {
+        // Passes 1 through 3. With a state in hand they are the log
+        // path's own code, so this cannot drift from what the access log
+        // does to the same string. Without one, the floor alone: it is
+        // unconditional and first, so a deployment with no redaction
+        // config still cannot ship a Bearer token.
+        let scrubbed = match state {
+            Some(state) => state.redact_free_text(tenant, route, raw),
+            None => crate::redact::redact_secrets(raw),
+        };
+        // The bound, LAST. Doing this first would cut a token below the
+        // body length its detection pattern needs, so the pattern would
+        // stop matching and the prefix would survive as plain text. See
+        // the ordering note in this function's rustdoc.
+        Self(sbproxy_util::truncate_utf8(&scrubbed, Self::MAX_BYTES).to_owned())
+    }
+
+    /// The scrubbed text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Parsing cannot bypass the scrub.
+///
+/// A record read back off the wire came from somewhere this process
+/// cannot vouch for: a replayed stderr line, a queue, a fixture. Deriving
+/// `Deserialize` on the newtype would hand that text straight into a type
+/// whose entire contract is that it carries none, so the impl routes
+/// through [`RedactedReason::redact`] like every other producer.
+///
+/// It passes `None` for the redaction state deliberately, and that is a
+/// strictly weaker scrub than a constructed value gets. Precisely: a
+/// deserialized reason gets [`crate::redact::redact_secrets`] and the
+/// 512-byte bound. It does **not** get the operator's
+/// `redact.patterns:` masks and does **not** get their PII rules,
+/// because both are keyed by a `(tenant, route)` scope and this impl has
+/// neither. Serde hands the field values over one at a time with no
+/// access to the record's siblings, so even the tenant sitting next to
+/// this field in the same JSON object is not readable from here, and
+/// guessing a scope would apply some other tenant's rules.
+///
+/// In practice that gap is narrow. A value that was scrubbed with
+/// operator rules before it was serialized stays scrubbed, because every
+/// pass is idempotent over text it has already replaced, and this crate
+/// serializes reasons only from values that already went through
+/// [`RedactedReason::redact`] with a scope. The uncovered case is a
+/// reason that entered this process from outside having never been
+/// scrubbed with the local operator's rules: a replayed stderr line, a
+/// queue, a fixture. Such a value is bounded and credential-free but may
+/// still carry something only a local `patterns:` mask would have
+/// caught, so do not treat a deserialized record as equivalent to one
+/// this process built.
+impl<'de> Deserialize<'de> for RedactedReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::redact(&raw, None, None, None))
+    }
+}
+
 /// A decision event, shaped for a SIEM.
 ///
 /// Normalized to [OCSF] rather than to field names of our own, because
@@ -561,21 +691,47 @@ pub struct DecisionAudit {
     pub tenant: String,
     /// Wall-clock instant the decision was rendered.
     pub occurred_at: chrono::DateTime<chrono::Utc>,
-    /// Why. Redacted before it reaches this struct.
-    pub reason: String,
+    /// Why. A [`RedactedReason`] rather than a `String` because the
+    /// previous version of this line said "redacted before it reaches
+    /// this struct" and nothing anywhere enforced it. The type does.
+    pub reason: RedactedReason,
     /// Stable identifier for the rule or hook that decided, when the
     /// engine exposes one.
     pub rule_id: Option<String>,
 }
 
 impl DecisionAudit {
-    /// Build a record. `reason` must already be redacted.
+    /// Build a record, scrubbing `reason` on the way in.
     ///
-    /// Nine arguments, and every one is load bearing on a SIEM record:
+    /// Ten arguments, and every one is load bearing on a SIEM record:
     /// dropping any of `event_id`, `request_id`, `origin`, `tenant`, or
     /// `occurred_at` makes the record unfilterable or uncorrelatable,
     /// which is the failure this whole family exists to avoid. A
     /// builder would let a caller omit one and find out in production.
+    ///
+    /// `reason` is a `&str` and not a [`RedactedReason`] on purpose. A
+    /// caller that could hand in a finished newtype is a caller that
+    /// decides for itself what "redacted" means, and every emit site
+    /// would then have to decide it the same way. The constructor owns
+    /// the scrub instead, so the only way to build a record is to have
+    /// it run.
+    ///
+    /// `redact_state` is the operator's installed redaction state, taken
+    /// once at the emit site with
+    /// [`crate::logging::operator_redact_state`]. See
+    /// [`RedactedReason::redact`] for the passes it drives and what
+    /// `None` costs.
+    ///
+    /// `route` is the origin **hostname** the operator's per-origin rules
+    /// are keyed by, which is not necessarily `origin`, the configured
+    /// origin id this record carries. Pass the route or the origin-scope
+    /// rules are silently skipped. The tenant half of that scope is not a
+    /// parameter: it is this record's own `tenant`, so the scrub cannot
+    /// run under one tenant's rules while the record is filed under
+    /// another. An empty `tenant` resolves as no tenant scope rather than
+    /// as the [`DEFAULT_TENANT`] sentinel, because the sentinel is a
+    /// display value for a single-tenant deployment and not a key an
+    /// operator can write a rule against.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         event_id: uuid::Uuid,
@@ -586,9 +742,17 @@ impl DecisionAudit {
         origin: impl Into<String>,
         tenant: impl Into<String>,
         occurred_at: chrono::DateTime<chrono::Utc>,
-        reason: impl Into<String>,
+        reason: &str,
+        redact_state: Option<&crate::logging::OpRedactState>,
+        route: Option<&str>,
     ) -> Self {
         let tenant = tenant.into();
+        let scope_tenant = if tenant.is_empty() {
+            None
+        } else {
+            Some(tenant.as_str())
+        };
+        let reason = RedactedReason::redact(reason, redact_state, scope_tenant, route);
         Self {
             event_id,
             request_id: request_id.into(),
@@ -602,7 +766,7 @@ impl DecisionAudit {
                 tenant
             },
             occurred_at,
-            reason: reason.into(),
+            reason,
             rule_id: None,
         }
     }
@@ -648,7 +812,7 @@ impl DecisionAudit {
             "policy": {
                 "name": self.event.as_label(),
                 "uid": self.rule_id,
-                "desc": self.reason,
+                "desc": self.reason.as_str(),
             },
             // Tenancy. Mandatory: a record an analyst cannot filter to a
             // customer is not evidence.
@@ -662,7 +826,7 @@ impl DecisionAudit {
                 DecisionOutcome::Error | DecisionOutcome::Timeout => 2,
                 _ => 1,
             },
-            "message": self.reason,
+            "message": self.reason.as_str(),
         })
     }
 }
@@ -709,31 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn the_per_chunk_event_never_audits_by_default() {
-        // A per-chunk SIEM feed is an ingest bill, not a control. This
-        // is the one default that must not drift.
-        assert!(!DecisionEvent::AiStreamEvent.emits_audit_by_default());
-    }
-
-    #[test]
-    fn security_relevant_events_audit_by_default() {
-        for event in [
-            DecisionEvent::Auth,
-            DecisionEvent::Policy,
-            DecisionEvent::AiGuardrailInput,
-            DecisionEvent::AiGuardrailOutput,
-            DecisionEvent::AiToolCall,
-            DecisionEvent::CacheKey,
-            DecisionEvent::PaymentLifecycle,
-        ] {
-            assert!(
-                event.emits_audit_by_default(),
-                "{event} is security relevant and must default on"
-            );
-        }
-    }
-
-    #[test]
     fn cel_is_the_only_scalar_engine() {
         // The ranking criterion for which engines can serve which
         // events. If a second scalar engine ever appears, the events
@@ -760,6 +899,8 @@ mod tests {
             "",
             chrono::DateTime::from_timestamp(0, 0).unwrap(),
             "rule 7 refused an unsigned agent",
+            None,
+            None,
         );
         assert_eq!(audit.tenant, DEFAULT_TENANT);
     }
@@ -776,6 +917,8 @@ mod tests {
             "tenant-a",
             chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             "rule 7 refused an unsigned agent",
+            None,
+            None,
         )
         .with_rule_id("no-unsigned-agents");
         let json = audit.to_ocsf();
@@ -812,6 +955,8 @@ mod tests {
             "t",
             chrono::DateTime::from_timestamp(0, 0).unwrap(),
             "deterministic completion",
+            None,
+            None,
         );
         assert_eq!(store.to_ocsf()["activity_id"], 1);
         assert_eq!(store.to_ocsf()["type_uid"], 600301);
@@ -832,11 +977,338 @@ mod tests {
             "t",
             chrono::DateTime::from_timestamp(0, 0).unwrap(),
             "no rule matched; built-in strategy applies",
+            None,
+            None,
         );
         let json = audit.to_ocsf();
         assert_eq!(json["status_id"], 1);
         assert_eq!(json["disposition_id"], 1);
         assert_eq!(json["is_alert"], false);
+    }
+
+    #[test]
+    fn a_credential_in_a_raw_reason_never_reaches_the_record() {
+        // A `reason` comes back from an operator-authored hook, and a
+        // hook is free to explain itself by quoting what it saw. The
+        // audit record is the first thing that carries a rationale off
+        // the box, so it is the first chance to put a live credential in
+        // a customer's SIEM. Assert on the OCSF render rather than on
+        // the field, because the render is what actually ships.
+        let audit = DecisionAudit::new(
+            uuid::Uuid::nil(),
+            "req-1",
+            DecisionEvent::CacheAdmit,
+            DecisionEngine::Lua,
+            DecisionOutcome::Deny,
+            "api.local",
+            "t",
+            chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            "upstream refused: Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345 \
+             using key sk-abcdefghijklmnopqrstuvwxyz1234",
+            None,
+            None,
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("abcdefghijklmnopqrstuvwxyz012345"),
+            "bearer token survived into the record: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-abcdefghijklmnopqrstuvwxyz1234"),
+            "api key survived into the record: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        // Both OCSF fields that carry the rationale, not just the one
+        // that happened to be checked first.
+        let json = audit.to_ocsf();
+        assert_eq!(json["policy"]["desc"], json["message"]);
+    }
+
+    #[test]
+    fn the_scrub_runs_before_the_bound_and_not_after() {
+        // The ordering is load bearing, so prove both directions.
+        //
+        // Every detection pattern needs a minimum body length; the
+        // Bearer pattern needs twenty characters after the keyword.
+        // Place a 24-character token so a 512-byte cut lands ten
+        // characters into it, which is below what the pattern needs.
+        // Bound first and the pattern stops matching, so ten characters
+        // of a live token ship as ordinary text. Scrub first and the
+        // whole token is gone before anything is measured.
+        const TOKEN: &str = "AbCdEfGh0123456789ijKLmn";
+        // 495 filler + "Bearer " (7) = 502, so the bound falls at
+        // TOKEN[10].
+        let filler = "a".repeat(495);
+        let raw = format!("{filler}Bearer {TOKEN}");
+        assert_eq!(TOKEN.len(), 24);
+        assert_eq!(raw.len(), 526, "the arithmetic this test rests on");
+
+        // The counterfactual. If this assertion ever fails the test has
+        // stopped proving anything, because truncate-then-scrub would no
+        // longer be the leak it is being contrasted with.
+        let cut_first = sbproxy_util::truncate_utf8(&raw, RedactedReason::MAX_BYTES);
+        let bound_first = crate::redact::redact_secrets(cut_first);
+        assert!(
+            bound_first.contains("AbCdEfGh01"),
+            "bounding first is expected to leak the token prefix: {bound_first}"
+        );
+
+        // The implementation, in the other order.
+        let reason = RedactedReason::redact(&raw, None, None, None);
+        assert!(
+            !reason.as_str().contains("AbCdEfGh"),
+            "token prefix survived: {}",
+            reason.as_str()
+        );
+        assert!(reason.as_str().ends_with("Bearer [REDACTED]"));
+        assert!(reason.as_str().len() <= RedactedReason::MAX_BYTES);
+    }
+
+    #[test]
+    fn a_reason_cannot_be_smuggled_in_through_deserialization() {
+        // A record read back off the wire came from somewhere this
+        // process cannot vouch for. Deriving `Deserialize` on the
+        // newtype would hand that text straight into a type whose whole
+        // contract is that it carries none.
+        let wire = serde_json::json!({
+            "event_id": "00000000-0000-0000-0000-000000000000",
+            "request_id": "req-1",
+            "event": "cache_admit",
+            "engine": "lua",
+            "outcome": "deny",
+            "origin": "api.local",
+            "tenant": "t",
+            "occurred_at": "2026-08-12T00:00:00Z",
+            "reason": "hook said Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
+            "rule_id": null,
+        });
+        let audit: DecisionAudit = serde_json::from_value(wire).expect("record parses");
+        assert_eq!(
+            audit.reason.as_str(),
+            "hook said Authorization: Bearer [REDACTED]"
+        );
+
+        // The newtype on its own, so the guarantee is pinned to the type
+        // rather than only to the record that happens to hold one today.
+        let bare: RedactedReason =
+            serde_json::from_str("\"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA\"")
+                .expect("string parses");
+        assert_eq!(bare.as_str(), "sk-ant-[REDACTED]");
+    }
+
+    #[test]
+    fn an_overlong_clean_reason_is_bounded_on_a_character_boundary() {
+        // One ASCII byte then 300 two-byte characters, so every boundary
+        // past the first sits at an odd offset and the 512-byte bound
+        // cannot land on one. A naive slice panics here; a naive byte
+        // copy emits invalid UTF-8 into a SIEM that is entitled to
+        // assume the field is a string.
+        let raw = format!("x{}", "é".repeat(300));
+        assert_eq!(raw.len(), 601);
+
+        let reason = RedactedReason::redact(&raw, None, None, None);
+        assert!(reason.as_str().len() <= RedactedReason::MAX_BYTES);
+        assert_eq!(
+            reason.as_str().len(),
+            511,
+            "backed off to the boundary below 512 rather than splitting a character"
+        );
+        assert!(reason.as_str().ends_with('é'));
+        // Clean input stays clean: the bound is the only pass that did
+        // anything.
+        assert!(!reason.as_str().contains("REDACTED"));
+    }
+
+    /// One compiled operator mask, the shape `redact.patterns:` entries
+    /// compile to at config load.
+    fn pattern_mask(pattern: &str, replacement: &str) -> (regex::Regex, String) {
+        (
+            regex::Regex::new(pattern).expect("test pattern compiles"),
+            replacement.to_owned(),
+        )
+    }
+
+    /// An [`crate::logging::OpRedactState`] carrying only the slots a
+    /// test names.
+    ///
+    /// Every field is spelled out rather than reached through
+    /// `..OpRedactState::empty()`, matching how the logging tests build
+    /// one. Struct-update syntax would let a new scope land defaulted to
+    /// "no rules" inside tests whose entire subject is that the rules
+    /// run, and that failure is invisible: the assertions still pass.
+    fn state_with(
+        patterns: Vec<(regex::Regex, String)>,
+        tenant_patterns: std::collections::HashMap<String, Vec<(regex::Regex, String)>>,
+        proxy_pii: Option<sbproxy_security::pii::PiiRedactor>,
+    ) -> crate::logging::OpRedactState {
+        crate::logging::OpRedactState {
+            fields: Vec::new(),
+            patterns,
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns,
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
+            proxy_pii,
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn the_operators_pii_rules_run_on_the_reason_when_the_caller_resolves_them() {
+        // The config-free floor knows credential shapes, not the
+        // operator's idea of PII. The redaction state is a parameter
+        // rather than a lookup because the composed per-scope rules are
+        // keyed by a scope this type cannot derive, so passing `None`
+        // where rules exist is the quiet way to lose them. Pin both
+        // halves.
+        let raw = "hook matched the account for bob@acme.com";
+        assert!(
+            RedactedReason::redact(raw, None, None, None)
+                .as_str()
+                .contains("bob@acme.com"),
+            "the floor alone does not know about email; that is what the rules are for"
+        );
+
+        let state = state_with(
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Some(sbproxy_security::pii::PiiRedactor::defaults()),
+        );
+        let scrubbed = RedactedReason::redact(raw, Some(&state), None, None);
+        assert!(
+            !scrubbed.as_str().contains("bob@acme.com"),
+            "operator rules did not run: {}",
+            scrubbed.as_str()
+        );
+    }
+
+    #[test]
+    fn an_operator_pattern_mask_reaches_the_audit_reason() {
+        // The bug this test exists for. `redact.patterns:` is documented
+        // as the general extension point for "mask this shape wherever it
+        // appears", and it ran on the access log, the error log, and the
+        // trace exporter. It did not run here, so an operator who masked
+        // an account number saw it masked in their own logs and shipped
+        // verbatim in the OCSF record going to their SIEM. The audit feed
+        // is the one that leaves the building.
+        let state = state_with(
+            vec![pattern_mask(r"ACCT-[0-9]{10}", "[ACCT]")],
+            std::collections::HashMap::new(),
+            None,
+        );
+        let raw = "no cache for ACCT-1234567890";
+
+        // The counterfactual: nothing but the floor, which is what this
+        // path used to run. If this ever starts masking, the assertion
+        // below has stopped proving the patterns pass is wired.
+        assert!(
+            RedactedReason::redact(raw, None, None, None)
+                .as_str()
+                .contains("ACCT-1234567890"),
+            "the credential floor is not expected to know an operator's account shape"
+        );
+
+        let scrubbed = RedactedReason::redact(raw, Some(&state), None, None);
+        assert_eq!(scrubbed.as_str(), "no cache for [ACCT]");
+    }
+
+    #[test]
+    fn a_tenant_scope_pattern_applies_to_that_tenant_and_not_another() {
+        // Same isolation the log path gives a tenant-scope rule set. A
+        // mask written under one tenant must not scrub a sibling's
+        // records, or a shared proxy leaks one customer's redaction
+        // policy into another's evidence.
+        let mut tenant_patterns = std::collections::HashMap::new();
+        tenant_patterns.insert(
+            "acme".to_owned(),
+            vec![pattern_mask(r"ACCT-[0-9]{10}", "[ACCT]")],
+        );
+        let state = state_with(Vec::new(), tenant_patterns, None);
+        let raw = "no cache for ACCT-1234567890";
+
+        let at_acme = RedactedReason::redact(raw, Some(&state), Some("acme"), None);
+        assert_eq!(at_acme.as_str(), "no cache for [ACCT]");
+
+        let at_other = RedactedReason::redact(raw, Some(&state), Some("other"), None);
+        assert_eq!(
+            at_other.as_str(),
+            "no cache for ACCT-1234567890",
+            "a tenant-scope mask must not fire for a sibling tenant"
+        );
+    }
+
+    #[test]
+    fn an_operator_pattern_runs_before_the_bound_and_not_after() {
+        // The ordering argument the credential floor makes applies to
+        // operator masks too, and an operator pattern is more brittle
+        // than the built-ins: `ACCT-[0-9]{10}` needs all ten digits, so a
+        // cut anywhere inside the number stops it matching and the
+        // surviving prefix ships as ordinary text.
+        let state = state_with(
+            vec![pattern_mask(r"ACCT-[0-9]{10}", "[ACCT]")],
+            std::collections::HashMap::new(),
+            None,
+        );
+        // 500 filler + the 15-character account number, so a 512-byte cut
+        // lands after "ACCT-" plus seven digits.
+        let filler = "b".repeat(500);
+        let raw = format!("{filler}ACCT-1234567890");
+        assert_eq!(raw.len(), 515, "the arithmetic this test rests on");
+
+        // Bound first, then mask: the pattern no longer matches and most
+        // of the number survives.
+        let cut_first = sbproxy_util::truncate_utf8(&raw, RedactedReason::MAX_BYTES);
+        let bound_first = state.redact_free_text(None, None, cut_first);
+        assert!(
+            bound_first.contains("ACCT-1234567"),
+            "bounding first is expected to leak the prefix: {bound_first}"
+        );
+
+        // The implementation, in the other order.
+        let reason = RedactedReason::redact(&raw, Some(&state), None, None);
+        assert!(
+            !reason.as_str().contains("ACCT-"),
+            "account prefix survived: {}",
+            reason.as_str()
+        );
+        assert!(reason.as_str().ends_with("[ACCT]"));
+        assert!(reason.as_str().len() <= RedactedReason::MAX_BYTES);
+    }
+
+    #[test]
+    fn the_record_scrubs_its_reason_under_its_own_tenants_rules() {
+        // The constructor takes the state and the route and derives the
+        // tenant half of the scope from the record's own `tenant`, so a
+        // record cannot be filed under one tenant and scrubbed under
+        // another's rules. Assert on the OCSF render, because that is
+        // what ships.
+        let mut tenant_patterns = std::collections::HashMap::new();
+        tenant_patterns.insert(
+            "acme".to_owned(),
+            vec![pattern_mask(r"ACCT-[0-9]{10}", "[ACCT]")],
+        );
+        let state = state_with(Vec::new(), tenant_patterns, None);
+
+        let audit = DecisionAudit::new(
+            uuid::Uuid::nil(),
+            "req-1",
+            DecisionEvent::CacheAdmit,
+            DecisionEngine::Lua,
+            DecisionOutcome::Decline,
+            "api-origin",
+            "acme",
+            chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            "no cache for ACCT-1234567890",
+            Some(&state),
+            Some("api.acme.example.com"),
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("ACCT-1234567890"),
+            "operator mask never reached the OCSF record: {rendered}"
+        );
+        assert_eq!(audit.reason.as_str(), "no cache for [ACCT]");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-15*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -307,6 +307,8 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_mirror_state_drift_total` | 1 | Counter; per-request increments when the request-mirror's primary and shadow responses diverge enough that a downstream replay would notice. Always sample to a debug log so the trigger is investigatable. |
 | `sbproxy_policy_audit_events_total` | 1 200 | Labels: `verdict` (allow\|deny\|warn), `surface` (http\|mcp\|a2a\|admin), `policy_id` (sanitised). Per-event audit-channel counter; the policy-decision path emits one per evaluated policy. |
 | `sbproxy_policy_audit_events_dropped_total` | 40 | Labels: `tenant` (sanitised). Counts the policy-audit events dropped because the per-tenant queue was full. A non-zero rate here means the operator should raise `policy.audit.queue_size` or shed load. |
+| `sbproxy_decision_audit_events_total` | 126 | Labels: `event` (the decision event's stable label), `outcome` (allow\|deny\|flag\|mutate\|decline\|error\|timeout). Counts decision-audit records accepted by the audit bus. Both labels are closed by construction, so the cap is the exact product of 18 events and 7 outcomes rather than an estimate. Read it beside the drop counter below: on its own a drop counter cannot tell a healthy quiet feed from a broken one, because both read zero. |
+| `sbproxy_decision_audit_events_dropped_total` | 18 000 | Labels: `event`, `tenant`. Counts decision-audit records lost before publication, because the shared audit queue was full or its consumer was gone. The cap is 18 closed event values against the shared `tenant` budget of 1000; in practice the family is sparse, since it only writes when a record is dropped. A non-zero rate is a lossy audit trail, and a lossy trail reads as an absence of decisions, so alert on it. |
 | `sbproxy_policy_decision_duration_seconds_bucket` | 60 | Labels: `surface`; histogram buckets 100us..1s. Time-to-decision per policy surface. Pair with `sbproxy_policy_evaluation_duration_seconds_bucket` for end-to-end policy latency. |
 | `sbproxy_mcp_policy_hook_invocations_total` | 2 000 | Labels: `verdict` (allow\|deny\|warn), `mcp_server` (sanitised), `tool_name` (sanitised). Counts per-tool MCP policy-hook decisions. |
 | `sbproxy_judge_calls_total` | 60 | Labels: `provider` (openai\|anthropic\|...), `verdict` (pass\|fail\|abstain), `cached` (true\|false). Counter for the AI judge surface (rubric / scorer eval calls). |
@@ -343,7 +345,7 @@ That counter tells you a label has already collapsed, which is late. In a multi-
 sbproxy_label_cardinality_unique_values / sbproxy_label_cardinality_budget > 0.9
 ```
 
-Both are labelled by label name and nothing else. There is no `metric` label, because one budget is shared by every metric using that label name and splitting by metric would be a lie. There is no `tenant_id` label either, because that would multiply the series count by the tenant budget, which is the failure these gauges exist to warn about.
+Both are labeled by label name and nothing else. There is no `metric` label, because one budget is shared by every metric using that label name and splitting by metric would be a lie. There is no `tenant_id` label either, because that would multiply the series count by the tenant budget, which is the failure these gauges exist to warn about.
 
 Forbidding the label does not mean losing the identifier. A run id reaches the AI span as `session.id` and the access log as `a2a_context_id`, which is where reconstructing one run is exactly the point. The one place it cannot reach is an outbound request header on the hop that learned it: the A2A `contextId` lives in the JSON-RPC request body, the body is parsed at the body phase, and the body phase runs after the upstream request header has already been assembled and sent. Run correlation between hops rides the W3C trace context instead. "[The phase constraint: a run id cannot ride an outbound header](#the-phase-constraint-a-run-id-cannot-ride-an-outbound-header)" under Traces has the detail.
 
@@ -412,13 +414,15 @@ The counter moves on every refusal rather than once per bad receipt, so a polled
 
 The proxy decides many things per request: whether to authenticate, which policies pass, how to key a cache, which provider to route to, whether a guardrail permits a prompt. Each of those arrived with its own metric and its own label vocabulary, which is why `record_policy`, `record_rate_limit_decision`, `record_cache`, and `record_semantic_cache` all count decisions and none of them agree on how.
 
-Three families cover all of them, dimensioned rather than duplicated:
+Three families cover all of them, dimensioned rather than duplicated, and two more report on the audit feed those decisions can publish (see [Decision-audit records](#decision-audit-records) under Logs):
 
 | Metric | Labels | What it answers |
 |---|---|---|
 | `sbproxy_decision_event_total` | `event`, `engine`, `outcome`, `origin`, `tenant` | How often each decision point fired, who answered, and what came out |
 | `sbproxy_decision_event_duration_seconds` | `event`, `engine`, `origin` | Whether a decision point is slow, and whether the engine behind it is the reason |
 | `sbproxy_decision_event_fail_open_total` | `event`, `engine`, `origin`, `tenant` | How often a request proceeded without the decision being made |
+| `sbproxy_decision_audit_events_total` | `event`, `outcome` | How much audit feed each decision point is producing, and of what shape |
+| `sbproxy_decision_audit_events_dropped_total` | `event`, `tenant` | Whose audit trail lost records, and which decision point they came from |
 
 `event` is a named pipeline point (`policy`, `cache.key`, `route.decide`, `ai.guardrail.input`, ...). `engine` is who answered it (`built_in`, `plugin`, `cel`, `lua`, `js`, `wasm`, `proxy_wasm`). Separating the two is the point: adding a capability should not mean picking an engine first and inheriting whatever seam that engine happens to have.
 
@@ -436,7 +440,7 @@ At 50 origins and 500 tenants, expect roughly 50 x 500 x (events actually config
 
 Every label value passes through the global cardinality limiter and demotes overflow to `__other__`, emitting `sbproxy_label_cardinality_overflow_total{metric, label}`. The budgets are per label name, not per metric: `origin` is 200 and `tenant` is 1000.
 
-`origin` on this family is the **configured origin id**, not the request `Host`, so it is bounded by your config rather than by what a client sends. That matters because the limiter's accepted-value set is keyed by label name and shared with every other `origin`-labelled family: a value admitted here consumes budget everywhere.
+`origin` on this family is the **configured origin id**, not the request `Host`, so it is bounded by your config rather than by what a client sends. That matters because the limiter's accepted-value set is keyed by label name and shared with every other `origin`-labeled family: a value admitted here consumes budget everywhere.
 
 One caveat worth knowing rather than discovering. Other recorders on the request path, `sbproxy_policy_triggers_total` among them, still pass the request `Host`. Under a wildcard origin every subdomain is a distinct value there, so an unauthenticated client can still fill the shared `origin` set, after which a config origin this family has not yet emitted demotes to `__other__`. Bounding this family's own writes does not close that; watch the overflow counter.
 
@@ -529,6 +533,8 @@ proxy:
 
 * `fields:` is additive on the built-in baseline. Matched lowercase. Cannot disable a built-in entry.
 * `patterns:` is a list of named regexes applied to the rendered JSON after the field-key pass. Compiled once at config load; an invalid regex is logged at `warn` and skipped (the rest of the block still installs). `replacement:` defaults to `[REDACTED:<NAME_UPPER>]` when omitted.
+
+The `patterns:` rules are not scoped to the log line. They also run over the free-text `reason` on every decision-audit record (see [Decision-audit records](#decision-audit-records)), resolved under that record's own tenant and route, so a mask you write for one tenant does not apply to another's records. `fields:` has nothing to match there, since a reason is one string rather than a keyed object, which is the one place the two halves of `redact:` behave differently.
 
 #### Tenant-scope and origin-scope redact additions
 
@@ -762,6 +768,45 @@ The file sink writes on a dedicated thread. Publishing puts the event on a bound
 The writer drains up to 256 events per flush, which means an abrupt kill loses at most the batch in flight. A `sink: file` with no `path`, or a `path` the proxy cannot open, logs a warning at startup and falls back to `sink: logging` instead of dropping the events.
 
 The sink is installed once at boot and a SIGHUP reload does not swap it, so changing `request_events:` needs a restart.
+
+### Decision-audit records
+
+Every decision event returns a `reason` saying what it decided and why, and that string used to be decoded and thrown away. Turn this block on and it becomes an audit record instead: one OCSF **API Activity (6003)** event carrying the **Security Control** profile, published on the same bus the policy verdicts already ride. A record saying a response was not cached is nearly useless; one naming the rule and why is an investigation, which is the difference this feed exists to close.
+
+The bundled drain prints each record to stderr as a JSON line prefixed `decision_audit_event:`, so it stays greppable apart from the `policy_verdict_event:` lines sharing the channel. Pipe stderr through `jq` or a log shipper and the payload is the same one an external consumer on the bus would receive.
+
+```yaml
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: false        # master switch for this scope; absent means off
+        events:
+          cache.admit: true   # per-event override, wins over the master switch
+```
+
+Precedence is one rule and lives in one place: a per-event entry wins outright, otherwise the master switch decides, and an absent switch or an absent block is off. `ai.stream.event` is the one exception, never published either way, because it fires once per streamed chunk; `ai.close` carries that stream's summary instead. The block belongs at `proxy.observability.log` and nowhere else this release: a `decision_audit:` under a tenant or an origin fails config load with an unknown-field error, because those log blocks reject keys they do not define. Scoped overrides are a later slice.
+
+**Off by default, on purpose.** The decision events differ by orders of magnitude in how often they fire. `cache.key` runs once per cacheable request, so a permissive default would hand you a per-request SIEM feed on your busiest origin the moment you turned anything on. That is an ingest bill rather than a control, and the usual answer to a feed nobody can afford is to switch the whole thing off, which takes the security-relevant events with it. Opting in per event costs one line and keeps that choice available.
+
+Two mistakes are refused at config load rather than ignored, both because a misconfigured audit feed is silent and silence is indistinguishable from a feed with nothing to say. An `events:` key naming no decision this proxy makes fails the load, and the error lists every accepted label. `ai.stream.event: true` fails too, because that event fires once per streamed chunk; enable `ai.close` instead, which carries the stream's summary once the response finishes. Writing `ai.stream.event: false` stays legal, since saying out loud that a feed is off is a reasonable thing to want in a config.
+
+**What is wired today.** `cache.admit` is the only decision point that publishes a record in this release, and it publishes only where the origin has an `admit_event` script and that script returned a plan. A declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no operator-authored reason to carry. Every other label parses and validates and emits nothing yet: `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle` get their emitters in later releases. If you enable one of those and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
+
+**What the record promises about its reason.** The `reason` field is scrubbed before the record exists at all: the type that field carries has exactly one constructor and that constructor runs the scrub, so no emit site can publish a raw string, whatever it believes redaction means. Four passes, in this order:
+
+1. The secrets floor, the config-free baseline that runs whether or not you configured any redaction.
+2. Your `redact.patterns:` masks, composed for that record's tenant and origin the same way the log path composes them, `disable:` opt-outs included. A mask written under one tenant does not run against another tenant's records.
+3. Your composed PII rules for the same scope, resolved per record rather than cached, so a config reload cannot leave a record scrubbed by a policy you have already replaced. [Built-in PII detector](#built-in-pii-detector) and the two scope sections after it are what compose them.
+4. A bound of 512 bytes, backing off to a character boundary rather than splitting one.
+
+Passes 2 and 3 are the log path's own code rather than a second implementation of it, which is the property worth having: a mask you add for your access logs covers this feed on the same reload, and there is no second list to keep in sync. `redact.fields:` is the one half that has no effect here, because a reason is a single string and there is no field key to match against. If you want key-level redaction on something, put it in the log line.
+
+The order is the load-bearing part. Bounding first can cut a `Bearer` token below the length its pattern needs to match, the pattern then misses what is left, and the prefix of a live credential ships to whoever reads your SIEM. Scrub, then bound.
+
+That is a floor and not a promise about arbitrary text: a reason that embeds a secret in a shape no rule knows about is a rule you have not written yet, and the scrub cannot invent it. Separately, the whole serialized line is capped at 64 KiB, and an oversized one collapses to a valid-JSON marker keeping `metadata.uid` and `metadata.correlation_uid`, so a truncation stays parseable and countable rather than corrupting the stream.
+
+**Drops are counted, never swallowed.** Publication never blocks the request path. The audit queue is bounded at 10 000 records and shared with the policy verdicts; when it is full the record is lost and `sbproxy_decision_audit_events_dropped_total{event,tenant}` increments against the tenant whose trail lost it. Counting per tenant is the whole point: a silently lossy audit feed reads as evidence that nothing was decided, which is worse than no feed at all, so a gap always has a counter behind it. Alert on any non-zero rate, and read it beside `sbproxy_decision_audit_events_total` to tell a quiet feed from a broken one.
 
 ## Traces
 

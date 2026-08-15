@@ -246,7 +246,9 @@ static AI_ROUTING_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(|| {
 });
 
 /// Operator routing-policy (WOR-2366) decisions by outcome and the
-/// normalized reason code. `outcome` is a closed set (`plan`, `decline`,
+/// normalized reason code. `outcome` is a closed set (`plan`,
+/// `plan_degraded` for a plan the host had to drop a tier from,
+/// `overridden` when a security `route_to` cleared it, `decline`,
 /// `error`); `reason_code` is bounded by the policy's `reason_codes`
 /// allowlist (`policy` / `other` / an allowlisted code, or `none` for a
 /// decline or error), so neither label can grow unbounded from a request.

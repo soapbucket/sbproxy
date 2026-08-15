@@ -513,6 +513,22 @@ fn record_configured_action(
 ) {
     let dynamic = configured_type(value).is_some_and(|name| registry.action(name).is_some());
     record_configured_hook(value, ExtensionHookKind::Action, dynamic, position, active);
+    // WOR-2366: an `ai_proxy` action can attach a bundle hook that is not
+    // its own `type:`. An `ai_routing_policy` with `engine: wasm` names an
+    // `ai_routing` hook, resolved from the registry when the action
+    // compiles, and that kind rides no AI event chain (`ai_hooks()`
+    // deliberately excludes attach-by-type kinds). So neither the action
+    // lookup above nor `record_lifecycle_attachments` can see it, and
+    // without this the hook authoring every routing decision reported
+    // `not_attached`. Attachment is the same fact the action compiler
+    // acts on: the registry answers with a hook of that name. One action
+    // carries at most one routing policy, so the position is 0 by
+    // construction, the convention the action and auth slots already use.
+    let ai_routing =
+        configured_ai_routing_type(value).filter(|name| registry.ai_routing(name).is_some());
+    if let Some(name) = ai_routing {
+        active.attach(ExtensionHookKind::AiRouting, name.to_owned(), 0);
+    }
 }
 
 fn record_configured_hook(
@@ -532,6 +548,29 @@ fn record_configured_hook(
 
 fn configured_type(value: &serde_json::Value) -> Option<&str> {
     value.get("type").and_then(serde_json::Value::as_str)
+}
+
+/// The `ai_routing` hook type an action attaches, if it attaches one.
+///
+/// Only an `ai_proxy` action reads `ai_routing_policy`, and only its
+/// `engine: wasm` form names a bundle hook; the inline engines carry
+/// their program in the config itself. The engine name is trimmed to
+/// match the action compiler, so the inventory and the compiler agree on
+/// which configs attach a hook (WOR-2366).
+fn configured_ai_routing_type(value: &serde_json::Value) -> Option<&str> {
+    if configured_type(value) != Some("ai_proxy") {
+        return None;
+    }
+    let policy = value.get("ai_routing_policy")?;
+    if policy
+        .get("engine")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        != Some("wasm")
+    {
+        return None;
+    }
+    policy.get("type").and_then(serde_json::Value::as_str)
 }
 
 fn linked_registration_exists(kind: ExtensionHookKind, name: &str) -> bool {
@@ -715,6 +754,7 @@ const fn bundle_hook_kind(kind: ExtensionHookKind) -> Option<BundleHookKind> {
         ExtensionHookKind::AiStreamEvent => Some(BundleHookKind::AiStreamEvent),
         ExtensionHookKind::AiClose => Some(BundleHookKind::AiClose),
         ExtensionHookKind::AiFailure => Some(BundleHookKind::AiFailure),
+        ExtensionHookKind::AiRouting => Some(BundleHookKind::AiRouting),
         ExtensionHookKind::Payment => Some(BundleHookKind::Payment),
         ExtensionHookKind::Startup
         | ExtensionHookKind::Identity
@@ -742,6 +782,7 @@ const fn hook_kind_label(kind: ExtensionHookKind) -> &'static str {
         ExtensionHookKind::AiStreamEvent => "ai_stream_event",
         ExtensionHookKind::AiClose => "ai_close",
         ExtensionHookKind::AiFailure => "ai_failure",
+        ExtensionHookKind::AiRouting => "ai_routing",
         ExtensionHookKind::Payment => "payment",
     }
 }
@@ -757,6 +798,9 @@ const fn hook_phase(kind: ExtensionHookKind) -> &'static str {
         | ExtensionHookKind::AiStreamEvent
         | ExtensionHookKind::AiClose
         | ExtensionHookKind::AiFailure => "ai",
+        // Attach-by-type, not event-chain, but the phase is still the AI
+        // decision plane; kept a separate arm to mirror the loader.
+        ExtensionHookKind::AiRouting => "ai",
         ExtensionHookKind::Payment => "payment",
         ExtensionHookKind::Mcp => "mcp",
         ExtensionHookKind::ProxyWasmFilter => "http",
@@ -1239,7 +1283,9 @@ fn bounded_count(count: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compiled_observations, AttachedChains};
+    use super::{
+        compiled_observations, configured_ai_routing_type, record_configured_action, AttachedChains,
+    };
     use sbproxy_config::BundleHookKind;
     use sbproxy_plugin::{
         ExtensionBodyMode, ExtensionBundleDeclaration, ExtensionBundleRecord, ExtensionCollision,
@@ -1541,6 +1587,132 @@ mod tests {
             active.position(ExtensionHookKind::Payment, "settle"),
             Some(3)
         );
+    }
+
+    /// A registry holding one real `ai_routing` hook.
+    ///
+    /// The kind is envelope-WASM only, so the fixture is the compiled
+    /// module sbproxy-extension keeps for its own adapter tests and the
+    /// e2e suite drives through a live proxy. The `TempDir` comes back
+    /// with the registry because the registry reads out of it.
+    fn wasm_routing_registry() -> (
+        tempfile::TempDir,
+        std::sync::Arc<super::DynamicBundleRegistry>,
+    ) {
+        const PLAN_ROUTER_WASM: &[u8] =
+            include_bytes!("../../sbproxy-extension/src/bundle/testdata/wasm/ai-routing-plan.wasm");
+        const MANIFEST: &str = r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: plan-router
+version: 1.0.0
+runtime: wasm
+abi: sbproxy-envelope/v1
+entry: plan.wasm
+hooks:
+  - kind: ai_routing
+    type: plan_router
+    execution:
+      body_mode: none
+failure_posture: closed
+"#;
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let bundle = directory.path().join("plan-router");
+        std::fs::create_dir(&bundle).expect("bundle directory");
+        std::fs::write(bundle.join("bundle.yaml"), MANIFEST).expect("manifest");
+        std::fs::write(bundle.join("plan.wasm"), PLAN_ROUTER_WASM).expect("artifact");
+        let registry = super::DynamicBundleRegistry::load(
+            &sbproxy_config::ExtensionBundlesConfig {
+                bundles_dir: Some(directory.path().display().to_string()),
+                ..Default::default()
+            },
+            directory.path(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("the fixture bundle loads");
+        (directory, registry)
+    }
+
+    #[test]
+    fn a_live_ai_routing_hook_is_reported_attached() {
+        // WOR-2366: this hook authors every routing decision the origin
+        // makes, and it attaches by `type:` from inside the action config
+        // rather than by riding an AI event chain. Read only the action's
+        // own `type:` and the chain kinds, as inventory did, and a live
+        // hook reports `not_attached` to the operator auditing it.
+        let (_directory, registry) = wasm_routing_registry();
+        let mut active = AttachedChains::default();
+        record_configured_action(
+            &serde_json::json!({
+                "type": "ai_proxy",
+                "providers": [],
+                "ai_routing_policy": {"engine": "wasm", "type": "plan_router"}
+            }),
+            registry.as_ref(),
+            0,
+            &mut active,
+        );
+
+        assert!(active.is_attached(ExtensionHookKind::AiRouting, "plan_router"));
+        assert_eq!(
+            active.position(ExtensionHookKind::AiRouting, "plan_router"),
+            Some(0),
+            "one action carries one routing policy, so the slot is 0"
+        );
+    }
+
+    #[test]
+    fn an_ai_routing_hook_no_bundle_declares_stays_unattached() {
+        // The attachment fact is the one the action compiler acts on: the
+        // registry answers with a hook of that name. A name nothing
+        // declares refuses at compile time, so inventory must not claim it.
+        let (_directory, registry) = wasm_routing_registry();
+        let mut active = AttachedChains::default();
+        record_configured_action(
+            &serde_json::json!({
+                "type": "ai_proxy",
+                "ai_routing_policy": {"engine": "wasm", "type": "absent_router"}
+            }),
+            registry.as_ref(),
+            0,
+            &mut active,
+        );
+
+        assert!(!active.is_attached(ExtensionHookKind::AiRouting, "absent_router"));
+    }
+
+    #[test]
+    fn only_a_wasm_routing_policy_on_an_ai_proxy_action_names_a_hook() {
+        let named = serde_json::json!({
+            "type": "ai_proxy",
+            "ai_routing_policy": {"engine": "wasm", "type": "plan_router"}
+        });
+        assert_eq!(configured_ai_routing_type(&named), Some("plan_router"));
+
+        // The inline engines carry their program in the config and attach
+        // no bundle hook; a wasm form with no `type` names nothing the
+        // compiler would accept; and the key on any other action type is
+        // inert, because only `ai_proxy` reads it.
+        for inert in [
+            serde_json::json!({
+                "type": "ai_proxy",
+                "ai_routing_policy": {"expression": "null"}
+            }),
+            serde_json::json!({
+                "type": "ai_proxy",
+                "ai_routing_policy": {"engine": "lua", "source": "return nil"}
+            }),
+            serde_json::json!({
+                "type": "ai_proxy",
+                "ai_routing_policy": {"engine": "wasm"}
+            }),
+            serde_json::json!({"type": "ai_proxy"}),
+            serde_json::json!({
+                "type": "proxy",
+                "ai_routing_policy": {"engine": "wasm", "type": "plan_router"}
+            }),
+        ] {
+            assert_eq!(configured_ai_routing_type(&inert), None, "{inert}");
+        }
     }
 
     #[test]

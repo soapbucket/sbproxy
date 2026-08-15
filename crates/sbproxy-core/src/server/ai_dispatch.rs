@@ -5929,6 +5929,8 @@ pub(super) async fn handle_ai_proxy(
     // The plan's reason code is held until precedence is resolved so a plan
     // an `ai_policy route_to` overrides is not counted as one that ran.
     let mut routing_plan_reason_code: Option<&'static str> = None;
+    // How many tiers the host dropped from the plan before it ran.
+    let mut routing_plan_dropped: usize = 0;
     // The plan's engine label, stashed with it for the deferred record.
     let mut routing_plan_engine: Option<sbproxy_observe::decision::DecisionEngine> = None;
     // A routing plan fans a request across configured providers, which
@@ -5964,11 +5966,15 @@ pub(super) async fn handle_ai_proxy(
                 .iter()
                 .map(|p| p.name.to_string())
                 .collect();
-            match routing_policy.evaluate(&routing_view, &configured_providers) {
+            match routing_policy
+                .evaluate(&routing_view, &configured_providers)
+                .await
+            {
                 sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Plan {
                     cascade,
                     reason,
                     reason_code,
+                    dropped,
                 } => {
                     // A routing plan must not route around the operator's
                     // model allowlist, exactly like the `ai_policy route_to`
@@ -6008,6 +6014,11 @@ pub(super) async fn handle_ai_proxy(
                     ctx.ai_route_reason = Some(reason);
                     routing_policy_cascade = Some(cascade);
                     routing_plan_reason_code = Some(reason_code);
+                    // A plan the host degraded (WOR-2366 D6) still runs, but
+                    // it is not the plan the operator wrote, so it must not
+                    // count as a clean one. Held with the reason code until
+                    // precedence settles, for the same reason that is.
+                    routing_plan_dropped = dropped.len();
                     routing_plan_engine = Some(routing_policy.decision_engine());
                 }
                 sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Decline => {
@@ -6252,7 +6263,14 @@ pub(super) async fn handle_ai_proxy(
     // plans; it is recorded as `overridden` instead.
     if let Some(reason_code) = routing_plan_reason_code {
         if routing_policy_cascade.is_some() {
-            sbproxy_ai::ai_metrics::record_routing_policy_decision("plan", reason_code);
+            sbproxy_ai::ai_metrics::record_routing_policy_decision(
+                if routing_plan_dropped > 0 {
+                    "plan_degraded"
+                } else {
+                    "plan"
+                },
+                reason_code,
+            );
             sbproxy_observe::decision::record_decision(
                 sbproxy_observe::decision::DecisionEvent::RouteDecide,
                 routing_plan_engine.unwrap_or(sbproxy_observe::decision::DecisionEngine::Cel),
@@ -7239,17 +7257,12 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
-    ctx.admin_load_balancer_strategy = Some(if routing_policy_cascade.is_some() {
-        // A routing-policy plan supersedes the configured strategy for
-        // this request; the admin view should say so rather than name a
-        // strategy that did not decide.
-        "ai_routing_policy".to_string()
-    } else {
-        router.strategy_name().to_string()
-    });
     ctx.admin_load_balancer_target = provider_order
         .first()
         .map(|&index| config.providers[index].name.to_string());
+    // Whether the streaming tier-1 pin below actually reordered the
+    // providers. Only then did a routing plan decide a streaming request.
+    let mut streaming_plan_pinned = false;
     // Cascade + streaming: cascade does not retry mid-stream, so
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
@@ -7267,6 +7280,12 @@ pub(super) async fn handle_ai_proxy(
                     .find(|&index| config.providers[index].name == first_tier.provider_id)
                 {
                     provider_order = vec![idx];
+                    // The pin took effect, so a plan (if this cascade came
+                    // from one) really did decide this streaming request.
+                    // A miss below leaves the order untouched and the
+                    // configured strategy deciding, which the admin label
+                    // must not report as the policy.
+                    streaming_plan_pinned = true;
                     if let Some(obj) = body.as_object_mut() {
                         obj.insert(
                             "model".to_string(),
@@ -7296,6 +7315,27 @@ pub(super) async fn handle_ai_proxy(
     let has_managed_local = provider_order.iter().any(|&index| {
         let provider = &config.providers[index];
         provider.serve.is_some() || provider.is_managed_model()
+    });
+    // A routing-policy plan supersedes the configured strategy for this
+    // request, and the admin view should say so; but only when the plan
+    // actually reaches dispatch. The disallow_training filter (both
+    // dispatch paths) and the managed-local filter (the non-streaming
+    // cascade executor) below can still drop a produced plan, and then
+    // the configured strategy is what decided, so naming
+    // `ai_routing_policy` here would misreport it.
+    // Streaming reports the plan only when the tier-1 pin above actually
+    // found its provider; a miss leaves the configured strategy deciding.
+    let routing_plan_dispatches = routing_policy_cascade.is_some()
+        && !disallow_training
+        && if is_stream {
+            streaming_plan_pinned
+        } else {
+            !has_managed_local
+        };
+    ctx.admin_load_balancer_strategy = Some(if routing_plan_dispatches {
+        "ai_routing_policy".to_string()
+    } else {
+        router.strategy_name().to_string()
     });
 
     // --- Cascade routing ---

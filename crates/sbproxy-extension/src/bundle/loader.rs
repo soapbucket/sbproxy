@@ -299,6 +299,10 @@ impl BundleRegistry for DynamicBundleRegistry {
         lookup(&self.hooks, BundleHookKind::ProxyWasm, type_name)
     }
 
+    fn ai_routing(&self, type_name: &str) -> Option<&LoadedBundleHook> {
+        lookup(&self.hooks, BundleHookKind::AiRouting, type_name)
+    }
+
     fn ai_hooks(&self, kind: BundleHookKind) -> Vec<&LoadedBundleHook> {
         if !is_ai_kind(kind) {
             return Vec::new();
@@ -935,6 +939,7 @@ const fn inventory_hook_kind(kind: BundleHookKind) -> ExtensionHookKind {
         BundleHookKind::Auth => ExtensionHookKind::Auth,
         BundleHookKind::Transform => ExtensionHookKind::Transform,
         BundleHookKind::Action => ExtensionHookKind::Action,
+        BundleHookKind::AiRouting => ExtensionHookKind::AiRouting,
         BundleHookKind::AiToolCall => ExtensionHookKind::AiToolCall,
         BundleHookKind::AiGuardrailInput => ExtensionHookKind::AiGuardrailInput,
         BundleHookKind::AiGuardrailOutput => ExtensionHookKind::AiGuardrailOutput,
@@ -957,11 +962,13 @@ const fn hook_phase(kind: BundleHookKind) -> &'static str {
         | BundleHookKind::AiStreamEvent
         | BundleHookKind::AiClose
         | BundleHookKind::AiFailure => "ai",
+        BundleHookKind::AiRouting => "ai",
         BundleHookKind::Payment => "payment",
     }
 }
 
 const fn is_ai_kind(kind: BundleHookKind) -> bool {
+    // AiRouting stays false: it is an attach-by-type hook, not an event-chain hook, and must not enter ai_hooks()/AiExtensionChain.
     matches!(
         kind,
         BundleHookKind::AiToolCall
@@ -979,6 +986,7 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::Auth => "auth",
         BundleHookKind::Transform => "transform",
         BundleHookKind::Action => "action",
+        BundleHookKind::AiRouting => "ai_routing",
         BundleHookKind::AiToolCall => "ai_tool_call",
         BundleHookKind::AiGuardrailInput => "ai_guardrail_input",
         BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",

@@ -1074,6 +1074,18 @@
           "items": {
             "$ref": "#/definitions/CustomLogFieldConfig"
           }
+        },
+        "decision_audit": {
+          "description": "Decision-event audit publication. Absent means off, which is also what `enabled: false` means: no decision event publishes an audit record at this scope.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DecisionAuditConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -1404,6 +1416,28 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DecisionAuditConfig": {
+      "description": "Operator control over which decision events publish an audit record.\n\nEvery decision point in the pipeline (cache admission, cache-key derivation, routing, auth, policy) already produces a `reason` string saying what it decided and why. This block is what turns that rationale into an OCSF audit record instead of letting it be decoded and dropped.\n\n```yaml observability: log: decision_audit: enabled: true events: cache.admit: true ```\n\nProxy scope only in this release. The tenant and origin log blocks deny unknown fields and carry no `decision_audit` key, so a block written under either one fails config load rather than composing or being ignored. When scoping does land it will compose the way `custom_fields` does, per key rather than per block: a more-specific scope naming one event must not wipe the entries a less-specific scope set for the others.\n\n# This block is the only thing that decides what publishes\n\nNo event carries a default of its own. Every label is off until a setting here says otherwise, and there is nowhere else to look. An earlier draft kept a second per-event default outside the config, which is how an operator ends up believing a feed is on: the two disagreed, and the one nothing consulted was the one that read as authoritative.\n\nThe security ordering behind that draft is worth keeping, as the shape a later release should default on once the events have emitters. `auth`, `policy`, `rate_limit`, `waf`, both AI guardrail events, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle` are the security-relevant ones, and an operator who can afford only part of the feed wants those. `cache.key` is security-relevant and also the densest event in the set, once per cacheable request, so it stays an explicit opt-in rather than riding a default. `route.decide` is worth publishing when a decision crosses a provider or data-residency boundary and is noise otherwise, which is a question about the decision rather than about the event, so it needs the routing event config to carry that predicate before any default for it means anything.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch for the block. `Some(true)` publishes every event the `events` map does not name, except `ai.stream.event`, which is never published by any setting; `Some(false)` and `None` are both **off**, as is an absent block.\n\n`proxy.observability.log.decision_audit` is the only place this block is accepted in this release. The tenant and origin log blocks deny unknown fields and carry no `decision_audit` key, so writing one there fails config load with an `unknown field` error rather than being read or quietly ignored. Scoped overrides land in a later slice, and until they do there is no parent for `None` to inherit from, which is why it reads as off rather than as inherit.\n\nOff is the default because the decision events differ by orders of magnitude in how often they fire. `cache.key` runs once per cacheable request, so a master switch with permissive defaults would hand an operator a per-request SIEM feed on their busiest origin the moment they flipped it. That is an ingest bill rather than a control, and the usual answer to a feed nobody can afford is to turn the whole thing off, which takes the security-relevant events with it. Opting in per event costs one line and keeps that choice available.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "events": {
+          "description": "Per-event override of the master switch, keyed by the event's stable label ([`sbproxy_observe::decision::DecisionEvent::as_label`]): `cache.admit`, `cache.key`, `route.decide`, `auth`, `policy`, and the rest. `true` publishes that event's records, `false` silences it. An event this map does not name falls back to the master switch.\n\nA key naming no known event is refused at config load rather than ignored, because a typo'd label is a feed the operator believes they turned on and nobody is watching. `ai.stream.event: true` is refused by value for the same reason the block defaults off: that event fires once per streamed chunk. `ai.close` carries the stream's summary instead. That one label is also the single exception to the fallback above: it never publishes, master switch or not.\n\nA `BTreeMap` rather than a `HashMap`, matching `custom_fields`: the composed set is iterated to resolve the emission policy, and a hash order would make two proxies holding identical config walk it differently.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "boolean"
+          }
         }
       },
       "additionalProperties": false

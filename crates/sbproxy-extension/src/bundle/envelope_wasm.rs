@@ -614,6 +614,62 @@ impl ActionHandler for WasmActionAdapter {
     }
 }
 
+/// AI routing program backed by one prepared envelope WASM runtime.
+///
+/// Built from a bundle hook of kind `ai_routing` (WOR-2366). The
+/// compiled routing policy in sbproxy-ai holds one of these and calls
+/// [`WasmAiRoutingProgram::plan`] with the `ai` decision document,
+/// the same vocabulary the inline engines read.
+pub struct WasmAiRoutingProgram {
+    type_name: String,
+    program: EnvelopeWasmProgram,
+}
+
+impl std::fmt::Debug for WasmAiRoutingProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WasmAiRoutingProgram")
+            .field("type_name", &self.type_name)
+            .field("program", &self.program)
+            .finish()
+    }
+}
+
+/// Build an AI routing program from a validated envelope WASM hook.
+///
+/// Runs the same prepare path as every other envelope adapter: the
+/// hook's `config_schema` defaults are applied to `vars`, declared
+/// `secret_vars` are resolved, the resolved config is validated
+/// against the hook's own schema, and the bundle's sandbox budget and
+/// buffer limits are attached to the program.
+pub fn build_wasm_ai_routing(
+    hook: &LoadedBundleHook,
+    vars: Value,
+) -> Result<WasmAiRoutingProgram, BundleLoadError> {
+    let (type_name, program) = prepare_wasm_program(hook, BundleHookKind::AiRouting, vars)?;
+    Ok(WasmAiRoutingProgram { type_name, program })
+}
+
+impl WasmAiRoutingProgram {
+    /// The hook's `type:` name, echoed for labels and error messages.
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// Invoke the guest with the `ai` decision document and return the
+    /// raw plan JSON from its response envelope.
+    ///
+    /// `Value::Null` is a legitimate decline; any other value is
+    /// handed to sbproxy-ai's plan decoder untouched, so this crate
+    /// never learns the routing-plan schema. Faults (timeout, guest
+    /// trap, resource caps, malformed envelope) map to [`PluginError`]
+    /// exactly like the policy adapter's.
+    pub async fn plan(&self, ai_document: Value) -> Result<Value, PluginError> {
+        let output = self.program.invoke("ai", ai_document).await?;
+        envelope::decode_route_document(&output).map_err(envelope_plugin_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -631,8 +687,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build_wasm_action, build_wasm_policy, build_wasm_transform, EnvelopeWasmProgram,
-        WasmExecutor,
+        build_wasm_action, build_wasm_ai_routing, build_wasm_policy, build_wasm_transform,
+        EnvelopeWasmProgram, WasmExecutor,
     };
     use crate::bundle::{BundleRegistry, DynamicBundleRegistry, LoadedBundleHook};
     use crate::wasm::{WasmBundleLimits, WasmCallFailure, WasmRuntime};
@@ -648,6 +704,7 @@ mod tests {
                 BundleHookKind::Policy => self.registry.policy(type_name),
                 BundleHookKind::Transform => self.registry.transform(type_name),
                 BundleHookKind::Action => self.registry.action(type_name),
+                BundleHookKind::AiRouting => self.registry.ai_routing(type_name),
                 _ => None,
             }
             .expect("fixture hook should load")
@@ -834,6 +891,52 @@ mod tests {
                 body: Bytes::from_static(b"queued"),
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn envelope_wasm_ai_routing_round_trips_a_plan_envelope() {
+        let fixture = fixture(
+            "ai-routing-plan.wasm",
+            "  - kind: ai_routing\n    type: wasm_ai_routing_fixture\n    execution:\n      body_mode: none\n",
+            "",
+        );
+        let program = build_wasm_ai_routing(
+            fixture.hook(BundleHookKind::AiRouting, "wasm_ai_routing_fixture"),
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(program.type_name(), "wasm_ai_routing_fixture");
+        let plan = program
+            .plan(json!({ "model": "gpt-4o", "intent": "chat" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            plan,
+            json!({
+                "candidates": [{ "provider_id": "frontier", "model": "gpt-4o" }],
+                "reason": "from wasm",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn envelope_wasm_ai_routing_null_plan_is_a_decline() {
+        // The guest declines when the `ai` document carries the bytes
+        // "decline"; the adapter must surface that as `Value::Null`,
+        // not an error, so the caller can fall through to its own
+        // routing.
+        let fixture = fixture(
+            "ai-routing-plan.wasm",
+            "  - kind: ai_routing\n    type: wasm_ai_routing_fixture\n    execution:\n      body_mode: none\n",
+            "",
+        );
+        let program = build_wasm_ai_routing(
+            fixture.hook(BundleHookKind::AiRouting, "wasm_ai_routing_fixture"),
+            json!({}),
+        )
+        .unwrap();
+        let plan = program.plan(json!({ "intent": "decline" })).await.unwrap();
+        assert!(plan.is_null(), "{plan}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

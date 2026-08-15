@@ -408,9 +408,18 @@ The expression reads the same `ai.*` decision view the
 `ai.model`, `ai.budget.fraction`, the guardrail verdicts, and the rest),
 and returns one of three shapes:
 
-- A plan, `{"candidates": [{"provider_id", "model", "quality_threshold"?, "cost_cap"?}], "reason", "reason_code"?}`. The candidates are tried in order, and a `quality_threshold` or `cost_cap` on one means exactly what it means on a `cascade` tier. `reason` is required and reaches the access log, so you can see why a request routed the way it did rather than guessing.
+- A plan, `{"candidates": [{"provider_id", "model", "quality_threshold"?, "cost_cap"?}], "reason", "reason_code"?}`. The candidates are tried in order, and a `quality_threshold` or `cost_cap` on one means exactly what it means on a `cascade` tier. `reason` is required and reaches the access log, so you can see why a request routed the way it did rather than guessing. An absent `quality_threshold` or `cost_cap` means no limit, and so does an explicit null, because encoders emit null for an unset optional constantly; if you compute a limit in CEL, guard the arithmetic against non-finite values, which arrive as null and therefore as no limit.
 - A decline: `null`, `{}`, or an empty candidate list. This is the common case and it is meant to be the cheapest thing to write. The configured `routing` strategy runs unchanged, so a policy that has an opinion about a few requests and none about the rest just declines for the rest.
-- Nothing usable: an evaluation error, a plan with no reason, or a candidate naming a provider you never configured. `on_error` decides what happens next. `decline` (the default) falls through to the strategy; `block` refuses the request. A broken optimization policy should not take the gateway down, which is why the default fails open.
+- Nothing usable: an evaluation error, a plan with no reason, or a plan none of whose candidates survive the provider check below. `on_error` decides what happens next. `decline` (the default) falls through to the strategy; `block` refuses the request. A broken optimization policy should not take the gateway down, which is why the default fails open.
+
+A candidate naming a provider the origin does not configure is handled
+more gently: the gateway drops that candidate with a warning and runs
+the plan on the survivors, and only a plan with no surviving candidate
+follows `on_error`. Earlier releases refused the whole plan at the first
+unknown name, which turned a partly stale plan, say one written before a
+provider rename, into a failed request even when its other candidates
+were fine. Degrading to the survivors keeps the request alive, and the
+warning keeps the stale name visible.
 
 One input on that decision view is worth calling out, because it turns a
 built-in strategy into something you author. `ai.prompt.difficulty` is a heuristic
@@ -509,12 +518,21 @@ Anything else collapses to `other`, and an absent code reads as `policy`,
 which keeps a policy from filling the label with unbounded distinct
 values.
 
+The `outcome` label separates a plan that ran whole (`plan`) from one
+the gateway had to degrade first (`plan_degraded`, at least one tier
+dropped for naming a provider this origin does not configure), from
+`decline`, `overridden` (a security `route_to` cleared the plan), and
+`error`. Alert on `plan_degraded`: the request was served, but not by
+the plan as written, and the reason in the access log still describes
+the plan the policy returned.
+
 The policy is not tied to CEL. The `engine` + `source` form authors the
-same decision in Lua, JavaScript, or Rego, all reading the same `ai`
-document (Lua and JavaScript as an `ai` global, Rego as `input.ai`) and
-returning the same plan shape, so a policy ported between engines
-renames nothing. `on_error` and `reason_codes` work identically in every
-engine.
+same decision in Lua, JavaScript, or Rego, and `engine: wasm` attaches
+compiled code instead of inline source. Every engine reads the same `ai`
+document (Lua and JavaScript as an `ai` global, Rego as `input.ai`,
+WebAssembly as the `ai` field of its request envelope) and returns the
+same plan shape, so a policy ported between engines renames nothing.
+`on_error` and `reason_codes` work identically in every engine.
 
 ```yaml
   # Lua: return a plan table, or nil to decline.
@@ -546,6 +564,23 @@ engine.
     reason_codes: [cost]
 ```
 
+```yaml
+  # WebAssembly: a compiled bundle hook, attached by type.
+  ai_routing_policy:
+    engine: wasm
+    type: acme_router          # an `ai_routing` hook a loaded bundle declares
+    vars: { aggressiveness: 2 }  # validated by the bundle's config_schema
+```
+
+There is no `source` to inline here. The `type` names an `ai_routing`
+hook a loaded [extension bundle](extension-bundles.md) declares in its
+manifest, running under the envelope WASM runtime, and `vars` is that
+attachment's config, checked against the hook's `config_schema`. The
+hook reads the same `ai` document as every other engine and returns the
+same plan envelope. It declares no capabilities and takes no request
+body, because a routing decision does no I/O and the `ai` document is
+its whole input.
+
 Lua and JavaScript run inline source on a fresh sandboxed VM per
 evaluation, the same cost model as every other inline script surface.
 Lua source is parse-checked at config load; JavaScript has no
@@ -555,9 +590,11 @@ evaluates on a shared in-process interpreter with a 50 ms budget
 (`budget_ms` to change it, which must be greater than zero), a `query`
 defaulting to `data.sbproxy.route`, and load-time validation: a module
 whose query names no rule refuses at config load rather than declining
-forever. A
-`wasm` routing hook is a compiled bundle rather than inline source and
-arrives through the extension-bundle registry in a later release.
+forever. A `wasm` hook runs its compiled module under the sandbox
+budget its bundle manifest declares, not a knob in this block, and it
+resolves at config load too: a `type` no loaded bundle declares, or a
+config that loads no bundle at all, refuses then rather than at the
+first request.
 
 ## Resilience
 

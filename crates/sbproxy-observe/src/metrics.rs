@@ -9,6 +9,7 @@ use prometheus::{
 
 use crate::agent_labels::AgentLabels;
 use crate::cardinality::{CardinalityConfig, CardinalityLimiter};
+use crate::decision::{DecisionEvent, DecisionOutcome};
 
 /// Global metrics registry.
 static METRICS: OnceLock<ProxyMetrics> = OnceLock::new();
@@ -2936,6 +2937,125 @@ pub fn record_policy_audit_event_dropped(tenant: &str) {
         tenant,
     );
     counter.with_label_values(&[tenant.as_str()]).inc();
+}
+
+// --- WOR-2405: decision audit publication accounting ---
+//
+// Two new families rather than two more labels on
+// `sbproxy_policy_audit_events_dropped_total`. That counter is
+// `SupportLevel::Stable`, and a label added to a live counter changes
+// every series an operator already selects on, so the dashboards and
+// alert rules built against it stop matching. A new name costs a doc row;
+// a widened label set costs somebody's paging rule.
+//
+// The two carry deliberately different label sets, and the asymmetry is
+// the point rather than an oversight.
+//
+// The drop counter carries `tenant` because the question a drop raises is
+// whose audit trail just went lossy, and `event` alone cannot answer it.
+// It is the same reasoning `record_policy_audit_event_dropped` is built
+// on: one noisy tenant must not silently degrade another tenant's
+// evidence, and an operator cannot act on a drop they cannot attribute.
+//
+// The emit counter carries `outcome` instead, because what it answers is
+// the shape of the feed: an audit stream that is all `allow` and an audit
+// stream that is all `deny` are different systems, and only the second is
+// worth waking somebody for. It does not carry `tenant`, because the
+// product of the two would multiply the label budget for a counter that
+// should be dense, and the per-tenant cut is already available from two
+// families that do carry it: this pair's own drop counter, and
+// `sbproxy_decision_event_total{event, engine, outcome, origin, tenant}`,
+// which counts the decisions these records are made from.
+//
+// `event` and `outcome` are closed by construction, the same way the
+// `sbproxy_decision_event_*` families close theirs. Both recorders take
+// `DecisionEvent` / `DecisionOutcome` and read `as_label()`, so no caller
+// can widen either dimension and neither has to spend a cardinality
+// budget slot to be safe. `tenant` is the only open dimension here, and
+// it goes through `sanitize_label_budget` exactly as its policy sibling
+// does.
+
+/// Increment `sbproxy_decision_audit_events_dropped_total{event, tenant}`.
+///
+/// Called when a [`DecisionAudit`](crate::decision::DecisionAudit) could
+/// not be handed to the audit bus: the bounded queue was full, the
+/// receiver was gone, or no bus was installed. The publisher never blocks
+/// the request path to make room, so the record is lost, and a lossy
+/// audit feed is worse than an absent one because the gap reads as
+/// evidence that nothing was decided. Treat a non-zero rate as a paging
+/// signal, the same way [`record_policy_audit_event_dropped`] is treated.
+///
+/// `event` names which feed lost coverage, which is the first thing an
+/// operator needs and the only thing that distinguishes one flooding
+/// event from a bus that is failing for everybody. `tenant` names whose
+/// trail it was.
+///
+/// Registration failure is swallowed with `.ok()` rather than unwrapped,
+/// following [`record_events_dropped`], and for the same reason: this
+/// runs from a request-path publish, and a proxy that aborts because a
+/// counter would not register is a worse outcome than one whose drop
+/// counter is missing. The only ways `register_int_counter_vec!` fails
+/// are a duplicate name and a malformed one, and the registry drift
+/// guard catches both before a release.
+pub fn record_decision_audit_dropped(event: DecisionEvent, tenant: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_decision_audit_events_dropped_total",
+            "Decision audit records dropped before publication, by decision event and tenant",
+            &["event", "tenant"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let tenant = sanitize_label_budget(
+            "sbproxy_decision_audit_events_dropped_total",
+            "tenant",
+            tenant,
+        );
+        counter
+            .with_label_values(&[event.as_label(), tenant.as_str()])
+            .inc();
+    }
+}
+
+/// Increment `sbproxy_decision_audit_events_total{event, outcome}`.
+///
+/// One increment per [`DecisionAudit`](crate::decision::DecisionAudit)
+/// accepted by the audit bus. This is the affirmative half of the pair:
+/// a drop counter on its own cannot tell a healthy quiet feed from a
+/// broken one, because both read zero. Pairing an emit counter with a
+/// drop counter is what makes "my `cache.admit` audit trail stopped" a
+/// question the metrics can answer, and it follows the policy family,
+/// where `record_policy_audit_emitted` sits beside
+/// [`record_policy_audit_event_dropped`] for the same reason.
+///
+/// `outcome` rather than `tenant`: see the note above this pair. The
+/// counter describes the shape of the feed, and its per-tenant cut is
+/// already carried by the drop counter and by
+/// `sbproxy_decision_event_total`.
+///
+/// Registration failure is swallowed with `.ok()` for the reason given on
+/// [`record_decision_audit_dropped`].
+pub fn record_decision_audit_emitted(event: DecisionEvent, outcome: DecisionOutcome) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_decision_audit_events_total",
+            "Decision audit records published on the audit bus, by decision event and outcome",
+            &["event", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter
+            .with_label_values(&[event.as_label(), outcome.as_label()])
+            .inc();
+    }
 }
 
 /// Observe the wall-clock latency of a policy decision in seconds.

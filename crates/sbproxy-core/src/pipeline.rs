@@ -36,7 +36,7 @@ use sbproxy_cache::{
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
 use sbproxy_modules::compile::{
-    compile_action_for_origin, compile_action_for_origin_for_validation,
+    compile_action_for_origin_for_validation_with_registry,
     compile_action_for_origin_with_registry, compile_action_with_registry, compile_auth,
     compile_auth_with_registry, compile_policy, compile_policy_with_registry, compile_transform,
     compile_transform_with_registry,
@@ -2224,23 +2224,29 @@ impl CompiledPipeline {
                 origin.origin_id.as_str(),
                 None,
             );
+            // The registry rides along for every action type, not only
+            // the ones a loaded bundle names: a built-in action may attach
+            // bundle hooks by `type:`, and `ai_proxy`'s `engine: wasm`
+            // routing policy is the first that does (WOR-2366). Finding a
+            // bundle action is still the compiler's job, in its
+            // unknown-type fall-through, so a built-in or linked-plugin
+            // `type:` reaches exactly the arm it always did.
+            //
+            // `mut` because an MCP action is bound to its route authority
+            // immediately below.
             let mut action = match mode {
-                _ if configured_type(&origin.action_config)
-                    .is_some_and(|name| extension_registry.action(name).is_some()) =>
-                {
-                    compile_action_for_origin_with_registry(
+                PipelineConstructionMode::Runtime => compile_action_for_origin_with_registry(
+                    &origin.action_config,
+                    &action_identity,
+                    extension_registry.as_ref(),
+                )?,
+                PipelineConstructionMode::Validation => {
+                    compile_action_for_origin_for_validation_with_registry(
                         &origin.action_config,
                         &action_identity,
                         extension_registry.as_ref(),
                     )?
                 }
-                PipelineConstructionMode::Runtime => {
-                    compile_action_for_origin(&origin.action_config, &action_identity)?
-                }
-                PipelineConstructionMode::Validation => compile_action_for_origin_for_validation(
-                    &origin.action_config,
-                    &action_identity,
-                )?,
             };
             if let Action::Mcp(mcp) = &mut action {
                 mcp.bind_exact_route_authority(origin.hostname.as_str());
@@ -3328,15 +3334,21 @@ fn compile_single_forward_rule(
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
+    // Same reasoning as the per-origin action site: the registry is
+    // passed for every action type, because a built-in action may attach
+    // bundle hooks by `type:` (`ai_proxy`'s `engine: wasm` routing
+    // policy, WOR-2366). The bundle-action lookup itself happens inside
+    // the compiler's unknown-type fall-through.
     let action = match mode {
-        _ if configured_type(action_config)
-            .is_some_and(|name| extension_registry.action(name).is_some()) =>
-        {
+        PipelineConstructionMode::Runtime => {
             compile_action_for_origin_with_registry(action_config, rule_id, extension_registry)?
         }
-        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, rule_id)?,
         PipelineConstructionMode::Validation => {
-            compile_action_for_origin_for_validation(action_config, rule_id)?
+            compile_action_for_origin_for_validation_with_registry(
+                action_config,
+                rule_id,
+                extension_registry,
+            )?
         }
     };
 
@@ -3617,16 +3629,23 @@ fn compile_fallback(
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
-    let action = if configured_type(action_config)
-        .is_some_and(|name| extension_registry.action(name).is_some())
-    {
-        compile_action_with_registry(action_config, extension_registry)?
-    } else {
-        match mode {
-            PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
-            PipelineConstructionMode::Validation => {
-                compile_action_for_origin_for_validation(action_config, "")?
-            }
+    // The fallback action takes the registry for every type too: a
+    // built-in action may attach bundle hooks by `type:` (`ai_proxy`'s
+    // `engine: wasm` routing policy, WOR-2366), and the bundle-action
+    // lookup happens inside the compiler's unknown-type fall-through.
+    // `compile_action_with_registry` is the empty-origin-id form of the
+    // per-origin entry point, which is what a fallback action has always
+    // compiled through.
+    let action = match mode {
+        PipelineConstructionMode::Runtime => {
+            compile_action_with_registry(action_config, extension_registry)?
+        }
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation_with_registry(
+                action_config,
+                "",
+                extension_registry,
+            )?
         }
     };
 
@@ -4504,6 +4523,7 @@ mod tests {
             l2_store: None,
             mesh: None,
             access_log: None,
+            decision_audit: None,
             agent_classes: None,
             rate_limits: None,
             audit: None,
@@ -4910,6 +4930,93 @@ hooks:
         );
     }
 
+    /// An `ai_proxy` action whose routing policy names a wasm bundle hook
+    /// that no loaded bundle declares.
+    fn wasm_routed_ai_proxy_action() -> serde_json::Value {
+        serde_json::json!({
+            "type": "ai_proxy",
+            "ai_routing_policy": {"engine": "wasm", "type": "steer"}
+        })
+    }
+
+    /// Assert a construction failed on hook resolution rather than on a
+    /// missing registry.
+    ///
+    /// The two refusals are what discriminate a registry that reached the
+    /// `ai_proxy` compile from one that never arrived, so the pair of
+    /// assertions is factored out instead of repeated per call site.
+    #[track_caller]
+    fn assert_registry_reached_wasm_routing(error: &anyhow::Error, site: &str) {
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("requires a loaded extension bundle"),
+            "the {site} action compiled with no registry, so the bundle registry never \
+             reached `ai_proxy`: {message}"
+        );
+        assert!(
+            message.contains("no loaded extension bundle declares an `ai_routing` hook"),
+            "expected the {site} action to refuse on hook resolution: {message}"
+        );
+    }
+
+    #[test]
+    fn wasm_ai_routing_reaches_the_registry_at_every_action_site() {
+        // WOR-2366: `ai_proxy` is a built-in `type:`, so a registry arm
+        // guarded by `registry.action("ai_proxy")` never fires and every
+        // `engine: wasm` routing policy refuses at boot. Staging a real
+        // `ai_routing` bundle here would need a compiled wasm module this
+        // crate has no dev-dependency to produce, so each site is proven
+        // by which refusal it returns instead. "requires a loaded
+        // extension bundle" is `prepare_wasm_routing` seeing no registry
+        // at all, which is the bug; naming the unresolved hook type is a
+        // registry that did arrive and simply holds no `steer` hook.
+        let directory = TempDir::new().expect("temporary config directory");
+
+        let origin_action = make_config(
+            "wasm-routing.example",
+            wasm_routed_ai_proxy_action(),
+            None,
+            Vec::new(),
+        );
+        let error = match CompiledPipeline::from_config_at(origin_action, directory.path()) {
+            Ok(_) => panic!("an unresolvable wasm ai_routing hook must refuse the origin action"),
+            Err(error) => error,
+        };
+        assert_registry_reached_wasm_routing(&error, "origin");
+
+        let mut forward_rule = make_config(
+            "wasm-routing.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            None,
+            Vec::new(),
+        );
+        forward_rule.origins[0].forward_rules = vec![serde_json::json!({
+            "rules": [{"path": {"prefix": "/chat"}}],
+            "origin": {"action": wasm_routed_ai_proxy_action()}
+        })];
+        let error = match CompiledPipeline::from_config_at(forward_rule, directory.path()) {
+            Ok(_) => panic!("an unresolvable wasm ai_routing hook must refuse the forward rule"),
+            Err(error) => error,
+        };
+        assert_registry_reached_wasm_routing(&error, "forward-rule");
+
+        let mut fallback = make_config(
+            "wasm-routing.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            None,
+            Vec::new(),
+        );
+        fallback.origins[0].fallback_origin = Some(serde_json::json!({
+            "on_error": true,
+            "origin": {"action": wasm_routed_ai_proxy_action()}
+        }));
+        let error = match CompiledPipeline::from_config_at(fallback, directory.path()) {
+            Ok(_) => panic!("an unresolvable wasm ai_routing hook must refuse the fallback origin"),
+            Err(error) => error,
+        };
+        assert_registry_reached_wasm_routing(&error, "fallback");
+    }
+
     #[test]
     fn pipeline_resolve_origin() {
         let config = make_config(
@@ -5065,6 +5172,7 @@ origins:
             l2_store: None,
             mesh: None,
             access_log: None,
+            decision_audit: None,
             agent_classes: None,
             rate_limits: None,
             audit: None,

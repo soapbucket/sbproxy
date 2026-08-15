@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use sbproxy_core::policy_bus::{self, PolicyBus, PolicyVerdictReceiver};
+use sbproxy_core::policy_bus::{self, AuditRecord, PolicyBus, PolicyVerdictReceiver};
 use sbproxy_core::policy_dispatch::{translate_plugin_decision, ConfirmReducerState};
 use sbproxy_observe::events::{PolicySurface, PolicyVerdictEvent, VerdictTag};
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
@@ -150,7 +150,13 @@ async fn audit_bus_round_trips_a_verdict_event() {
     let outcome = policy_bus::try_publish(event.clone());
     match outcome {
         Ok(()) => {}
-        Err(returned) => assert_eq!(returned.policy_id, event.policy_id),
+        // The bus carries an `AuditRecord` envelope, so an event that
+        // could not be enqueued comes back wrapped in the arm it was
+        // published on.
+        Err(returned) => match *returned {
+            AuditRecord::PolicyVerdict(got) => assert_eq!(got.policy_id, event.policy_id),
+            other => panic!("a published verdict must come back as one, got {other:?}"),
+        },
     }
 }
 
