@@ -424,7 +424,7 @@ Three families cover all of them, dimensioned rather than duplicated, and two mo
 | `sbproxy_decision_audit_events_total` | `event`, `outcome` | How much audit feed each decision point is producing, and of what shape |
 | `sbproxy_decision_audit_events_dropped_total` | `event`, `tenant` | Whose audit trail lost records, and which decision point they came from |
 
-`event` is a named pipeline point (`policy`, `cache.key`, `route.decide`, `ai.guardrail.input`, ...). `engine` is who answered it (`built_in`, `plugin`, `cel`, `lua`, `js`, `wasm`, `proxy_wasm`). Separating the two is the point: adding a capability should not mean picking an engine first and inheriting whatever seam that engine happens to have.
+`event` is a named pipeline point (`policy`, `cache.key`, `route.decide`, `ai.guardrail.input`, ...). `engine` is who answered it (`built_in`, `plugin`, `cel`, `lua`, `js`, `rego`, `wasm`, `proxy_wasm`). Separating the two is the point: adding a capability should not mean picking an engine first and inheriting whatever seam that engine happens to have.
 
 `outcome` always carries `error` and `timeout` alongside an event's own verdicts, so a failing hook is alertable without knowing in advance which hook it was in. `decline` is separate from both, and it is not a failure: a routing or cache policy that returns nothing falls through to the configured default, which is the common path rather than the exceptional one.
 
@@ -434,7 +434,7 @@ Three families cover all of them, dimensioned rather than duplicated, and two mo
 
 #### Cardinality budget
 
-Stated here rather than discovered on your Prometheus. The theoretical product is `event x engine x outcome x origin x tenant`, which is 18 x 7 x 7 = 882 before tenancy. In practice it is sparse: one event is normally served by one engine per origin, and most origins use a handful of events.
+Stated here rather than discovered on your Prometheus. The theoretical product is `event x engine x outcome x origin x tenant`, which is 18 x 8 x 7 = 1008 before tenancy. In practice it is sparse: one event is normally served by one engine per origin, and most origins use a handful of events.
 
 At 50 origins and 500 tenants, expect roughly 50 x 500 x (events actually configured, typically 4 to 8) x 1 engine x (outcomes actually seen, typically 2 to 3), which lands in the low hundreds of thousands of series if every tenant uses every origin. That is the pathological reading. Tenants are normally partitioned across origins rather than crossed with them, which divides it by the number of origins and puts the realistic figure in the low thousands.
 
@@ -829,6 +829,12 @@ That is a floor and not a promise about arbitrary text: a reason that embeds a s
 ```
 
 Every value there is proxy-authored rather than operator-authored, which is why it is not subject to the reason's scrubbing: a model id and a provider id come from the plan the proxy resolved, not from a script's free text.
+
+All three wired events carry detail. `cache.admit` reports `stored`, `ttl_secs`, and `swr_secs`; `cache.key` reports `skip_lookup` and `vary_count`. An absent field means the decision did not settle it and the origin's configured value applies, which is why it is omitted rather than sent as zero: a zero would read as "this decision chose no TTL", a different and false claim.
+
+`cache.key` reports a count rather than the dimension names on purpose. The names can carry header values an operator chose to key on, and this object is not scrubbed the way `reason` is, so a count answers "did the policy narrow this key" without carrying what it narrowed on.
+
+**What is not wired, and how you will know.** `auth`, `rate_limit`, `waf`, both AI guardrail events, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle` accept configuration and publish nothing. Enabling one is legal, because refusing it would block pre-configuring an event a later release wires. The proxy warns once at boot naming each event you enabled that has no emitter, so the gap is visible where the mistake is made rather than only as a metric reading flat zero.
 
 This is what makes filtering the SIEM's job rather than the proxy's. "Show me every routing decision that moved a request off the model it asked for" is `requested_model != selected_model`, and "show me the plans we had to degrade" is `dropped > 0`. `route.decide` fires on every AI request that reaches a routing policy and most of those decisions change nothing, so the volume is real; the answer is to publish the fields that let a rule drop the no-ops at ingest, not to have the proxy guess in config which decisions were interesting. A record left out at the proxy cannot be recovered later.
 

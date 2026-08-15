@@ -1469,7 +1469,7 @@ pub(super) fn evaluate_cache_admit_for(
                     (!scope.tenant_id.is_empty()).then_some(scope.tenant_id.as_str()),
                     (!origin.is_empty()).then_some(origin),
                 ) {
-                    crate::policy_bus::emit_decision_audit(
+                    crate::policy_bus::emit_decision_audit_detailed(
                         DecisionEvent::CacheAdmit,
                         engine,
                         outcome,
@@ -1478,6 +1478,11 @@ pub(super) fn evaluate_cache_admit_for(
                         &scope.hostname,
                         &scope.tenant_id,
                         &plan.reason,
+                        sbproxy_observe::decision::DecisionDetails::cache_admit(
+                            plan.store,
+                            plan.ttl_secs,
+                            plan.swr_secs,
+                        ),
                     );
                 }
                 plan

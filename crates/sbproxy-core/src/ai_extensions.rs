@@ -13,6 +13,23 @@ const MAX_EVENT_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_MESSAGES: usize = 256;
 const MAX_EVENT_ID_BYTES: usize = 512;
 
+/// One content rewrite a stream hook asked for.
+///
+/// Carries the text the hook was shown as well as the text it returned,
+/// because the passthrough lane has to find the original inside a raw
+/// SSE frame in order to replace it. The translate lane does not need
+/// `from`, but both lanes share one carrier so a caller cannot apply a
+/// rewrite on one path and forget it on the other (WOR-2365).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamContentRewrite {
+    /// Canonical content-block index the delta belonged to.
+    pub(crate) index: usize,
+    /// Text the hook was shown.
+    pub(crate) from: String,
+    /// Text the hook returned.
+    pub(crate) to: String,
+}
+
 /// Client-safe refusal returned by an enforcing AI extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AiExtensionBlock {
@@ -211,7 +228,8 @@ impl AiRequestExtensions {
     pub(crate) async fn stream_chunks(
         &mut self,
         chunks: &[HubChunk],
-    ) -> Result<(), AiExtensionBlock> {
+    ) -> Result<Vec<StreamContentRewrite>, AiExtensionBlock> {
+        let mut rewrites = Vec::new();
         for chunk in chunks {
             let event = match chunk {
                 HubChunk::MessageStart { model, .. } => {
@@ -261,14 +279,54 @@ impl AiRequestExtensions {
             };
             if self.kinds.stream {
                 if let Some(chunk) = event {
+                    // Held so a returned rewrite can be matched against
+                    // what the hook was actually shown. A hook that
+                    // rewrites text it never saw is a bug we would
+                    // rather surface than splice.
+                    let shown = match &chunk {
+                        AiExtensionStreamChunk::ContentDelta { index, text } => {
+                            Some((*index, text.clone()))
+                        }
+                        _ => None,
+                    };
                     let mutated = self
                         .dispatch(AiExtensionEventPayload::Stream { chunk })
                         .await?;
-                    self.expect_unmutated(mutated)?;
+                    match (mutated, shown) {
+                        (None, _) => {}
+                        (
+                            Some(AiExtensionEventPayload::Stream {
+                                chunk: AiExtensionStreamChunk::ContentDelta { index, text },
+                            }),
+                            Some((shown_index, shown_text)),
+                        ) if index == shown_index => {
+                            // Only a real change is carried forward, so
+                            // an echoing hook costs nothing downstream.
+                            if text != shown_text {
+                                rewrites.push(StreamContentRewrite {
+                                    index,
+                                    from: shown_text,
+                                    to: text,
+                                });
+                            }
+                        }
+                        // Usage and the control frames are the ones this
+                        // refuses. Those numbers feed cost tracking, the
+                        // budget path, and the metering ledger, so a hook
+                        // that could rewrite them could rewrite a bill
+                        // through a surface that looks like content
+                        // moderation. Fails closed rather than dropping
+                        // the rewrite silently, which is the "hook
+                        // believes it rewrote them" failure this seam
+                        // exists to prevent.
+                        (Some(other), _) => {
+                            self.expect_unmutated(Some(other))?;
+                        }
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(rewrites)
     }
 
     /// Enforce complete tool calls before held frames are released.

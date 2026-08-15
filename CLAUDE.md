@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-15*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -20,6 +20,7 @@ ten-minute build.
 | unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
+| NOTICE (Apache-2.0-only) | `bash scripts/check-notice.sh` |
 | Doc drift | `bash scripts/check-doc-drift.sh` |
 | Tapes + GIF wiring | `make tapes-check` |
 | Doc configs | `python3 scripts/sync-doc-configs.py --check` |
@@ -496,32 +497,17 @@ keep the file correct as you go than to reconstruct it later.
 
 ### Verifying NOTICE coverage
 
-Run this from the workspace root before opening a PR that touches
-`Cargo.toml` or `Cargo.lock`. It diffs the current Apache-2.0-only
-dep set against the names already mentioned in `NOTICE` and prints any
-gap. Zero output means the file is current.
+`scripts/check-notice.sh` diffs the current Apache-2.0-only dep set
+against the names already mentioned in `NOTICE` and fails on a gap.
+`scripts/check.sh` and the CI lint job both run it. Zero output and
+exit 0 means the file is current.
 
 ```bash
-cargo metadata --format-version 1 --all-features 2>/dev/null \
-  | python3 -c '
-import json, sys, re
-m = json.load(sys.stdin)
-ws = set(m["workspace_members"])
-notice = open("NOTICE").read().lower()
-for p in m["packages"]:
-    if p["id"] in ws: continue
-    lic = (p.get("license") or "").strip()
-    parts = [x.strip() for x in re.split(r"\s+(?:OR|/)\s+", lic.replace("/", " OR "))]
-    apache_only = ("Apache-2.0" in parts and "MIT" not in parts
-                   and not any(x.startswith("Apache-2.0 WITH") for x in parts)
-                   and "BSL-1.0" not in parts and "CC0-1.0" not in parts)
-    if apache_only and p["name"].lower() not in notice:
-        print(f"  {p[\"name\"]:<40} {p[\"version\"]:<14} {lic}")
-'
+bash scripts/check-notice.sh
 ```
 
-If any line prints, add an attribution stanza to `NOTICE` for each
-named crate (Apache 2.0 §4(d) requires the copyright notice and the
+If it prints crate names, add an attribution stanza to `NOTICE` for
+each (Apache 2.0 section 4(d) requires the copyright notice and the
 URL of the project's source). Dev-dependencies that are Apache-only
 should also be listed (mark them "Used as a dev-dependency in test
 fixtures only" so the intent is clear). The check is conservative;
