@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-08-15*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -148,9 +148,10 @@ gives every tool a content digest and grades every change.
 
 ## What it produces
 
-- **A contract digest.** A `sha256` over the RFC 8785 (JCS) canonical form of
+- **A contract digest.** A SHA-256 over the RFC 8785 (JCS) canonical form of
   the tool's contract, so an equal digest means an equal contract no matter the
-  key order.
+  key order. See [What the contract digest covers](#what-the-contract-digest-covers)
+  for the exact field set and how a stored digest names its own scheme.
 - **A compatibility grade.** One of `none`, `patch`, `minor`, or `major`, taken
   as the most significant grade across three dimensions.
 - **A version-bump verdict.** The declared bump compared against the computed
@@ -193,6 +194,50 @@ ergonomic as a schema-diff gate in a pull request.
 The baseline is a committed lockfile, one contract digest and semver per tool,
 and the declared versions live in a registry the operator edits. The oracle
 diffs the live tools against the lockfile and lints each declared bump.
+
+## What the contract digest covers
+
+A digest answers one question: did the part of this tool that changes what the
+gateway does move? So it covers five fields and no others.
+
+| Field | Covered | Why |
+|---|---|---|
+| `name` | yes | The routing key. |
+| `description` | yes | The text the model reads, which is the tool-poisoning surface. |
+| `inputSchema` | yes | Compiled and enforced on arguments. |
+| `outputSchema` | yes | Compiled and enforced on results, so a move changes which responses are accepted. |
+| `annotations` | yes | Carries the read-only and destructive hints a host may turn into an auto-approval decision. |
+| `title`, `icons`, `_meta` | no | Display and transport extras this gateway never acts on. Hashing them would refuse a tool over a label edit. |
+
+A tool that declares none of the optional fields hashes exactly the content it
+always did, because the projection only carries fields that are present.
+
+Digests are written with the scheme that produced them:
+
+```
+mcp-contract-v2-sha256:<hex>
+```
+
+The scheme is also mixed into the hashed bytes, so a digest can never be
+compared against a recipe that did not produce it. A baseline carrying the
+older bare `sha256:` prefix keeps the comparison it was pinned against, which
+covered only `name`, `description`, and `inputSchema`. That is deliberate:
+upgrading the gateway never re-grades a tool an operator already pinned. To
+pick up `outputSchema` and `annotations` coverage, regenerate the baseline.
+
+A digest whose scheme this build does not recognize leaves that tool ungated,
+with an `mcp.tool_versioning.unknown_digest_scheme` audit event and an
+`unknown_digest_scheme` outcome on
+`sbproxy_mcp_tool_compat_verdicts_total`. Refusing it instead would turn a
+lockfile written by a newer build into an outage on rollback, which is the same
+fail-open-and-say-so posture an unreadable lockfile takes.
+
+One consequence worth stating plainly: the gate reports movement, and the
+oracle grades severity. The oracle models property, type, required and enum
+changes, so a change it cannot express, a `const` or a numeric bound for
+instance, still registers as movement and grades as at least a patch. The
+digest is the safety net; a narrower digest than the contract the gateway
+enforces would make the net smaller than the thing it protects.
 
 ## The description judge
 

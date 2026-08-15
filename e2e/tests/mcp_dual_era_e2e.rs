@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness, Response};
-use sbproxy_extension::mcp::compat::{contract_digest, Lockfile, ToolLock};
+use sbproxy_extension::mcp::compat::{contract_digest_v2, Lockfile, ToolLock};
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy)]
@@ -658,21 +658,16 @@ fn write_version_baseline_lockfile() -> String {
         .into_iter()
         .find(|tool| tool["name"] == "search")
         .expect("search baseline contract");
-    // The version gate digests the same three-field projection it always has
-    // (`name`, `description`, `inputSchema`), not the complete advertised
-    // document, so a baseline built from the full tool would never match the
-    // live digest and every run would open with `search` already blocked.
-    let gate_contract = json!({
-        "name": search["name"],
-        "description": search["description"],
-        "inputSchema": search["inputSchema"],
-    });
+    // Pin under the material-field scheme, which covers `outputSchema`. The
+    // legacy scheme digests only name, description and inputSchema, so a
+    // generation change that moves nothing but the declared output shape would
+    // never register as contract movement.
     let mut tools = BTreeMap::new();
     tools.insert(
         "search".to_string(),
         ToolLock {
             semver: "1.0.0".parse().expect("baseline semver"),
-            contract_digest: contract_digest(&gate_contract),
+            contract_digest: contract_digest_v2(&search),
             contract: Some(search),
         },
     );

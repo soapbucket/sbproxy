@@ -2838,8 +2838,25 @@ impl McpFederation {
                 // New tool: nothing to diff against.
                 continue;
             };
-            let live_contract = legacy_compatibility_contract(tool);
-            let live_digest = super::compat::contract_digest(&live_contract);
+            let Some((live_contract, live_digest)) =
+                live_contract_for_baseline(tool, &lock.contract_digest)
+            else {
+                // A scheme this build does not know is neither a match nor a
+                // mismatch. Refusing the tool would turn a lockfile written by
+                // a newer build into an outage on rollback, so this follows
+                // the same loud fail-open the unreadable-lockfile path takes.
+                sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                    "none",
+                    "unknown_digest_scheme",
+                );
+                warn!(
+                    target: "sbproxy::audit",
+                    event = "mcp.tool_versioning.unknown_digest_scheme",
+                    tool = %name,
+                    "lockfile contract digest uses an unrecognized scheme; this tool is not gated"
+                );
+                continue;
+            };
             if live_digest == lock.contract_digest {
                 continue;
             }
@@ -3289,6 +3306,40 @@ fn legacy_compatibility_contract(tool: &FederatedTool) -> serde_json::Value {
         "description": tool.description,
         "inputSchema": tool.input_schema,
     })
+}
+
+/// Project and digest a live tool under the same scheme its baseline was
+/// written with, returning `None` when the baseline names a scheme this build
+/// does not implement.
+///
+/// Comparing like with like is what lets the material-field scheme land
+/// without invalidating a committed baseline. A `sha256:` entry keeps the
+/// three-field view it was pinned against, so an operator who upgrades sees no
+/// change; a `mcp-contract-v2-sha256:` entry is compared against the complete
+/// upstream contract, which is where `outputSchema` and `annotations` become
+/// visible. The projection also feeds the oracle as `new_tool`, so the graded
+/// diff always covers exactly the fields the digest covered.
+fn live_contract_for_baseline(
+    tool: &FederatedTool,
+    baseline_digest: &str,
+) -> Option<(serde_json::Value, String)> {
+    if super::compat::is_contract_digest_v2(baseline_digest) {
+        // A tool whose `inputSchema` is not an object has no strict contract.
+        // It keeps the frozen legacy projection rather than dropping out of
+        // the gate entirely.
+        let live = tool.contract.as_ref().map_or_else(
+            || legacy_compatibility_contract(tool),
+            McpToolContract::as_value,
+        );
+        let digest = super::compat::contract_digest_v2(&live);
+        Some((live, digest))
+    } else if super::compat::is_contract_digest_v1(baseline_digest) {
+        let live = legacy_compatibility_contract(tool);
+        let digest = super::compat::contract_digest(&live);
+        Some((live, digest))
+    } else {
+        None
+    }
 }
 
 /// Order-independent content digest of a tool registry. Two
@@ -5181,6 +5232,124 @@ mod tests {
         assert!(
             blocked.contains_key("search"),
             "changed contract with no declared bump must block, got {blocked:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A tool carrying the fields the legacy digest cannot see.
+    fn output_schema_tool(generation: &str) -> HashMap<String, FederatedTool> {
+        let tool = FederatedTool::from_contract_document(
+            json!({
+                "name": "search",
+                "title": "Search",
+                "description": "search public repositories",
+                "inputSchema": {"type": "object", "properties": {}},
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {"generation": {"const": generation}}
+                },
+                "annotations": {"readOnlyHint": true}
+            }),
+            "srv".to_string(),
+            false,
+        )
+        .expect("strict contract fixture");
+        let mut map = HashMap::new();
+        map.insert("search".to_string(), tool);
+        map
+    }
+
+    fn output_schema_lockfile(generation: &str, v2: bool) -> crate::mcp::compat::Lockfile {
+        let registry = output_schema_tool(generation);
+        let contract = registry["search"]
+            .contract
+            .as_ref()
+            .expect("strict contract")
+            .as_value();
+        let digest = if v2 {
+            crate::mcp::compat::contract_digest_v2(&contract)
+        } else {
+            crate::mcp::compat::contract_digest(&legacy_compatibility_contract(&registry["search"]))
+        };
+        let mut tools = std::collections::BTreeMap::new();
+        tools.insert(
+            "search".to_string(),
+            crate::mcp::compat::ToolLock {
+                semver: semver::Version::new(1, 0, 0),
+                contract_digest: digest,
+                contract: Some(contract),
+            },
+        );
+        crate::mcp::compat::Lockfile {
+            version: 1,
+            generated_for: "test".to_string(),
+            tools,
+        }
+    }
+
+    #[tokio::test]
+    async fn wor_2387_v2_baseline_catches_an_output_schema_only_change() {
+        // The gateway compiles and enforces `outputSchema` on the modern path,
+        // so a silent move changes which results it accepts. Under the
+        // material-field scheme that movement is graded like any other.
+        let path = write_lockfile("v2-output", &output_schema_lockfile("old", true));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&output_schema_tool("new"))
+            .await;
+        let blocked = fed.version_blocked();
+        assert!(
+            blocked.contains_key("search"),
+            "an outputSchema-only move must be graded, got {blocked:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn wor_2387_v2_baseline_leaves_an_unchanged_contract_alone() {
+        let path = write_lockfile("v2-same", &output_schema_lockfile("old", true));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&output_schema_tool("old"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "an identical contract must not be graded as moved"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn wor_2387_a_legacy_baseline_keeps_its_original_blind_spot() {
+        // Deliberate: upgrading the gateway must not re-grade a tool an
+        // operator already pinned. A `sha256:` baseline keeps the three-field
+        // comparison it was written against, so this stays invisible until the
+        // baseline is regenerated under the newer scheme.
+        let path = write_lockfile("v1-output", &output_schema_lockfile("old", false));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&output_schema_tool("new"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "a legacy baseline must behave exactly as it did before the new scheme"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn wor_2387_an_unrecognized_digest_scheme_fails_open() {
+        // A baseline written by a newer build must not brick a rollback.
+        let mut lockfile = output_schema_lockfile("old", true);
+        lockfile
+            .tools
+            .get_mut("search")
+            .expect("search entry")
+            .contract_digest = "mcp-contract-v9-blake3:00".to_string();
+        let path = write_lockfile("v9-unknown", &lockfile);
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&output_schema_tool("new"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "an unknown digest scheme must not block"
         );
         let _ = std::fs::remove_file(path);
     }
