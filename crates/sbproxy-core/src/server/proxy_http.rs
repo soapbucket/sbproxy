@@ -5050,14 +5050,28 @@ impl ProxyHttp for SbProxy {
                                                 ));
                                                 break;
                                             }
-                                            PromptInjectionAction::Tag
-                                            | PromptInjectionAction::Log => {
+                                            PromptInjectionAction::Log => {
                                                 tracing::warn!(
                                                     target: "sbproxy::prompt_injection_v2",
                                                     score = %result.score,
                                                     label = %result.label,
                                                     "prompt injection detected in request body \
                                                      (advisory; upstream already dispatched)"
+                                                );
+                                            }
+                                            PromptInjectionAction::Tag => {
+                                                // Unreachable on a compiled proxy origin:
+                                                // compile_config refuses action: tag with
+                                                // enable_body_aware (WOR-2136). Keep a distinct
+                                                // error so a future path that skips the compiler
+                                                // cannot silently look like log.
+                                                tracing::error!(
+                                                    target: "sbproxy::prompt_injection_v2",
+                                                    score = %result.score,
+                                                    label = %result.label,
+                                                    "prompt injection tag hit on the request body \
+                                                     after upstream headers were sent; this \
+                                                     combination is refused at config compile"
                                                 );
                                             }
                                         }

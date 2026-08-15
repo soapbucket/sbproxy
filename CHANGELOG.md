@@ -12,6 +12,13 @@ the next version cut.
 
 ### Added
 
+- **Self-host certification writes a complete `record.json`.** Live Apple
+  Metal and GitHub release macos-14 runs emit macOS version, chip, memory,
+  engine version, artifact digest, time to ready, and first-token result in
+  one file. The Metal probe is compiled by the named `apple_metal_probe`
+  lane, and a live launch fails if engine RSS overshoots the planned
+  memory envelope by more than 25%.
+
 - **Bundles can make granted outbound HTTP calls.** A JavaScript hook
   may declare `net:outbound=<scheme>://<host>[:port]` destinations in
   its manifest `permissions`, the operator grants them per bundle under
@@ -34,6 +41,14 @@ the next version cut.
   observe hook's decisions are discarded.
 
 ### Changed, and worth checking before you upgrade
+
+- **`proxy.messenger_settings` refuse names the deleted bus defects.** The
+  block was already refused. The error now says GCP Pub/Sub and SQS
+  acknowledged before yield, treated errors as end-of-stream, and could
+  not stop on drop, and that a replacement needs an async Stream with
+  cancellation (WOR-2192). Remove the block; config distribution is
+  `proxy.config_authority` and cache invalidation is
+  `POST /admin/cache/purge`.
 
 - **A broken `ai_policy.expression` now refuses the config instead of
   disabling itself.** A syntax error, or a reference to a binding

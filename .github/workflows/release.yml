@@ -368,6 +368,26 @@ jobs:
           sw_vers
           uname -srm
           sysctl -n machdep.cpu.brand_string || true
+          python3 - <<'PY'
+          import json, os, subprocess
+          def cmd(*args):
+              return subprocess.check_output(args, text=True).strip()
+          host = {
+              "recorded_at": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "git_revision": cmd("git", "rev-parse", "HEAD"),
+              "os": cmd("uname", "-s"),
+              "os_release": cmd("uname", "-r"),
+              "arch": cmd("uname", "-m"),
+              "macos_version": cmd("sw_vers", "-productVersion"),
+              "macos_build": cmd("sw_vers", "-buildVersion"),
+              "chip": cmd("sysctl", "-n", "machdep.cpu.brand_string"),
+              "memory_bytes": int(cmd("sysctl", "-n", "hw.memsize")),
+          }
+          os.makedirs("/tmp/sbproxy-cert-artifacts", exist_ok=True)
+          with open("/tmp/sbproxy-cert-host.json", "w") as handle:
+              json.dump(host, handle, indent=2)
+              handle.write("\n")
+          PY
 
       - name: boot sbproxy and certify against it
         env:
@@ -446,6 +466,7 @@ jobs:
           }
           trap cleanup EXIT
 
+          BOOT_START="$(date +%s)"
           start_sbproxy /tmp/sbproxy-cert-boot.log
 
           # Wait for the HTTP port to accept connections. This only
@@ -457,6 +478,16 @@ jobs:
             cat /tmp/sbproxy-cert-boot.log >&2 || true
             exit 1
           fi
+
+          READY_SECS=-1
+          for _ in $(seq 1 90); do
+            if grep -q "is ready on" /tmp/sbproxy-cert-boot.log 2>/dev/null; then
+              READY_SECS=$(( $(date +%s) - BOOT_START ))
+              break
+            fi
+            sleep 1
+          done
+          echo "${READY_SECS}" > /tmp/sbproxy-cert-ready-secs
 
           # Derive the supervised engine from sbproxy's exact durable
           # ownership record, never from an executable-name sweep.
@@ -480,6 +511,41 @@ jobs:
           if [ "${CERT_STATUS}" -ne 0 ]; then
             exit "${CERT_STATUS}"
           fi
+
+          READY_SECS="$(cat /tmp/sbproxy-cert-ready-secs 2>/dev/null || echo -1)"
+          ADMIN_PASSWORD="$(grep -m1 'Admin password:' /tmp/sbproxy-cert-boot.log | awk '{print $3}')"
+          SB_ADMIN_URL="http://127.0.0.1:48124" \
+          SB_ADMIN_USERNAME=admin \
+          SB_ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
+            ./target/release/sbproxy models ps --format json \
+            > /tmp/sbproxy-cert-ps.json || true
+          python3 - "${READY_SECS}" <<'PY'
+          import json, os, sys
+          ready = int(sys.argv[1])
+          host = {}
+          if os.path.exists("/tmp/sbproxy-cert-host.json"):
+              host = json.load(open("/tmp/sbproxy-cert-host.json"))
+          findings = {}
+          if os.path.exists("/tmp/sbproxy-cert-findings.json"):
+              findings = json.load(open("/tmp/sbproxy-cert-findings.json"))
+          engine_version = None
+          digest = None
+          if os.path.exists("/tmp/sbproxy-cert-ps.json"):
+              status = json.load(open("/tmp/sbproxy-cert-ps.json"))
+              payload = status.get("data") or status
+              deployments = payload.get("deployments") or []
+              if deployments:
+                  engine_version = deployments[0].get("engine_version")
+                  digest = deployments[0].get("artifact_digest")
+          findings["engine_version"] = engine_version
+          findings["artifact_digest"] = digest
+          findings["time_to_ready_seconds"] = ready if ready >= 0 else None
+          sys.path.insert(0, "scripts/lib")
+          from cert_record import write_record
+          os.makedirs("/tmp/sbproxy-cert-artifacts", exist_ok=True)
+          write_record("/tmp/sbproxy-cert-artifacts/record.json", host, findings)
+          print("wrote /tmp/sbproxy-cert-artifacts/record.json")
+          PY
 
           # SIGKILL the gateway, then start the same managed run again.
           # The replacement must reap the exact old engine identity before
@@ -617,6 +683,15 @@ jobs:
           # growth (engine stderr tails are <= 8 KiB each).
           if [ -f /tmp/sbproxy-cert-boot.log ]; then
             tail -c 8388608 /tmp/sbproxy-cert-boot.log > "${OUT}/sbproxy-cert-boot.log"
+          fi
+          if [ -f /tmp/sbproxy-cert-artifacts/record.json ]; then
+            cp /tmp/sbproxy-cert-artifacts/record.json "${OUT}/record.json"
+          fi
+          if [ -f /tmp/sbproxy-cert-host.json ]; then
+            cp /tmp/sbproxy-cert-host.json "${OUT}/host.json"
+          fi
+          if [ -f /tmp/sbproxy-cert-findings.json ]; then
+            cp /tmp/sbproxy-cert-findings.json "${OUT}/findings.json"
           fi
           # Durable model-host operation job records (<cache>/jobs/*.json).
           find /tmp/sbproxy-cert-cache -type d -name jobs 2>/dev/null | while read -r dir; do

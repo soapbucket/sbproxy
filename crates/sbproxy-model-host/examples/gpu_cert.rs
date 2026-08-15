@@ -15,6 +15,7 @@
 //!     --features gpu-nvidia,weights -- weights Qwen/Qwen3-0.6B
 //!   cargo run --release --example gpu_cert \
 //!     --features gpu-nvidia,weights -- serve Qwen/Qwen3-0.6B 8000
+//!   cargo run --example gpu_cert --features gpu-apple -- metal-probe
 //!
 //! `certify` is the exception: a KL-divergence gate over a stubbed
 //! logit pair (harness scaffolding, no GPU or feature flags needed):
@@ -22,6 +23,14 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Keep the envelope helper in the compiled example on every
+    // platform so the Metal live-RSS check cannot compile out of the
+    // crate's public surface (WOR-2200).
+    let _ = sbproxy_model_host::live_rss_within_planned_envelope(
+        1,
+        1,
+        sbproxy_model_host::LIVE_MEMORY_OVERSHOOT,
+    );
     let mode = args.get(1).map(String::as_str).unwrap_or("probe");
     match mode {
         "probe" => probe(),
@@ -45,13 +54,14 @@ fn main() {
         "translators" => {
             translators_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"))
         }
+        "metal-probe" => metal_probe(),
         "certify" => certify(
             args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"),
             args.get(3).map(String::as_str),
         ),
         other => {
             eprintln!(
-                "unknown mode {other}; use probe | weights | serve | runtime | seed-config | llamacpp <gguf-repo> | translators <repo> | certify <model> [date]"
+                "unknown mode {other}; use probe | weights | serve | runtime | seed-config | llamacpp <gguf-repo> | translators <repo> | metal-probe | certify <model> [date]"
             );
             std::process::exit(2);
         }
@@ -529,6 +539,17 @@ fn probe() {
                     plan.quant_name
                 );
             }
+            assert!(
+                plan.estimated_vram_bytes <= g.total_vram_bytes,
+                "FAIL: planned {:.1} GiB exceeds the {:.1} GiB device",
+                plan.estimated_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                g.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            println!(
+                "PASS: planned {:.1} GiB is within the {:.1} GiB device budget",
+                plan.estimated_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                g.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
         }
         Err(e) => println!("fit error: {e}"),
     }
@@ -543,6 +564,70 @@ fn probe() {
 #[cfg(not(feature = "gpu-nvidia"))]
 fn probe() {
     eprintln!("build with --features gpu-nvidia to run the probe");
+    std::process::exit(2);
+}
+
+/// Compile and run the Metal probe, then assert a small GGUF plan fits
+/// the unified-memory budget (WOR-2200). Live RSS comparison happens in
+/// `scripts/cert-lane-managed-serve.sh` after a real launch.
+#[cfg(all(target_os = "macos", feature = "gpu-apple"))]
+fn metal_probe() {
+    use sbproxy_model_host::fit::{plan_fit, ModelMetadata};
+    use sbproxy_model_host::{GpuProbe, MetalGpuProbe};
+
+    let gpus = MetalGpuProbe::new().probe();
+    assert_eq!(
+        gpus.len(),
+        1,
+        "FAIL: Metal probe did not report exactly one Apple device"
+    );
+    let g = &gpus[0];
+    println!(
+        "PASS: probed {} | {:.1} GiB Metal working-set budget",
+        g.name,
+        g.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    let meta = ModelMetadata {
+        params: 500_000_000,
+        layers: 24,
+        kv_heads: 2,
+        head_dim: 64,
+        max_context: 32768,
+        hidden_size: 0,
+        expert_count: 0,
+        expert_ffn_length: 0,
+    };
+    match plan_fit(g, &meta, &["Q4_K_M".to_string()], 2048, 1.15) {
+        Ok(plan) => {
+            assert!(
+                plan.estimated_vram_bytes <= g.total_vram_bytes,
+                "FAIL: 0.5B Q4_K_M plan {:.1} MiB exceeds the {:.1} GiB Metal budget",
+                plan.estimated_vram_bytes as f64 / (1024.0 * 1024.0),
+                g.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            println!(
+                "PASS: 0.5B Q4_K_M plan {:.1} MiB fits the Metal budget",
+                plan.estimated_vram_bytes as f64 / (1024.0 * 1024.0),
+            );
+            assert!(
+                sbproxy_model_host::live_rss_within_planned_envelope(
+                    plan.estimated_vram_bytes,
+                    1,
+                    sbproxy_model_host::LIVE_MEMORY_OVERSHOOT
+                ),
+                "the envelope helper must accept a live RSS below the plan"
+            );
+        }
+        Err(e) => {
+            eprintln!("FAIL: fit error on Apple Silicon: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", feature = "gpu-apple")))]
+fn metal_probe() {
+    eprintln!("build on macOS with --features gpu-apple to run the Metal probe");
     std::process::exit(2);
 }
 

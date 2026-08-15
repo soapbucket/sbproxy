@@ -1810,14 +1810,21 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // rejected instead of accepted into a snapshot where it does nothing.
     // WOR-2310 deleted the four bus backends from `sbproxy-platform`, so this
     // gate is permanent rather than a placeholder waiting on a first consumer.
-    // The block still parses so the failure below is an explanatory
+    // WOR-2192: those backends acknowledged before yield (a crash lost the
+    // message), treated any error as a clean end-of-stream, and could not
+    // stop when the owner dropped. A future consumer has to ship an async
+    // Stream with an explicit cancellation contract before any of them
+    // return. The block still parses so the failure below is an explanatory
     // diagnostic instead of an unknown-key error.
     if let Some(settings) = &config_file.proxy.messenger_settings {
         anyhow::bail!(
             "config compile: proxy.messenger_settings is set (driver '{}'), but this build has \
              no runtime consumer for the message bus. Nothing subscribes to a topic and nothing \
              publishes on one, so the block would validate at boot and then move no events \
-             between replicas for the life of the process. Remove it. Both uses this block was \
+             between replicas for the life of the process. The GCP and SQS adapters were also \
+             deleted because they acknowledged before yield, treated errors as end-of-stream, \
+             and could not stop on drop (WOR-2192); do not restore them without an async Stream \
+             and an explicit cancellation contract. Remove the block. Both uses this block was \
              documented for have a working surface today: config distribution across replicas \
              is `proxy.config_authority`, where one node publishes a signed bundle and the \
              others pull and verify it, and cache invalidation is `POST /admin/cache/purge` on \
@@ -7038,6 +7045,10 @@ origins:
                 msg.contains("no runtime consumer"),
                 "error must say the bus has no consumer in this build: {msg}"
             );
+            assert!(
+                msg.contains("WOR-2192"),
+                "error must name the delivery defects that forbid restoring the drivers: {msg}"
+            );
         }
     }
 
@@ -7071,6 +7082,10 @@ origins:
         assert!(
             msg.contains("/admin/cache/purge"),
             "cache invalidation has a working surface and the error must name it: {msg}"
+        );
+        assert!(
+            msg.contains("WOR-2192"),
+            "the diagnostic must name the deleted-backend defects so they cannot return unnoticed: {msg}"
         );
     }
 

@@ -26,6 +26,13 @@
 #                   lane exercises the cache an operator actually gets.
 #   CERT_ENGINE_PROC engine process name to check for orphans.
 #                    Default llama-server.
+#   CERT_RECORD     optional path for the machine-readable record
+#                    (WOR-2201). When set with CERT_HOST_JSON, the lane
+#                    writes the seven promised fields plus live-memory
+#                    agreement (WOR-2200).
+#   CERT_HOST_JSON  host metadata.json to merge into CERT_RECORD.
+#   CERT_MEMORY_OVERSHOOT  live RSS / planned envelope ceiling.
+#                    Default 0.25.
 set -uo pipefail
 
 MODEL="${1:?usage: cert-lane-managed-serve.sh <model> <variant> <accel>}"
@@ -149,6 +156,13 @@ if ! admin_env "$WORK/cold.log"; then
   exit 1
 fi
 
+CONTENT=""
+DIGEST=""
+ENGINE_VERSION=""
+PLANNED_BYTES=""
+OBSERVED_RSS=""
+PROBE_BUDGET=""
+
 # --- 2/3. completion ----------------------------------------------------
 http_code="$(curl -sS -m 180 "http://127.0.0.1:$CERT_PORT/v1/chat/completions" \
   -H 'content-type: application/json' \
@@ -160,6 +174,7 @@ import json,sys
 d = json.load(open('$WORK/completion.json'))
 print(d['choices'][0]['message'].get('content') or '')
 " 2>/dev/null)"
+  CONTENT="$content"
   if [ -n "${content// /}" ]; then
     ok "completion returned nonempty content: $(printf '%q' "$content")"
   else
@@ -217,7 +232,18 @@ PY
     ok "status is complete and truthful: $(sed 's/^OK //' "$WORK/ps-ready.txt")"
     DIGEST="$(python3 -c "
 import json
-print(json.load(open('$WORK/ps-ready.json'))['deployments'][0]['artifact_digest'])
+d = json.load(open('$WORK/ps-ready.json'))['deployments'][0]
+print(d.get('artifact_digest') or '')
+")"
+    ENGINE_VERSION="$(python3 -c "
+import json
+d = json.load(open('$WORK/ps-ready.json'))['deployments'][0]
+print(d.get('engine_version') or '')
+")"
+    PLANNED_BYTES="$(python3 -c "
+import json
+mem = json.load(open('$WORK/ps-ready.json'))['deployments'][0].get('memory') or {}
+print(mem.get('total_bytes') or 0)
 ")"
   else
     bad "$(cat "$WORK/ps-ready.txt")"
@@ -226,6 +252,94 @@ print(json.load(open('$WORK/ps-ready.json'))['deployments'][0]['artifact_digest'
 else
   bad "models ps failed"
   DIGEST=""
+fi
+
+# --- 4b. planned vs live memory (WOR-2200) -----------------------------
+#
+# models ps.memory is the fit-plan envelope, not RSS. Capture the live
+# engine RSS while it is still running, then assert it does not overshoot
+# that envelope by more than CERT_MEMORY_OVERSHOOT (default 25%).
+# Undershoot is expected: KV pages in the plan are reserved, not always
+# resident.
+if [ "$ACCEL" = "metal" ]; then
+  OVERSHOOT="${CERT_MEMORY_OVERSHOOT:-0.25}"
+  engine_pid="$(pgrep -n -f "$CERT_ENGINE_PROC" 2>/dev/null || true)"
+  if [ -n "$engine_pid" ]; then
+    rss_kb="$(ps -o rss= -p "$engine_pid" 2>/dev/null | tr -d ' ')"
+    OBSERVED_RSS=$(( ${rss_kb:-0} * 1024 ))
+  else
+    OBSERVED_RSS=0
+  fi
+  PROBE_BUDGET="$("$SBPROXY_BIN" doctor --format json 2>/dev/null | python3 -c "
+import json, sys
+report = json.load(sys.stdin)
+gpus = [g for g in (report.get('gpus') or []) if g.get('vendor') == 'apple' or g.get('vendor') == 'Apple']
+print(gpus[0]['total_vram_bytes'] if gpus else 0)
+" 2>/dev/null || echo 0)"
+  python3 - "$PLANNED_BYTES" "$OBSERVED_RSS" "$PROBE_BUDGET" "$OVERSHOOT" \
+    "$WORK/ps-ready.json" <<'PY' >"$WORK/agreement.txt" 2>&1
+import json, math, sys
+planned = int(sys.argv[1] or 0)
+observed = int(sys.argv[2] or 0)
+budget = int(sys.argv[3] or 0)
+overshoot = float(sys.argv[4])
+status = json.load(open(sys.argv[5]))["deployments"][0]
+planned = planned or int((status.get("memory") or {}).get("total_bytes") or 0)
+if planned <= 0:
+    print("FAIL planned memory envelope is missing or zero")
+    raise SystemExit(1)
+if budget and planned > budget:
+    print(f"FAIL planned {planned} exceeds Metal probe budget {budget}")
+    raise SystemExit(1)
+if observed <= 0:
+    print("FAIL live engine RSS was not observable")
+    raise SystemExit(1)
+cap = math.ceil(planned * (1.0 + overshoot))
+ratio = observed / planned
+if observed > cap:
+    print(
+        f"FAIL live RSS {observed} overshoots planned {planned} "
+        f"by more than {overshoot:.0%} (ratio {ratio:.3f})"
+    )
+    raise SystemExit(1)
+print(
+    f"OK planned={planned} rss={observed} budget={budget} "
+    f"ratio={ratio:.3f} overshoot={overshoot:.0%}"
+)
+PY
+  if grep -q '^OK' "$WORK/agreement.txt"; then
+    ok "planned memory envelope contains live RSS: $(sed 's/^OK //' "$WORK/agreement.txt")"
+  else
+    bad "$(cat "$WORK/agreement.txt")"
+  fi
+fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -n "${CERT_RECORD:-}" ] && [ -n "${CERT_HOST_JSON:-}" ] && [ -f "${CERT_HOST_JSON:-}" ]; then
+  python3 - "$WORK/findings.json" "$CONTENT" "$ENGINE_VERSION" "$DIGEST" \
+    "$cold_secs" "$PLANNED_BYTES" "$OBSERVED_RSS" "$PROBE_BUDGET" <<'PY'
+import json, sys
+path, content, engine, digest, ready, planned, rss, budget = sys.argv[1:9]
+findings = {
+    "engine_version": engine,
+    "artifact_digest": digest,
+    "time_to_ready_seconds": int(ready) if str(ready).lstrip("-").isdigit() else None,
+    "first_token_result": content.strip() if content.strip() else None,
+    "planned_memory_bytes": int(planned or 0) or None,
+    "observed_rss_bytes": int(rss or 0) or None,
+    "probe_budget_bytes": int(budget or 0) or None,
+    "memory_overshoot": 0.25,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(findings, handle)
+    handle.write("\n")
+PY
+  if python3 "$REPO_ROOT/scripts/lib/cert_record.py" \
+    "$CERT_HOST_JSON" "$WORK/findings.json" "$CERT_RECORD"; then
+    ok "wrote certification record $CERT_RECORD"
+  else
+    bad "certification record is missing required fields"
+  fi
 fi
 
 # --- 5. stop drains and reaps ------------------------------------------

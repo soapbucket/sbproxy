@@ -209,6 +209,8 @@ python3 "$ROOT/scripts/check-secret-resolver-drift.py"
 step "gate helper self-tests"
 bash "$ROOT/scripts/tests/workspace_bin_test.sh"
 bash "$ROOT/scripts/tests/runner_disk_test.sh"
+python3 "$ROOT/scripts/lib/cert_record.py" --self-test
+python3 "$ROOT/scripts/tests/test_cert_record.py"
 
 # CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs.
