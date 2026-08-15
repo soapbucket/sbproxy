@@ -31,6 +31,7 @@
 
 pub mod acquire;
 pub mod admission;
+pub mod archive;
 pub mod artifact;
 pub mod artifact_spec;
 pub mod capabilities;

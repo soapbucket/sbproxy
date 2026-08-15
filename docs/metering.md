@@ -1,6 +1,6 @@
 # Attested metering
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-15*
 
 ![A metered request cuts a signed receipt, the chain verifies, one tampered entry on disk breaks it, and the verifier names the broken sequence number](assets/metering-verify.gif)
 
@@ -178,7 +178,7 @@ The ledger file is its own write-ahead log: each entry is serialized, written, a
 
 ### `billable`: the outcome table
 
-Every metered call ends in exactly one of eight outcomes: `delivered`, `client_disconnected`, `origin_4xx`, `origin_5xx`, `policy_blocked`, `rate_limited`, `cache_hit`, `retry`. The table gives the billing answer for each: `yes` bills every unit the call produced, `no` bills nothing, `partial` bills the work performed before a cut, and `collapse` folds every attempt at one unit of work into the invoice line its claim names, so a flaky origin costs the buyer once rather than once per attempt.
+Every metered call's receipt names exactly one of eight outcomes: `delivered`, `client_disconnected`, `origin_4xx`, `origin_5xx`, `policy_blocked`, `rate_limited`, `cache_hit`, `retry`. The table gives the billing answer for each: `yes` bills every unit the call produced, `no` bills nothing, `partial` bills the work performed before a cut, and `collapse` folds every attempt at one unit of work into the invoice line its claim names, so a flaky origin costs the buyer once rather than once per attempt. Extra origin or provider attempts are recorded as `retry` under the same claim id; the receipt for a successful retry still names `delivered`, which is what keeps that sale billable when `retry` is `collapse`.
 
 All eight answers are required and none is defaulted, on purpose. An unstated billing rule still runs; it just runs as whatever the code happened to do, and nobody discovers what that was until a buyer asks. An outcome the table says is free still gets a receipt, with an empty units list: "not billed, because the table says origin_5xx is free" is exactly the evidence a dispute needs, and an omitted receipt would be indistinguishable from a call that never happened.
 

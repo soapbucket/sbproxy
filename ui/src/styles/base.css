@@ -217,8 +217,14 @@ button {
 
 /* Tables: white artifact panels ruled with hairlines under an ink
    header rule. */
+.sb-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+}
 .sb-table {
   width: 100%;
+  max-width: 100%;
   border-collapse: collapse;
   font-size: 0.86rem;
 }
@@ -238,6 +244,7 @@ button {
   padding: 10px 12px;
   border-bottom: 1px solid var(--sb-border);
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 .sb-table tbody tr:hover {
   background: var(--sb-surface-2);

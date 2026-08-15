@@ -6089,7 +6089,7 @@ impl DecisionAuditConfig {
 /// Built once at compile time and read per decision, the same shape the
 /// operator redaction state uses, and for the same reason: the
 /// precedence has to live in one place or each emit site invents its
-/// own. [`DecisionAuditScopes::rule`] is the only resolver.
+/// own. [`DecisionAuditScopes::publishes`] is the only resolver.
 ///
 /// Composition is **per event label**, not per block. A tenant that
 /// names `route.decide` inherits the proxy's `cache.admit` setting

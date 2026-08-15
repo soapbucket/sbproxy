@@ -17,9 +17,9 @@
 //! version can load; see [`default_release_tag_for_platform`].
 //!
 //! The platform detection, asset-URL construction, and PATH lookup are
-//! pure and unit-tested. The actual download + extract is behind the
-//! `weights` feature (it reuses the reqwest fetch) and shells out to
-//! `tar`, so no archive crate is pulled into the lean build.
+//! pure and unit-tested. The download is behind the `weights` feature.
+//! Archives unpack in-process ([`crate::archive`]) so a distroless image
+//! without a `tar` binary can still provision an engine.
 
 use std::path::PathBuf;
 
@@ -526,19 +526,9 @@ async fn install_release(
         ),
     }
 
-    // Extract. macOS/Linux assets are gzip tarballs (shell out to `tar` to
-    // avoid an archive crate dependency in the lean build).
-    let status = tokio::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(staging)
-        .status()
-        .await
-        .map_err(|e| format!("tar: {e}"))?;
-    if !status.success() {
-        return Err(format!("tar extract of {} failed", archive_path.display()));
-    }
+    // Extract. macOS/Linux assets are gzip tarballs; unpack in-process so
+    // this works on the distroless gateway image (no host `tar`).
+    crate::archive::extract_tar_gz_async(&archive_path, staging).await?;
 
     // The binary lands under a bin/ dir in the archive. Check the common
     // layouts first, then fall back to a recursive scan (the layout has

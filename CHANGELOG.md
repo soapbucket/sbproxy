@@ -71,6 +71,27 @@ the next version cut.
   refusals and upstream auth failures were one value and are now
   distinguishable; dashboards keyed on `outcome="auth_denied"` need
   updating. Usage rollups keep the legacy mapping.
+- **Meter receipts now fold extra attempts under `billable.retry: collapse`.**
+  Provider fallback and HTTP origin retries previously billed only the
+  final attempt as `delivered`, so the `retry` outcome never ran. Extra
+  attempts are recorded as `retry` and collapse; the receipt that bills
+  remains `delivered`. Exhausted retries that still end in 4xx/5xx keep
+  those outcomes.
+- **The Kubernetes operator image builds inside Docker.**
+  `crates/sbproxy-k8s-operator/Dockerfile.ci` compiled on the host and
+  copied a `target/` binary that `.dockerignore` excluded (and that was
+  the wrong platform on macOS/Windows). The documented
+  `docker build -f crates/sbproxy-k8s-operator/Dockerfile.ci .` path now
+  compiles in a Linux builder stage.
+
+### Fixed
+
+- **llama.cpp and mistral.rs Model Host provisioning on the official
+  Docker image.** Engine release extract shelled out to `tar`, which the
+  distroless gateway image does not contain. Archives unpack in-process.
+- **Jobs admin table overflow.** A long artifact digest pushed the
+  Updated column past the content panel. Shared `.sb-table` styles now
+  wrap long cells and the Jobs table scrolls inside the panel.
 
 ## [1.11.0] - 2026-08-10
 
