@@ -3194,9 +3194,6 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
                 &format!("origin '{hostname}': response_cache.admit_event"),
                 script,
             )?;
-            // WOR-2367: these two do not compose yet, and the failure is
-            // silent, so it is refused rather than shipped.
-            //
         }
     }
 
