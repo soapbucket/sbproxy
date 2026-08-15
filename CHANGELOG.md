@@ -12,6 +12,11 @@ the next version cut.
 
 ### Added
 
+- **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
+  `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
+  job) fails when an Apache-2.0-only dependency is missing a stanza,
+  so the next swc-class crate cannot land unattributed.
+
 - **Self-host certification writes a complete `record.json`.** Live Apple
   Metal and GitHub release macos-14 runs emit macOS version, chip, memory,
   engine version, artifact digest, time to ready, and first-token result in
@@ -100,6 +105,11 @@ the next version cut.
   compiles in a Linux builder stage.
 
 ### Fixed
+
+- **NOTICE names the 27 Apache-2.0-only crates it previously omitted.**
+  Most of them are the swc TypeScript and JavaScript toolchain reached
+  through `sbproxy-extension`, plus `unicode-general-category`. Apache
+  2.0 section 4(d) requires those stanzas on every redistributed binary.
 
 - **Anthropic multi-tool-call streams now close every content block.**
   The Messages SSE emitter opened a `content_block_start` per tool call
