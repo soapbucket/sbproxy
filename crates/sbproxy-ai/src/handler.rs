@@ -1066,11 +1066,18 @@ impl AiHandlerConfig {
         }
         // WOR-2366: same eager-compile discipline for the routing policy.
         // A CEL expression referencing a binding the routing surface does
-        // not offer, a bad `on_error`, or an oversized `reason_codes` fails
-        // config load here rather than disabling the policy at first use.
+        // not offer, a bad `on_error`, an oversized `reason_codes`, or a
+        // Rego module that fails the evaluability proof fails config load
+        // here rather than disabling the policy at first use. The compiled
+        // program pre-warms the lazy cell rather than being dropped, so a
+        // Rego module is parsed and proved once per load, not twice (and
+        // the script-compile metric counts one compile per load).
         if let Some(policy) = config.ai_routing_policy.as_ref() {
-            crate::ai_routing_policy::CompiledAiRoutingPolicy::compile(policy)
+            let compiled = crate::ai_routing_policy::CompiledAiRoutingPolicy::compile(policy)
                 .map_err(|error| anyhow::anyhow!("ai ai_routing_policy: {error}"))?;
+            let _ = config
+                .ai_routing_policy_compiled
+                .set(Some(std::sync::Arc::new(compiled)));
         }
         // WOR-2233: `token_rate` scores remaining headroom against a
         // per-provider tokens-per-minute limit, and nothing supplies

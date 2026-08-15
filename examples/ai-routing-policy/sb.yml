@@ -1,0 +1,98 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: an operator-authored routing policy.
+#
+# The built-in strategies pick from a fixed menu. `ai_routing_policy`
+# hands the routing decision itself to operator code: one sandboxed CEL
+# expression reads the gateway-computed `ai` decision view and returns a
+# *plan* (an ordered candidate list plus a reason), or `null` to decline
+# to the configured `routing` strategy. Declining is the cheap common
+# path: this policy has an opinion about three kinds of request and none
+# about the rest.
+#
+# The expression below composes three signals no fixed strategy can
+# weigh together:
+#   - `ai.prompt.difficulty`: a heuristic in [0.0, 1.0] over prompt
+#     shape (length, code, math, multi-step reasoning), the same score
+#     the built-in `cost_quality` strategy routes on.
+#   - `ai.providers`: each provider's live health, p50 latency,
+#     in-flight count, and circuit-breaker state, the same signals the
+#     latency- and load-aware strategies select on.
+#   - `ai.catalog`: per-model prices (USD per million tokens, resolved
+#     exactly as cost accounting resolves them) and context windows,
+#     rebuilt on config reload.
+#
+# Decision order:
+#   1. If the frontier provider is unhealthy or its circuit is open,
+#      shed everything to the cheap tier and say so.
+#   2. Hard prompts (difficulty > 0.7) go to the frontier model.
+#   3. Expensive models requested by anyone without the `pro` tier tag
+#      are downgraded to the cheap tier.
+#   4. Everything else declines to `least_token_usage`.
+#
+# Every plan carries a `reason` (it reaches the access log) and a
+# `reason_code` from the bounded allowlist below (it becomes the
+# `sbproxy_ai_routing_policy_decisions_total{outcome, reason_code}`
+# metric label). A plan can never route around the model allowlist, and
+# the policy does not run for bring-your-own-key requests.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/ai-routing-policy/sb.yml
+#
+# Test (a hard prompt routes to the frontier model; watch the access
+# log's route reason):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "gpt-4o-mini",
+#       "messages": [{"role": "user",
+#         "content": "Prove step by step that the following function terminates:\n```\ndef f(n):\n    while n > 1:\n        n = n // 2\n    return n\n```"}]
+#     }'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      # Runs whenever the policy declines: the boring, load-balanced
+      # default for every request the policy has no opinion about.
+      routing: least_token_usage
+
+      providers:
+        - name: cheap
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+        - name: frontier
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o
+          models:
+            - gpt-4o
+
+      ai_routing_policy:
+        expression: |
+          ai.providers.exists(p, p.name == "frontier" && (!p.healthy || p.circuit_open))
+            ? {"candidates": [{"provider_id": "cheap", "model": "gpt-4o-mini"}],
+               "reason": "frontier degraded, shedding to cheap",
+               "reason_code": "provider_health"}
+            : ai.prompt.difficulty > 0.7
+              ? {"candidates": [{"provider_id": "frontier", "model": "gpt-4o"}],
+                 "reason": "hard prompt", "reason_code": "difficulty"}
+              : ai.principal.tier != "pro"
+                  && ai.model in ai.catalog
+                  && ai.catalog[ai.model].input_per_million > 10.0
+                ? {"candidates": [{"provider_id": "cheap", "model": "gpt-4o-mini"}],
+                   "reason": "pricey model on a free plan", "reason_code": "price"}
+                : null
+        # Only these codes pass to the metric label verbatim; anything
+        # else a policy returns collapses to `other`.
+        reason_codes: [provider_health, difficulty, price]
+        # A broken optimization policy should not take the gateway
+        # down: on an evaluation fault, fall through to the strategy.
+        on_error: decline

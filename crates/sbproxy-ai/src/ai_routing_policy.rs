@@ -79,11 +79,44 @@ impl AiRoutingOnError {
 }
 
 /// Config for the operator-authored routing policy.
+///
+/// Two mutually exclusive authoring forms:
+///
+/// - `expression`: a CEL expression (the original form, unchanged).
+/// - `engine` + `source`: an inline document engine, `lua`, `js`, or
+///   `rego`. Rego additionally accepts `query` (default
+///   `data.sbproxy.route`), `data` (a base-data document, WOR-2420), and
+///   `budget_ms`. A `wasm` routing hook is a compiled bundle, not inline
+///   source, and arrives through the extension-bundle registry in a later
+///   slice, mirroring the decision-script rule.
+///
+/// `on_error` and `reason_codes` are engine-neutral.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiRoutingPolicyConfig {
     /// CEL expression returning a routing-plan document (or a decline).
-    pub expression: String,
+    /// Mutually exclusive with `engine`/`source`.
+    #[serde(default)]
+    pub expression: Option<String>,
+    /// Document engine for `source`: `lua`, `js`, or `rego`.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// Inline script/module for `engine`. The script reads the same `ai`
+    /// document CEL reads (Lua/JS as an `ai` global, Rego as `input.ai`)
+    /// and returns a routing-plan document, or null/nothing to decline.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Rego only: the rule to evaluate. Defaults to `data.sbproxy.route`.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Rego only: a base-data document the rules read as `data.*`, kept
+    /// separate from the module so tables change without policy edits.
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound the `rego` policy module uses.
+    #[serde(default)]
+    pub budget_ms: Option<u64>,
     /// What to do when the expression faults or returns a malformed plan.
     /// `decline` (default) or `block`.
     #[serde(default = "default_on_error")]
@@ -100,9 +133,48 @@ fn default_on_error() -> String {
     "decline".to_owned()
 }
 
+/// Default Rego evaluation budget, matching the `rego` policy module.
+const DEFAULT_REGO_BUDGET_MS: u64 = 50;
+
+/// Default Rego rule for a routing policy.
+const DEFAULT_REGO_QUERY: &str = "data.sbproxy.route";
+
+/// The compiled program behind one routing policy, one variant per engine.
+///
+/// Every variant produces the same routing-plan JSON document; everything
+/// after the document (decode, reason, provider check, metric label) is
+/// shared, which is what makes the engines interchangeable.
+enum RoutingProgram {
+    /// A CEL expression, evaluated against the `ai` binding.
+    Cel(CompiledCel),
+    /// An inline Luau script; the `ai` document is a global. Fresh VM per
+    /// evaluation, the decision-script cost model.
+    Lua { source: String },
+    /// An inline JavaScript script; the `ai` document is a global. Fresh
+    /// VM per evaluation, the decision-script cost model.
+    Js { source: String },
+    /// A Rego module, evaluated on a shared interpreter behind a lock;
+    /// the `ai` document is `input.ai`. Boxed because the interpreter is
+    /// an order of magnitude larger than the other variants and the
+    /// program is built once per config load, so the indirection costs
+    /// one allocation per load, not per request.
+    Rego(Box<std::sync::Mutex<sbproxy_extension::rego::CompiledRego>>),
+}
+
+impl RoutingProgram {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Cel(_) => "cel",
+            Self::Lua { .. } => "lua",
+            Self::Js { .. } => "js",
+            Self::Rego(_) => "rego",
+        }
+    }
+}
+
 /// A compiled routing policy, ready to evaluate per request.
 pub struct CompiledAiRoutingPolicy {
-    cel: CompiledCel,
+    program: RoutingProgram,
     on_error: AiRoutingOnError,
     reason_codes: HashSet<String>,
 }
@@ -110,6 +182,7 @@ pub struct CompiledAiRoutingPolicy {
 impl std::fmt::Debug for CompiledAiRoutingPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledAiRoutingPolicy")
+            .field("engine", &self.program.label())
             .field("on_error", &self.on_error)
             .field("reason_codes", &self.reason_codes)
             .finish_non_exhaustive()
@@ -144,16 +217,15 @@ impl CompiledAiRoutingPolicy {
     ///
     /// # Errors
     ///
-    /// Returns an error when the CEL expression does not compile against
-    /// the routing surface (a reference to a binding it does not offer is
-    /// a load error, not a runtime fault), when `on_error` is not a
+    /// Returns an error when neither or both authoring forms are present,
+    /// when the engine is not one of `lua`/`js`/`rego` (with a
+    /// self-explaining refusal for `cel` and `wasm`), when a Rego-only
+    /// knob accompanies a non-Rego form, when the program itself does not
+    /// compile (CEL against the routing surface; a Rego module through
+    /// parse plus the evaluability proof), when `on_error` is not a
     /// recognized posture, or when `reason_codes` exceeds its bounds.
     pub fn compile(cfg: &AiRoutingPolicyConfig) -> anyhow::Result<Self> {
-        let cel = CompiledCel::compile(
-            CelSurface::AiRouting,
-            "ai_routing_policy `expression`",
-            &cfg.expression,
-        )?;
+        let program = Self::compile_program(cfg)?;
         let on_error = AiRoutingOnError::parse(&cfg.on_error)?;
         if cfg.reason_codes.len() > MAX_REASON_CODES {
             anyhow::bail!(
@@ -171,10 +243,119 @@ impl CompiledAiRoutingPolicy {
             }
         }
         Ok(Self {
-            cel,
+            program,
             on_error,
             reason_codes: cfg.reason_codes.iter().cloned().collect(),
         })
+    }
+
+    /// Resolve the authoring form and compile the engine-specific program.
+    fn compile_program(cfg: &AiRoutingPolicyConfig) -> anyhow::Result<RoutingProgram> {
+        match (&cfg.expression, &cfg.engine) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "ai_routing_policy takes either `expression` (CEL) or `engine` + `source`, \
+                 not both"
+            ),
+            (None, None) => {
+                anyhow::bail!("ai_routing_policy needs `expression` (CEL) or `engine` + `source`")
+            }
+            (Some(expression), None) => {
+                if cfg.source.is_some()
+                    || cfg.query.is_some()
+                    || cfg.data.is_some()
+                    || cfg.budget_ms.is_some()
+                {
+                    anyhow::bail!(
+                        "ai_routing_policy `source`/`query`/`data`/`budget_ms` belong to the \
+                         `engine` form; an `expression` policy is CEL and takes none of them"
+                    );
+                }
+                Ok(RoutingProgram::Cel(CompiledCel::compile(
+                    CelSurface::AiRouting,
+                    "ai_routing_policy `expression`",
+                    expression,
+                )?))
+            }
+            (None, Some(engine)) => {
+                let source = cfg.source.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("ai_routing_policy `engine: {engine}` needs an inline `source`")
+                })?;
+                let rego_only_knobs =
+                    cfg.query.is_some() || cfg.data.is_some() || cfg.budget_ms.is_some();
+                match engine.trim() {
+                    "lua" | "js" if rego_only_knobs => anyhow::bail!(
+                        "ai_routing_policy `query`/`data`/`budget_ms` are Rego knobs; \
+                         `engine: {engine}` takes only `source`"
+                    ),
+                    "lua" => {
+                        // Syntax errors refuse at load. Runtime faults (a nil
+                        // index, a bad return shape) still follow `on_error`.
+                        sbproxy_extension::lua::LuaEngine::check_syntax(source).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "ai_routing_policy lua `source` does not parse: {error:#}"
+                                )
+                            },
+                        )?;
+                        Ok(RoutingProgram::Lua {
+                            source: source.to_owned(),
+                        })
+                    }
+                    // JS has no compile-only seam in the embedded engine, so
+                    // a syntax error surfaces at first evaluation under
+                    // `on_error` rather than at load; the docs say so.
+                    "js" => Ok(RoutingProgram::Js {
+                        source: source.to_owned(),
+                    }),
+                    "rego" => {
+                        // Same invariant the `rego` policy module holds: a zero
+                        // budget reads as "no budget" but is an instantly
+                        // expired timer. The load-time evaluability trial can
+                        // finish before regorus's first deadline check, so a
+                        // zero would load green and then abort every real
+                        // request into `on_error`.
+                        if cfg.budget_ms == Some(0) {
+                            anyhow::bail!(
+                                "ai_routing_policy `budget_ms` must be greater than zero; a \
+                                 zero budget would abort every evaluation before the rule ran"
+                            );
+                        }
+                        Ok(RoutingProgram::Rego(Box::new(std::sync::Mutex::new(
+                            sbproxy_extension::rego::CompiledRego::compile(
+                                "ai_routing_policy",
+                                source,
+                                cfg.query.as_deref().unwrap_or(DEFAULT_REGO_QUERY),
+                                cfg.budget_ms.unwrap_or(DEFAULT_REGO_BUDGET_MS),
+                                cfg.data.clone(),
+                            )?,
+                        ))))
+                    }
+                    "cel" => anyhow::bail!(
+                        "ai_routing_policy CEL policies are written as `expression`, not \
+                         `engine: cel`"
+                    ),
+                    "wasm" => anyhow::bail!(
+                        "ai_routing_policy `engine: wasm` is a compiled bundle, not inline \
+                         source; a WASM routing hook arrives through the extension-bundle \
+                         registry in a later release"
+                    ),
+                    other => anyhow::bail!(
+                        "ai_routing_policy `engine` must be `lua`, `js`, or `rego`, got \
+                         {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The engine label for decision events, mirroring what the program is.
+    pub fn decision_engine(&self) -> sbproxy_observe::decision::DecisionEngine {
+        match &self.program {
+            RoutingProgram::Cel(_) => sbproxy_observe::decision::DecisionEngine::Cel,
+            RoutingProgram::Lua { .. } => sbproxy_observe::decision::DecisionEngine::Lua,
+            RoutingProgram::Js { .. } => sbproxy_observe::decision::DecisionEngine::JavaScript,
+            RoutingProgram::Rego(_) => sbproxy_observe::decision::DecisionEngine::Rego,
+        }
     }
 
     /// Normalize a policy-returned reason code to a bounded metric label.
@@ -204,13 +385,10 @@ impl CompiledAiRoutingPolicy {
         view: &AiDecisionView,
         configured_providers: &[String],
     ) -> AiRoutingOutcome {
-        let mut ctx = CelContext::new();
-        ctx.set("ai", view.to_cel());
-        let value = match self.cel.eval(&ctx) {
-            Ok(value) => value,
-            Err(error) => return self.error(format!("expression evaluation failed: {error}")),
+        let document = match self.produce_document(view) {
+            Ok(document) => document,
+            Err(detail) => return self.error(detail),
         };
-        let document = cel_to_json(&value);
         let decision = match decode_route_plan(&document) {
             Ok(decision) => decision,
             Err(error) => return self.error(error.to_string()),
@@ -232,6 +410,52 @@ impl CompiledAiRoutingPolicy {
             cascade: plan.to_cascade_config(None),
             reason: plan.reason,
             reason_code,
+        }
+    }
+
+    /// Run the program and produce the routing-plan JSON document.
+    ///
+    /// Every engine reads the same `ai` vocabulary: CEL binds
+    /// [`AiDecisionView::to_cel`], the document engines read
+    /// [`AiDecisionView::to_json`] (Lua/JS as an `ai` global, Rego as
+    /// `input.ai`), and the parity test keeps the two forms identical. An
+    /// `Err` here is an evaluation fault, bounded to a debug detail.
+    fn produce_document(&self, view: &AiDecisionView) -> Result<serde_json::Value, String> {
+        match &self.program {
+            RoutingProgram::Cel(cel) => {
+                let mut ctx = CelContext::new();
+                ctx.set("ai", view.to_cel());
+                match cel.eval(&ctx) {
+                    Ok(value) => Ok(cel_to_json(&value)),
+                    Err(error) => Err(format!("expression evaluation failed: {error}")),
+                }
+            }
+            RoutingProgram::Lua { source } => {
+                let engine = sbproxy_extension::lua::LuaEngine::new()
+                    .map_err(|error| format!("lua engine unavailable: {error:#}"))?;
+                let mut globals = std::collections::HashMap::new();
+                globals.insert("ai".to_owned(), view.to_json());
+                engine
+                    .execute(source, globals)
+                    .map_err(|error| format!("lua evaluation failed: {error:#}"))
+            }
+            RoutingProgram::Js { source } => {
+                let engine = sbproxy_extension::js::JsEngine::new()
+                    .map_err(|error| format!("js engine unavailable: {error:#}"))?;
+                let mut globals = std::collections::HashMap::new();
+                globals.insert("ai".to_owned(), view.to_json());
+                engine
+                    .execute(source, globals)
+                    .map_err(|error| format!("js evaluation failed: {error}"))
+            }
+            RoutingProgram::Rego(program) => {
+                let mut guard = program
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard
+                    .eval_value(serde_json::json!({ "ai": view.to_json() }))
+                    .map_err(|error| format!("rego evaluation failed: {error:#}"))
+            }
         }
     }
 
@@ -277,7 +501,7 @@ fn interned_reason_code(code: &str) -> &'static str {
 /// A non-finite float has no JSON representation and becomes `null`;
 /// `decode_route_plan` then treats it as an absent optional or a missing
 /// field, which is the same as any other malformed number.
-fn cel_to_json(value: &CelValue) -> serde_json::Value {
+pub(crate) fn cel_to_json(value: &CelValue) -> serde_json::Value {
     match value {
         CelValue::String(string) => serde_json::Value::String(string.clone()),
         CelValue::Int(int) => serde_json::Value::from(*int),
@@ -303,7 +527,26 @@ mod tests {
 
     fn config(expression: &str) -> AiRoutingPolicyConfig {
         AiRoutingPolicyConfig {
-            expression: expression.to_owned(),
+            expression: Some(expression.to_owned()),
+            engine: None,
+            source: None,
+            query: None,
+            data: None,
+            budget_ms: None,
+            on_error: default_on_error(),
+            reason_codes: Vec::new(),
+        }
+    }
+
+    /// A config in the `engine` + `source` form, for the document engines.
+    fn engine_config(engine: &str, source: &str) -> AiRoutingPolicyConfig {
+        AiRoutingPolicyConfig {
+            expression: None,
+            engine: Some(engine.to_owned()),
+            source: Some(source.to_owned()),
+            query: None,
+            data: None,
+            budget_ms: None,
             on_error: default_on_error(),
             reason_codes: Vec::new(),
         }
@@ -315,6 +558,176 @@ mod tests {
 
     fn providers() -> Vec<String> {
         vec!["openai".to_owned(), "anthropic".to_owned()]
+    }
+
+    #[track_caller]
+    fn expect_plan(outcome: AiRoutingOutcome) -> (CascadeConfig, String, &'static str) {
+        match outcome {
+            AiRoutingOutcome::Plan {
+                cascade,
+                reason,
+                reason_code,
+            } => (cascade, reason, reason_code),
+            other => panic!("expected a plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lua_policy_plans_declines_and_labels_its_engine() {
+        let planning = CompiledAiRoutingPolicy::compile(&engine_config(
+            "lua",
+            r#"
+            if ai.prompt.difficulty < 0.5 then
+              return { candidates = {{provider_id = "openai", model = "gpt-4o-mini"}},
+                       reason = "easy prompt" }
+            end
+            return nil
+            "#,
+        ))
+        .expect("lua compiles");
+        assert_eq!(
+            planning.decision_engine(),
+            sbproxy_observe::decision::DecisionEngine::Lua
+        );
+
+        let easy = AiDecisionView::default(); // difficulty 0.0
+        let (cascade, reason, code) = expect_plan(planning.evaluate(&easy, &providers()));
+        assert_eq!(cascade.tiers[0].provider_id, "openai");
+        assert_eq!(reason, "easy prompt");
+        assert_eq!(code, "policy");
+
+        let hard = AiDecisionView {
+            prompt_difficulty: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(
+            planning.evaluate(&hard, &providers()),
+            AiRoutingOutcome::Decline
+        );
+    }
+
+    #[test]
+    fn a_js_policy_plans_and_declines() {
+        let policy = CompiledAiRoutingPolicy::compile(&engine_config(
+            "js",
+            r#"
+            ai.budget.fraction > 0.8
+              ? { candidates: [{provider_id: "anthropic", model: "claude-sonnet-5"}],
+                  reason: "budget pressure", reason_code: "cost" }
+              : null
+            "#,
+        ))
+        .expect("js compiles");
+        assert_eq!(
+            policy.decision_engine(),
+            sbproxy_observe::decision::DecisionEngine::JavaScript
+        );
+
+        let pressed = AiDecisionView {
+            budget_fraction: 0.95,
+            ..Default::default()
+        };
+        let (cascade, _, code) = expect_plan(policy.evaluate(&pressed, &providers()));
+        assert_eq!(cascade.tiers[0].provider_id, "anthropic");
+        // `cost` is not in the (empty) allowlist, so it collapses.
+        assert_eq!(code, "other");
+
+        assert_eq!(
+            policy.evaluate(&AiDecisionView::default(), &providers()),
+            AiRoutingOutcome::Decline
+        );
+    }
+
+    #[test]
+    fn a_rego_policy_plans_declines_and_reads_base_data() {
+        let mut cfg = engine_config(
+            "rego",
+            r#"
+            package sbproxy
+            route := {"candidates": [{"provider_id": data.cheap_provider, "model": "gpt-4o-mini"}],
+                      "reason": "over budget"} if {
+                input.ai.budget.fraction > 0.8
+            }
+            "#,
+        );
+        cfg.data = Some(serde_json::json!({ "cheap_provider": "openai" }));
+        let policy = CompiledAiRoutingPolicy::compile(&cfg).expect("rego compiles");
+        assert_eq!(
+            policy.decision_engine(),
+            sbproxy_observe::decision::DecisionEngine::Rego
+        );
+
+        let pressed = AiDecisionView {
+            budget_fraction: 0.9,
+            ..Default::default()
+        };
+        let (cascade, reason, _) = expect_plan(policy.evaluate(&pressed, &providers()));
+        assert_eq!(cascade.tiers[0].provider_id, "openai");
+        assert_eq!(reason, "over budget");
+
+        // Rule undefined for this input: the policy declines, not errors.
+        assert_eq!(
+            policy.evaluate(&AiDecisionView::default(), &providers()),
+            AiRoutingOutcome::Decline
+        );
+    }
+
+    #[test]
+    fn the_authoring_forms_are_validated_at_load() {
+        // Both forms at once.
+        let mut both = engine_config("lua", "return nil");
+        both.expression = Some("null".to_owned());
+        assert!(CompiledAiRoutingPolicy::compile(&both).is_err());
+
+        // Neither form.
+        let mut neither = config("null");
+        neither.expression = None;
+        assert!(CompiledAiRoutingPolicy::compile(&neither).is_err());
+
+        // Engine without source.
+        let mut missing = engine_config("lua", "return nil");
+        missing.source = None;
+        assert!(CompiledAiRoutingPolicy::compile(&missing).is_err());
+
+        // `cel` and `wasm` refuse with their own messages; unknown refuses.
+        for engine in ["cel", "wasm", "python"] {
+            let error = CompiledAiRoutingPolicy::compile(&engine_config(engine, "x"))
+                .expect_err("refused engine");
+            assert!(
+                error.to_string().contains("ai_routing_policy"),
+                "refusal must name the site: {error}"
+            );
+        }
+
+        // Rego knobs on a non-Rego engine.
+        let mut knobs = engine_config("lua", "return nil");
+        knobs.budget_ms = Some(10);
+        assert!(CompiledAiRoutingPolicy::compile(&knobs).is_err());
+
+        // Rego knobs on the CEL form.
+        let mut cel_knobs = config("null");
+        cel_knobs.query = Some("data.x.y".to_owned());
+        assert!(CompiledAiRoutingPolicy::compile(&cel_knobs).is_err());
+
+        // A Rego module whose query names no rule fails at load, not at
+        // the first request.
+        let bad_query = engine_config("rego", "package sbproxy\nroute := 1");
+        let mut bad = bad_query;
+        bad.query = Some("data.sbproxy.missing".to_owned());
+        assert!(CompiledAiRoutingPolicy::compile(&bad).is_err());
+
+        // A zero Rego budget would abort every evaluation before the rule
+        // ran; refuse it by name, the same invariant the rego policy
+        // module holds.
+        let mut zero = engine_config("rego", "package sbproxy\nroute := 1");
+        zero.budget_ms = Some(0);
+        let error = CompiledAiRoutingPolicy::compile(&zero).expect_err("zero budget refused");
+        assert!(error.to_string().contains("budget_ms"), "{error}");
+
+        // A Lua syntax error refuses at load, not at the first request.
+        let error = CompiledAiRoutingPolicy::compile(&engine_config("lua", "retrun nil"))
+            .expect_err("lua typo refused");
+        assert!(error.to_string().contains("does not parse"), "{error}");
     }
 
     #[test]

@@ -86,6 +86,10 @@ for the shared grammar and rejection rules.
 
 ## The `ai.*` namespace
 
+This vocabulary is engine-neutral: a multi-engine `ai_routing_policy`
+reads exactly these paths in Lua and JavaScript (as an `ai` global) and
+in Rego (as `input.ai`), kept identical by a parity test.
+
 | Field | Type | Meaning |
 |---|---|---|
 | `ai.surface` | string | Classified surface (`chat_completions`, `embeddings`, ...). |
