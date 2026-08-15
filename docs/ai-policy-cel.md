@@ -111,6 +111,10 @@ for the shared grammar and rejection rules.
 | `ai.providers[i].tokens_used` | int | Tokens charged to the current minute. |
 | `ai.providers[i].circuit_open` | bool | `true` when the circuit breaker is open (requests are being rejected). |
 | `ai.providers[i].circuit` | string | `closed`, `open`, or `half_open`. |
+| `ai.catalog` | map | Base data for the origin's declared models, keyed by the `models` strings verbatim (declare them in the casing callers use). Built once per config generation and rebuilt on reload, so it tracks `model_prices` and the rate card without the policy changing. A model with no known price or context window is omitted, and a provider that omits `models` contributes nothing (all providers deferring means an empty catalog and a load-time warning); guard with `ai.model in ai.catalog`. |
+| `ai.catalog[m].input_per_million` | double | USD per million prompt tokens, the same unit `model_prices` is written in. Resolution order matches cost accounting: operator `model_prices`/rate card first, then the built-in catalog. Absent when no layer prices the model. |
+| `ai.catalog[m].output_per_million` | double | USD per million completion tokens. Absent when no layer prices the model. |
+| `ai.catalog[m].context_window` | int | Context window in tokens, from the built-in table. Absent when unknown. |
 
 `ai.tokens.input_est` is computed before CEL and before compression. Known
 OpenAI model families use their registered tokenizer; other model names use

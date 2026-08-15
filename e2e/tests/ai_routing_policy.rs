@@ -343,3 +343,72 @@ fn prompt_fingerprint_is_visible_to_the_routing_policy() {
         "cheap must be untouched when the fingerprint drives the plan"
     );
 }
+
+/// A routing policy that reads `ai.catalog`: the config prices `gpt-4o` at
+/// $30 per million prompt tokens via `model_prices`, and the policy plans to
+/// `frontier` when the requested model's catalog price crosses $10. Proof the
+/// base-data document reaches the policy: without the wiring the catalog is
+/// empty, the `in` guard fails, the policy declines, and round_robin serves
+/// `cheap` (index 0) instead.
+fn catalog_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      model_prices:
+        gpt-4o:
+          input_per_million: 30.0
+          output_per_million: 60.0
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        expression: |
+          ai.model in ai.catalog && ai.catalog[ai.model].input_per_million > 10.0
+            ? {{"candidates": [{{"provider_id": "frontier", "model": "gpt-4o"}}], "reason": "pricey model", "reason_code": "price"}}
+            : null
+        reason_codes: [price]
+"#
+    )
+}
+
+#[test]
+fn the_catalog_prices_are_visible_to_the_routing_policy() {
+    // The operator's model_prices flow through the catalog into the policy:
+    // gpt-4o is priced at $30/M, above the policy's $10 threshold, so the
+    // plan fires and frontier serves. An unwired catalog would decline to
+    // round_robin and cheap would serve instead.
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy =
+        ProxyHarness::start_with_yaml(&catalog_config(&cheap.base_url(), &frontier.base_url()))
+            .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "a catalog-priced model above the threshold must plan to frontier"
+    );
+    assert!(
+        cheap.captured().is_empty(),
+        "cheap must be untouched when the catalog drives the plan"
+    );
+}

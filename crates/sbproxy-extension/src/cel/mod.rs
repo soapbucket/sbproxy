@@ -100,6 +100,14 @@ pub enum CelValue {
     /// bind the result on every request: the containers inside
     /// [`cel::Value`] are `Arc`-backed, so each bind clones a handful of
     /// reference counts instead of the document.
+    ///
+    /// Bind `Shared` only for values you build whole and never inspect
+    /// again (today: the `ai.catalog` document nested inside `ai`). Several
+    /// namespace-population helpers pattern-match `Map` to merge fields
+    /// into an existing binding and treat everything else as empty, so
+    /// rebinding an established namespace like `request` as `Shared` would
+    /// silently drop its fields there. Use [`CelValue::into_owned`] first
+    /// if a shared document ever needs that treatment.
     Shared(cel::Value),
 }
 

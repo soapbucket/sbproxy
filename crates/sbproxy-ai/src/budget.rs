@@ -786,6 +786,13 @@ impl PriceTable {
 /// with no config the behavior is exactly the built-in catalog.
 static PRICE_TABLE: RwLock<Option<PriceTable>> = RwLock::new(None);
 
+/// Serializes tests, in any module of this crate, that touch the
+/// process-global `PRICE_TABLE`, so they do not race each other under a
+/// threaded test runner. Nextest isolates tests per process; the
+/// documented `cargo test -p sbproxy-ai --lib` inner loop does not.
+#[cfg(test)]
+pub(crate) static PRICE_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Install the operator price table, replacing any previous one (so a
 /// config hot-reload updates prices). WOR-1707.
 pub fn set_price_table(table: PriceTable) {
@@ -1403,10 +1410,6 @@ fn is_rolled_over_window(key: &str, now_unix_secs: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Serializes tests that mutate the process-global PRICE_TABLE so
-    // they do not race each other under the parallel test runner.
-    static PRICE_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn litellm_ratecard_parses_per_million_and_cache() {
