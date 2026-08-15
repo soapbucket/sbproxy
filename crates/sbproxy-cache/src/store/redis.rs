@@ -145,6 +145,7 @@ mod tests {
                 .unwrap()
                 .as_secs(),
             ttl_secs: 300,
+            swr_secs: None,
             config_fp: String::new(),
         }
     }

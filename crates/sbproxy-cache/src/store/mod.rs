@@ -37,6 +37,17 @@ pub struct CachedResponse {
     pub cached_at: u64,
     /// Time-to-live in seconds from `cached_at`.
     pub ttl_secs: u64,
+    /// Per-entry stale-while-revalidate window, when an `admit_event`
+    /// chose one (WOR-2367).
+    ///
+    /// `None` falls back to the origin's configured
+    /// `stale_while_revalidate`, which is what every entry written
+    /// before this field existed deserializes to. Stored per entry
+    /// rather than read from config on each hit so a response admitted
+    /// with a deliberately short window keeps it when the origin's
+    /// default later widens.
+    #[serde(default)]
+    pub swr_secs: Option<u64>,
     /// Cache-config fingerprint of the origin that stored this entry
     /// (WOR-2407).
     ///
@@ -122,6 +133,9 @@ impl CachedResponse {
             body: self.body.clone(),
             cached_at,
             ttl_secs,
+            // The window the entry was admitted with still applies; a
+            // 304 refreshes metadata around the same representation.
+            swr_secs: self.swr_secs,
             // A 304 refreshes metadata around the same representation,
             // so the entry still belongs to the config that stored it.
             config_fp: self.config_fp.clone(),
@@ -280,6 +294,7 @@ mod tests {
             body: Vec::new(),
             cached_at: now_secs(),
             ttl_secs: 60,
+            swr_secs: None,
             config_fp: config_fp.to_string(),
         }
     }
@@ -337,6 +352,7 @@ mod tests {
             body: Vec::new(),
             cached_at: now_secs(),
             ttl_secs: u64::MAX,
+            swr_secs: None,
             config_fp: String::new(),
         };
         assert!(!entry.is_expired(), "a saturated expiry is still future");
@@ -348,6 +364,7 @@ mod tests {
             body: Vec::new(),
             cached_at: u64::MAX,
             ttl_secs: u64::MAX,
+            swr_secs: None,
             config_fp: String::new(),
         };
         assert!(!pinned.is_expired(), "both fields at the maximum saturate");
@@ -362,6 +379,7 @@ mod tests {
             body: Vec::new(),
             cached_at: now_secs().saturating_sub(600),
             ttl_secs: 60,
+            swr_secs: None,
             config_fp: String::new(),
         };
         assert!(entry.is_expired());
@@ -382,6 +400,7 @@ mod tests {
             body: b"body".to_vec(),
             cached_at: now_secs(),
             ttl_secs: 60,
+            swr_secs: None,
             config_fp: String::new(),
         };
 
@@ -392,6 +411,49 @@ mod tests {
         assert_eq!(
             decoded.last_modified(),
             Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+    }
+
+    #[test]
+    fn an_entry_written_before_the_swr_field_still_deserializes() {
+        // The stored format is on disk and in Redis at customer sites.
+        // A required field here would make every pre-existing entry
+        // undeserializable, which reads as a cold cache after upgrade
+        // rather than as an error anyone would notice.
+        let legacy = serde_json::json!({
+            "status": 200,
+            "headers": [["content-type", "application/json"]],
+            "body": [123, 125],
+            "cached_at": 1_700_000_000_u64,
+            "ttl_secs": 60,
+            "config_fp": "abc123"
+        });
+        let entry: CachedResponse =
+            serde_json::from_value(legacy).expect("a pre-WOR-2367 entry must still load");
+        assert_eq!(entry.swr_secs, None, "absence means inherit, not zero");
+        assert_eq!(entry.generation, 0, "and the same holds for generation");
+        assert_eq!(entry.ttl_secs, 60);
+    }
+
+    #[test]
+    fn a_freshened_entry_keeps_the_window_it_was_admitted_with() {
+        // A 304 refreshes metadata around the same representation, so
+        // the admit decision that chose this window still stands.
+        let stored = CachedResponse {
+            generation: 7,
+            status: 200,
+            headers: vec![("etag".into(), "\"v1\"".into())],
+            body: b"body".to_vec(),
+            cached_at: 1_000,
+            ttl_secs: 60,
+            swr_secs: Some(15),
+            config_fp: "fp".into(),
+        };
+        let refreshed = stored.freshen_from_not_modified(&[], 2_000, 60);
+        assert_eq!(
+            refreshed.swr_secs,
+            Some(15),
+            "a 304 must not silently widen the window back to the origin default"
         );
     }
 
@@ -413,6 +475,7 @@ mod tests {
             body: br#"{"value":1}"#.to_vec(),
             cached_at: 10,
             ttl_secs: 5,
+            swr_secs: None,
             config_fp: String::new(),
         };
 

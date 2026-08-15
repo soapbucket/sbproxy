@@ -4133,7 +4133,17 @@ pub(super) async fn request_filter(
                             .as_secs();
                         let age = now.saturating_sub(entry.cached_at);
                         let fresh = age <= entry.ttl_secs;
-                        let swr_window = cache_cfg.stale_while_revalidate.unwrap_or(0);
+                        // WOR-2367: the entry's own window wins. An
+                        // `admit_event` that chose a short window for a
+                        // volatile response must keep it when the
+                        // origin's default is later widened, otherwise
+                        // the policy silently loosens with config it
+                        // never mentioned. Entries written before the
+                        // field existed carry `None` and fall back.
+                        let swr_window = entry
+                            .swr_secs
+                            .or(cache_cfg.stale_while_revalidate)
+                            .unwrap_or(0);
                         let in_swr = !fresh && age <= entry.ttl_secs + swr_window;
 
                         if fresh || in_swr {
@@ -4236,6 +4246,13 @@ pub(super) async fn request_filter(
                                 // the response_filter does.
                                 let cacheable_status = cache_cfg.cacheable_status.clone();
                                 let new_ttl = cache_cfg.ttl_secs;
+                                // WOR-2367: the refresh runs the origin's
+                                // `admit_event` against the response it
+                                // fetches, so a stale-while-revalidate
+                                // origin and a programmable admission
+                                // policy compose. Captured here because
+                                // the task outlives the request.
+                                let admit_scope = super::proxy_http::AdmitEventScope::from_ctx(ctx);
                                 if let Some(revalidation_request) = revalidation_request {
                                     spawn_swr_revalidation(
                                         cache_store.clone(),
@@ -4247,6 +4264,7 @@ pub(super) async fn request_filter(
                                         cacheable_status,
                                         pipeline.clone(),
                                         origin_idx,
+                                        admit_scope,
                                     );
                                 }
                             }

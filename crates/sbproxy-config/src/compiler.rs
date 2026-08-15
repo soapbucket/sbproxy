@@ -3197,27 +3197,6 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
             // WOR-2367: these two do not compose yet, and the failure is
             // silent, so it is refused rather than shipped.
             //
-            // The stale-while-revalidate refresh runs in a background
-            // task with no request context, so it cannot evaluate
-            // `admit_event` against the response it just fetched. It
-            // writes back under the same key with the static `ttl_secs`
-            // and only the `cacheable_status` gate, which reverts both
-            // halves of the policy: a `ttl_secs` override lasts until
-            // the first refresh, and a response the policy refused is
-            // written by the refresh anyway.
-            //
-            // Refusing the pair is the honest state. Teaching the
-            // refresh to run the event is the fix, and it needs the
-            // event's context to survive into a detached task.
-            if cache.stale_while_revalidate.is_some_and(|swr| swr > 0) {
-                anyhow::bail!(
-                    "origin '{hostname}': response_cache sets both `admit_event` and \
-                     `stale_while_revalidate`, which do not compose. The revalidation refresh \
-                     runs without a request context, so it cannot evaluate the event and would \
-                     write back with the static `ttl_secs`, silently reverting both the event's \
-                     TTL override and any response it refused. Drop one of the two."
-                );
-            }
         }
     }
 
@@ -9683,28 +9662,32 @@ mod cache_decision_event_tests {
     }
 
     #[test]
-    fn admit_event_and_stale_while_revalidate_do_not_compose() {
-        // The revalidation refresh runs with no request context, so it
-        // cannot evaluate the event and would write back with the static
-        // ttl, silently reverting both the TTL override and any refusal.
-        let yaml = origin_with_cache(
-            "      enabled: true\n      stale_while_revalidate: 300\n      admit_event:\n        \
-             engine: lua\n        source: \"return {store = true}\"\n",
-        );
-        let message = format!(
-            "{:#}",
-            compile_config(&yaml)
-                .err()
-                .expect("the pair must be refused rather than silently reverting the policy")
-        );
-        assert!(
-            message.contains("stale_while_revalidate") && message.contains("admit_event"),
-            "must name both keys: {message}"
-        );
-        assert!(
-            message.contains("revert"),
-            "must say what goes wrong, not just that it is refused: {message}"
-        );
+    fn admit_event_and_stale_while_revalidate_compose() {
+        // These two were refused together until WOR-2367, because the
+        // revalidation refresh had no way to evaluate the event and
+        // would write back with the static `ttl_secs`, reverting both
+        // the override and any refusal. The refresh now runs the event
+        // against the response it fetched, so the pair is legal.
+        compile_config(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 60
+      stale_while_revalidate: 30
+      admit_event:
+        engine: lua
+        source: "return {store = true, reason = 'ok'}"
+"#,
+        )
+        .map(|_| ())
+        .expect("admit_event and stale_while_revalidate compose now");
     }
 
     #[test]

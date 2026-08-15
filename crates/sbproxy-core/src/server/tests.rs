@@ -148,6 +148,7 @@ fn swr_write_back_does_not_resurrect_an_invalidated_entry() {
         body: b"stale".to_vec(),
         cached_at: 1,
         ttl_secs: 60,
+        swr_secs: None,
         config_fp: String::new(),
     };
     let refreshed = sbproxy_cache::CachedResponse {

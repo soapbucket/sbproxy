@@ -7450,6 +7450,7 @@ origins:
                 .unwrap()
                 .as_secs(),
             ttl_secs: 300,
+            swr_secs: None,
             config_fp: String::new(),
         };
         scoped.put("k", &entry).unwrap();
@@ -7601,6 +7602,7 @@ origins:
                 .unwrap()
                 .as_secs(),
             ttl_secs: 300,
+            swr_secs: None,
             config_fp: String::new(),
         };
         stores.per_origin["a.example"]
@@ -7777,6 +7779,7 @@ origins:
             body: b"body".to_vec(),
             cached_at: 1_700_000_000,
             ttl_secs: 300,
+            swr_secs: None,
             config_fp: String::new(),
         };
 
