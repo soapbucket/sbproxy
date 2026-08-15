@@ -278,3 +278,68 @@ fn provider_state_is_visible_to_the_routing_policy() {
         "cheap must be untouched: the plan named frontier"
     );
 }
+
+/// A routing policy that keys on `ai.prompt.fingerprint`: plan to `frontier`
+/// whenever the fingerprint is present. The fingerprint is salted per process,
+/// so the test cannot assert a fixed value, only that it reaches the view: a
+/// real request produces a non-empty `pf_...`, so the plan fires; if the wiring
+/// were missing the fingerprint would be empty, the policy would decline, and
+/// round_robin would serve `cheap` (index 0).
+fn fingerprint_config(cheap_url: &str, frontier_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: cheap
+          provider_type: openai
+          api_key: "k"
+          base_url: "{cheap_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: frontier
+          provider_type: openai
+          api_key: "k"
+          base_url: "{frontier_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      ai_routing_policy:
+        expression: |
+          ai.prompt.fingerprint != ""
+            ? {{"candidates": [{{"provider_id": "frontier", "model": "gpt-4o"}}], "reason": "fingerprinted", "reason_code": "fingerprint"}}
+            : null
+        reason_codes: [fingerprint]
+"#
+    )
+}
+
+#[test]
+fn prompt_fingerprint_is_visible_to_the_routing_policy() {
+    // Proves the salted prompt fingerprint reaches the routing view: a real
+    // request produces a non-empty `pf_...`, so the policy plans to frontier.
+    // Without the wiring the fingerprint is empty, the policy declines, and
+    // cheap (round_robin index 0) serves.
+    let cheap = MockUpstream::start(chat_reply()).expect("cheap");
+    let frontier = MockUpstream::start(chat_reply()).expect("frontier");
+    let proxy =
+        ProxyHarness::start_with_yaml(&fingerprint_config(&cheap.base_url(), &frontier.base_url()))
+            .expect("proxy");
+
+    let resp = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !frontier.captured().is_empty(),
+        "a fingerprinted request must plan to frontier"
+    );
+    assert!(
+        cheap.captured().is_empty(),
+        "cheap must be untouched when the fingerprint drives the plan"
+    );
+}

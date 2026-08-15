@@ -250,6 +250,19 @@ pub struct AiDecisionView {
     /// strategy routes on, exposed so a routing policy can author that
     /// decision. Bound as `ai.prompt.difficulty`.
     pub prompt_difficulty: f64,
+    /// Salted, non-reversible fingerprint of the prompt (`pf_<12hex>`), or
+    /// empty when no prompt is present. Covers the model plus every message's
+    /// role and content, and never embeds prompt text. Lets a routing policy
+    /// key on prompt identity (e.g. sticky/cache-affinity routing) without
+    /// seeing the prompt. Bound as `ai.prompt.fingerprint`.
+    ///
+    /// This is the fingerprint of the prompt as the caller sent it, before any
+    /// prompt compression. It uses the same `pf_` scheme as the
+    /// `prompt_fingerprint` on request-event envelopes, but that one is taken
+    /// after compression, so the two values differ for a compressed request and
+    /// must not be joined. The routing policy necessarily runs before
+    /// compression, which is why it sees the pre-compression prompt.
+    pub prompt_fingerprint: String,
     /// Per-provider live runtime state (health, latency, in-flight, tokens
     /// used, circuit state), index-aligned with the configured providers.
     /// Bound as the `ai.providers` list. Empty when no router state is
@@ -293,10 +306,16 @@ impl AiDecisionView {
             "input_est".to_string(),
             CelValue::Int(self.input_tokens_est),
         )]);
-        let prompt = HashMap::from([(
-            "difficulty".to_string(),
-            CelValue::Float(self.prompt_difficulty),
-        )]);
+        let prompt = HashMap::from([
+            (
+                "difficulty".to_string(),
+                CelValue::Float(self.prompt_difficulty),
+            ),
+            (
+                "fingerprint".to_string(),
+                CelValue::String(self.prompt_fingerprint.clone()),
+            ),
+        ]);
         let providers = CelValue::List(
             self.providers
                 .iter()
@@ -689,6 +708,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&easy).route_model(), None);
+    }
+
+    #[test]
+    fn prompt_fingerprint_is_bound() {
+        // Sticky / cache-affinity routing: a policy keys on prompt identity
+        // without seeing the prompt text.
+        let p = policy(r#"ai.prompt.fingerprint == "pf_abc123def0" ? "route_to:sticky" : "allow""#);
+        let matching = AiDecisionView {
+            prompt_fingerprint: "pf_abc123def0".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.evaluate(&matching).route_model(), Some("sticky"));
+        let other = AiDecisionView {
+            prompt_fingerprint: "pf_0000ffff1111".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.evaluate(&other).route_model(), None);
     }
 
     #[test]

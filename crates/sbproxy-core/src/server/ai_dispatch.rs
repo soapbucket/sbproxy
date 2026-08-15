@@ -497,6 +497,34 @@ fn ai_policy_prompt_difficulty(body: &serde_json::Value) -> f64 {
     f64::from(sbproxy_ai::cost_quality::heuristic_difficulty(&text))
 }
 
+/// Salted, non-reversible fingerprint (`pf_<12hex>`) of the request's prompt
+/// for the AI decision view, or empty when the body carries no messages.
+///
+/// Parses the chat messages from the body the same lenient way the rest of the
+/// dispatch path does, then delegates to [`sbproxy_ai::prompt_fingerprint`],
+/// which never embeds prompt text. Exposed to policy as `ai.prompt.fingerprint`
+/// so a routing policy can key on prompt identity (sticky / cache-affinity
+/// routing) without seeing the prompt.
+fn ai_policy_prompt_fingerprint(model: &str, body: &serde_json::Value) -> String {
+    let msgs: Vec<sbproxy_ai::Message> = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    // The bare fingerprint hashes salt+model even for an empty message slice,
+    // so it is never empty on its own. Return empty when there are no messages
+    // so `ai.prompt.fingerprint == ""` is a usable "no prompt" test for a
+    // policy, matching how `ai.prompt.difficulty` reads zero for no text.
+    if msgs.is_empty() {
+        return String::new();
+    }
+    sbproxy_ai::prompt_fingerprint(model, &msgs)
+}
+
 /// Build the `ai.providers` view: each configured provider's live runtime
 /// state read from the router, index-aligned by position with `providers`.
 ///
@@ -5921,6 +5949,7 @@ pub(super) async fn handle_ai_proxy(
                 budget_exceeded: ctx.ai_budget_fraction >= 1.0,
                 input_tokens_est: ai_policy_input_tokens_est(&model, &body),
                 prompt_difficulty: ai_policy_prompt_difficulty(&body),
+                prompt_fingerprint: ai_policy_prompt_fingerprint(&model, &body),
                 providers: ai_provider_state_views(router.as_ref(), &config.providers),
             };
             let configured_providers: Vec<String> = config
@@ -6054,6 +6083,7 @@ pub(super) async fn handle_ai_proxy(
             budget_exceeded: ctx.ai_budget_fraction >= 1.0,
             input_tokens_est: policy_input_tokens_est,
             prompt_difficulty: ai_policy_prompt_difficulty(&body),
+            prompt_fingerprint: ai_policy_prompt_fingerprint(&model, &body),
             providers: ai_provider_state_views(router.as_ref(), &config.providers),
         };
         let decision = policy.evaluate(&view);
@@ -16211,11 +16241,12 @@ mod request_policy_tests {
 #[cfg(test)]
 mod compression_selection_tests {
     use super::{
-        ai_policy_input_tokens_est, bind_compression_selection, buffered_ai_response_body_limit,
-        compression_header_value, compression_selection_bypasses_cache,
-        compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
-        resolve_compression_selection_intent, upstream_response_is_successful_stream,
-        CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
+        ai_policy_input_tokens_est, ai_policy_prompt_fingerprint, bind_compression_selection,
+        buffered_ai_response_body_limit, compression_header_value,
+        compression_selection_bypasses_cache, compression_selection_outcome,
+        native_bypass_body_changed, native_bypass_is_safe, resolve_compression_selection_intent,
+        upstream_response_is_successful_stream, CompressionSelectionError,
+        CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
     use sbproxy_ai::compression::CompressionSelector;
@@ -16567,6 +16598,36 @@ mod compression_selection_tests {
             i64::try_from(expected).unwrap()
         );
         assert!(ai_policy_input_tokens_est("gpt-4o", &body) > 0);
+    }
+
+    #[test]
+    fn prompt_fingerprint_is_empty_without_messages_and_stable_with() {
+        // No messages -> empty, so `ai.prompt.fingerprint == ""` is a usable
+        // "no prompt" test for a policy (the bare fingerprint would be a
+        // non-empty pf_ even for an empty slice).
+        let no_field = serde_json::json!({"model": "gpt-4o"});
+        assert_eq!(ai_policy_prompt_fingerprint("gpt-4o", &no_field), "");
+        let empty_arr = serde_json::json!({"model": "gpt-4o", "messages": []});
+        assert_eq!(ai_policy_prompt_fingerprint("gpt-4o", &empty_arr), "");
+
+        // A real prompt is a stable, non-empty pf_ value within a process.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let fp = ai_policy_prompt_fingerprint("gpt-4o", &body);
+        assert!(fp.starts_with("pf_"), "expected a pf_ value, got {fp:?}");
+        assert_eq!(
+            fp,
+            ai_policy_prompt_fingerprint("gpt-4o", &body),
+            "identical prompts fingerprint identically within a process"
+        );
+        // A different prompt fingerprints differently.
+        let other = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "goodbye"}]
+        });
+        assert_ne!(fp, ai_policy_prompt_fingerprint("gpt-4o", &other));
     }
 }
 
