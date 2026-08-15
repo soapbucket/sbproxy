@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-15*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -397,7 +397,6 @@ proxy:
 | `bot_auth_directory_client_secs` | int | 5 | Client-level timeout for the Web Bot Auth directory lookup client. |
 | `swr_client_secs` | int | 30 | Client-level timeout for the stale-while-revalidate background refresh client. |
 | `callback_client_secs` | int | 10 | Client-level timeout for the callback / webhook client used by fire-and-forget POSTs. |
-
 
 ### HTTP/3 fields
 
@@ -3685,7 +3684,7 @@ origins:
 |-------|------|-------------|
 | `vary` | list | Extra dimensions folded into the cache key, added to the static `vary:` list of request headers. At most 16. |
 | `skip_lookup` | bool | Go upstream for this request instead of reading the cache. The response stays eligible for storage. |
-| `reason` | string | Free text explaining the plan, trimmed and truncated at 512 bytes. Carried with the decision; nothing branches on it. |
+| `reason` | string | Free text explaining the plan, trimmed and truncated at 512 bytes. Nothing branches on it. It reaches the decision-audit feed when that feed is turned on for this event, so write it for the person reading an audit trail six months from now. |
 
 `admit_event` returns:
 
@@ -3693,7 +3692,7 @@ origins:
 |-------|------|-------------|
 | `store` | bool | Required. Whether this response is written to the cache. |
 | `ttl_secs` | int | TTL for this entry, replacing the configured `ttl_secs`. Clamped to 30 days. |
-| `reason` | string | Same free text, same bounds. |
+| `reason` | string | Same free text, same bounds, and the same audit destination. |
 
 Every field on a `key_event` document is optional, and `{}` or `null` declines, which leaves the static `vary:` in charge. `admit_event` declines the same two ways, but any other document has to carry `store`. There is no safe default for that one: guessing `true` caches a response the policy never approved, and guessing `false` silently switches the cache off, so a non-empty document without `store` is refused as incomplete rather than assumed either way.
 
@@ -3716,6 +3715,52 @@ Two engines are refused at config compile, on boot and on reload, rather than at
 
 - `engine: cel`, because these events return a document (a list of key dimensions, or `store` plus `ttl_secs`) and CEL evaluates to a single scalar. Supporting it would mean a token grammar for packing a document into a string. The error names `lua` and `js`, which return documents natively.
 - `engine: wasm`, because a compiled module is not inline source. Attach a WASM hook through an [extension bundle](extension-bundles.md) instead.
+
+### Sending decision reasons to an audit feed
+
+A `reason` is the part of a decision worth keeping. A record saying a response
+was not cached is nearly useless; one saying `too large to be worth a cache
+slot` is an answer. Turn the feed on per event under
+`observability.log.decision_audit`, and each decision publishes an OCSF API
+Activity record carrying its reason, engine, outcome, origin, and tenant.
+
+```yaml
+observability:
+  log:
+    decision_audit:
+      events:
+        cache.admit: true
+```
+
+`enabled: true` alongside `events:` turns on every event that has an emitter;
+a per-event entry overrides it in either direction. Everything is off unless
+you ask for it, and that default is deliberate: `cache.key` runs once per
+cacheable request, so a permissive master switch would hand a busy origin a
+per-request feed, and the usual answer to a feed nobody can afford is to
+switch the whole thing off, which takes the security-relevant events with it.
+
+`cache.admit` is the only event with an emitter in this release. A label naming
+no known event is refused when the config loads rather than ignored, because a
+typo is a feed you believe you turned on and nobody is watching.
+`ai.stream.event: true` is refused by value: it fires once per streamed chunk,
+and `ai.close` carries the stream's summary instead.
+
+Reasons are scrubbed before they leave the process, in this order: a built-in
+secrets pass, then the `redact.patterns:` masks and PII rules that apply at the
+record's own tenant and route, then a 512-byte bound. That is the same
+resolution the log path uses, so a mask you wrote for a tenant covers that
+tenant's decision records and nobody else's, and there is nothing to configure
+twice. The `redact.fields:` denylist is the one half that does not carry over,
+since a reason is a single string with no field key to match on. Scrubbing runs
+before the bound on purpose: trimming first can cut a credential below the
+length its detector needs and ship the surviving prefix as ordinary text. A
+script that explains itself by quoting a prompt is still a script quoting a
+prompt, so treat the feed as carrying whatever your policies decide to say.
+
+Records ride the same bounded channel as policy verdicts. When it is full the
+record is dropped and counted on
+`sbproxy_decision_audit_events_dropped_total{event, tenant}`, because a feed
+that loses records silently reads as evidence that nothing happened.
 
 An `admit_event` next to a non-zero `stale_while_revalidate` is refused for a third reason: the two do not compose yet. The revalidation refresh runs in the background with no request context, so it cannot evaluate the event, and it writes back with the static `ttl_secs` and the `cacheable_status` gate alone. A TTL override would last until the first refresh, and a response the event refused would be written by the refresh anyway. Config compile fails naming both keys; drop one of the two.
 

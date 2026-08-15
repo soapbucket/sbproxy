@@ -182,11 +182,16 @@ pub struct CacheAdmitPlan {
     pub ttl_secs: Option<u64>,
     /// Why this response was admitted or refused.
     ///
-    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then it
-    /// goes nowhere. Nothing in this workspace builds an audit record
-    /// yet, and the `cache.admit` call site records the outcome without
-    /// ever reading this field. Wiring it to the audit record is
-    /// outstanding, not done.
+    /// Decoded and bounded to [`MAX_CACHE_REASON_BYTES`], and then, when
+    /// the origin's operator turns the decision-audit feed on for
+    /// `cache.admit`, published in an OCSF record that can leave the
+    /// process for a log store. That makes this field the one place
+    /// operator-authored script text reaches an external system, so it
+    /// is scrubbed on the way out: the audit type's constructor is the
+    /// only way to build the record and it applies the secrets floor,
+    /// the operator's redaction patterns, and their PII rules before
+    /// bounding. The feed is off unless asked for; with it off the field
+    /// is decoded and dropped as before.
     ///
     /// It is kept because a reason is what makes a cache decision
     /// diagnosable, and a debug line is not somewhere to keep one:

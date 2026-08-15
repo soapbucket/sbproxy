@@ -1,5 +1,5 @@
 # Performance
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-15*
 
 What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
@@ -153,7 +153,7 @@ scripts/perf-regression-run.sh /tmp/bench.json my-label
 SBPROXY_BIN=./target/release/sbproxy scripts/perf-compare.sh
 ```
 
-The first is what the `perf-regression` CI lane runs on a PR labelled `run-perf`; it compares the PR against a freshly built `main` baseline and fails the check when p99, idle RSS, or max RSS regresses more than 5%. Both scripts need [`oha`](https://github.com/hatoo/oha) on `PATH`, pinned to 1.4.5 in CI. [capacity-planning.md](capacity-planning.md) covers the tuning variables and how to read what comes back.
+The first is what the `perf-regression` CI lane runs on a PR labeled `run-perf`; it compares the PR against a freshly built `main` baseline and fails the check when p99, idle RSS, or max RSS regresses more than 5%. Both scripts need [`oha`](https://github.com/hatoo/oha) on `PATH`, pinned to 1.4.5 in CI. [capacity-planning.md](capacity-planning.md) covers the tuning variables and how to read what comes back.
 
 ### End-to-end local run
 

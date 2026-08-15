@@ -1005,6 +1005,59 @@ fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<
     Ok(())
 }
 
+/// Validate `observability.log.decision_audit:` at config-load time.
+///
+/// Two refusals, both landing on the same property: a misconfigured
+/// audit feed is silent, and silence is indistinguishable from a feed
+/// that is working and quiet. Neither mistake can be found by looking
+/// at the proxy afterwards, so both are found here.
+///
+/// 1. An event label naming no decision this proxy makes. Accepting it
+///    would leave an operator believing they had an audit trail.
+/// 2. `ai.stream.event: true`. That event fires once per streamed
+///    chunk, so a per-event audit record is an ingest bill rather than
+///    a control. `ai.close` carries the stream's summary instead.
+///    Writing `ai.stream.event: false` stays legal: saying out loud
+///    that a feed is off is a reasonable thing for an operator to do.
+///
+/// The second refusal is deliberately not the only defense.
+/// [`crate::DecisionAuditConfig::publishes`] answers `false` for that
+/// label whatever the config says, because this function iterates
+/// `events` and so cannot see the config that reaches the same feed
+/// through the master switch (`enabled: true` with no `events:` map).
+/// Both are kept: the type makes the feed unreachable, and this
+/// refusal means a config that asked for it fails loudly instead of
+/// being silently ignored.
+fn validate_decision_audit(audit: &crate::DecisionAuditConfig) -> Result<()> {
+    use sbproxy_observe::decision::DecisionEvent;
+
+    for (label, enabled) in &audit.events {
+        let Some(event) = DecisionEvent::from_label(label) else {
+            let accepted = DecisionEvent::ALL
+                .iter()
+                .map(|event| event.as_label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "observability.log.decision_audit.events names `{label}`, which is not a \
+                 decision this proxy makes. A label that matches nothing turns nothing on, and \
+                 an audit feed that emits nothing looks exactly like one with nothing to say. \
+                 Accepted values: {accepted}."
+            );
+        };
+        if *enabled && event == DecisionEvent::AiStreamEvent {
+            anyhow::bail!(
+                "observability.log.decision_audit.events sets `ai.stream.event: true`, which is \
+                 the one event that cannot be turned on: it fires once per streamed chunk, so a \
+                 per-event audit record is an ingest bill rather than a control. Enable \
+                 `ai.close` instead, which carries the stream's summary once the response \
+                 finishes."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Reject a `proxy.admin.bind` value that is not an IP address.
 ///
 /// The admin server used to fall back to `127.0.0.1` when the bind
@@ -1569,6 +1622,13 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         .and_then(|o| o.log.as_ref())
     {
         validate_custom_log_fields(&log.custom_fields)?;
+        // Proxy scope only, because that is the only scope carrying the
+        // block today. Tenant and origin `decision_audit:` land with the
+        // scope composition, and this call grows a sibling per scope the
+        // way `validate_custom_log_fields` already has.
+        if let Some(audit) = log.decision_audit.as_ref() {
+            validate_decision_audit(audit)?;
+        }
     }
     // Tenant- and origin-scope custom_fields use the same validation.
     for tenant in &config_file.proxy.tenants {
@@ -1895,6 +1955,22 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         .validate()
         .context("config compile: invalid extension bundle source")?;
 
+    // Lift the decision-audit block onto the snapshot so a decision point
+    // asks one `Option` on the compiled config instead of walking
+    // `proxy.observability.log` per request. Proxy scope only, matching
+    // the validation above: that is the only scope carrying the block
+    // today, and when tenant and origin `decision_audit:` land this
+    // becomes a compose the way `custom_fields` already is.
+    //
+    // Cloned rather than moved because `config_file.proxy` is handed to
+    // the snapshot whole as `server` below.
+    let decision_audit = config_file
+        .proxy
+        .observability
+        .as_ref()
+        .and_then(|obs| obs.log.as_ref())
+        .and_then(|log| log.decision_audit.clone());
+
     Ok(CompiledConfig {
         extension_bundles: config_file.extensions,
         origins,
@@ -1907,6 +1983,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         // Access-log emission settings ride through unchanged. `None`
         // (the default) keeps the logging hook a no-op.
         access_log: config_file.access_log,
+        // WOR-2405: which decision events publish an audit record.
+        // `None` keeps every decision point's publish check a single
+        // `Option` test that fails fast.
+        decision_audit,
         // G1.4 wire: hand the parsed `agent_classes:` block to the
         // binary startup code. The resolver itself is constructed in
         // `sbproxy-core` (which depends on the classifier crate); this
@@ -4499,6 +4579,194 @@ origins:
             keys.lock().unwrap().as_slice(),
             ["proxy.observability.log.sampling.debug"],
             "compile_config must warn once for the explicitly-set config-only key"
+        );
+    }
+
+    /// A typo'd event label has to fail the compile. Dropping it leaves
+    /// an operator believing they have an audit trail, and an audit feed
+    /// that emits nothing looks exactly like one with nothing to report,
+    /// so nothing downstream can find the mistake either.
+    #[test]
+    fn decision_audit_refuses_an_unknown_event_label() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+        events:
+          cache.admision: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("an unknown decision event label must fail the compile");
+        let message = format!("{error:#}");
+        assert!(message.contains("`cache.admision`"), "{message}");
+        // The accepted set is listed, so the operator does not have to
+        // guess which spelling was wanted.
+        assert!(message.contains("cache.admit"), "{message}");
+        assert!(message.contains("route.decide"), "{message}");
+        assert!(message.contains("payment.lifecycle"), "{message}");
+    }
+
+    /// `ai.stream.event` fires once per streamed chunk, so a per-event
+    /// audit record on it is an ingest bill rather than a control. The
+    /// refusal names `ai.close`, which carries the same stream's summary
+    /// once, so the operator gets the record they were after.
+    #[test]
+    fn decision_audit_refuses_the_per_chunk_stream_event() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+        events:
+          ai.stream.event: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("ai.stream.event must not be enable-able as a per-event audit feed");
+        let message = format!("{error:#}");
+        assert!(message.contains("ai.stream.event"), "{message}");
+        assert!(message.contains("per streamed chunk"), "{message}");
+        assert!(message.contains("ai.close"), "{message}");
+    }
+
+    /// The valid shape compiles: a known label turned on, and the
+    /// per-chunk event turned explicitly off. Writing a feed's `false`
+    /// down is a reasonable thing for an operator to do, so only the
+    /// `true` is refused.
+    #[test]
+    fn decision_audit_accepts_a_known_event_and_an_explicit_off() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+        events:
+          cache.admit: true
+          ai.stream.event: false
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        compile_config(yaml).expect("a known event label with a boolean toggle must compile");
+    }
+
+    /// Validating the block is not the same as delivering it. The
+    /// request path reads `CompiledConfig.decision_audit`, so a config
+    /// that parses and validates but never reaches the snapshot is a
+    /// feed the operator configured and no decision point can see.
+    #[test]
+    fn decision_audit_reaches_the_compiled_snapshot() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        events:
+          cache.admit: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("a per-event decision audit toggle compiles");
+        let audit = compiled
+            .decision_audit
+            .as_ref()
+            .expect("an authored decision_audit block must reach the snapshot");
+        // The per-event entry carries this on its own: the master switch
+        // is unset, so anything re-deriving the precedence off `enabled`
+        // alone would read this as off.
+        assert!(
+            audit.publishes("cache.admit"),
+            "an event the operator turned on must publish"
+        );
+        assert!(
+            !audit.publishes("route.decide"),
+            "an event the operator never named must stay off under an unset master switch"
+        );
+    }
+
+    /// The refusal above is a refusal of one `events:` key, and the
+    /// master switch does not go through that key. `enabled: true` with
+    /// no `events:` map names nothing, so it compiles clean, and a
+    /// `publishes` that only consulted the map and the switch would hand
+    /// the operator the per-chunk feed the refusal exists to prevent as
+    /// soon as an emitter lands. This walks the whole path (compile,
+    /// snapshot, read) rather than calling the method directly, because
+    /// the bypass is a property of the two halves together.
+    #[test]
+    fn a_bare_master_switch_does_not_turn_on_the_per_chunk_stream_event() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("a bare master switch compiles");
+        let audit = compiled
+            .decision_audit
+            .as_ref()
+            .expect("an authored decision_audit block must reach the snapshot");
+        assert!(
+            audit.publishes("cache.admit"),
+            "the master switch turns on the events it is meant to"
+        );
+        assert!(
+            !audit.publishes("ai.stream.event"),
+            "the master switch must not reach the per-chunk stream event; `ai.close` carries \
+             the stream's summary instead"
+        );
+    }
+
+    /// No block means no feed, and the snapshot has to say so with
+    /// `None` rather than a default-constructed block. A `Some` holding
+    /// empty defaults would answer the same way today and stop doing so
+    /// the moment any default turns permissive.
+    #[test]
+    fn no_decision_audit_block_compiles_to_none() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled =
+            compile_config(yaml).expect("a config with no decision_audit block compiles");
+        assert!(
+            compiled.decision_audit.is_none(),
+            "a config that never mentions decision_audit must not synthesize a block"
         );
     }
 

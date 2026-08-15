@@ -252,6 +252,20 @@ pub struct CompiledConfig {
     /// (the default) means no access-log lines are emitted; the
     /// request-path logging hook short-circuits before sampling.
     pub access_log: Option<AccessLogConfig>,
+    /// Decision-event audit publication, lifted off
+    /// `observability.log.decision_audit:` once at compile time so a
+    /// decision point on the request path never walks the raw config to
+    /// find out whether anyone is listening. `None` means no decision
+    /// event publishes an audit record at all, which is also where an
+    /// absent block and an explicit `enabled: false` land.
+    ///
+    /// Ask [`crate::types::DecisionAuditConfig::publishes`] rather than
+    /// reading `enabled` and `events` at the call site. The precedence
+    /// (a per-event entry beats the master switch, an unset master
+    /// switch is off) lives on the type, and re-deriving it per emitting
+    /// site is how two decision points end up disagreeing about whether
+    /// the same config turned them on.
+    pub decision_audit: Option<crate::types::DecisionAuditConfig>,
     /// Parsed top-level `agent_classes:` block. `None` means the
     /// operator did not author the block; the binary startup code
     /// constructs a resolver from defaults in that case. `Some(_)`
@@ -343,5 +357,9 @@ mod tests {
         assert!(cfg.mesh.is_none());
         assert!(cfg.l2_store.is_none());
         assert!(cfg.access_log.is_none());
+        // Off is the default for decision audits too, and `None` here is
+        // the whole of it: no per-event map to consult and no master
+        // switch to inherit.
+        assert!(cfg.decision_audit.is_none());
     }
 }

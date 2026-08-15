@@ -1880,12 +1880,22 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // --- WOR-201 PR 1b: install policy verdict audit bus ---
     //
     // Construct a bounded mpsc channel and install the sender as the
-    // process-wide audit bus before the pipeline is loaded. The
-    // dispatcher emits a `PolicyVerdictEvent` for every policy
-    // decision; the default drain stub on the receiver prints each event
-    // to stderr as a JSON line. An extension can replace the consumer
+    // process-wide audit bus before the pipeline is loaded. The queue
+    // carries an `AuditRecord`: the dispatcher emits a
+    // `PolicyVerdictEvent` for every policy decision, and the decision
+    // family emits a `DecisionAudit` for every emitting decision point
+    // an operator has enabled. One channel for both, so the two arrive
+    // in the order they happened for a given request. The default drain
+    // stub on the receiver prints each record to stderr as a JSON line,
+    // prefixed by its record kind. An extension can replace the consumer
     // with a NATS-backed audit-chain subscriber per
     // `docs/adr-policy-audit-binding.md`.
+    //
+    // Installed here, before `CompiledPipeline::from_config_at` below,
+    // so no request can reach a publish site before the bus exists.
+    // `try_publish` cannot distinguish "not installed" from "queue
+    // full", so a record emitted ahead of this line would count as a
+    // drop and make every boot look like an audit outage.
     //
     // Spawn the drain on a dedicated single-threaded runtime in a
     // background std thread so it lives independently of Pingora's
@@ -4812,6 +4822,7 @@ origins:
             l2_store: None,
             mesh: None,
             access_log: None,
+            decision_audit: None,
             agent_classes: None,
             rate_limits: None,
             audit: None,
