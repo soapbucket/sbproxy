@@ -193,6 +193,8 @@ impl BundleConfigValidationError {
 pub trait BundleRegistry {
     /// Look up one dynamic policy by its `type:` value.
     fn policy(&self, type_name: &str) -> Option<&LoadedBundleHook>;
+    /// Look up one dynamic auth provider by its `type:` value.
+    fn auth(&self, type_name: &str) -> Option<&LoadedBundleHook>;
     /// Look up one dynamic transform by its `type:` value.
     fn transform(&self, type_name: &str) -> Option<&LoadedBundleHook>;
     /// Look up one dynamic action by its `type:` value.

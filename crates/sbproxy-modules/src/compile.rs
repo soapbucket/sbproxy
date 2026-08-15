@@ -7,8 +7,9 @@
 use anyhow::{Context, Result};
 use sbproxy_config::extract_type;
 use sbproxy_extension::bundle::{
-    build_javascript_action, build_javascript_policy, build_javascript_transform,
-    build_wasm_action, build_wasm_policy, build_wasm_transform, BundleRegistry, LoadedBundleHook,
+    build_javascript_action, build_javascript_auth, build_javascript_policy,
+    build_javascript_transform, build_wasm_action, build_wasm_policy, build_wasm_transform,
+    BundleRegistry, LoadedBundleHook,
 };
 
 use crate::action::{
@@ -145,6 +146,31 @@ fn compile_action_for_origin_with_runtime(
 /// `oauth`, `oauth_introspection`, `ext_authz`, ...) work transparently
 /// when their crates are linked into the binary.
 pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
+    compile_auth_with_optional_registry(config, None)
+}
+
+/// Compile an auth provider with dynamic bundle lookup after built-ins and
+/// linked plugins.
+///
+/// A bundle auth hook only wins when no built-in or linked plugin claims the
+/// `type:` first, matching the policy/transform/action precedence: a
+/// config-loaded artifact can extend the auth surface but never shadow a
+/// name the binary already answers.
+pub fn compile_auth_with_registry(
+    config: &serde_json::Value,
+    registry: &dyn BundleRegistry,
+) -> Result<Auth> {
+    let type_name = extract_type(config)?;
+    if registry.auth(&type_name).is_none() {
+        return compile_auth(config);
+    }
+    compile_auth_with_optional_registry(config, Some(registry))
+}
+
+fn compile_auth_with_optional_registry(
+    config: &serde_json::Value,
+    registry: Option<&dyn BundleRegistry>,
+) -> Result<Auth> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
         "api_key" => Ok(Auth::ApiKey(ApiKeyAuth::from_config(config.clone())?)),
@@ -190,10 +216,30 @@ pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
                     );
                     Err(e).with_context(|| format!("auth plugin {other:?} factory failed"))
                 }
-                None => anyhow::bail!("unknown auth type: {}", other),
+                None => match registry.and_then(|registry| registry.auth(other)) {
+                    Some(hook) => compile_bundle_auth(hook, attachment_config(config, &[]))
+                        .with_context(|| format!("auth bundle {other:?} initialization failed")),
+                    None => anyhow::bail!("unknown auth type: {}", other),
+                },
             }
         }
     }
+}
+
+fn compile_bundle_auth(hook: &LoadedBundleHook, config: serde_json::Value) -> Result<Auth> {
+    let handler: Box<dyn sbproxy_plugin::AuthProvider> = match hook.manifest().runtime {
+        sbproxy_config::BundleRuntime::Javascript => Box::new(build_javascript_auth(hook, config)?),
+        // Wasm auth hooks are refused at manifest validation
+        // (WOR-2426: JavaScript-only this release); this arm is the
+        // defensive backstop should a bundle reach compile anyway.
+        sbproxy_config::BundleRuntime::Wasm => {
+            anyhow::bail!("wasm bundles cannot provide auth hooks")
+        }
+        sbproxy_config::BundleRuntime::ProxyWasm => {
+            anyhow::bail!("Proxy-Wasm bundles cannot provide auth hooks")
+        }
+    };
+    Ok(Auth::Plugin(handler))
 }
 
 /// Compile a single JSON policy config into a Policy enum variant.
@@ -541,9 +587,9 @@ mod tests {
     use sbproxy_config::{BundleBodyMode, ExtensionBundlesConfig, FailureMode};
     use sbproxy_extension::bundle::DynamicBundleRegistry;
     use sbproxy_plugin::{
-        ActionHandler, ActionOutcome, ActionPluginRegistration, PluginResult, PolicyDecision,
-        PolicyEnforcer, PolicyPluginRegistration, TransformContext, TransformHandler,
-        TransformPluginRegistration,
+        ActionHandler, ActionOutcome, ActionPluginRegistration, AuthDecision, AuthSubjectSource,
+        PluginResult, PolicyDecision, PolicyEnforcer, PolicyPluginRegistration, TransformContext,
+        TransformHandler, TransformPluginRegistration,
     };
     use tempfile::TempDir;
 
@@ -659,6 +705,14 @@ mod tests {
                         body_base64: "ZHluYW1pYyBhY3Rpb24="
                     };
                 }
+                export function auth() {
+                    return {
+                        version: "sbproxy-envelope/v1",
+                        decision: "allow",
+                        sub: "acct-9",
+                        source: "header"
+                    };
+                }
             "#,
         )
         .expect("write JavaScript entry");
@@ -677,6 +731,9 @@ hooks:
   - kind: policy
     type: compile_fixture_policy
     export: denyPolicy
+  - kind: auth
+    type: dynamic_compile_auth
+    export: auth
   - kind: transform
     type: dynamic_compile_transform
     export: transform
@@ -818,6 +875,44 @@ hooks:
             .await
             .expect("linked static policy should run");
         assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extension_registry_compiles_a_dynamic_auth_provider() {
+        let fixture = dynamic_compile_fixture();
+
+        let auth = compile_auth_with_registry(
+            &serde_json::json!({"type": "dynamic_compile_auth"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("dynamic auth should compile");
+        assert_eq!(auth.auth_type(), "dynamic_compile_auth");
+        let Auth::Plugin(provider) = auth else {
+            panic!("dynamic auth should use plugin dispatch");
+        };
+        let decision = provider
+            .authenticate(&http::Request::new(Bytes::new()), &mut ())
+            .await
+            .expect("dynamic auth should run");
+        assert_eq!(
+            decision,
+            AuthDecision::allow_with_subject("acct-9", AuthSubjectSource::Header)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extension_registry_never_shadows_a_built_in_auth_type() {
+        let fixture = dynamic_compile_fixture();
+
+        // A built-in name resolves to its built-in even with a registry in
+        // hand: the registry has no `noop` auth hook, so the compile falls
+        // straight through to the built-in variant.
+        let builtin = compile_auth_with_registry(
+            &serde_json::json!({"type": "noop"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("built-in auth should compile");
+        assert!(matches!(builtin, Auth::Noop));
     }
 
     // --- compile_action tests ---

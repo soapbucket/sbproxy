@@ -155,16 +155,27 @@ origins:
 #[cfg(unix)]
 #[test]
 fn sigterm_cleanly_releases_a_prepared_public_listener() {
-    let reservation = TcpListener::bind("0.0.0.0:0").expect("reserve ephemeral public port");
-    let port = reservation.local_addr().expect("reserved address").port();
-    drop(reservation);
     let root = temp_dir("sigterm");
     let config = root.join("sb.yml");
     let log_path = root.join("sbproxy.log");
-    std::fs::write(
-        &config,
-        format!(
-            r#"proxy:
+
+    // Acquire a free ephemeral port and start the proxy on it. The port is
+    // reserved, its number read, and the reservation dropped so the child
+    // can bind it, which leaves a TOCTOU window: under parallel test load
+    // another process can take the port before the child binds, and the
+    // child then exits with "address in use". That is a harness race, not a
+    // shutdown bug, so it retries on a fresh port; any other early exit is
+    // a real startup failure and fails immediately.
+    let (mut child, port) = 'acquire: {
+        for _ in 0..16 {
+            let reservation =
+                TcpListener::bind("0.0.0.0:0").expect("reserve ephemeral public port");
+            let port = reservation.local_addr().expect("reserved address").port();
+            drop(reservation);
+            std::fs::write(
+                &config,
+                format!(
+                    r#"proxy:
   http_bind_port: {port}
 origins:
   "listener.test":
@@ -174,39 +185,53 @@ origins:
       content_type: text/plain
       body: ok
 "#
-        ),
-    )
-    .expect("write serve config");
-    let stdout = std::fs::File::create(&log_path).expect("create serve log");
-    let stderr = stdout.try_clone().expect("clone serve log");
-    let mut child = Command::new(binary())
-        .arg("serve")
-        .arg(&config)
-        .arg("--shutdown-grace-ms")
-        .arg("0")
-        .env_remove("SB_CONFIG_FILE")
-        .env("SBPROXY_ENGINE_OWNERSHIP_DIR", root.join("ownership"))
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .expect("start sbproxy");
-    let startup_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
+                ),
+            )
+            .expect("write serve config");
+            let stdout = std::fs::File::create(&log_path).expect("create serve log");
+            let stderr = stdout.try_clone().expect("clone serve log");
+            let mut child = Command::new(binary())
+                .arg("serve")
+                .arg(&config)
+                .arg("--shutdown-grace-ms")
+                .arg("0")
+                .env_remove("SB_CONFIG_FILE")
+                .env("SBPROXY_ENGINE_OWNERSHIP_DIR", root.join("ownership"))
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()
+                .expect("start sbproxy");
+            let startup_deadline = Instant::now() + Duration::from_secs(15);
+            let ready = loop {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break true;
+                }
+                if let Some(status) = child.try_wait().expect("poll startup") {
+                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    let stolen = {
+                        let lower = log.to_ascii_lowercase();
+                        lower.contains("address") && lower.contains("use")
+                    };
+                    assert!(
+                        stolen,
+                        "sbproxy exited before listener was ready: {status}; log={log}"
+                    );
+                    break false; // port was taken; retry on a fresh one
+                }
+                if Instant::now() >= startup_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    panic!("sbproxy did not accept on prepared listener; log={log}");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            if ready {
+                break 'acquire (child, port);
+            }
         }
-        if let Some(status) = child.try_wait().expect("poll startup") {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            panic!("sbproxy exited before listener was ready: {status}; log={log}");
-        }
-        if Instant::now() >= startup_deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            panic!("sbproxy did not accept on prepared listener; log={log}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        panic!("could not acquire a free public port for the proxy after 16 attempts");
+    };
 
     let signal = Command::new("/bin/kill")
         .arg("-TERM")
@@ -229,7 +254,22 @@ origins:
     };
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(status.success(), "SIGTERM exit was {status}; log={log}");
-    TcpListener::bind(("0.0.0.0", port))
-        .expect("clean shutdown must release the prepared public listener");
+    // The child has exited, so the port is ours to reclaim. Retry briefly:
+    // if the child cleanly released the listener the bind succeeds at once,
+    // and the retry only absorbs another process transiently holding the
+    // just-freed port. A child that failed to release keeps the port for
+    // its whole (already-exited) lifetime, so this never masks that bug.
+    let mut released = false;
+    for _ in 0..20 {
+        if TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        released,
+        "clean shutdown must release the prepared public listener; log={log}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }

@@ -3235,6 +3235,9 @@ async fn check_auth_with_tls_outcome(
                             status,
                             message,
                             headers,
+                            // `kind` already fed `trust_outcome` through
+                            // `denial_kind`; the response only needs the wire fields.
+                            kind: _,
                         } => (
                             AuthResult::DenyWithHeaders(status, message, headers),
                             None,

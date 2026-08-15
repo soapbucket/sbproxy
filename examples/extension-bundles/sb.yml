@@ -13,6 +13,19 @@
 # The Proxy-Wasm HTTP filter stamps a response from the public echo service:
 #   curl -i -H 'Host: filtered.extension.local' \
 #     http://127.0.0.1:8080/echo
+#
+# The JavaScript auth hook verifies an HMAC-SHA256 request signature.
+# Export the shared secret, then sign "${keyId}.${timestamp}" with it:
+#   export SBPROXY_HMAC_SECRET=worked-example-secret
+#   ts=1723600000; key=acct-42
+#   sig=$(printf '%s.%s' "$key" "$ts" \
+#     | openssl dgst -sha256 -hmac "$SBPROXY_HMAC_SECRET" -hex \
+#     | sed 's/^.*= //')
+#   curl -i -H 'Host: authenticated.extension.local' \
+#     -H "X-Key-Id: $key" -H "X-Timestamp: $ts" -H "X-Signature: $sig" \
+#     http://127.0.0.1:8080/
+# An unsigned request is challenged with 401 and a WWW-Authenticate header:
+#   curl -i -H 'Host: authenticated.extension.local' http://127.0.0.1:8080/
 
 proxy:
   http_bind_port: 8080
@@ -51,3 +64,14 @@ origins:
         config:
           label: worked-example
         failure_posture: closed
+
+  "authenticated.extension.local":
+    # The auth hook runs before the action. `signing_secret` is a secret
+    # reference resolved at load, so the plaintext secret never sits in
+    # config; the bundle recomputes the HMAC and compares in constant time.
+    auth:
+      type: hmac_signature
+      signing_secret: env:SBPROXY_HMAC_SECRET
+    action:
+      type: hello_javascript
+      response_header: x-extension-runtime

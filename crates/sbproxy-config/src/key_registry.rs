@@ -1121,14 +1121,15 @@ const MODULE_DISPATCHES: &[ModuleDispatch] = &[
         source: "crates/sbproxy-modules/src/compile.rs",
         function: "compile_action_for_origin_with_runtime",
     },
+    // These all name the private `_with_optional_registry` function
+    // rather than the `pub` wrapper. Bundle support turned each wrapper
+    // into a one-line delegation, so the `type:` table lives one level
+    // down.
     ModuleDispatch {
         kind: "auth",
         source: "crates/sbproxy-modules/src/compile.rs",
-        function: "compile_auth",
+        function: "compile_auth_with_optional_registry",
     },
-    // Both name the private `_with_optional_registry` function rather
-    // than the `pub` wrapper. Bundle support turned the wrapper into a
-    // one-line delegation, so the `type:` table lives one level down.
     ModuleDispatch {
         kind: "policy",
         source: "crates/sbproxy-modules/src/compile.rs",

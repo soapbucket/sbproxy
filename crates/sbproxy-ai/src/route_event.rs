@@ -91,6 +91,12 @@ pub struct RouteCandidate {
     /// accepts any response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_threshold: Option<f32>,
+    /// Optional per-candidate cost cap in micro-USD, matching
+    /// `CascadeTier::cost_cap`. `None` disables the cap. The unit is the
+    /// same micro-USD scale the cost catalog uses, so a plan expresses a
+    /// cap the built-in cascade already understands rather than a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_cap: Option<u64>,
 }
 
 /// An ordered routing plan plus the reason it was chosen.
@@ -139,6 +145,7 @@ impl RoutePlan {
                 provider_id: String::new(),
                 model: model.into(),
                 quality_threshold: None,
+                cost_cap: None,
             }],
             reason: "route_to policy action".to_owned(),
         }
@@ -186,6 +193,54 @@ impl RoutePlan {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a plan unless every candidate names a configured provider.
+    ///
+    /// Stricter than [`Self::validate_providers`]: an empty `provider_id`
+    /// is a [`RouteEventError::MissingProvider`] rather than the "resolve
+    /// from the model" sentinel. A plan headed into the cascade executor
+    /// dispatches each candidate at a named provider, so a blank one has
+    /// nothing to dispatch to; the lenient form exists for the `route_to`
+    /// lift, which does resolve a bare model, and must not be reused here.
+    pub fn require_known_providers(&self, configured: &[String]) -> Result<(), RouteEventError> {
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if candidate.provider_id.is_empty() {
+                return Err(RouteEventError::MissingProvider { index });
+            }
+            if !configured.iter().any(|p| p == &candidate.provider_id) {
+                return Err(RouteEventError::UnknownProvider {
+                    provider_id: candidate.provider_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert this plan into a [`crate::routing::CascadeConfig`] so it
+    /// dispatches through the same cascade executor the built-in
+    /// `Cascade` strategy uses, rather than a parallel path.
+    ///
+    /// A candidate's absent `quality_threshold` becomes `0.0`
+    /// (accept-any): an operator plan is a preference order, not
+    /// necessarily a quality cascade, and `CascadeTier::quality_threshold`
+    /// is non-optional. `max_total_cost` carries the cascade-wide cap the
+    /// caller already computes for the built-in strategy.
+    #[must_use]
+    pub fn to_cascade_config(&self, max_total_cost: Option<u64>) -> crate::routing::CascadeConfig {
+        crate::routing::CascadeConfig {
+            tiers: self
+                .candidates
+                .iter()
+                .map(|candidate| crate::routing::CascadeTier {
+                    provider_id: candidate.provider_id.clone(),
+                    model: candidate.model.clone(),
+                    quality_threshold: candidate.quality_threshold.unwrap_or(0.0),
+                    cost_cap: candidate.cost_cap,
+                })
+                .collect(),
+            max_total_cost,
+        }
     }
 }
 
@@ -236,6 +291,13 @@ pub enum RouteEventError {
         /// The name that did not resolve.
         provider_id: String,
     },
+    /// A candidate headed into the cascade executor left `provider_id`
+    /// empty. The lenient `route_to` resolve-from-model sentinel is not
+    /// valid for a plan that dispatches at a named provider per tier.
+    MissingProvider {
+        /// Position of the offending candidate.
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for RouteEventError {
@@ -266,6 +328,11 @@ impl std::fmt::Display for RouteEventError {
             Self::UnknownProvider { provider_id } => write!(
                 f,
                 "route.decide named provider `{provider_id}`, which is not configured"
+            ),
+            Self::MissingProvider { index } => write!(
+                f,
+                "route.decide candidate {index} has an empty `provider_id`, which a \
+                 cascade plan cannot dispatch"
             ),
         }
     }
@@ -355,10 +422,31 @@ pub fn decode_route_plan(value: &serde_json::Value) -> Result<RouteDecision, Rou
                 })
             }
         };
+        // A `cost_cap` is an unsigned micro-USD integer. A wrong-typed one
+        // is refused for the same reason a wrong-typed threshold is: a cap
+        // dropped to `None` silently removes a limit the operator wrote. A
+        // negative or fractional number is not a valid cap, so it is a
+        // type error rather than a value to clamp.
+        let cost_cap = match entry.get("cost_cap") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(number)) => {
+                Some(number.as_u64().ok_or(RouteEventError::CandidateFieldType {
+                    index,
+                    field: "cost_cap",
+                })?)
+            }
+            Some(_) => {
+                return Err(RouteEventError::CandidateFieldType {
+                    index,
+                    field: "cost_cap",
+                })
+            }
+        };
         candidates.push(RouteCandidate {
             provider_id: provider_id.to_owned(),
             model: model.to_owned(),
             quality_threshold,
+            cost_cap,
         });
     }
 
@@ -735,5 +823,91 @@ mod tests {
             plan.reason.chars().all(|c| c == '\u{20ac}'),
             "truncation must not split a character"
         );
+    }
+
+    #[test]
+    fn cost_cap_decodes_as_micro_usd_and_refuses_a_wrong_type() {
+        let RouteDecision::Plan(plan) = decode_route_plan(&json!({
+            "candidates": [{"model": "a", "provider_id": "openai", "cost_cap": 1500}],
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        assert_eq!(plan.candidates[0].cost_cap, Some(1500));
+        // A negative or fractional cap is not a valid micro-USD integer,
+        // and a string is not a number, so both are refused rather than
+        // silently dropping the operator's cap.
+        for bad in [json!(-5), json!(1.5), json!("1500")] {
+            assert_eq!(
+                decode_route_plan(&json!({
+                    "candidates": [{"model": "a", "provider_id": "openai", "cost_cap": bad}],
+                })),
+                Err(RouteEventError::CandidateFieldType {
+                    index: 0,
+                    field: "cost_cap",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn to_cascade_config_carries_fields_and_defaults_absent_threshold_to_zero() {
+        let RouteDecision::Plan(plan) = decode_route_plan(&json!({
+            "candidates": [
+                {"provider_id": "anthropic", "model": "claude-sonnet-5", "quality_threshold": 0.7, "cost_cap": 2000},
+                {"provider_id": "openai", "model": "gpt-4o-mini"},
+            ],
+            "reason": "x",
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        let cascade = plan.to_cascade_config(Some(9000));
+        assert_eq!(cascade.max_total_cost, Some(9000));
+        assert_eq!(cascade.tiers.len(), 2);
+        assert_eq!(cascade.tiers[0].provider_id, "anthropic");
+        assert_eq!(cascade.tiers[0].quality_threshold, 0.7);
+        assert_eq!(cascade.tiers[0].cost_cap, Some(2000));
+        // An absent threshold becomes accept-any (0.0), because a plan is a
+        // preference order and `CascadeTier::quality_threshold` is non-optional.
+        assert_eq!(cascade.tiers[1].quality_threshold, 0.0);
+        assert_eq!(cascade.tiers[1].cost_cap, None);
+    }
+
+    #[test]
+    fn require_known_providers_is_stricter_than_validate_providers() {
+        // The `route_to` lift leaves `provider_id` empty to mean "resolve
+        // from the model", which `validate_providers` accepts. A plan
+        // headed into the cascade executor has nothing to dispatch a blank
+        // provider to, so `require_known_providers` refuses it.
+        let lifted = RoutePlan::from_route_to("gpt-4o-mini");
+        assert!(lifted.validate_providers(&["openai".to_owned()]).is_ok());
+        assert_eq!(
+            lifted.require_known_providers(&["openai".to_owned()]),
+            Err(RouteEventError::MissingProvider { index: 0 })
+        );
+
+        // A named-but-unconfigured provider is refused by both.
+        let RouteDecision::Plan(ghost) = decode_route_plan(&json!({
+            "candidates": [{"provider_id": "ghost", "model": "m"}],
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        assert_eq!(
+            ghost.require_known_providers(&["openai".to_owned()]),
+            Err(RouteEventError::UnknownProvider {
+                provider_id: "ghost".to_owned(),
+            })
+        );
+
+        // A fully configured plan passes.
+        let RouteDecision::Plan(ok) = decode_route_plan(&json!({
+            "candidates": [{"provider_id": "openai", "model": "m"}],
+        }))
+        .unwrap() else {
+            panic!("expected a plan");
+        };
+        assert!(ok.require_known_providers(&["openai".to_owned()]).is_ok());
     }
 }

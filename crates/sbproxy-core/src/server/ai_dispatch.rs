@@ -484,6 +484,68 @@ fn ai_policy_input_tokens_est(model: &str, body: &serde_json::Value) -> i64 {
     i64::try_from(tokens).unwrap_or(i64::MAX)
 }
 
+/// Heuristic prompt-difficulty in `[0.0, 1.0]` for the AI decision view.
+///
+/// Derived from the uncompressed request body's prompt text (blending prompt
+/// length with code, math, and multi-step-reasoning signals); zero when the
+/// body carries no scorable text. This is the same score the built-in
+/// `cost_quality` strategy routes on, exposed to policy as `ai.prompt.difficulty`
+/// so an operator can author the routing decision instead. See
+/// `sbproxy_ai::cost_quality`.
+fn ai_policy_prompt_difficulty(body: &serde_json::Value) -> f64 {
+    let text = sbproxy_ai::cost_quality::prompt_text_for_scoring(body);
+    f64::from(sbproxy_ai::cost_quality::heuristic_difficulty(&text))
+}
+
+/// Salted, non-reversible fingerprint (`pf_<12hex>`) of the request's prompt
+/// for the AI decision view, or empty when the body carries no messages.
+///
+/// Parses the chat messages from the body the same lenient way the rest of the
+/// dispatch path does, then delegates to [`sbproxy_ai::prompt_fingerprint`],
+/// which never embeds prompt text. Exposed to policy as `ai.prompt.fingerprint`
+/// so a routing policy can key on prompt identity (sticky / cache-affinity
+/// routing) without seeing the prompt.
+fn ai_policy_prompt_fingerprint(model: &str, body: &serde_json::Value) -> String {
+    let msgs: Vec<sbproxy_ai::Message> = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    // The bare fingerprint hashes salt+model even for an empty message slice,
+    // so it is never empty on its own. Return empty when there are no messages
+    // so `ai.prompt.fingerprint == ""` is a usable "no prompt" test for a
+    // policy, matching how `ai.prompt.difficulty` reads zero for no text.
+    if msgs.is_empty() {
+        return String::new();
+    }
+    sbproxy_ai::prompt_fingerprint(model, &msgs)
+}
+
+/// Build the `ai.providers` view: each configured provider's live runtime
+/// state read from the router, index-aligned by position with `providers`.
+///
+/// The read is a lock-free atomic snapshot per provider (see
+/// [`sbproxy_ai::Router::provider_runtime_states`]), so this is safe on the
+/// request path before an `ai_routing_policy` runs. The provider name comes
+/// from the config, which the router's index-keyed state does not carry.
+fn ai_provider_state_views(
+    router: &sbproxy_ai::Router,
+    providers: &[sbproxy_ai::ProviderConfig],
+) -> Vec<sbproxy_ai::ai_policy::ProviderStateView> {
+    let states = router.provider_runtime_states();
+    providers
+        .iter()
+        .zip(states)
+        .map(|(p, s)| {
+            sbproxy_ai::ai_policy::ProviderStateView::from_runtime(p.name.to_string(), &s)
+        })
+        .collect()
+}
+
 /// Whether one attempt may replay the original native request bytes to the
 /// upstream instead of the governed canonical body. Streaming, any request
 /// transform, and any selected RAG runtime (which pins the request to the
@@ -5857,6 +5919,144 @@ pub(super) async fn handle_ai_proxy(
     // configured and compiled. A policy bug fails open (see `on_error`).
     let mut cel_compression_selector = None;
     let mut cel_compression_selector_invalid = false;
+
+    // WOR-2366: the operator routing policy runs before the security
+    // policy. It returns a plan the request dispatches through the cascade
+    // executor; a firing `ai_policy` `route_to` below then clears the plan
+    // (safety over optimization). Declining is the common, cheap path and
+    // leaves the configured `RoutingStrategy` untouched.
+    let mut routing_policy_cascade: Option<sbproxy_ai::routing::CascadeConfig> = None;
+    // The plan's reason code is held until precedence is resolved so a plan
+    // an `ai_policy route_to` overrides is not counted as one that ran.
+    let mut routing_plan_reason_code: Option<&'static str> = None;
+    // A routing plan fans a request across configured providers, which
+    // would replay a caller's own provider credential across the boundary
+    // native-key mode exists to hold. The same reason the pre-policy cascade
+    // check refuses a native-key cascade applies here: the routing policy
+    // does not run for a native-key request.
+    if ctx.inbound_key_mode != crate::context::InboundKeyMode::Native {
+        if let Some(routing_policy) = config.ai_routing_policy() {
+            let routing_view = sbproxy_ai::ai_policy::AiDecisionView {
+                surface: surface_label.to_string(),
+                model: model.clone(),
+                provider: config
+                    .providers
+                    .first()
+                    .map(|p| p.name.to_string())
+                    .unwrap_or_default(),
+                tenant: ctx.tenant_id.to_string(),
+                api_key_id: ctx.principal.api_key_id().to_string(),
+                tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
+                guardrail_labels: ctx.ai_guardrail_labels.clone(),
+                guardrail_flagged_count,
+                budget_fraction: ctx.ai_budget_fraction,
+                budget_exceeded: ctx.ai_budget_fraction >= 1.0,
+                input_tokens_est: ai_policy_input_tokens_est(&model, &body),
+                prompt_difficulty: ai_policy_prompt_difficulty(&body),
+                prompt_fingerprint: ai_policy_prompt_fingerprint(&model, &body),
+                providers: ai_provider_state_views(router.as_ref(), &config.providers),
+            };
+            let configured_providers: Vec<String> = config
+                .providers
+                .iter()
+                .map(|p| p.name.to_string())
+                .collect();
+            match routing_policy.evaluate(&routing_view, &configured_providers) {
+                sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Plan {
+                    cascade,
+                    reason,
+                    reason_code,
+                } => {
+                    // A routing plan must not route around the operator's
+                    // model allowlist, exactly like the `ai_policy route_to`
+                    // path below re-checks its target. Both model gates ran
+                    // against the *requested* model far upstream; the plan
+                    // substitutes a new model set, so every tier's model is
+                    // re-checked here against the origin allowlist and the
+                    // resolved key's allowlist. A disallowed model is a
+                    // config bug and is refused rather than silently served,
+                    // which would also land the request on the wrong budget
+                    // scope and past the per-model rate limit.
+                    let disallowed = cascade.tiers.iter().find(|tier| {
+                        !(config.is_model_allowed(&tier.model)
+                            && resolved_request_vk
+                                .as_ref()
+                                .is_none_or(|vk| vk.is_model_allowed(&tier.model)))
+                    });
+                    if let Some(tier) = disallowed {
+                        warn!(
+                            from = %model,
+                            to = %tier.model,
+                            "AI routing policy: plan named a model the allowlist refuses"
+                        );
+                        ctx.ai_outcome = Some("routing_policy_route_blocked".to_string());
+                        sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
+                        sbproxy_observe::decision::record_decision(
+                            sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                            sbproxy_observe::decision::DecisionEngine::Cel,
+                            sbproxy_observe::decision::DecisionOutcome::Deny,
+                            route_origin_label(ctx),
+                            ctx.tenant_id.as_str(),
+                        );
+                        let msg = format!("model '{}' is not allowed", tier.model);
+                        send_error(session, 403, &msg).await?;
+                        return Ok(());
+                    }
+                    ctx.ai_route_reason = Some(reason);
+                    routing_policy_cascade = Some(cascade);
+                    routing_plan_reason_code = Some(reason_code);
+                }
+                sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Decline => {
+                    sbproxy_ai::ai_metrics::record_routing_policy_decision("decline", "none");
+                    sbproxy_observe::decision::record_decision(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        sbproxy_observe::decision::DecisionOutcome::Decline,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                }
+                sbproxy_ai::ai_routing_policy::AiRoutingOutcome::Error { detail, on_error } => {
+                    warn!(
+                        ai.surface = surface_label,
+                        error = %detail,
+                        "AI routing policy: evaluation error"
+                    );
+                    sbproxy_ai::ai_metrics::record_routing_policy_decision("error", "none");
+                    sbproxy_observe::decision::record_decision(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        sbproxy_observe::decision::DecisionOutcome::Error,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                    if on_error == sbproxy_ai::ai_routing_policy::AiRoutingOnError::Block {
+                        ctx.ai_outcome = Some("routing_policy_error".to_string());
+                        let body_bytes = ErrorEnvelope::new(
+                            "ai_routing_policy_error",
+                            "AI routing policy failed to produce a decision",
+                        )
+                        .request_id(ctx.request_id.as_str())
+                        .to_bytes();
+                        send_response(session, 503, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                    // `decline` posture (the default): fall through to the
+                    // configured strategy. This is a fail-open, so record it
+                    // as one; an operator alerting on routing fail-opens must
+                    // see it, and without this it is indistinguishable from a
+                    // clean decline.
+                    sbproxy_observe::decision::record_decision_fail_open(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(policy) = config.ai_policy() {
         // This estimate must be computed before CEL runs. The request-path
         // accounting estimate below intentionally runs after compression and
@@ -5886,6 +6086,9 @@ pub(super) async fn handle_ai_proxy(
             budget_fraction: ctx.ai_budget_fraction,
             budget_exceeded: ctx.ai_budget_fraction >= 1.0,
             input_tokens_est: policy_input_tokens_est,
+            prompt_difficulty: ai_policy_prompt_difficulty(&body),
+            prompt_fingerprint: ai_policy_prompt_fingerprint(&model, &body),
+            providers: ai_provider_state_views(router.as_ref(), &config.providers),
         };
         let decision = policy.evaluate(&view);
 
@@ -5989,6 +6192,12 @@ pub(super) async fn handle_ai_proxy(
                 set_body_model(&mut body, &candidate.model);
                 ctx.ai_model = Some(candidate.model.clone());
                 model = candidate.model.clone();
+                // WOR-2366: a security-driven `route_to` override wins over
+                // an optimization routing plan. Drop the plan so dispatch
+                // follows the hard model pin, not the cascade the routing
+                // policy computed.
+                routing_policy_cascade = None;
+                ctx.ai_route_reason = Some("ai_policy route_to override".to_owned());
                 // The event rewrote the payload, which is `Mutate` in this
                 // vocabulary (OCSF disposition 13, Corrected) rather than
                 // `Allow` (disposition 1). A SIEM rule keyed on "a control
@@ -6030,6 +6239,25 @@ pub(super) async fn handle_ai_proxy(
         } else {
             decision.compression_selector().cloned()
         };
+    }
+
+    // WOR-2366: record the routing-plan decision only once precedence is
+    // settled. A plan an `ai_policy route_to` cleared above never runs, so
+    // counting it as `plan` at evaluation time would overstate executed
+    // plans; it is recorded as `overridden` instead.
+    if let Some(reason_code) = routing_plan_reason_code {
+        if routing_policy_cascade.is_some() {
+            sbproxy_ai::ai_metrics::record_routing_policy_decision("plan", reason_code);
+            sbproxy_observe::decision::record_decision(
+                sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                sbproxy_observe::decision::DecisionEngine::Cel,
+                sbproxy_observe::decision::DecisionOutcome::Mutate,
+                route_origin_label(ctx),
+                ctx.tenant_id.as_str(),
+            );
+        } else {
+            sbproxy_ai::ai_metrics::record_routing_policy_decision("overridden", "none");
+        }
     }
 
     ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
@@ -6986,7 +7214,11 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::normalize_prefix(&body, namespace)
         })
         .flatten();
-    if !is_failover && router.cascade_config().is_none() && router.cost_quality_config().is_none() {
+    if !is_failover
+        && routing_policy_cascade.is_none()
+        && router.cascade_config().is_none()
+        && router.cost_quality_config().is_none()
+    {
         // Prefix-affinity consults the bounded observed-holder directory over
         // the exact candidates this dispatch can run. Other strategies use
         // their ordinary selection path.
@@ -7002,7 +7234,14 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
-    ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+    ctx.admin_load_balancer_strategy = Some(if routing_policy_cascade.is_some() {
+        // A routing-policy plan supersedes the configured strategy for
+        // this request; the admin view should say so rather than name a
+        // strategy that did not decide.
+        "ai_routing_policy".to_string()
+    } else {
+        router.strategy_name().to_string()
+    });
     ctx.admin_load_balancer_target = provider_order
         .first()
         .map(|&index| config.providers[index].name.to_string());
@@ -7010,7 +7249,11 @@ pub(super) async fn handle_ai_proxy(
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
     // applied to the request body below in the per-provider loop.
-    if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
+    if let Some(cascade_cfg) = routing_policy_cascade
+        .as_ref()
+        .or_else(|| router.cascade_config())
+        .filter(|_| !disallow_training)
+    {
         if is_stream {
             if let Some(first_tier) = cascade_cfg.tiers.first() {
                 if let Some(idx) = provider_order
@@ -7063,8 +7306,9 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
-    if let Some(cascade_cfg) = router
-        .cascade_config()
+    if let Some(cascade_cfg) = routing_policy_cascade
+        .as_ref()
+        .or_else(|| router.cascade_config())
         .filter(|_| !disallow_training && !has_managed_local)
     {
         if !is_stream {
@@ -7287,7 +7531,10 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
-    if !is_stream && has_managed_local && router.cascade_config().is_some() {
+    if !is_stream
+        && has_managed_local
+        && (routing_policy_cascade.is_some() || router.cascade_config().is_some())
+    {
         warn!(
             "AI proxy: confidence cascade includes a managed local provider; using the normal \
              failover path so local admission and engine lifecycle remain governed"
@@ -16201,11 +16448,12 @@ mod request_policy_tests {
 #[cfg(test)]
 mod compression_selection_tests {
     use super::{
-        ai_policy_input_tokens_est, bind_compression_selection, buffered_ai_response_body_limit,
-        compression_header_value, compression_selection_bypasses_cache,
-        compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
-        resolve_compression_selection_intent, upstream_response_is_successful_stream,
-        CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
+        ai_policy_input_tokens_est, ai_policy_prompt_fingerprint, bind_compression_selection,
+        buffered_ai_response_body_limit, compression_header_value,
+        compression_selection_bypasses_cache, compression_selection_outcome,
+        native_bypass_body_changed, native_bypass_is_safe, resolve_compression_selection_intent,
+        upstream_response_is_successful_stream, CompressionSelectionError,
+        CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
     use sbproxy_ai::compression::CompressionSelector;
@@ -16557,6 +16805,36 @@ mod compression_selection_tests {
             i64::try_from(expected).unwrap()
         );
         assert!(ai_policy_input_tokens_est("gpt-4o", &body) > 0);
+    }
+
+    #[test]
+    fn prompt_fingerprint_is_empty_without_messages_and_stable_with() {
+        // No messages -> empty, so `ai.prompt.fingerprint == ""` is a usable
+        // "no prompt" test for a policy (the bare fingerprint would be a
+        // non-empty pf_ even for an empty slice).
+        let no_field = serde_json::json!({"model": "gpt-4o"});
+        assert_eq!(ai_policy_prompt_fingerprint("gpt-4o", &no_field), "");
+        let empty_arr = serde_json::json!({"model": "gpt-4o", "messages": []});
+        assert_eq!(ai_policy_prompt_fingerprint("gpt-4o", &empty_arr), "");
+
+        // A real prompt is a stable, non-empty pf_ value within a process.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let fp = ai_policy_prompt_fingerprint("gpt-4o", &body);
+        assert!(fp.starts_with("pf_"), "expected a pf_ value, got {fp:?}");
+        assert_eq!(
+            fp,
+            ai_policy_prompt_fingerprint("gpt-4o", &body),
+            "identical prompts fingerprint identically within a process"
+        );
+        // A different prompt fingerprints differently.
+        let other = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "goodbye"}]
+        });
+        assert_ne!(fp, ai_policy_prompt_fingerprint("gpt-4o", &other));
     }
 }
 

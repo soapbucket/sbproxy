@@ -283,6 +283,10 @@ impl BundleRegistry for DynamicBundleRegistry {
         lookup(&self.hooks, BundleHookKind::Policy, type_name)
     }
 
+    fn auth(&self, type_name: &str) -> Option<&LoadedBundleHook> {
+        lookup(&self.hooks, BundleHookKind::Auth, type_name)
+    }
+
     fn transform(&self, type_name: &str) -> Option<&LoadedBundleHook> {
         lookup(&self.hooks, BundleHookKind::Transform, type_name)
     }
@@ -928,6 +932,7 @@ const fn inventory_runtime(runtime: BundleRuntime) -> ExtensionRuntime {
 const fn inventory_hook_kind(kind: BundleHookKind) -> ExtensionHookKind {
     match kind {
         BundleHookKind::Policy => ExtensionHookKind::Policy,
+        BundleHookKind::Auth => ExtensionHookKind::Auth,
         BundleHookKind::Transform => ExtensionHookKind::Transform,
         BundleHookKind::Action => ExtensionHookKind::Action,
         BundleHookKind::AiToolCall => ExtensionHookKind::AiToolCall,
@@ -943,7 +948,7 @@ const fn inventory_hook_kind(kind: BundleHookKind) -> ExtensionHookKind {
 
 const fn hook_phase(kind: BundleHookKind) -> &'static str {
     match kind {
-        BundleHookKind::Policy | BundleHookKind::Action => "request",
+        BundleHookKind::Policy | BundleHookKind::Auth | BundleHookKind::Action => "request",
         BundleHookKind::Transform => "body",
         BundleHookKind::ProxyWasm => "http",
         BundleHookKind::AiToolCall
@@ -971,6 +976,7 @@ const fn is_ai_kind(kind: BundleHookKind) -> bool {
 const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
     match kind {
         BundleHookKind::Policy => "policy",
+        BundleHookKind::Auth => "auth",
         BundleHookKind::Transform => "transform",
         BundleHookKind::Action => "action",
         BundleHookKind::AiToolCall => "ai_tool_call",

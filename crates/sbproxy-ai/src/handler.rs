@@ -198,6 +198,13 @@ pub struct AiHandlerConfig {
     /// unchanged.
     #[serde(default)]
     pub ai_policy: Option<crate::ai_policy::AiPolicyConfig>,
+    /// WOR-2366: operator-authored routing policy. A CEL expression
+    /// returns a routing plan (an ordered candidate list) that dispatches
+    /// through the cascade executor, or declines to the configured
+    /// strategy. Runs before `ai_policy`; a firing `ai_policy` `route_to`
+    /// overrides it. `None` (the default) leaves routing to the strategy.
+    #[serde(default)]
+    pub ai_routing_policy: Option<crate::ai_routing_policy::AiRoutingPolicyConfig>,
     /// WOR-1707: operator model price table for cost reporting. Each
     /// entry (per-million USD input/output, optional cache rates)
     /// overrides the built-in catalog for that model. Empty by default.
@@ -257,6 +264,14 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) ai_policy_compiled:
         OnceLock<Option<std::sync::Arc<crate::ai_policy::CompiledAiPolicy>>>,
+    /// Lazy-compiled routing policy (WOR-2366). `None` inside the OnceLock
+    /// means no routing policy is configured or it failed to compile; the
+    /// request path treats both as "no routing policy". `from_config`
+    /// validates the expression eagerly, so a compile failure here after a
+    /// green load is not reachable in practice.
+    #[serde(skip)]
+    pub(crate) ai_routing_policy_compiled:
+        OnceLock<Option<std::sync::Arc<crate::ai_routing_policy::CompiledAiRoutingPolicy>>>,
     /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
     #[serde(skip)]
     quota_pool_store: OnceLock<std::sync::Arc<CachedQuotaPoolStore>>,
@@ -410,6 +425,31 @@ impl AiHandlerConfig {
                         Ok(p) => Some(std::sync::Arc::new(p)),
                         Err(e) => {
                             tracing::error!(error = %e, "ai_policy: disabled (failed to compile)");
+                            None
+                        }
+                    }
+                })
+            })
+            .as_ref()
+    }
+
+    /// Return the compiled routing policy for this handler, compiling it
+    /// once (WOR-2366). `None` when no routing policy is configured. The
+    /// failure arm is defensive for the same reason as [`Self::ai_policy`]:
+    /// `from_config` already refused any expression that does not compile.
+    pub fn ai_routing_policy(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::ai_routing_policy::CompiledAiRoutingPolicy>> {
+        self.ai_routing_policy_compiled
+            .get_or_init(|| {
+                self.ai_routing_policy.as_ref().and_then(|cfg| {
+                    match crate::ai_routing_policy::CompiledAiRoutingPolicy::compile(cfg) {
+                        Ok(policy) => Some(std::sync::Arc::new(policy)),
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "ai_routing_policy: disabled (failed to compile)"
+                            );
                             None
                         }
                     }
@@ -990,6 +1030,14 @@ impl AiHandlerConfig {
             crate::ai_policy::CompiledAiPolicy::compile(policy)
                 .map_err(|error| anyhow::anyhow!("ai ai_policy: {error}"))?;
         }
+        // WOR-2366: same eager-compile discipline for the routing policy.
+        // A CEL expression referencing a binding the routing surface does
+        // not offer, a bad `on_error`, or an oversized `reason_codes` fails
+        // config load here rather than disabling the policy at first use.
+        if let Some(policy) = config.ai_routing_policy.as_ref() {
+            crate::ai_routing_policy::CompiledAiRoutingPolicy::compile(policy)
+                .map_err(|error| anyhow::anyhow!("ai ai_routing_policy: {error}"))?;
+        }
         // WOR-2233: `token_rate` scores remaining headroom against a
         // per-provider tokens-per-minute limit, and nothing supplies
         // one. `Router::token_limits` has no config field and no
@@ -1049,6 +1097,24 @@ impl AiHandlerConfig {
                     "ai provider name {:?} is configured more than once",
                     provider.name
                 );
+            }
+        }
+        // WOR-2366: a cascade tier naming a provider that is not configured
+        // is silently skipped at runtime (the cascade treats it as a failed
+        // tier), so the operator's tier never runs and nothing says why.
+        // Refuse it at load, the way a duplicate provider name is refused
+        // above. This is also the literal, checkable half of the routing
+        // policy's provider validation: a computed plan is checked per
+        // request, but a statically configured tier is checked here.
+        if let RoutingStrategy::Cascade(cascade) = &config.routing {
+            for (index, tier) in cascade.tiers.iter().enumerate() {
+                if !provider_names.contains(tier.provider_id.as_str()) {
+                    anyhow::bail!(
+                        "ai routing cascade tier {index} names provider {:?}, \
+                         which is not configured",
+                        tier.provider_id
+                    );
+                }
             }
         }
         for provider in &config.providers {
@@ -1821,12 +1887,14 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            ai_routing_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1865,12 +1933,14 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            ai_routing_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1909,12 +1979,14 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            ai_routing_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -1954,12 +2026,14 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            ai_routing_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
@@ -2155,6 +2229,45 @@ mod tests {
             "ai_policy": {"expression": "ai.guardrails.flagged_count > 1 ? 'block' : 'allow'"},
         });
         AiHandlerConfig::from_config(json).expect("a valid ai.* policy must load");
+    }
+
+    #[test]
+    fn from_config_rejects_an_ai_routing_policy_that_does_not_compile() {
+        // WOR-2366: same eager-validate discipline as ai_policy. A syntax
+        // error, an unknown binding, or a bad on_error refuses at load.
+        let syntax = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_routing_policy": {"expression": "ai.surface ==   "},
+        });
+        let error = AiHandlerConfig::from_config(syntax)
+            .expect_err("a syntax error must refuse the config")
+            .to_string();
+        assert!(error.contains("ai_routing_policy"), "{error}");
+
+        let binding = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_routing_policy": {"expression": "request.method == \"GET\""},
+        });
+        assert!(AiHandlerConfig::from_config(binding).is_err());
+
+        let posture = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_routing_policy": {"expression": "null", "on_error": "explode"},
+        });
+        assert!(AiHandlerConfig::from_config(posture).is_err());
+    }
+
+    #[test]
+    fn from_config_accepts_a_valid_ai_routing_policy() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "ai_routing_policy": {
+                "expression": "ai.tier == 'free' ? {'candidates': [{'provider_id': 'openai', 'model': 'gpt-4o-mini'}], 'reason': 'free tier'} : null",
+                "reason_codes": ["free tier"],
+            },
+        });
+        let config = AiHandlerConfig::from_config(json).expect("a valid routing policy must load");
+        assert!(config.ai_routing_policy().is_some());
     }
 
     #[test]
@@ -2832,6 +2945,32 @@ mod tests {
         assert!((cascade.tiers[0].quality_threshold - 0.75).abs() < 1e-6);
         assert_eq!(cascade.tiers[1].cost_cap, Some(50000));
         assert_eq!(cascade.max_total_cost, Some(100000));
+    }
+
+    #[test]
+    fn from_config_rejects_a_cascade_tier_naming_an_unconfigured_provider() {
+        // WOR-2366: a cascade tier naming a provider that is not
+        // configured is silently skipped at runtime, so the operator's
+        // tier never runs. Refuse it at load instead. Red before the
+        // backfill: nothing validated tier providers against `providers`.
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "cheap", "api_key": "x"}],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {"provider_id": "cheap", "model": "gpt-4o-mini", "quality_threshold": 0.7},
+                    {"provider_id": "ghost", "model": "gpt-4o", "quality_threshold": 0.9}
+                ]
+            }
+        });
+        let err = AiHandlerConfig::from_config(cfg_json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ghost"), "error names the bad provider: {err}");
+        assert!(
+            err.contains("tier 1"),
+            "error names the offending tier index: {err}"
+        );
     }
 
     #[test]

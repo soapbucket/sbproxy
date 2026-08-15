@@ -253,6 +253,8 @@ pub enum BundleRuntime {
 pub enum BundleHookKind {
     /// Request policy hook.
     Policy,
+    /// Request authentication hook.
+    Auth,
     /// Buffered body transform hook.
     Transform,
     /// Request action hook.
@@ -680,6 +682,12 @@ impl BundleManifest {
             if hook.kind == BundleHookKind::Action && self.failure_posture != FailureMode::Closed {
                 return invalid("action hooks are terminal and require failure_posture closed");
             }
+            // WOR-2426: a failed auth hook always denies at runtime, so a
+            // non-closed posture would be silently inert. Refuse it at load
+            // rather than let an operator believe `open` fails a request open.
+            if hook.kind == BundleHookKind::Auth && self.failure_posture != FailureMode::Closed {
+                return invalid("auth hooks always fail closed and require failure_posture closed");
+            }
             if matches!(
                 hook.kind,
                 BundleHookKind::Transform | BundleHookKind::Action
@@ -806,6 +814,13 @@ impl BundleManifest {
                         }
                         BundleHookKind::AiStreamEvent => {
                             return invalid("runtime wasm cannot declare an ai_stream_event hook");
+                        }
+                        // WOR-2426: bundle auth hooks ship JavaScript-only
+                        // this release. Refuse a wasm auth hook at load so
+                        // the failure is a named manifest error rather than
+                        // a compile-time bail with no adapter behind it.
+                        BundleHookKind::Auth => {
+                            return invalid("runtime wasm cannot declare an auth hook");
                         }
                         _ => {}
                     }
@@ -1089,6 +1104,7 @@ const fn failure_mode_label(mode: FailureMode) -> &'static str {
 const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
     match kind {
         BundleHookKind::Policy => "policy",
+        BundleHookKind::Auth => "auth",
         BundleHookKind::Transform => "transform",
         BundleHookKind::Action => "action",
         BundleHookKind::AiToolCall => "ai_tool_call",

@@ -959,6 +959,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_routing_policy_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_routing_policy_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome", "reason_code"],
+        description: "Operator AI routing-policy decisions by outcome and reason code.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_model_directory_exclusions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_model_directory_exclusion"),

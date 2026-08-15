@@ -8,16 +8,16 @@ use bytes::{Bytes, BytesMut};
 use http::{Request, StatusCode};
 use sbproxy_config::{BundleManifest, ExtensionBundlesConfig};
 use sbproxy_extension::bundle::{
-    build_javascript_action, build_javascript_policy, build_javascript_transform,
-    build_proxy_wasm_filter, build_wasm_action, AiExtensionChain, BundleRegistry,
-    DynamicBundleRegistry, PaymentExtensionChain,
+    build_javascript_action, build_javascript_auth, build_javascript_policy,
+    build_javascript_transform, build_proxy_wasm_filter, build_wasm_action, AiExtensionChain,
+    BundleRegistry, DynamicBundleRegistry, PaymentExtensionChain,
 };
 use sbproxy_plugin::{
     ActionHandler, ActionOutcome, AiExtensionEvent, AiExtensionEventPayload, AiExtensionMessage,
-    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, ExtensionHookKind,
-    ExtensionRuntime, PaymentExtensionDecision, PaymentExtensionEvent, PaymentExtensionOutcome,
-    PaymentExtensionPhase, PolicyDecision, PolicyEnforcer, TransformContext, TransformHandler,
-    AI_EXTENSION_EVENT_SCHEMA_VERSION,
+    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, AuthDecision, AuthDenialKind,
+    AuthProvider, AuthSubjectSource, ExtensionHookKind, ExtensionRuntime, PaymentExtensionDecision,
+    PaymentExtensionEvent, PaymentExtensionOutcome, PaymentExtensionPhase, PolicyDecision,
+    PolicyEnforcer, TransformContext, TransformHandler, AI_EXTENSION_EVENT_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -70,8 +70,8 @@ fn published_bundle_manifests_pin_the_exact_entry_digest_and_load() {
     let directories = bundle_directories(&root);
     assert_eq!(
         directories.len(),
-        6,
-        "the worked example should cover six bundles"
+        7,
+        "the worked example should cover seven bundles"
     );
 
     for directory in directories {
@@ -92,8 +92,8 @@ fn published_bundle_manifests_pin_the_exact_entry_digest_and_load() {
 
     let registry = load_registry();
     let inventory = registry.inventory();
-    assert_eq!(inventory.summary.bundles, 6);
-    assert_eq!(inventory.summary.hooks, 11);
+    assert_eq!(inventory.summary.bundles, 7);
+    assert_eq!(inventory.summary.hooks, 12);
     assert!(inventory
         .bundles
         .iter()
@@ -122,6 +122,10 @@ fn published_bundle_manifests_pin_the_exact_entry_digest_and_load() {
         .hooks
         .iter()
         .any(|hook| hook.kind == ExtensionHookKind::ProxyWasmFilter));
+    assert!(inventory
+        .hooks
+        .iter()
+        .any(|hook| hook.kind == ExtensionHookKind::Auth));
 }
 
 #[tokio::test]
@@ -201,6 +205,66 @@ async fn published_javascript_typescript_and_envelope_wasm_hooks_execute() {
     assert_eq!(
         typescript.enforce(&present, &mut ()).await.unwrap(),
         PolicyDecision::Allow
+    );
+
+    // The HMAC auth hook computes the signature in pure JavaScript inside
+    // the sandbox. The expected value below is an independent HMAC-SHA256
+    // over "acct-42.1723600000" with the fixture secret, so a green test
+    // proves the bundle's crypto agrees with the reference algorithm.
+    let hmac = registry
+        .auth("hmac_signature")
+        .expect("the HMAC auth hook should be registered");
+    let hmac = build_javascript_auth(
+        hmac,
+        serde_json::json!({"signing_secret": "worked-example-secret"}),
+    )
+    .expect("the HMAC auth hook should initialize");
+    let signature = "8c87b13f34b5d68111a98d38b950ff0710c88e29da487c8a1246bab037dc02a9";
+    let signed = Request::builder()
+        .uri("https://extension.local/authenticated")
+        .header("x-key-id", "acct-42")
+        .header("x-timestamp", "1723600000")
+        .header("x-signature", signature)
+        .body(Bytes::new())
+        .unwrap();
+    assert_eq!(
+        hmac.authenticate(&signed, &mut ()).await.unwrap(),
+        AuthDecision::allow_with_subject("acct-42", AuthSubjectSource::Header)
+    );
+    let tampered = Request::builder()
+        .uri("https://extension.local/authenticated")
+        .header("x-key-id", "acct-42")
+        .header("x-timestamp", "1723600001")
+        .header("x-signature", signature)
+        .body(Bytes::new())
+        .unwrap();
+    assert_eq!(
+        hmac.authenticate(&tampered, &mut ()).await.unwrap(),
+        AuthDecision::DenyWithHeaders {
+            status: 401,
+            message: "invalid request signature".to_owned(),
+            headers: vec![(
+                "WWW-Authenticate".to_owned(),
+                "HMAC error=\"invalid_token\"".to_owned()
+            )],
+            kind: AuthDenialKind::InvalidProof,
+        }
+    );
+    let unsigned = Request::builder()
+        .uri("https://extension.local/authenticated")
+        .body(Bytes::new())
+        .unwrap();
+    assert_eq!(
+        hmac.authenticate(&unsigned, &mut ()).await.unwrap(),
+        AuthDecision::DenyWithHeaders {
+            status: 401,
+            message: "valid request signature required".to_owned(),
+            headers: vec![(
+                "WWW-Authenticate".to_owned(),
+                "HMAC realm=\"sbproxy\"".to_owned()
+            )],
+            kind: AuthDenialKind::Challenge,
+        }
     );
 
     let wasm = registry
