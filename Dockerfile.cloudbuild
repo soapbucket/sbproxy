@@ -37,7 +37,7 @@
 # --- Stage 1: chef-base ------------------------------------------------
 # Shared toolchain layer. Pins Rust + cargo-chef + apt deps so all
 # downstream stages start from the same base.
-FROM rust:1.94-bookworm AS chef-base
+FROM rust:1.95-bookworm AS chef-base
 WORKDIR /src
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

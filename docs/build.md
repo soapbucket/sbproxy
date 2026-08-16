@@ -67,7 +67,7 @@ adds two stages of its own (**admin-ui** and **cert-gen**) for seven
 total. `Dockerfile.gateway` and `Dockerfile.worker` reuse the same spine
 through `builder` (see above) rather than repeating it here:
 
-1. **chef-base**: `rust:1.94-bookworm` plus the apt deps (`pkg-config`,
+1. **chef-base**: `rust:1.95-bookworm` plus the apt deps (`pkg-config`,
    `libclang-dev`, `build-essential`, `cmake`, `perl`,
    `protobuf-compiler`) plus a pinned `cargo-chef@0.1.71`. Reused by
    every later Rust stage.
