@@ -6303,7 +6303,7 @@ mod mcp_audit_redaction_tests {
 
 #[cfg(test)]
 mod mcp_governance_evidence_tests {
-    use super::{mcp_governance_event_data, mcp_governance_fail_closed};
+    use super::{mcp_governance_event_data, mcp_governance_fail_closed, McpGovernanceVerdict};
     use sbproxy_config::types::EventsConfig;
     use sbproxy_observe::events::EventType;
 
