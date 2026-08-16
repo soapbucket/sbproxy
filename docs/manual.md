@@ -980,7 +980,7 @@ The result is a JSON artifact at `--output` recording the prompt-store
 
 ```bash
 sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl
-sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl --signing-seed-hex <hex>
+sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl --signing-seed-hex "$SIGNING_SEED_HEX"
 ```
 
 Re-derives the tamper-evident security audit chain written by
