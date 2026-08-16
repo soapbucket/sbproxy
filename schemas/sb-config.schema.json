@@ -156,6 +156,18 @@
         }
       ]
     },
+    "egress": {
+      "description": "Operator-authored egress allowlists that arm the AiProvider, UsageSink, ModelArtifact, TokenExchange, and Telemetry purposes (WOR-2476, WOR-2481). Absent, or a sub-block omitted within it, keeps the corresponding purpose exactly as ungated as it was before this section existed. See [`EgressTopLevelConfig`].",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EgressTopLevelConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "session_ledger": {
       "description": "WOR-1186: emit the canonical session ledger (per-tool-call run records) from the live MCP `tools/call` path. Off unless this block is present and `enabled: true`.",
       "default": null,
@@ -10818,7 +10830,23 @@
           ]
         },
         "config_path": {
-          "description": "Optional path where `config_audit` events are chained. Opt-in; when absent, `config_audit` remains a tracing stream and is not durably recorded, preserving exactly the old behavior. Requires `sink: chain`. Must differ from `path` because the two audit event types (config and security) have different payload formats and verify independently. `key_audit` is deliberately not chainable yet, since its before/after diff contents require a separate contents-based ruling first.",
+          "description": "Optional path where `config_audit` events are chained. Opt-in; when absent, `config_audit` remains a tracing stream and is not durably recorded, preserving exactly the old behavior. Requires `sink: chain`. Must differ from `path`, `key_path`, and `admin_path`: every audit channel has a different payload format and verifies independently.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_path": {
+          "description": "Optional path where `key_audit` mutations are chained (WOR-2478). Opt-in, same terms as `config_path`. The chained record is metadata plus a keyed-HMAC fingerprint of each before/after field, never the raw diff `key_audit`'s tracing target carries; see `sbproxy_observe::audit`'s module docs. Requires `sink: chain`. Must differ from `path`, `config_path`, and `admin_path`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "admin_path": {
+          "description": "Optional path where authenticated admin-console actions are chained (WOR-2478): mutating admin API calls, logins, and content inspection, the same events the `sbproxy::admin::audit` tracing target and the admin ring's `admin` channel already carry. Opt-in, same terms as `config_path`. Requires `sink: chain`. Must differ from `path`, `config_path`, and `key_path`.",
           "default": null,
           "type": [
             "string",
@@ -10846,10 +10874,125 @@
           ]
         },
         {
-          "description": "Append every `security_audit` event to a SHA-256 hash-chained, Ed25519-signed file at `path`, signed by the identity `sign_with` names. Editing or removing a record breaks the chain, and `sbproxy audit verify` re-derives it from genesis. When `config_path` is set, `config_audit` events chain to that file; `key_audit` is not chained yet.",
+          "description": "Append every `security_audit` event to a SHA-256 hash-chained, Ed25519-signed file at `path`, signed by the identity `sign_with` names. Editing or removing a record breaks the chain, and `sbproxy audit verify` re-derives it from genesis. `config_path`, `key_path`, and `admin_path` opt the `config_audit`, `key_audit`, and admin-console channels into their own chain files under the same signing identity (WOR-2478).",
           "type": "string",
           "enum": [
             "chain"
+          ]
+        }
+      ]
+    },
+    "EgressTopLevelConfig": {
+      "description": "Top-level `egress:` section: operator-authored allowlists that arm the per-purpose egress gates (WOR-2476), plus the OTLP exporter gate (WOR-2481).\n\nReuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI `egress:` block already ships (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot depend on `sbproxy-extension` (that dependency runs the other way), so the shape is redeclared here rather than shared by type.\n\nEvery sub-block is independently optional. A purpose whose sub-block is omitted stays legacy ungated: `AiClient`'s documented `None` contract, the usage sinks' unauthenticated dispatch, the model-artifact fetcher's unauthenticated download, the non-MCP token-exchange resolver, and the OTLP exporters all keep behaving exactly as they did before this section existed. `compile_config` compiles each configured sub-block into a [`sbproxy_security::egress::EgressAuthorizer`] once, on [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses this raw struct directly.",
+      "type": "object",
+      "properties": {
+        "ai_providers": {
+          "description": "Arms `EgressPurpose::AiProvider`: every upstream AI provider dispatch the AI gateway's client makes.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_sinks": {
+          "description": "Arms Langfuse, Datadog, and object-store usage-sink deliveries under `EgressPurpose::UsageSink`, and webhook deliveries under `EgressPurpose::Webhook` (a separate, pre-existing purpose the webhook sink authorizes under internally): one config knob, two purposes armed from the same allowlist.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_artifacts": {
+          "description": "Arms `EgressPurpose::ModelArtifact`: the model-host artifact fetcher's HTTP downloads.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token_exchange": {
+          "description": "Arms `EgressPurpose::TokenExchange` for the non-MCP outbound credential resolver's OAuth token-endpoint calls. The MCP token exchange path (`sbproxy_extension::mcp::auth`) has its own `egress:` block and is unaffected by this section.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "telemetry": {
+          "description": "Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a config reload does not re-verify an already-running exporter (WOR-2481 tracks closing that gap).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EgressPurposeConfig": {
+      "description": "One purpose's allowlist under the top-level `egress:` section.\n\nShares its vocabulary with the per-tool MCP/OpenAPI `egress:` block; see `sbproxy_extension::mcp::egress::EgressPolicy` for the enforcement semantics this compiles to. Only `hosts` (exact match) and `allow_private` are supported here; the per-tool block's `suffixes` has no equivalent in this section.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "Default behavior for hosts that do not match `hosts`. `allow_by_default` (the default) is inert: the purpose stays legacy ungated even though `hosts` is present, mirroring the per-tool block's `EgressMode::AllowByDefault` short-circuit. Set `deny_by_default` to actually arm the gate.",
+          "default": "allow_by_default",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeMode"
+            }
+          ]
+        },
+        "hosts": {
+          "description": "Exact hostnames, compared case-insensitively. Ignored under `allow_by_default`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_private": {
+          "description": "When true, resolved private/link-local addresses are permitted for hosts on this allowlist (operator opt-in).",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EgressPurposeMode": {
+      "description": "Egress behavior when a destination host does not match `hosts` (mirrors `sbproxy_extension::mcp::egress::EgressMode`, minus its `enforce` alias).",
+      "oneOf": [
+        {
+          "description": "Only explicitly listed `hosts` may be contacted; compiles to a real `EgressAuthorizer` that fails closed.",
+          "type": "string",
+          "enum": [
+            "deny_by_default"
+          ]
+        },
+        {
+          "description": "All hosts may be contacted. Legacy default: an omitted `mode:`, or an omitted sub-block entirely, compiles to no authorizer at all.",
+          "type": "string",
+          "enum": [
+            "allow_by_default"
           ]
         }
       ]
