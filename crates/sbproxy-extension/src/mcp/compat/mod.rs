@@ -21,7 +21,7 @@ pub mod structural;
 
 pub use behavioral::behavioral_findings;
 pub use digest::{
-    contract_digest, contract_digest_v2, is_contract_digest_v1, is_contract_digest_v2,
+    contract_digest, contract_digest_v2, contract_of, is_contract_digest_v1, is_contract_digest_v2,
 };
 pub use lint::{lint_bump, BumpVerdict};
 pub use lockfile::{Lockfile, ToolLock};

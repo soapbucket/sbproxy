@@ -234,6 +234,24 @@ pub struct McpToolVersioningConfig {
     /// `warn` (default) or `block`.
     #[serde(default)]
     pub mode: McpVersioningModeConfig,
+    /// Refuse a tool with no lockfile entry at all (WOR-2444).
+    ///
+    /// Off by default, because turning it on means every newly
+    /// advertised tool is refused until the lockfile is regenerated,
+    /// which changes behavior for anyone who adds a tool.
+    ///
+    /// On, it is what closes the rename escape. A tool renamed but
+    /// otherwise unchanged is matched back to its baseline by contract
+    /// digest and graded as a rename. A rename that also edits the
+    /// contract matches no baseline by construction, so it is
+    /// indistinguishable from a new tool, and refusing unlocked tools
+    /// is the only thing that stops it being served ungated. A pinning
+    /// gate that serves whatever it has not seen before is pinning only
+    /// the tools an upstream chooses not to rename.
+    ///
+    /// Only consulted under `mode: block`; warn mode blocks nothing.
+    #[serde(default)]
+    pub block_unlocked: bool,
     /// Operator-declared current version per advertised tool name.
     /// A changed tool absent from this map is linted as "no bump
     /// declared" against its lockfile version.
@@ -630,8 +648,13 @@ enum ModernHttpTrustAnchor {
 }
 
 impl ModernHttpTrustAnchor {
-    /// Whether `origin`, reached over `connection_scheme`, is an origin
-    /// this gateway answers to.
+    /// Whether `origin`, reached over `connection_scheme`, is an
+    /// authority this gateway answers to.
+    ///
+    /// This is the authority test only. The browser `Origin` is a
+    /// different question with a different answer, and comparing it
+    /// through here would widen same-origin to mean same-host; see the
+    /// `Origin` branch of `validate_request`.
     ///
     /// The two variants disagree about the port, deliberately. An
     /// explicit `public_origin` is the operator writing down the URL
@@ -641,12 +664,10 @@ impl ModernHttpTrustAnchor {
     /// against; assuming the scheme's default would refuse every
     /// gateway not listening on 80 or 443, which is most of them.
     ///
-    /// Dropping the port costs nothing here. What this check defends
-    /// against is a browser page at some other site aiming a request at
-    /// this gateway, and that is stopped by requiring a `Host` this
-    /// gateway claims, which a page cannot forge whatever port it
-    /// dials. An operator who does want the port pinned says so with
-    /// `public_origin`.
+    /// What the authority test establishes is that the request is
+    /// addressed to a name this gateway serves, and the port is not part
+    /// of that. An operator who wants the authority's port pinned as
+    /// well says so with `public_origin`.
     fn matches(&self, connection_scheme: &str, origin: &CanonicalHttpOrigin) -> bool {
         match self {
             Self::Explicit(anchor) => origin == anchor,
@@ -743,9 +764,6 @@ impl CompiledModernHttpSecurity {
         let request_origin = uri_origin
             .or(host_origin)
             .ok_or(McpModernHttpRejection::Authority)?;
-        if !matches!(connection_scheme, "http" | "https") {
-            return Err(McpModernHttpRejection::Authority);
-        }
         if !self
             .trust_anchor
             .matches(connection_scheme, &request_origin)
@@ -761,7 +779,24 @@ impl CompiledModernHttpSecurity {
             let value = value.to_str().map_err(|_| McpModernHttpRejection::Origin)?;
             let origin = CanonicalHttpOrigin::parse_config(value, "Origin")
                 .map_err(|_| McpModernHttpRejection::Origin)?;
-            let is_same_origin = self.trust_anchor.matches(connection_scheme, &origin);
+            // Same-origin is the web platform's definition, ports included,
+            // and it is compared against a full origin under either anchor.
+            // A declared `public_origin` is that origin. A derived anchor has
+            // no port of its own, so the comparison uses the request's own
+            // origin, which carries the port the client dialed and has just
+            // been accepted as this gateway's.
+            //
+            // Reusing the port-blind anchor test here would be a real
+            // widening rather than a convenience: a page served from
+            // `http://localhost:3000` would count as same-origin with a
+            // gateway on `http://localhost:8080` and could drive `tools/call`
+            // from the browser. Ports are exactly what separates two local
+            // origins.
+            let trusted_origin = match &self.trust_anchor {
+                ModernHttpTrustAnchor::Explicit(origin) => origin,
+                ModernHttpTrustAnchor::ExactRouteHost(_) => &request_origin,
+            };
+            let is_same_origin = &origin == trusted_origin;
             if !is_same_origin && !self.allowed_origins.contains(&origin) {
                 return Err(McpModernHttpRejection::Origin);
             }
@@ -1206,6 +1241,7 @@ impl McpAction {
                             McpVersioningModeConfig::Warn => VersioningMode::Warn,
                             McpVersioningModeConfig::Block => VersioningMode::Block,
                         },
+                        block_unlocked: tv.block_unlocked,
                         judges,
                     })
                 }
@@ -1964,6 +2000,38 @@ mod tests {
         assert_eq!(
             action.validate_modern_http_request("https", None, &downgraded_origin),
             Err(McpModernHttpRejection::Origin)
+        );
+    }
+
+    #[test]
+    fn a_page_on_another_port_of_the_same_host_is_not_same_origin() {
+        // Loosening the authority test must not loosen the browser one.
+        // This is the canonical local shape: a dev server or a local tool's
+        // UI on one port, the gateway on another. The web platform calls
+        // those different origins, and so does this.
+        let mut action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{ "origin": "upstream.example.com" }]
+        }))
+        .expect("legacy-only MCP config remains valid");
+        action.bind_exact_route_authority("localhost");
+
+        let mut cross_port = http::HeaderMap::new();
+        cross_port.append("host", "localhost:8080".parse().unwrap());
+        cross_port.append("origin", "http://localhost:3000".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("http", None, &cross_port),
+            Err(McpModernHttpRejection::Origin)
+        );
+
+        // The gateway's own page still is, on whatever port it runs.
+        let mut same_port = http::HeaderMap::new();
+        same_port.append("host", "localhost:8080".parse().unwrap());
+        same_port.append("origin", "http://localhost:8080".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("http", None, &same_port),
+            Ok(())
         );
     }
 

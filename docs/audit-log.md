@@ -277,7 +277,9 @@ does not apply.
 
 ### `security_audit`: security-relevant rejections
 
-One `SecurityAuditEntry` per security-relevant rejection, on the `security_audit` target. Today the event class is `framing_violation` (request-smuggling defenses); the `reason` field carries a stable discriminator (`dual_cl_te`, `duplicate_cl`, `malformed_te`, `duplicate_te`, `control_chars`) that matches the `sbproxy_http_framing_blocks_total{reason}` metric label exactly. The schema deliberately omits the offending header value: including attacker-controlled bytes in a SIEM log is a poisoning vector. Entries carry hostname, client IP, request id, method, status code, and tenant when known.
+One `SecurityAuditEntry` per security-relevant rejection, on the `security_audit` target. The `event_type` names the class of rejection and the `reason` field carries a stable discriminator within it, so a SIEM rule can route on the pair without parsing prose. `framing_violation` (request-smuggling defenses) uses `dual_cl_te`, `duplicate_cl`, `malformed_te`, `duplicate_te`, and `control_chars`, which match the `sbproxy_http_framing_blocks_total{reason}` metric label exactly. `mcp_transport_denied` uses `mcp_modern_missing_trust_anchor`, `mcp_modern_authority`, and `mcp_modern_origin`. Rate limiting, the WAF, A2A, and object authorization emit here too.
+
+The schema deliberately omits the offending header value: including attacker-controlled bytes in a SIEM log is a poisoning vector. Entries carry hostname, client IP, request id, method, status code, and tenant when known. `hostname` is always the request's origin, so denials correlate across event classes.
 
 ### `key_audit`: key and credential mutations
 

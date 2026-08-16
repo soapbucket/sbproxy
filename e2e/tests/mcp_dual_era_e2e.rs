@@ -1051,6 +1051,88 @@ fn modern_request_never_enters_legacy_session_or_stream_paths() {
 /// This is also what made the surrounding tests flaky: the harness writes its
 /// config to the shared temp directory, so every other test's temp file was
 /// reloading this gateway.
+/// The other half of the watcher's job, and the half nothing covered.
+///
+/// Suppressing reloads is only correct if a real change still gets through,
+/// and every mechanism that suppresses one (the content digest, the burst
+/// coalescing, the baseline seeded from boot) is a chance to suppress all of
+/// them. A watcher that never reloads passes every test that only asserts
+/// sessions survive.
+#[test]
+fn a_real_config_change_still_reaches_the_running_gateway() {
+    let upstream = MockMcpUpstream::legacy();
+    let harness = start_gateway(&upstream, true);
+    let init = harness
+        .post_json(
+            "/",
+            "mcp.localhost",
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}}
+            }),
+            &[],
+        )
+        .expect("initialize legacy session");
+    let session_id = init
+        .headers
+        .get("mcp-session-id")
+        .expect("legacy initialize issues a session")
+        .to_string();
+
+    // Assert the session works before the edit, so a failure afterwards is
+    // the reload and not a session that never worked.
+    let before = harness
+        .post_json(
+            "/",
+            "mcp.localhost",
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            &[("Mcp-Session-Id", session_id.as_str())],
+        )
+        .expect("reuse session before the edit");
+    assert_eq!(before.status, 200, "session must work before the edit");
+
+    // A genuine change: bump the advertised server version. Writing through a
+    // temp file and renaming it into place is what an editor does, and it is
+    // the save shape the directory watch exists for.
+    // The harness normalizes the YAML it writes, so match what lands on disk
+    // rather than what the fixture literal looks like.
+    let original = std::fs::read_to_string(harness.config_path()).expect("read config");
+    let edited = original.replace("version: 1.0.0", "version: 1.0.1");
+    assert_ne!(
+        edited, original,
+        "fixture must carry the value being changed"
+    );
+    let staged = harness.config_path().with_extension("yml.staged");
+    std::fs::write(&staged, &edited).expect("write staged config");
+    std::fs::rename(&staged, harness.config_path()).expect("rename staged config into place");
+
+    // A reload replaces the compiled origin chain, so the old session goes
+    // with it. That is the observable proof the edit was applied.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = None;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        let reuse = harness
+            .post_json(
+                "/",
+                "mcp.localhost",
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                &[("Mcp-Session-Id", session_id.as_str())],
+            )
+            .expect("reuse session after the edit");
+        if reuse.status != 200 {
+            last = Some(reuse.status);
+            break;
+        }
+        last = Some(reuse.status);
+    }
+    assert_eq!(
+        last,
+        Some(404),
+        "a real config edit must reload; the pre-edit session should be gone"
+    );
+}
+
 #[test]
 fn unrelated_file_activity_beside_the_config_keeps_sessions_alive() {
     let upstream = MockMcpUpstream::legacy();

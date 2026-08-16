@@ -125,6 +125,31 @@ pub fn is_contract_digest_v1(digest: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(':'))
 }
 
+/// The contract projection of a live federated tool.
+///
+/// The one place a live tool becomes a contract, so the gate and any
+/// lockfile generator cannot construct different inputs for the same
+/// tool and disagree about its digest (WOR-2443). Before this existed
+/// the projection was built inline at the call site, which meant the
+/// recipe was defined by whichever caller you happened to read.
+///
+/// [`FederatedTool`] carries three of the six contract fields today:
+/// `title`, `outputSchema`, and `annotations` have no home on it, so
+/// they are absent from the projection rather than null. That is the
+/// intended behavior, since the projection includes only fields that
+/// are present, but it does mean a digest over a live tool is not
+/// interchangeable with a digest over a raw upstream `tools/list` entry
+/// that carries the other three. Generate baselines from this function.
+///
+/// [`FederatedTool`]: crate::mcp::federation::FederatedTool
+pub fn contract_of(tool: &crate::mcp::federation::FederatedTool) -> Value {
+    serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    })
+}
+
 /// Project a tool value down to its contract fields, dropping everything else.
 fn project_contract(tool: &Value) -> Value {
     project_fields(tool, &CONTRACT_FIELDS)
@@ -151,6 +176,60 @@ fn project_fields(tool: &Value, fields: &[&str]) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `contract_of` must stay the only way a live tool becomes a
+    /// contract.
+    ///
+    /// This is not hypothetical. The inline projection this function
+    /// replaced was reintroduced within a day, by WOR-2444 adding a
+    /// second branch that needed a contract and hand-rolled one. Two
+    /// projections is exactly how CONTRACT_FIELDS and the gate drifted
+    /// apart the first time, and the drift is silent: both compile,
+    /// both produce a digest, and they only disagree once a field is
+    /// added to one of them.
+    ///
+    /// Greps the federation source rather than trusting review.
+    #[test]
+    fn nothing_hand_rolls_a_contract_projection() {
+        let src = include_str!("../federation.rs");
+        assert!(
+            !src.contains(r#""inputSchema": tool.input_schema"#),
+            "federation.rs hand-rolls a contract projection; call compat::contract_of instead, \
+             so the generator and the gate cannot disagree about a digest"
+        );
+    }
+
+    /// The shipped example must not be permanently in the
+    /// "contract moved" state.
+    ///
+    /// `examples/mcp-tool-versioning/` carried a zeroed placeholder
+    /// digest that could never match, so an operator following the
+    /// example got a gate that fires on every refresh and learns the
+    /// wrong lesson about what a drift verdict means (WOR-2443).
+    ///
+    /// Reads the committed file rather than a copy, so the example and
+    /// the recipe cannot drift apart again without this failing.
+    #[test]
+    fn the_shipped_example_lockfile_digests_match_the_recipe() {
+        let yaml =
+            include_str!("../../../../../examples/mcp-tool-versioning/tool-versions.lock.yaml");
+        let lockfile: crate::mcp::compat::Lockfile =
+            serde_yaml::from_str(yaml).expect("the shipped example must parse");
+        assert!(
+            !lockfile.tools.is_empty(),
+            "an example with no tools proves nothing"
+        );
+        for (name, lock) in &lockfile.tools {
+            let contract = lock.contract.as_ref().unwrap_or_else(|| {
+                panic!("example tool `{name}` must embed its contract so this can be checked")
+            });
+            assert_eq!(
+                contract_digest(contract),
+                lock.contract_digest,
+                "example tool `{name}` has a digest the gate would not compute; regenerate it"
+            );
+        }
+    }
 
     #[test]
     fn digest_is_stable_under_key_reordering() {

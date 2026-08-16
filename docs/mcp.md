@@ -205,12 +205,19 @@ event so it reaches the same SIEM stream as every other denial. The
 response body is empty on purpose so a disallowed origin learns nothing
 about the endpoint.
 
-The two ways of getting an anchor differ on the port. An origin key is a
-hostname and carries no port, so a derived anchor compares the host and
-accepts whatever port the client dialed; a gateway on `8080` works
-without configuration. A declared `public_origin` is you writing down
-the URL clients use, port included, and is matched whole. Declare one
-when you want the port pinned.
+The two ways of getting an anchor differ on the port, and only for the
+request authority. An origin key is a hostname and carries no port, so a
+derived anchor checks that the request is addressed to a name this
+gateway serves and accepts whatever port the client dialed. A gateway on
+`8080` works without configuration. A declared `public_origin` is you
+writing down the URL clients use, port included, and is matched whole.
+
+The browser `Origin` is compared with ports either way, because two
+ports on one host are two origins and treating them as one would let a
+page on `http://localhost:3000` drive a gateway on `http://localhost:8080`.
+Under a derived anchor the comparison is against the request's own
+origin, so the gateway's own pages are same-origin on whatever port it
+runs. Anything else needs `allowed_origins`.
 
 Behind a TLS-terminating load balancer, list the balancer in
 `proxy.trusted_proxies`. The gateway takes the external scheme from

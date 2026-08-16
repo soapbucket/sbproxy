@@ -280,10 +280,7 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcom
 /// than calling [`reload_from_config_yaml`] directly: a reload that skipped
 /// the counter would leave the cadence operators alert on under-reporting
 /// every file-watch reload.
-pub(crate) fn reload_from_config_text(
-    config_path: &str,
-    yaml: &str,
-) -> anyhow::Result<ReloadOutcome> {
+fn reload_from_config_text(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
     let result = reload_from_config_yaml(config_path, yaml);
     match &result {
         Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
@@ -1269,7 +1266,7 @@ fn reload_compiled_config_locked(
 
 /// Digest of a config payload, used as the file watcher's "is this actually
 /// different" baseline.
-pub(super) fn config_content_digest(bytes: &[u8]) -> [u8; 32] {
+fn config_content_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::Digest as _;
     sha2::Sha256::digest(bytes).into()
 }
@@ -1299,6 +1296,21 @@ fn config_file_text_and_digest(path: &std::path::Path) -> Option<([u8; 32], Stri
 /// also the floor on how fast two genuinely different configs can be applied
 /// back to back, which is not a rate anyone edits at.
 const CONFIG_WATCH_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Hard ceiling on how long one burst may hold off the read.
+///
+/// The quiet period alone is not safe as a loop condition. The watch is on
+/// the config's whole directory and reports every file in it, so a neighbour
+/// written more than four times a second, which is an ordinary access log or
+/// audit sink, would restart the quiet timer forever and the config would
+/// never be read again. That failure is silent: the thread stays alive and
+/// blocked, and an operator sees only that their edit did nothing.
+///
+/// With a ceiling the same busy directory costs a bounded delay instead. A
+/// read taken under a still-churning directory can catch a torn file, and
+/// that case is already handled: the reload either fails and leaves the
+/// baseline alone, or the events still queued drive another pass.
+const CONFIG_WATCH_MAX_COALESCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub(super) fn start_config_watcher(config_path: String, loaded_digest: [u8; 32]) {
     use notify::{RecursiveMode, Watcher};
@@ -1393,7 +1405,19 @@ pub(super) fn start_config_watcher(config_path: String, loaded_digest: [u8; 32])
             // everything else in the burst. That is the same trade the
             // coalescing makes everywhere else: the reload below reports any
             // problem that actually matters, from the file itself.
-            while rx.recv_timeout(CONFIG_WATCH_QUIET_PERIOD).is_ok() {}
+            let burst_deadline = std::time::Instant::now() + CONFIG_WATCH_MAX_COALESCE;
+            loop {
+                let remaining = burst_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if rx
+                    .recv_timeout(CONFIG_WATCH_QUIET_PERIOD.min(remaining))
+                    .is_err()
+                {
+                    break;
+                }
+            }
 
             let current = config_file_text_and_digest(&cfg_path);
             if let Some((digest, _)) = &current {
@@ -1427,6 +1451,15 @@ pub(super) fn start_config_watcher(config_path: String, loaded_digest: [u8; 32])
                 }
             }
         }
+
+        // Only reachable once the watcher has been dropped, which means no
+        // further config change will ever be seen. Say so: without this a
+        // dead watcher and a quiet one look identical from the outside, and
+        // the symptom either way is an edit that does nothing.
+        tracing::error!(
+            path = %config_path,
+            "config file watcher stopped; config changes will no longer be applied"
+        );
     });
 }
 

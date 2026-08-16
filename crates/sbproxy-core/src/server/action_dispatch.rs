@@ -2033,7 +2033,7 @@ origins:
 pub(super) async fn handle_mcp_action(
     session: &mut Session,
     mcp: &sbproxy_modules::action::McpAction,
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     has_agent_skills: bool,
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
@@ -4605,11 +4605,18 @@ pub(super) fn mcp_request_target_authority(uri: &http::Uri) -> Option<String> {
 ///
 /// The refusal body is deliberately empty so a disallowed Origin learns
 /// nothing about the endpoint, which means the caller is told nothing and the
-/// record written here is all an operator ever gets. So it is a record, not
-/// just a log line: the [`sbproxy_observe::SecurityAuditEntry`] is the durable
-/// half and reaches the SIEM stream alongside every other denial, and it is
-/// what both refusal sites share. The `warn!` beside it is for the operator
-/// reading logs directly.
+/// record written here is all an operator ever gets. So it is a record rather
+/// than a log line: the [`sbproxy_observe::SecurityAuditEntry`] reaches the
+/// SIEM stream alongside every other denial, the metric gives the refusal rate
+/// something to alert on, and the deny ring puts a reason on the request row.
+/// Every refusal path goes through here, so all three land the same way
+/// wherever the request happened to be caught.
+///
+/// `hostname` on the audit entry is the request's origin, matching every other
+/// denial in this workspace, because that is the field SIEM correlation keys
+/// on. The MCP server's configured name would collapse a fleet into one bucket.
+/// The rejected authority is in the log line and not the audit entry, which
+/// has no field for it.
 ///
 /// Everything recorded is safe to emit: the rejection class is a closed enum,
 /// the scheme is server-derived, and the authority is a parsed header value,
@@ -4619,7 +4626,7 @@ pub(super) fn record_mcp_modern_refusal(
     server_name: &str,
     connection_scheme: &str,
     authority: Option<&str>,
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     session: &Session,
 ) -> http::StatusCode {
     use sbproxy_modules::action::mcp::McpModernHttpRejection;
@@ -4629,6 +4636,7 @@ pub(super) fn record_mcp_modern_refusal(
             http::StatusCode::MISDIRECTED_REQUEST
         }
     };
+    let reason = mcp_modern_rejection_reason(rejection);
     warn!(
         mcp_server = %server_name,
         rejection = ?rejection,
@@ -4637,11 +4645,15 @@ pub(super) fn record_mcp_modern_refusal(
         status = status.as_u16(),
         "refused MCP 2026-07-28 request at the transport trust boundary"
     );
+    let origin_label = ctx.hostname.to_string();
+    ctx.record_policy_decision("mcp_modern_transport", "deny");
+    ctx.deny_reason = Some(format!("mcp_modern_transport: {reason}"));
+    sbproxy_observe::metrics::record_policy(&origin_label, "mcp_modern_transport", "deny");
     sbproxy_observe::SecurityAuditEntry::policy_violation(
         "mcp_transport_denied",
-        mcp_modern_rejection_reason(rejection),
+        reason,
         status.as_u16(),
-        Some(server_name.to_string()),
+        Some(origin_label),
         ctx.client_ip,
         Some(ctx.request_id.to_string()),
         Some(session.req_header().method.as_str().to_string()),
@@ -6525,9 +6537,9 @@ mod mcp_catalog_snapshot_tests {
             .read_request()
             .await
             .expect("parse MCP downstream request");
-        let context = RequestContext::new();
+        let mut context = RequestContext::new();
 
-        handle_mcp_action(&mut session, action, &context, false)
+        handle_mcp_action(&mut session, action, &mut context, false)
             .await
             .expect("MCP handler response");
         drop(session);

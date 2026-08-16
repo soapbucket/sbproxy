@@ -3084,11 +3084,6 @@ pub(super) async fn request_filter(
         _ => None,
     };
     if let Some((rejection, scheme, authority, server_name)) = mcp_modern_rejection {
-        ctx.record_policy_decision("mcp_modern_transport", "deny");
-        ctx.deny_reason = Some(format!(
-            "mcp_modern_transport: {}",
-            super::action_dispatch::mcp_modern_rejection_reason(rejection)
-        ));
         let status = super::action_dispatch::record_mcp_modern_refusal(
             rejection,
             &server_name,
