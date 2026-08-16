@@ -14501,7 +14501,10 @@ cases: []
         );
 
         let output = run_rego_tests(&found, None).expect("the sweep itself does not fail");
-        assert_eq!(output.passed, 2, "the good fixture's cases must still run: {output:?}");
+        assert_eq!(
+            output.passed, 2,
+            "the good fixture's cases must still run: {output:?}"
+        );
         assert_eq!(output.failed, 0, "{output:?}");
 
         let exit = handle_rego_test(&RegoTestArgs {
