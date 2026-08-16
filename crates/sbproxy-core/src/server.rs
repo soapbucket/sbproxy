@@ -3752,6 +3752,15 @@ struct PolicyVerdictCtx {
     /// to provide. `CompiledOrigin::tenant_id` is the populated one and
     /// defaults to `__default__`, which is what the docs promise.
     tenant: String,
+    /// Which wire shape this process publishes `policy` records in
+    /// (WOR-2448).
+    ///
+    /// Resolved at the dispatcher entry from the compiled config, next
+    /// to the identifiers, rather than read per policy: the encoding is
+    /// a property of the process, and a chain whose first policy
+    /// serialized one way and whose second serialized another would be
+    /// unreadable in exactly the way this migration exists to fix.
+    record_format: sbproxy_config::types::PolicyRecordFormat,
 }
 
 /// Map a policy verdict onto the shared outcome vocabulary.
@@ -3889,26 +3898,69 @@ fn emit_policy_verdict_with_outcome(
     // saying `tenant="acme-corp"` while the SIEM record for the same
     // decision said `tenant_id=""`, and the SIEM record is the
     // analyst-facing half.
-    let event = sbproxy_observe::events::PolicyVerdictEvent::new(
-        uuid::Uuid::new_v4(),
-        ctx.request_id.clone(),
-        ctx.tenant.clone(),
-        ctx.workspace_id.clone(),
-        chrono::Utc::now(),
-        policy_id.to_string(),
-        surface,
-        engine,
-        verdict,
-        elapsed_ms,
-    );
-    if let Err(_dropped) = crate::policy_bus::try_publish(event) {
-        // Bus full or not yet installed; the dropped-events metric is
-        // the paging signal per `docs/adr-policy-audit-binding.md`. The
-        // drop counter is per tenant on purpose: one noisy tenant
-        // filling the queue must not silently degrade another tenant's
-        // audit trail, which it would if this were keyed on the always
-        // empty workspace id.
-        sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.tenant);
+    // WOR-2448: one record either way, in the shape this process is
+    // configured for. Publishing both during the deprecation window
+    // would double volume on the densest event in the system and give an
+    // analyst two rows for one decision, which is the thing the
+    // convergence exists to stop.
+    //
+    // Neither arm consults `decision_audit.publishes("policy")`. Policy
+    // records have published unconditionally since the audit bus landed,
+    // and gating the converged shape on a block an operator has probably
+    // never written would turn a format change into a silent loss of the
+    // most security-relevant feed in the system. The flag chooses an
+    // encoding; it does not choose whether to emit.
+    match ctx.record_format {
+        sbproxy_config::types::PolicyRecordFormat::Legacy => {
+            let event = sbproxy_observe::events::PolicyVerdictEvent::new(
+                uuid::Uuid::new_v4(),
+                ctx.request_id.clone(),
+                ctx.tenant.clone(),
+                ctx.workspace_id.clone(),
+                chrono::Utc::now(),
+                policy_id.to_string(),
+                surface,
+                engine,
+                verdict,
+                elapsed_ms,
+            );
+            if let Err(_dropped) = crate::policy_bus::try_publish(event) {
+                // Bus full or not yet installed; the dropped-events metric is
+                // the paging signal per `docs/adr-policy-audit-binding.md`. The
+                // drop counter is per tenant on purpose: one noisy tenant
+                // filling the queue must not silently degrade another tenant's
+                // audit trail, which it would if this were keyed on the always
+                // empty workspace id.
+                sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.tenant);
+            }
+        }
+        sbproxy_config::types::PolicyRecordFormat::Decision => {
+            // The reason the legacy shape had no room for. It is
+            // proxy-authored rather than operator prose, so it says what
+            // decided and what it decided, and the structured detail
+            // beside it is what a rule actually selects on.
+            let reason = format!(
+                "policy {policy_id} returned {} on the {} surface",
+                verdict.as_label(),
+                surface.as_label()
+            );
+            crate::policy_bus::emit_decision_audit_detailed(
+                sbproxy_observe::decision::DecisionEvent::Policy,
+                engine,
+                engine_outcome.unwrap_or_else(|| decision_outcome_for(verdict)),
+                &ctx.request_id,
+                &ctx.origin,
+                &ctx.origin,
+                &ctx.tenant,
+                &reason,
+                sbproxy_observe::decision::DecisionDetails::policy(
+                    policy_id,
+                    surface.as_label(),
+                    verdict.as_label(),
+                    elapsed_ms,
+                ),
+            );
+        }
     }
     // WOR-2094: non-allow verdicts land on the console's audit sample.
     // Allow verdicts stay off the ring (they would flood it at request

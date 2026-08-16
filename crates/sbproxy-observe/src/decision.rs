@@ -822,6 +822,37 @@ pub struct DecisionDetails {
     /// belongs in the reason, which is scrubbed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_type: Option<String>,
+    /// Which policy decided, by its stable config identity.
+    ///
+    /// The field an analyst pivots on first: "every deny by the waf
+    /// policy" has to be a term query, not a substring match against
+    /// prose that whoever wrote the rule can reword.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    /// Whether a built-in arm or a dynamic-dispatch plugin decided.
+    ///
+    /// Carried beside `engine` rather than derived from it, because a
+    /// surface cannot tell a CEL expression from a rate limiter and an
+    /// engine cannot tell a linked plugin from a built-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_surface: Option<String>,
+    /// The coarse verdict tag the policy returned.
+    ///
+    /// Not the same as the record's `outcome`, and both are carried on
+    /// purpose. A policy whose `enforce()` faulted still produces a
+    /// verdict, because the posture decides what happens to the request,
+    /// while the decision itself was an engine error. An analyst asking
+    /// "what happened to this request" reads the verdict; one asking
+    /// "is the control plane healthy" reads the outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// How long the decision took, in milliseconds.
+    ///
+    /// Coarse on purpose, matching the field it replaces. The histogram
+    /// is where latency analysis belongs; this is here so one record is
+    /// self-contained when an analyst is looking at a single decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_latency_ms: Option<u32>,
 }
 
 impl DecisionDetails {
@@ -835,6 +866,26 @@ impl DecisionDetails {
     pub fn auth(auth_type: &str) -> Self {
         Self {
             auth_type: (!auth_type.is_empty()).then(|| auth_type.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for a policy decision.
+    ///
+    /// The field set that lets `policy` records answer the questions
+    /// `PolicyVerdictEvent` answered, so converging the two shapes does
+    /// not cost a consumer anything it had. Every value is
+    /// proxy-authored: a policy id comes from the compiled config, a
+    /// surface and a verdict are closed enums here, and the latency is a
+    /// measurement. None of them is operator prose, which is what keeps
+    /// them out of [`RedactedReason`] and lets them ship as plain
+    /// selectable fields.
+    pub fn policy(policy_id: &str, surface: &str, verdict: &str, decision_latency_ms: u32) -> Self {
+        Self {
+            policy_id: (!policy_id.is_empty()).then(|| policy_id.to_owned()),
+            policy_surface: (!surface.is_empty()).then(|| surface.to_owned()),
+            verdict: (!verdict.is_empty()).then(|| verdict.to_owned()),
+            decision_latency_ms: Some(decision_latency_ms),
             ..Self::default()
         }
     }

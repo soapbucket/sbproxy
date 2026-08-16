@@ -1208,6 +1208,7 @@ fn reload_compiled_config_locked(
         }
         install_usage_rollups_from_config(compiled);
         warn_unwired_decision_audit_events(compiled);
+        warn_legacy_policy_record_format(compiled);
 
         // Rebuild the AI client alongside the catalog. It lives behind an
         // `ArcSwap`, so this is a lock-free atomic swap from the reload
@@ -1931,6 +1932,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // on reload); the installer is set-once so both calling is safe.
     install_usage_rollups_from_config(&compiled);
     warn_unwired_decision_audit_events(&compiled);
+    warn_legacy_policy_record_format(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -4062,6 +4064,40 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
             .join(", "),
         "decision_audit enables events that nothing publishes yet; they emit no records until \
          their emitters ship"
+    );
+}
+
+/// Warn while `policy` records still ship in the legacy shape
+/// (WOR-2448).
+///
+/// The deprecation is announced at boot rather than only in the docs,
+/// because the operator who most needs to know is the one who has never
+/// read that section: their consumer parses `policy_verdict_event:` and
+/// will stop matching when the default flips. A line naming the setting
+/// and the release is the difference between a scheduled migration and
+/// an outage on upgrade.
+///
+/// Silent when the block is absent entirely. An operator who has not
+/// configured decision audit at all has no consumer to migrate, and
+/// warning them about a format they do not read is how a startup log
+/// becomes noise nobody scans.
+fn warn_legacy_policy_record_format(compiled: &sbproxy_config::CompiledConfig) {
+    use sbproxy_config::types::PolicyRecordFormat;
+
+    if compiled.decision_audit.is_empty() {
+        return;
+    }
+    if compiled.decision_audit.policy_record_format() != PolicyRecordFormat::Legacy {
+        return;
+    }
+    tracing::warn!(
+        setting = "proxy.observability.log.decision_audit.policy_record_format",
+        current = PolicyRecordFormat::Legacy.as_label(),
+        migrate_to = PolicyRecordFormat::Decision.as_label(),
+        "policy decisions still publish the legacy policy_verdict_event shape, which carries no \
+         reason and cannot be joined with the other decision events; set policy_record_format: \
+         decision once your consumer reads decision_audit_event. The legacy shape is deprecated \
+         and this setting's default changes in the next major release"
     );
 }
 
