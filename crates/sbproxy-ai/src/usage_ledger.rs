@@ -222,6 +222,10 @@ struct OpenAiUsageResult {
 }
 
 /// One `{"object": "bucket", ...}` entry of the export's `data` array.
+/// `end_time` is not captured: with `bucket_width=1d` a bucket's
+/// `start_time` alone already lands on UTC midnight, so it is a
+/// complete, unambiguous day on its own and `end_time` would only ever
+/// repeat the next bucket's `start_time`.
 #[derive(Debug, Deserialize)]
 struct OpenAiUsageBucket {
     start_time: i64,

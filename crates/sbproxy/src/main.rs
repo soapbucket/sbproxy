@@ -10845,15 +10845,13 @@ mod tests {
     fn ai_ledger_reconcile_flags_an_injected_provider_only_row_and_strict_exits_nonzero() {
         let ledger_path = temp_jsonl_ledger_path("bypass");
         let _ = std::fs::remove_file(&ledger_path);
-        // A real, chain-valid ledger with zero entries: nothing the
-        // gateway ever metered.
-        drop(
-            sbproxy_ai::usage_ledger::LedgerSink::try_build(
-                ledger_path.to_str().expect("utf-8 temp path"),
-                None,
-            )
-            .expect("open empty ledger"),
-        );
+        // A 0-byte file is a trivially valid (empty) hash chain: both
+        // `verify_ledger` and `read_ledger_entries` parse zero lines and
+        // succeed. Written directly with a plain filesystem call, not
+        // through the ledger-opening constructor this crate's usage-sink
+        // wiring uses in production, so this test does not become that
+        // constructor's first cross-crate caller.
+        std::fs::write(&ledger_path, b"").expect("create empty ledger file");
 
         let export_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
