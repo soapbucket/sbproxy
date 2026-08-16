@@ -278,6 +278,24 @@ pub struct ToolVersioningGate {
     pub declared_versions: HashMap<String, semver::Version>,
     /// Warn or block.
     pub mode: VersioningMode,
+    /// Refuse a tool that has no lockfile entry at all (WOR-2444).
+    ///
+    /// Off by default because it changes behavior for anyone who adds a
+    /// tool without regenerating the lockfile: every newly advertised
+    /// tool starts refused until the baseline is updated.
+    ///
+    /// On, it is what actually closes the rename escape. Digest
+    /// correlation catches a tool renamed but otherwise unchanged; a
+    /// rename that *also* edits the contract matches no baseline by
+    /// construction and is indistinguishable from a new tool, so the
+    /// only thing that stops it being served ungated is refusing
+    /// unlocked tools. A pinning gate that serves whatever it has not
+    /// seen before is pinning the tools an upstream chooses not to
+    /// rename.
+    ///
+    /// Only consulted under [`VersioningMode::Block`]; in warn mode the
+    /// gate blocks nothing by definition.
+    pub block_unlocked: bool,
     /// Description-semantics judges (WOR-1637). Empty skips the
     /// dimension entirely, exactly as the oracle promises; more than
     /// one runs a jury whose agreement sets the confidence.
@@ -1898,6 +1916,43 @@ impl McpFederation {
     /// publish the violating tool set. Runs only when the catalogue
     /// content changed. Fail-open: an unreadable lockfile clears the
     /// blocked set and reports `lockfile_error`.
+    /// Resolve a live contract to the baseline it was pinned under, ignoring
+    /// the tool's name.
+    ///
+    /// The contract digest covers the name, so a renamed tool never matches
+    /// a baseline digest directly. This re-digests the live contract with
+    /// the baseline's name substituted in: if the two agree, everything
+    /// except the name is identical and this is the same pinned tool wearing
+    /// a different label.
+    ///
+    /// Only usable against baselines that captured their full contract.
+    /// Digest-only entries (the pre-WOR-1635 shape) cannot be re-digested
+    /// under another name, so a rename away from one of those is not
+    /// detectable here and falls through to the unlocked path.
+    fn by_digest_match<'a>(
+        by_digest: &'a HashMap<&str, (&'a String, &'a super::compat::ToolLock)>,
+        live_contract: &serde_json::Value,
+    ) -> Option<&'a String> {
+        for (old_name, lock) in by_digest.values() {
+            let Some(baseline) = lock.contract.as_ref() else {
+                continue;
+            };
+            let mut candidate = live_contract.clone();
+            if let Some(obj) = candidate.as_object_mut() {
+                obj.insert(
+                    "name".to_string(),
+                    serde_json::Value::String((*old_name).clone()),
+                );
+            }
+            if super::compat::contract_digest(&candidate) == lock.contract_digest
+                && &candidate == baseline
+            {
+                return Some(old_name);
+            }
+        }
+        None
+    }
+
     async fn evaluate_tool_versioning(&self, registry: &HashMap<String, FederatedTool>) {
         let Some(gate) = self.versioning.as_ref() else {
             return;
@@ -1919,10 +1974,82 @@ impl McpFederation {
             }
         };
 
+        // WOR-2444: a rename used to escape this gate entirely. The old
+        // name vanished into the removal sweep, which reports and never
+        // blocks because "there is nothing left to block", and the new
+        // name hit the unlocked `continue` below and was served with no
+        // baseline. Correct in isolation, wrong in aggregate: there is
+        // nothing left to block under the old name, and the thing that
+        // replaced it is exactly what should have been.
+        //
+        // Indexing the baseline by digest closes the identical-rename
+        // half: a tool renamed but otherwise unchanged resolves to the
+        // baseline it was approved under. It cannot close the general
+        // case, because a rename that also edits the contract matches
+        // no baseline by construction. `block_unlocked` is what closes
+        // that, and the two are complementary rather than alternatives.
+        let mut by_digest: HashMap<&str, (&String, &super::compat::ToolLock)> = HashMap::new();
+        for (locked_name, lock) in &lockfile.tools {
+            by_digest.insert(lock.contract_digest.as_str(), (locked_name, lock));
+        }
+
         let mut blocked: HashMap<String, String> = HashMap::new();
+        let mut renamed_from: HashMap<String, String> = HashMap::new();
         for (name, tool) in registry {
             let Some(lock) = lockfile.tools.get(name) else {
-                // New tool: nothing to diff against.
+                let live_contract = super::compat::contract_of(tool);
+                // The digest covers the name, so an identical rename does
+                // not collide here. Compare against the baseline's own
+                // contract with the name projected out.
+                let renamed = Self::by_digest_match(&by_digest, &live_contract);
+                if let Some(old_name) = renamed {
+                    // A rename is at least Minor: the advertised name is
+                    // the routing key, so callers pinned to the old one
+                    // break even when every field behind it is identical.
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                        "minor",
+                        "renamed_tool",
+                    );
+                    warn!(
+                        target: "sbproxy::audit",
+                        event = "mcp.tool_versioning.renamed",
+                        tool = %name,
+                        previous_tool = %old_name,
+                        "locked tool reappeared under a new name; the pinned baseline follows the \
+                         contract, not the name"
+                    );
+                    renamed_from.insert(name.clone(), old_name.clone());
+                    continue;
+                }
+                if gate.block_unlocked && gate.mode == VersioningMode::Block {
+                    // The posture that actually closes the escape. A
+                    // rename that also edits the contract matches no
+                    // baseline, so it is indistinguishable from a new
+                    // tool; refusing unlocked tools is the only thing
+                    // that stops it being served ungated. Opt-in,
+                    // because it changes behavior for anyone who adds a
+                    // tool without regenerating the lockfile.
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                        "major",
+                        "unlocked_tool",
+                    );
+                    warn!(
+                        target: "sbproxy::audit",
+                        event = "mcp.tool_versioning.unlocked",
+                        tool = %name,
+                        "tool is not in the lockfile and block_unlocked is set; refusing"
+                    );
+                    blocked.insert(
+                        name.clone(),
+                        "tool is not in the version lockfile".to_string(),
+                    );
+                } else {
+                    // New tool: nothing to diff against.
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                        "none",
+                        "unlocked_tool",
+                    );
+                }
                 continue;
             };
             let live_contract = super::compat::contract_of(tool);
@@ -2047,7 +2174,17 @@ impl McpFederation {
         // Tools that vanished from the live catalogue but exist in
         // the baseline: report, never block (there is nothing left
         // to block).
+        let renamed_to: HashMap<&str, &String> = renamed_from
+            .iter()
+            .map(|(new_name, old_name)| (old_name.as_str(), new_name))
+            .collect();
         for locked_name in lockfile.tools.keys() {
+            if renamed_to.contains_key(locked_name.as_str()) {
+                // Already reported as a rename. Counting it as a removal
+                // too would double-report one event and make the removal
+                // rate read high whenever an upstream renames.
+                continue;
+            }
             if !registry.contains_key(locked_name) {
                 sbproxy_observe::metrics::record_mcp_tool_compat_verdict("major", "removed_tool");
                 warn!(
@@ -2908,6 +3045,21 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// Lets a test opt the gate into refusing unlocked tools
+        /// without changing the signature of helpers every other test
+        /// in this module already calls (WOR-2444).
+        static BLOCK_UNLOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Run `body` with the unlocked-tool refusal enabled.
+    fn with_block_unlocked<T>(body: impl FnOnce() -> T) -> T {
+        BLOCK_UNLOCKED.with(|b| b.set(true));
+        let out = body();
+        BLOCK_UNLOCKED.with(|b| b.set(false));
+        out
+    }
+
     fn gated_federation(
         lockfile_path: String,
         mode: VersioningMode,
@@ -2933,6 +3085,7 @@ mod tests {
                 lockfile_path,
                 declared_versions,
                 mode,
+                block_unlocked: BLOCK_UNLOCKED.with(|b| b.get()),
                 judges,
             }),
         )
@@ -2949,6 +3102,91 @@ mod tests {
             blocked.contains_key("search"),
             "changed contract with no declared bump must block, got {blocked:?}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The same registry `gate_registry` builds, under another name.
+    fn renamed_registry(new_name: &str, description: &str) -> HashMap<String, FederatedTool> {
+        let mut tool = make_tool(new_name, "srv");
+        tool.description = description.to_string();
+        let mut map = HashMap::new();
+        map.insert(new_name.to_string(), tool);
+        map
+    }
+
+    #[tokio::test]
+    async fn a_renamed_tool_resolves_to_the_baseline_it_was_pinned_under() {
+        // WOR-2444 acceptance 1. Before this, the old name fell into the
+        // removal sweep (report, never block) and the new name hit the
+        // unlocked `continue`, so a rename produced no verdict tied to
+        // the pinned tool at all.
+        let path = write_lockfile("rename", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&renamed_registry("search_v2", "original description"))
+            .await;
+        // A rename of an otherwise-identical contract is graded, not
+        // blocked: the contract an operator approved is unchanged.
+        assert!(
+            fed.version_blocked().is_empty(),
+            "an identical rename is a rename, not a contract violation"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_rename_cannot_smuggle_a_contract_that_would_have_been_blocked() {
+        // WOR-2444 acceptance 2, and the reason digest correlation is
+        // not sufficient on its own. Renaming *and* editing the contract
+        // matches no baseline by construction, so it is indistinguishable
+        // from a new tool. Refusing unlocked tools is what closes it.
+        let path = write_lockfile("smuggle", &gate_lockfile("original description"));
+
+        // Under the same name this contract blocks, which is the thing
+        // the rename is trying to get around.
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+            .await;
+        assert!(
+            fed.version_blocked().contains_key("search"),
+            "precondition: this contract is blocked under its pinned name"
+        );
+
+        // Renamed, it is served ungated unless the posture is on.
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&renamed_registry(
+            "search_v2",
+            "completely different meaning",
+        ))
+        .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "documents the residual gap: without block_unlocked a renamed, edited tool is served"
+        );
+
+        let fed =
+            with_block_unlocked(|| gated_federation(path.clone(), VersioningMode::Block, None));
+        fed.evaluate_tool_versioning(&renamed_registry(
+            "search_v2",
+            "completely different meaning",
+        ))
+        .await;
+        assert!(
+            fed.version_blocked().contains_key("search_v2"),
+            "with block_unlocked the rename cannot serve what its pinned name could not"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn an_unlocked_tool_is_served_unless_the_posture_says_otherwise() {
+        // The default has to stay permissive: refusing every newly
+        // advertised tool changes behavior for anyone who adds one
+        // without regenerating the lockfile.
+        let path = write_lockfile("unlocked", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&renamed_registry("brand_new", "a tool nobody pinned"))
+            .await;
+        assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
     }
 

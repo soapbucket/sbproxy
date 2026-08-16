@@ -78,6 +78,28 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// `contract_of` must stay the only way a live tool becomes a
+    /// contract.
+    ///
+    /// This is not hypothetical. The inline projection this function
+    /// replaced was reintroduced within a day, by WOR-2444 adding a
+    /// second branch that needed a contract and hand-rolled one. Two
+    /// projections is exactly how CONTRACT_FIELDS and the gate drifted
+    /// apart the first time, and the drift is silent: both compile,
+    /// both produce a digest, and they only disagree once a field is
+    /// added to one of them.
+    ///
+    /// Greps the federation source rather than trusting review.
+    #[test]
+    fn nothing_hand_rolls_a_contract_projection() {
+        let src = include_str!("../federation.rs");
+        assert!(
+            !src.contains(r#""inputSchema": tool.input_schema"#),
+            "federation.rs hand-rolls a contract projection; call compat::contract_of instead, \
+             so the generator and the gate cannot disagree about a digest"
+        );
+    }
+
     /// The shipped example must not be permanently in the
     /// "contract moved" state.
     ///
