@@ -958,7 +958,57 @@ fn decode(resp: reqwest::blocking::Response) -> anyhow::Result<Response> {
 /// zero as this code allows without passing the bound fd through to
 /// the child.
 fn pick_free_port() -> anyhow::Result<TcpListener> {
-    Ok(TcpListener::bind("127.0.0.1:0")?)
+    // Retry until the operating system offers a port this process has not
+    // already handed to a child, keeping every rejected reservation open for
+    // the duration of the call so the same number cannot be offered twice.
+    //
+    // Closing a reservation is unavoidable, because the child binds the port
+    // itself, but the number must never be reissued: the losing harness then
+    // sends its requests to the winner's gateway, which answers them
+    // correctly while holding none of the loser's state. That reads as a
+    // product bug rather than a collision, and it is what made a legacy MCP
+    // session return "unknown or expired" in a test that passes serially.
+    //
+    // Cross-process collisions are still possible, which is what the harness
+    // token check on readiness covers.
+    let mut rejected = Vec::new();
+    for _ in 0..PORT_PICK_ATTEMPTS {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let unseen = handed_out_ports()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(port);
+        if unseen {
+            return Ok(listener);
+        }
+        rejected.push(listener);
+    }
+    anyhow::bail!(
+        "no unused ephemeral port after {PORT_PICK_ATTEMPTS} attempts; \
+         this process has already used {} of them",
+        handed_out_ports()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    )
+}
+
+/// How many times [`pick_free_port`] will ask for a port before giving up.
+///
+/// Only a port already handed out costs an attempt, so this is reached only
+/// when the ephemeral range is genuinely exhausted for this process.
+const PORT_PICK_ATTEMPTS: usize = 64;
+
+/// Every ephemeral port this process has handed to a child.
+///
+/// Never pruned. A port is unsafe to reissue for the lifetime of the process
+/// because the child that took it may still be listening, and a harness whose
+/// child died holds no evidence that it stopped.
+fn handed_out_ports() -> &'static Mutex<std::collections::HashSet<u16>> {
+    static PORTS: std::sync::OnceLock<Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    PORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Build a token unique to this harness invocation.

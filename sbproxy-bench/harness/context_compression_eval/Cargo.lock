@@ -5194,6 +5194,7 @@ dependencies = [
  "http 1.4.2",
  "ipnetwork",
  "jsonschema 0.17.1",
+ "jsonschema 0.47.0",
  "mlua",
  "once_cell",
  "parking_lot",

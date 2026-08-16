@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-08-15*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -148,9 +148,10 @@ gives every tool a content digest and grades every change.
 
 ## What it produces
 
-- **A contract digest.** A `sha256` over the RFC 8785 (JCS) canonical form of
+- **A contract digest.** A SHA-256 over the RFC 8785 (JCS) canonical form of
   the tool's contract, so an equal digest means an equal contract no matter the
-  key order.
+  key order. See [What the contract digest covers](#what-the-contract-digest-covers)
+  for the exact field set and how a stored digest names its own scheme.
 - **A compatibility grade.** One of `none`, `patch`, `minor`, or `major`, taken
   as the most significant grade across three dimensions.
 - **A version-bump verdict.** The declared bump compared against the computed
@@ -193,6 +194,74 @@ ergonomic as a schema-diff gate in a pull request.
 The baseline is a committed lockfile, one contract digest and semver per tool,
 and the declared versions live in a registry the operator edits. The oracle
 diffs the live tools against the lockfile and lints each declared bump.
+
+## What the contract digest covers
+
+A digest answers one question: did the part of this tool that changes what the
+gateway does move?
+
+Two recipes are in use, and a digest says which one wrote it. The newer scheme
+covers five fields:
+
+| Field | Covered | Why |
+|---|---|---|
+| `name` | yes | The routing key. |
+| `description` | yes | The text the model reads, which is the tool-poisoning surface. |
+| `inputSchema` | yes | Compiled and enforced on arguments. |
+| `outputSchema` | yes | Compiled and enforced on results, so a move changes which responses are accepted. |
+| `annotations` | yes | Carries the read-only and destructive hints a host may turn into an auto-approval decision. |
+| `title`, `icons`, `_meta` | no | Display and transport extras this gateway never acts on. Hashing them would refuse a tool over a label edit. |
+
+The value is [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON
+over that projection, hashed with SHA-256. Canonical form means key order and
+whitespace do not matter. Fields absent from the tool are absent from the
+projection rather than null, so a tool that declares none of the optional ones
+hashes exactly the content it always did.
+
+Digests carry the scheme that produced them:
+
+```
+mcp-contract-v2-sha256:<hex>
+```
+
+The scheme is mixed into the hashed bytes as well as prefixed to them, so a
+digest can never be compared against a recipe that did not produce it.
+
+A baseline carrying the older bare `sha256:` prefix keeps the comparison it was
+pinned against, which covered `name`, `title`, `description`, `inputSchema`,
+`outputSchema`, and `annotations` from a raw tool document. Upgrading the
+gateway never re-grades a tool an operator already pinned. Regenerate the
+baseline to pick up the newer scheme.
+
+A digest whose scheme this build does not recognize leaves that tool ungated,
+with an `mcp.tool_versioning.unknown_digest_scheme` audit event and an
+`unknown_digest_scheme` outcome on
+`sbproxy_mcp_tool_compat_verdicts_total`. Refusing it instead would turn a
+lockfile written by a newer build into an outage on rollback, which is the same
+fail-open-and-say-so posture an unreadable lockfile takes.
+
+One pinned recipe rather than a per-caller one is the point of all this: two
+implementations that hash the same tool and disagree give you a gate that fires
+on nothing an operator changed. In this codebase `contract_of` is the only
+function that turns a live tool into a contract, and a test greps for anyone
+who hand-rolls a second one, because that has already happened twice.
+
+A worked baseline is in `examples/mcp-tool-versioning/tool-versions.lock.yaml`,
+and a test asserts its digests are the ones the gateway computes, so the example
+cannot drift into the permanently-blocked state a hand-written digest lands in.
+
+Today the lockfile is hand-assembled from a tool's advertised contract. A
+`sbproxy mcp lock` subcommand that discovers a live catalog and writes the
+baseline is not shipped yet, so the practical path is to copy each tool's
+contract into the lockfile and let the test above, or a first `mode: warn` run,
+tell you the digest.
+
+One consequence worth stating plainly: the gate reports movement, and the
+oracle grades severity. The oracle models property, type, required and enum
+changes, so a change it cannot express, a `const` or a numeric bound for
+instance, still registers as movement and grades as at least a patch. The
+digest is the safety net, and a narrower digest than the contract the gateway
+enforces would make the net smaller than the thing it protects.
 
 ## The description judge
 

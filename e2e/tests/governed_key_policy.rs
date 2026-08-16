@@ -115,6 +115,10 @@ access_log:
     path: "{access_path}"
 origins:
   "{MCP_HOST}":
+    # The tenant is load bearing. An MCP catalogue is injectable only by keys
+    # on its own tenant, so this has to match the tenant of the ai_proxy
+    # origin that names it.
+    tenant_id: tenant-a
     action:
       type: mcp
       mode: gateway

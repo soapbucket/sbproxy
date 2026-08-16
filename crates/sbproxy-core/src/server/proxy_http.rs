@@ -2822,10 +2822,15 @@ impl ProxyHttp for SbProxy {
                             None,
                         ),
                     },
-                    _ => (
-                        Err("validated GraphQL action is no longer available".to_string()),
-                        None,
-                    ),
+                    // The flag is set before the route is known, from a
+                    // preview that can be unevaluable, so "pending" means
+                    // validation might be needed rather than that it is.
+                    // Landing on a non-GraphQL action means there is no
+                    // GraphQL contract to hold this request to, which is a
+                    // pass and not a refusal. Refusing here rejected every
+                    // request that reached a proxy action through a `body:`
+                    // forward rule.
+                    _ => (Ok(()), None),
                 }
             } else {
                 (

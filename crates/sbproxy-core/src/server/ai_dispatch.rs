@@ -5003,9 +5003,12 @@ pub(super) async fn handle_ai_proxy(
         // MCP catalogue (RBAC-filtered by this principal,
         // converted to the requested provider shape) is
         // appended to the static set.
-        let mut injected: Vec<serde_json::Value> = vk.inject_tools().to_vec();
-        if let Some(inject) = vk.inject_mcp() {
-            match sbproxy_modules::action::lookup_inject_source(&inject.reference) {
+        let static_tools = vk.inject_tools();
+        let inject_mcp = vk.inject_mcp();
+        let replaces_caller_tools = !static_tools.is_empty() || inject_mcp.is_some();
+        let mut injected: Vec<serde_json::Value> = static_tools.to_vec();
+        if let Some(inject) = inject_mcp {
+            match pipeline.mcp_inject_source(ctx.tenant_id.as_str(), &inject.reference) {
                 Some(source) => {
                     injected.extend(source.resolve_tools(
                         &ctx.principal,
@@ -5016,12 +5019,13 @@ pub(super) async fn handle_ai_proxy(
                 None => {
                     warn!(
                         mcp_ref = %inject.reference,
-                        "AI proxy: inject_mcp references an unknown MCP gateway; no tools injected"
+                        tenant = %ctx.tenant_id,
+                        "AI proxy: inject_mcp references an unknown MCP gateway in the route tenant; no tools injected"
                     );
                 }
             }
         }
-        if !injected.is_empty() {
+        if replaces_caller_tools {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("tools".to_string(), serde_json::Value::Array(injected));
             }
@@ -13450,6 +13454,209 @@ mod external_guardrail_context_tests {
             request
         });
         (format!("http://{address}/v1"), hits, task)
+    }
+
+    fn pipeline_with_mcp_inject_tool(tool_name: &str) -> crate::pipeline::CompiledPipeline {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: tenant-a
+origins:
+  mcp.tenant-a.test:
+    tenant_id: tenant-a
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: task-5b-pinned-dispatch
+        version: 1.0.0
+      federated_servers:
+        - origin: https://test.sbproxy.dev
+          prefix: catalog
+"#,
+        )
+        .expect("MCP inject fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(config)
+            .expect("MCP inject fixture pipeline");
+        let sbproxy_modules::Action::Mcp(action) = &pipeline.actions[0] else {
+            panic!("fixture origin must compile an MCP action");
+        };
+        let input_schema = serde_json::json!({"type": "object", "properties": {}});
+        let contract =
+            sbproxy_extension::mcp::protocol::McpToolContract::try_from(serde_json::json!({
+                "name": tool_name,
+                "description": "pinned dispatch fixture",
+                "inputSchema": input_schema.clone(),
+            }))
+            .expect("pinned dispatch tool contract");
+        action.federation.seed_tools_for_test(
+            std::collections::HashMap::from([(
+                tool_name.to_string(),
+                sbproxy_extension::mcp::FederatedTool {
+                    name: tool_name.to_string(),
+                    description: "pinned dispatch fixture".to_string(),
+                    input_schema,
+                    server_name: "catalog".to_string(),
+                    streaming: false,
+                    meta: None,
+                    contract: Some(contract),
+                    legacy_document: None,
+                    modern_contract: None,
+                    modern_incompatibility: None,
+                },
+            )]),
+            None,
+        );
+        pipeline
+    }
+
+    #[tokio::test]
+    async fn task_5b_mcp_injection_uses_the_requests_pinned_pipeline_generation() {
+        let pinned_pipeline = pipeline_with_mcp_inject_tool("catalog.old");
+        let _replacement_pipeline = pipeline_with_mcp_inject_tool("catalog.new");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "virtual_keys": [{
+                "key": "tenant-a-key",
+                "key_id": "tenant-a-key-id",
+                "inject_mcp": {"ref": "task-5b-pinned-dispatch"}
+            }]
+        }))
+        .expect("AI proxy config");
+        let request = serde_json::json!({
+            "model": "fixture-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        session
+            .req_header_mut()
+            .insert_header("authorization", "Bearer tenant-a-key")
+            .expect("authorization header");
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "tenant-a".into();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pinned_pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("AI request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body = request_text
+            .split_once("\r\n\r\n")
+            .expect("upstream request body")
+            .1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("upstream JSON body");
+        let tool_names = body["tools"]
+            .as_array()
+            .expect("injected tools array")
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tool_names,
+            ["catalog.old"],
+            "a replacement compile must not overwrite an in-flight request's MCP source"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5b_empty_mcp_injection_replaces_caller_supplied_tools_fail_closed() {
+        let pipeline = pipeline_with_mcp_inject_tool("catalog.allowed");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "virtual_keys": [{
+                "key": "tenant-a-key",
+                "key_id": "tenant-a-key-id",
+                "inject_mcp": {
+                    "ref": "task-5b-pinned-dispatch",
+                    "filter": ["catalog.does-not-match"]
+                }
+            }]
+        }))
+        .expect("AI proxy config");
+        let request = serde_json::json!({
+            "model": "fixture-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "caller_attacker_tool",
+                    "description": "must be replaced",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        session
+            .req_header_mut()
+            .insert_header("authorization", "Bearer tenant-a-key")
+            .expect("authorization header");
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "tenant-a".into();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("AI request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body: serde_json::Value = serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body");
+
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([]),
+            "an empty governed MCP result must replace, never preserve, caller tools"
+        );
     }
 
     /// WOR-2312: a global alias resolves before provider selection, which

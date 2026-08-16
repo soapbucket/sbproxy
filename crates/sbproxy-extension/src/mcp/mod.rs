@@ -27,10 +27,13 @@ pub mod auth;
 pub mod cassette_drift;
 pub mod codemode_ts;
 pub mod compat;
+pub mod concealed_text;
 pub mod discovery;
 pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
+pub mod poisoned_text;
+pub mod protocol;
 pub mod quarantine;
 /// Tool rollout plane: multiple live versions of one tool with
 /// per-consumer resolution (call `_meta`, session requirements,
@@ -62,9 +65,16 @@ pub use cassette_drift::{
 pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
     FederatedPrompt, FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation,
-    McpServerConfig, NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools,
-    ToolVersioningGate, VersioningMode,
+    McpServerConfig, NamespaceMode, OpenApiBacking, PromptCatalogSnapshot, SerializedToolEntry,
+    SerializedTools, ToolVersioningGate, VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
+pub use protocol::{
+    classify_http_era, decode_header_value, decode_http_request, decode_http_request_with_scan,
+    encode_header_value, DecodedMcpRequest, DecodedRequestId, HeaderValueError,
+    Legacy2025_06_18Codec, McpImplementation, McpProtocolCodec, McpProtocolContext, McpProtocolEra,
+    McpRoutingHeaders, McpServerDescription, McpWireBody, McpWireError, McpWireResponse,
+    Modern2026_07_28Codec, RawModernScan, RawModernScanLimit,
+};
 pub use stdio::{encode_stdio_url, StdioCommand};
 pub use types::*;

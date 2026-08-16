@@ -203,8 +203,9 @@ origins:
     let resp = proxy.get("/", "cap-proxy.local").expect("GET");
     let body = resp.text().unwrap_or_default();
     assert!(
-        body.contains("\"error\""),
-        "expected generic error envelope when payload exceeds limit on proxy action, got: {}",
+        resp.status >= 500,
+        "an over-limit payload must not report success, got {}: {}",
+        resp.status,
         body
     );
     assert!(

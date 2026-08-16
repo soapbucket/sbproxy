@@ -1530,6 +1530,48 @@ pub struct CompiledIdempotency {
     pub permits: Arc<tokio::sync::Semaphore>,
 }
 
+/// Immutable MCP catalog sources owned by one compiled pipeline generation.
+///
+/// The outer key is the route-derived tenant id and the inner key is the MCP
+/// action's advertised server name. Keeping this registry on the pipeline
+/// makes request pinning cover catalog injection just like every other
+/// compiled dependency: a candidate reload cannot overwrite a live source.
+#[derive(Default)]
+pub(crate) struct McpInjectRegistry {
+    by_tenant: HashMap<String, HashMap<String, Arc<sbproxy_modules::action::McpInjectSource>>>,
+}
+
+impl McpInjectRegistry {
+    fn insert(
+        &mut self,
+        tenant_id: &str,
+        server_name: &str,
+        source: Arc<sbproxy_modules::action::McpInjectSource>,
+    ) -> anyhow::Result<()> {
+        let tenant_sources = self.by_tenant.entry(tenant_id.to_owned()).or_default();
+        if tenant_sources.contains_key(server_name) {
+            anyhow::bail!(
+                "duplicate MCP inject source for tenant '{}' and server '{}'",
+                tenant_id,
+                server_name
+            );
+        }
+        tenant_sources.insert(server_name.to_owned(), source);
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        tenant_id: &str,
+        server_name: &str,
+    ) -> Option<Arc<sbproxy_modules::action::McpInjectSource>> {
+        self.by_tenant
+            .get(tenant_id)?
+            .get(server_name)
+            .map(Arc::clone)
+    }
+}
+
 /// A compiled config with its module instances ready for request processing.
 ///
 /// Each vec is parallel to `config.origins` - index N in `actions` corresponds
@@ -1563,6 +1605,8 @@ pub struct CompiledPipeline {
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Tenant-scoped MCP injection sources pinned to this generation.
+    pub(crate) mcp_inject_registry: McpInjectRegistry,
     /// Compiled Proxy-Wasm filter chain for each origin.
     pub(crate) proxy_wasm_filters: Vec<Option<crate::proxy_wasm_http::ProxyWasmFilterChain>>,
     /// Guards the one-time activation of this generation's background tasks.
@@ -1823,6 +1867,7 @@ impl Default for CompiledPipeline {
             sensitive_header_names,
             router,
             actions: Vec::new(),
+            mcp_inject_registry: McpInjectRegistry::default(),
             proxy_wasm_filters: Vec::new(),
             background_tasks_started: AtomicBool::new(false),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
@@ -2003,6 +2048,19 @@ impl CompiledPipeline {
             .is_some_and(|inbound| inbound.is_credential_carrier(header_name))
     }
 
+    /// Resolve an injectable MCP source from this exact pipeline generation.
+    ///
+    /// `tenant_id` must come from the matched route, not from a caller-mutable
+    /// principal attribute. Returning an owned `Arc` keeps the source pinned
+    /// without borrowing the pipeline across request work.
+    pub(crate) fn mcp_inject_source(
+        &self,
+        tenant_id: &str,
+        server_name: &str,
+    ) -> Option<Arc<sbproxy_modules::action::McpInjectSource>> {
+        self.mcp_inject_registry.get(tenant_id, server_name)
+    }
+
     /// The response-cache handle the data path must use for `origin_id`.
     ///
     /// With at-rest encryption on, this is the handle bound to that
@@ -2144,6 +2202,7 @@ impl CompiledPipeline {
 
         let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
+        let mut mcp_inject_registry = McpInjectRegistry::default();
         let mut proxy_wasm_filters = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
@@ -2172,7 +2231,10 @@ impl CompiledPipeline {
             // bundle action is still the compiler's job, in its
             // unknown-type fall-through, so a built-in or linked-plugin
             // `type:` reaches exactly the arm it always did.
-            let action = match mode {
+            //
+            // `mut` because an MCP action is bound to its route authority
+            // immediately below.
+            let mut action = match mode {
                 PipelineConstructionMode::Runtime => compile_action_for_origin_with_registry(
                     &origin.action_config,
                     &action_identity,
@@ -2186,6 +2248,14 @@ impl CompiledPipeline {
                     )?
                 }
             };
+            if let Action::Mcp(mcp) = &mut action {
+                mcp.bind_exact_route_authority(origin.hostname.as_str());
+                mcp_inject_registry.insert(
+                    origin.tenant_id.as_str(),
+                    &mcp.server_name,
+                    mcp.inject_source(),
+                )?;
+            }
             let proxy_wasm_filter = if origin.filters.is_empty() {
                 None
             } else {
@@ -2202,6 +2272,7 @@ impl CompiledPipeline {
                 )?)
             };
             proxy_wasm_filters.push(proxy_wasm_filter);
+            let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
             actions.push(action);
 
             // Compile auth (optional per origin). Route through the
@@ -2337,13 +2408,45 @@ impl CompiledPipeline {
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
-            let origin_fwd_rules = compile_forward_rules(
+            let mut origin_fwd_rules = compile_forward_rules(
                 &origin.forward_rules,
                 origin.workspace_id.as_str(),
                 origin.origin_id.as_str(),
                 mode,
                 extension_registry.as_ref(),
             )?;
+            for rule in &mut origin_fwd_rules {
+                if let Action::Mcp(mcp) = &mut rule.action {
+                    mcp.bind_exact_route_authority(origin.hostname.as_str());
+                }
+            }
+            // MCP picks its protocol era and trust anchor from the route
+            // before the body is buffered or auth has run. Any rule that
+            // could be selected ahead of an mcp action therefore has to be
+            // decidable from method, path, headers, and query alone;
+            // otherwise the gateway cannot tell pre-auth whether a request
+            // belongs to MCP at all.
+            // Guard through the LAST mcp rule, not up to the first. The mcp
+            // rule's own matchers decide whether MCP is selected at all, and a
+            // rule sitting between two mcp rules is still ahead of one of them.
+            let guarded_rules = if origin_action_is_mcp {
+                origin_fwd_rules.len()
+            } else {
+                origin_fwd_rules
+                    .iter()
+                    .rposition(|rule| matches!(&rule.action, Action::Mcp(_)))
+                    .map_or(0, |index| index + 1)
+            };
+            for rule in origin_fwd_rules.iter().take(guarded_rules) {
+                if let Some(label) = rule.matchers.iter().find_map(indeterminate_matcher_label) {
+                    anyhow::bail!(
+                        "origin `{}`: forward rule matcher `{label}` cannot be decided before an \
+                         `mcp` action is selected, so it would shadow MCP route selection; drop \
+                         the `{label}` matcher or move the mcp action onto its own origin",
+                        origin.hostname
+                    );
+                }
+            }
             if !origin.filters.is_empty() {
                 if let Some((rule_index, _)) = origin_fwd_rules
                     .iter()
@@ -2361,6 +2464,20 @@ impl CompiledPipeline {
             // Compile fallback origin (optional per origin).
             let fallback =
                 compile_fallback(&origin.fallback_origin, mode, extension_registry.as_ref())?;
+            // The fallback dispatcher serves a prepared response after the
+            // primary action already failed. It has no MCP session, no
+            // negotiated era, and no trust anchor, so an `mcp` action placed
+            // here could never dispatch.
+            if fallback
+                .as_ref()
+                .is_some_and(|fallback| matches!(&fallback.action, Action::Mcp(_)))
+            {
+                anyhow::bail!(
+                    "origin `{}`: fallback_origin cannot serve an `mcp` action; the fallback \
+                     dispatcher has no negotiated MCP era or trust anchor to dispatch through",
+                    origin.hostname
+                );
+            }
             if !origin.filters.is_empty() && fallback.is_some() {
                 anyhow::bail!(
                     "origin `{}`: Proxy-Wasm filters do not support fallback_origin responses",
@@ -2779,6 +2896,7 @@ impl CompiledPipeline {
             sensitive_header_names,
             router,
             actions,
+            mcp_inject_registry,
             proxy_wasm_filters,
             background_tasks_started: AtomicBool::new(false),
             compression_runtimes,
@@ -3094,6 +3212,22 @@ fn routing_action_identity(
         .unwrap_or_else(|| "main".to_string());
     serde_json::to_string(&(workspace_id, origin_id, scope))
         .expect("routing action identity fields are serializable")
+}
+
+/// Name the first matcher in `entry` that cannot be decided from the route
+/// alone, if there is one.
+///
+/// A `body` matcher needs buffered bytes and a `when` predicate needs the CEL
+/// context, so neither is available at the point MCP has to pick its protocol
+/// era and trust anchor.
+fn indeterminate_matcher_label(entry: &MatcherEntry) -> Option<&'static str> {
+    if entry.body.is_some() {
+        return Some("body");
+    }
+    if entry.when.is_some() {
+        return Some("when");
+    }
+    None
 }
 
 fn compile_forward_rules(
@@ -3733,6 +3867,573 @@ mod transform_posture_tests {
 }
 
 #[cfg(test)]
+mod mcp_inject_registry_tests {
+    use super::CompiledPipeline;
+    use sbproxy_extension::mcp::protocol::McpToolContract;
+    use sbproxy_extension::mcp::FederatedTool;
+    use sbproxy_modules::Action;
+    use std::collections::{BTreeSet, HashMap};
+
+    fn compile_mcp_pipeline(
+        origins: &[(&str, &str, &str, &str)],
+    ) -> anyhow::Result<CompiledPipeline> {
+        let tenant_ids = origins
+            .iter()
+            .map(|(_, tenant_id, _, _)| *tenant_id)
+            .collect::<BTreeSet<_>>();
+        let mut yaml = String::from("proxy:\n  tenants:\n");
+        for tenant_id in tenant_ids {
+            yaml.push_str(&format!("    - id: {tenant_id}\n"));
+        }
+        yaml.push_str("origins:\n");
+        for (hostname, tenant_id, server_name, upstream_prefix) in origins {
+            yaml.push_str(&format!(
+                "  {hostname}:\n    tenant_id: {tenant_id}\n    action:\n      type: mcp\n      mode: gateway\n      server_info:\n        name: {server_name}\n        version: private-config-canary\n      federated_servers:\n        - origin: https://test.sbproxy.dev\n          prefix: {upstream_prefix}\n"
+            ));
+        }
+        let config = sbproxy_config::compile_config(&yaml).expect("MCP pipeline fixture compiles");
+        CompiledPipeline::from_config_for_validation(config)
+    }
+
+    fn federated_tool(name: &str, server_name: &str) -> FederatedTool {
+        let input_schema = serde_json::json!({"type": "object", "properties": {}});
+        let contract = McpToolContract::try_from(serde_json::json!({
+            "name": name,
+            "description": "tenant-scoped fixture",
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("tenant-scoped tool contract");
+        FederatedTool {
+            name: name.to_string(),
+            description: "tenant-scoped fixture".to_string(),
+            input_schema,
+            server_name: server_name.to_string(),
+            streaming: false,
+            meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
+        }
+    }
+
+    fn seed_tool(
+        pipeline: &CompiledPipeline,
+        hostname: &str,
+        upstream_prefix: &str,
+        tool_name: &str,
+    ) {
+        let origin_index = pipeline
+            .resolve_origin(hostname)
+            .expect("fixture origin resolves");
+        let Action::Mcp(action) = &pipeline.actions[origin_index] else {
+            panic!("fixture origin must compile an MCP action");
+        };
+        action.federation.seed_tools_for_test(
+            HashMap::from([(
+                tool_name.to_string(),
+                federated_tool(tool_name, upstream_prefix),
+            )]),
+            None,
+        );
+    }
+
+    fn resolved_tool_names(source: &sbproxy_modules::action::McpInjectSource) -> Vec<String> {
+        source
+            .resolve_tools(
+                &sbproxy_plugin::Principal::anonymous(),
+                &[],
+                sbproxy_ai::identity::McpToolFormat::Openai,
+            )
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")?
+                    .get("name")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn task_5b_same_mcp_server_name_coexists_across_tenants() {
+        let pipeline = compile_mcp_pipeline(&[
+            ("mcp-a.test", "tenant-a", "shared-tools", "alpha"),
+            ("mcp-b.test", "tenant-b", "shared-tools", "beta"),
+        ])
+        .expect("distinct tenant identities compile");
+        seed_tool(&pipeline, "mcp-a.test", "alpha", "alpha.lookup");
+        seed_tool(&pipeline, "mcp-b.test", "beta", "beta.lookup");
+
+        let tenant_a = pipeline
+            .mcp_inject_source("tenant-a", "shared-tools")
+            .expect("tenant A source");
+        let tenant_b = pipeline
+            .mcp_inject_source("tenant-b", "shared-tools")
+            .expect("tenant B source");
+
+        assert_eq!(resolved_tool_names(&tenant_a), ["alpha.lookup"]);
+        assert_eq!(resolved_tool_names(&tenant_b), ["beta.lookup"]);
+    }
+
+    #[test]
+    fn task_5b_duplicate_mcp_inject_identity_rejects_pipeline_compilation() {
+        let error = match compile_mcp_pipeline(&[
+            ("mcp-primary.test", "tenant-a", "shared-tools", "primary"),
+            (
+                "mcp-secondary.test",
+                "tenant-a",
+                "shared-tools",
+                "secondary",
+            ),
+        ]) {
+            Ok(_) => panic!("a duplicate tenant and MCP server identity must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("duplicate"), "{message}");
+        assert!(message.contains("tenant-a"), "{message}");
+        assert!(message.contains("shared-tools"), "{message}");
+        assert!(
+            !message.contains("private-config-canary"),
+            "the duplicate error must not echo unrelated action configuration: {message}"
+        );
+    }
+
+    #[test]
+    fn task_5b_mcp_inject_lookup_fails_closed_outside_its_tenant_or_name() {
+        let pipeline =
+            compile_mcp_pipeline(&[("mcp-a.test", "tenant-a", "tenant-a-tools", "alpha")])
+                .expect("fixture pipeline compiles");
+
+        assert!(pipeline
+            .mcp_inject_source("tenant-b", "tenant-a-tools")
+            .is_none());
+        assert!(pipeline
+            .mcp_inject_source("tenant-a", "unknown-tools")
+            .is_none());
+    }
+
+    #[test]
+    fn task_5b_mcp_inject_sources_remain_pinned_to_their_pipeline_generation() {
+        let old_pipeline =
+            compile_mcp_pipeline(&[("mcp-a.test", "tenant-a", "shared-tools", "alpha")])
+                .expect("old generation compiles");
+        seed_tool(&old_pipeline, "mcp-a.test", "alpha", "alpha.old");
+
+        let new_pipeline =
+            compile_mcp_pipeline(&[("mcp-a.test", "tenant-a", "shared-tools", "alpha")])
+                .expect("new generation compiles");
+        seed_tool(&new_pipeline, "mcp-a.test", "alpha", "alpha.new");
+
+        let old_source = old_pipeline
+            .mcp_inject_source("tenant-a", "shared-tools")
+            .expect("old generation source");
+        let new_source = new_pipeline
+            .mcp_inject_source("tenant-a", "shared-tools")
+            .expect("new generation source");
+
+        assert_eq!(resolved_tool_names(&old_source), ["alpha.old"]);
+        assert_eq!(resolved_tool_names(&new_source), ["alpha.new"]);
+    }
+}
+
+#[cfg(test)]
+mod mcp_modern_http_authority_tests {
+    use super::CompiledPipeline;
+    use http::{HeaderMap, HeaderValue};
+    use sbproxy_modules::action::mcp::{McpAction, McpModernHttpRejection};
+    use sbproxy_modules::Action;
+
+    fn compile_mcp_pipeline(
+        origin_key: &str,
+        modern_http: Option<&str>,
+    ) -> anyhow::Result<CompiledPipeline> {
+        let modern_http = modern_http.unwrap_or_default();
+        let yaml = format!(
+            r#"
+origins:
+  "{origin_key}":
+    action:
+      type: mcp
+      mode: gateway
+{modern_http}      federated_servers:
+        - origin: https://test.sbproxy.dev
+          prefix: upstream
+"#
+        );
+        let config = sbproxy_config::compile_config(&yaml)?;
+        CompiledPipeline::from_config_for_validation(config)
+    }
+
+    fn mcp_action(pipeline: &CompiledPipeline) -> &McpAction {
+        let Some(Action::Mcp(action)) = pipeline.actions.first() else {
+            panic!("fixture origin must compile an MCP action");
+        };
+        action
+    }
+
+    fn browser_headers(authority: &str, origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_str(authority).expect("fixture authority is a valid header value"),
+        );
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_str(origin).expect("fixture origin is a valid header value"),
+        );
+        headers
+    }
+
+    fn origin_header(origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_str(origin).expect("fixture origin is a valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn task_5c_exact_mcp_origin_derives_scheme_aware_default_authority() {
+        let pipeline = compile_mcp_pipeline("mcp.localhost", None)
+            .expect("exact MCP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        for (scheme, authority, origin) in [
+            ("http", "mcp.localhost", "http://mcp.localhost:80"),
+            ("http", "mcp.localhost:80", "http://mcp.localhost"),
+        ] {
+            assert_eq!(
+                action.validate_modern_http_request(
+                    scheme,
+                    None,
+                    &browser_headers(authority, origin),
+                ),
+                Ok(()),
+                "{scheme} request should canonicalize its default effective port"
+            );
+        }
+        for (authority, origin) in [
+            ("mcp.localhost", "https://mcp.localhost:443"),
+            ("mcp.localhost:443", "https://mcp.localhost"),
+        ] {
+            assert_eq!(
+                action.validate_modern_http_request(
+                    "https",
+                    Some(authority),
+                    &origin_header(origin),
+                ),
+                Ok(()),
+                "HTTP/2 authority should canonicalize its default effective port"
+            );
+        }
+    }
+
+    #[test]
+    fn task_5c_exact_mcp_origin_rejects_an_untrusted_authority() {
+        let pipeline = compile_mcp_pipeline("mcp.localhost", None)
+            .expect("exact MCP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                Some("evil.example"),
+                &browser_headers("mcp.localhost", "https://mcp.localhost"),
+            ),
+            Err(McpModernHttpRejection::Authority)
+        );
+    }
+
+    #[test]
+    fn task_5c_wildcard_mcp_origin_does_not_derive_a_trust_anchor() {
+        let pipeline = compile_mcp_pipeline("*.localhost", None)
+            .expect("wildcard MCP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "http",
+                None,
+                &browser_headers("tenant.localhost", "http://tenant.localhost"),
+            ),
+            Err(McpModernHttpRejection::MissingTrustAnchor)
+        );
+    }
+
+    #[test]
+    fn task_5c_explicit_modern_public_origin_remains_authoritative() {
+        let pipeline = compile_mcp_pipeline(
+            "mcp.localhost",
+            Some(
+                r#"      modern_http:
+        public_origin: https://mcp.localhost:8443
+"#,
+            ),
+        )
+        .expect("explicit modern HTTP origin pipeline compiles");
+        let action = mcp_action(&pipeline);
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                None,
+                &browser_headers("mcp.localhost:8443", "https://mcp.localhost:8443"),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                None,
+                &browser_headers("mcp.localhost", "https://mcp.localhost:8443"),
+            ),
+            Err(McpModernHttpRejection::Authority)
+        );
+    }
+
+    #[test]
+    fn task_5c_inner_wildcard_mcp_origin_is_rejected_before_pipeline_compilation() {
+        assert!(compile_mcp_pipeline("mcp.*.localhost", None).is_err());
+    }
+
+    #[test]
+    fn task_5c_forward_rule_mcp_action_inherits_the_exact_route_authority() {
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: static
+      status_code: 404
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+        origin:
+          id: forwarded-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("forward MCP config compiles");
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("forward MCP pipeline compiles");
+        let Some(Action::Mcp(action)) = pipeline.forward_rules[0].first().map(|rule| &rule.action)
+        else {
+            panic!("forward rule must compile an MCP action");
+        };
+
+        assert_eq!(
+            action.validate_modern_http_request(
+                "https",
+                Some("mcp.localhost"),
+                &origin_header("https://mcp.localhost"),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn task_5c_mcp_routes_reject_body_or_cel_dependent_forward_selection() {
+        let cases = [
+            (r#"body: {pointer: /route, value: mcp}"#, "body"),
+            (r#"when: 'request.path == "/mcp"'"#, "when"),
+        ];
+
+        for (matcher, label) in cases {
+            let yaml = format!(
+                r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: mcp
+      mode: gateway
+      federated_servers:
+        - origin: https://test.sbproxy.dev
+          prefix: upstream
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+            {matcher}
+        origin:
+          id: conditional-route
+          action:
+            type: static
+            status_code: 404
+"#
+            );
+            let config = sbproxy_config::compile_config(&yaml)
+                .unwrap_or_else(|error| panic!("{label} fixture config compiles: {error}"));
+            let error = CompiledPipeline::from_config_for_validation(config)
+                .err()
+                .unwrap_or_else(|| panic!("{label} matcher must be rejected on an MCP origin"));
+            let message = error.to_string();
+            assert!(message.contains("mcp.localhost"), "{label}: {message}");
+            assert!(message.contains(label), "{label}: {message}");
+        }
+    }
+
+    #[test]
+    fn task_5c_forward_mcp_route_rejects_an_earlier_indeterminate_rule() {
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: static
+      status_code: 404
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+            when: 'request.path.startsWith("/shadow")'
+        origin:
+          id: conditional-shadow
+          action:
+            type: static
+            status_code: 403
+      - rules:
+          - path:
+              prefix: /mcp
+        origin:
+          id: forwarded-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("forward MCP config compiles");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("an earlier indeterminate route must not shadow MCP pre-auth selection");
+        let message = error.to_string();
+        assert!(message.contains("mcp.localhost"), "{message}");
+        assert!(message.contains("when"), "{message}");
+    }
+
+    #[test]
+    fn task_5c_an_mcp_rule_cannot_carry_its_own_indeterminate_matcher() {
+        // The mcp rule's own matchers decide whether MCP is selected at all. A
+        // body matcher here arms the route-matching body drain, so the MCP
+        // handler would re-read an already-consumed body and decode nothing.
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: proxy
+      url: https://api.example.com
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /
+            body: {pointer: /route, value: mcp}
+        origin:
+          id: body-selected-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("body-selected MCP config parses");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("an mcp rule must not select on the request body");
+        let message = error.to_string();
+        assert!(message.contains("mcp.localhost"), "{message}");
+        assert!(message.contains("body"), "{message}");
+    }
+
+    #[test]
+    fn task_5c_a_rule_between_two_mcp_rules_is_still_guarded() {
+        // Guarding only up to the FIRST mcp rule would let this one through.
+        let yaml = r#"
+origins:
+  "mcp.localhost":
+    action:
+      type: proxy
+      url: https://api.example.com
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /first
+        origin:
+          id: first-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+      - rules:
+          - path:
+              prefix: /shadow
+            when: 'request.path.startsWith("/shadow")'
+        origin:
+          id: conditional-shadow
+          action:
+            type: static
+            status_code: 403
+      - rules:
+          - path:
+              prefix: /second
+        origin:
+          id: second-mcp
+          action:
+            type: mcp
+            mode: gateway
+            federated_servers:
+              - origin: https://test.sbproxy.dev
+                prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("interleaved MCP config parses");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("a rule between two mcp rules must not be indeterminate");
+        let message = error.to_string();
+        assert!(message.contains("mcp.localhost"), "{message}");
+        assert!(message.contains("when"), "{message}");
+    }
+
+    #[test]
+    fn task_5c_mcp_is_rejected_as_an_undispatchable_fallback_action() {
+        let yaml = r#"
+origins:
+  "api.localhost":
+    action:
+      type: proxy
+      url: https://api.example.com
+    fallback_origin:
+      on_error: true
+      origin:
+        id: invalid-mcp-fallback
+        action:
+          type: mcp
+          mode: gateway
+          federated_servers:
+            - origin: https://test.sbproxy.dev
+              prefix: upstream
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("fallback MCP config parses");
+        let error = CompiledPipeline::from_config_for_validation(config)
+            .err()
+            .expect("MCP cannot run through the static-only fallback dispatcher");
+        let message = error.to_string();
+        assert!(message.contains("fallback"), "{message}");
+        assert!(message.contains("mcp"), "{message}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use compact_str::CompactString;
@@ -3740,6 +4441,52 @@ mod tests {
     use sbproxy_plugin::{ExtensionHookKind, ExtensionState};
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    /// An MCP catalogue is injectable only by keys on its own tenant.
+    ///
+    /// The lookup used to be process-global by server name, so a key on any
+    /// tenant could name any gateway and get its tools. Scoping it is the
+    /// point, and the same-name case is what proves the scoping is real:
+    /// two tenants may both run a gateway called `toolhub`, and each must see
+    /// only its own.
+    #[test]
+    fn an_mcp_catalogue_is_reachable_only_from_its_own_tenant() {
+        fn source(name: &str) -> Arc<sbproxy_modules::action::McpInjectSource> {
+            let action = sbproxy_modules::action::McpAction::from_config(serde_json::json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": name, "version": "1.0.0"},
+                "federated_servers": [{"origin": "upstream.example.com"}]
+            }))
+            .expect("mcp fixture compiles");
+            action.inject_source()
+        }
+
+        let mut registry = McpInjectRegistry::default();
+        registry
+            .insert("tenant-a", "toolhub", source("toolhub"))
+            .expect("tenant-a toolhub");
+        registry
+            .insert("tenant-b", "toolhub", source("toolhub"))
+            .expect("a second tenant may reuse the name");
+
+        assert!(registry.get("tenant-a", "toolhub").is_some());
+        assert!(registry.get("tenant-b", "toolhub").is_some());
+        assert!(
+            registry.get("tenant-c", "toolhub").is_none(),
+            "a tenant with no gateway of that name must not borrow another's"
+        );
+        assert!(
+            registry.get("", "toolhub").is_none(),
+            "an empty tenant must not act as a wildcard"
+        );
+
+        // Same tenant, same name, twice is an operator error rather than a
+        // silent last-one-wins.
+        assert!(registry
+            .insert("tenant-a", "toolhub", source("toolhub"))
+            .is_err());
+    }
 
     #[test]
     fn routing_state_namespace_is_workspace_and_rule_scoped() {

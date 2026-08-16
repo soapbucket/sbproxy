@@ -88,17 +88,41 @@ fn request_requires_graphql_replay(
     origin_idx: usize,
 ) -> bool {
     match request_effective_action(session, pipeline, origin_idx) {
-        // Ambiguous, so take the safe reading: validation may be
-        // pending. Assuming the base action would let the idempotency
-        // pre-check serve a cached response before the current GraphQL
-        // action has validated it, which is the replay this flag
-        // exists to prevent.
-        EffectiveAction::Indeterminate => true,
+        // Ambiguous, so take the safe reading: validation may be pending.
+        // Assuming the base action would let the idempotency pre-check serve
+        // a cached response before the current GraphQL action has validated
+        // it, which is the replay this flag exists to prevent.
+        //
+        // Safe only where there is a GraphQL action to be ambiguous about. A
+        // `body:` forward rule always previews as indeterminate, so without
+        // this an ordinary proxy origin that routes on a body field would
+        // claim a GraphQL validation was pending, and the validation step
+        // would then refuse the request for not being GraphQL.
+        EffectiveAction::Indeterminate => origin_can_validate_graphql(pipeline, origin_idx),
         EffectiveAction::Resolved(action) => matches!(
             action,
             Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
         ),
     }
+}
+
+/// Whether any action this origin could route to validates GraphQL.
+///
+/// Used to decide what an unevaluable route preview might have selected, so
+/// it deliberately looks at every candidate rather than at one.
+fn origin_can_validate_graphql(pipeline: &CompiledPipeline, origin_idx: usize) -> bool {
+    fn validates(action: &Action) -> bool {
+        matches!(action, Action::GraphQL(graphql) if graphql.validation_enabled())
+    }
+    if pipeline.actions.get(origin_idx).is_some_and(validates) {
+        return true;
+    }
+    pipeline
+        .forward_rules
+        .get(origin_idx)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .any(|rule| validates(&rule.action))
 }
 
 /// Resolve the base or header/path/query-matched forward-rule action without
@@ -3035,6 +3059,73 @@ pub(super) async fn request_filter(
                 return Ok(true);
             }
         }
+    }
+
+    // --- MCP 2026-07-28 transport trust, ahead of authentication ---
+    //
+    // A request addressed to an origin this gateway does not serve must not
+    // reach the auth backend, be handed an authentication challenge, or cause
+    // federation work. Authentication runs immediately below and action
+    // dispatch runs much later, so this is the only place that gets ahead of
+    // both.
+    //
+    // Classification is header-only, which is complete for any caller that
+    // follows the era: `MCP-Protocol-Version` and `Mcp-Method` are mandatory
+    // on the wire precisely so an intermediary can classify without reading a
+    // body. It is not complete for a caller that does not, and the gap is the
+    // request shape this gate most wants to stop. A cross-origin `fetch()`
+    // cannot set either header without a preflight, but a simple request can
+    // carry any body under `text/plain`, so a hostile page can put the modern
+    // marker in `_meta` and be classified legacy here. That request is still
+    // refused, in `handle_mcp_action`, once there is a body to read; what it
+    // gets to do first is run authentication, which for a forward-auth origin
+    // means an outbound call per request. The catalogue and the OAuth
+    // challenge both sit behind the body-aware check, so this is amplification
+    // rather than disclosure. Reading the body here to close it would mean
+    // buffering every request to every MCP origin ahead of routing, which
+    // costs more than the amplification does.
+    //
+    // The route is resolved the way every other pre-route consumer in this
+    // file resolves it, because an origin whose base action is MCP can still
+    // send this path elsewhere through a forward rule, and judging that
+    // request against the MCP action's trust anchor would refuse it before the
+    // rule it would actually have taken is ever evaluated.
+    let mcp_modern_rejection = match request_effective_action(session, &pipeline, origin_idx) {
+        EffectiveAction::Resolved(Some(Action::Mcp(mcp))) => {
+            let request = session.req_header();
+            if sbproxy_extension::mcp::classify_http_era(None, &request.headers)
+                == sbproxy_extension::mcp::McpProtocolEra::Modern2026_07_28
+            {
+                let authority = super::action_dispatch::mcp_request_target_authority(&request.uri);
+                let scheme = if ctx.tls_terminated { "https" } else { "http" };
+                mcp.validate_modern_http_request(scheme, authority.as_deref(), &request.headers)
+                    .err()
+                    .map(|rejection| (rejection, scheme, authority, mcp.server_name.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some((rejection, scheme, authority, server_name)) = mcp_modern_rejection {
+        let status = super::action_dispatch::record_mcp_modern_refusal(
+            rejection,
+            &server_name,
+            scheme,
+            authority.as_deref(),
+            ctx,
+            session,
+        );
+        super::action_dispatch::write_mcp_wire_response(
+            session,
+            sbproxy_extension::mcp::McpWireResponse {
+                status,
+                headers: http::HeaderMap::new(),
+                body: None,
+            },
+        )
+        .await?;
+        return Ok(true);
     }
 
     // --- Auth check ---

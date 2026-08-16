@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-15*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -136,6 +136,97 @@ the spec's assumed-version rule. `2025-03-26` is deliberately absent:
 that revision requires servers to accept JSON-RPC batches, which this
 gateway does not, so a batch body returns a specific invalid-request
 error rather than a silent mis-negotiation.
+
+## The 2026-07-28 era
+
+One endpoint serves both the established `2025-06-18` protocol and the
+stateless `2026-07-28` one. A request selects the newer era by showing
+positive evidence for it, and anything else is served exactly as it was
+before this split existed:
+
+- an `MCP-Protocol-Version: 2026-07-28` header, or
+- an `Mcp-Method`, `Mcp-Name`, or `Mcp-Param-*` routing header, or
+- an `io.modelcontextprotocol/*` marker in the request's `params._meta`.
+
+An older or unrecognized revision in `MCP-Protocol-Version` is not
+evidence of the newer era. It stays on the established path and gets the
+same `400` it always did, so a client can still negotiate down through
+`initialize`.
+
+A `2026-07-28` request is stateless. It never receives an
+`Mcp-Session-Id`, and it carries its own context on every call:
+`io.modelcontextprotocol/protocolVersion` and
+`io.modelcontextprotocol/clientCapabilities` in `params._meta`, plus
+`MCP-Protocol-Version` and `Mcp-Method` as headers. `tools/call`,
+`resources/read`, and `prompts/get` also send `Mcp-Name`. Header names
+compare case-insensitively and values case-sensitively. A header that
+disagrees with the body is refused rather than reconciled.
+
+Successful results carry `resultType: "complete"` and
+`io.modelcontextprotocol/serverInfo`. List and discovery results carry
+`ttlMs: 0` and `cacheScope: "private"`, and every `listChanged` is
+`false` because subscriptions are not implemented. Three error codes are
+specific to this era: `-32020` for a malformed or missing routing
+carrier, `-32021` for a rejected envelope, and `-32022` for an
+unsupported protocol version.
+
+The gateway deliberately does not advertise or serve subscriptions,
+Tasks, MCP Apps, MRTR generation, or arbitrary protocol extensions on
+this era. It answers `server/discover`, the tool, resource, and prompt
+method set, and nothing beyond that.
+
+### Trusting the endpoint's own origin
+
+The newer era validates the browser `Origin` and the request authority
+before it authenticates, reads a catalog, or contacts an upstream. That
+check needs to know the endpoint's real public origin, so declare it:
+
+```yaml
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      modern_http:
+        public_origin: "https://mcp.example.com"
+        allowed_origins:
+          - "https://console.example.com"
+      federated_servers:
+        - origin: https://tools.internal
+          prefix: tools
+```
+
+An origin with an exact hostname derives its own anchor, so
+`modern_http` is optional there. A wildcard hostname cannot, and without
+`public_origin` every `2026-07-28` request to it is refused with a
+`421`. That refusal is logged with the reason and the authority that was
+rejected, and it is recorded as a `mcp_transport_denied` security audit
+event so it reaches the same SIEM stream as every other denial. The
+response body is empty on purpose so a disallowed origin learns nothing
+about the endpoint.
+
+The two ways of getting an anchor differ on the port, and only for the
+request authority. An origin key is a hostname and carries no port, so a
+derived anchor checks that the request is addressed to a name this
+gateway serves and accepts whatever port the client dialed. A gateway on
+`8080` works without configuration. A declared `public_origin` is you
+writing down the URL clients use, port included, and is matched whole.
+
+The browser `Origin` is compared with ports either way, because two
+ports on one host are two origins and treating them as one would let a
+page on `http://localhost:3000` drive a gateway on `http://localhost:8080`.
+Under a derived anchor the comparison is against the request's own
+origin, so the gateway's own pages are same-origin on whatever port it
+runs. Anything else needs `allowed_origins`.
+
+Behind a TLS-terminating load balancer, list the balancer in
+`proxy.trusted_proxies`. The gateway takes the external scheme from
+`X-Forwarded-Proto` only for peers in that list, and strips the header
+from everyone else.
+
+Misspelling a key inside `modern_http` fails config compilation rather
+than being ignored, because every key here turns on a protection and a
+typo would otherwise read as hardening that is not in effect.
 
 ## Minimal config
 
@@ -320,6 +411,98 @@ guardrails:
 Multiple `tool_allowlist` entries are unioned. An empty `allow` list
 denies every call. No guardrails means open access. Source:
 `crates/sbproxy-modules/src/action/mcp.rs:McpGuardrailEntry`.
+
+## Watching the catalog for tampering
+
+A federated tool's name, title, and description reach the model at
+`tools/list`, before anything is called. That makes the catalog itself a
+place an upstream can influence behavior, and it is why approving
+individual calls does not cover it: by the time a call is approved, the
+text has already been read.
+
+The gateway reports two classes of finding when it publishes a refreshed
+catalog. Both are reports, not refusals. They change no bytes on the
+wire, so they run for every deployment without being configured.
+
+### Text a reviewer cannot see
+
+Several Unicode ranges are invisible in a rendered catalog and plain
+text to a model. The Unicode TAG block is the sharpest: every code point
+in `U+E0000` to `U+E007F` mirrors an ASCII character and displays as
+nothing at all, so a description can carry a full sentence past the
+person approving it.
+
+A finding names the tool, the field, and what it found:
+
+```
+WARN mcp.catalog kind=added field=description classes=tag_block
+     tool=search server=alpha
+     MCP advertised tool text conceals content from a reader
+```
+
+Counted on `sbproxy_mcp_concealed_text_findings_total{field, class,
+kind}`, where `class` is one of `tag_block`, `bidi_control`,
+`zero_width`, or `other_control`.
+
+Ordinary text in any language is never a finding. An Arabic or Hebrew
+description contains right-to-left characters by nature; only the
+explicit controls that reorder or hide are reported.
+
+### Descriptions that read as instructions
+
+The second class is the static tool-poisoning indicators: a path that
+holds credentials, an instruction inside a markup comment that renders
+as nothing, or text addressed to the model rather than to a reader.
+
+```
+WARN mcp.catalog kind=added field=description
+     indicators=credential_path,model_directive
+     tool=search server=alpha
+     MCP advertised tool text carries a poisoning indicator
+```
+
+Counted on `sbproxy_mcp_poison_indicators_total{field, indicator,
+kind}`.
+
+**This is not injection detection, and nothing is blocked by it.**
+Measured catch rates for content-based injection detectors on realistic
+traffic are single digit, and attacks written against a published
+defense break it. Treating this as a boundary would be a false sense of
+one. What it gives you is a named, countable signal to review, and a
+reason to look at a specific tool from a specific upstream.
+
+The controls that *are* enforced are the deterministic ones: contract
+pinning, which refuses a tool whose definition moved
+([tool versioning](tool-versioning.md)); argument schemas, which refuse a
+call whose arguments do not match what the tool declared; and the
+namespacing below.
+
+Both reports are edge triggered. A catalog that keeps advertising the
+same finding says so once, when it appears and again when it clears, not
+on every refresh.
+
+### Keeping one upstream from speaking for another
+
+A description from one server can name a tool belonging to a different
+server, so that a model reading both is steered across the boundary. The
+answer is structural rather than a scan: give every upstream its own
+namespace, so a name always carries its owner and no description can
+borrow another server's identity.
+
+```yaml
+federated_servers:
+  - origin: "tools.internal"
+    prefix: internal
+    namespace: always
+  - origin: "partner.example"
+    prefix: partner
+    namespace: always
+```
+
+With `namespace: always`, `internal.search` and `partner.search` are
+distinct names from the moment they are advertised, rather than only
+once they collide. Prefer it whenever more than one upstream is
+federated and they are not equally trusted.
 
 ## Progressive discovery
 

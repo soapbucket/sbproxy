@@ -318,8 +318,15 @@ fn extension_bundle_reload_publishes_one_complete_generation() {
         "export function missingExpectedExport() {}",
     );
     let (status, body) = post_reload(admin_port);
-    assert_eq!(status, 500, "invalid candidate response: {body}");
-    assert!(body.contains("reload failed"), "{body}");
+    // A candidate the operator submitted that does not compile is their
+    // error, not the node's, so the reload endpoint answers 400 and names the
+    // key at fault. It used to answer 500, which read as "the node broke"
+    // for what is a typo in the submitted config.
+    assert_eq!(status, 400, "invalid candidate response: {body}");
+    assert!(
+        body.contains("does not compile") && body.contains("bundle.javascript"),
+        "the refusal must name what failed to compile: {body}"
+    );
     let after_failure = proxy
         .get("/", "extension.localhost")
         .expect("request after rejected generation");

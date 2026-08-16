@@ -1,5 +1,5 @@
 # Cloudflare Code Mode
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-15*
 
 SBproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code
@@ -29,7 +29,7 @@ export interface SearchDocsOutput {
 
 export const codemode = {
   /** Search the documentation. */
-  search_docs: (input: SearchDocsInput): Promise<SearchDocsOutput> =>
+  ['search_docs']: (input: SearchDocsInput): Promise<SearchDocsOutput> =>
     __codemode_call('search_docs', input as unknown),
 } as const;
 
@@ -74,9 +74,9 @@ The codegen covers the subset MCP tool schemas typically use:
   to emit. Operators who want a tighter type can post-process or
   ask the upstream MCP server to publish a tighter schema.
 
-Property names that collide with TypeScript reserved words or
-contain non-identifier characters are emitted as string-quoted keys
-(`'class':`, `'with-dash':`).
+Every tool name is emitted as a computed string key (`['class']`,
+`['with-dash']`, and even `['__proto__']`) so upstream names always remain data
+and cannot change the generated namespace object's prototype.
 
 ## Streaming tools
 

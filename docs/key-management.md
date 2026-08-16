@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-15*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -976,6 +976,23 @@ This field does not control the key-owned definitions in `inject_tools` or
 `inject_mcp`. In the web UI, choose **Unrestricted** for `null`, or **Use
 allowlist** for a list. An empty allowlist intentionally denies every
 caller-supplied tool.
+
+`inject_mcp.ref` resolves an MCP action by `server_info.name` only within the
+request route's tenant and pinned configuration generation. The injected set
+is the intersection of the MCP action's tool allowlist, per-server RBAC,
+version-gate verdict, and the key's optional `inject_mcp.filter`. A reference
+cannot select another tenant's catalogue, and a rejected reload cannot replace
+the source held by an in-flight request. If that governed intersection is
+empty or the tenant-local reference is unknown, SBproxy sends an empty tool
+array; it never falls back to caller-supplied tools.
+
+The tenant is worth checking on an existing config. The reference used to
+resolve by name across the whole node, so a key could reach a catalogue on any
+tenant. It is now scoped, and a reference that crosses a tenant boundary
+resolves to nothing: the request still succeeds, with no tools. Give the MCP
+origin the same `tenant_id` as the `ai_proxy` origin whose keys name it. The
+refusal is logged with the reference and the route's tenant, so grep for
+`inject_mcp references an unknown MCP gateway` to find one.
 
 ### Governed admission: strict and approximate
 

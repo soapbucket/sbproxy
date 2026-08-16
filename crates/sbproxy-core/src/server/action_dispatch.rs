@@ -2033,25 +2033,83 @@ origins:
 pub(super) async fn handle_mcp_action(
     session: &mut Session,
     mcp: &sbproxy_modules::action::McpAction,
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     has_agent_skills: bool,
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
-        is_supported_protocol_version, negotiate_protocol_version, InitializeResult,
-        JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo, INTERNAL_ERROR,
-        INVALID_PARAMS, INVALID_REQUEST, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, PARSE_ERROR,
-        SUPPORTED_PROTOCOL_VERSIONS,
+        negotiate_protocol_version, InitializeResult, JsonRpcResponse, ServerCapabilities,
+        ServerInfo, HEADER_MISMATCH, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
+        LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND,
+    };
+    use sbproxy_extension::mcp::{
+        classify_http_era, decode_http_request_with_scan, DecodedRequestId, McpProtocolCodec,
+        McpProtocolEra, McpServerDescription, McpWireResponse, Modern2026_07_28Codec,
+        RawModernScan,
     };
 
     let method = session.req_header().method.clone();
-    let req_path = session.req_header().uri.path();
 
-    // WOR-1638: make the federation servable before any branch reads
-    // the registry. First request spawns the periodic refresh task
-    // and runs the cold-start prime (single-flight); every request
-    // after that is a no-op fast path serving the cached snapshot.
-    // Inbound traffic never fans out to upstream catalogues inline.
-    mcp.federation.ensure_ready(mcp.refresh_interval).await;
+    // Preserve every received field line for modern duplicate detection.
+    // HeaderMap::clone retains repeated and non-UTF-8 values; no protected
+    // routing carrier is coalesced before the protocol codec sees it.
+    let request_headers = session.req_header().headers.clone();
+    let uri_authority = mcp_request_target_authority(&session.req_header().uri);
+    // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+    // `X-Forwarded-Proto: https` stamped by a peer inside
+    // `proxy.trusted_proxies`. The request phase strips that header
+    // from untrusted peers, so an external client cannot forge it.
+    let listener_is_tls = ctx.tls_terminated;
+    let connection_scheme = if listener_is_tls { "https" } else { "http" };
+
+    // Transport trust runs before anything else this function can do,
+    // whatever the method. The well-known routes below read the tool
+    // catalogue and start the federation, and a POST reaches authentication
+    // before its body is ever scanned, so refusing later would mean a
+    // disallowed Origin had already learned the catalogue, caused upstream
+    // work, or been handed an authentication challenge. All three are what
+    // this check exists to prevent.
+    //
+    // Classification here is header-only on purpose, and it is complete for
+    // any conforming caller: the era makes `MCP-Protocol-Version` and
+    // `Mcp-Method` mandatory on every request precisely so an intermediary
+    // can classify without parsing the body. A body-only marker is malformed
+    // rather than modern and is still refused further down, once there is a
+    // body to read.
+    //
+    // Only the refusal is hoisted. Whether a modern request may use a given
+    // method is decided after the well-known routes, so a trusted modern
+    // client still fetches them exactly as it did before, and a trusted
+    // modern POST falls through here untouched.
+    //
+    // Marker-free legacy traffic never enters this branch and reaches the
+    // routes below unchanged.
+    if classify_http_era(None, &request_headers) == McpProtocolEra::Modern2026_07_28 {
+        if let Err(rejection) = mcp.validate_modern_http_request(
+            connection_scheme,
+            uri_authority.as_deref(),
+            &request_headers,
+        ) {
+            let status = record_mcp_modern_refusal(
+                rejection,
+                &mcp.server_name,
+                connection_scheme,
+                uri_authority.as_deref(),
+                ctx,
+                session,
+            );
+            return write_mcp_wire_response(
+                session,
+                McpWireResponse {
+                    status,
+                    headers: http::HeaderMap::new(),
+                    body: None,
+                },
+            )
+            .await;
+        }
+    }
+
+    let req_path = session.req_header().uri.path();
 
     // WOR-483: serve the federated tool catalogue as a typed
     // Cloudflare-Code-Mode TypeScript module at
@@ -2061,10 +2119,15 @@ pub(super) async fn handle_mcp_action(
     // any TypeScript agent or sandbox can `import` the module
     // directly without a separate codegen step.
     if method == http::Method::GET && req_path == "/.well-known/mcp/codemode.ts" {
-        let listener_is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
+        // This well-known route reads the catalogue, so it explicitly
+        // starts the federation. Endpoint traffic is primed only after
+        // transport trust and authentication have succeeded below.
+        mcp.federation.ensure_ready(mcp.refresh_interval).await;
+        // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+        // `X-Forwarded-Proto: https` stamped by a peer inside
+        // `proxy.trusted_proxies`. The request phase strips that header
+        // from untrusted peers, so an external client cannot forge it.
+        let listener_is_tls = ctx.tls_terminated;
         let scheme = if listener_is_tls { "https" } else { "http" };
         let callback_base = match session
             .req_header()
@@ -2171,10 +2234,11 @@ pub(super) async fn handle_mcp_action(
         && req_path == sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
     {
         if let Some(oauth) = mcp.oauth.as_ref() {
-            let listener_is_tls = session
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref())
-                .is_some();
+            // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+            // `X-Forwarded-Proto: https` stamped by a peer inside
+            // `proxy.trusted_proxies`. The request phase strips that header
+            // from untrusted peers, so an external client cannot forge it.
+            let listener_is_tls = ctx.tls_terminated;
             let scheme = if listener_is_tls { "https" } else { "http" };
             let resource = match session
                 .req_header()
@@ -2219,13 +2283,15 @@ pub(super) async fn handle_mcp_action(
     if method == http::Method::GET
         && sbproxy_extension::mcp::discovery::SERVER_MANIFEST_PATHS.contains(&req_path)
     {
+        mcp.federation.ensure_ready(mcp.refresh_interval).await;
         // Own the path now so its borrow of `session` ends before the
         // mutable `write_response_*` calls below (used only for audit).
         let path_for_log = req_path.to_string();
-        let listener_is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
+        // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+        // `X-Forwarded-Proto: https` stamped by a peer inside
+        // `proxy.trusted_proxies`. The request phase strips that header
+        // from untrusted peers, so an external client cannot forge it.
+        let listener_is_tls = ctx.tls_terminated;
         let scheme = if listener_is_tls { "https" } else { "http" };
         let endpoint = match session
             .req_header()
@@ -2241,23 +2307,22 @@ pub(super) async fn handle_mcp_action(
         // RBAC policy against the inbound principal (WOR-1065) so
         // the manifest never lists a tool the gateway would refuse
         // to call for this caller.
-        let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> = mcp
-            .federation
-            .list_tools()
-            .into_iter()
-            .filter(|t| mcp.is_tool_allowed(&t.name))
-            .filter(|t| match mcp.policy_for_server(&t.server_name) {
-                Some(policy) => matches!(
-                    policy.check(&ctx.principal, &t.name),
-                    sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                ),
-                None => true,
-            })
-            .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
-                name: t.name,
-                description: t.description,
-            })
-            .collect();
+        let catalog = mcp.federation.tool_catalog_snapshot();
+        let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> =
+            mcp_unblocked_catalog_tools(&catalog)
+                .filter(|t| mcp.is_tool_allowed(&t.name))
+                .filter(|t| match mcp.policy_for_server(&t.server_name) {
+                    Some(policy) => matches!(
+                        policy.check(&ctx.principal, &t.name),
+                        sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                    ),
+                    None => true,
+                })
+                .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                })
+                .collect();
         // RFC 9728 auth-discovery pointer when the gateway is
         // OAuth-protected (WOR-806).
         let authorization = mcp.oauth.as_ref().map(|_| {
@@ -2307,6 +2372,26 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
+    // GET and DELETE have no JSON body to classify. Transport trust for a
+    // modern non-POST request was already validated at the top of this
+    // function, before any well-known route could read the catalogue, so
+    // what remains here is the method itself: the modern era serves no GET
+    // or DELETE endpoint. Marker-free traffic retains the frozen legacy
+    // stream and session lifecycle.
+    if method != http::Method::POST
+        && classify_http_era(None, &request_headers) == McpProtocolEra::Modern2026_07_28
+    {
+        return write_mcp_wire_response(
+            session,
+            McpWireResponse {
+                status: http::StatusCode::METHOD_NOT_ALLOWED,
+                headers: http::HeaderMap::new(),
+                body: None,
+            },
+        )
+        .await;
+    }
+
     // WOR-1642: a GET with `Accept: text/event-stream` opens the
     // streamable HTTP server-to-client channel. The gateway pushes
     // `notifications/tools/list_changed` and
@@ -2322,64 +2407,19 @@ pub(super) async fn handle_mcp_action(
             .map(|a| a.contains("text/event-stream"))
             .unwrap_or(false);
         if accepts_sse {
+            mcp.federation.ensure_ready(mcp.refresh_interval).await;
             return handle_mcp_server_stream(session, mcp, ctx).await;
         }
     }
 
     // WOR-1642: DELETE ends a session when session management is on.
     if method == http::Method::DELETE {
+        mcp.federation.ensure_ready(mcp.refresh_interval).await;
         return handle_mcp_session_delete(session, mcp, ctx).await;
     }
 
     if method != http::Method::POST {
         send_error(session, 405, "MCP gateway accepts POST only").await?;
-        return Ok(());
-    }
-
-    // WOR-1643: an OAuth-protected gateway must point credential-less
-    // callers at its protected-resource metadata; the MCP auth
-    // discovery flow starts from exactly this challenge (RFC 9728).
-    // Token validation stays in the generic auth layer; this covers
-    // only the no-Authorization-header case, so a request that passed
-    // header-based auth is never re-challenged. The well-known
-    // discovery routes above stay unauthenticated.
-    if mcp.oauth.is_some() && session.req_header().headers.get("authorization").is_none() {
-        let listener_is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
-        let scheme = if listener_is_tls { "https" } else { "http" };
-        let metadata_url = match session
-            .req_header()
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-        {
-            Some(authority) => format!(
-                "{scheme}://{authority}{}",
-                sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
-            ),
-            None => sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH.to_string(),
-        };
-        let mut header = pingora_http::ResponseHeader::build(401, Some(2)).map_err(|e| {
-            Error::because(ErrorType::InternalError, "failed to build 401 header", e)
-        })?;
-        let _ = header.insert_header(
-            "www-authenticate",
-            format!("Bearer resource_metadata=\"{metadata_url}\""),
-        );
-        let _ = header.insert_header("content-length", "0");
-        session
-            .write_response_header(Box::new(header), true)
-            .await?;
-        tracing::info!(
-            target: "sbproxy::audit",
-            event = "mcp.oauth.challenge",
-            mcp_server = %mcp.server_name,
-            request_id = %ctx.request_id,
-            resource_metadata = %metadata_url,
-            "challenged credential-less MCP request with RFC 9728 pointer"
-        );
         return Ok(());
     }
 
@@ -2410,63 +2450,182 @@ pub(super) async fn handle_mcp_action(
         body_bytes.extend_from_slice(&chunk);
     }
     let body_bytes = body_bytes.freeze();
-    let request: JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(r) => r,
-        Err(_) => {
-            // WOR-1641: a JSON-RPC batch (top-level array) is valid
-            // JSON, so answer it with a specific message instead of
-            // a bare parse error. The 2025-06-18 revision removed
-            // batching and this gateway does not accept it.
-            let first_byte = body_bytes.iter().find(|b| !b.is_ascii_whitespace());
-            let (code, message) = if first_byte == Some(&b'[') {
-                (
-                    INVALID_REQUEST,
-                    "JSON-RPC batching is not supported (removed in MCP 2025-06-18); send one request per POST",
-                )
-            } else {
-                (PARSE_ERROR, "invalid JSON-RPC body")
-            };
-            let err = JsonRpcResponse::error(None, code, message);
-            return write_jsonrpc(session, &err).await;
-        }
-    };
+    let scan = RawModernScan::scan(&body_bytes);
+    let selected_era = classify_http_era(Some(&scan), &request_headers);
 
-    if request.jsonrpc != "2.0" {
-        let err = JsonRpcResponse::error(
-            request.id.clone(),
-            INVALID_REQUEST,
-            "jsonrpc field must be \"2.0\"",
-        );
-        return write_jsonrpc(session, &err).await;
+    // The modern transport trust boundary precedes every authentication,
+    // catalogue, policy, and upstream operation. Marker-free legacy traffic
+    // deliberately bypasses this new check.
+    if selected_era == McpProtocolEra::Modern2026_07_28 {
+        if let Err(rejection) = mcp.validate_modern_http_request(
+            connection_scheme,
+            uri_authority.as_deref(),
+            &request_headers,
+        ) {
+            let status = record_mcp_modern_refusal(
+                rejection,
+                &mcp.server_name,
+                connection_scheme,
+                uri_authority.as_deref(),
+                ctx,
+                session,
+            );
+            return write_mcp_wire_response(
+                session,
+                McpWireResponse {
+                    status,
+                    headers: http::HeaderMap::new(),
+                    body: None,
+                },
+            )
+            .await;
+        }
     }
 
-    // WOR-1641: post-initialize requests SHOULD carry
-    // `MCP-Protocol-Version`; when present it must name a revision
-    // the gateway serves, else 400 per the spec's version-validation
-    // rule. A missing header is accepted (the request is served at
-    // the gateway's newest revision). `initialize` is exempt: that
-    // is where negotiation happens.
-    if request.method != "initialize" {
-        if let Some(header_version) = session
-            .req_header()
-            .headers
-            .get("mcp-protocol-version")
-            .and_then(|v| v.to_str().ok())
+    // WOR-1643: challenge only after a modern request has proven that it is
+    // addressed to this trusted endpoint. This prevents a disallowed browser
+    // Origin from learning auth metadata or triggering federation work.
+    if mcp.oauth.is_some() && request_headers.get("authorization").is_none() {
+        let host_authority = request_headers
+            .get("host")
+            .and_then(|value| value.to_str().ok());
+        let trusted_uri_authority = (selected_era == McpProtocolEra::Modern2026_07_28)
+            .then_some(uri_authority.as_deref())
+            .flatten();
+        let metadata_url = mcp_oauth_resource_metadata_url(
+            connection_scheme,
+            trusted_uri_authority,
+            host_authority,
+        );
+        let mut header = pingora_http::ResponseHeader::build(401, Some(2)).map_err(|error| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to build 401 header",
+                error,
+            )
+        })?;
+        let _ = header.insert_header(
+            "www-authenticate",
+            format!("Bearer resource_metadata=\"{metadata_url}\""),
+        );
+        let _ = header.insert_header("content-length", "0");
+        session
+            .write_response_header(Box::new(header), true)
+            .await?;
+        tracing::info!(
+            target: "sbproxy::audit",
+            event = "mcp.oauth.challenge",
+            mcp_server = %mcp.server_name,
+            request_id = %ctx.request_id,
+            resource_metadata = %metadata_url,
+            "challenged credential-less MCP request with RFC 9728 pointer"
+        );
+        return Ok(());
+    }
+
+    let decoded = match decode_http_request_with_scan(&scan, &request_headers) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            // The frozen gateway exposed a present unsupported legacy
+            // protocol-version header as its plaintext HTTP 400 path. Keep
+            // that exact outer behavior even though the reusable legacy codec
+            // represents the same rejection as a typed wire error.
+            if selected_era == McpProtocolEra::Legacy2025_06_18
+                && error.0.status == http::StatusCode::BAD_REQUEST
+            {
+                if let Some(sbproxy_extension::mcp::McpWireBody::Legacy(response)) =
+                    error.0.body.as_ref()
+                {
+                    if let Some(rpc_error) = response.error.as_ref() {
+                        send_error(session, 400, &rpc_error.message).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            return write_mcp_wire_response(session, *error.0).await;
+        }
+    };
+    let era = decoded.context.era;
+    let request_id = decoded.request_id;
+    let routing_headers = decoded.routing_headers;
+    let mut request = decoded.request;
+
+    let is_modern = era == McpProtocolEra::Modern2026_07_28;
+    if is_modern {
+        let supported_method = matches!(
+            request.method.as_str(),
+            "server/discover"
+                | "tools/list"
+                | "tools/call"
+                | "resources/list"
+                | "resources/read"
+                | "prompts/list"
+                | "prompts/get"
+        );
+        let request_id_is_absent = matches!(
+            &request_id,
+            DecodedRequestId::Modern(id) if id.is_absent()
+        );
+        if request_id_is_absent {
+            // Same predicate as `supported_method`: a method this era knows
+            // but that arrived without an id is a malformed request, not an
+            // unknown method. Keeping one list means the two answers cannot
+            // drift apart.
+            let (code, message) = if supported_method {
+                (INVALID_REQUEST, "modern MCP request methods require an id")
+            } else {
+                (METHOD_NOT_FOUND, "unknown modern MCP method")
+            };
+            if let DecodedRequestId::Modern(id) = &request_id {
+                let response = Modern2026_07_28Codec.encode_error(id.clone(), code, message, None);
+                return write_mcp_wire_response(session, response).await;
+            }
+        }
+        if !supported_method {
+            if let DecodedRequestId::Modern(id) = &request_id {
+                let response = Modern2026_07_28Codec.encode_error(
+                    id.clone(),
+                    METHOD_NOT_FOUND,
+                    &format!("unknown method: {}", request.method),
+                    None,
+                );
+                return write_mcp_wire_response(session, response).await;
+            }
+        }
+        if mcp.strict_modern_parameter_headers()
+            && request.method != "tools/call"
+            && !routing_headers.params.is_empty()
         {
-            if !is_supported_protocol_version(header_version) {
-                send_error(
-                    session,
-                    400,
-                    &format!(
-                        "unsupported MCP-Protocol-Version '{header_version}' (supported: {})",
-                        SUPPORTED_PROTOCOL_VERSIONS.join(", ")
-                    ),
-                )
-                .await?;
-                return Ok(());
+            if let DecodedRequestId::Modern(id) = &request_id {
+                let response = Modern2026_07_28Codec.encode_error(
+                    id.clone(),
+                    HEADER_MISMATCH,
+                    "MCP parameter routing headers are not valid for this method",
+                    None,
+                );
+                return write_mcp_wire_response(session, response).await;
             }
         }
     }
+
+    // A structurally valid, authenticated endpoint request may now start the
+    // federation. This remains a single-flight cold prime followed by a cheap
+    // readiness check on warm requests.
+    mcp.federation.ensure_ready(mcp.refresh_interval).await;
+
+    let held_modern_tool_catalog = is_modern.then(|| mcp.federation.tool_catalog_snapshot());
+    let modern_server = is_modern.then(|| McpServerDescription {
+        implementation: sbproxy_extension::mcp::McpImplementation {
+            name: mcp.server_name.clone(),
+            version: mcp.server_version.clone(),
+        },
+        capabilities: sbproxy_extension::mcp::protocol::modern_server_capabilities(
+            true,
+            !mcp.federation.list_resources().is_empty(),
+            mcp.federation.prompts_capability().is_some(),
+        ),
+        instructions: None,
+    });
 
     // WOR-1644: code-mode's emitted runtime stub sends
     // `mcp-caller: code-execution`, so tool calls it makes are
@@ -2486,40 +2645,42 @@ pub(super) async fn handle_mcp_action(
     // unknown or expired means 404, the client's cue to
     // re-initialize.
     let mut mcp_session_id: Option<String> = None;
-    if let Some(store) = mcp.sessions.as_deref() {
-        if request.method != "initialize" {
-            match session
-                .req_header()
-                .headers
-                .get("mcp-session-id")
-                .and_then(|v| v.to_str().ok())
-            {
-                None => {
-                    send_error(
-                        session,
-                        400,
-                        "missing Mcp-Session-Id header (session management is enabled)",
-                    )
-                    .await?;
-                    return Ok(());
+    if !is_modern {
+        if let Some(store) = mcp.sessions.as_deref() {
+            if request.method != "initialize" {
+                match session
+                    .req_header()
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    None => {
+                        send_error(
+                            session,
+                            400,
+                            "missing Mcp-Session-Id header (session management is enabled)",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Some(id) if !store.validate(id) => {
+                        send_error(
+                            session,
+                            404,
+                            "unknown or expired MCP session; re-initialize",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Some(id) => mcp_session_id = Some(id.to_string()),
                 }
-                Some(id) if !store.validate(id) => {
-                    send_error(
-                        session,
-                        404,
-                        "unknown or expired MCP session; re-initialize",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                Some(id) => mcp_session_id = Some(id.to_string()),
             }
         }
     }
 
     // Notifications (id absent) get an empty 202 Accepted per the
     // streamable HTTP transport (WOR-1642; previously 204).
-    if request.id.is_none() {
+    if !is_modern && request.id.is_none() {
         let header = pingora_http::ResponseHeader::build(202, Some(0))
             .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp 202", e))?;
         session
@@ -2530,13 +2691,28 @@ pub(super) async fn handle_mcp_action(
 
     // WOR-1640: take the method out so match arms can move
     // `request.params` instead of cloning the full inbound JSON.
-    let mut request = request;
     let rpc_method = std::mem::take(&mut request.method);
     // WOR-1642: set when this request is an `initialize` on a
     // session-managed gateway; the response then carries the issued
     // `Mcp-Session-Id` header.
     let mut issued_session: Option<String> = None;
     let response = match rpc_method.as_str() {
+        "server/discover" if is_modern => match modern_server.as_ref() {
+            Some(server) => JsonRpcResponse::success(
+                request.id.clone(),
+                sbproxy_extension::mcp::protocol::build_discover_result(server),
+            ),
+            None => JsonRpcResponse::error(
+                request.id.clone(),
+                INTERNAL_ERROR,
+                "modern MCP server description is unavailable",
+            ),
+        },
+        "initialize" | "ping" if is_modern => JsonRpcResponse::error(
+            request.id.clone(),
+            METHOD_NOT_FOUND,
+            &format!("unknown method: {}", rpc_method),
+        ),
         "initialize" => {
             // WOR-195: when the origin opts into Agent Skills, surface
             // `experimental.agentSkillsUrl` so MCP clients that have
@@ -2545,10 +2721,11 @@ pub(super) async fn handle_mcp_action(
             // and authenticated callers see the same path; the
             // manifest itself filters by visibility at serve time.
             let experimental = if has_agent_skills {
-                let listener_is_tls = session
-                    .digest()
-                    .and_then(|d| d.ssl_digest.as_ref())
-                    .is_some();
+                // Trust-bounded: `tls_terminated` is true for a TLS listener or a
+                // `X-Forwarded-Proto: https` stamped by a peer inside
+                // `proxy.trusted_proxies`. The request phase strips that header
+                // from untrusted peers, so an external client cannot forge it.
+                let listener_is_tls = ctx.tls_terminated;
                 let scheme = if listener_is_tls { "https" } else { "http" };
                 let url = match session
                     .req_header()
@@ -2667,7 +2844,61 @@ pub(super) async fn handle_mcp_action(
             // (`search` / `execute`) instead of the full catalogue, so
             // a large federated tool set stays out of the model's
             // context window.
-            if mcp.progressive_discovery {
+            if is_modern {
+                // Modern discovery is the directly callable strict-contract
+                // view from this request's held publication. Progressive
+                // meta-tools and rollout aliases are legacy-only until they
+                // have independently compiled caller-facing contracts.
+                match held_modern_tool_catalog.as_ref() {
+                    Some(catalog) => {
+                        let snapshot = catalog.serialized_modern_tools();
+                        let version_blocked = catalog.version_blocked();
+                        let rollout_hidden = mcp_modern_rollout_hidden_names(mcp, catalog);
+                        let mut tools = Vec::with_capacity(snapshot.entries.len());
+                        let mut serialization_failed = false;
+                        for entry in &snapshot.entries {
+                            if version_blocked.contains_key(&entry.name)
+                                || rollout_hidden.contains(&entry.name)
+                                || !mcp.is_tool_allowed(&entry.name)
+                            {
+                                continue;
+                            }
+                            if let Some(policy) = mcp.policy_for_server(&entry.server_name) {
+                                if !matches!(
+                                    policy.check(&ctx.principal, &entry.name),
+                                    sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                                ) {
+                                    continue;
+                                }
+                            }
+                            match serde_json::from_str::<serde_json::Value>(&entry.json) {
+                                Ok(tool) => tools.push(tool),
+                                Err(_) => {
+                                    serialization_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if serialization_failed {
+                            JsonRpcResponse::error(
+                                request.id.clone(),
+                                INTERNAL_ERROR,
+                                "modern MCP tool catalogue is unavailable",
+                            )
+                        } else {
+                            JsonRpcResponse::success(
+                                request.id.clone(),
+                                serde_json::json!({ "tools": tools }),
+                            )
+                        }
+                    }
+                    None => JsonRpcResponse::error(
+                        request.id.clone(),
+                        INTERNAL_ERROR,
+                        "modern MCP tool catalogue is unavailable",
+                    ),
+                }
+            } else if mcp.progressive_discovery {
                 JsonRpcResponse::success(
                     request.id.clone(),
                     serde_json::json!({ "tools": mcp_progressive_meta_tools() }),
@@ -2683,22 +2914,29 @@ pub(super) async fn handle_mcp_action(
                 // WOR-1065: the RBAC filter still runs per principal
                 // so the catalogue never lists a tool the gate would
                 // refuse to call for this caller.
-                let snapshot = mcp.federation.serialized_tools();
+                let catalog = mcp.federation.tool_catalog_snapshot();
+                let snapshot = catalog.serialized_tools();
                 // WOR-1635: tools blocked by the version gate are
-                // filtered out of the catalogue entirely.
-                let version_blocked = mcp.federation.version_blocked();
+                // filtered out of the catalogue entirely. Both views
+                // come from one immutable catalog publication.
+                let version_blocked = catalog.version_blocked();
                 // Rollout plane: compute the per-consumer patch
                 // (managed entries to hide, versioned entries to
-                // advertise instead) before the filter loop runs.
+                // advertise instead) before the filter loop runs. Blocked
+                // entries are excluded from its live-schema source, and
+                // synthesized entries receive a second held-target check
+                // below for inline-contract routes.
+                let rollout_session_reqs = mcp_session_id.as_deref().and_then(|sid| {
+                    mcp.sessions
+                        .as_deref()
+                        .and_then(|s| s.tool_requirements(sid))
+                });
+                let rollout_today = chrono::Utc::now().date_naive();
                 let rollout_patch = mcp.rollout_plan.as_ref().map(|plan| {
-                    let session_reqs = mcp_session_id.as_deref().and_then(|sid| {
-                        mcp.sessions
-                            .as_deref()
-                            .and_then(|s| s.tool_requirements(sid))
-                    });
                     let entries: Vec<mcp_rollout::CatalogueEntry<'_>> = snapshot
                         .entries
                         .iter()
+                        .filter(|entry| !version_blocked.contains_key(&entry.name))
                         .map(|e| mcp_rollout::CatalogueEntry {
                             name: &e.name,
                             server: &e.server_name,
@@ -2708,9 +2946,9 @@ pub(super) async fn handle_mcp_action(
                     mcp_rollout::synthesize_view(
                         plan,
                         &entries,
-                        session_reqs.as_deref(),
+                        rollout_session_reqs.as_deref(),
                         Some(&ctx.principal),
-                        chrono::Utc::now().date_naive(),
+                        rollout_today,
                     )
                 });
                 let needs_filter = mcp.tool_allowlist.is_some()
@@ -2751,18 +2989,25 @@ pub(super) async fn handle_mcp_action(
                         first = false;
                         out.push_str(&entry.json);
                     }
-                    if let Some(patch) = &rollout_patch {
+                    if let (Some(plan), Some(patch)) =
+                        (mcp.rollout_plan.as_ref(), rollout_patch.as_ref())
+                    {
                         // Versioned entries the managed tools
-                        // advertise in place of the hidden ones. RBAC
-                        // stays enforced at call time on the resolved
-                        // server; the allowlist applies here by name.
+                        // advertise in place of the hidden ones. A
+                        // synthesized inline contract is visible only when
+                        // its exact routed target exists, is unblocked, and
+                        // passes the same target-name allowlist and
+                        // target-server RBAC checks as tools/call.
                         for tool in &patch.synthesized {
-                            let allowed = tool
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|n| mcp.is_tool_allowed(n))
-                                .unwrap_or(false);
-                            if !allowed {
+                            if !mcp_synthesized_rollout_tool_is_visible_to_principal(
+                                mcp,
+                                plan,
+                                &catalog,
+                                tool,
+                                rollout_session_reqs.as_deref(),
+                                &ctx.principal,
+                                rollout_today,
+                            ) {
                                 continue;
                             }
                             if let Ok(json) = serde_json::to_string(tool) {
@@ -2789,7 +3034,7 @@ pub(super) async fn handle_mcp_action(
             // WOR-818/WOR-1638: pass-through the federated resource
             // list from the primed snapshot (same pattern as
             // `tools/list`).
-            let resources: Vec<serde_json::Value> = mcp
+            let mut resources: Vec<serde_json::Value> = mcp
                 .federation
                 .list_resources()
                 .into_iter()
@@ -2807,6 +3052,13 @@ pub(super) async fn handle_mcp_action(
                     entry
                 })
                 .collect();
+            if is_modern {
+                resources.sort_by(|left, right| {
+                    left.get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .cmp(&right.get("uri").and_then(serde_json::Value::as_str))
+                });
+            }
             JsonRpcResponse::success(
                 request.id.clone(),
                 serde_json::json!({ "resources": resources }),
@@ -2829,11 +3081,17 @@ pub(super) async fn handle_mcp_action(
                 match mcp.federation.read_resource(uri).await {
                     Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
                     Err(e) => {
-                        warn!(error = %e, uri = %uri, "resources/read failed");
-                        JsonRpcResponse::error(
+                        if is_modern {
+                            warn!(failure_class = "upstream", "modern resources/read failed");
+                        } else {
+                            warn!(error = %e, uri = %uri, "resources/read failed");
+                        }
+                        mcp_upstream_failure_response(
                             request.id.clone(),
-                            INTERNAL_ERROR,
-                            &format!("resources/read failed: {e}"),
+                            is_modern,
+                            "upstream resource read failed",
+                            "resources/read failed",
+                            &e,
                         )
                     }
                 }
@@ -2844,7 +3102,17 @@ pub(super) async fn handle_mcp_action(
             // `tools/list` and `resources/list` are. Upstreams that
             // declare no prompts capability contributed nothing at
             // refresh time, so there is nothing here to skip for them.
-            let prompts = mcp_prompts_view(mcp, &ctx.principal, &mcp.federation.list_prompts());
+            let prompt_catalog = mcp.federation.prompt_catalog_snapshot();
+            let prompts = prompt_catalog.list_prompts();
+            let prompts = match held_modern_tool_catalog.as_ref() {
+                Some(tool_catalog) => {
+                    mcp_prompts_view_in_snapshot(mcp, &ctx.principal, &prompts, tool_catalog)
+                }
+                None => {
+                    let tool_catalog = mcp.federation.tool_catalog_snapshot();
+                    mcp_prompts_view_in_snapshot(mcp, &ctx.principal, &prompts, &tool_catalog)
+                }
+            };
             JsonRpcResponse::success(
                 request.id.clone(),
                 serde_json::json!({ "prompts": prompts }),
@@ -2857,10 +3125,27 @@ pub(super) async fn handle_mcp_action(
             // `-32602` (the client asked for something that is not in
             // the catalogue) rather than the `-32603` an upstream
             // failure would earn.
-            let owner = mcp.federation.resolve_prompt(name);
+            let prompt_catalog = mcp.federation.prompt_catalog_snapshot();
+            let owner = prompt_catalog.resolve_prompt(name);
             let reachable = owner
                 .as_ref()
-                .map(|p| mcp_prompt_server_reachable(mcp, &ctx.principal, &p.server_name))
+                .map(|p| match held_modern_tool_catalog.as_ref() {
+                    Some(tool_catalog) => mcp_prompt_server_reachable_in_snapshot(
+                        mcp,
+                        &ctx.principal,
+                        &p.server_name,
+                        tool_catalog,
+                    ),
+                    None => {
+                        let tool_catalog = mcp.federation.tool_catalog_snapshot();
+                        mcp_prompt_server_reachable_in_snapshot(
+                            mcp,
+                            &ctx.principal,
+                            &p.server_name,
+                            &tool_catalog,
+                        )
+                    }
+                })
                 .unwrap_or(false);
             if name.is_empty() {
                 JsonRpcResponse::error(
@@ -2896,14 +3181,24 @@ pub(super) async fn handle_mcp_action(
                 )
             } else {
                 let arguments = params.get("arguments").cloned();
-                match mcp.federation.get_prompt(name, arguments).await {
+                match mcp
+                    .federation
+                    .get_prompt_from_snapshot(&prompt_catalog, name, arguments)
+                    .await
+                {
                     Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
                     Err(e) => {
-                        warn!(error = %e, prompt = %name, "prompts/get failed");
-                        JsonRpcResponse::error(
+                        if is_modern {
+                            warn!(failure_class = "upstream", "modern prompts/get failed");
+                        } else {
+                            warn!(error = %e, prompt = %name, "prompts/get failed");
+                        }
+                        mcp_upstream_failure_response(
                             request.id.clone(),
-                            INTERNAL_ERROR,
-                            &format!("prompts/get failed: {e}"),
+                            is_modern,
+                            "upstream prompt retrieval failed",
+                            "prompts/get failed",
+                            &e,
                         )
                     }
                 }
@@ -2940,7 +3235,7 @@ pub(super) async fn handle_mcp_action(
             // value directly); `execute` unwraps to the real tool name +
             // arguments and then runs the normal allowlist / RBAC /
             // timeout / dispatch path below.
-            if mcp.progressive_discovery && tool_name.as_deref() == Some("search") {
+            if !is_modern && mcp.progressive_discovery && tool_name.as_deref() == Some("search") {
                 let query = arguments
                     .get("query")
                     .and_then(|v| v.as_str())
@@ -2959,7 +3254,10 @@ pub(super) async fn handle_mcp_action(
                     }),
                 )
             } else {
-                if mcp.progressive_discovery && tool_name.as_deref() == Some("execute") {
+                if !is_modern
+                    && mcp.progressive_discovery
+                    && tool_name.as_deref() == Some("execute")
+                {
                     let inner_name = arguments
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -2979,6 +3277,17 @@ pub(super) async fn handle_mcp_action(
                         "tools/call requires a 'name' parameter",
                     ),
                     Some(name) => {
+                        // Capture one publication before rollout planning.
+                        // Both the route-to-catalogue mapping and final
+                        // block-aware resolve below must use this handle,
+                        // otherwise a refresh can pair an old server route
+                        // with a replacement entry from a different server.
+                        let tool_catalog = match held_modern_tool_catalog.as_ref() {
+                            Some(catalog) => catalog.clone(),
+                            None => mcp.federation.tool_catalog_snapshot(),
+                        };
+                        let modern_rollout_hidden =
+                            is_modern.then(|| mcp_modern_rollout_hidden_names(mcp, &tool_catalog));
                         // Rollout plane: resolve the requested version
                         // before any gate runs, because the caller may
                         // use an alias (`search_v1`) or carry a `_meta`
@@ -2988,7 +3297,20 @@ pub(super) async fn handle_mcp_action(
                         let mut arguments = arguments;
                         let mut rollout_route: Option<mcp_rollout::RoutedCall> = None;
                         let mut rollout_reject: Option<JsonRpcResponse> = None;
-                        if let Some(plan) = mcp.rollout_plan.as_ref() {
+                        if is_modern {
+                            if mcp.rollout_plan.as_deref().is_some_and(|plan| {
+                                plan.manages(&name)
+                                    || modern_rollout_hidden
+                                        .as_ref()
+                                        .is_some_and(|hidden| hidden.contains(&name))
+                            }) {
+                                rollout_reject = Some(JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    INVALID_PARAMS,
+                                    "rollout-managed tools are not available through MCP 2026-07-28",
+                                ));
+                            }
+                        } else if let Some(plan) = mcp.rollout_plan.as_ref() {
                             let call_req = request
                                 .params
                                 .as_ref()
@@ -3025,8 +3347,8 @@ pub(super) async fn handle_mcp_action(
                                     ));
                                 }
                                 mcp_rollout::CallPlan::Routed(route) => {
-                                    let mapped = mcp_rollout::catalogue_name_for(
-                                        |n| mcp.federation.resolve_tool(n).map(|t| t.server_name),
+                                    let mapped = mcp_catalogue_name_for_snapshot(
+                                        &tool_catalog,
                                         &route.server,
                                         &route.base,
                                     );
@@ -3107,10 +3429,79 @@ pub(super) async fn handle_mcp_action(
                             }
                         }
 
+                        // Load the resolved tool and version-gate
+                        // verdict from one immutable publication.
+                        // A refresh between independent reads used to
+                        // admit a newly blocked tool or pair a new
+                        // registry entry with an old verdict.
+                        let (federated, version_blocked) =
+                            tool_catalog.resolve_tool_with_version_block(&name);
+
+                        // The modern caller-visible contract is selected from
+                        // the same held publication that supplies the route and
+                        // version verdict. Header binding and input validation
+                        // precede every policy, quota, token, and network gate.
+                        let mut modern_contract = None;
+                        let modern_preflight_reject = if is_modern {
+                            if let Some(detail) = version_blocked.as_deref() {
+                                Some(JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    INVALID_PARAMS,
+                                    &format!(
+                                        "tool '{}' is blocked by the version gate: {}",
+                                        name, detail
+                                    ),
+                                ))
+                            } else if let Some(tool) = federated.as_ref() {
+                                if let Some(compiled) = tool.modern_contract.as_ref() {
+                                    modern_contract = Some(std::sync::Arc::clone(compiled));
+                                    match mcp_validate_modern_tool_input(
+                                        compiled,
+                                        &routing_headers.params,
+                                        &arguments,
+                                        mcp.strict_modern_parameter_headers(),
+                                    ) {
+                                        Ok(()) => None,
+                                        Err(McpModernValidationFailure::HeaderBinding) => {
+                                            Some(JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                HEADER_MISMATCH,
+                                                "MCP routing header does not match request parameters",
+                                            ))
+                                        }
+                                        Err(McpModernValidationFailure::InputSchema)
+                                        | Err(McpModernValidationFailure::OutputSchema) => {
+                                            Some(JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                INVALID_PARAMS,
+                                                "tool arguments do not conform to the advertised input schema",
+                                            ))
+                                        }
+                                    }
+                                } else {
+                                    Some(JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        INVALID_PARAMS,
+                                        "tool contract is not valid for MCP 2026-07-28",
+                                    ))
+                                }
+                            } else {
+                                Some(JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    INVALID_PARAMS,
+                                    "tool contract is not valid for MCP 2026-07-28",
+                                ))
+                            }
+                        } else {
+                            None
+                        };
+
                         // WOR-1635: version-gate check first; a
                         // blocked tool is invisible in tools/list and
                         // must fail calls with the violation detail.
                         if let Some(reject) = rollout_reject {
+                            reject
+                        } else if let Some(reject) = modern_preflight_reject {
                             reject
                         } else if let Some(denial) = mcp_lethal_trifecta_denial(
                             mcp,
@@ -3120,7 +3511,7 @@ pub(super) async fn handle_mcp_action(
                             request.id.clone(),
                         ) {
                             denial
-                        } else if let Some(detail) = mcp.federation.version_blocked().get(&name) {
+                        } else if let Some(detail) = version_blocked.as_deref() {
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,
@@ -3159,7 +3550,6 @@ pub(super) async fn handle_mcp_action(
                             // 3. Wrap `federation.call_tool` in
                             //    `tokio::time::timeout(server.timeout, ...)`
                             //    when a per-server timeout is configured.
-                            let federated = mcp.federation.resolve_tool(&name);
                             let server_policy = federated
                                 .as_ref()
                                 .and_then(|t| mcp.policy_for_server(&t.server_name));
@@ -3294,13 +3684,18 @@ pub(super) async fn handle_mcp_action(
                                         .as_ref()
                                         .and_then(|t| mcp.upstream_auth_for_server(&t.server_name))
                                     else {
-                                        return write_jsonrpc(
+                                        let response = JsonRpcResponse::error(
+                                            request.id.clone(),
+                                            INTERNAL_ERROR,
+                                            "run_as_user_auth requires upstream_auth config",
+                                        );
+                                        return write_mcp_application_response(
                                             session,
-                                            &JsonRpcResponse::error(
-                                                request.id.clone(),
-                                                INTERNAL_ERROR,
-                                                "run_as_user_auth requires upstream_auth config",
-                                            ),
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
                                         )
                                         .await;
                                     };
@@ -3346,13 +3741,18 @@ pub(super) async fn handle_mcp_action(
                                                     &auth,
                                                 )
                                             {
-                                                return write_jsonrpc(
+                                                let response = JsonRpcResponse::error(
+                                                    request.id.clone(),
+                                                    INTERNAL_ERROR,
+                                                    &e.to_string(),
+                                                );
+                                                return write_mcp_application_response(
                                                     session,
-                                                    &JsonRpcResponse::error(
-                                                        request.id.clone(),
-                                                        INTERNAL_ERROR,
-                                                        &e.to_string(),
-                                                    ),
+                                                    &response,
+                                                    &request_id,
+                                                    &rpc_method,
+                                                    modern_server.as_ref(),
+                                                    None,
                                                 )
                                                 .await;
                                             }
@@ -3368,13 +3768,18 @@ pub(super) async fn handle_mcp_action(
                                                 "mcp_run_as_user",
                                                 "deny",
                                             );
-                                            return write_jsonrpc(
+                                            let response = JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                INVALID_PARAMS,
+                                                &e.to_string(),
+                                            );
+                                            return write_mcp_application_response(
                                                 session,
-                                                &JsonRpcResponse::error(
-                                                    request.id.clone(),
-                                                    INVALID_PARAMS,
-                                                    &e.to_string(),
-                                                ),
+                                                &response,
+                                                &request_id,
+                                                &rpc_method,
+                                                modern_server.as_ref(),
+                                                None,
                                             )
                                             .await;
                                         }
@@ -3398,11 +3803,13 @@ pub(super) async fn handle_mcp_action(
                                         .unwrap_or("unknown"),
                                 );
                                 let call = tracing::Instrument::instrument(
-                                    mcp.federation.call_tool_with_upstream_headers(
-                                        &name,
-                                        outbound_arguments,
-                                        &upstream_headers,
-                                    ),
+                                    mcp.federation
+                                        .call_tool_with_upstream_headers_from_snapshot(
+                                            &tool_catalog,
+                                            &name,
+                                            outbound_arguments,
+                                            &upstream_headers,
+                                        ),
                                     tool_span.clone(),
                                 );
                                 let mut outcome = match timeout {
@@ -3429,31 +3836,82 @@ pub(super) async fn handle_mcp_action(
                                     None => call.await,
                                 };
 
+                                // Validate and reconstruct the exact modern
+                                // ToolResult document before any output judge,
+                                // ledger, audit emission, response adapter, or
+                                // compaction can observe or release it. On
+                                // failure the raw upstream value is dropped and
+                                // only a stable generic error continues.
+                                let mut modern_output_invalid = false;
+                                let mut quarantine_deny: Option<String> = None;
+                                if is_modern {
+                                    outcome = match outcome {
+                                        Ok(value) => match modern_contract.as_deref() {
+                                            Some(compiled) => match mcp_validate_and_judge_modern_tool_output(
+                                                    compiled,
+                                                    mcp.tool_output_judge(),
+                                                    value,
+                                                )
+                                                .await
+                                                {
+                                                    Ok((document, sbproxy_extension::mcp::quarantine::ToolOutputVerdict::Release)) => {
+                                                        Ok(document.into_value())
+                                                    }
+                                                    Ok((_, sbproxy_extension::mcp::quarantine::ToolOutputVerdict::Quarantine { reason_code })) => {
+                                                        sbproxy_observe::metrics::record_policy(
+                                                            ctx.hostname.as_str(),
+                                                            "mcp_dual_llm_quarantine",
+                                                            "deny",
+                                                        );
+                                                        quarantine_deny = Some(reason_code.clone());
+                                                        Err(anyhow::anyhow!(
+                                                            "tool output quarantined ({reason_code})"
+                                                        ))
+                                                    }
+                                                    Err(_) => {
+                                                        modern_output_invalid = true;
+                                                        Err(anyhow::anyhow!(
+                                                            "upstream tool result failed modern contract validation"
+                                                        ))
+                                                    }
+                                                },
+                                            None => {
+                                                modern_output_invalid = true;
+                                                Err(anyhow::anyhow!(
+                                                    "modern tool contract unavailable after dispatch"
+                                                ))
+                                            }
+                                        },
+                                        Err(error) => Err(error),
+                                    };
+                                }
+
                                 // WOR-1789: quarantine BEFORE served
                                 // ledger/outcome and before compaction.
                                 // Fail closed; reason_code only (no matched
                                 // text / raw tool output).
-                                let mut quarantine_deny: Option<String> = None;
-                                if let Ok(value) = &outcome {
-                                    match mcp_apply_tool_output_quarantine(
-                                        mcp.tool_output_judge(),
-                                        value,
-                                    )
-                                    .await
-                                    {
-                                        sbproxy_extension::mcp::quarantine::ToolOutputVerdict::Release => {}
-                                        sbproxy_extension::mcp::quarantine::ToolOutputVerdict::Quarantine {
-                                            reason_code,
-                                        } => {
-                                            sbproxy_observe::metrics::record_policy(
-                                                ctx.hostname.as_str(),
-                                                "mcp_dual_llm_quarantine",
-                                                "deny",
-                                            );
-                                            quarantine_deny = Some(reason_code.clone());
-                                            outcome = Err(anyhow::anyhow!(
-                                                "tool output quarantined ({reason_code})"
-                                            ));
+                                if !is_modern {
+                                    if let Ok(value) = &outcome {
+                                        match mcp_apply_tool_output_quarantine(
+                                            mcp.tool_output_judge(),
+                                            value,
+                                        )
+                                        .await
+                                        {
+                                            sbproxy_extension::mcp::quarantine::ToolOutputVerdict::Release => {}
+                                            sbproxy_extension::mcp::quarantine::ToolOutputVerdict::Quarantine {
+                                                reason_code,
+                                            } => {
+                                                sbproxy_observe::metrics::record_policy(
+                                                    ctx.hostname.as_str(),
+                                                    "mcp_dual_llm_quarantine",
+                                                    "deny",
+                                                );
+                                                quarantine_deny = Some(reason_code.clone());
+                                                outcome = Err(anyhow::anyhow!(
+                                                    "tool output quarantined ({reason_code})"
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -3518,7 +3976,13 @@ pub(super) async fn handle_mcp_action(
                                     emit_mcp_prompt_audit(ctx, &name, cap, &outcome);
                                 }
 
-                                if let Some(reason_code) = quarantine_deny {
+                                if modern_output_invalid {
+                                    JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        INTERNAL_ERROR,
+                                        "upstream tool result does not conform to the advertised output schema",
+                                    )
+                                } else if let Some(reason_code) = quarantine_deny {
                                     JsonRpcResponse::error(
                                         request.id.clone(),
                                         INTERNAL_ERROR,
@@ -3536,36 +4000,44 @@ pub(super) async fn handle_mcp_action(
                                             // result back into the caller's
                                             // version shape and stamp the
                                             // served version on `_meta`.
-                                            match mcp_rollout::finish_response(
-                                                rollout_route.as_ref(),
-                                                value,
-                                            ) {
-                                                Err(message) => {
-                                                    tracing::warn!(
-                                                        target: "sbproxy::mcp::rollout",
-                                                        tool = %name,
-                                                        %message,
-                                                        "MCP rollout response adapter failed",
-                                                    );
-                                                    JsonRpcResponse::error(
-                                                        request.id.clone(),
-                                                        mcp_rollout::ROLLOUT_ERROR_CODE as i32,
-                                                        &message,
-                                                    )
-                                                }
-                                                Ok(value) => {
-                                                    let value = mcp_compact_tool_result(mcp, value);
-                                                    JsonRpcResponse::success(
-                                                        request.id.clone(),
-                                                        value,
-                                                    )
+                                            if is_modern {
+                                                let value = mcp_compact_tool_result(mcp, value);
+                                                JsonRpcResponse::success(request.id.clone(), value)
+                                            } else {
+                                                match mcp_rollout::finish_response(
+                                                    rollout_route.as_ref(),
+                                                    value,
+                                                ) {
+                                                    Err(message) => {
+                                                        tracing::warn!(
+                                                            target: "sbproxy::mcp::rollout",
+                                                            tool = %name,
+                                                            %message,
+                                                            "MCP rollout response adapter failed",
+                                                        );
+                                                        JsonRpcResponse::error(
+                                                            request.id.clone(),
+                                                            mcp_rollout::ROLLOUT_ERROR_CODE as i32,
+                                                            &message,
+                                                        )
+                                                    }
+                                                    Ok(value) => {
+                                                        let value =
+                                                            mcp_compact_tool_result(mcp, value);
+                                                        JsonRpcResponse::success(
+                                                            request.id.clone(),
+                                                            value,
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
-                                        Err(e) => JsonRpcResponse::error(
+                                        Err(e) => mcp_upstream_failure_response(
                                             request.id.clone(),
-                                            INTERNAL_ERROR,
-                                            &format!("tool call failed: {}", e),
+                                            is_modern,
+                                            "upstream tool call failed",
+                                            "tool call failed",
+                                            &e,
                                         ),
                                     }
                                 }
@@ -3582,10 +4054,15 @@ pub(super) async fn handle_mcp_action(
         ),
     };
 
-    match issued_session.as_deref() {
-        Some(session_id) => write_jsonrpc_with_session(session, &response, session_id).await,
-        None => write_jsonrpc(session, &response).await,
-    }
+    write_mcp_application_response(
+        session,
+        &response,
+        &request_id,
+        &rpc_method,
+        modern_server.as_ref(),
+        issued_session.as_deref(),
+    )
+    .await
 }
 
 /// WOR-1788: enforce the session-level lethal-trifecta guardrail before
@@ -4080,6 +4557,239 @@ fn mcp_progressive_meta_tools() -> Vec<serde_json::Value> {
     ]
 }
 
+/// Resolve a rollout `(server, base tool)` pair through one held catalogue
+/// publication. The caller must retain the same snapshot for the eventual
+/// block-aware resolve and dispatch.
+fn mcp_catalogue_name_for_snapshot(
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    server: &str,
+    base: &str,
+) -> Option<String> {
+    mcp_rollout::catalogue_name_for(
+        |name| catalog.resolve_tool(name).map(|tool| tool.server_name),
+        server,
+        base,
+    )
+}
+
+/// Authority of the request target, including the absolute form.
+///
+/// Pingora builds the request URI with `Uri::builder().path_and_query(target)`,
+/// so an absolute-form target (RFC 9112 section 3.2.2) lands intact in the path
+/// and `Uri::authority()` is always `None`. Reading it back matters: a target
+/// naming one authority while `Host` names another is a routing-confusion
+/// vector, and without this the modern transport check compares `Host` against
+/// itself and sees nothing wrong.
+///
+/// A target is only treated as absolute form when the text before `://` is a
+/// syntactically valid scheme, so an origin-form path that merely contains
+/// `://` inside a query stays a path.
+pub(super) fn mcp_request_target_authority(uri: &http::Uri) -> Option<String> {
+    if let Some(authority) = uri.authority() {
+        return Some(authority.as_str().to_string());
+    }
+    let (scheme, rest) = uri.path().split_once("://")?;
+    let scheme_is_valid = !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    if !scheme_is_valid {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+/// Map a modern transport-trust rejection to its HTTP status, and record it.
+///
+/// The refusal body is deliberately empty so a disallowed Origin learns
+/// nothing about the endpoint, which means the caller is told nothing and the
+/// record written here is all an operator ever gets. So it is a record rather
+/// than a log line: the [`sbproxy_observe::SecurityAuditEntry`] reaches the
+/// SIEM stream alongside every other denial, the metric gives the refusal rate
+/// something to alert on, and the deny ring puts a reason on the request row.
+/// Every refusal path goes through here, so all three land the same way
+/// wherever the request happened to be caught.
+///
+/// `hostname` on the audit entry is the request's origin, matching every other
+/// denial in this workspace, because that is the field SIEM correlation keys
+/// on. The MCP server's configured name would collapse a fleet into one bucket.
+/// The rejected authority is in the log line and not the audit entry, which
+/// has no field for it.
+///
+/// Everything recorded is safe to emit: the rejection class is a closed enum,
+/// the scheme is server-derived, and the authority is a parsed header value,
+/// which cannot carry control characters. No credential is in scope this early.
+pub(super) fn record_mcp_modern_refusal(
+    rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
+    server_name: &str,
+    connection_scheme: &str,
+    authority: Option<&str>,
+    ctx: &mut RequestContext,
+    session: &Session,
+) -> http::StatusCode {
+    use sbproxy_modules::action::mcp::McpModernHttpRejection;
+    let status = match rejection {
+        McpModernHttpRejection::Origin => http::StatusCode::FORBIDDEN,
+        McpModernHttpRejection::MissingTrustAnchor | McpModernHttpRejection::Authority => {
+            http::StatusCode::MISDIRECTED_REQUEST
+        }
+    };
+    let reason = mcp_modern_rejection_reason(rejection);
+    warn!(
+        mcp_server = %server_name,
+        rejection = ?rejection,
+        connection_scheme = %connection_scheme,
+        authority = authority.unwrap_or("<none>"),
+        status = status.as_u16(),
+        "refused MCP 2026-07-28 request at the transport trust boundary"
+    );
+    let origin_label = ctx.hostname.to_string();
+    ctx.record_policy_decision("mcp_modern_transport", "deny");
+    ctx.deny_reason = Some(format!("mcp_modern_transport: {reason}"));
+    sbproxy_observe::metrics::record_policy(&origin_label, "mcp_modern_transport", "deny");
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "mcp_transport_denied",
+        reason,
+        status.as_u16(),
+        Some(origin_label),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(session.req_header().method.as_str().to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .emit();
+    status
+}
+
+/// Closed reason label for a modern transport-trust refusal, so a SIEM rule
+/// can route on the failure mode rather than parse a sentence.
+pub(super) fn mcp_modern_rejection_reason(
+    rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
+) -> &'static str {
+    use sbproxy_modules::action::mcp::McpModernHttpRejection;
+    match rejection {
+        McpModernHttpRejection::MissingTrustAnchor => "mcp_modern_missing_trust_anchor",
+        McpModernHttpRejection::Authority => "mcp_modern_authority",
+        McpModernHttpRejection::Origin => "mcp_modern_origin",
+    }
+}
+
+/// Return every concrete modern catalogue name owned by a rollout-managed
+/// base tool. Modern PR1 deliberately exposes neither these per-server targets
+/// nor synthesized aliases because the rollout transforms do not yet carry an
+/// independently compiled caller-facing modern contract.
+fn mcp_modern_rollout_hidden_names(
+    mcp: &sbproxy_modules::action::McpAction,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> std::collections::HashSet<String> {
+    let Some(plan) = mcp.rollout_plan.as_deref() else {
+        return std::collections::HashSet::new();
+    };
+    let snapshot = catalog.serialized_modern_tools();
+    snapshot
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let literal = entry.name.as_str();
+            let base = literal
+                .strip_prefix(entry.server_name.as_str())
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .unwrap_or(literal);
+            // A rollout may be keyed on the bare tool name or on the exact
+            // advertised name. Stripping only the server prefix would miss a
+            // tool whose own name happens to start with its server name.
+            (plan.manages(base) || plan.manages(literal)).then(|| entry.name.clone())
+        })
+        .collect()
+}
+
+/// Return every tool from one publication that is not refused by that same
+/// publication's version gate. Discovery callers must apply their own RBAC
+/// and allowlist filters after this invariant-preserving filter.
+fn mcp_unblocked_catalog_tools(
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> impl Iterator<Item = &sbproxy_extension::mcp::FederatedTool> {
+    let version_blocked = catalog.version_blocked();
+    catalog
+        .iter_tools()
+        .filter(move |tool| !version_blocked.contains_key(&tool.name))
+}
+
+/// Whether a synthesized rollout entry resolves to an existing, unblocked
+/// target through this exact held catalogue. This rejects malformed synthesis
+/// and inline contracts whose configured target is no longer safe to expose.
+#[cfg(test)]
+fn mcp_synthesized_rollout_tool_is_visible(
+    plan: &sbproxy_extension::mcp::rollout::RolloutPlan,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    tool: &serde_json::Value,
+    session_reqs: Option<&std::collections::HashMap<String, String>>,
+    principal: &sbproxy_plugin::Principal,
+    today: chrono::NaiveDate,
+) -> bool {
+    mcp_synthesized_rollout_target(plan, catalog, tool, session_reqs, principal, today).is_some()
+}
+
+fn mcp_synthesized_rollout_target(
+    plan: &sbproxy_extension::mcp::rollout::RolloutPlan,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    tool: &serde_json::Value,
+    session_reqs: Option<&std::collections::HashMap<String, String>>,
+    principal: &sbproxy_plugin::Principal,
+    today: chrono::NaiveDate,
+) -> Option<sbproxy_extension::mcp::FederatedTool> {
+    let name = tool.get("name").and_then(serde_json::Value::as_str)?;
+    let call_req = tool
+        .get("_meta")
+        .and_then(|meta| meta.get(sbproxy_extension::mcp::rollout::META_VERSION_KEY))
+        .and_then(serde_json::Value::as_str);
+    let mcp_rollout::CallPlan::Routed(route) =
+        mcp_rollout::plan_call(plan, name, call_req, session_reqs, Some(principal), today)
+    else {
+        return None;
+    };
+    let catalogue_name = mcp_catalogue_name_for_snapshot(catalog, &route.server, &route.base)?;
+    let (tool, blocked) = catalog.resolve_tool_with_version_block(&catalogue_name);
+    if blocked.is_some() {
+        None
+    } else {
+        tool
+    }
+}
+
+/// Apply the exact call-side target authorization to a synthesized alias.
+///
+/// Rollout aliases are presentation names. The dispatcher rewrites one to its
+/// concrete catalog target before allowlist and RBAC enforcement, so discovery
+/// must decide on that same held target rather than the alias string.
+fn mcp_synthesized_rollout_tool_is_visible_to_principal(
+    mcp: &sbproxy_modules::action::McpAction,
+    plan: &sbproxy_extension::mcp::rollout::RolloutPlan,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+    tool: &serde_json::Value,
+    session_reqs: Option<&std::collections::HashMap<String, String>>,
+    principal: &sbproxy_plugin::Principal,
+    today: chrono::NaiveDate,
+) -> bool {
+    let Some(target) =
+        mcp_synthesized_rollout_target(plan, catalog, tool, session_reqs, principal, today)
+    else {
+        return false;
+    };
+    if !mcp.is_tool_allowed(&target.name) {
+        return false;
+    }
+    match mcp.policy_for_server(&target.server_name) {
+        Some(policy) => matches!(
+            policy.check(principal, &target.name),
+            sbproxy_extension::mcp::ToolAccessDecision::Allow,
+        ),
+        None => true,
+    }
+}
+
 /// Search the federated tool catalogue for entries whose name or
 /// description matches `query` (case-insensitive substring), honouring
 /// the `tool_allowlist` guardrail, the per-server RBAC policy
@@ -4092,9 +4802,8 @@ fn mcp_progressive_search(
     limit: usize,
 ) -> Vec<serde_json::Value> {
     let q = query.to_ascii_lowercase();
-    mcp.federation
-        .list_tools()
-        .into_iter()
+    let catalog = mcp.federation.tool_catalog_snapshot();
+    mcp_unblocked_catalog_tools(&catalog)
         .filter(|t| mcp.is_tool_allowed(&t.name))
         .filter(|t| match mcp.policy_for_server(&t.server_name) {
             Some(policy) => matches!(
@@ -4149,17 +4858,32 @@ fn mcp_progressive_search(
 /// The `tool_allowlist` guardrail deliberately does not participate:
 /// it is a gateway-wide cap on what may be called, not a statement
 /// about who this caller is.
+#[cfg(test)]
 fn mcp_prompt_server_reachable(
     mcp: &sbproxy_modules::action::McpAction,
     principal: &sbproxy_plugin::Principal,
     server_name: &str,
 ) -> bool {
+    let catalog = mcp.federation.tool_catalog_snapshot();
+    mcp_prompt_server_reachable_in_snapshot(mcp, principal, server_name, &catalog)
+}
+
+fn mcp_prompt_server_reachable_in_snapshot(
+    mcp: &sbproxy_modules::action::McpAction,
+    principal: &sbproxy_plugin::Principal,
+    server_name: &str,
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> bool {
     let Some(policy) = mcp.policy_for_server(server_name) else {
         return true;
     };
-    let snapshot = mcp.federation.serialized_tools();
+    let snapshot = catalog.serialized_tools();
+    let version_blocked = catalog.version_blocked();
     let mut saw_tool = false;
     for entry in &snapshot.entries {
+        if version_blocked.contains_key(&entry.name) {
+            continue;
+        }
         if entry.server_name != server_name {
             continue;
         }
@@ -4185,14 +4909,37 @@ fn mcp_prompt_server_reachable(
 /// `tools/list` does with denied tools and for the same reason: a
 /// catalogue that names entries the caller cannot use leaks the shape
 /// of an upstream to someone with no access to it.
+#[cfg(test)]
 fn mcp_prompts_view(
     mcp: &sbproxy_modules::action::McpAction,
     principal: &sbproxy_plugin::Principal,
     prompts: &[sbproxy_extension::mcp::FederatedPrompt],
 ) -> Vec<serde_json::Value> {
+    let catalog = mcp.federation.tool_catalog_snapshot();
+    mcp_prompts_view_in_snapshot(mcp, principal, prompts, &catalog)
+}
+
+fn mcp_prompts_view_in_snapshot(
+    mcp: &sbproxy_modules::action::McpAction,
+    principal: &sbproxy_plugin::Principal,
+    prompts: &[sbproxy_extension::mcp::FederatedPrompt],
+    catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,
+) -> Vec<serde_json::Value> {
+    let mut server_reachability = std::collections::HashMap::new();
     let mut out: Vec<serde_json::Value> = prompts
         .iter()
-        .filter(|p| mcp_prompt_server_reachable(mcp, principal, &p.server_name))
+        .filter(|prompt| {
+            *server_reachability
+                .entry(prompt.server_name.as_str())
+                .or_insert_with(|| {
+                    mcp_prompt_server_reachable_in_snapshot(
+                        mcp,
+                        principal,
+                        &prompt.server_name,
+                        catalog,
+                    )
+                })
+        })
         .map(|p| {
             let mut entry = serde_json::json!({ "name": p.name });
             if let Some(title) = &p.title {
@@ -4218,6 +4965,127 @@ fn mcp_prompts_view(
             .cmp(&b.get("name").and_then(|v| v.as_str()))
     });
     out
+}
+
+/// Build the RFC 9728 metadata pointer from an already validated authority.
+fn mcp_oauth_resource_metadata_url(
+    connection_scheme: &str,
+    validated_uri_authority: Option<&str>,
+    validated_host_authority: Option<&str>,
+) -> String {
+    match validated_uri_authority.or(validated_host_authority) {
+        Some(authority) => format!(
+            "{connection_scheme}://{authority}{}",
+            sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
+        ),
+        None => sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH.to_string(),
+    }
+}
+
+/// Map an upstream failure without reflecting untrusted detail to a modern
+/// caller. The legacy branch deliberately retains its frozen wire message.
+fn mcp_upstream_failure_response(
+    id: Option<serde_json::Value>,
+    is_modern: bool,
+    modern_message: &'static str,
+    legacy_context: &'static str,
+    error: &anyhow::Error,
+) -> sbproxy_extension::mcp::types::JsonRpcResponse {
+    let message = if is_modern {
+        modern_message.to_string()
+    } else {
+        format!("{legacy_context}: {error}")
+    };
+    sbproxy_extension::mcp::types::JsonRpcResponse::error(
+        id,
+        sbproxy_extension::mcp::types::INTERNAL_ERROR,
+        &message,
+    )
+}
+
+/// Encode one application response with the request's selected protocol era.
+/// Legacy keeps its frozen serializer and optional session header. Modern uses
+/// the strict ID representation and status mapping, including an omitted ID
+/// for errors associated with an absent request identifier.
+async fn write_mcp_application_response(
+    session: &mut Session,
+    response: &sbproxy_extension::mcp::types::JsonRpcResponse,
+    request_id: &sbproxy_extension::mcp::DecodedRequestId,
+    method: &str,
+    modern_server: Option<&sbproxy_extension::mcp::McpServerDescription>,
+    issued_session: Option<&str>,
+) -> Result<()> {
+    use sbproxy_extension::mcp::McpProtocolCodec;
+
+    match request_id {
+        sbproxy_extension::mcp::DecodedRequestId::Legacy(_) => match issued_session {
+            Some(session_id) => write_jsonrpc_with_session(session, response, session_id).await,
+            None => write_jsonrpc(session, response).await,
+        },
+        sbproxy_extension::mcp::DecodedRequestId::Modern(id) => {
+            let codec = sbproxy_extension::mcp::Modern2026_07_28Codec;
+            let wire = if let Some(error) = response.error.as_ref() {
+                codec.encode_error(id.clone(), error.code, &error.message, error.data.clone())
+            } else if let (Some(result), Some(server)) = (response.result.as_ref(), modern_server) {
+                match codec.encode_success(method, id.clone(), result.clone(), server) {
+                    Ok(response) => response,
+                    Err(error) => *error.0,
+                }
+            } else {
+                codec.encode_error(
+                    id.clone(),
+                    sbproxy_extension::mcp::types::INTERNAL_ERROR,
+                    "failed to construct modern MCP response",
+                    None,
+                )
+            };
+            write_mcp_wire_response(session, wire).await
+        }
+    }
+}
+
+/// Serialize and write an era-specific MCP transport response.
+pub(super) async fn write_mcp_wire_response(
+    session: &mut Session,
+    response: sbproxy_extension::mcp::McpWireResponse,
+) -> Result<()> {
+    let body = match response.body {
+        Some(body) => serde_json::to_vec(&body).map_err(|error| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to serialize MCP response",
+                error,
+            )
+        })?,
+        None => Vec::new(),
+    };
+    let mut header = pingora_http::ResponseHeader::build(
+        response.status.as_u16(),
+        Some(response.headers.len() + 2),
+    )
+    .map_err(|error| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to build MCP response",
+            error,
+        )
+    })?;
+    for (name, value) in &response.headers {
+        let _ = header.insert_header(name.clone(), value.clone());
+    }
+    if !body.is_empty() {
+        let _ = header.insert_header("content-type", "application/json");
+    }
+    let _ = header.insert_header("content-length", body.len().to_string());
+    session
+        .write_response_header(Box::new(header), body.is_empty())
+        .await?;
+    if !body.is_empty() {
+        session
+            .write_response_body(Some(bytes::Bytes::from(body)), true)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Serialise a JSON-RPC response and write it to the session.
@@ -4760,7 +5628,11 @@ mod govern_security_tests {
 
 #[cfg(test)]
 mod mcp_prompts_tests {
-    use super::{mcp_prompt_server_reachable, mcp_prompts_view};
+    use super::{
+        mcp_prompt_server_reachable, mcp_prompt_server_reachable_in_snapshot, mcp_prompts_view,
+        mcp_prompts_view_in_snapshot,
+    };
+    use sbproxy_extension::mcp::protocol::McpToolContract;
     use sbproxy_extension::mcp::{FederatedPrompt, FederatedTool};
     use sbproxy_modules::action::McpAction;
     use sbproxy_plugin::{Principal, PrincipalAttrs, PrincipalSource, TenantId};
@@ -4781,13 +5653,24 @@ mod mcp_prompts_tests {
     }
 
     fn tool(name: &str, server: &str) -> FederatedTool {
+        let input_schema = json!({"type": "object", "properties": {}});
+        let contract = McpToolContract::try_from(json!({
+            "name": name,
+            "description": format!("Tool {name}"),
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("prompt fixture contract");
         FederatedTool {
             name: name.to_string(),
             description: format!("Tool {name}"),
-            input_schema: json!({"type": "object", "properties": {}}),
+            input_schema,
             server_name: server.to_string(),
             streaming: false,
             meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
         }
     }
 
@@ -4861,11 +5744,14 @@ mod mcp_prompts_tests {
     #[test]
     fn prompt_access_follows_server_level_tool_access() {
         let mcp = action_with_rbac();
-        mcp.federation.seed_tools_for_test(HashMap::from([
-            ("search_docs".to_string(), tool("search_docs", "gh")),
-            ("delete_repo".to_string(), tool("delete_repo", "gh")),
-            ("gl.search".to_string(), tool("gl.search", "gl")),
-        ]));
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([
+                ("search_docs".to_string(), tool("search_docs", "gh")),
+                ("delete_repo".to_string(), tool("delete_repo", "gh")),
+                ("gl.search".to_string(), tool("gl.search", "gl")),
+            ]),
+            None,
+        );
 
         let reader = principal("u-reader", &["reader"]);
         // `readers` allows exactly one of gh's tools, so gh is reachable.
@@ -4880,16 +5766,83 @@ mod mcp_prompts_tests {
         assert!(!mcp_prompt_server_reachable(&mcp, &stranger, "gl"));
     }
 
+    #[test]
+    fn task_5b_prompt_reachability_ignores_version_blocked_tools() {
+        let mcp = action_with_rbac();
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([("search_docs".to_string(), tool("search_docs", "gh"))]),
+            Some(HashMap::from([(
+                "search_docs".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+
+        let reader = principal("u-reader", &["reader"]);
+        assert!(
+            !mcp_prompt_server_reachable(&mcp, &reader, "gh"),
+            "a version-blocked tool cannot make its upstream prompt surface reachable"
+        );
+    }
+
+    #[test]
+    fn task_5b_prompt_list_and_get_share_one_held_catalogue_reachability_view() {
+        let mcp = action_with_rbac();
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([("search_docs".to_string(), tool("search_docs", "gh"))]),
+            None,
+        );
+        let held_allowed = mcp.federation.tool_catalog_snapshot();
+        let prompts = vec![
+            prompt("code_review", "gh"),
+            prompt("triage", "gh"),
+            prompt("release_notes", "gh"),
+        ];
+        let reader = principal("u-reader-snapshot", &["reader"]);
+
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([("search_docs".to_string(), tool("search_docs", "gh"))]),
+            Some(HashMap::from([(
+                "search_docs".to_string(),
+                "replacement is blocked".to_string(),
+            )])),
+        );
+        let current_blocked = mcp.federation.tool_catalog_snapshot();
+
+        assert!(
+            mcp_prompt_server_reachable_in_snapshot(&mcp, &reader, "gh", &held_allowed),
+            "prompts/get authorization must retain the publication held before refresh"
+        );
+        assert!(
+            !mcp_prompt_server_reachable_in_snapshot(&mcp, &reader, "gh", &current_blocked),
+            "a later request must use the later publication's blocked verdict"
+        );
+
+        let held_view = mcp_prompts_view_in_snapshot(&mcp, &reader, &prompts, &held_allowed);
+        let current_view = mcp_prompts_view_in_snapshot(&mcp, &reader, &prompts, &current_blocked);
+        assert_eq!(
+            held_view.len(),
+            3,
+            "prompts/list must memoize one server reachability answer across its held view"
+        );
+        assert!(
+            current_view.is_empty(),
+            "prompts/list and prompts/get must agree for the same held publication"
+        );
+    }
+
     /// `prompts/list` omits the prompts of an upstream the caller
     /// cannot reach rather than reporting them as denied, which is
     /// what `tools/list` does with denied tools.
     #[test]
     fn prompts_list_hides_prompts_from_an_unreachable_upstream() {
         let mcp = action_with_rbac();
-        mcp.federation.seed_tools_for_test(HashMap::from([
-            ("search_docs".to_string(), tool("search_docs", "gh")),
-            ("gl.search".to_string(), tool("gl.search", "gl")),
-        ]));
+        mcp.federation.seed_tools_for_test(
+            HashMap::from([
+                ("search_docs".to_string(), tool("search_docs", "gh")),
+                ("gl.search".to_string(), tool("gl.search", "gl")),
+            ]),
+            None,
+        );
 
         let reader = principal("u-reader", &["reader"]);
         let prompts = vec![
@@ -4964,5 +5917,745 @@ mod mcp_prompts_tests {
             mcp.federation.prompts_capability().is_none(),
             "no upstream has declared prompts, so nothing may be advertised"
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpModernValidationFailure {
+    HeaderBinding,
+    InputSchema,
+    OutputSchema,
+}
+
+fn mcp_validate_modern_tool_input(
+    compiled: &sbproxy_extension::mcp::protocol::CompiledMcpToolContract,
+    headers: &http::HeaderMap,
+    arguments: &serde_json::Value,
+    strict_parameter_headers: bool,
+) -> Result<(), McpModernValidationFailure> {
+    sbproxy_extension::mcp::protocol::validate_mirrored_headers(
+        headers,
+        &compiled.header_projections,
+        arguments,
+    )
+    .map_err(|_| McpModernValidationFailure::HeaderBinding)?;
+
+    if strict_parameter_headers
+        && headers.keys().any(|name| {
+            name.as_str().starts_with("mcp-param-")
+                && !compiled
+                    .header_projections
+                    .iter()
+                    .any(|projection| projection.header_name.as_str() == name.as_str())
+        })
+    {
+        return Err(McpModernValidationFailure::HeaderBinding);
+    }
+
+    if !compiled.input.is_valid(arguments) {
+        return Err(McpModernValidationFailure::InputSchema);
+    }
+    Ok(())
+}
+
+fn mcp_validate_modern_tool_output(
+    compiled: &sbproxy_extension::mcp::protocol::CompiledMcpToolContract,
+    value: serde_json::Value,
+) -> Result<sbproxy_extension::mcp::protocol::McpModernToolResultDocument, McpModernValidationFailure>
+{
+    let document = sbproxy_extension::mcp::protocol::McpModernToolResultDocument::try_from(value)
+        .map_err(|_| McpModernValidationFailure::OutputSchema)?;
+    if let Some(output) = &compiled.output {
+        let structured = document
+            .structured_content()
+            .ok_or(McpModernValidationFailure::OutputSchema)?;
+        if !output.is_valid(structured) {
+            return Err(McpModernValidationFailure::OutputSchema);
+        }
+    }
+    Ok(document)
+}
+
+async fn mcp_validate_and_judge_modern_tool_output(
+    compiled: &sbproxy_extension::mcp::protocol::CompiledMcpToolContract,
+    judge: Option<&dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge>,
+    value: serde_json::Value,
+) -> Result<
+    (
+        sbproxy_extension::mcp::protocol::McpModernToolResultDocument,
+        sbproxy_extension::mcp::quarantine::ToolOutputVerdict,
+    ),
+    McpModernValidationFailure,
+> {
+    let document = mcp_validate_modern_tool_output(compiled, value)?;
+    let verdict = mcp_apply_tool_output_quarantine(judge, document.as_value()).await;
+    Ok((document, verdict))
+}
+
+#[cfg(test)]
+mod mcp_modern_contract_gate_tests {
+    use super::{
+        mcp_oauth_resource_metadata_url, mcp_upstream_failure_response,
+        mcp_validate_and_judge_modern_tool_output, mcp_validate_modern_tool_input,
+        mcp_validate_modern_tool_output, McpModernValidationFailure,
+    };
+    use sbproxy_extension::mcp::protocol::{
+        compile_modern_tool_contract, McpSchemaLimits, McpToolContract,
+    };
+    use sbproxy_extension::mcp::quarantine::{
+        ToolOutputJudge, ToolOutputVerdict, UntrustedToolOutput,
+    };
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingJudge {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolOutputJudge for CountingJudge {
+        async fn judge(&self, _output: &UntrustedToolOutput) -> ToolOutputVerdict {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ToolOutputVerdict::Release
+        }
+    }
+
+    fn compiled_contract() -> sbproxy_extension::mcp::protocol::CompiledMcpToolContract {
+        let contract = McpToolContract::try_from(json!({
+            "name": "search",
+            "inputSchema": {
+                "type": "object",
+                "required": ["region", "count"],
+                "properties": {
+                    "region": {"type": "string", "x-mcp-header": "Region"},
+                    "count": {"type": "integer"}
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": false
+            }
+        }))
+        .expect("strict fixture contract");
+        compile_modern_tool_contract(&contract, McpSchemaLimits::default())
+            .expect("compiled fixture contract")
+    }
+
+    #[test]
+    fn task_5c_modern_header_binding_precedes_input_schema_validation() {
+        let compiled = compiled_contract();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("mcp-param-region", "eu-west1".parse().unwrap());
+        let arguments = json!({"region": "us-west1", "count": "not-an-integer"});
+
+        assert_eq!(
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false),
+            Err(McpModernValidationFailure::HeaderBinding)
+        );
+
+        headers.insert("mcp-param-region", "us-west1".parse().unwrap());
+        assert_eq!(
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false),
+            Err(McpModernValidationFailure::InputSchema)
+        );
+    }
+
+    #[test]
+    fn task_5c_strict_parameter_headers_reject_only_unprojected_fields() {
+        let compiled = compiled_contract();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("mcp-param-region", "us-west1".parse().unwrap());
+        headers.insert("mcp-param-unbound", "opaque".parse().unwrap());
+        let arguments = json!({"region": "us-west1", "count": 2});
+
+        assert_eq!(
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false),
+            Ok(())
+        );
+        assert_eq!(
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, true),
+            Err(McpModernValidationFailure::HeaderBinding)
+        );
+    }
+
+    #[test]
+    fn task_5c_modern_output_schema_withholds_missing_or_invalid_structured_content() {
+        let compiled = compiled_contract();
+        for result in [
+            json!({"content": []}),
+            json!({"content": [], "structuredContent": {"ok": "yes"}}),
+            json!({"content": [], "structuredContent": {"ok": true, "extra": 1}}),
+        ] {
+            assert_eq!(
+                mcp_validate_modern_tool_output(&compiled, result),
+                Err(McpModernValidationFailure::OutputSchema)
+            );
+        }
+
+        let valid = json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "structuredContent": {"ok": true},
+            "_meta": {"vendor.example/trace": "preserved"}
+        });
+        let document = mcp_validate_modern_tool_output(&compiled, valid.clone())
+            .expect("conforming output is released");
+        let normalized = document.into_value();
+        assert_eq!(normalized["content"], valid["content"]);
+        assert_eq!(normalized["structuredContent"], valid["structuredContent"]);
+        assert_eq!(normalized["_meta"], valid["_meta"]);
+        assert_eq!(normalized["resultType"], "complete");
+    }
+
+    #[test]
+    fn task_5c_oauth_metadata_prefers_the_validated_uri_authority() {
+        assert_eq!(
+            mcp_oauth_resource_metadata_url(
+                "https",
+                Some("mcp.example.com:8443"),
+                Some("ignored.example.com"),
+            ),
+            "https://mcp.example.com:8443/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            mcp_oauth_resource_metadata_url("http", None, Some("mcp.example.com")),
+            "http://mcp.example.com/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_5c_invalid_modern_envelope_never_reaches_the_output_judge() {
+        let compiled = compiled_contract();
+        let judge = CountingJudge::default();
+
+        for invalid in [
+            json!({
+                "content": [],
+                "structuredContent": {"ok": true},
+                "_meta": "private-upstream-detail"
+            }),
+            json!({
+                "content": [],
+                "structuredContent": {"ok": true},
+                "resultType": "input_required"
+            }),
+        ] {
+            assert!(mcp_validate_and_judge_modern_tool_output(
+                &compiled,
+                Some(&judge as &dyn ToolOutputJudge),
+                invalid,
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+
+        let valid = json!({
+            "content": [],
+            "structuredContent": {"ok": true},
+            "_meta": {},
+            "resultType": "complete"
+        });
+        assert!(mcp_validate_and_judge_modern_tool_output(
+            &compiled,
+            Some(&judge as &dyn ToolOutputJudge),
+            valid,
+        )
+        .await
+        .is_ok());
+        assert_eq!(judge.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn task_5c_modern_upstream_failures_never_reflect_error_detail() {
+        let planted = anyhow::anyhow!("private-api-key=do-not-reflect");
+        for (modern_message, legacy_context) in [
+            ("upstream resource read failed", "resources/read failed"),
+            ("upstream prompt retrieval failed", "prompts/get failed"),
+            ("upstream tool call failed", "tool call failed"),
+        ] {
+            let modern = mcp_upstream_failure_response(
+                Some(json!(7)),
+                true,
+                modern_message,
+                legacy_context,
+                &planted,
+            );
+            let modern_error = modern.error.expect("modern error");
+            assert_eq!(modern_error.message, modern_message);
+            assert!(!modern_error.message.contains("private-api-key"));
+
+            let legacy = mcp_upstream_failure_response(
+                Some(json!(7)),
+                false,
+                modern_message,
+                legacy_context,
+                &planted,
+            );
+            assert!(
+                legacy
+                    .error
+                    .expect("legacy error")
+                    .message
+                    .contains("private-api-key"),
+                "the frozen legacy error detail changed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_request_target_authority_tests {
+    use super::mcp_request_target_authority;
+
+    fn authority_of(target: &str) -> Option<String> {
+        // Built the way Pingora builds it, so the test exercises the shape the
+        // gateway actually receives rather than a URI parsed from scratch.
+        let uri = http::Uri::builder()
+            .path_and_query(target)
+            .build()
+            .expect("target parses as a path");
+        mcp_request_target_authority(&uri)
+    }
+
+    #[test]
+    fn absolute_form_target_yields_its_authority() {
+        assert_eq!(
+            authority_of("http://evil.example/"),
+            Some("evil.example".to_string())
+        );
+        assert_eq!(
+            authority_of("https://mcp.example.com:8443/mcp?x=1"),
+            Some("mcp.example.com:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn origin_form_target_has_no_authority() {
+        assert_eq!(authority_of("/"), None);
+        assert_eq!(authority_of("/mcp"), None);
+        assert_eq!(authority_of("/.well-known/mcp-server"), None);
+    }
+
+    #[test]
+    fn a_path_containing_a_scheme_like_query_is_still_a_path() {
+        // The text before `://` is not a valid scheme here, so this must not
+        // be read as an authority of `evil.example`.
+        assert_eq!(authority_of("/redirect?url=http://evil.example"), None);
+        assert_eq!(authority_of("/a/b?next=https://evil.example/x"), None);
+    }
+
+    #[test]
+    fn a_malformed_absolute_form_target_yields_nothing() {
+        assert_eq!(authority_of("://evil.example/"), None);
+        assert_eq!(authority_of("1http://evil.example/"), None);
+        assert_eq!(authority_of("http:///"), None);
+    }
+}
+
+#[cfg(test)]
+mod mcp_catalog_snapshot_tests {
+    use super::{
+        handle_mcp_action, mcp_catalogue_name_for_snapshot, mcp_modern_rollout_hidden_names,
+        mcp_synthesized_rollout_tool_is_visible,
+        mcp_synthesized_rollout_tool_is_visible_to_principal, mcp_unblocked_catalog_tools,
+    };
+    use crate::context::RequestContext;
+    use pingora_core::protocols::l4::stream::Stream;
+    use pingora_proxy::Session;
+    use sbproxy_extension::mcp::protocol::{
+        compile_modern_tool_contract, McpSchemaLimits, McpToolContract,
+    };
+    use sbproxy_extension::mcp::rollout::{RolloutPlan, RolloutSpec, ToolRolloutSpec, VersionSpec};
+    use sbproxy_extension::mcp::{FederatedTool, McpFederation};
+    use sbproxy_modules::action::McpAction;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn tool(name: &str, server: &str) -> FederatedTool {
+        let input_schema = json!({"type": "object", "properties": {}});
+        let contract = McpToolContract::try_from(json!({
+            "name": name,
+            "description": "snapshot fixture",
+            "inputSchema": input_schema.clone(),
+        }))
+        .expect("snapshot fixture contract");
+        FederatedTool {
+            name: name.to_string(),
+            description: "snapshot fixture".to_string(),
+            input_schema,
+            server_name: server.to_string(),
+            streaming: false,
+            meta: None,
+            contract: Some(contract),
+            legacy_document: None,
+            modern_contract: None,
+            modern_incompatibility: None,
+        }
+    }
+
+    fn modern_tool(name: &str, server: &str) -> FederatedTool {
+        let mut tool = tool(name, server);
+        let contract = tool.contract.as_ref().expect("strict fixture contract");
+        tool.modern_contract = Some(Arc::new(
+            compile_modern_tool_contract(contract, McpSchemaLimits::default())
+                .expect("compiled modern fixture contract"),
+        ));
+        tool
+    }
+
+    #[test]
+    fn task_5b_rollout_mapping_uses_the_held_catalog_snapshot() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+            None,
+        );
+        let held = federation.tool_catalog_snapshot();
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), tool("search", "replacement-server"))]),
+            Some(HashMap::from([(
+                "search".to_string(),
+                "replacement is blocked".to_string(),
+            )])),
+        );
+
+        assert_eq!(
+            mcp_catalogue_name_for_snapshot(&held, "old-server", "search"),
+            Some("search".to_string()),
+            "route mapping remains bound to the server selected before publication"
+        );
+        assert_eq!(
+            mcp_catalogue_name_for_snapshot(
+                &federation.tool_catalog_snapshot(),
+                "old-server",
+                "search",
+            ),
+            None,
+            "the current replacement belongs to a different server"
+        );
+    }
+
+    #[test]
+    fn task_5b_core_discovery_filters_version_blocked_snapshot_entries() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([
+                ("allowed".to_string(), tool("allowed", "catalog-server")),
+                ("refused".to_string(), tool("refused", "catalog-server")),
+            ]),
+            Some(HashMap::from([(
+                "refused".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+
+        let mut names: Vec<String> =
+            mcp_unblocked_catalog_tools(&federation.tool_catalog_snapshot())
+                .map(|tool| tool.name.clone())
+                .collect();
+        names.sort();
+        assert_eq!(names, vec!["allowed"]);
+    }
+
+    #[test]
+    fn task_5c_modern_catalog_hides_a_literal_dotted_rollout_name() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "dotted-rollout", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": "https://legacy.example.com/mcp",
+                "prefix": "legacy-api"
+            }],
+            "tool_versioning": {"rollout": {"tools": {
+                "legacy-api.search": {
+                    "versions": [{
+                        "version": "1.0.0",
+                        "server": "legacy-api"
+                    }],
+                    "default": "1.0.0"
+                }
+            }}}
+        }))
+        .expect("dotted rollout fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(
+                "legacy-api.search".to_string(),
+                modern_tool("legacy-api.search", "legacy-api"),
+            )]),
+            None,
+        );
+
+        let hidden =
+            mcp_modern_rollout_hidden_names(&action, &action.federation.tool_catalog_snapshot());
+
+        assert!(
+            hidden.contains("legacy-api.search"),
+            "the literal advertised name is rollout-managed even when it begins with the server name"
+        );
+    }
+
+    #[test]
+    fn task_5b_rollout_catalogue_hides_synthesized_alias_for_a_blocked_target() {
+        let federation = McpFederation::new(vec![]);
+        federation.seed_tools_for_test(
+            HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+            Some(HashMap::from([(
+                "search".to_string(),
+                "version policy refuses this tool".to_string(),
+            )])),
+        );
+        let plan = RolloutPlan::compile(&RolloutSpec {
+            tools: HashMap::from([(
+                "search".to_string(),
+                ToolRolloutSpec {
+                    versions: vec![VersionSpec {
+                        version: "1.0.0".to_string(),
+                        server: Some("old-server".to_string()),
+                        contract: Some(json!({
+                            "name": "search",
+                            "description": "inline historical contract",
+                            "inputSchema": {"type": "object", "properties": {}}
+                        })),
+                        ..VersionSpec::default()
+                    }],
+                    default: Some("1.0.0".to_string()),
+                    aliases: true,
+                },
+            )]),
+            ..RolloutSpec::default()
+        })
+        .expect("rollout fixture compiles");
+        let synthesized_alias = json!({
+            "name": "search_v1",
+            "description": "inline historical contract",
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": {"sbproxy.dev/version": "1.0.0"}
+        });
+
+        assert!(
+            !mcp_synthesized_rollout_tool_is_visible(
+                &plan,
+                &federation.tool_catalog_snapshot(),
+                &synthesized_alias,
+                None,
+                &sbproxy_plugin::Principal::anonymous(),
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 14).expect("fixture date"),
+            ),
+            "an inline-contract alias must not re-advertise a blocked routed target"
+        );
+    }
+
+    fn rollout_action_with_authorization(allowlist: &[&str], rbac_allowed: &[&str]) -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "rollout-auth-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "reader": {
+                    "default_allow": false,
+                    "tool_access": [{"principals": [], "allowed": rbac_allowed}]
+                }
+            },
+            "federated_servers": [{
+                "origin": "https://old.example.com/mcp",
+                "prefix": "old-server",
+                "rbac": "reader"
+            }],
+            "guardrails": [{"type": "tool_allowlist", "allow": allowlist}],
+            "tool_versioning": {"rollout": {"tools": {
+                "search": {
+                    "versions": [{
+                        "version": "1.0.0",
+                        "server": "old-server",
+                        "contract": {
+                            "name": "search",
+                            "description": "inline historical contract",
+                            "inputSchema": {"type": "object", "properties": {}}
+                        }
+                    }],
+                    "default": "1.0.0",
+                    "aliases": true
+                }
+            }}}
+        }))
+        .expect("rollout authorization fixture compiles")
+    }
+
+    fn synthesized_search_v1() -> serde_json::Value {
+        json!({
+            "name": "search_v1",
+            "description": "inline historical contract",
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": {"sbproxy.dev/version": "1.0.0"}
+        })
+    }
+
+    async fn mcp_handler_exchange(
+        action: &McpAction,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::to_vec(&request).expect("MCP request JSON");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP downstream fixture");
+        let address = listener.local_addr().expect("MCP downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect MCP downstream fixture");
+            let headers = format!(
+                "POST / HTTP/1.1\r\nHost: mcp.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write MCP request headers");
+            stream
+                .write_all(&body)
+                .await
+                .expect("write MCP request body");
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read MCP response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse MCP downstream request");
+        let mut context = RequestContext::new();
+
+        handle_mcp_action(&mut session, action, &mut context, false)
+            .await
+            .expect("MCP handler response");
+        drop(session);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("MCP response timeout")
+            .expect("MCP downstream task");
+        let response = String::from_utf8(response).expect("MCP HTTP response UTF-8");
+        serde_json::from_str(
+            response
+                .split_once("\r\n\r\n")
+                .expect("MCP HTTP response body")
+                .1,
+        )
+        .expect("MCP JSON response")
+    }
+
+    #[test]
+    fn task_5b_synthesized_rollout_visibility_authorizes_the_resolved_call_target() {
+        let cases = [
+            (
+                vec!["search_v1"],
+                vec!["search"],
+                false,
+                "an alias-only allowlist must not advertise a call that resolves to a denied target",
+            ),
+            (
+                vec!["search"],
+                vec!["search_v1"],
+                false,
+                "alias-only RBAC must not advertise a call that resolves to a denied target",
+            ),
+            (
+                vec!["search"],
+                vec!["search"],
+                true,
+                "the alias is visible when its concrete call target passes every gate",
+            ),
+        ];
+
+        for (allowlist, rbac_allowed, expected, reason) in cases {
+            let action = rollout_action_with_authorization(&allowlist, &rbac_allowed);
+            action.federation.seed_tools_for_test(
+                HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+                None,
+            );
+            let catalog = action.federation.tool_catalog_snapshot();
+            let plan = action.rollout_plan.as_deref().expect("rollout plan");
+
+            assert_eq!(
+                mcp_synthesized_rollout_tool_is_visible_to_principal(
+                    &action,
+                    plan,
+                    &catalog,
+                    &synthesized_search_v1(),
+                    None,
+                    &sbproxy_plugin::Principal::anonymous(),
+                    chrono::NaiveDate::from_ymd_opt(2026, 8, 14).expect("fixture date"),
+                ),
+                expected,
+                "{reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_5b_handler_list_and_call_share_resolved_rollout_authorization() {
+        let cases = [
+            (
+                vec!["search_v1"],
+                vec!["search"],
+                "tool_allowlist",
+                "alias-only allowlist",
+            ),
+            (vec!["search"], vec!["search_v1"], "RBAC", "alias-only RBAC"),
+        ];
+
+        for (allowlist, rbac_allowed, denial, case) in cases {
+            let action = rollout_action_with_authorization(&allowlist, &rbac_allowed);
+            action.federation.seed_tools_for_test(
+                HashMap::from([("search".to_string(), tool("search", "old-server"))]),
+                None,
+            );
+
+            let list = mcp_handler_exchange(
+                &action,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            )
+            .await;
+            assert!(
+                list["result"]["tools"]
+                    .as_array()
+                    .expect("tools/list result")
+                    .iter()
+                    .all(|tool| tool["name"] != "search_v1"),
+                "{case} must hide the synthesized alias from tools/list"
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "search_v1", "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains(denial),
+                "{case} must deny the same resolved target on tools/call, got: {message}"
+            );
+        }
     }
 }

@@ -4220,6 +4220,65 @@ pub fn record_mcp_tool_cost(tool: &str, server: &str, cost_usd: f64) {
         .inc_by(cost_usd);
 }
 
+/// Record a static tool-poisoning indicator found in advertised tool text on
+/// `sbproxy_mcp_poison_indicators_total{field, indicator, kind}`.
+///
+/// Reporting only. Nothing gates on this: published evaluations put
+/// injection classifiers at single-digit catch rates on realistic channels,
+/// so an indicator is a signal for a reviewer, never a boundary. The
+/// boundaries this gateway enforces are deterministic and live elsewhere.
+///
+/// Labels are closed sets and exclude the tool and server names, which a
+/// federated peer controls.
+pub fn record_mcp_poison_indicator(
+    field: &'static str,
+    indicator: &'static str,
+    kind: &'static str,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_poison_indicators_total",
+            "Static tool-poisoning indicators in advertised MCP tool text, by field and indicator",
+            &["field", "indicator", "kind"],
+        )
+        .expect("mcp poison indicator counter registers")
+    });
+    counter.with_label_values(&[field, indicator, kind]).inc();
+}
+
+/// Record advertised tool text that hides content from a reader on
+/// `sbproxy_mcp_concealed_text_findings_total{field, class, kind}`.
+///
+/// `field` is the advertised field (`name`, `title`, `description`), `class`
+/// the concealment class (`tag_block`, `bidi_control`, `zero_width`,
+/// `other_control`), and `kind` whether the finding appeared or cleared.
+///
+/// Every label is a closed set chosen by this gateway. Deliberately none of
+/// them is the tool or server name: those are upstream-controlled strings and
+/// would make this series unbounded, which is the standing rule for anything
+/// a federated peer can name.
+pub fn record_mcp_concealed_text_finding(
+    field: &'static str,
+    class: &'static str,
+    kind: &'static str,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_concealed_text_findings_total",
+            "Advertised MCP tool text carrying characters hidden from a reader, by field and class",
+            &["field", "class", "kind"],
+        )
+        .expect("mcp concealed text finding counter registers")
+    });
+    counter.with_label_values(&[field, class, kind]).inc();
+}
+
 /// Record a tool-versioning oracle verdict on
 /// `sbproxy_mcp_tool_compat_verdicts_total{grade, outcome}`
 /// (WOR-1635). `grade` is the computed semver grade (`none`, `patch`,

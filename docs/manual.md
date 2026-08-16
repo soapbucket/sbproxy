@@ -1721,7 +1721,13 @@ proxy:
 
 ### File watcher
 
-SBproxy watches the directory containing the configuration file via `notify`. Every modify, create, or remove event in that directory triggers a reload of the config file; there is no debounce window. Back-to-back editor writes produce back-to-back reloads, which is harmless: each reload atomically swaps the compiled pipeline, and a failed compile leaves the previous pipeline serving.
+SBproxy watches the directory containing the configuration file via `notify`, rather than the file itself, so an atomic-rename save or a Kubernetes ConfigMap symlink swap is still seen. Watching the directory also means every unrelated file in it reports an event, so two things decide whether a reload actually happens.
+
+A save arrives as a burst of events, not one event, so the watcher waits for the burst to go quiet (250 ms, capped at 2 seconds for a directory that never goes quiet) before reading. Back-to-back editor writes therefore coalesce into a single reload rather than one apiece, and the read sees a finished file rather than one still being written.
+
+It then compares the file's content against what is currently loaded, and does nothing when they match. Activity on a neighbouring file, or a no-op save of the config itself, costs no reload. This matters beyond efficiency: a reload swaps the compiled pipeline, which ends every live MCP session and makes callers re-initialize.
+
+When the content has genuinely changed, the swap is atomic, and a config that fails to compile leaves the previous pipeline serving.
 
 ### SIGHUP trigger
 

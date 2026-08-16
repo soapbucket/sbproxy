@@ -23,8 +23,8 @@ pub enum McpToolFormat {
 /// catalogue is injected as the key's tool surface (WOR-1646).
 #[derive(Debug, Clone, Deserialize)]
 pub struct InjectMcpRef {
-    /// The target gateway's `server_info.name`, as registered by its
-    /// `mcp` action.
+    /// The target gateway's `server_info.name`, resolved only among MCP
+    /// actions in the request route's tenant and pinned config generation.
     #[serde(rename = "ref")]
     pub reference: String,
     /// Provider tool-JSON shape to emit. Defaults to OpenAI.

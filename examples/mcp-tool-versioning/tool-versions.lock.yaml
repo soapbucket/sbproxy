@@ -6,7 +6,7 @@ generated_for: mcp.example.com
 tools:
   search:
     semver: "1.0.0"
-    contract_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    contract_digest: "sha256:56d47fc4c5280f5723d3e355c8149bc402abd636d3c6bebb979b93abaecce0db"
     contract:
       name: search
       description: search public repositories
