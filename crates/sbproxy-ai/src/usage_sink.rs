@@ -11,9 +11,9 @@
 //! a failure: a broken sink cannot fail the request it is logging.
 
 use sbproxy_security::egress::{
-    configured_gate, evaluate_hop, record_egress_refused, record_egress_seen,
-    CachedSystemResolver, EgressAuthorizer, EgressDenied, EgressPurpose, EgressSightingStatus,
-    HostResolver, RedirectRule,
+    configured_gate, evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
+    EgressAuthorizer, EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
+    RedirectRule,
 };
 use serde::{Deserialize, Serialize};
 

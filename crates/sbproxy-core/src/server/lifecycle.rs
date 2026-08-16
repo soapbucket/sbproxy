@@ -4378,8 +4378,14 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 /// again to observe. WOR-2481 tracks adding real reload re-verification.
 fn install_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
     use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
-    install_configured_gate(EgressPurpose::AiProvider, compiled.egress.ai_providers.clone());
-    install_configured_gate(EgressPurpose::UsageSink, compiled.egress.usage_sinks.clone());
+    install_configured_gate(
+        EgressPurpose::AiProvider,
+        compiled.egress.ai_providers.clone(),
+    );
+    install_configured_gate(
+        EgressPurpose::UsageSink,
+        compiled.egress.usage_sinks.clone(),
+    );
     install_configured_gate(
         EgressPurpose::ModelArtifact,
         compiled.egress.model_artifacts.clone(),

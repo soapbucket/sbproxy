@@ -2771,7 +2771,10 @@ mod tests {
             "http://attacker-collector.invalid:4317",
             "traces-wor2481-denied",
         );
-        assert_eq!(outcome, TelemetryEgressOutcome::Denied(EgressDenied::UnlistedHost));
+        assert_eq!(
+            outcome,
+            TelemetryEgressOutcome::Denied(EgressDenied::UnlistedHost)
+        );
 
         let sighting = egress_inventory_snapshot()
             .into_iter()
@@ -2792,10 +2795,8 @@ mod tests {
         // No `egress.telemetry:` sub-block configured: nothing installed.
         install_configured_gate(EgressPurpose::Telemetry, None);
 
-        let outcome = check_telemetry_egress(
-            "http://collector.internal:4317",
-            "traces-wor2481-omitted",
-        );
+        let outcome =
+            check_telemetry_egress("http://collector.internal:4317", "traces-wor2481-omitted");
         assert_eq!(outcome, TelemetryEgressOutcome::Proceed);
 
         let sighting = egress_inventory_snapshot()
@@ -2820,8 +2821,7 @@ mod tests {
             Some(enforce_telemetry(&["127.0.0.1"], true)),
         );
 
-        let outcome =
-            check_telemetry_egress("https://127.0.0.1", "metrics-wor2481-allowed");
+        let outcome = check_telemetry_egress("https://127.0.0.1", "metrics-wor2481-allowed");
         assert_eq!(outcome, TelemetryEgressOutcome::Proceed);
 
         let sighting = egress_inventory_snapshot()

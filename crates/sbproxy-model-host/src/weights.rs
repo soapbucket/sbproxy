@@ -138,7 +138,8 @@ pub async fn ensure_weight_file(
     // WOR-2476: wires the `EgressPurpose::ModelArtifact` gate from the
     // top-level `egress.model_artifacts:` section, when configured.
     let transport = std::sync::Arc::new(
-        crate::HttpArtifactTransport::with_configured_egress().map_err(|error| error.to_string())?,
+        crate::HttpArtifactTransport::with_configured_egress()
+            .map_err(|error| error.to_string())?,
     );
     let manager =
         crate::ArtifactManager::new(cache_root, transport).map_err(|error| error.to_string())?;
