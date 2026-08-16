@@ -558,10 +558,17 @@ pub struct McpFederatedServerConfig {
     /// Protocol negotiation pin for this upstream (WOR-2384). `"auto"`
     /// (default) negotiates: the gateway remembers, per tenant, the best
     /// era this upstream has demonstrated and refuses (or, under
-    /// `downgrade: warn`, flags) a later contact that looks weaker. A
-    /// pinned literal era (`"2025-06-18"` or `"2026-07-28"`) never
-    /// negotiates: an upstream that ever answers `initialize` with any
-    /// other `protocolVersion` is refused, regardless of `downgrade:`.
+    /// `downgrade: warn`, flags) a later contact that looks weaker.
+    /// Pinning `"2025-06-18"` never negotiates: an upstream that ever
+    /// answers `initialize` with any other `protocolVersion` is
+    /// refused, regardless of `downgrade:`.
+    ///
+    /// Pinning `"2026-07-28"` is a config-compile error today: outbound
+    /// federation (the leg that dials an upstream MCP server) speaks
+    /// `2025-06-18` only, so a modern pin could never match and would
+    /// permanently refuse every upstream. For the same reason, `auto`
+    /// mode's demonstrated-era ceiling is `2025-06-18` until outbound
+    /// federation speaks the modern era.
     #[serde(default = "default_federated_protocol")]
     pub protocol: String,
     /// Downgrade-resistance mode applied when `protocol: auto` and this
@@ -1109,21 +1116,46 @@ impl McpAction {
             }
         }
 
-        // WOR-2384: a pinned `protocol:` must name one of the two eras
-        // the gateway actually speaks; a typo here would otherwise
-        // silently behave as if `protocol:` had never been set (the
-        // upstream is compared against no pin), and the operator would
-        // have no way to notice the pin never took effect.
+        // WOR-2384 fix round 1, item 1 (critical): federation's
+        // OUTBOUND leg speaks only `LEGACY_PROTOCOL_VERSION` today.
+        // `fetch_server_capabilities` requests `LATEST_PROTOCOL_VERSION`
+        // (== `LEGACY_PROTOCOL_VERSION`; see `types.rs`'s
+        // `SUPPORTED_PROTOCOL_VERSIONS`), and no transport this crate
+        // ships (`streamable.rs`, `sse_client.rs`, `stdio.rs`) ever
+        // constructs a modern-era envelope -- confirmed by grepping all
+        // three for `MODERN_PROTOCOL_VERSION` / `MCP-Protocol-Version`
+        // and finding no hits outside this action's own inbound-facing
+        // code. Per `negotiate_protocol_version`'s own documented
+        // contract (echo the requested revision when supported), a
+        // spec-compliant dual-era peer that the gateway asks for
+        // `2025-06-18` echoes `2025-06-18`, never volunteers
+        // `2026-07-28` on its own. A modern pin could therefore never
+        // match, permanently refusing every dual-era peer, and `auto`
+        // mode can never observe a modern high-water mark -- so a
+        // modern pin is refused at compile time rather than accepted
+        // and silently defeated. `auto` still compiles and tracks
+        // whatever the peer demonstrates; today that ceiling is
+        // `LEGACY_PROTOCOL_VERSION` until outbound federation speaks
+        // the modern era.
         for upstream in &cfg.federated_servers {
+            if upstream.protocol == sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].protocol cannot pin '{}' (origin '{}'): \
+                     outbound federation speaks {} only today, so a modern pin could never \
+                     match; use \"auto\" or pin \"{}\" instead",
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION,
+                    upstream.origin,
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION,
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION,
+                );
+            }
             if upstream.protocol != "auto"
                 && upstream.protocol != sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION
-                && upstream.protocol != sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION
             {
                 anyhow::bail!(
-                    "mcp action: federated_servers[].protocol '{}' must be \"auto\", \"{}\", or \"{}\" (origin '{}')",
+                    "mcp action: federated_servers[].protocol '{}' must be \"auto\" or \"{}\" (origin '{}')",
                     upstream.protocol,
                     sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION,
-                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION,
                     upstream.origin
                 );
             }
@@ -3211,16 +3243,31 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_modern_protocol_compiles() {
+    fn a_pinned_modern_protocol_is_refused_because_outbound_is_legacy_only() {
+        // WOR-2384 fix round 1, item 1 (critical): outbound federation
+        // speaks 2025-06-18 only today (no transport in
+        // `sbproxy_extension::mcp` constructs a modern-era envelope),
+        // so a modern pin could never match a real peer and would
+        // permanently refuse every dual-era upstream. Refused at
+        // compile time rather than accepted and silently defeated.
         let value = json!({
             "type": "mcp",
             "federated_servers": [
                 { "origin": "example.com", "protocol": "2026-07-28" }
             ]
         });
-        let action = McpAction::from_config(value).expect("compile");
-        let prefix = action.prefixes.values().next().expect("compiled");
-        assert_eq!(prefix.protocol_pin(), Some("2026-07-28"));
+        let err = McpAction::from_config(value).expect_err("a modern pin must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("federated_servers[].protocol"),
+            "error should name the offending key: {message}"
+        );
+        assert!(
+            message.contains("outbound federation speaks")
+                && message.contains("2025-06-18")
+                && message.contains("only today"),
+            "error should name the outbound constraint, not just reject the value: {message}"
+        );
     }
 
     #[test]
