@@ -1167,6 +1167,15 @@ pub struct McpFederation {
     /// needs to know what an upstream supports, so adding a surface
     /// does not add a handshake.
     server_capabilities: ArcSwap<HashMap<String, serde_json::Value>>,
+    /// server_name -> the `protocolVersion` string the upstream answered
+    /// with on its last `initialize`, refreshed by
+    /// `refresh_server_capabilities` in the same pass as
+    /// `server_capabilities`. This map is process-wide -- there is
+    /// exactly one upstream behind a server name, so what it answers is
+    /// not a per-tenant fact. Per-tenant downgrade-resistance scoping
+    /// happens in `sbproxy_extension::mcp::peer_profile`, which a caller
+    /// consults using the value this map reports (WOR-2384).
+    server_protocol_versions: ArcSwap<HashMap<String, String>>,
     /// WOR-818: mcpApps capability values mirrored from any
     /// upstream that advertised one. Empty when no upstream
     /// supports SEP-1865. The first non-empty value is what the
@@ -1319,6 +1328,7 @@ impl McpFederation {
             prompts: ArcSwap::from_pointee(HashMap::new()),
             prompt_catalog_owner: Arc::new(()),
             server_capabilities: ArcSwap::from_pointee(HashMap::new()),
+            server_protocol_versions: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
             openapi_client,
@@ -1795,13 +1805,15 @@ impl McpFederation {
     /// Returns the number of upstreams that answered.
     pub async fn refresh_server_capabilities(&self) -> usize {
         let mut snapshot: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut protocol_versions: HashMap<String, String> = HashMap::new();
         for server in &self.servers {
             if server.openapi.is_some() {
                 continue;
             }
             match self.fetch_server_capabilities(server).await {
-                Ok(caps) => {
+                Ok((caps, protocol_version)) => {
                     snapshot.insert(server.name.clone(), caps);
+                    protocol_versions.insert(server.name.clone(), protocol_version);
                 }
                 Err(e) => {
                     warn!(
@@ -1814,6 +1826,8 @@ impl McpFederation {
         }
         let count = snapshot.len();
         self.server_capabilities.store(Arc::new(snapshot));
+        self.server_protocol_versions
+            .store(Arc::new(protocol_versions));
         count
     }
 
@@ -1828,12 +1842,30 @@ impl McpFederation {
             .is_some()
     }
 
-    /// Initialize the upstream and return the whole `capabilities`
-    /// object it advertised, or `Value::Null` when it advertised none.
+    /// The `protocolVersion` string `server_name` answered with on its
+    /// last successful `initialize`, or `None` when it has never
+    /// answered (never probed yet, an OpenAPI-backed upstream, or every
+    /// probe so far has failed). Feeds the peer-profile downgrade check
+    /// (WOR-2384); call after at least one
+    /// [`Self::refresh_server_capabilities`].
+    pub fn last_negotiated_protocol(&self, server_name: &str) -> Option<String> {
+        self.server_protocol_versions
+            .load()
+            .get(server_name)
+            .cloned()
+    }
+
+    /// Initialize the upstream and return the `capabilities` object it
+    /// advertised (or `Value::Null` when it advertised none) alongside
+    /// the `protocolVersion` string it answered with. A response that
+    /// omits `protocolVersion`, or carries a non-string value, is
+    /// treated as [`super::types::LEGACY_PROTOCOL_VERSION`]: only
+    /// positive modern evidence counts as modern, the same rule
+    /// inbound era classification already applies (`classify_http_era`).
     async fn fetch_server_capabilities(
         &self,
         server: &McpServerConfig,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<(serde_json::Value, String)> {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "initialize".to_string(),
@@ -1854,7 +1886,13 @@ impl McpFederation {
             );
         }
         let result = resp.result.unwrap_or_default();
-        Ok(result.get("capabilities").cloned().unwrap_or_default())
+        let capabilities = result.get("capabilities").cloned().unwrap_or_default();
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or(super::types::LEGACY_PROTOCOL_VERSION)
+            .to_string();
+        Ok((capabilities, protocol_version))
     }
 
     /// Fetch the resource list from one upstream server. Pure
@@ -5498,6 +5536,42 @@ mod tests {
             .prompts_capability()
             .expect("a declaring upstream turns the capability on");
         assert_eq!(advertised, json!({ "listChanged": false }));
+    }
+
+    #[test]
+    fn last_negotiated_protocol_reads_back_what_a_refresh_recorded() {
+        // WOR-2384: `refresh_server_capabilities` stores into
+        // `server_protocol_versions` in the same pass as
+        // `server_capabilities`; this test seeds the ArcSwap directly
+        // (mirroring `prompts_capability_is_absent_until_an_upstream_declares_one`
+        // above) so it does not need a live upstream to prove the
+        // accessor reads back what a refresh would have written.
+        let fed = McpFederation::new(vec![
+            mock_server("gh", "http://gh.test"),
+            mock_server("docs", "http://docs.test"),
+        ]);
+        assert_eq!(
+            fed.last_negotiated_protocol("gh"),
+            None,
+            "nothing has been probed yet"
+        );
+
+        let mut versions = HashMap::new();
+        versions.insert(
+            "gh".to_string(),
+            crate::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+        );
+        fed.server_protocol_versions.store(Arc::new(versions));
+
+        assert_eq!(
+            fed.last_negotiated_protocol("gh").as_deref(),
+            Some(crate::mcp::types::MODERN_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            fed.last_negotiated_protocol("docs"),
+            None,
+            "a server this refresh never recorded declares nothing"
+        );
     }
 
     #[tokio::test]

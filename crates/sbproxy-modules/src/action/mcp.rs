@@ -555,6 +555,65 @@ pub struct McpFederatedServerConfig {
     /// config error; pick one credential source.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Protocol negotiation pin for this upstream (WOR-2384). `"auto"`
+    /// (default) negotiates: the gateway remembers, per tenant, the best
+    /// era this upstream has demonstrated and refuses (or, under
+    /// `downgrade: warn`, flags) a later contact that looks weaker. A
+    /// pinned literal era (`"2025-06-18"` or `"2026-07-28"`) never
+    /// negotiates: an upstream that ever answers `initialize` with any
+    /// other `protocolVersion` is refused, regardless of `downgrade:`.
+    #[serde(default = "default_federated_protocol")]
+    pub protocol: String,
+    /// Downgrade-resistance mode applied when `protocol: auto` and this
+    /// upstream's contact looks weaker than what it has previously
+    /// demonstrated, on either axis: a legacy-only answer after having
+    /// shown the modern era, or a successful call needing no
+    /// credentials after having required them before. `warn` (default)
+    /// logs and counts the downgrade; the call still proceeds. `block`
+    /// refuses the call until the operator pins `protocol:` explicitly
+    /// or edits this server entry (which starts a fresh profile; see
+    /// [`sbproxy_extension::mcp::peer_profile::peer_key`]). Ignored
+    /// when `protocol:` is pinned. WOR-2384.
+    #[serde(default)]
+    pub downgrade: McpDowngradePolicy,
+}
+
+fn default_federated_protocol() -> String {
+    "auto".to_string()
+}
+
+/// Wire form of `federated_servers[].downgrade` (WOR-2384). See
+/// [`McpFederatedServerConfig::downgrade`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpDowngradePolicy {
+    /// Log and count a downgrade; the call proceeds.
+    #[default]
+    Warn,
+    /// Refuse a call whose contact looks weaker than this peer's
+    /// recorded profile.
+    Block,
+}
+
+impl From<McpDowngradePolicy> for sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy {
+    fn from(value: McpDowngradePolicy) -> Self {
+        match value {
+            McpDowngradePolicy::Warn => sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Warn,
+            McpDowngradePolicy::Block => sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block,
+        }
+    }
+}
+
+impl McpDowngradePolicy {
+    /// Wire name, used as one of the four [`sbproxy_extension::mcp::peer_profile::peer_key`]
+    /// inputs so editing `downgrade:` alone still starts a fresh peer
+    /// profile.
+    fn peer_key_component(self) -> &'static str {
+        match self {
+            McpDowngradePolicy::Warn => "warn",
+            McpDowngradePolicy::Block => "block",
+        }
+    }
 }
 
 /// One entry in the gateway-level guardrails list.
@@ -897,6 +956,24 @@ pub struct McpServerPrefix {
     pub run_as_user_auth: bool,
     /// Upstream auth minting config when `run_as_user_auth` is true.
     pub upstream_auth: Option<sbproxy_extension::mcp::auth::McpUpstreamAuthConfig>,
+    /// Configured protocol pin: `"auto"` or a literal era string. See
+    /// [`McpFederatedServerConfig::protocol`]. WOR-2384.
+    pub protocol: String,
+    /// Downgrade-resistance mode when `protocol == "auto"`. See
+    /// [`McpFederatedServerConfig::downgrade`]. WOR-2384.
+    pub downgrade: McpDowngradePolicy,
+    /// This server entry's identity key in the peer-profile registry,
+    /// computed once at compile time from `(name, origin, protocol,
+    /// downgrade)`. See
+    /// [`sbproxy_extension::mcp::peer_profile::peer_key`]. WOR-2384.
+    pub peer_key: String,
+}
+
+impl McpServerPrefix {
+    /// The pinned protocol era, or `None` for `protocol: auto`.
+    pub fn protocol_pin(&self) -> Option<&str> {
+        (self.protocol != "auto").then_some(self.protocol.as_str())
+    }
 }
 
 /// Configured tool classifications for the lethal-trifecta guardrail.
@@ -1025,6 +1102,26 @@ impl McpAction {
                         upstream.origin
                     );
                 }
+            }
+        }
+
+        // WOR-2384: a pinned `protocol:` must name one of the two eras
+        // the gateway actually speaks; a typo here would otherwise
+        // silently behave as if `protocol:` had never been set (the
+        // upstream is compared against no pin), and the operator would
+        // have no way to notice the pin never took effect.
+        for upstream in &cfg.federated_servers {
+            if upstream.protocol != "auto"
+                && upstream.protocol != sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION
+                && upstream.protocol != sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION
+            {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].protocol '{}' must be \"auto\", \"{}\", or \"{}\" (origin '{}')",
+                    upstream.protocol,
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION,
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION,
+                    upstream.origin
+                );
             }
         }
 
@@ -1169,6 +1266,18 @@ impl McpAction {
                 namespace: upstream.namespace,
                 openapi,
             });
+            // WOR-2384: computed before `upstream.protocol` /
+            // `upstream.downgrade` are moved into the struct literal
+            // below. Any edit to `name`, `origin`, `protocol`, or
+            // `downgrade` on this entry produces a different key, which
+            // is the entire "reload of the server entry resets the
+            // profile" mechanism -- see `peer_key`'s doc comment.
+            let peer_key = sbproxy_extension::mcp::peer_profile::peer_key(
+                &name,
+                &upstream.origin,
+                &upstream.protocol,
+                upstream.downgrade.peer_key_component(),
+            );
             prefixes.insert(
                 name.clone(),
                 McpServerPrefix {
@@ -1178,6 +1287,9 @@ impl McpAction {
                     timeout: upstream.timeout,
                     run_as_user_auth: upstream.run_as_user_auth,
                     upstream_auth: upstream.upstream_auth,
+                    protocol: upstream.protocol,
+                    downgrade: upstream.downgrade,
+                    peer_key,
                 },
             );
         }
@@ -3011,6 +3123,8 @@ mod tests {
                 spec_path: None,
                 headers: BTreeMap::new(),
                 egress: None,
+                protocol: default_federated_protocol(),
+                downgrade: McpDowngradePolicy::default(),
             };
             assert_eq!(entry.timeout, Some(expected), "parsed {raw}");
         }
@@ -3055,5 +3169,115 @@ mod tests {
         let action = McpAction::from_config(value).expect("compile");
         // No explicit prefix, so the derived name comes from the host.
         assert!(action.prefixes.contains_key("github_example_com"));
+    }
+
+    // --- WOR-2384: federated_servers[].protocol / .downgrade ---
+
+    #[test]
+    fn protocol_and_downgrade_default_to_auto_and_warn() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com" }
+            ]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        let prefix = action
+            .prefixes
+            .values()
+            .next()
+            .expect("one federated server compiled");
+        assert_eq!(prefix.protocol, "auto");
+        assert_eq!(prefix.protocol_pin(), None);
+        assert_eq!(prefix.downgrade, McpDowngradePolicy::Warn);
+    }
+
+    #[test]
+    fn a_pinned_legacy_protocol_compiles_and_is_reported_by_protocol_pin() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com", "protocol": "2025-06-18", "downgrade": "block" }
+            ]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        let prefix = action.prefixes.values().next().expect("compiled");
+        assert_eq!(prefix.protocol_pin(), Some("2025-06-18"));
+        assert_eq!(prefix.downgrade, McpDowngradePolicy::Block);
+    }
+
+    #[test]
+    fn a_pinned_modern_protocol_compiles() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com", "protocol": "2026-07-28" }
+            ]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        let prefix = action.prefixes.values().next().expect("compiled");
+        assert_eq!(prefix.protocol_pin(), Some("2026-07-28"));
+    }
+
+    #[test]
+    fn an_unrecognised_protocol_pin_is_rejected() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com", "protocol": "2025-03-26" }
+            ]
+        });
+        let err = McpAction::from_config(value).expect_err("unknown era must be refused");
+        assert!(
+            err.to_string().contains("federated_servers[].protocol"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_downgrade_mode_is_rejected_by_serde() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com", "downgrade": "ignore" }
+            ]
+        });
+        assert!(McpAction::from_config(value).is_err());
+    }
+
+    #[test]
+    fn editing_downgrade_alone_changes_the_peer_key() {
+        // The peer_key is one of the mechanisms behind "reload of the
+        // server entry resets the profile" (see
+        // `sbproxy_extension::mcp::peer_profile::peer_key`); this pins
+        // that even a same-origin, same-protocol-pin edit to only
+        // `downgrade:` still produces a different compiled key.
+        let warn_value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com", "downgrade": "warn" }
+            ]
+        });
+        let block_value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "example.com", "downgrade": "block" }
+            ]
+        });
+        let warn_action = McpAction::from_config(warn_value).expect("compile");
+        let block_action = McpAction::from_config(block_value).expect("compile");
+        let warn_key = &warn_action
+            .prefixes
+            .values()
+            .next()
+            .expect("compiled")
+            .peer_key;
+        let block_key = &block_action
+            .prefixes
+            .values()
+            .next()
+            .expect("compiled")
+            .peer_key;
+        assert_ne!(warn_key, block_key);
     }
 }

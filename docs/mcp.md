@@ -390,6 +390,8 @@ success.
 | `headers` | map<string, string> | `{}` | Static headers attached to every REST request a `type: openapi` server dispatches, e.g. a shared service credential. Values pass through `${VAR}` interpolation; keep secrets in the environment. Rejected on non-`openapi` servers. |
 | `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
 | `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
+| `protocol` | string | `auto` | `auto` negotiates and remembers, per tenant, the best MCP era this upstream has demonstrated. A pinned literal era (`2025-06-18` or `2026-07-28`) never negotiates: any other answer is refused. |
+| `downgrade` | string | `warn` | `warn` or `block`. Applies only when `protocol: auto` and this upstream's contact looks weaker, on protocol era or auth posture, than what it has shown before. `warn` logs and allows; `block` refuses until the operator pins `protocol` explicitly or edits this server entry. |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
 config error, and so is a server with no `rbac` label at all while

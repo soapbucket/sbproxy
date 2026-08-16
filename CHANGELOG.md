@@ -26,6 +26,20 @@ the next version cut.
   counts every refusal. Everything else keeps the existing best-effort,
   drop-and-count contract.
 
+- **Federated MCP servers resist a silent protocol or auth downgrade.**
+  `federated_servers[].protocol` pins one upstream to a literal MCP era
+  (`2025-06-18` or `2026-07-28`); the default, `auto`, negotiates and
+  remembers, per tenant, the best era and strictest auth posture that
+  upstream has ever demonstrated. A later contact that looks weaker,
+  a legacy-only answer after showing the modern era, or a successful
+  call needing no credentials after having required them, is a
+  downgrade: `federated_servers[].downgrade: warn` (default) logs and
+  allows it, `block` refuses the call until the operator pins
+  `protocol` explicitly or edits that server entry. Both refusal paths
+  emit the `mcp_governance_decision` evidence event with
+  `rule_id: peer_downgrade` and a `SecurityAuditEntry` policy
+  violation.
+
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
   job) fails when an Apache-2.0-only dependency is missing a stanza,

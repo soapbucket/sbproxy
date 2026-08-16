@@ -21,6 +21,8 @@
 //! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
 //! - [`auth`] - Run-as-user upstream credential minting (WOR-1792).
 //! - [`stdio`] - Supervised local stdio MCP transport.
+//! - [`peer_profile`] - Per-tenant downgrade-resistant negotiation
+//!   profiles for federated peers (WOR-2384).
 
 pub mod access_control;
 pub mod auth;
@@ -32,6 +34,7 @@ pub mod discovery;
 pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
+pub mod peer_profile;
 pub mod poisoned_text;
 pub mod protocol;
 pub mod quarantine;
@@ -69,6 +72,10 @@ pub use federation::{
     SerializedTools, ToolVersioningGate, VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
+pub use peer_profile::{
+    McpPeerProfile, ObservationVerdict, PeerDowngradeKind, PeerDowngradePolicy, PinMismatch,
+    PEER_DOWNGRADE_RULE_ID,
+};
 pub use protocol::{
     classify_http_era, decode_header_value, decode_http_request, decode_http_request_with_scan,
     encode_header_value, DecodedMcpRequest, DecodedRequestId, HeaderValueError,
