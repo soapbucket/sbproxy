@@ -4477,6 +4477,7 @@ fn the_recorded_tenant_and_origin_are_the_populated_config_fields() {
         workspace_id: String::new(),
         origin: "billing-api".to_owned(),
         tenant: "acme-corp".to_owned(),
+        record_format: sbproxy_config::types::PolicyRecordFormat::default(),
     };
     let labels = [
         ("event", "policy"),
@@ -4518,6 +4519,7 @@ fn the_audit_record_names_the_same_engine_the_metric_does() {
         workspace_id: String::new(),
         origin: "audit-origin".to_owned(),
         tenant: "acme-corp".to_owned(),
+        record_format: sbproxy_config::types::PolicyRecordFormat::default(),
     };
     super::emit_policy_verdict(
         &ctx,
@@ -4551,6 +4553,150 @@ fn the_audit_record_names_the_same_engine_the_metric_does() {
 }
 
 #[test]
+fn the_decision_format_publishes_one_shared_shape_carrying_a_reason() {
+    // WOR-2448. The convergence, driven through the real bus. Two
+    // things have to hold at once and only the pair is meaningful:
+    // exactly one record is published, and it is the shared shape.
+    //
+    // Publishing both during the deprecation window was the tempting
+    // migration and is the one this rejects: it doubles volume on the
+    // densest event in the system and gives an analyst two rows for one
+    // decision, which is the thing convergence exists to stop.
+    //
+    // Needs process isolation, which is why the repository requires
+    // nextest for the test lane. The global bus is a `OnceLock`, so
+    // under a threaded `cargo test` the first installer wins and every
+    // other test in the binary publishes into a channel it cannot read.
+    // Every bus test in this file has that property; this one says so
+    // because the failure reads as "the emitter is broken" rather than
+    // "the runner is wrong".
+    let (bus, mut rx) = super::super::policy_bus::channel(8);
+    super::super::policy_bus::init_global_bus(bus);
+    let ctx = super::PolicyVerdictCtx {
+        request_id: "req-converged".to_owned(),
+        workspace_id: String::new(),
+        origin: "converged-origin".to_owned(),
+        tenant: "acme-corp".to_owned(),
+        record_format: sbproxy_config::types::PolicyRecordFormat::Decision,
+    };
+    super::emit_policy_verdict(
+        &ctx,
+        "waf",
+        sbproxy_observe::events::PolicySurface::BuiltIn,
+        sbproxy_observe::decision::DecisionEngine::BuiltIn,
+        sbproxy_observe::events::VerdictTag::Deny,
+        std::time::Instant::now(),
+    );
+
+    let mut decisions = Vec::new();
+    let mut verdicts = 0usize;
+    while let Ok(record) = rx.try_recv() {
+        match record {
+            super::super::policy_bus::AuditRecord::Decision(audit)
+                if audit.request_id == "req-converged" =>
+            {
+                decisions.push(audit);
+            }
+            super::super::policy_bus::AuditRecord::PolicyVerdict(event)
+                if event.request_id == "req-converged" =>
+            {
+                verdicts += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        verdicts, 0,
+        "the decision format must not also publish the legacy shape; two records for one \
+         decision is the outcome this migration exists to avoid"
+    );
+    assert_eq!(
+        decisions.len(),
+        1,
+        "exactly one converged record per policy decision"
+    );
+    let audit = &decisions[0];
+    assert_eq!(
+        audit.event,
+        sbproxy_observe::decision::DecisionEvent::Policy
+    );
+    assert_eq!(
+        audit.engine,
+        sbproxy_observe::decision::DecisionEngine::BuiltIn,
+        "the converged record must carry the engine, same as the shape it replaces"
+    );
+    // The gap the legacy shape could not close: it has no reason field
+    // at all, so the most security-relevant event in the system was the
+    // one that could not say why it decided.
+    assert!(
+        !audit.reason.as_str().is_empty(),
+        "the converged record must carry a reason"
+    );
+    // And the fields a rule selects on, because prose does not
+    // aggregate: a regex over `message` stops matching the day someone
+    // rewords it.
+    assert_eq!(audit.details.policy_id.as_deref(), Some("waf"));
+    assert_eq!(audit.details.policy_surface.as_deref(), Some("built_in"));
+    assert_eq!(audit.details.verdict.as_deref(), Some("deny"));
+    assert!(audit.details.decision_latency_ms.is_some());
+}
+
+#[test]
+fn the_legacy_format_stays_the_default_and_the_only_record_it_publishes() {
+    // The other half of the deprecation contract. An operator who
+    // upgrades without touching config must see exactly what they saw
+    // before: the legacy shape, and nothing on the converged prefix
+    // that their filter would not match but their parser might trip on.
+    let (bus, mut rx) = super::super::policy_bus::channel(8);
+    super::super::policy_bus::init_global_bus(bus);
+    assert_eq!(
+        sbproxy_config::types::PolicyRecordFormat::default(),
+        sbproxy_config::types::PolicyRecordFormat::Legacy,
+        "flipping this default is a breaking change for every consumer filtering on \
+         policy_verdict_event, and belongs in a major release with the warning already shipped"
+    );
+    let ctx = super::PolicyVerdictCtx {
+        request_id: "req-legacy".to_owned(),
+        workspace_id: String::new(),
+        origin: "legacy-origin".to_owned(),
+        tenant: "acme-corp".to_owned(),
+        record_format: sbproxy_config::types::PolicyRecordFormat::default(),
+    };
+    super::emit_policy_verdict(
+        &ctx,
+        "waf",
+        sbproxy_observe::events::PolicySurface::BuiltIn,
+        sbproxy_observe::decision::DecisionEngine::BuiltIn,
+        sbproxy_observe::events::VerdictTag::Deny,
+        std::time::Instant::now(),
+    );
+
+    let mut verdicts = 0usize;
+    let mut decisions = 0usize;
+    while let Ok(record) = rx.try_recv() {
+        match record {
+            super::super::policy_bus::AuditRecord::PolicyVerdict(event)
+                if event.request_id == "req-legacy" =>
+            {
+                verdicts += 1;
+            }
+            super::super::policy_bus::AuditRecord::Decision(audit)
+                if audit.request_id == "req-legacy" =>
+            {
+                decisions += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(verdicts, 1, "legacy publishes exactly one verdict record");
+    assert_eq!(
+        decisions, 0,
+        "legacy must not publish on the converged prefix; an operator who changed nothing \
+         must see nothing new"
+    );
+}
+
+#[test]
 fn a_faulting_engine_is_recorded_as_error_rather_than_as_its_verdict() {
     // `outcome` documents `error` and `timeout` as always carried, so
     // an alert can fire without knowing which hook broke. That is only
@@ -4560,6 +4706,7 @@ fn a_faulting_engine_is_recorded_as_error_rather_than_as_its_verdict() {
         workspace_id: String::new(),
         origin: "fault-origin".to_owned(),
         tenant: "acme-corp".to_owned(),
+        record_format: sbproxy_config::types::PolicyRecordFormat::default(),
     };
     let labels = [("origin", "fault-origin"), ("outcome", "error")];
     let before = decision_event_total(&labels);

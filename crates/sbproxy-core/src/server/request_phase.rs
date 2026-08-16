@@ -3697,6 +3697,7 @@ pub(super) async fn request_filter(
         workspace_id: policy_workspace_id,
         origin: pipeline.config.origins[origin_idx].origin_id.to_string(),
         tenant: ctx.tenant_id.to_string(),
+        record_format: pipeline.config.decision_audit.policy_record_format(),
     };
     let policy_verdict =
         check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await;

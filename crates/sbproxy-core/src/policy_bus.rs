@@ -79,7 +79,12 @@ pub enum AuditRecord {
     PolicyVerdict(PolicyVerdictEvent),
     /// A decision-family audit record, one per emitting decision
     /// point that the operator has enabled.
-    Decision(DecisionAudit),
+    ///
+    /// Boxed because it is several times the size of the verdict
+    /// variant, and an enum is as large as its largest arm: unboxed,
+    /// every one of the queue's 10 000 slots would be sized for a
+    /// decision record whether it held one or not.
+    Decision(Box<DecisionAudit>),
 }
 
 impl AuditRecord {
@@ -358,7 +363,7 @@ pub fn try_publish(event: PolicyVerdictEvent) -> Result<(), Box<AuditRecord>> {
 /// caller reads the tenant off it and cannot label a drop with a
 /// tenant the record disagrees about.
 pub fn try_publish_decision(audit: DecisionAudit) -> Result<(), Box<AuditRecord>> {
-    send_record(AuditRecord::Decision(audit))
+    send_record(AuditRecord::Decision(Box::new(audit)))
 }
 
 /// Build, scrub, publish, and account for one decision audit record.
@@ -594,7 +599,7 @@ mod tests {
         // OCSF keys can still count and correlate its own truncations.
         let audit = decision_with_request_id(&"x".repeat(200_000));
         let event_id = audit.event_id;
-        let record = AuditRecord::Decision(audit);
+        let record = AuditRecord::Decision(Box::new(audit));
         let line = encode_record(&record).expect("encode");
         assert!(line.len() > MAX_AUDIT_LINE_BYTES);
 
@@ -625,7 +630,7 @@ mod tests {
         // the SIEM parsers on this feed read. Nothing but this test stops
         // somebody "simplifying" the drain to `serde_json::to_string(audit)`,
         // which would keep every line valid JSON and break every consumer.
-        let record = AuditRecord::Decision(sample_decision());
+        let record = AuditRecord::Decision(Box::new(sample_decision()));
         let line = encode_record(&record).expect("encode");
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
 
@@ -650,7 +655,7 @@ mod tests {
             "policy_verdict_event"
         );
         assert_eq!(
-            AuditRecord::Decision(sample_decision()).stderr_prefix(),
+            AuditRecord::Decision(Box::new(sample_decision())).stderr_prefix(),
             "decision_audit_event"
         );
     }
@@ -679,7 +684,7 @@ mod tests {
         tx.send(AuditRecord::PolicyVerdict(sample_event()))
             .await
             .expect("verdict send");
-        tx.send(AuditRecord::Decision(sample_decision()))
+        tx.send(AuditRecord::Decision(Box::new(sample_decision())))
             .await
             .expect("decision send");
 
@@ -726,11 +731,11 @@ mod tests {
 
         let (decision_tx, _decision_rx) = channel(1);
         decision_tx
-            .send(AuditRecord::Decision(sample_decision()))
+            .send(AuditRecord::Decision(Box::new(sample_decision())))
             .await
             .expect("first decision fits");
         let decision_err = decision_tx
-            .try_send(AuditRecord::Decision(sample_decision()))
+            .try_send(AuditRecord::Decision(Box::new(sample_decision())))
             .expect_err("second decision overflows");
 
         match (verdict_err, decision_err) {
@@ -932,7 +937,7 @@ mod tests {
             .try_recv()
             .unwrap_or_else(|err| panic!("{context}: nothing reached the bus ({err})"))
         {
-            AuditRecord::Decision(audit) => audit,
+            AuditRecord::Decision(audit) => *audit,
             other => panic!("{context}: the chokepoint publishes decisions, got {other:?}"),
         }
     }
