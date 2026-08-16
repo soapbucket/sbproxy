@@ -391,12 +391,7 @@ async fn mint_token_exchange(
                     EgressSightingStatus::Denied,
                     Some(denied),
                 );
-                record_egress_refused(
-                    EgressPurpose::TokenExchange,
-                    denied,
-                    tenant,
-                    &endpoint_host,
-                );
+                record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, &endpoint_host);
                 return Err(UpstreamAuthError::EgressDenied);
             }
         },

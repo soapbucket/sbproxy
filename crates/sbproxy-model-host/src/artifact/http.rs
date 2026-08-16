@@ -320,7 +320,9 @@ impl ArtifactTransport for HttpArtifactTransport {
                         "unset",
                         &artifact_host,
                     );
-                    return Err(ArtifactError::Transport(format!("egress denied: {denied:?}")));
+                    return Err(ArtifactError::Transport(format!(
+                        "egress denied: {denied:?}"
+                    )));
                 }
             }
         }

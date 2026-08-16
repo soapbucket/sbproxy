@@ -3116,7 +3116,7 @@ mod tests {
     /// attempt (the denied host does not resolve).
     #[tokio::test]
     async fn denied_by_allowlist_judge_url_is_refused() {
-        use sbproxy_extension::mcp::quarantine::{REASON_JUDGE_EGRESS_DENIED, UntrustedToolOutput};
+        use sbproxy_extension::mcp::quarantine::{UntrustedToolOutput, REASON_JUDGE_EGRESS_DENIED};
 
         let action = McpAction::from_config(json!({
             "type": "mcp",

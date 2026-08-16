@@ -1902,6 +1902,9 @@ mod tests {
             .find(|e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == expected_host)
             .expect("denied object-store destination must be stamped in the inventory");
         assert_eq!(entry.status, "denied");
-        assert_eq!(entry.last_reason, Some(EgressDenied::UnlistedHost.as_label()));
+        assert_eq!(
+            entry.last_reason,
+            Some(EgressDenied::UnlistedHost.as_label())
+        );
     }
 }

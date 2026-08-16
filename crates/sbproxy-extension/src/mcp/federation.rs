@@ -2708,10 +2708,11 @@ impl McpFederation {
         // short-circuits to a synthetic, always-`Ok` destination
         // (`legacy_passthrough`) rather than surfacing as `None`.
         let is_gated = backing.egress_policy.mode.is_enforce();
-        let mut dest = match backing
-            .egress_policy
-            .authorize(EgressPurpose::OpenApiTool, url.as_str(), resolver)
-        {
+        let mut dest = match backing.egress_policy.authorize(
+            EgressPurpose::OpenApiTool,
+            url.as_str(),
+            resolver,
+        ) {
             Ok(dest) => {
                 record_egress_seen(
                     EgressPurpose::OpenApiTool,
