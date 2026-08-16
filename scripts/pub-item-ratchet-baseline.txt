@@ -366,3 +366,17 @@
 # The miscount is the conservative direction by design (an item looks more
 # used, not less), so the drift it causes is a ratchet that was too loose
 # getting tighter.
+
+# 2026-08-16 (WOR-2384 fix round 1): 290 -> 293. Three new
+# `McpFederation` test seams in sbproxy-extension/src/mcp/federation.rs:
+# `seed_resources_for_test`, `seed_prompts_for_test`, and
+# `seed_server_observations_for_test`. All three are `#[doc(hidden)]
+# pub fn`, named `..._for_test`, and exist for exactly the reason the
+# pre-existing `seed_tools_for_test` (already in this baseline, unaffected
+# by this bump) does: `server_protocol_versions`, `server_auth_required`,
+# `resources`, and `prompts` are private `McpFederation` fields that only
+# a real upstream round trip (`refresh_server_capabilities`) would
+# otherwise populate, so a caller in another crate (sbproxy-core's
+# peer-downgrade dispatch tests) needs a seam to seed them directly. Not
+# narrowable: the whole point is a public entry point a different crate's
+# `#[test]`/`#[tokio::test]` functions call.
