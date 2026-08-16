@@ -200,8 +200,17 @@ An origin with an exact hostname derives its own anchor, so
 `modern_http` is optional there. A wildcard hostname cannot, and without
 `public_origin` every `2026-07-28` request to it is refused with a
 `421`. That refusal is logged with the reason and the authority that was
-rejected; the response body is empty on purpose so a disallowed origin
-learns nothing about the endpoint.
+rejected, and it is recorded as a `mcp_transport_denied` security audit
+event so it reaches the same SIEM stream as every other denial. The
+response body is empty on purpose so a disallowed origin learns nothing
+about the endpoint.
+
+The two ways of getting an anchor differ on the port. An origin key is a
+hostname and carries no port, so a derived anchor compares the host and
+accepts whatever port the client dialed; a gateway on `8080` works
+without configuration. A declared `public_origin` is you writing down
+the URL clients use, port included, and is matched whole. Declare one
+when you want the port pinned.
 
 Behind a TLS-terminating load balancer, list the balancer in
 `proxy.trusted_proxies`. The gateway takes the external scheme from

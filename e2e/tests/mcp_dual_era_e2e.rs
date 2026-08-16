@@ -1372,20 +1372,52 @@ fn modern_strict_parameter_headers_reject_unknown_projection_names() {
 }
 
 #[test]
-fn modern_origin_and_authority_compare_effective_ports() {
+fn a_route_derived_anchor_admits_any_port_and_still_pins_the_host() {
+    // An origin key is a hostname. It carries no port, so there is nothing to
+    // compare a port against, and assuming the scheme's default would refuse
+    // every gateway not listening on 80 or 443. A real client dialing a
+    // gateway on 8080 sends `Host: mcp.localhost:8080`, and that has to work.
     let upstream = MockMcpUpstream::legacy();
     let harness = start_gateway(&upstream, false);
-    let body = modern_wire_body("tools/list", Some("411"), "");
-    let mut default_port = modern_wire_headers("tools/list", None);
-    replace_raw_header(&mut default_port, b"host", "mcp.localhost:80");
-    default_port.push(raw_header("Origin", "http://mcp.localhost:80"));
 
-    let response = raw_modern_post(harness.port(), default_port, &body);
-    assert_eq!(response.status, 200, "effective default port: {response:?}");
+    for authority in ["mcp.localhost", "mcp.localhost:80", "mcp.localhost:8080"] {
+        let body = modern_wire_body("tools/list", Some("411"), "");
+        let mut headers = modern_wire_headers("tools/list", None);
+        replace_raw_header(&mut headers, b"host", authority);
+        headers.push(raw_header("Origin", &format!("http://{authority}")));
 
+        let response = raw_modern_post(harness.port(), headers, body);
+        assert_eq!(response.status, 200, "{authority}: {response:?}");
+    }
+
+    // The host is still pinned, and on an exact-hostname origin it is pinned
+    // twice over: routing keys on `Host` too, so a foreign host never reaches
+    // the MCP action at all and the answer is the ordinary 404 for an origin
+    // this gateway does not serve. Asserting 421 here would be asserting that
+    // the trust check ran, which it does not need to.
+    let body = modern_wire_body("tools/list", Some("412"), "");
+    let mut wrong_host = modern_wire_headers("tools/list", None);
+    replace_raw_header(&mut wrong_host, b"host", "evil.localhost:8080");
+    let response = raw_modern_post(harness.port(), wrong_host, body);
+    assert_eq!(response.status, 404, "{response:?}");
+}
+
+#[test]
+fn a_declared_public_origin_pins_the_port_the_operator_wrote() {
+    // The escape hatch for an operator who does want the port compared: say
+    // so, and the whole origin is matched.
+    let upstream = MockMcpUpstream::legacy();
+    let harness = start_gateway_with_allowed_origin(&upstream);
+
+    let body = modern_wire_body("tools/list", Some("413"), "");
+    let mut declared = modern_wire_headers("tools/list", None);
+    replace_raw_header(&mut declared, b"host", "mcp.localhost:80");
+    let response = raw_modern_post(harness.port(), declared, body);
+    assert_eq!(response.status, 200, "declared port: {response:?}");
+
+    let body = modern_wire_body("tools/list", Some("414"), "");
     let mut wrong_port = modern_wire_headers("tools/list", None);
     replace_raw_header(&mut wrong_port, b"host", "mcp.localhost:81");
-    wrong_port.push(raw_header("Origin", "http://mcp.localhost:81"));
     let response = raw_modern_post(harness.port(), wrong_port, body);
     assert_eq!(response.status, 421);
     assert!(response.body.is_empty());

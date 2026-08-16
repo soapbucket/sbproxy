@@ -629,6 +629,34 @@ enum ModernHttpTrustAnchor {
     ExactRouteHost(String),
 }
 
+impl ModernHttpTrustAnchor {
+    /// Whether `origin`, reached over `connection_scheme`, is an origin
+    /// this gateway answers to.
+    ///
+    /// The two variants disagree about the port, deliberately. An
+    /// explicit `public_origin` is the operator writing down the URL
+    /// clients use, port included, so it is compared whole. A
+    /// route-derived anchor is a hostname lifted from the origin key,
+    /// which carries no port at all, so there is nothing to compare
+    /// against; assuming the scheme's default would refuse every
+    /// gateway not listening on 80 or 443, which is most of them.
+    ///
+    /// Dropping the port costs nothing here. What this check defends
+    /// against is a browser page at some other site aiming a request at
+    /// this gateway, and that is stopped by requiring a `Host` this
+    /// gateway claims, which a page cannot forge whatever port it
+    /// dials. An operator who does want the port pinned says so with
+    /// `public_origin`.
+    fn matches(&self, connection_scheme: &str, origin: &CanonicalHttpOrigin) -> bool {
+        match self {
+            Self::Explicit(anchor) => origin == anchor,
+            Self::ExactRouteHost(host) => {
+                origin.scheme == connection_scheme && &origin.host == host
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CompiledModernHttpSecurity {
     trust_anchor: ModernHttpTrustAnchor,
@@ -715,19 +743,13 @@ impl CompiledModernHttpSecurity {
         let request_origin = uri_origin
             .or(host_origin)
             .ok_or(McpModernHttpRejection::Authority)?;
-        let trusted_origin = match &self.trust_anchor {
-            ModernHttpTrustAnchor::Explicit(origin) => origin.clone(),
-            ModernHttpTrustAnchor::ExactRouteHost(host) => CanonicalHttpOrigin {
-                scheme: connection_scheme.to_string(),
-                host: host.clone(),
-                port: match connection_scheme {
-                    "http" => 80,
-                    "https" => 443,
-                    _ => return Err(McpModernHttpRejection::Authority),
-                },
-            },
-        };
-        if request_origin != trusted_origin {
+        if !matches!(connection_scheme, "http" | "https") {
+            return Err(McpModernHttpRejection::Authority);
+        }
+        if !self
+            .trust_anchor
+            .matches(connection_scheme, &request_origin)
+        {
             return Err(McpModernHttpRejection::Authority);
         }
 
@@ -739,7 +761,7 @@ impl CompiledModernHttpSecurity {
             let value = value.to_str().map_err(|_| McpModernHttpRejection::Origin)?;
             let origin = CanonicalHttpOrigin::parse_config(value, "Origin")
                 .map_err(|_| McpModernHttpRejection::Origin)?;
-            let is_same_origin = origin == trusted_origin;
+            let is_same_origin = self.trust_anchor.matches(connection_scheme, &origin);
             if !is_same_origin && !self.allowed_origins.contains(&origin) {
                 return Err(McpModernHttpRejection::Origin);
             }
@@ -1329,8 +1351,11 @@ impl McpAction {
     ///
     /// The binding is idempotent: an explicit origin or an earlier exact
     /// route binding is never overwritten. The request's authenticated
-    /// connection scheme supplies the HTTP(S) scheme and effective default
-    /// port at validation time.
+    /// connection scheme supplies the HTTP(S) scheme at validation time. It
+    /// supplies no port, and none is assumed: an origin key names a host, so
+    /// a derived anchor compares the host and takes the client at its word
+    /// about which port it dialed. An operator who wants the port pinned
+    /// declares `modern_http.public_origin`.
     pub fn bind_exact_route_authority(&mut self, route_host: &str) {
         if self.modern_http.is_none() {
             self.modern_http = CompiledModernHttpSecurity::derive_exact_route_host(route_host);
@@ -1892,6 +1917,76 @@ mod tests {
         assert_eq!(
             action.validate_modern_http_request("https", None, &duplicate_origin),
             Err(McpModernHttpRejection::Origin)
+        );
+    }
+
+    #[test]
+    fn a_route_derived_anchor_takes_the_client_at_its_word_about_the_port() {
+        // The bug this pins: a gateway on 8080 whose origin key is a bare
+        // hostname used to assume port 80 and refuse every real client, since
+        // a client dialing 8080 sends `Host: mcp.example.com:8080`.
+        let mut action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{ "origin": "upstream.example.com" }]
+        }))
+        .expect("legacy-only MCP config remains valid");
+        action.bind_exact_route_authority("mcp.example.com");
+
+        for authority in [
+            "mcp.example.com",
+            "mcp.example.com:80",
+            "mcp.example.com:8080",
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.append("host", authority.parse().unwrap());
+            assert_eq!(
+                action.validate_modern_http_request("http", None, &headers),
+                Ok(()),
+                "{authority}"
+            );
+        }
+
+        // The host is still compared, which is the half that stops a page on
+        // another site from reaching this gateway.
+        let mut wrong_host = http::HeaderMap::new();
+        wrong_host.append("host", "evil.example.com:8080".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("http", None, &wrong_host),
+            Err(McpModernHttpRejection::Authority)
+        );
+
+        // And so is the scheme, so an `Origin` naming plain HTTP is not the
+        // same origin as the HTTPS endpoint that served the page.
+        let mut downgraded_origin = http::HeaderMap::new();
+        downgraded_origin.append("host", "mcp.example.com:8443".parse().unwrap());
+        downgraded_origin.append("origin", "http://mcp.example.com".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &downgraded_origin),
+            Err(McpModernHttpRejection::Origin)
+        );
+    }
+
+    #[test]
+    fn a_declared_public_origin_still_compares_the_port() {
+        // The escape hatch: an operator who writes the port down gets it
+        // matched, which is the whole reason `public_origin` exists.
+        let action = modern_http_action(json!({
+            "public_origin": "https://mcp.example.com"
+        }));
+
+        let mut declared = http::HeaderMap::new();
+        declared.append("host", "mcp.example.com:443".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &declared),
+            Ok(())
+        );
+
+        let mut other_port = http::HeaderMap::new();
+        other_port.append("host", "mcp.example.com:8443".parse().unwrap());
+        assert_eq!(
+            action.validate_modern_http_request("https", None, &other_port),
+            Err(McpModernHttpRejection::Authority)
         );
     }
 
