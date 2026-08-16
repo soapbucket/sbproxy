@@ -54,6 +54,16 @@
 proxy:
   http_bind_port: 8080
 
+  # The mock-origin/mock-ledger backends resolve to the docker-compose
+  # bridge network (172.16.0.0/12), which the SSRF guard treats as
+  # private by default. Allowlisted here because this example's whole
+  # point is a self-contained compose stack; a production config
+  # pointing at a real upstream does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '172.16.0.0/12'
+
 origins:
   "blog.localhost":
     # Mock origin running in the bundled compose stack. Serves a small

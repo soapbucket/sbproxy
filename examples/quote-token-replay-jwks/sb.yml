@@ -33,6 +33,16 @@ proxy:
     username: admin
     password: changeme
 
+  # The mock-origin backend resolves to the docker-compose bridge
+  # network (172.16.0.0/12), which the SSRF guard treats as private by
+  # default. Allowlisted here because this example's whole point is a
+  # self-contained compose stack; a production config pointing at a
+  # real upstream does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '172.16.0.0/12'
+
 origins:
   "blog.test.sbproxy.dev":
     action:
