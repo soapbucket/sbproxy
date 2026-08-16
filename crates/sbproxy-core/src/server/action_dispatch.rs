@@ -622,9 +622,12 @@ pub(super) async fn handle_action(
                     // header, matching every other modifier call site.
                     if let Some(module) = &modifier.rego_module {
                         let rego_status = status_override.unwrap_or(s.status);
+                        let rego_budget_ms =
+                            modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS);
                         match rego_response_modifier(
                             module,
                             modifier.rego_v0,
+                            rego_budget_ms,
                             rego_status,
                             &response_headers,
                             ctx,
@@ -1407,7 +1410,15 @@ fn apply_plugin_action_response_modifiers(
         // the later engine wins on a shared header, matching every other
         // modifier call site.
         if let Some(module) = &modifier.rego_module {
-            match rego_response_modifier(module, modifier.rego_v0, status, &response_headers, ctx) {
+            let rego_budget_ms = modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS);
+            match rego_response_modifier(
+                module,
+                modifier.rego_v0,
+                rego_budget_ms,
+                status,
+                &response_headers,
+                ctx,
+            ) {
                 Ok(modified) => {
                     for (name, value) in modified {
                         set_plugin_action_response_header(&mut headers, &name, &value);

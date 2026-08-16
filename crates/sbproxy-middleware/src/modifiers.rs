@@ -369,6 +369,7 @@ mod tests {
                 js_script: None,
                 rego_module: None,
                 rego_module_path: None,
+                rego_budget_ms: None,
                 rego_v0: false,
             },
             RequestModifierConfig {
@@ -381,6 +382,7 @@ mod tests {
                 js_script: None,
                 rego_module: None,
                 rego_module_path: None,
+                rego_budget_ms: None,
                 rego_v0: false,
             },
             RequestModifierConfig {
@@ -393,6 +395,7 @@ mod tests {
                 js_script: None,
                 rego_module: None,
                 rego_module_path: None,
+                rego_budget_ms: None,
                 rego_v0: false,
             },
         ];
@@ -414,6 +417,7 @@ mod tests {
             js_script: None,
             rego_module: None,
             rego_module_path: None,
+            rego_budget_ms: None,
             rego_v0: false,
         }];
 

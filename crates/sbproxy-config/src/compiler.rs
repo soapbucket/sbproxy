@@ -297,14 +297,20 @@ pub fn interpolate_config_vars(
         }
         serde_json::Value::Object(map) => {
             for (key, val) in map.iter_mut() {
-                // Skip Lua and Rego script bodies - they are executed
-                // (Lua) or evaluated (Rego) at runtime, not templated.
-                // WOR-2482: without this, a forward-rule modifier's
-                // `rego_module` reaches here through the whole-rule JSON
-                // round-trip in `compile_origin`, and a literal `{{`
-                // inside the module (a string or comment) would be
-                // corrupted by var substitution.
-                if key == "lua_script" || key == "rego_module" {
+                // Skip Lua, JavaScript, and Rego script bodies - they
+                // are executed (Lua/JS) or evaluated (Rego) at runtime,
+                // not templated. WOR-2482: without this, a forward-rule
+                // modifier's script reaches here through the whole-rule
+                // JSON round-trip in `compile_origin`, and a literal
+                // `{{` inside the script (a string or comment) would be
+                // corrupted by var substitution. `js_script` was missing
+                // from this list until a review caught it: a
+                // forward-rule `js_script` containing a literal
+                // `{{vars.X}}` (e.g. building a header value with a
+                // template-looking string) was silently rewritten with
+                // the variable's value instead of reaching the engine
+                // as authored.
+                if key == "lua_script" || key == "js_script" || key == "rego_module" {
                     continue;
                 }
                 interpolate_config_vars(val, variables);
@@ -418,22 +424,39 @@ fn resolve_template_string(
 /// `rego_module`; a modifier entry with neither field set has no Rego
 /// form and is left untouched.
 ///
+/// Also validates `rego_budget_ms`, the Rego evaluation budget: not
+/// module resolution, but the same per-modifier Rego validation this
+/// function already performs at the same three call sites, so it lives
+/// here rather than as a fourth near-duplicate loop.
+///
 /// # Errors
 ///
 /// Returns an error naming the origin and the modifier field when both
-/// `rego_module` and `rego_module_path` are set, or when
-/// `rego_module_path` cannot be read.
+/// `rego_module` and `rego_module_path` are set, when `rego_module_path`
+/// cannot be read, or when `rego_budget_ms` is `Some(0)`.
 fn resolve_rego_modifier_module(
     hostname: &str,
     field: &str,
     module: &mut Option<String>,
     module_path: &mut Option<String>,
+    budget_ms: Option<u64>,
 ) -> Result<()> {
     if module.is_some() && module_path.is_some() {
         anyhow::bail!(
             "origin {hostname}: {field} sets both rego_module and rego_module_path; use \
              `rego_module` for an inline Rego source or `rego_module_path` for a path to a \
              .rego file, not both"
+        );
+    }
+    // Same invariant `policy: rego` and `ai_routing_policy` hold: a zero
+    // budget reads as "no budget" but is an instantly expired timer, so
+    // it would abort every evaluation before the rule ran rather than
+    // disabling the limit.
+    if budget_ms == Some(0) {
+        anyhow::bail!(
+            "origin {hostname}: {field} rego_budget_ms must be greater than zero; a zero \
+             budget would abort every evaluation before the rule ran, silently dropping every \
+             header the module would have set"
         );
     }
     if let Some(path) = module_path.take() {
@@ -3228,6 +3251,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
             "request_modifiers[]",
             &mut modifier.rego_module,
             &mut modifier.rego_module_path,
+            modifier.rego_budget_ms,
         )?;
     }
     for modifier in &mut config.response_modifiers {
@@ -3236,6 +3260,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
             "response_modifiers[]",
             &mut modifier.rego_module,
             &mut modifier.rego_module_path,
+            modifier.rego_budget_ms,
         )?;
     }
     for fwd_rule in &mut config.forward_rules {
@@ -3245,6 +3270,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
                 "forward_rules[].origin.request_modifiers[]",
                 &mut modifier.rego_module,
                 &mut modifier.rego_module_path,
+                modifier.rego_budget_ms,
             )?;
         }
     }
@@ -6545,6 +6571,33 @@ origins:
         );
     }
 
+    /// `rego_budget_ms: 0` on a modifier, mirroring `policy: rego`'s
+    /// `budget_ms` refusal: a zero budget is an instantly expired timer,
+    /// not "no limit", so it is refused at config compile rather than
+    /// silently aborting every evaluation at request time.
+    #[test]
+    fn rego_budget_ms_of_zero_on_a_modifier_is_refused() {
+        let yaml = r#"
+origins:
+  "rego-zero-budget.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module: |
+          package sbproxy
+          modify_request := {"set_headers": {}}
+        rego_budget_ms: 0
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("rego_budget_ms: 0 on a modifier must be refused");
+        assert!(
+            error.to_string().contains("rego_budget_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
     /// The multi-engine "both set" case is a different question from the
     /// mutual-exclusion case above: this is `rego_module` alongside
     /// `lua_script`, two *different* engines on one modifier entry.
@@ -7057,6 +7110,59 @@ origins:
         assert!(fb.get("on_error").unwrap().as_bool().unwrap());
     }
 
+    /// WOR-2482 review finding: a forward-rule modifier's `js_script`
+    /// reaches `interpolate_config_vars` through the whole-rule JSON
+    /// round-trip this function performs on every `forward_rules[]`
+    /// entry. Before the fix, a `{{vars.X}}`-shaped literal inside the
+    /// script body (naming a variable the origin actually defines) was
+    /// silently rewritten with the variable's value rather than
+    /// reaching the JS engine as authored, the same corruption
+    /// `interpolate_skips_lua_script_keys` already pins for
+    /// `lua_script`. End to end through `compile_config`, not the
+    /// lower-level `interpolate_config_vars` unit test
+    /// (`interpolate_skips_js_script_keys`, in the section below), so
+    /// this proves the fix survives the forward-rule round-trip
+    /// specifically.
+    #[test]
+    fn forward_rule_js_script_with_a_vars_pattern_is_not_interpolated() {
+        let yaml = r#"
+origins:
+  "js-braces.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    variables:
+      literal_marker: "SUBSTITUTED"
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          action:
+            type: proxy
+            url: http://127.0.0.1:18888
+          request_modifiers:
+            - js_script: |
+                function modify_request(req, ctx) {
+                  return { set_headers: { "x-literal": "{{vars.literal_marker}}" } };
+                }
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("js-braces.test").unwrap();
+        let script = origin.forward_rules[0]["origin"]["request_modifiers"][0]["js_script"]
+            .as_str()
+            .expect("js_script survives as a string");
+        assert!(
+            script.contains("{{vars.literal_marker}}"),
+            "a js_script's {{{{vars.X}}}} pattern must stay literal, matching lua_script and \
+             rego_module, not be resolved at compile time: {script}"
+        );
+        assert!(
+            !script.contains("SUBSTITUTED"),
+            "the script must not have been silently rewritten with the variable's value: {script}"
+        );
+    }
+
     // --- interpolate_config_vars tests ---
 
     #[test]
@@ -7139,6 +7245,32 @@ origins:
         // lua_script should NOT be interpolated
         assert_eq!(
             val["lua_script"].as_str().unwrap(),
+            "result.set_headers['X-Name'] = '{{vars.name}}'"
+        );
+    }
+
+    /// WOR-2482 review finding: `js_script` was missing from the skip
+    /// list `interpolate_skips_lua_script_keys` above pins for
+    /// `lua_script`, so a forward-rule `js_script` containing a literal
+    /// `{{vars.X}}` (a template-looking string the author meant to reach
+    /// the JS engine verbatim, not a real template reference) was
+    /// silently rewritten with the variable's value.
+    #[test]
+    fn interpolate_skips_js_script_keys() {
+        let vars: HashMap<String, serde_json::Value> =
+            [("name".to_string(), serde_json::json!("test"))]
+                .into_iter()
+                .collect();
+        let mut val = serde_json::json!({
+            "headers": {"X-Name": "{{vars.name}}"},
+            "js_script": "result.set_headers['X-Name'] = '{{vars.name}}'"
+        });
+        interpolate_config_vars(&mut val, &vars);
+        // headers value should be interpolated
+        assert_eq!(val["headers"]["X-Name"].as_str().unwrap(), "test");
+        // js_script should NOT be interpolated
+        assert_eq!(
+            val["js_script"].as_str().unwrap(),
             "result.set_headers['X-Name'] = '{{vars.name}}'"
         );
     }

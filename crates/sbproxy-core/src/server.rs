@@ -4953,8 +4953,13 @@ fn js_request_modifier(
 // knob to rename it: the capability is identical, only the spelling
 // differs per language.
 
-/// Evaluation budget for a Rego request/response modifier, matching
-/// `policy: rego`'s default (`docs/scripting.md` §3a).
+/// Default evaluation budget for a Rego request/response modifier when
+/// `rego_budget_ms` is not set, matching `policy: rego`'s default
+/// (`docs/scripting.md` §3a). Operator-overridable per modifier via
+/// `rego_budget_ms`, unlike Lua's/JS's sandbox budgets, which are
+/// process-wide (`proxy.scripting.{lua,javascript}.sandbox`); Rego's is
+/// per-policy already on the other two Rego surfaces, so the modifier
+/// form matches them rather than introducing a third shape.
 const REGO_MODIFIER_BUDGET_MS: u64 = 50;
 
 /// The rule a Rego request modifier's `rego_module` evaluates.
@@ -5036,6 +5041,9 @@ fn rego_response_modifier_input(
 ///
 /// Extracts `set_headers` from the evaluated `data.sbproxy.modify_request`
 /// document, the same field Lua's and JS's `modify_request` return.
+/// `budget_ms` is the modifier's resolved `rego_budget_ms` (the caller
+/// applies the [`REGO_MODIFIER_BUDGET_MS`] default when the config left
+/// it unset; config compile already refused a `Some(0)`).
 ///
 /// # Errors
 ///
@@ -5046,6 +5054,7 @@ fn rego_response_modifier_input(
 fn rego_request_modifier(
     module: &str,
     rego_v0: bool,
+    budget_ms: u64,
     req_header: &RequestHeader,
     ctx: &RequestContext,
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -5054,7 +5063,7 @@ fn rego_request_modifier(
         "rego request modifier",
         module,
         REGO_MODIFIER_REQUEST_QUERY,
-        REGO_MODIFIER_BUDGET_MS,
+        budget_ms,
         None,
         rego_v0,
     )?;
@@ -5076,7 +5085,8 @@ fn rego_request_modifier(
 /// Extracts headers the same way [`response_modifier_headers`] does for
 /// Lua and JavaScript response modifiers, so a module returning
 /// `{"set_headers": {...}}` behaves identically across all three
-/// engines.
+/// engines. `budget_ms` is the modifier's resolved `rego_budget_ms`,
+/// the same as [`rego_request_modifier`]'s parameter of the same name.
 ///
 /// # Errors
 ///
@@ -5087,6 +5097,7 @@ fn rego_request_modifier(
 fn rego_response_modifier(
     module: &str,
     rego_v0: bool,
+    budget_ms: u64,
     status: u16,
     response_headers: &serde_json::Map<String, serde_json::Value>,
     ctx: &RequestContext,
@@ -5096,7 +5107,7 @@ fn rego_response_modifier(
         "rego response modifier",
         module,
         REGO_MODIFIER_RESPONSE_QUERY,
-        REGO_MODIFIER_BUDGET_MS,
+        budget_ms,
         None,
         rego_v0,
     )?;

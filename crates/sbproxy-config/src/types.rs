@@ -8196,6 +8196,12 @@ pub struct RequestModifierConfig {
     /// `rego_module`. Mutually exclusive with `rego_module`.
     #[serde(default)]
     pub rego_module_path: Option<String>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound `policy: rego` and `ai_routing_policy`'s Rego form
+    /// use. Must be greater than zero; a zero budget is refused at
+    /// config compile.
+    #[serde(default)]
+    pub rego_budget_ms: Option<u64>,
     /// Parse `rego_module` (or the file at `rego_module_path`) as
     /// pre-OPA-1.0 Rego v0 (no `if`/`contains` required) instead of the
     /// v1 default. A compatibility escape hatch for a module pasted from
@@ -8298,6 +8304,12 @@ pub struct ResponseModifierConfig {
     /// `rego_module`. Mutually exclusive with `rego_module`.
     #[serde(default)]
     pub rego_module_path: Option<String>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound `policy: rego` and `ai_routing_policy`'s Rego form
+    /// use. Must be greater than zero; a zero budget is refused at
+    /// config compile.
+    #[serde(default)]
+    pub rego_budget_ms: Option<u64>,
     /// Parse `rego_module` (or the file at `rego_module_path`) as
     /// pre-OPA-1.0 Rego v0 (no `if`/`contains` required) instead of the
     /// v1 default. A compatibility escape hatch for a module pasted from

@@ -626,7 +626,7 @@ A `print()` call inside a policy never reaches the process's stderr. It is gathe
 
 ### Rego modifiers
 
-`request_modifiers[]` and `response_modifiers[]` also accept a Rego form, beside `lua_script` and `js_script`: `rego_module` (inline source) or `rego_module_path` (a path to a `.rego` file, mutually exclusive with `rego_module`), plus `rego_v0` for pre-OPA-1.0 syntax. This is engine-surface parity, not a different contract: the module evaluates against the same document `req`/`resp` and `ctx` give Lua and JavaScript, merged into one `input` because Rego takes a single document where the other two take two arguments, and it returns the same `{"set_headers": {...}}` shape those scripts return.
+`request_modifiers[]` and `response_modifiers[]` also accept a Rego form, beside `lua_script` and `js_script`: `rego_module` (inline source) or `rego_module_path` (a path to a `.rego` file, mutually exclusive with `rego_module`), `rego_v0` for pre-OPA-1.0 syntax, and `rego_budget_ms` (default 50, must be greater than zero) for the evaluation budget, the same knob `policy: rego` and `ai_routing_policy`'s Rego form expose. This is engine-surface parity, not a different contract: the module evaluates against the same document `req`/`resp` and `ctx` give Lua and JavaScript, merged into one `input` because Rego takes a single document where the other two take two arguments, and it returns the same `{"set_headers": {...}}` shape those scripts return.
 
 ```yaml
 request_modifiers:
@@ -1142,6 +1142,7 @@ Request and response modifiers are lists of typed entries. Each entry can combin
 | `lua_script` | string | Lua `modify_request(req, ctx)`; returned `set_headers` applied |
 | `js_script` | string | JavaScript `modify_request(req, ctx)`; returned `set_headers` applied |
 | `rego_module` / `rego_module_path` | string | Rego `data.sbproxy.modify_request`; returned `{"set_headers": {...}}` applied. Mutually exclusive with each other |
+| `rego_budget_ms` | int | Rego evaluation budget in milliseconds. Defaults to 50. Must be greater than zero |
 | `rego_v0` | bool | Parse the Rego module as pre-OPA-1.0 syntax |
 
 ```yaml
@@ -1176,6 +1177,7 @@ request_modifiers:
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |
 | `js_script` | string | JavaScript `modify_response(resp, ctx)`; returned `set_headers` applied |
 | `rego_module` / `rego_module_path` | string | Rego `data.sbproxy.modify_response`; returned `{"set_headers": {...}}` applied. Mutually exclusive with each other |
+| `rego_budget_ms` | int | Rego evaluation budget in milliseconds. Defaults to 50. Must be greater than zero |
 | `rego_v0` | bool | Parse the Rego module as pre-OPA-1.0 syntax |
 
 ```yaml

@@ -1941,10 +1941,11 @@ impl ProxyHttp for SbProxy {
         let mut req_to_append: Vec<(String, String)> = Vec::new();
         let mut lua_scripts: Vec<String> = Vec::new();
         let mut js_scripts: Vec<String> = Vec::new();
-        // WOR-2482: (module, rego_v0) pairs, mirroring lua_scripts /
-        // js_scripts. rego_v0 travels with the module because it is a
-        // per-modifier parse-dialect knob, not a global engine setting.
-        let mut rego_scripts: Vec<(String, bool)> = Vec::new();
+        // WOR-2482: (module, rego_v0, budget_ms) triples, mirroring
+        // lua_scripts / js_scripts. rego_v0 and budget_ms travel with
+        // the module because they are per-modifier knobs (parse
+        // dialect, eval budget), not a global engine setting.
+        let mut rego_scripts: Vec<(String, bool, u64)> = Vec::new();
         let mut advanced_modifiers: Vec<sbproxy_config::RequestModifierConfig> = Vec::new();
         let mut upstream_url_path: Option<String> = None;
         let mut upstream_host_header: Option<String> = None;
@@ -2208,7 +2209,11 @@ impl ProxyHttp for SbProxy {
                             js_scripts.push(script.clone());
                         }
                         if let Some(module) = &modifier.rego_module {
-                            rego_scripts.push((module.clone(), modifier.rego_v0));
+                            rego_scripts.push((
+                                module.clone(),
+                                modifier.rego_v0,
+                                modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS),
+                            ));
                         }
                     }
                 }
@@ -2243,7 +2248,11 @@ impl ProxyHttp for SbProxy {
                                     js_scripts.push(script.clone());
                                 }
                                 if let Some(module) = &modifier.rego_module {
-                                    rego_scripts.push((module.clone(), modifier.rego_v0));
+                                    rego_scripts.push((
+                                        module.clone(),
+                                        modifier.rego_v0,
+                                        modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS),
+                                    ));
                                 }
                             }
                         }
@@ -2696,8 +2705,14 @@ impl ProxyHttp for SbProxy {
         // modifier setting more than one engine resolves the same way
         // the other two already do: the later engine's headers win on a
         // shared header (WOR-2482).
-        for (module, rego_v0) in &rego_scripts {
-            match rego_request_modifier(module, *rego_v0, session.req_header(), ctx) {
+        for (module, rego_v0, rego_budget_ms) in &rego_scripts {
+            match rego_request_modifier(
+                module,
+                *rego_v0,
+                *rego_budget_ms,
+                session.req_header(),
+                ctx,
+            ) {
                 Ok(headers_to_set) => {
                     for (key, value) in headers_to_set {
                         let _ = upstream_request.insert_header(key, &value);
@@ -3623,9 +3638,12 @@ impl ProxyHttp for SbProxy {
                     // headers win on a shared header.
                     if let Some(module) = &modifier.rego_module {
                         let status = upstream_response.status.as_u16();
+                        let rego_budget_ms =
+                            modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS);
                         match rego_response_modifier(
                             module,
                             modifier.rego_v0,
+                            rego_budget_ms,
                             status,
                             &response_headers,
                             ctx,

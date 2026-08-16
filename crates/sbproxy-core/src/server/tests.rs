@@ -477,7 +477,7 @@ package sbproxy
 modify_request := {"set_headers": {"x-rego-modified": "true"}}
 "#;
 
-    let out = rego_request_modifier(module, false, &req_header, &ctx)
+    let out = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
         .expect("rego request modifier runs");
 
     assert_eq!(
@@ -505,7 +505,7 @@ modify_request := {"set_headers": {
 }}
 "#;
 
-    let out = rego_request_modifier(module, false, &req_header, &ctx)
+    let out = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
         .expect("rego request modifier runs");
 
     assert!(out.contains(&(
@@ -527,7 +527,7 @@ package sbproxy
 modify_response := {"set_headers": {"x-rego-stage": "response"}}
 "#;
 
-    let out = rego_response_modifier(module, false, 200, &headers, &ctx)
+    let out = rego_response_modifier(module, false, REGO_MODIFIER_BUDGET_MS, 200, &headers, &ctx)
         .expect("rego response modifier runs");
 
     assert_eq!(
@@ -549,7 +549,7 @@ is_5xx := "true" if input.response.status_code >= 500
 is_5xx := "false" if input.response.status_code < 500
 "#;
 
-    let out = rego_response_modifier(module, false, 503, &headers, &ctx)
+    let out = rego_response_modifier(module, false, REGO_MODIFIER_BUDGET_MS, 503, &headers, &ctx)
         .expect("rego response modifier runs");
 
     assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
@@ -566,8 +566,9 @@ fn rego_request_modifier_a_module_that_does_not_parse_is_an_error() {
     let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
     let module = "package sbproxy\n\nmodify_request := {\n";
 
-    let error = rego_request_modifier(module, false, &req_header, &ctx)
-        .expect_err("a module that does not parse must error, not silently produce no headers");
+    let error =
+        rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+            .expect_err("a module that does not parse must error, not silently omit headers");
     assert!(!error.to_string().is_empty());
 }
 
@@ -588,7 +589,7 @@ modify_request := {"set_headers": {"x-crawler": "true"}} if {
 }
 "#;
 
-    let out = rego_request_modifier(module, false, &req_header, &ctx)
+    let out = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
         .expect("an unsatisfied rule is undefined, not an error");
     assert!(out.is_empty());
 }
@@ -610,10 +611,10 @@ modify_request := {"set_headers": {"x-legacy": "true"}} {
 }
 "#;
 
-    rego_request_modifier(module, false, &req_header, &ctx)
+    rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
         .expect_err("v0 syntax must not compile without rego_v0: true");
 
-    let out = rego_request_modifier(module, true, &req_header, &ctx)
+    let out = rego_request_modifier(module, true, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
         .expect("rego_v0: true compiles the same module");
     assert_eq!(out, vec![("x-legacy".to_string(), "true".to_string())]);
 }
@@ -645,7 +646,10 @@ modify_request := {"set_headers": {"x-engine": "rego"}}
     for (key, value) in lua_request_modifier(lua_script, &req_header, &ctx).unwrap() {
         upstream_request.insert_header(key, &value).unwrap();
     }
-    for (key, value) in rego_request_modifier(rego_module, false, &req_header, &ctx).unwrap() {
+    for (key, value) in
+        rego_request_modifier(rego_module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+            .unwrap()
+    {
         upstream_request.insert_header(key, &value).unwrap();
     }
 
@@ -653,6 +657,68 @@ modify_request := {"set_headers": {"x-engine": "rego"}}
         upstream_request.headers.get("x-engine").unwrap(),
         "rego",
         "rego runs after lua at the real call site, so it wins on a shared header"
+    );
+}
+
+/// The full three-engine precedence claim, pinned so a future refactor
+/// cannot silently flip it: `lua_script`, `js_script`, and `rego_module`
+/// on ONE modifier entry all run, in that fixed order (matching the
+/// real call site in `proxy_http.rs`), the later engine wins on a
+/// shared header, and each engine's own non-shared header survives
+/// untouched.
+#[test]
+fn lua_js_and_rego_request_modifiers_on_one_entry_apply_in_documented_order() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    let lua_script = r#"
+        function modify_request(req, ctx)
+          return { set_headers = { ["x-shared"] = "lua", ["x-lua-only"] = "from-lua" } }
+        end
+    "#;
+    let js_script = r#"
+        function modify_request(req, ctx) {
+          return { set_headers: { "x-shared": "js", "x-js-only": "from-js" } };
+        }
+    "#;
+    let rego_module = r#"
+package sbproxy
+
+modify_request := {"set_headers": {"x-shared": "rego", "x-rego-only": "from-rego"}}
+"#;
+
+    let mut upstream_request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    // Same order the real call site applies them: lua, then js, then rego.
+    for (key, value) in lua_request_modifier(lua_script, &req_header, &ctx).unwrap() {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+    for (key, value) in js_request_modifier(js_script, &req_header, &ctx).unwrap() {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+    for (key, value) in
+        rego_request_modifier(rego_module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+            .unwrap()
+    {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+
+    assert_eq!(
+        upstream_request.headers.get("x-shared").unwrap(),
+        "rego",
+        "the last engine to run, rego, wins the shared header"
+    );
+    assert_eq!(
+        upstream_request.headers.get("x-lua-only").unwrap(),
+        "from-lua",
+        "lua's own non-shared header must survive js and rego running after it"
+    );
+    assert_eq!(
+        upstream_request.headers.get("x-js-only").unwrap(),
+        "from-js",
+        "js's own non-shared header must survive rego running after it"
+    );
+    assert_eq!(
+        upstream_request.headers.get("x-rego-only").unwrap(),
+        "from-rego"
     );
 }
 
