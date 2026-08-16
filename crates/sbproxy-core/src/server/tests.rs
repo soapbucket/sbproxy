@@ -566,9 +566,8 @@ fn rego_request_modifier_a_module_that_does_not_parse_is_an_error() {
     let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
     let module = "package sbproxy\n\nmodify_request := {\n";
 
-    let error =
-        rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
-            .expect_err("a module that does not parse must error, not silently omit headers");
+    let error = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect_err("a module that does not parse must error, not silently omit headers");
     assert!(!error.to_string().is_empty());
 }
 
@@ -646,9 +645,14 @@ modify_request := {"set_headers": {"x-engine": "rego"}}
     for (key, value) in lua_request_modifier(lua_script, &req_header, &ctx).unwrap() {
         upstream_request.insert_header(key, &value).unwrap();
     }
-    for (key, value) in
-        rego_request_modifier(rego_module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
-            .unwrap()
+    for (key, value) in rego_request_modifier(
+        rego_module,
+        false,
+        REGO_MODIFIER_BUDGET_MS,
+        &req_header,
+        &ctx,
+    )
+    .unwrap()
     {
         upstream_request.insert_header(key, &value).unwrap();
     }
@@ -694,9 +698,14 @@ modify_request := {"set_headers": {"x-shared": "rego", "x-rego-only": "from-rego
     for (key, value) in js_request_modifier(js_script, &req_header, &ctx).unwrap() {
         upstream_request.insert_header(key, &value).unwrap();
     }
-    for (key, value) in
-        rego_request_modifier(rego_module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
-            .unwrap()
+    for (key, value) in rego_request_modifier(
+        rego_module,
+        false,
+        REGO_MODIFIER_BUDGET_MS,
+        &req_header,
+        &ctx,
+    )
+    .unwrap()
     {
         upstream_request.insert_header(key, &value).unwrap();
     }
