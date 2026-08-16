@@ -5032,6 +5032,7 @@ mod wor_2477_panic_containment_tests {
             workspace_id: String::new(),
             origin: "wor-2477-test-origin".to_string(),
             tenant: "wor-2477-test-tenant".to_string(),
+            record_format: sbproxy_config::types::PolicyRecordFormat::default(),
         };
         let before = panic_counter_value(policy_label);
 
@@ -5084,6 +5085,7 @@ mod wor_2477_panic_containment_tests {
             workspace_id: String::new(),
             origin: "wor-2477-test-origin".to_string(),
             tenant: "wor-2477-test-tenant".to_string(),
+            record_format: sbproxy_config::types::PolicyRecordFormat::default(),
         };
         let before = panic_counter_value(policy_label);
 
