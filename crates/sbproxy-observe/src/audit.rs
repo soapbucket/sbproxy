@@ -994,10 +994,8 @@ mod tests {
     /// test --lib` fallback path.
     #[test]
     fn config_audit_emit_lands_on_an_installed_chain_with_an_ok_outcome() {
-        let path = std::env::temp_dir().join(format!(
-            "sb-audit-config-emit-{}.jsonl",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sb-audit-config-emit-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let seed = "cd".repeat(32);
         let chain = crate::audit_chain::ConfigAuditChain::open(&path, &seed, "audit-emit-test")

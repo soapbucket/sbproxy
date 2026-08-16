@@ -801,11 +801,7 @@ pub fn record_egress_seen(
             let port = parsed.port_or_known_default().unwrap_or(0);
             (host, port, parsed.scheme().to_string())
         }
-        Err(_) => (
-            "unparseable".to_string(),
-            0u16,
-            "unparseable".to_string(),
-        ),
+        Err(_) => ("unparseable".to_string(), 0u16, "unparseable".to_string()),
     };
     let now_ms = now_unix_ms();
     let status_label = status.as_label();
@@ -1439,7 +1435,10 @@ mod tests {
                 None,
             );
         }
-        assert_eq!(egress_inventory_snapshot().len(), EGRESS_INVENTORY_MAX_ENTRIES);
+        assert_eq!(
+            egress_inventory_snapshot().len(),
+            EGRESS_INVENTORY_MAX_ENTRIES
+        );
 
         // A new key past the cap must be dropped, not panic.
         record_egress_seen(
@@ -1555,11 +1554,23 @@ mod tests {
         assert_eq!(snapshot[0].scheme, "https");
 
         let serialized = serde_json::to_string(&snapshot[0]).expect("sighting serializes");
-        assert!(!serialized.contains("s3cr3t-token"), "no credential: {serialized}");
-        assert!(!serialized.contains("svc-user"), "no credential: {serialized}");
-        assert!(!serialized.contains("client_secret"), "no query: {serialized}");
+        assert!(
+            !serialized.contains("s3cr3t-token"),
+            "no credential: {serialized}"
+        );
+        assert!(
+            !serialized.contains("svc-user"),
+            "no credential: {serialized}"
+        );
+        assert!(
+            !serialized.contains("client_secret"),
+            "no query: {serialized}"
+        );
         assert!(!serialized.contains("topsecret"), "no query: {serialized}");
         assert!(!serialized.contains("scope=all"), "no query: {serialized}");
-        assert!(!serialized.contains("/oauth/token"), "no full URL: {serialized}");
+        assert!(
+            !serialized.contains("/oauth/token"),
+            "no full URL: {serialized}"
+        );
     }
 }

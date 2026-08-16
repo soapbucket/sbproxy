@@ -67,7 +67,7 @@ it.
 
 | Control | Log target | Metric |
 |---|---|---|
-| Multipart surface refusal | `security_audit` (policy_denied via events sink) | `sbproxy_audit_emit_duration_seconds{channel="security_audit"}` |
+| Multipart surface refusal | `security_audit` (policy_denied via events sink) | `sbproxy_audit_emit_duration_seconds{channel="security"}` |
 | Budget fail-open | `sbproxy::budget` WARN on transition | `sbproxy_budget_share_fail_open_total{op}`, `sbproxy_budget_share_unavailable` |
 | Tenant throttle | decision events | `sbproxy_rate_limit_total{workspace}`, `sbproxy_rate_limit_decisions_total{policy}` |
 | Policy panic | `security_audit` ERROR | `sbproxy_policy_panic_total{policy}` |

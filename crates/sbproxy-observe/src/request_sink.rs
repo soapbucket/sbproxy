@@ -573,9 +573,10 @@ mod tests {
 
         let mut event = sample_event();
         // Add a Bearer token to the properties map, which should be redacted
-        event
-            .properties
-            .insert("x".to_string(), "Bearer sk-abc123def456ghi789jkl012".to_string());
+        event.properties.insert(
+            "x".to_string(),
+            "Bearer sk-abc123def456ghi789jkl012".to_string(),
+        );
 
         let sink = FileEventSink::create(&path).expect("file sink opens");
         sink.publish(event);

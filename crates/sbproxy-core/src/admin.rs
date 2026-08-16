@@ -5793,8 +5793,7 @@ mod tests {
         let (status, _, _) = handle_admin_request("GET", "/api/egress", &state, None, None);
         assert_eq!(status, 401);
 
-        let (status, _, _) =
-            handle_admin_request("POST", "/api/egress", &state, Some(&auth), None);
+        let (status, _, _) = handle_admin_request("POST", "/api/egress", &state, Some(&auth), None);
         assert_eq!(status, 405);
     }
 

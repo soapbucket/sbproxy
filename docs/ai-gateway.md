@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -836,9 +836,9 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `reranking` | `body["query"]` |
 | `moderations` | `body["input"]` |
 
-A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. A request whose inbound `Content-Type` starts with `multipart/` bypasses the built-in input check, because its body is forwarded byte-transparently and never parsed as JSON. Built-in output scanning for those requests is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
+A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. A request whose inbound `Content-Type` starts with `multipart/` bypasses the built-in input check on the surfaces that actually accept multipart bodies (image edits, image variations, audio transcription, audio translation, file uploads, and any request the proxy cannot classify), because its body is forwarded byte-transparently and never parsed as JSON; see [Multipart bodies](#multipart-bodies) below for which surfaces those are and what happens on the rest. Built-in output scanning for those requests is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
 
-That gate keys on the `Content-Type` and not on the classified surface, which is worth reading twice. Image edits, image variations, and audio transcription are the surfaces that legitimately send multipart, but nothing stops a caller putting a multipart `Content-Type` on `/v1/chat/completions` and taking the same path. Each bypassed check increments `sbproxy_ai_multipart_inspection_skipped_total`, labeled by `check` (`input_guardrails` or `pii_redaction`) and by `surface`, so a skipped guardrail shows up on a dashboard instead of looking exactly like a clean request. Traffic on `audio_transcription` is the expected shape. A nonzero rate on a JSON surface is somebody routing around your guardrails, and it is worth an alert.
+A multipart `Content-Type` on a classified JSON surface such as `chat_completions` or `embeddings` does not take that path. `AiSurface::accepts_multipart` is the allowlist, and a multipart `Content-Type` on any surface it excludes is refused with `403` and a `security_audit` entry (`multipart_disallowed_surface`; see [audit-log.md](audit-log.md)) before any budget check, guardrail, or upstream dispatch runs. Each bypassed check on a surface the allowlist does permit still increments `sbproxy_ai_multipart_inspection_skipped_total`, labeled by `check` (`input_guardrails` or `pii_redaction`) and by `surface`; that counter can no longer fire for `chat_completions` or any other disallowed surface, since those requests are refused before reaching it. It now means legitimate multipart surfaces that skipped body inspection, and a nonzero rate on `audio_transcription` or `image_edits` is expected traffic, not a bypass attempt.
 
 ### Gateway-side retrieval (RAG)
 

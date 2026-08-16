@@ -5825,9 +5825,7 @@ mod event_egress_tests {
                 )
                 .expect("chain opens");
                 let security_reinstall =
-                    sbproxy_observe::audit_chain::install_security_audit_chain(
-                        redundant_security,
-                    );
+                    sbproxy_observe::audit_chain::install_security_audit_chain(redundant_security);
                 assert!(
                     security_reinstall.is_err(),
                     "the security slot this boot call claimed is already taken"

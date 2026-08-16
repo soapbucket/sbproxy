@@ -15763,8 +15763,7 @@ origins:
     async fn multipart_on_chat_completions_is_refused_before_upstream() {
         // Same body bytes a legitimate audio request sends; only the path
         // differs.
-        let (upstream_url, upstream_hits) =
-            upstream_fixture(r#"{"id":"unreachable"}"#).await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"unreachable"}"#).await;
         let config = builtin_guardrail_and_pii_config(&upstream_url);
         let (content_type, body) = multipart_audio_request();
         let (mut session, client) =
@@ -15884,13 +15883,19 @@ origins:
         );
     }
 
-    /// WOR-2309: the short-circuit keys on the inbound `Content-Type`, not
-    /// on the classified surface, so a caller can relabel a JSON surface as
-    /// multipart and take the same bypass. The `surface` label is what makes
-    /// that visible, and `chat_completions` is the value that separates a
-    /// bypass attempt from routine audio traffic.
+    /// WOR-2309 found that the short-circuit keyed on the inbound
+    /// `Content-Type`, not on the classified surface, so a caller could
+    /// relabel a JSON surface as multipart and take the same bypass; that
+    /// version of this test pinned the bypass as merely *counted*.
+    /// WOR-2472 closes the bypass itself: `AiSurface::accepts_multipart`
+    /// refuses a multipart `chat_completions` request before the skip
+    /// counter, or anything else past the multipart gate, ever runs. The
+    /// counter's meaning is "a legitimate multipart surface skipped an
+    /// inspection it could not perform"; a refused surface never reaches
+    /// that code, so pinning the counter flat (not rising) here is what
+    /// keeps that meaning honest.
     #[tokio::test]
-    async fn multipart_content_type_on_a_json_surface_is_counted_under_that_surface() {
+    async fn multipart_on_a_json_surface_is_refused_and_not_counted_as_skipped() {
         let (upstream_url, _upstream_hits) = upstream_fixture(r#"{"id":"chat-fixture"}"#).await;
         let config = builtin_guardrail_and_pii_config(&upstream_url);
         let before = multipart_inspection_skipped_count("input_guardrails", "chat_completions");
@@ -15911,11 +15916,15 @@ origins:
         .expect("multipart-on-chat request is handled");
         drop(session);
 
-        let _ = live_downstream_body(client).await;
-        assert!(
-            multipart_inspection_skipped_count("input_guardrails", "chat_completions") > before,
-            "a multipart Content-Type on a JSON surface bypassed the built-in guardrails \
-             without being counted under that surface"
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(
+            multipart_inspection_skipped_count("input_guardrails", "chat_completions"),
+            before,
+            "a refused multipart request on a JSON surface must not be counted as a skipped \
+             inspection: the counter means a legitimate multipart surface skipped a check it \
+             could not perform, and a refused surface never reached that code"
         );
     }
 

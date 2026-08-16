@@ -1644,7 +1644,7 @@ mod tests {
 
         let mut props = BTreeMap::new();
         props.insert(
-            "authorization".to_string(),
+            "x-custom".to_string(),
             "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".into(),
         );
         entry.properties = props;

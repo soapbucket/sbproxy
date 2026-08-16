@@ -148,7 +148,10 @@ fn tenant_budgets_are_isolated() {
             break;
         }
     }
-    assert!(found_429, "expected tenant-a's one-request budget to throttle");
+    assert!(
+        found_429,
+        "expected tenant-a's one-request budget to throttle"
+    );
 
     // tenant-b's bucket is untouched: its first request is allowed.
     let resp_b = harness.get("/anything", "b.localhost").expect("send");

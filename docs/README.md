@@ -114,6 +114,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
+- [security.md](security.md) - security overview hub: AI traffic guardrails, budgets, egress control, tenant isolation, and audit chains, plus API traffic security and model hosting, each linking to its detail page.
 - [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - what the gateway enforces against the OWASP LLM Top 10 (2026) and the gateway-layer control set, with coverage stated as full, partial, or out of scope.
 - [events.md](events.md) - the eleven typed events, the `events:` file and webhook sinks, and the in-process bus.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
