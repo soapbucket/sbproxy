@@ -35,12 +35,10 @@ services:
         condition: service_healthy
       mock-origin:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+    # No healthcheck: the runtime image (Dockerfile.cloudbuild's
+    # gcr.io/distroless/cc-debian12 stage) has no shell and no wget, so
+    # a CMD-SHELL wget probe can never succeed here. Verify liveness
+    # from the host instead (curl http://localhost:8080/health).
     networks:
       - jwkssb
 

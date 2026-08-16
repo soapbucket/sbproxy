@@ -42,18 +42,13 @@ services:
         condition: service_healthy
       mock-origin:
         condition: service_healthy
-    healthcheck:
-      # The proxy data plane exposes `/health` on its main listener.
-      # `/healthz` (and `/readyz`) live on the admin port (default
-      # 9090), which this example does not enable; using `/health`
-      # keeps the example self-contained. wget-spider returns 0 only
-      # on 2xx. The proxy serves /health unconditionally regardless
-      # of Host header.
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+    # No healthcheck: the runtime image (Dockerfile.cloudbuild's
+    # gcr.io/distroless/cc-debian12 stage) has no shell and no wget, so
+    # a CMD-SHELL wget probe can never succeed here. Verify liveness
+    # from the host instead: the proxy data plane exposes `/health` on
+    # its main listener unconditionally regardless of Host header.
+    # `/healthz` (and `/readyz`) live on the admin port (default 9090),
+    # which this example does not enable.
     networks:
       - tieredsb
 
