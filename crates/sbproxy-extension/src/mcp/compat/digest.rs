@@ -77,10 +77,16 @@ pub fn contract_digest(tool: &Value) -> String {
 /// the tool's material contract projection, domain-separated by the scheme
 /// label.
 ///
-/// Unlike [`contract_digest`], this covers `outputSchema` and `annotations`
-/// and excludes `title`. See [`MATERIAL_CONTRACT_FIELDS`] for why that is the
-/// set. A tool that declares none of the added fields hashes the same content
-/// as it always did, because the projection only carries fields that exist.
+/// Covers `name`, `description`, `inputSchema`, `outputSchema` and
+/// `annotations`: the fields whose movement changes what this gateway does.
+/// Both schemas are compiled and enforced, the description is the text the
+/// model reads, and the annotations carry the hints a host may turn into an
+/// auto-approval. `title` and `icons` are excluded on purpose, being display
+/// values this gateway never acts on, so a label edit cannot refuse a tool.
+///
+/// A tool that declares none of the fields [`contract_digest`] omitted hashes
+/// the same content as it always did, because the projection only carries
+/// fields that are present.
 pub fn contract_digest_v2(tool: &Value) -> String {
     let projected = project_material_contract(tool);
     // Canonicalizing a JSON object is infallible here: a serde_json::Value

@@ -715,9 +715,18 @@ impl JavascriptPolicyAdapter {
     /// eat its sandbox budget (WOR-2445). The generous budget is
     /// test-only: two loopback fetches plus JS under load exceed the
     /// 1000 ms config cap that production manifests cannot raise.
+    ///
+    /// The private worker was not enough on its own. Under a full
+    /// workspace run the budget is wall clock, so this competes with
+    /// every other test on the machine for CPU and 5 seconds still
+    /// expired often enough to red the gate. The number wants to be far
+    /// enough above the work that only a genuine hang reaches it, and
+    /// the assertions here are about whether a declared destination is
+    /// granted and an undeclared one refused, never about how long that
+    /// took. A test whose subject is not time should not fail on time.
     pub(crate) fn with_isolated_executor_and_generous_budget(mut self) -> Self {
         self.program.executor = Arc::new(JavascriptExecutor::start(1, 1));
-        self.program.limits.budget_ms = 5_000;
+        self.program.limits.budget_ms = 60_000;
         self
     }
 }
