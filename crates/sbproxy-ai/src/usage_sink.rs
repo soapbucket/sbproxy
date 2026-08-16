@@ -920,32 +920,52 @@ enum ObjectStoreKind {
 /// `GOOGLE_APPLICATION_CREDENTIALS`, etc.) on each put. An empty bucket,
 /// missing credentials, or a put failure logs and returns, never panics
 /// or propagates to the request hot path.
+///
+/// `auth_url` (WOR-2476) is resolved once, at construction, via
+/// [`object_store_authorization_url`], and reused for every `record()`
+/// call rather than recomputed. A sink is built once per config
+/// compile (see [`UsageSinkConfig::build`]) and lives for the process
+/// lifetime, so this assumes an operator's S3 endpoint override
+/// (`AWS_ENDPOINT_URL` / `AWS_ENDPOINT`) does not change mid-process;
+/// it is read from the environment once, the same way every other
+/// piece of process-lifetime config here is. Without this,
+/// `AmazonS3Builder::from_env()`'s full `std::env::vars_os()` scan ran
+/// synchronously on the request-logging hot path for every completed
+/// AI call, duplicating the scan [`object_store_put`]'s builders
+/// already do inside the spawned task.
 #[derive(Debug)]
 pub struct ObjectStoreSink {
     kind: ObjectStoreKind,
     bucket: String,
     prefix: String,
     egress: Option<EgressAuthorizer>,
+    auth_url: String,
 }
 
 impl ObjectStoreSink {
     /// Create an S3 usage sink for `bucket` under `prefix`.
     pub fn s3(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        let bucket = bucket.into();
+        let auth_url = object_store_authorization_url(ObjectStoreKind::S3, &bucket);
         Self {
             kind: ObjectStoreKind::S3,
-            bucket: bucket.into(),
+            bucket,
             prefix: prefix.into(),
             egress: None,
+            auth_url,
         }
     }
 
     /// Create a GCS usage sink for `bucket` under `prefix`.
     pub fn gcs(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        let bucket = bucket.into();
+        let auth_url = object_store_authorization_url(ObjectStoreKind::Gcs, &bucket);
         Self {
             kind: ObjectStoreKind::Gcs,
-            bucket: bucket.into(),
+            bucket,
             prefix: prefix.into(),
             egress: None,
+            auth_url,
         }
     }
 
@@ -974,19 +994,22 @@ impl UsageSink for ObjectStoreSink {
         // request URL here: `object_store`'s builders resolve the real
         // dial target from the environment (`AWS_*` /
         // `GOOGLE_APPLICATION_CREDENTIALS`, a possible custom endpoint
-        // override, etc.), not from a field on this struct. `auth_url`
-        // reads that same environment back for S3 (a real endpoint
-        // override, e.g. MinIO/R2, authorizes against its own host);
-        // GCS has no such accessor and always uses its well-known
-        // default endpoint. See `object_store_authorization_url` for
-        // the full derivation and the S3-vs-GCS inventory-granularity
-        // note.
-        let auth_url = object_store_authorization_url(self.kind, &self.bucket);
+        // override, etc.), not from a field on this struct. `self.auth_url`
+        // is that same environment read back, resolved once at
+        // construction (see the struct doc comment) rather than here on
+        // every `record()`: this method runs on the request-logging hot
+        // path, and `AmazonS3Builder::from_env()` is a full
+        // `std::env::vars_os()` scan that would otherwise run per logged
+        // request in addition to the identical scan
+        // [`object_store_put`]'s builders already do inside the spawned
+        // task. See `object_store_authorization_url` for the S3-vs-GCS
+        // derivation and the inventory-granularity note.
+        let auth_url = &self.auth_url;
         match self.egress.as_ref() {
             None => {
                 record_egress_seen(
                     EgressPurpose::UsageSink,
-                    &auth_url,
+                    auth_url,
                     self.name(),
                     EgressSightingStatus::Ungated,
                     None,
@@ -995,13 +1018,13 @@ impl UsageSink for ObjectStoreSink {
             Some(_) => match authorize_usage_http(
                 self.egress.as_ref(),
                 EgressPurpose::UsageSink,
-                &auth_url,
+                auth_url,
                 &CachedSystemResolver,
             ) {
                 Ok(()) => {
                     record_egress_seen(
                         EgressPurpose::UsageSink,
-                        &auth_url,
+                        auth_url,
                         self.name(),
                         EgressSightingStatus::Allowed,
                         None,
@@ -1010,7 +1033,7 @@ impl UsageSink for ObjectStoreSink {
                 Err(denied) => {
                     record_egress_seen(
                         EgressPurpose::UsageSink,
-                        &auth_url,
+                        auth_url,
                         self.name(),
                         EgressSightingStatus::Denied,
                         Some(denied),
@@ -2029,6 +2052,58 @@ mod tests {
                 .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
                     && e.host == synthetic_host),
             "the synthetic default host must never be stamped once a real override resolves"
+        );
+    }
+
+    /// `record()` must gate against the `auth_url` memoized at
+    /// construction, never recompute it (WOR-2476 perf follow-up: a
+    /// fresh `AmazonS3Builder::from_env()` per `record()` call is a
+    /// full `std::env::vars_os()` scan on the request-logging hot path).
+    ///
+    /// Constructed via the struct literal rather than `ObjectStoreSink::s3`:
+    /// `mod tests` is a child module of this file, so `ObjectStoreSink`'s
+    /// private fields (including `auth_url`) are visible here, and that
+    /// is the only way to plant an `auth_url` a fresh resolution could
+    /// never produce. This test environment sets no `AWS_ENDPOINT_URL`,
+    /// so `object_store_authorization_url` would resolve the synthetic
+    /// `<bucket>.s3.amazonaws.com` default for this bucket if `record()`
+    /// recomputed it; the sighting below is keyed by a different host
+    /// entirely, so its presence is proof `record()` read the memoized
+    /// field instead.
+    #[test]
+    fn record_gates_against_the_auth_url_memoized_at_construction() {
+        let bucket = "wor-2476-memoized-bucket";
+        let memoized_host = "already-resolved.internal.test";
+        let sink = ObjectStoreSink {
+            kind: ObjectStoreKind::S3,
+            bucket: bucket.to_string(),
+            prefix: "prefix".to_string(),
+            egress: Some(enforce_purpose(
+                EgressPurpose::UsageSink,
+                &["allowed-elsewhere.example.com"],
+            )),
+            auth_url: format!("https://{memoized_host}"),
+        };
+
+        // No panic: the memoized host is denied by the authorizer above,
+        // so `record()` returns before `object_store_put`'s
+        // `tokio::spawn`, which would panic outside a Tokio runtime.
+        sink.record(&sample_event());
+
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == memoized_host)
+            .expect("record() must gate against the memoized auth_url, not a fresh resolution");
+        assert_eq!(entry.status, "denied");
+
+        let synthetic_host = format!("{bucket}.s3.amazonaws.com");
+        assert!(
+            !snapshot
+                .iter()
+                .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
+                    && e.host == synthetic_host),
+            "record() must not recompute the synthetic default from a fresh environment scan"
         );
     }
 }
