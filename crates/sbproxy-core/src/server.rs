@@ -4928,6 +4928,182 @@ fn js_request_modifier(
     Ok(headers_to_set)
 }
 
+// --- Rego modifier helpers ---
+//
+// WOR-2482: engine-surface parity. `rego_module` / `rego_module_path`
+// on a request or response modifier evaluate the same way `lua_script`
+// / `js_script` do: a fresh `CompiledRego` is built from the module
+// text on every invocation, no config-load compile and no cached
+// engine, matching how `js_request_modifier` above builds a fresh
+// `JsEngine` per call rather than caching a parsed script. The failure
+// posture mirrors the Lua/JS row of `docs/scripting.md`'s modifier
+// error table, not `policy: rego`'s fail-closed-and-deny posture: an
+// error (a module that does not name the queried rule at all, a
+// budget overrun) is logged by the caller and the modifier's headers
+// are simply not applied; the request proceeds. A rule that is defined
+// but simply does not fire for a given input is `undefined`, which
+// Rego treats as "no opinion" rather than a fault
+// (`CompiledRego::eval_value`), so it also produces no headers without
+// logging anything.
+//
+// The evaluated rule name is a fixed convention,
+// `data.sbproxy.modify_request` / `data.sbproxy.modify_response`,
+// mirroring how Lua and JavaScript modifiers also call a fixed
+// function name (`modify_request` / `modify_response`) with no config
+// knob to rename it: the capability is identical, only the spelling
+// differs per language.
+
+/// Evaluation budget for a Rego request/response modifier, matching
+/// `policy: rego`'s default (`docs/scripting.md` §3a).
+const REGO_MODIFIER_BUDGET_MS: u64 = 50;
+
+/// The rule a Rego request modifier's `rego_module` evaluates.
+const REGO_MODIFIER_REQUEST_QUERY: &str = "data.sbproxy.modify_request";
+
+/// The rule a Rego response modifier's `rego_module` evaluates.
+const REGO_MODIFIER_RESPONSE_QUERY: &str = "data.sbproxy.modify_response";
+
+/// Build the Rego `input` document a request modifier's `rego_module`
+/// evaluates against.
+///
+/// Lua and JavaScript request modifiers receive two arguments, `req`
+/// (`method`/`path`/`headers`/`host`/`tls`) and `ctx`
+/// (`aipref`/`tls`/`principal`, [`script_modifier_context`]). Rego
+/// takes one `input` document, so this merges the two: `ctx`'s
+/// `request` object already carries `aipref` and `tls`; `req`'s fields
+/// join it under the same key. `input.principal` is `ctx`'s `principal`
+/// unchanged. The result is exactly the union of what the two engines
+/// see, addressed as `input.request.*` / `input.principal.*` instead of
+/// two arguments.
+fn rego_request_modifier_input(
+    req_header: &RequestHeader,
+    ctx: &RequestContext,
+) -> serde_json::Value {
+    let mut headers_map = std::collections::HashMap::new();
+    for (name, value) in req_header.headers.iter() {
+        if let Ok(v) = value.to_str() {
+            headers_map.insert(name.as_str().to_string(), v.to_string());
+        }
+    }
+    let mut input = script_modifier_context(ctx);
+    if let Some(request) = input
+        .get_mut("request")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        request.insert(
+            "method".to_string(),
+            serde_json::Value::String(req_header.method.as_str().to_string()),
+        );
+        request.insert(
+            "path".to_string(),
+            serde_json::Value::String(req_header.uri.path().to_string()),
+        );
+        request.insert(
+            "host".to_string(),
+            serde_json::Value::String(ctx.hostname.as_str().to_string()),
+        );
+        request.insert("headers".to_string(), serde_json::json!(headers_map));
+    }
+    input
+}
+
+/// Build the Rego `input` document a response modifier's `rego_module`
+/// evaluates against.
+///
+/// Mirrors [`rego_request_modifier_input`]: `ctx`'s `request` /
+/// `principal` objects carry what Lua/JS's `ctx` argument carries, and
+/// `resp` (`status_code`/`headers`) joins as a new `response` key, the
+/// same fields Lua/JS's `resp` argument carries.
+fn rego_response_modifier_input(
+    status: u16,
+    response_headers: &serde_json::Map<String, serde_json::Value>,
+    ctx: &RequestContext,
+) -> serde_json::Value {
+    let mut input = script_modifier_context(ctx);
+    if let Some(map) = input.as_object_mut() {
+        map.insert(
+            "response".to_string(),
+            serde_json::json!({
+                "status_code": status,
+                "headers": response_headers,
+            }),
+        );
+    }
+    input
+}
+
+/// Execute a Rego request modifier module.
+///
+/// Extracts `set_headers` from the evaluated `data.sbproxy.modify_request`
+/// document, the same field Lua's and JS's `modify_request` return.
+///
+/// # Errors
+///
+/// Returns an error when the module does not parse or evaluate, or
+/// evaluation exceeds its budget. The caller logs this and skips the
+/// modifier's headers, matching the Lua/JS request modifier row of
+/// `docs/scripting.md`'s error table.
+fn rego_request_modifier(
+    module: &str,
+    rego_v0: bool,
+    req_header: &RequestHeader,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let input = rego_request_modifier_input(req_header, ctx);
+    let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
+        "rego request modifier",
+        module,
+        REGO_MODIFIER_REQUEST_QUERY,
+        REGO_MODIFIER_BUDGET_MS,
+        None,
+        rego_v0,
+    )?;
+    let result = compiled.eval_value(input, ctx.principal.tenant_id.as_str())?;
+
+    let mut headers_to_set = Vec::new();
+    if let Some(set_headers) = result.get("set_headers").and_then(|h| h.as_object()) {
+        for (key, value) in set_headers {
+            if let Some(v) = value.as_str() {
+                headers_to_set.push((key.clone(), v.to_string()));
+            }
+        }
+    }
+    Ok(headers_to_set)
+}
+
+/// Execute a Rego response modifier module.
+///
+/// Extracts headers the same way [`response_modifier_headers`] does for
+/// Lua and JavaScript response modifiers, so a module returning
+/// `{"set_headers": {...}}` behaves identically across all three
+/// engines.
+///
+/// # Errors
+///
+/// Returns an error when the module does not parse or evaluate, or
+/// evaluation exceeds its budget. The caller logs this and skips the
+/// modifier's headers, matching the Lua/JS response modifier row of
+/// `docs/scripting.md`'s error table.
+fn rego_response_modifier(
+    module: &str,
+    rego_v0: bool,
+    status: u16,
+    response_headers: &serde_json::Map<String, serde_json::Value>,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let input = rego_response_modifier_input(status, response_headers, ctx);
+    let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
+        "rego response modifier",
+        module,
+        REGO_MODIFIER_RESPONSE_QUERY,
+        REGO_MODIFIER_BUDGET_MS,
+        None,
+        rego_v0,
+    )?;
+    let result = compiled.eval_value(input, ctx.principal.tenant_id.as_str())?;
+    Ok(response_modifier_headers(&result, response_headers))
+}
+
 // --- Session cookie builder ---
 
 /// Build a Set-Cookie header value for a session cookie.

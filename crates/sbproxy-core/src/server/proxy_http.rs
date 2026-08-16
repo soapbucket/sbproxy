@@ -1941,6 +1941,10 @@ impl ProxyHttp for SbProxy {
         let mut req_to_append: Vec<(String, String)> = Vec::new();
         let mut lua_scripts: Vec<String> = Vec::new();
         let mut js_scripts: Vec<String> = Vec::new();
+        // WOR-2482: (module, rego_v0) pairs, mirroring lua_scripts /
+        // js_scripts. rego_v0 travels with the module because it is a
+        // per-modifier parse-dialect knob, not a global engine setting.
+        let mut rego_scripts: Vec<(String, bool)> = Vec::new();
         let mut advanced_modifiers: Vec<sbproxy_config::RequestModifierConfig> = Vec::new();
         let mut upstream_url_path: Option<String> = None;
         let mut upstream_host_header: Option<String> = None;
@@ -2203,6 +2207,9 @@ impl ProxyHttp for SbProxy {
                         if let Some(script) = &modifier.js_script {
                             js_scripts.push(script.clone());
                         }
+                        if let Some(module) = &modifier.rego_module {
+                            rego_scripts.push((module.clone(), modifier.rego_v0));
+                        }
                     }
                 }
 
@@ -2234,6 +2241,9 @@ impl ProxyHttp for SbProxy {
                                 }
                                 if let Some(script) = &modifier.js_script {
                                     js_scripts.push(script.clone());
+                                }
+                                if let Some(module) = &modifier.rego_module {
+                                    rego_scripts.push((module.clone(), modifier.rego_v0));
                                 }
                             }
                         }
@@ -2678,6 +2688,23 @@ impl ProxyHttp for SbProxy {
                 }
                 Err(e) => {
                     warn!(error = %e, "JavaScript request modifier script error");
+                }
+            }
+        }
+
+        // Apply Rego request modifiers, after Lua and JavaScript so a
+        // modifier setting more than one engine resolves the same way
+        // the other two already do: the later engine's headers win on a
+        // shared header (WOR-2482).
+        for (module, rego_v0) in &rego_scripts {
+            match rego_request_modifier(module, *rego_v0, session.req_header(), ctx) {
+                Ok(headers_to_set) => {
+                    for (key, value) in headers_to_set {
+                        let _ = upstream_request.insert_header(key, &value);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Rego request modifier script error");
                 }
             }
         }
@@ -3587,6 +3614,30 @@ impl ProxyHttp for SbProxy {
                             }
                             Err(e) => {
                                 warn!(error = %e, "JavaScript response modifier script error");
+                            }
+                        }
+                    }
+                    // WOR-2482: after Lua and JavaScript, so a modifier
+                    // setting more than one engine resolves the same way
+                    // the request side already does: the later engine's
+                    // headers win on a shared header.
+                    if let Some(module) = &modifier.rego_module {
+                        let status = upstream_response.status.as_u16();
+                        match rego_response_modifier(
+                            module,
+                            modifier.rego_v0,
+                            status,
+                            &response_headers,
+                            ctx,
+                        ) {
+                            Ok(headers) => {
+                                for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
+                                    to_set.push((key, value));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Rego response modifier script error");
                             }
                         }
                     }

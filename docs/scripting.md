@@ -42,8 +42,10 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `observability.log.custom_fields[]` with `engine: cel` | CEL | Returns the value of one operator-defined access-log field |
 | `request_modifiers[].lua_script` | Lua | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
 | `request_modifiers[].js_script` | JavaScript | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
+| `request_modifiers[].rego_module` (+ `rego_module_path`, `rego_v0`) | Rego | The `data.sbproxy.modify_request` rule returns `{"set_headers": {...}}`, applied to the upstream request |
 | `response_modifiers[].lua_script` | Lua | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `response_modifiers[].js_script` | JavaScript | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
+| `response_modifiers[].rego_module` (+ `rego_module_path`, `rego_v0`) | Rego | The `data.sbproxy.modify_response` rule returns `{"set_headers": {...}}`, applied to the response |
 | `transforms[] type: lua_json`, field `script` | Lua | Defines `modify_json(data, ctx)`; return value replaces the JSON response body |
 | `transforms[] type: javascript`, field `script` | JavaScript | Defines `transform(body, ctx)` over the raw body string |
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
@@ -622,6 +624,34 @@ Reach for it to run a policy pasted from an older OPA install rather than rewrit
 
 A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior for every `policy: rego` and every `ai_routing_policy` `engine: rego`.
 
+### Rego modifiers
+
+`request_modifiers[]` and `response_modifiers[]` also accept a Rego form, beside `lua_script` and `js_script`: `rego_module` (inline source) or `rego_module_path` (a path to a `.rego` file, mutually exclusive with `rego_module`), plus `rego_v0` for pre-OPA-1.0 syntax. This is engine-surface parity, not a different contract: the module evaluates against the same document `req`/`resp` and `ctx` give Lua and JavaScript, merged into one `input` because Rego takes a single document where the other two take two arguments, and it returns the same `{"set_headers": {...}}` shape those scripts return.
+
+```yaml
+request_modifiers:
+  - rego_module: |
+      package sbproxy
+
+      default modify_request := {"set_headers": {"x-caller-kind": "browser"}}
+
+      modify_request := {"set_headers": {"x-caller-kind": "crawler"}} if {
+        contains(input.request.headers["user-agent"], "GPTBot")
+      }
+```
+
+```yaml
+response_modifiers:
+  - rego_module: |
+      package sbproxy
+
+      modify_response := {"set_headers": {"x-status-bucket": "5xx"}} if {
+        input.response.status_code >= 500
+      }
+```
+
+The queried rule is a fixed name, `data.sbproxy.modify_request` / `data.sbproxy.modify_response`, the same way Lua and JavaScript modifiers call a fixed function name (`modify_request` / `modify_response`) with no config knob to rename it. Unlike `policy: rego`, a module that fails to parse does not refuse the config: the failure posture here matches the Lua/JS modifier row in [§11](#error-behavior), not the `rego` policy row above. See [§7](#7-modifier-reference) for the full modifier field reference.
+
 ---
 
 ## 4. Lua scripting
@@ -1110,6 +1140,9 @@ Request and response modifiers are lists of typed entries. Each entry can combin
 | `body.replace` | string | Replace the request body with this string |
 | `body.replace_json` | any | Replace the request body with this JSON value |
 | `lua_script` | string | Lua `modify_request(req, ctx)`; returned `set_headers` applied |
+| `js_script` | string | JavaScript `modify_request(req, ctx)`; returned `set_headers` applied |
+| `rego_module` / `rego_module_path` | string | Rego `data.sbproxy.modify_request`; returned `{"set_headers": {...}}` applied. Mutually exclusive with each other |
+| `rego_v0` | bool | Parse the Rego module as pre-OPA-1.0 syntax |
 
 ```yaml
 request_modifiers:
@@ -1142,6 +1175,8 @@ request_modifiers:
 | `body.replace_json` | any | Replace the response body with this JSON value |
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |
 | `js_script` | string | JavaScript `modify_response(resp, ctx)`; returned `set_headers` applied |
+| `rego_module` / `rego_module_path` | string | Rego `data.sbproxy.modify_response`; returned `{"set_headers": {...}}` applied. Mutually exclusive with each other |
+| `rego_v0` | bool | Parse the Rego module as pre-OPA-1.0 syntax |
 
 ```yaml
 response_modifiers:
@@ -1278,7 +1313,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `rego` policy | A module that fails to parse or a semantic fault (unsafe variable, `query` naming no rule) rejects the config at compile time; a rule error, non-boolean result, or exceeded `budget_ms` denies the request with `deny_status` |
 | forward-rule `when:` | A CEL parse error rejects the config at compile time; an evaluation error means the rule does not match, logged per request |
 | WAF custom rule (Lua / JS) | A rule whose script errors is skipped and counted; if no rule blocked but at least one went unevaluated, the pass reports a WAF failure and the policy's `failure_posture` decides (default closed) |
-| Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
+| Lua / JS / Rego modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds. Unlike `policy: rego`, a Rego modifier module that fails to parse follows this row, not the `rego` policy row above: the module is not compiled at config load |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |

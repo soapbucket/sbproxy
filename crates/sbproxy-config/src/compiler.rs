@@ -297,8 +297,14 @@ pub fn interpolate_config_vars(
         }
         serde_json::Value::Object(map) => {
             for (key, val) in map.iter_mut() {
-                // Skip Lua scripts - they are executed at runtime.
-                if key == "lua_script" {
+                // Skip Lua and Rego script bodies - they are executed
+                // (Lua) or evaluated (Rego) at runtime, not templated.
+                // WOR-2482: without this, a forward-rule modifier's
+                // `rego_module` reaches here through the whole-rule JSON
+                // round-trip in `compile_origin`, and a literal `{{`
+                // inside the module (a string or comment) would be
+                // corrupted by var substitution.
+                if key == "lua_script" || key == "rego_module" {
                     continue;
                 }
                 interpolate_config_vars(val, variables);
@@ -401,6 +407,44 @@ fn resolve_template_string(
     }
     result.push_str(rest);
     result
+}
+
+/// Resolve a request/response modifier's `rego_module_path` into
+/// `rego_module`, mirroring `policy: rego`'s `module` / `module_path`
+/// split (WOR-2482; Task 1 established the convention on
+/// `transforms[] type: wasm`'s `module_path`): read once here, when the
+/// config compiles, and again on every reload. Downstream code
+/// (`sbproxy-core`, which does the actual Rego evaluation) reads only
+/// `rego_module`; a modifier entry with neither field set has no Rego
+/// form and is left untouched.
+///
+/// # Errors
+///
+/// Returns an error naming the origin and the modifier field when both
+/// `rego_module` and `rego_module_path` are set, or when
+/// `rego_module_path` cannot be read.
+fn resolve_rego_modifier_module(
+    hostname: &str,
+    field: &str,
+    module: &mut Option<String>,
+    module_path: &mut Option<String>,
+) -> Result<()> {
+    if module.is_some() && module_path.is_some() {
+        anyhow::bail!(
+            "origin {hostname}: {field} sets both rego_module and rego_module_path; use \
+             `rego_module` for an inline Rego source or `rego_module_path` for a path to a \
+             .rego file, not both"
+        );
+    }
+    if let Some(path) = module_path.take() {
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "origin {hostname}: {field}: loading rego_module_path from {path}: {error}"
+            )
+        })?;
+        *module = Some(contents);
+    }
+    Ok(())
 }
 
 // --- features.* -> proxy.extensions[...] migration ---
@@ -3171,6 +3215,37 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
                     *value = resolve_template_string(value, &config.variables);
                 }
             }
+        }
+    }
+
+    // WOR-2482: resolve a Rego modifier's `rego_module_path` into
+    // `rego_module` once, here, mirroring `policy: rego`'s `module` /
+    // `module_path` split (see Task 1). Downstream code (sbproxy-core,
+    // which does the actual evaluation) reads only `rego_module`.
+    for modifier in &mut config.request_modifiers {
+        resolve_rego_modifier_module(
+            hostname,
+            "request_modifiers[]",
+            &mut modifier.rego_module,
+            &mut modifier.rego_module_path,
+        )?;
+    }
+    for modifier in &mut config.response_modifiers {
+        resolve_rego_modifier_module(
+            hostname,
+            "response_modifiers[]",
+            &mut modifier.rego_module,
+            &mut modifier.rego_module_path,
+        )?;
+    }
+    for fwd_rule in &mut config.forward_rules {
+        for modifier in &mut fwd_rule.origin.request_modifiers {
+            resolve_rego_modifier_module(
+                hostname,
+                "forward_rules[].origin.request_modifiers[]",
+                &mut modifier.rego_module,
+                &mut modifier.rego_module_path,
+            )?;
         }
     }
 
@@ -6359,6 +6434,143 @@ origins:
         assert!(origin.request_modifiers[0].lua_script.is_some());
         assert_eq!(origin.response_modifiers.len(), 1);
         assert!(origin.response_modifiers[0].lua_script.is_some());
+    }
+
+    // --- WOR-2482: Rego request/response modifiers ---
+
+    #[test]
+    fn compile_config_with_rego_request_modifiers() {
+        let yaml = r#"
+origins:
+  "rego-reqmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module: |
+          package sbproxy
+
+          modify_request := {"set_headers": {"x-rego-modified": "true"}}
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("rego-reqmod.test").unwrap();
+        assert_eq!(origin.request_modifiers.len(), 1);
+        assert!(origin.request_modifiers[0].lua_script.is_none());
+        assert!(origin.request_modifiers[0].rego_module.is_some());
+        let module = origin.request_modifiers[0].rego_module.as_ref().unwrap();
+        assert!(module.contains("modify_request"));
+        assert!(module.contains("x-rego-modified"));
+        assert!(origin.request_modifiers[0].rego_module_path.is_none());
+    }
+
+    #[test]
+    fn compile_config_with_rego_response_modifiers() {
+        let yaml = r#"
+origins:
+  "rego-respmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - rego_module: |
+          package sbproxy
+
+          modify_response := {"set_headers": {"x-rego-stage": "response"}}
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("rego-respmod.test").unwrap();
+        assert_eq!(origin.response_modifiers.len(), 1);
+        assert!(origin.response_modifiers[0].rego_module.is_some());
+        let module = origin.response_modifiers[0].rego_module.as_ref().unwrap();
+        assert!(module.contains("modify_response"));
+    }
+
+    #[test]
+    fn rego_module_path_on_a_modifier_is_loaded_and_the_path_field_is_cleared() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("modify.rego");
+        std::fs::write(&path, "package sbproxy\n\nmodify_request := {\"set_headers\": {}}\n")
+            .expect("write fixture module");
+
+        let yaml = format!(
+            r#"
+origins:
+  "rego-path.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module_path: "{}"
+"#,
+            path.display()
+        );
+        let compiled = compile_config(&yaml).unwrap();
+        let origin = compiled.resolve_origin("rego-path.test").unwrap();
+        let modifier = &origin.request_modifiers[0];
+        assert!(
+            modifier.rego_module_path.is_none(),
+            "module_path is resolved into module at compile time, mirroring policy: rego"
+        );
+        let module = modifier.rego_module.as_ref().expect("module loaded from path");
+        assert!(module.contains("modify_request"));
+    }
+
+    #[test]
+    fn rego_module_and_rego_module_path_together_on_one_modifier_is_refused() {
+        let yaml = r#"
+origins:
+  "rego-both.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module: |
+          package sbproxy
+          modify_request := {"set_headers": {}}
+        rego_module_path: /etc/sbproxy/modify.rego
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("setting both rego_module and rego_module_path must be refused");
+        assert!(
+            error.to_string().contains("rego_module")
+                && error.to_string().contains("rego_module_path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The multi-engine "both set" case is a different question from the
+    /// mutual-exclusion case above: this is `rego_module` alongside
+    /// `lua_script`, two *different* engines on one modifier entry.
+    ///
+    /// `lua_script` and `js_script` set together on one modifier are not
+    /// refused today (`sbproxy_core::server::proxy_http` runs Lua then
+    /// JavaScript, and the later engine's headers win on a shared key,
+    /// by design - see the comment at that call site). `rego_module`
+    /// mirrors that: it is not refused either, so it must survive
+    /// compilation with both fields intact for the runtime to run all
+    /// three.
+    #[test]
+    fn rego_module_alongside_lua_script_on_one_modifier_is_not_refused() {
+        let yaml = r#"
+origins:
+  "rego-and-lua.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - lua_script: |
+          function modify_request(req, ctx)
+            return { set_headers = { ["x-engine"] = "lua" } }
+          end
+        rego_module: |
+          package sbproxy
+          modify_request := {"set_headers": {"x-engine": "rego"}}
+"#;
+        let compiled = compile_config(yaml).expect("both engines on one modifier compiles");
+        let origin = compiled.resolve_origin("rego-and-lua.test").unwrap();
+        assert!(origin.request_modifiers[0].lua_script.is_some());
+        assert!(origin.request_modifiers[0].rego_module.is_some());
     }
 
     #[test]
