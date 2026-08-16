@@ -1761,25 +1761,34 @@ these methods is not implemented yet.
 
 ### Multipart bodies
 
-Image edits, image variations, audio transcription, and audio translation send
-multipart request bodies. The proxy detects multipart from the inbound
-`Content-Type`; when it starts with `multipart/`, the body is forwarded with
-that Content-Type preserved. The detection is on the Content-Type alone, so any
-surface can end up on this path, not only the four above. A governed key's model
-policy is checked against the bounded `model` part, and `route_to_model` or a
-budget downgrade rewrites only that part. A required model with no interpretable
-model part fails closed. Because the gateway cannot safely apply JSON PII
-redaction to arbitrary multipart bytes, a credential with
-`require_pii_redaction` is rejected before idempotency, cache, or provider
-dispatch.
+Image edits, image variations, audio transcription, audio translation, and file
+uploads send multipart request bodies; a request the proxy cannot classify also
+takes this path. `AiSurface::accepts_multipart` is the allowlist for all of
+these, and it is checked against the classified surface, not only against the
+inbound `Content-Type`. The proxy still detects multipart from the inbound
+`Content-Type`; when it starts with `multipart/` on one of the allowed
+surfaces, the body is forwarded with that Content-Type preserved. A multipart
+`Content-Type` on any other classified surface, such as `chat_completions` or
+`embeddings`, is a caller relabeling a JSON surface to route around body
+inspection, and it is refused with `403` before this branch runs, along with a
+`security_audit` entry (`multipart_disallowed_surface`); see
+[audit-log.md](audit-log.md). A governed key's model policy is checked against
+the bounded `model` part, and `route_to_model` or a budget downgrade rewrites
+only that part. A required model with no interpretable model part fails closed.
+Because the gateway cannot safely apply JSON PII redaction to arbitrary
+multipart bytes, a credential with `require_pii_redaction` is rejected before
+idempotency, cache, or provider dispatch.
 
 Everything downstream of the JSON parse is skipped for these requests: the
 built-in input guardrails, origin-level `pii:` request redaction, body-aware
 `prompt_injection_v2` scanning, and the AI policy plane. Only the
 credential-level `require_pii_redaction` gate above rejects; the rest are
 permitted and counted under
-`sbproxy_ai_multipart_inspection_skipped_total`. Scan that counter before you
-assume a configured guardrail covers your upload traffic.
+`sbproxy_ai_multipart_inspection_skipped_total`. The counter now means
+legitimate multipart surfaces that skipped body inspection: it can no longer
+fire for `chat_completions` or any other classified JSON surface, since those
+requests are refused before reaching it. Scan the counter before you assume a
+configured guardrail covers your upload traffic.
 
 Provider *request* translation does not run for multipart, so the inbound bytes
 reach the provider unchanged. The response is still translated and rewrapped

@@ -1,9 +1,9 @@
 # Audit log
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
-SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the tamper-evident chain the `security_audit` channel can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
+SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the tamper-evident chains the `security_audit` and `config_audit` channels can each be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
 
-One thing on this page is durable and provable, and the rest is not. `audit.sink: chain` writes every `security_audit` event to a hash-chained, Ed25519-signed file that `sbproxy audit verify` re-derives from genesis; see [Tamper-evident security audit trail](#tamper-evident-security-audit-trail). Everything else here is either an in-memory ring that dies with the process or a tracing stream whose durability is whatever your collector gives it. Read the sections below with that split in mind, because a log stream is a record of what the proxy said rather than a record of what happened: whoever can write the file can rewrite it.
+One thing on this page is durable and provable, and the rest is not. `audit.sink: chain` writes every `security_audit` event to a hash-chained, Ed25519-signed file that `sbproxy audit verify` re-derives from genesis. Setting `audit.config_path` on top of that opts `config_audit` events into their own chained file, verified the same way with `--channel config`; see [Tamper-evident security audit trail](#tamper-evident-security-audit-trail). Everything else here is either an in-memory ring that dies with the process or a tracing stream whose durability is whatever your collector gives it. Read the sections below with that split in mind, because a log stream is a record of what the proxy said rather than a record of what happened: whoever can write the file can rewrite it.
 
 ## Admin-action audit rows
 
@@ -94,6 +94,41 @@ not acquire a second key-distribution problem by turning this on. Source
 the seed from the environment or a vault reference rather than committing
 it.
 
+### The config chain
+
+`audit.config_path` opts `config_audit` events into a second chained file,
+signed with the same identity:
+
+```yaml
+audit:
+  sink: chain
+  path: /var/lib/sbproxy/security-audit.jsonl
+  sign_with: proxy.web_bot_auth
+  config_path: /var/lib/sbproxy/config-audit.jsonl
+```
+
+It is off by default: with no `config_path`, `config_audit` stays a
+tracing stream and nothing else changes, which is the same behavior this
+proxy has always had. Setting it requires `sink: chain`; naming it under
+`sink: memory` is refused at load. It must also name a different file
+than `path`, because the security and config chains carry different
+payload shapes and verify independently, and one file cannot hold both
+without breaking the digest walk partway through.
+
+Everything the security chain gives you above applies to this one too:
+each `ConfigAuditEntry` is hash-chained and signed the same way, the file
+is its own write-ahead log, and `sbproxy audit verify` re-derives it from
+genesis. What is chained is the change, never the document. A
+`ConfigAuditEntry` carries which origins moved, which revision it moved
+between, and who asked for it, and not one config value, which is why
+chaining the record of a reload is safe even though chaining what it
+loaded would not be.
+
+`key_audit` is deliberately not chainable yet. Its entries carry a
+before/after diff of a credential record, and writing that into a file
+designed to be impossible to quietly amend needs its own answer to what
+the diff may contain before it goes anywhere permanent.
+
 ### What the chain proves
 
 Each record is `SHA-256(prev_hash || seq || recorded_at || event)` and
@@ -112,13 +147,23 @@ auditor can rely on:
 
 ### Verifying it
 
-`sbproxy audit verify` re-derives the chain from genesis and reports the
+`sbproxy audit verify` re-derives a chain from genesis and reports the
 first record that does not check out. Exit 0 verifies, exit 1 does not, so
 it drops straight into cron or a CI lane:
 
 ```bash
 sbproxy audit verify /var/lib/sbproxy/security-audit.jsonl \
   --signing-seed-hex "$SBPROXY_AUDIT_SEED"
+```
+
+`--channel` picks which chain the file at `path` is: `security` (the
+default, the trail `audit.sink: chain` writes) or `config` (the trail
+`audit.config_path` writes). The two channels write different payload
+shapes to different files, so pass the channel that matches the file:
+
+```bash
+sbproxy audit verify /var/lib/sbproxy/config-audit.jsonl \
+  --channel config --signing-seed-hex "$SBPROXY_AUDIT_SEED"
 ```
 
 Without `--signing-seed-hex` only the hash chain is checked, which catches
@@ -136,41 +181,51 @@ implementation.
 
 ### What it does not cover yet
 
-`config_audit` and `key_audit` are not chained. Both are worth chaining
-and neither is in this first pass. `key_audit` in particular ships a
-before/after diff of a credential record, and writing that into a file
-designed to be impossible to quietly amend needs its own answer to what
-the diff may contain before it goes anywhere permanent.
+`config_audit` is chainable, but only when `audit.config_path` is set; see
+[The config chain](#the-config-chain) above. `key_audit` is not chainable
+at all yet, deliberately: it ships a before/after diff of a credential
+record, and writing that into a file designed to be impossible to quietly
+amend needs its own answer to what the diff may contain before it goes
+anywhere permanent.
 
 The admin-action ring at `/api/audit/recent` is not chained either, and
 neither is the `sbproxy::admin::audit` tracing target that records admin
 logins and config writes.
 
-There is no rotation or segmentation: the chain is one file that grows,
-and truncating it is by construction indistinguishable from tampering with
-it. Size it accordingly, and archive by copying rather than by trimming.
+There is no rotation or segmentation on either chain: each is one file
+that grows, and truncating it is by construction indistinguishable from
+tampering with it. Size it accordingly, and archive by copying rather
+than by trimming.
 
 ### What a record may contain
 
-The chained record is a `SecurityAuditEntry` and nothing more. Every field
-is an identifier, a label, or a status: hostname, client IP, request id,
-method, status code, tenant, the recognized provider label, the credential
-mode, and the public `api_key_id`. It never carries a credential, a token,
-a header value, or a resolved config value, which is a property the type
-is required to keep rather than one it happens to have. Durability is why
-it matters: a secret written into a hash chain cannot be quietly removed
-later, because quiet removal is the thing the chain exists to prevent.
+The chained record is a `SecurityAuditEntry` on the security chain, or a
+`ConfigAuditEntry` on the config chain, and nothing more in either case.
+Every field of the security entry is an identifier, a label, or a status:
+hostname, client IP, request id, method, status code, tenant, the
+recognized provider label, the credential mode, and the public
+`api_key_id`. The config entry's fields are listed in
+[`config_audit`: configuration changes](#config_audit-configuration-changes)
+below: which origins moved, which revision to which revision, and the
+operator name, never a config value. Neither type carries a credential, a
+token, a header value, or a resolved config value, which is a property
+each is required to keep rather than one it happens to have. Durability is
+why it matters: a secret written into a hash chain cannot be quietly
+removed later, because quiet removal is the thing the chain exists to
+prevent.
 
-The one operator-authored field is `reason`, which carries a policy's deny
-message. It is written verbatim, in the chain and on the tracing target
-alike. If your deny messages interpolate request data, that data reaches
-both.
+The one operator-authored field on the security chain is `reason`, which
+carries a policy's deny message. It is written verbatim, in the chain and
+on the tracing target alike. If your deny messages interpolate request
+data, that data reaches both.
 
 ### If the chain cannot be written
 
-Opening it is a boot condition. A path that cannot be created, a seed that
-is not 32 bytes of hex, or an existing file whose last line was torn by a
-crash all stop the proxy from starting, and the error names `audit.path`.
+Opening either chain is a boot condition. A path that cannot be created, a
+seed that is not 32 bytes of hex, or an existing file whose last line was
+torn by a crash all stop the proxy from starting, and the error names
+`audit.path` for the security chain or `audit.config_path` for the config
+chain.
 
 That is the opposite of what the metering chain does with the same
 conditions, and the difference is deliberate. Metering defaults to
@@ -178,15 +233,20 @@ conditions, and the difference is deliberate. Metering defaults to
 billing can be reconciled afterwards. An audit trail cannot be
 reconciled afterwards: the events that would fall in the hole are the ones
 an investigator needs, and no later moment recovers them. An operator who
-would rather have the proxy sets `sink: memory`.
+would rather have the proxy sets `sink: memory` and leaves `config_path`
+unset.
 
 An append that fails after boot cannot stop anything, because the request
-being audited is already being refused and failing it a second way would
-turn a full disk into an outage. The first such failure, and the first
-after any recovery, is logged at `error` on the `security_audit` target
-itself, which is the pipe you are already watching. Repeats are suppressed
-so an attack against a proxy with a full disk does not also produce one
-log line per refused request.
+or reload being audited is already going through and failing it a second
+way would turn a full disk into an outage. Instead the emitter records the
+loss: the outcome of that emission on
+`sbproxy_audit_emit_duration_seconds` is `chain_error` rather than `ok`,
+so the failure is visible on a dashboard, not just in the log; see
+[Metrics](#metrics). The first such failure, and the first after any
+recovery, is also logged at `error` on the `security_audit` or
+`config_audit` target, whichever chain failed, which is the pipe you are
+already watching. Repeats are suppressed so an attack against a proxy with
+a full disk does not also produce one log line per refused request.
 
 ## Calling it
 
@@ -299,7 +359,7 @@ The default build registers a no-op emitter (`NoOpAdminAuditEmitter`); a downstr
 
 ## Failure handling
 
-Audit emission failure never fails the underlying request or config operation. A `ConfigAuditEntry` that fails JSON serialization is dropped and the drop is visible in the metric below; the tracing channels otherwise inherit the logging pipeline's delivery semantics.
+Audit emission failure never fails the underlying request or config operation. A `ConfigAuditEntry` that fails JSON serialization is dropped and the drop is visible in the metric below. A configured chain that rejects an append (a full disk, for instance) also does not fail the request or reload; the emitter records the loss on the same metric instead. The tracing channels otherwise inherit the logging pipeline's delivery semantics.
 
 ## Metrics
 
@@ -309,7 +369,7 @@ Each emission on the tracing channels records its wall-clock duration on:
 sbproxy_audit_emit_duration_seconds{channel, outcome}
 ```
 
-`channel` is `config`, `security`, or `key`; `outcome` is `ok` or `serialize_error`. A `serialize_error` outcome means the audit record was dropped, which is itself worth alerting on. The histogram carries the active trace as an exemplar so a slow audit sink links back to the originating span.
+`channel` is `config`, `security`, or `key`. `outcome` is `ok`, `serialize_error`, or `chain_error`. `serialize_error` means the audit record failed to encode and was dropped entirely, on any channel. `chain_error` means encoding succeeded, the tracing target still got the record, but a configured chain (`audit.path` on the security channel, `audit.config_path` on the config channel) rejected the append, so that record is not in the durable trail; `key` never reports `chain_error` because `key_audit` has no chain to append to. Either non-`ok` outcome is worth alerting on: `outcome!="ok"` firing means either an audit record vanished or your tamper-evident trail has a gap. The histogram carries the active trace as an exemplar so a slow audit sink links back to the originating span.
 
 ## See also
 
