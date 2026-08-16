@@ -12,6 +12,20 @@ the next version cut.
 
 ### Added
 
+- **MCP tool calls emit a governance evidence event, with an optional
+  fail-closed guarantee.** A twelfth `events:` type,
+  `mcp_governance_decision`, carries OTel GenAI/MCP semantic-convention
+  attribute names plus sbproxy's own `sbproxy.*` fields (verdict,
+  redacted reason, a salted argument hash, and a per-tenant gapless
+  sequence number a SIEM can use to detect a dropped record) for every
+  dispatched `tools/call`. `events.fail_closed` names event types that
+  must never be silently dropped; when `mcp_governance_decision` is
+  listed there and the record cannot be queued, the tool call is
+  refused with a JSON-RPC internal error rather than served
+  un-evidenced, and `sbproxy_mcp_evidence_fail_closed_total{tenant}`
+  counts every refusal. Everything else keeps the existing best-effort,
+  drop-and-count contract.
+
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
   job) fails when an Apache-2.0-only dependency is missing a stanza,

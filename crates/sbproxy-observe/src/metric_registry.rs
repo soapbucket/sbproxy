@@ -1786,6 +1786,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_evidence_seq_tenant_cap_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_evidence_seq_tenant_cap"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_gateway_reconcile_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_reconcile"),
@@ -2172,6 +2183,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["grade", "outcome"],
         description: "Tool-versioning oracle verdicts, by computed grade and outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_evidence_fail_closed_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_evidence_fail_closed"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant"],
+        description: "MCP tool calls refused because fail-closed evidence delivery failed, by tenant.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3548,6 +3570,11 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_inbound_key_requests_total",
     "sbproxy_judge_budget_exhausted_total",
     "sbproxy_label_cardinality_overflow_per_tenant_total",
+    // WOR-2384. A fail-closed MCP evidence refusal is a security-policy
+    // outcome for one tenant's traffic. Merged across tenants it answers
+    // "some evidence write failed somewhere", which cannot tell an
+    // operator whose governed calls are being blocked.
+    "sbproxy_mcp_evidence_fail_closed_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
     // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a

@@ -80,7 +80,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub request_events: Option<RequestEventsConfig>,
     /// Where typed proxy events go. Absent, or present with the default
-    /// `sink: none`, means the eleven event types stay in-process and
+    /// `sink: none`, means the twelve event types stay in-process and
     /// nothing leaves the proxy.
     #[serde(default)]
     pub events: Option<EventsConfig>,
@@ -537,7 +537,7 @@ pub struct EventsConfig {
     /// any host that can reach the endpoint can forge.
     #[serde(default)]
     pub signing_secret: Option<String>,
-    /// Which of the eleven event types to deliver. Empty or absent means
+    /// Which of the twelve event types to deliver. Empty or absent means
     /// all of them.
     ///
     /// Names are the snake_case wire names (`policy_denied`,
@@ -546,6 +546,25 @@ pub struct EventsConfig {
     /// cannot present as a sink that is working and quiet.
     #[serde(default)]
     pub types: Vec<String>,
+    /// Event type names for which delivery must never be silently
+    /// dropped (WOR-2384). Empty by default, meaning every type keeps
+    /// the best-effort, drop-and-count contract every other event type
+    /// has.
+    ///
+    /// Names come from the same closed set `types:` accepts, and an
+    /// unrecognized one is refused the same way, with the accepted list
+    /// in the message. A name here does not have to also appear in
+    /// `types:`, but an operator who lists one without also selecting it
+    /// there has configured every governed call to be refused: nothing
+    /// would ever be able to deliver that type, and a caller listed here
+    /// treats "nothing can deliver this" the same as "delivery failed".
+    ///
+    /// The only publisher that reads this today is the MCP tool-call
+    /// funnel, for `mcp_governance_decision`: when the type is named
+    /// here and the record cannot be queued, the tool call is refused
+    /// with a JSON-RPC internal error rather than served un-evidenced.
+    #[serde(default)]
+    pub fail_closed: Vec<String>,
     /// Bound on the hand-off queue between the publish site and the
     /// delivery worker. Defaults to 4096. Refused when `sink: none`, and
     /// refused at zero, which would drop every event while looking

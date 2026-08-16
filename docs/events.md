@@ -1,8 +1,8 @@
 # SBproxy events
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
-SBproxy has a closed set of eleven typed lifecycle events. The `events:` block sends them out of the process, either appended to a file as NDJSON or POSTed to an HTTP endpoint. That is how you get policy denials into a SIEM without parsing a log sink.
+SBproxy has a closed set of twelve typed lifecycle events. The `events:` block sends them out of the process, either appended to a file as NDJSON or POSTed to an HTTP endpoint. That is how you get policy denials into a SIEM without parsing a log sink.
 
 Delivery is off the request path. A publish site tests a bitmask, puts the event on a bounded queue, and returns; a background worker owns the file handle and the HTTP client. A collector that has gone slow or gone away cannot make a request slower, and the price of that is that a full queue drops events and counts them. There is no configuration in which an event sink adds latency to a request.
 
@@ -25,12 +25,13 @@ There is also a separate in-process `EventBus` that embedders can register closu
 | `budget_exceeded` | An AI spend or quota budget was exhausted. |
 | `guardrail_triggered` | An AI guardrail flagged or blocked content. |
 | `config_reloaded` | The proxy configuration changed. |
+| `mcp_governance_decision` | An MCP `tools/call` dispatch was decided: allowed, or refused by a governance gate (dual-LLM quarantine, modern output-schema validation). |
 
 Circuit-breaker activity is a metric (`sbproxy_circuit_breaker_transitions_total`), not an event. See [metrics-stability.md](metrics-stability.md).
 
 ## Which of them the shipped binary actually emits
 
-Five. The other six are enum variants an embedder can publish, and configuring a sink for one of those gets you a sink that never fires.
+Six. The other six are enum variants an embedder can publish, and configuring a sink for one of those gets you a sink that never fires.
 
 | Event | Emitted from |
 |------|------|
@@ -39,6 +40,7 @@ Five. The other six are enum variants an embedder can publish, and configuring a
 | `auth_denied` | Every authentication rejection, including forward-auth and digest challenges. |
 | `policy_denied` | Every policy block (rate limit, IP filter, WAF, object authorization, A2A, prompt injection) and every HTTP framing violation. |
 | `config_reloaded` | A configuration change through the admin API, carrying the revision pair and the origin delta. |
+| `mcp_governance_decision` | The same MCP tool-call funnel every dispatch already passes through, alongside the decision-audit record. |
 
 `request_started`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, and `guardrail_triggered` have no emitter in this build. The cache path reports through `sbproxy_cache_*`, and the AI path reports through `sbproxy_ai_*` and the [usage ledger](ai-usage-ledger.md), which is where the gateway's own accounting lives. Point a sink at those six only if your own code publishes them.
 
@@ -54,7 +56,7 @@ pub struct ProxyEvent {
 }
 ```
 
-`data` is the record the emitting channel already built. For `auth_denied` and `policy_denied` it is the `security_audit` entry: timestamp, event type, reason, hostname, client IP, request id, method, status code, tenant id, credential provider and mode, and the public key id. For `config_reloaded` it is the `config_audit` entry: source, origin delta, actor, and the before and after revisions. For `request_completed` and `request_error` it is the full request envelope, including latency, status, provider, model, token counts, and cost.
+`data` is the record the emitting channel already built. For `auth_denied` and `policy_denied` it is the `security_audit` entry: timestamp, event type, reason, hostname, client IP, request id, method, status code, tenant id, credential provider and mode, and the public key id. For `config_reloaded` it is the `config_audit` entry: source, origin delta, actor, and the before and after revisions. For `request_completed` and `request_error` it is the full request envelope, including latency, status, provider, model, token counts, and cost. For `mcp_governance_decision` it is OTel GenAI/MCP semantic-convention attribute names (Development stability) plus sbproxy's own `sbproxy.*` namespace: the tool name and call id, the MCP method and protocol version, the decision verdict and redacted reason, a salted hash of the tool arguments (never the arguments themselves), the tenant id, and a per-tenant gapless sequence number a SIEM can use to detect a dropped record.
 
 None of those payloads carries a credential, and that is a property under test rather than a convention. `api_key_id` is the public id or a derived `sk_<hex>` fingerprint and never the secret. `prompt_fingerprint` is salted and non-reversible. No field holds prompt text, a header value, or a resolved config value. A field added to either record fails a test until somebody has confirmed it can be sent to a third party, because with a webhook sink these bytes leave your network.
 
@@ -77,7 +79,8 @@ events:
 | `path` | Output file for `sink: file`. Parent directories are created at boot. Required by `file`, refused otherwise. |
 | `url` | Destination for `sink: webhook`. Must be `http://` or `https://`. Required by `webhook`, refused otherwise. |
 | `signing_secret` | HMAC-SHA256 key for the webhook signature. Takes a secret reference and nothing else; see below. |
-| `types` | Which event types to deliver. Empty or absent means all eleven. An unrecognized name is refused at compile time with the accepted list. |
+| `types` | Which event types to deliver. Empty or absent means all twelve. An unrecognized name is refused at compile time with the accepted list. |
+| `fail_closed` | Event type names that must never be silently dropped. Empty by default. Same accepted set and refusal as `types`. See [Fail-closed delivery](#fail-closed-delivery). |
 | `queue_capacity` | Depth of the hand-off queue. Defaults to 4096. Zero is refused. |
 
 The file form is a line per event, the same shape a `jq` filter or a Vector source expects:
@@ -151,6 +154,24 @@ Every other way an event fails to arrive lands on the same counter, so an empty 
 
 A steady `queue_full` rate against a healthy collector usually means `types:` is too broad. `request_completed` fires once per request; `policy_denied` fires once per denial.
 
+## Fail-closed delivery
+
+Everything above this line describes the default, best-effort contract: a full queue drops the newest event and counts it, and the request that produced it keeps going. `events.fail_closed` is the one way to opt an event type out of that.
+
+```yaml
+events:
+  sink: webhook
+  url: https://siem.example.com/sbproxy
+  types:
+    - mcp_governance_decision
+  fail_closed:
+    - mcp_governance_decision
+```
+
+`mcp_governance_decision` is the only publisher wired to this today. When it is named in `fail_closed` and the record cannot be handed to the queue (`queue_full`, `worker_stopped`, or no sink is configured to deliver it at all), the MCP tool call that would have produced that record is refused with a JSON-RPC internal error rather than served with no evidence behind it. `sbproxy_mcp_evidence_fail_closed_total{tenant}` counts every refusal.
+
+A `fail_closed` entry does not have to also appear in `types`, but if it does not, nothing will ever deliver that type, so every governed call is refused. That is a valid configuration (it reads as "block MCP tool calls until the sink is fixed"), not a bug, but it is worth naming so it is not the surprise that turns up in an incident review.
+
 ## Shutdown does not flush
 
 Stated plainly so nobody assumes otherwise. On `SIGTERM` or `SIGKILL` the process exits with whatever is still queued still queued: up to `queue_capacity` events, plus the batch the worker was mid-delivery on.
@@ -168,7 +189,7 @@ Every one of these is a config that would compile, boot, serve traffic, and deli
 - A `url` that is not `http://` or `https://`.
 - `queue_capacity: 0`.
 - `types:` or `queue_capacity:` under `sink: none`.
-- An event name `types:` does not recognize. The error quotes the name and lists all eleven.
+- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all twelve.
 - Any key the block does not define, so a hopeful `retries:` or `batch_size:` fails rather than being dropped.
 
 ## Not implemented

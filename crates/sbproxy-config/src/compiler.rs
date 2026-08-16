@@ -2401,6 +2401,24 @@ fn validate_events(events: &EventsConfig) -> Result<()> {
         }
     }
 
+    // WOR-2384: `fail_closed` draws from the exact same closed set as
+    // `types`, checked the same way and refused with the same accepted
+    // list, so a typo here fails the same way a typo in `types` does
+    // rather than silently naming a type that can never be fail-closed.
+    for name in &events.fail_closed {
+        if sbproxy_observe::EventType::from_name(name).is_none() {
+            let accepted = sbproxy_observe::ALL_EVENT_TYPES
+                .iter()
+                .map(|event_type| event_type.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "events.fail_closed names `{name}`, which is not an event this proxy emits. \
+                 Accepted values: {accepted}."
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -8631,6 +8649,49 @@ origins:
                 "refusing `{absent}` must name the sinks that do exist: {message}"
             );
         }
+    }
+
+    // --- WOR-2384: `events.fail_closed` ---
+
+    #[test]
+    fn events_fail_closed_defaults_to_empty() {
+        let compiled = compile_config(&events_yaml(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson",
+        ))
+        .expect("compile");
+        let events = compiled.events.expect("events block survives compilation");
+        assert!(events.fail_closed.is_empty());
+    }
+
+    #[test]
+    fn events_fail_closed_compiles_with_a_known_type() {
+        let compiled = compile_config(&events_yaml(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  fail_closed:\n    \
+             - mcp_governance_decision",
+        ))
+        .expect("compile");
+        let events = compiled.events.expect("events block survives compilation");
+        assert_eq!(events.fail_closed, vec!["mcp_governance_decision"]);
+    }
+
+    #[test]
+    fn an_unknown_fail_closed_type_is_refused_with_the_accepted_list() {
+        // Mirrors `an_unknown_event_type_is_refused_with_the_accepted_list`:
+        // `fail_closed` draws from the exact same closed set as `types`
+        // and is refused the same way, so a typo cannot silently name a
+        // type that is never actually enforced.
+        let message = events_refusal(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  fail_closed:\n    \
+             - mcp_governance_decisionn",
+        );
+        assert!(
+            message.contains("mcp_governance_decisionn"),
+            "the refusal quotes the offending name: {message}"
+        );
+        assert!(
+            message.contains("mcp_governance_decision") && message.contains("policy_denied"),
+            "and lists what is accepted: {message}"
+        );
     }
 
     #[test]

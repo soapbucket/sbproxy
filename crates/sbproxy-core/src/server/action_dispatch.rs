@@ -3963,17 +3963,46 @@ pub(super) async fn handle_mcp_action(
                                     mcp.tool_cost(&name),
                                 );
 
+                                // WOR-2384: the raw (unredacted) reason a
+                                // governance gate refused this call, if
+                                // any. Distinct from a plain upstream
+                                // `tool_error`: these are the proxy's own
+                                // decisions to withhold output, which is
+                                // what the evidence event's
+                                // `sbproxy.decision.verdict`/`error.type`
+                                // describe. Computed before either flag
+                                // is consumed below.
+                                let governance_denial_reason = if modern_output_invalid {
+                                    Some(
+                                        "upstream tool result does not conform to the advertised output schema"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    quarantine_deny
+                                        .as_ref()
+                                        .map(|reason_code| format!("tool output quarantined ({reason_code})"))
+                                };
+
                                 // WOR-1644: attribute the call into the
                                 // usage plane. Metrics always fire;
                                 // cost and the usage-sink row appear
                                 // when a price map resolves the tool.
-                                emit_mcp_tool_attribution(
+                                // WOR-2384: also emits the
+                                // `mcp_governance_decision` evidence
+                                // record and reports whether a
+                                // fail-closed delivery failure must
+                                // refuse this call.
+                                let evidence_refused = emit_mcp_tool_attribution(
                                     ctx,
                                     mcp,
                                     &name,
                                     federated.as_ref().map(|t| t.server_name.as_str()),
                                     &outcome,
                                     call_started.elapsed(),
+                                    mcp_session_id.as_deref(),
+                                    is_modern,
+                                    mcp_audit_capture.as_ref(),
+                                    governance_denial_reason.as_deref(),
                                 );
 
                                 // WOR-508: bridge the prompt-linked audit
@@ -3983,7 +4012,27 @@ pub(super) async fn handle_mcp_action(
                                     emit_mcp_prompt_audit(ctx, &name, cap, &outcome);
                                 }
 
-                                if modern_output_invalid {
+                                if evidence_refused {
+                                    // WOR-2384: `events.fail_closed` names
+                                    // `mcp_governance_decision` and the
+                                    // evidence record could not be queued.
+                                    // The tool call may already have run
+                                    // (or already failed) upstream, but the
+                                    // gateway will not hand back a result it
+                                    // cannot also evidence, so this
+                                    // overrides every other outcome below,
+                                    // including a clean allow.
+                                    // `sbproxy_mcp_evidence_fail_closed_total{tenant}`
+                                    // was already ticked inside
+                                    // `emit_mcp_tool_attribution`, at the
+                                    // point the delivery failure was
+                                    // actually observed.
+                                    JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        INTERNAL_ERROR,
+                                        "mcp governance evidence could not be recorded; refusing per events.fail_closed (evidence_unavailable)",
+                                    )
+                                } else if modern_output_invalid {
                                     JsonRpcResponse::error(
                                         request.id.clone(),
                                         INTERNAL_ERROR,
@@ -4538,6 +4587,12 @@ fn record_mcp_tool_decision(
     );
 }
 
+/// Returns `true` when the caller must refuse the tool call outright
+/// because `events.fail_closed` names `mcp_governance_decision` and the
+/// evidence record for this call could not be queued (WOR-2384). `false`
+/// covers every other case, including the default where the type is not
+/// fail-closed configured at all.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct, independently-sourced field of the emitted evidence record
 fn emit_mcp_tool_attribution(
     ctx: &RequestContext,
     mcp: &sbproxy_modules::action::McpAction,
@@ -4545,7 +4600,11 @@ fn emit_mcp_tool_attribution(
     server: Option<&str>,
     outcome: &anyhow::Result<serde_json::Value>,
     duration: std::time::Duration,
-) {
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
+    mcp_audit_capture: Option<&McpAuditCapture>,
+    governance_denial_reason: Option<&str>,
+) -> bool {
     let (result_label, is_error): (&'static str, bool) = match outcome {
         Ok(value) => {
             let app_error = value
@@ -4579,6 +4638,22 @@ fn emit_mcp_tool_attribution(
         sbproxy_observe::metrics::record_mcp_tool_cost(tool_name, server, cost_usd);
     }
 
+    // WOR-2384: a second, independent publication from this same funnel.
+    // `record_mcp_tool_decision` above feeds the decision-audit bus
+    // (OCSF, gated on `observability.log.decision_audit` scopes); this
+    // feeds `events:` (semconv-shaped, gated on `events.types`), because
+    // an operator who wired a SIEM webhook through `events:` should not
+    // also have to turn on the decision-audit feed to get MCP coverage.
+    let evidence_refused = emit_mcp_governance_evidence(
+        ctx,
+        tool_name,
+        server,
+        mcp_session_id,
+        is_modern,
+        mcp_audit_capture,
+        governance_denial_reason,
+    );
+
     // WOR-2169: record the call for the durable billing queue, which is
     // written at the end of the request. A tool call is a billable unit in
     // its own right, so it is recorded here whether or not a usage sink is
@@ -4594,7 +4669,7 @@ fn emit_mcp_tool_attribution(
 
     // Usage-sink row: only build it when a sink is listening.
     if mcp.usage_sinks.is_empty() {
-        return;
+        return evidence_refused;
     }
     let event = sbproxy_ai::usage_sink::LlmUsageEvent {
         // `mcp` provider + the owning server as the "model" so a tool
@@ -4648,6 +4723,189 @@ fn emit_mcp_tool_attribution(
     for sink in &mcp.usage_sinks {
         sink.record(&event);
     }
+    evidence_refused
+}
+
+/// WOR-2384: whether `events.fail_closed` names `event_type` in the
+/// config pinned to this request's own pipeline generation.
+///
+/// Read straight off `ctx.pipeline.config.events` rather than a
+/// process-global, so a reload that changes the fail-closed set cannot
+/// change the rule applied to a request that is already in flight, and
+/// so a unit test can exercise the decision against a bare
+/// [`sbproxy_config::types::EventsConfig`] without needing a
+/// [`RequestContext`] at all.
+fn mcp_governance_fail_closed(
+    events: Option<&sbproxy_config::types::EventsConfig>,
+    event_type: sbproxy_observe::events::EventType,
+) -> bool {
+    events.is_some_and(|events| {
+        events
+            .fail_closed
+            .iter()
+            .any(|name| name.as_str() == event_type.as_str())
+    })
+}
+
+/// WOR-2384: emit the `mcp_governance_decision` [`sbproxy_observe::events::EventType`]
+/// for one dispatched MCP tool call, and report whether the caller must
+/// refuse the call because delivery was fail-closed configured and
+/// failed.
+///
+/// Runs from [`emit_mcp_tool_attribution`], the single funnel every MCP
+/// tool dispatch already passes through for [`record_mcp_tool_decision`].
+#[allow(clippy::too_many_arguments)] // one call site; mirrors emit_mcp_tool_attribution's own field-per-argument shape
+fn emit_mcp_governance_evidence(
+    ctx: &RequestContext,
+    tool_name: &str,
+    server: &str,
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
+    mcp_audit_capture: Option<&McpAuditCapture>,
+    governance_denial_reason: Option<&str>,
+) -> bool {
+    use sbproxy_observe::events::{EventType, ProxyEvent};
+
+    let event_type = EventType::McpGovernance;
+    let fail_closed = mcp_governance_fail_closed(ctx.pipeline.config.events.as_ref(), event_type);
+
+    let protocol_version = if is_modern {
+        sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION
+    } else {
+        sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION
+    };
+    // Reuses the exact salted digest `mcp_audit` already computed for
+    // this same call (see `sha256_hex_prefix`'s doc comment) rather than
+    // hashing the arguments a second time under a different salt: the
+    // two events describe the same call, and an analyst correlating
+    // them needs one digest, not two disagreeing ones. Present only
+    // when `mcp_audit_capture` ran, which is the default under stock
+    // config (WOR-2473) and absent only when an operator has suppressed
+    // the `mcp_audit` tracing target below `info`.
+    let arguments_hash =
+        mcp_audit_capture.map(|cap| sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json)));
+    let seq = sbproxy_observe::evidence_seq::next_seq(&ctx.tenant_id);
+
+    let data = mcp_governance_event_data(
+        tool_name,
+        server,
+        ctx.request_id.as_str(),
+        mcp_session_id,
+        protocol_version,
+        ctx.tenant_id.as_str(),
+        ctx.hostname.as_str(),
+        governance_denial_reason,
+        Some(sbproxy_observe::logging::operator_redact_state().as_ref()),
+        arguments_hash.as_deref(),
+        seq,
+    );
+    let event = ProxyEvent::new(
+        event_type,
+        ctx.hostname.to_string(),
+        ctx.tenant_id.to_string(),
+        data,
+    );
+
+    if fail_closed {
+        match sbproxy_observe::event_sink::publish_proxy_event_checked(event_type, || event) {
+            Ok(()) => false,
+            Err(_) => {
+                sbproxy_observe::metrics::record_mcp_evidence_fail_closed(&ctx.tenant_id);
+                true
+            }
+        }
+    } else {
+        sbproxy_observe::event_sink::publish_proxy_event(event_type, || event);
+        false
+    }
+}
+
+/// Build the `mcp_governance_decision` event payload (WOR-2384).
+///
+/// Field provenance:
+/// - `gen_ai.*` and `mcp.*` names come from the OTel GenAI MCP semantic
+///   conventions, schema `gen-ai-dev/1.42.0-dev`, all Development
+///   stability. `gen_ai.tool.call.arguments` is deliberately absent:
+///   the spec marks it opt-in, and shipping raw tool arguments to every
+///   configured `events:` sink by default would make a webhook target a
+///   second place a credential pasted into a tool call could leak from.
+///   That capability is a future explicit opt-in, not something this
+///   record ships.
+/// - `sbproxy.*` names are this crate's own, namespaced so they can
+///   never collide with a semconv key the same schema adds later.
+///   `sbproxy.decision.rule_id` is part of that namespace but is not
+///   populated by any call site yet: nothing upstream of this funnel
+///   currently names a rule id for an MCP governance decision. It is
+///   reserved rather than invented here.
+/// - `raw_denial_reason` is redacted through
+///   [`sbproxy_observe::decision::RedactedReason`], the same scrub the
+///   decision-audit bus applies to every OCSF `reason` field, before it
+///   ever reaches `sbproxy.decision.reason`. Every caller of this
+///   function today passes a fixed, argument-free string (a quarantine
+///   reason code, or the schema-validation failure message), so nothing
+///   live currently depends on the scrub; it runs anyway so a future
+///   caller cannot turn this event into a leak channel just by handing
+///   it richer text.
+#[allow(clippy::too_many_arguments)] // pure builder; kept free of RequestContext so the semconv shape is unit-testable on its own
+fn mcp_governance_event_data(
+    tool_name: &str,
+    server: &str,
+    request_id: &str,
+    mcp_session_id: Option<&str>,
+    protocol_version: &str,
+    tenant_id: &str,
+    route: &str,
+    raw_denial_reason: Option<&str>,
+    redact_state: Option<&sbproxy_observe::logging::OpRedactState>,
+    arguments_hash: Option<&str>,
+    seq: u64,
+) -> serde_json::Value {
+    let verdict = if raw_denial_reason.is_some() {
+        "deny"
+    } else {
+        "allow"
+    };
+    let redacted_reason = raw_denial_reason.map(|raw| {
+        sbproxy_observe::decision::RedactedReason::redact(
+            raw,
+            redact_state,
+            Some(tenant_id),
+            Some(route),
+        )
+    });
+
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "gen_ai.operation.name".to_string(),
+        "execute_tool".into(),
+    );
+    fields.insert("gen_ai.tool.name".to_string(), tool_name.into());
+    fields.insert("gen_ai.tool.call.id".to_string(), request_id.into());
+    fields.insert("mcp.method.name".to_string(), "tools/call".into());
+    if let Some(session_id) = mcp_session_id {
+        fields.insert("mcp.session.id".to_string(), session_id.into());
+    }
+    fields.insert(
+        "mcp.protocol.version".to_string(),
+        protocol_version.into(),
+    );
+    if verdict == "deny" {
+        fields.insert("error.type".to_string(), "policy_denied".into());
+    }
+    fields.insert("sbproxy.decision.verdict".to_string(), verdict.into());
+    if let Some(reason) = &redacted_reason {
+        fields.insert(
+            "sbproxy.decision.reason".to_string(),
+            reason.as_str().into(),
+        );
+    }
+    if let Some(hash) = arguments_hash {
+        fields.insert("sbproxy.tool.arguments_hash".to_string(), hash.into());
+    }
+    fields.insert("sbproxy.tool.server".to_string(), server.into());
+    fields.insert("sbproxy.tenant.id".to_string(), tenant_id.into());
+    fields.insert("sbproxy.evidence.seq".to_string(), seq.into());
+    serde_json::Value::Object(fields)
 }
 
 /// The two meta-tool definitions advertised by `tools/list` when
@@ -5541,6 +5799,161 @@ mod mcp_audit_redaction_tests {
         assert!(
             line.contains(&format!("tool_arguments_len={}", tool_arguments.len())),
             "mcp_audit must carry the tool_arguments length: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mcp_governance_evidence_tests {
+    use super::{mcp_governance_event_data, mcp_governance_fail_closed};
+    use sbproxy_config::types::EventsConfig;
+    use sbproxy_observe::events::EventType;
+
+    /// WOR-2384: the config-reading half of the fail-closed decision is
+    /// a pure function of an [`EventsConfig`], so it is testable without
+    /// a [`crate::context::RequestContext`] or a compiled pipeline.
+    #[test]
+    fn fail_closed_reads_the_configured_type_list() {
+        assert!(
+            !mcp_governance_fail_closed(None, EventType::McpGovernance),
+            "no events: block at all must not fail-closed"
+        );
+
+        let empty = EventsConfig::default();
+        assert!(!mcp_governance_fail_closed(
+            Some(&empty),
+            EventType::McpGovernance
+        ));
+
+        let unrelated = EventsConfig {
+            fail_closed: vec!["policy_denied".to_string()],
+            ..Default::default()
+        };
+        assert!(!mcp_governance_fail_closed(
+            Some(&unrelated),
+            EventType::McpGovernance
+        ));
+
+        let configured = EventsConfig {
+            fail_closed: vec!["mcp_governance_decision".to_string()],
+            ..Default::default()
+        };
+        assert!(mcp_governance_fail_closed(
+            Some(&configured),
+            EventType::McpGovernance
+        ));
+    }
+
+    /// WOR-2384 test (d): a snapshot of the emitted field names. OTel
+    /// GenAI/MCP semantic-convention names plus the `sbproxy.*`
+    /// namespace, pinned so a rename here is caught rather than shipped
+    /// as a silent breaking change to every SIEM rule built against the
+    /// old key.
+    #[test]
+    fn field_names_are_pinned_to_the_semconv_and_sbproxy_schema() {
+        let data = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            Some("sess-1"),
+            "2026-07-28",
+            "acme",
+            "api.example.com",
+            None,
+            None,
+            Some("deadbeefcafef00d"),
+            7,
+        );
+        let obj = data.as_object().expect("object payload");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "gen_ai.operation.name",
+                "gen_ai.tool.call.id",
+                "gen_ai.tool.name",
+                "mcp.method.name",
+                "mcp.protocol.version",
+                "mcp.session.id",
+                "sbproxy.decision.verdict",
+                "sbproxy.evidence.seq",
+                "sbproxy.tenant.id",
+                "sbproxy.tool.arguments_hash",
+                "sbproxy.tool.server",
+            ],
+            "field set drifted from the pinned semconv + sbproxy schema: {obj:?}"
+        );
+        assert_eq!(data["gen_ai.operation.name"], "execute_tool");
+        assert_eq!(data["mcp.method.name"], "tools/call");
+        assert_eq!(data["sbproxy.decision.verdict"], "allow");
+        assert_eq!(data["sbproxy.evidence.seq"], 7);
+        assert!(
+            data.get("error.type").is_none(),
+            "an allow must not carry error.type: {data:?}"
+        );
+        assert!(
+            data.get("sbproxy.decision.reason").is_none(),
+            "an allow must not carry a reason: {data:?}"
+        );
+    }
+
+    /// The deny shape: `error.type`, `sbproxy.decision.reason`, and no
+    /// `mcp.session.id` when the call carried none.
+    #[test]
+    fn deny_carries_error_type_and_reason_and_omits_absent_optionals() {
+        let data = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            Some("tool output quarantined (dual_llm)"),
+            None,
+            None,
+            1,
+        );
+        assert_eq!(data["sbproxy.decision.verdict"], "deny");
+        assert_eq!(data["error.type"], "policy_denied");
+        assert_eq!(data["sbproxy.decision.reason"], "tool output quarantined (dual_llm)");
+        assert!(data.get("mcp.session.id").is_none());
+        assert!(data.get("sbproxy.tool.arguments_hash").is_none());
+    }
+
+    /// WOR-2384 test (e): mirrors mcp_audit's planted-secret discipline.
+    /// Every caller today passes a fixed, argument-free reason string,
+    /// so nothing live depends on this, but the redaction wiring is
+    /// proven directly rather than trusted: a reason string carrying a
+    /// credential shape must not survive into the emitted payload.
+    #[test]
+    fn a_planted_secret_in_the_denial_reason_never_survives_into_the_event() {
+        let planted =
+            "tool output quarantined (dual_llm) near Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc";
+        let data = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            Some(planted),
+            None,
+            None,
+            1,
+        );
+        let reason = data["sbproxy.decision.reason"]
+            .as_str()
+            .expect("reason present on a deny");
+        assert!(
+            !reason.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc"),
+            "a bearer-token-shaped fragment leaked into the evidence reason: {reason}"
+        );
+        assert!(
+            !data.to_string().contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc"),
+            "the raw secret leaked into the event payload somewhere: {data:?}"
         );
     }
 }

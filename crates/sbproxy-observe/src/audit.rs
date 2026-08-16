@@ -418,7 +418,7 @@ impl SecurityAuditEntry {
     /// `events:` egress.
     ///
     /// `event_type` here is an open string; the egress filter is a closed
-    /// enum of eleven. The split follows what a SIEM rule would route on:
+    /// enum of twelve. The split follows what a SIEM rule would route on:
     /// the four values [`Self::auth_failure`] documents are the
     /// credential ones, and everything else that reaches this channel
     /// (framing violations plus every policy label

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Egress for the eleven [`crate::events::EventType`] variants: the
+//! Egress for the twelve [`crate::events::EventType`] variants: the
 //! `events:` block's file and webhook sinks.
 //!
 //! # The defect this closes
@@ -104,9 +104,9 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// request path, once per candidate event, before anything is allocated:
 /// it has to be cheaper than the event it is deciding not to build.
 ///
-/// `u16` holds the eleven bits [`ALL_EVENT_TYPES`] declares with room to
-/// spare. A twelfth variant is caught by that array's fixed length long
-/// before it reaches the width of this word.
+/// `u16` holds the twelve bits [`ALL_EVENT_TYPES`] declares with room to
+/// spare. A thirteenth variant is caught by that array's fixed length
+/// long before it reaches the width of this word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventTypeMask(u16);
 
@@ -196,6 +196,50 @@ impl EventSinkTarget {
     }
 }
 
+/// Why [`EventEgress::publish_checked`] or [`publish_proxy_event_checked`]
+/// could not hand an event to the worker (WOR-2384).
+///
+/// [`EventEgress::publish`] and [`publish_proxy_event`] never report
+/// this: their whole contract is that a caller on the request path
+/// cannot be made to care. `events.fail_closed` exists for the callers
+/// that must care, naming event types for which a silent drop is worse
+/// than refusing the request that would have produced one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPublishError {
+    /// The hand-off queue was at `events.queue_capacity`; the event was
+    /// discarded rather than blocking the caller.
+    QueueFull,
+    /// The worker thread is gone, or the egress is mid-[`Drop`]. Nothing
+    /// will ever drain this queue again.
+    WorkerStopped,
+    /// No egress is installed, or the installed egress's `types:` filter
+    /// does not select this event type. Either way nothing was ever
+    /// going to deliver it, which [`publish_proxy_event_checked`] treats
+    /// as the same fact [`EventEgress::publish_checked`] cannot see on
+    /// its own: there was no egress instance to ask.
+    NoSinkConfigured,
+}
+
+impl EventPublishError {
+    /// Stable label, matching the `reason` this same failure is counted
+    /// under on `sbproxy_events_dropped_total` where one applies.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::WorkerStopped => "worker_stopped",
+            Self::NoSinkConfigured => "no_sink_configured",
+        }
+    }
+}
+
+impl std::fmt::Display for EventPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for EventPublishError {}
+
 /// A running event egress: a bounded queue, a worker thread draining it,
 /// and the type filter the producer side tests against.
 pub struct EventEgress {
@@ -275,6 +319,39 @@ impl EventEgress {
             }
             Err(TrySendError::Disconnected(_)) => {
                 crate::metrics::record_events_dropped(self.sink_label, "worker_stopped");
+            }
+        }
+    }
+
+    /// Hand one event to the worker, reporting a delivery failure back
+    /// to the caller instead of only counting it (WOR-2384).
+    ///
+    /// Same non-blocking `try_send` as [`Self::publish`], and the same
+    /// drop-reason metric increments on every failing path, so a sink
+    /// mixing fail-closed and best-effort event types still gets one
+    /// consistent `sbproxy_events_dropped_total` count. The only
+    /// difference is the return value: [`Self::publish`]'s whole
+    /// contract is that a request-path caller cannot be made to care
+    /// whether delivery worked, and this is for the caller that must.
+    ///
+    /// Cannot itself return [`EventPublishError::NoSinkConfigured`]: an
+    /// `EventEgress` that exists is, by definition, configured for
+    /// something. That case belongs to [`publish_proxy_event_checked`],
+    /// which is the one that knows whether an egress exists at all.
+    pub fn publish_checked(&self, event: ProxyEvent) -> Result<(), EventPublishError> {
+        let Some(tx) = self.tx.as_ref() else {
+            crate::metrics::record_events_dropped(self.sink_label, "worker_stopped");
+            return Err(EventPublishError::WorkerStopped);
+        };
+        match tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                crate::metrics::record_events_dropped(self.sink_label, "queue_full");
+                Err(EventPublishError::QueueFull)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                crate::metrics::record_events_dropped(self.sink_label, "worker_stopped");
+                Err(EventPublishError::WorkerStopped)
             }
         }
     }
@@ -597,6 +674,30 @@ pub fn publish_proxy_event(event_type: EventType, build: impl FnOnce() -> ProxyE
         return;
     }
     egress.publish(build());
+}
+
+/// [`publish_proxy_event`]'s fail-closed sibling (WOR-2384): `build`
+/// still runs only when an egress is installed and selects
+/// `event_type`, but a caller that must know whether delivery worked
+/// gets `Err` back instead of a fire-and-forget guarantee it cannot
+/// verify.
+///
+/// `Err(`[`EventPublishError::NoSinkConfigured`]`)` covers both "no
+/// egress is installed" and "an egress is installed but its `types:`
+/// filter does not select `event_type`". A caller deciding whether to
+/// refuse a request cannot act on the difference between those two: in
+/// both, nothing was ever going to deliver this event.
+pub fn publish_proxy_event_checked(
+    event_type: EventType,
+    build: impl FnOnce() -> ProxyEvent,
+) -> Result<(), EventPublishError> {
+    let Some(egress) = EGRESS.get() else {
+        return Err(EventPublishError::NoSinkConfigured);
+    };
+    if !egress.wants(event_type) {
+        return Err(EventPublishError::NoSinkConfigured);
+    }
+    egress.publish_checked(build())
 }
 
 #[cfg(test)]
@@ -980,5 +1081,90 @@ mod tests {
                 "the payload build did not follow the type filter"
             ),
         }
+    }
+
+    // --- WOR-2384: publish_checked / publish_proxy_event_checked ---
+
+    #[test]
+    fn publish_checked_succeeds_when_the_queue_has_room() {
+        let (tx, rx) = sync_channel::<ProxyEvent>(4);
+        let egress = EventEgress::over_channel(tx, EventTypeMask::all(), "file");
+
+        assert!(egress
+            .publish_checked(event(EventType::McpGovernance))
+            .is_ok());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn publish_checked_reports_queue_full_rather_than_dropping_silently() {
+        // Same capacity-1, never-drained setup as
+        // `a_full_queue_drops_the_newest_event_and_counts_it`, but this
+        // is the call a fail-closed caller actually makes: it needs the
+        // `Err` back, not just the counter tick, so it can refuse the
+        // request that would otherwise serve un-evidenced.
+        let (tx, _rx) = sync_channel::<ProxyEvent>(1);
+        let egress = EventEgress::over_channel(tx, EventTypeMask::all(), "file");
+
+        let before = dropped("file", "queue_full");
+        assert!(egress
+            .publish_checked(event(EventType::McpGovernance))
+            .is_ok());
+        let second = egress.publish_checked(event(EventType::McpGovernance));
+        let after = dropped("file", "queue_full");
+
+        assert_eq!(second, Err(EventPublishError::QueueFull));
+        assert_eq!(after - before, 1, "the overrun attempt must still be counted");
+    }
+
+    #[test]
+    fn publish_checked_reports_worker_stopped_rather_than_dropping_silently() {
+        let (tx, rx) = sync_channel::<ProxyEvent>(4);
+        drop(rx);
+        let egress = EventEgress::over_channel(tx, EventTypeMask::all(), "webhook");
+
+        let before = dropped("webhook", "worker_stopped");
+        let result = egress.publish_checked(event(EventType::McpGovernance));
+        let after = dropped("webhook", "worker_stopped");
+
+        assert_eq!(result, Err(EventPublishError::WorkerStopped));
+        assert_eq!(after - before, 1);
+    }
+
+    #[test]
+    fn publish_proxy_event_checked_reports_no_sink_configured_when_nothing_wants_it() {
+        // Same defensive shape as
+        // `publish_proxy_event_does_not_build_when_nothing_is_installed`:
+        // other tests in this binary may already have set the
+        // process-global egress, so this asserts the property that
+        // holds either way rather than assuming a fresh process.
+        let result = publish_proxy_event_checked(EventType::McpGovernance, || {
+            event(EventType::McpGovernance)
+        });
+        match EGRESS.get() {
+            None => assert_eq!(result, Err(EventPublishError::NoSinkConfigured)),
+            Some(egress) if !egress.wants(EventType::McpGovernance) => {
+                assert_eq!(result, Err(EventPublishError::NoSinkConfigured))
+            }
+            Some(_) => {
+                // Some earlier test in this binary installed an egress
+                // that wants this type; either outcome is then a real
+                // attempt at that egress's actual queue, not a
+                // configuration gap this test is checking for.
+            }
+        }
+    }
+
+    #[test]
+    fn event_publish_error_as_str_matches_the_drop_reason_labels() {
+        // These are the same strings `record_events_dropped` counts
+        // failures under, so a caller formatting one into a log line or
+        // an error message stays consistent with the metric.
+        assert_eq!(EventPublishError::QueueFull.as_str(), "queue_full");
+        assert_eq!(EventPublishError::WorkerStopped.as_str(), "worker_stopped");
+        assert_eq!(
+            EventPublishError::NoSinkConfigured.as_str(),
+            "no_sink_configured"
+        );
     }
 }

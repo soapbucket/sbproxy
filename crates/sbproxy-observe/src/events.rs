@@ -213,6 +213,10 @@ pub enum EventType {
     GuardrailTriggered,
     /// Event name `config_reloaded`. The proxy configuration was reloaded.
     ConfigReloaded,
+    /// Event name `mcp_governance_decision`. An MCP `tools/call` dispatch
+    /// was decided (allowed or refused), emitted from the same funnel
+    /// every MCP tool dispatch already passes through (WOR-2384).
+    McpGovernance,
 }
 
 impl ProxyEvent {
@@ -252,10 +256,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a twelfth event type that no `events:` sink can
-/// ever be told to deliver, which looks exactly like a working sink to
-/// everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 11] = [
+/// mode this prevents is a thirteenth event type that no `events:` sink
+/// can ever be told to deliver, which looks exactly like a working sink
+/// to everyone except the operator waiting for the event.
+pub const ALL_EVENT_TYPES: [EventType; 12] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -267,6 +271,7 @@ pub const ALL_EVENT_TYPES: [EventType; 11] = [
     EventType::BudgetExceeded,
     EventType::GuardrailTriggered,
     EventType::ConfigReloaded,
+    EventType::McpGovernance,
 ];
 
 impl EventType {
@@ -290,6 +295,7 @@ impl EventType {
             Self::BudgetExceeded => "budget_exceeded",
             Self::GuardrailTriggered => "guardrail_triggered",
             Self::ConfigReloaded => "config_reloaded",
+            Self::McpGovernance => "mcp_governance_decision",
         }
     }
 
@@ -317,6 +323,7 @@ impl EventType {
             Self::BudgetExceeded => 8,
             Self::GuardrailTriggered => 9,
             Self::ConfigReloaded => 10,
+            Self::McpGovernance => 11,
         }
     }
 }
@@ -469,6 +476,7 @@ mod tests {
             (EventType::BudgetExceeded, "\"budget_exceeded\""),
             (EventType::GuardrailTriggered, "\"guardrail_triggered\""),
             (EventType::ConfigReloaded, "\"config_reloaded\""),
+            (EventType::McpGovernance, "\"mcp_governance_decision\""),
         ];
 
         for (variant, expected) in variants {

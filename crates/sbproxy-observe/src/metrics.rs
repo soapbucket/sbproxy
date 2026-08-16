@@ -4282,6 +4282,51 @@ pub fn record_mcp_tool_cost(tool: &str, server: &str, cost_usd: f64) {
         .inc_by(cost_usd);
 }
 
+/// Record one MCP tool call refused because `events.fail_closed` names
+/// `mcp_governance_decision` and the evidence record could not be
+/// queued (`sbproxy_mcp_evidence_fail_closed_total{tenant}`, WOR-2384).
+///
+/// A tick here means the caller received a JSON-RPC internal error
+/// naming `evidence_unavailable` rather than the tool's actual result,
+/// even when the tool call itself succeeded: the gateway refused to
+/// serve a response it could not also evidence.
+pub fn record_mcp_evidence_fail_closed(tenant: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_evidence_fail_closed_total",
+            "MCP tool calls refused because fail-closed evidence delivery failed, by tenant",
+            &["tenant"],
+        )
+        .expect("mcp evidence fail-closed counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    counter.with_label_values(&[tenant.as_str()]).inc();
+}
+
+/// Record one tenant that overflowed the evidence-sequence registry's
+/// [`crate::evidence_seq`] cap and fell back to the shared overflow
+/// counter (`sbproxy_evidence_seq_tenant_cap_total`, WOR-2384). No
+/// labels: the cap is process-wide, and the tenant that caused it is
+/// exactly the caller-controlled string the cap exists to bound, so it
+/// cannot appear as a label value without recreating the unbounded
+/// cardinality the cap is closing off.
+pub fn record_evidence_seq_tenant_cap() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_evidence_seq_tenant_cap_total",
+            "Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter",
+        )
+        .expect("evidence seq tenant cap counter registers")
+    });
+    counter.inc();
+}
+
 /// Record a static tool-poisoning indicator found in advertised tool text on
 /// `sbproxy_mcp_poison_indicators_total{field, indicator, kind}`.
 ///
