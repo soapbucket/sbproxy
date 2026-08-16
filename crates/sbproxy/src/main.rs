@@ -6406,8 +6406,11 @@ fn run_one_fixture(
     fixture_path: &std::path::Path,
     fixture_label: &str,
 ) -> anyhow::Result<RegoTestFixtureRun> {
-    let bytes =
-        read_bounded_cli_file(fixture_path, MAX_REGO_TEST_FIXTURE_BYTES, "rego test fixture")?;
+    let bytes = read_bounded_cli_file(
+        fixture_path,
+        MAX_REGO_TEST_FIXTURE_BYTES,
+        "rego test fixture",
+    )?;
     let text =
         std::str::from_utf8(&bytes).map_err(|error| anyhow::anyhow!("not UTF-8: {error}"))?;
     let fixture: RegoTestFixture =
@@ -14209,8 +14212,7 @@ cases:
         // whole batch.
         let dir = rego_test_scratch_dir("mixed-batch");
         std::fs::write(dir.join("good_test.yaml"), PASSING_FIXTURE).expect("write good fixture");
-        std::fs::write(dir.join("broken_test.yaml"), BROKEN_FIXTURE)
-            .expect("write broken fixture");
+        std::fs::write(dir.join("broken_test.yaml"), BROKEN_FIXTURE).expect("write broken fixture");
 
         let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
         assert_eq!(found.len(), 2, "{found:?}");
@@ -14336,10 +14338,7 @@ cases:
         let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
             .expect("the sweep itself does not fail");
         assert_eq!(output.errors.len(), 1, "{output:?}");
-        assert!(
-            output.errors[0].error.contains("module_path"),
-            "{output:?}"
-        );
+        assert!(output.errors[0].error.contains("module_path"), "{output:?}");
         assert_eq!(output.exit_code(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -14363,10 +14362,7 @@ cases: []
         let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
             .expect("the sweep itself does not fail");
         assert_eq!(output.errors.len(), 1, "{output:?}");
-        assert!(
-            output.errors[0].error.contains("no `cases`"),
-            "{output:?}"
-        );
+        assert!(output.errors[0].error.contains("no `cases`"), "{output:?}");
         assert_eq!(output.exit_code(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
