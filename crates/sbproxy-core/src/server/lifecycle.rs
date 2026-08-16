@@ -4028,19 +4028,19 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
     use sbproxy_observe::decision::EventCoverage;
 
     let enabled_unwired = unwired_decision_audit_events(compiled);
-    let superseded: Vec<&str> = enabled_unwired
-        .iter()
-        .copied()
-        .filter(|label| {
-            sbproxy_observe::decision::DecisionEvent::from_label(label)
-                .is_some_and(|event| event.coverage() == EventCoverage::SupersededByPolicy)
-        })
-        .collect();
-    let unwired: Vec<&str> = enabled_unwired
-        .iter()
-        .copied()
-        .filter(|label| !superseded.contains(label))
-        .collect();
+    let with_coverage = |want: EventCoverage| -> Vec<&str> {
+        enabled_unwired
+            .iter()
+            .copied()
+            .filter(|label| {
+                sbproxy_observe::decision::DecisionEvent::from_label(label)
+                    .is_some_and(|event| event.coverage() == want)
+            })
+            .collect()
+    };
+    let superseded = with_coverage(EventCoverage::SupersededByPolicy);
+    let durable_elsewhere = with_coverage(EventCoverage::DurableElsewhere);
+    let unwired = with_coverage(EventCoverage::Unwired);
 
     // Two messages, because they are two different problems and one
     // wording cannot be true of both. An unwired event publishes
@@ -4055,6 +4055,15 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
             "decision_audit enables events whose decisions already publish as `policy` records: \
              these run in the policy chain, so enable `policy` and select on the `policy_id` \
              field instead. They will never emit under their own label"
+        );
+    }
+    if !durable_elsewhere.is_empty() {
+        tracing::warn!(
+            events = %durable_elsewhere.join(", "),
+            "decision_audit enables events that are recorded on a durable store instead of this \
+             feed, and will never publish here: this queue drops records under load, which is a \
+             sound trade for a security decision and the wrong one for money. Read the \
+             settlement store and the billing usage sinks for payment history"
         );
     }
     if !unwired.is_empty() {

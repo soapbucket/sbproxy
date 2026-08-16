@@ -143,6 +143,23 @@ pub enum EventCoverage {
     /// Selecting on that field is the supported query; a separate
     /// emitter would double-record.
     SupersededByPolicy,
+    /// The decision is recorded, on a durable store rather than this
+    /// bus, and deliberately not published here.
+    ///
+    /// This feed is lossy by contract: the queue holds 10 000 records,
+    /// overflow drops and counts, and the request continues. That is the
+    /// right trade for a security decision, where the drop counter is a
+    /// paging signal and a missed record is recoverable context.
+    ///
+    /// It is the wrong trade for money. A payment record that can be
+    /// dropped under load is not an audit trail, and the settlement
+    /// store already exists so that no fund movement is ever forgotten:
+    /// an attempt that may have dispatched can only move to
+    /// `NeedsReconciliation`, never silently to a terminal state.
+    /// Publishing the same event onto a lossy queue beside it would
+    /// offer a second, weaker answer to a question that already has an
+    /// authoritative one.
+    DurableElsewhere,
     /// No emitter yet. Enabling it publishes nothing.
     Unwired,
 }
@@ -276,6 +293,9 @@ impl DecisionEvent {
             | Self::McpTool => EventCoverage::Emitted,
             // Published as `policy` records already; see the doc above.
             Self::Waf | Self::RateLimit => EventCoverage::SupersededByPolicy,
+            // Money is recorded by the durable settlement store, not
+            // here. See `EventCoverage::DurableElsewhere`.
+            Self::PaymentLifecycle => EventCoverage::DurableElsewhere,
             Self::AiToolCall => EventCoverage::Emitted,
             Self::Policy
             | Self::AiStreamEvent
@@ -283,8 +303,7 @@ impl DecisionEvent {
             | Self::AiFailure
             | Self::Transform
             | Self::Action
-            | Self::LogCustomField
-            | Self::PaymentLifecycle => EventCoverage::Unwired,
+            | Self::LogCustomField => EventCoverage::Unwired,
         }
     }
 
@@ -1431,6 +1450,29 @@ mod tests {
                 "{event} must not report an emitter of its own: it publishes under `policy`"
             );
         }
+    }
+
+    #[test]
+    fn money_is_not_routed_onto_a_lossy_feed() {
+        // `payment.lifecycle` is not an unwired event waiting for an
+        // emitter. This queue drops records under load by design, which
+        // is a sound trade for a security decision and the wrong one for
+        // a financial record. The settlement store already answers this
+        // authoritatively, so a second lossy copy would be a weaker
+        // answer to a question that already has one.
+        assert_eq!(
+            DecisionEvent::PaymentLifecycle.coverage(),
+            EventCoverage::DurableElsewhere,
+            "a payment record that can be dropped under load is not an audit trail"
+        );
+        assert!(
+            !DecisionEvent::PaymentLifecycle.has_emitter(),
+            "it must not claim an emitter on this feed"
+        );
+        // Still parses, so an operator who configured it does not fail
+        // their load on upgrade; the boot warning tells them where the
+        // records actually are.
+        assert!(DecisionEvent::from_label("payment.lifecycle").is_some());
     }
 
     #[test]
