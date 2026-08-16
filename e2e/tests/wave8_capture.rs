@@ -113,7 +113,7 @@ fn an_invalid_session_id_is_dropped_rather_than_replaced() {
     );
 
     assert!(
-        resp.headers.get("x-sb-session-id").is_none(),
+        !resp.headers.contains_key("x-sb-session-id"),
         "a dropped session must not be replaced with a fresh one, got {:?}",
         resp.headers.get("x-sb-session-id")
     );

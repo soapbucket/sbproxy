@@ -1466,7 +1466,7 @@ fn a_route_derived_anchor_admits_any_port_and_still_pins_the_host() {
         let body = modern_wire_body("tools/list", Some("411"), "");
         let mut headers = modern_wire_headers("tools/list", None);
         replace_raw_header(&mut headers, b"host", authority);
-        headers.push(raw_header("Origin", &format!("http://{authority}")));
+        headers.push(raw_header("Origin", format!("http://{authority}")));
 
         let response = raw_modern_post(harness.port(), headers, body);
         assert_eq!(response.status, 200, "{authority}: {response:?}");
