@@ -480,7 +480,10 @@ modify_request := {"set_headers": {"x-rego-modified": "true"}}
     let out = rego_request_modifier(module, false, &req_header, &ctx)
         .expect("rego request modifier runs");
 
-    assert_eq!(out, vec![("x-rego-modified".to_string(), "true".to_string())]);
+    assert_eq!(
+        out,
+        vec![("x-rego-modified".to_string(), "true".to_string())]
+    );
 }
 
 /// The Rego twin of [`js_request_modifier_reads_the_same_table_lua_does`]:
@@ -527,7 +530,10 @@ modify_response := {"set_headers": {"x-rego-stage": "response"}}
     let out = rego_response_modifier(module, false, 200, &headers, &ctx)
         .expect("rego response modifier runs");
 
-    assert_eq!(out, vec![("x-rego-stage".to_string(), "response".to_string())]);
+    assert_eq!(
+        out,
+        vec![("x-rego-stage".to_string(), "response".to_string())]
+    );
 }
 
 #[test]

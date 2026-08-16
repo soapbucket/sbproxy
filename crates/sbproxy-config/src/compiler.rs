@@ -6489,8 +6489,11 @@ origins:
     fn rego_module_path_on_a_modifier_is_loaded_and_the_path_field_is_cleared() {
         let directory = tempfile::TempDir::new().expect("tempdir");
         let path = directory.path().join("modify.rego");
-        std::fs::write(&path, "package sbproxy\n\nmodify_request := {\"set_headers\": {}}\n")
-            .expect("write fixture module");
+        std::fs::write(
+            &path,
+            "package sbproxy\n\nmodify_request := {\"set_headers\": {}}\n",
+        )
+        .expect("write fixture module");
 
         let yaml = format!(
             r#"
@@ -6511,7 +6514,10 @@ origins:
             modifier.rego_module_path.is_none(),
             "module_path is resolved into module at compile time, mirroring policy: rego"
         );
-        let module = modifier.rego_module.as_ref().expect("module loaded from path");
+        let module = modifier
+            .rego_module
+            .as_ref()
+            .expect("module loaded from path");
         assert!(module.contains("modify_request"));
     }
 
