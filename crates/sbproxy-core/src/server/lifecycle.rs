@@ -273,6 +273,25 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcom
     result
 }
 
+/// As [`reload_from_config_path`], for a caller that has already read the
+/// file and needs the reload to use those exact bytes.
+///
+/// Carries the same reload metric, which is the reason this exists rather
+/// than calling [`reload_from_config_yaml`] directly: a reload that skipped
+/// the counter would leave the cadence operators alert on under-reporting
+/// every file-watch reload.
+pub(crate) fn reload_from_config_text(
+    config_path: &str,
+    yaml: &str,
+) -> anyhow::Result<ReloadOutcome> {
+    let result = reload_from_config_yaml(config_path, yaml);
+    match &result {
+        Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
+        Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
+    }
+    result
+}
+
 /// WOR-1186: build the configured session-ledger sink and register it
 /// process-wide. The `file` sink needs a `path`; a missing or
 /// unopenable path falls back to the logging sink with a warning so a
@@ -1248,18 +1267,40 @@ fn reload_compiled_config_locked(
     Ok(outcome)
 }
 
-/// Digest of the config file's bytes, or `None` when it cannot be read.
+/// Digest of a config payload, used as the file watcher's "is this actually
+/// different" baseline.
+pub(super) fn config_content_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// The config file's text and the digest of the exact bytes it was computed
+/// from, or `None` when the file cannot be read or is not UTF-8.
+///
+/// One read, two results, and that pairing is the point. Hashing in one read
+/// and reloading in another leaves a window for a write to land between them,
+/// which records a digest for content the pipeline never loaded. Returning
+/// both means the reload uses the bytes that were hashed.
 ///
 /// `None` never compares equal to itself here, so an unreadable file always
 /// attempts the reload and lets that path report the real error rather than
 /// being silently swallowed as "unchanged".
-fn config_file_digest(path: &std::path::Path) -> Option<[u8; 32]> {
-    use sha2::Digest as _;
+fn config_file_text_and_digest(path: &std::path::Path) -> Option<([u8; 32], String)> {
     let bytes = std::fs::read(path).ok()?;
-    Some(sha2::Sha256::digest(&bytes).into())
+    let digest = config_content_digest(&bytes);
+    Some((digest, String::from_utf8(bytes).ok()?))
 }
 
-pub(super) fn start_config_watcher(config_path: String) {
+/// How long the config watcher waits for a save's event burst to go quiet
+/// before it reads the file.
+///
+/// Long enough that a truncate-then-write or a write-then-rename has landed,
+/// short enough that a deliberate config change still applies promptly. It is
+/// also the floor on how fast two genuinely different configs can be applied
+/// back to back, which is not a rate anyone edits at.
+const CONFIG_WATCH_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
+
+pub(super) fn start_config_watcher(config_path: String, loaded_digest: [u8; 32]) {
     use notify::{RecursiveMode, Watcher};
 
     std::thread::spawn(move || {
@@ -1297,58 +1338,93 @@ pub(super) fn start_config_watcher(config_path: String) {
         tracing::info!(path = %config_path, dir = %watch_dir.display(), "config file watcher started");
 
         // Watching the directory is what makes an atomic-rename save visible,
-        // but it also reports every unrelated file in that directory. A
-        // config sharing a directory with logs, editor swap files, or a
-        // Kubernetes ConfigMap's `..data` churn would otherwise reload the
-        // pipeline on activity that has nothing to do with it, and a reload
-        // is not free: it replaces the compiled origin chain, which discards
-        // every live MCP session and makes callers re-initialize.
+        // but it also reports every unrelated file in that directory. A config
+        // sharing a directory with logs, editor swap files, or a neighbouring
+        // process's temp files would otherwise reload the pipeline on activity
+        // that has nothing to do with it, and a reload is not free: it
+        // replaces the compiled origin chain, which discards every live MCP
+        // session and makes callers re-initialize.
         //
-        // So narrow twice. First to events that name the config file, which
-        // covers the rename case because the rename creates that name. Then
-        // to a content change, because an editor or config-management tool
-        // can rewrite a file byte-for-byte and a no-op reload should stay a
-        // no-op rather than cost sessions.
-        let config_file_name = cfg_path.file_name().map(std::ffi::OsString::from);
-        let names_config_file = |event: &notify::Event| {
-            event
-                .paths
-                .iter()
-                .any(|path| path == &cfg_path || path.file_name() == config_file_name.as_deref())
-        };
-        let mut loaded_digest = config_file_digest(&cfg_path);
+        // The filter is on content, not on the path. Filtering by path is the
+        // obvious move and it is wrong here: under a Kubernetes ConfigMap
+        // mount the config is a symlink into `..data`, and an update renames
+        // `..data` without ever touching the config file's own name, so a
+        // path filter would drop exactly the events the directory watch
+        // exists to catch. Reading the file through whatever indirection it
+        // has and comparing a digest answers the real question, which is
+        // whether the config this process would load has actually moved.
+        //
+        // The baseline comes from the caller, taken from the bytes boot
+        // actually loaded, rather than from a fresh read here. Re-reading is
+        // the obvious move and it races: a write landing between boot's read
+        // and this thread starting would seed the digest of content the
+        // pipeline never loaded, and the event that same write queued would
+        // then be discarded as "unchanged", leaving the node on the old
+        // config for the rest of its life.
+        let mut loaded_digest = Some(loaded_digest);
 
-        for event in rx {
-            match event {
-                Ok(event)
-                    if (event.kind.is_modify()
-                        || event.kind.is_create()
-                        || event.kind.is_remove())
-                        && names_config_file(&event) =>
-                {
-                    let current_digest = config_file_digest(&cfg_path);
-                    if current_digest.is_some() && current_digest == loaded_digest {
-                        tracing::debug!(
-                            path = %config_path,
-                            "config file touched but its contents are unchanged; not reloading"
-                        );
-                        continue;
-                    }
-                    tracing::info!(path = %config_path, "config file changed, reloading...");
-                    // The outcome's degraded list is already logged by
-                    // the reload itself; the watcher only needs to know
-                    // whether the reload was refused outright.
-                    match reload_from_config_path(&config_path) {
-                        Ok(_) => loaded_digest = current_digest,
-                        Err(e) => {
-                            tracing::error!(error = %e, "reload failed; serving prior pipeline");
-                        }
-                    }
-                }
+        while let Ok(first) = rx.recv() {
+            match first {
                 Err(e) => {
                     tracing::warn!(error = %e, "config file watcher error");
+                    continue;
                 }
-                _ => {}
+                Ok(event)
+                    if !(event.kind.is_modify()
+                        || event.kind.is_create()
+                        || event.kind.is_remove()) =>
+                {
+                    continue;
+                }
+                Ok(_) => {}
+            }
+
+            // One save is a burst of events, not an event. `fs::write`
+            // truncates and then writes, an editor writes a temp file and
+            // renames it, and a ConfigMap swap renames a directory and
+            // deletes another. Reading on the first of those sees a file
+            // mid-write, and a truncated YAML document is not reliably an
+            // invalid one: a prefix that happens to end on a key boundary
+            // compiles, and the node would swap to a config missing whatever
+            // came after the cut. Waiting for the burst to go quiet is what
+            // makes the read see a finished file.
+            //
+            // Errors arriving during the quiet period are dropped along with
+            // everything else in the burst. That is the same trade the
+            // coalescing makes everywhere else: the reload below reports any
+            // problem that actually matters, from the file itself.
+            while rx.recv_timeout(CONFIG_WATCH_QUIET_PERIOD).is_ok() {}
+
+            let current = config_file_text_and_digest(&cfg_path);
+            if let Some((digest, _)) = &current {
+                if Some(*digest) == loaded_digest {
+                    tracing::debug!(
+                        path = %config_path,
+                        "config file touched but its contents are unchanged; not reloading"
+                    );
+                    continue;
+                }
+            }
+            tracing::info!(path = %config_path, "config file changed, reloading...");
+            // Reload the exact bytes that were hashed, so the digest recorded
+            // below describes the config now being served. The outcome's
+            // degraded list is already logged by the reload itself; the
+            // watcher only needs to know whether the reload was refused
+            // outright.
+            let (digest, result) = match current {
+                Some((digest, yaml)) => {
+                    (Some(digest), reload_from_config_text(&config_path, &yaml))
+                }
+                // Unreadable, so there are no bytes to reload from. Going
+                // through the path lets that read fail and report the real
+                // error.
+                None => (None, reload_from_config_path(&config_path)),
+            };
+            match result {
+                Ok(_) => loaded_digest = digest,
+                Err(e) => {
+                    tracing::error!(error = %e, "reload failed; serving prior pipeline");
+                }
             }
         }
     });
@@ -1730,6 +1806,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // baseline was the merged document would report drift on every scrape
     // forever.
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
+    // The file watcher's baseline, taken from the same local bytes and for the
+    // same reason: the watcher watches the file on disk, so what it compares
+    // against has to be the file this process read and not the document a
+    // `source:` pointer resolved to.
+    let initial_file_digest = config_content_digest(yaml.as_bytes());
 
     // Honour `source:` first. Resolution order is fixed and documented:
     // the source produces the base document, then the config-authority
@@ -2072,8 +2153,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);
 
-    // Start file watcher for config hot-reload.
-    start_config_watcher(config_path.to_string());
+    // Start file watcher for config hot-reload. It is told what boot loaded,
+    // so its "has this actually changed" baseline is the served config rather
+    // than whatever is on disk by the time its thread runs.
+    start_config_watcher(config_path.to_string(), initial_file_digest);
 
     // Start the config-authority poller. Its cycles apply through the
     // non-blocking reload entry point, so a slow file-watcher or SIGHUP
