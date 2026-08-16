@@ -408,7 +408,7 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
   border-radius: 0;
 }
 .rate--ok .rate-fill {
-  background: var(--sb-ok, #157a5b);
+  background: var(--sb-ok, #178a50);
 }
 .rate--warn .rate-fill {
   background: var(--sb-warn, #b7791f);

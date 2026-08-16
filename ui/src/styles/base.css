@@ -93,7 +93,9 @@ button {
 
 .sb-card {
   background: var(--sb-surface);
-  border: 1px solid var(--sb-border-strong);
+  border: 1px solid var(--sb-border);
+  border-radius: var(--sb-radius-lg);
+  box-shadow: var(--sb-shadow);
   padding: var(--sb-space-5);
 }
 
@@ -115,14 +117,15 @@ button {
   color: var(--sb-text-faint);
 }
 
-/* Buttons: square, mono, flush. Ink outline is the default; the
+/* Buttons: rounded, mono. Hairline outline is the default; the
    accent fill is the single primary action on a page. */
 .sb-btn {
   display: inline-flex;
   align-items: center;
   gap: var(--sb-space-2);
   padding: 7px 14px;
-  border: 1px solid var(--sb-border-ink);
+  border: 1px solid var(--sb-border-strong);
+  border-radius: var(--sb-radius-pill);
   background: var(--sb-surface);
   color: var(--sb-text);
   font-family: var(--sb-font-mono);
@@ -193,6 +196,7 @@ button {
   padding: 8px 10px;
   background: var(--sb-surface);
   border: 1px solid var(--sb-border-strong);
+  border-radius: var(--sb-radius-sm);
   color: var(--sb-text);
   font-family: inherit;
   font-size: 0.88rem;
@@ -258,6 +262,7 @@ button {
   background: var(--sb-code-bg);
   color: var(--sb-code-fg);
   border: 1px solid var(--sb-code-bg);
+  border-radius: var(--sb-radius);
   padding: var(--sb-space-4);
   font-family: var(--sb-font-mono);
   font-size: 0.8rem;

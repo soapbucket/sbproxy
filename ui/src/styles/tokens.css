@@ -1,23 +1,23 @@
 /*
  * SBproxy admin design tokens.
  *
- * Matches the sbproxy.dev paper/ink editorial system (2026-07-12
- * handoff): a warm paper page, white artifact panels, ink text and
- * rules, one green accent, amber strictly for warnings, square
- * corners, no shadows, no gradients. Values mirror the live
- * sbproxy.dev stylesheet variables.
+ * Matches the sbproxy.dev white/navy system (2026-08-16 refresh): a
+ * white page, white panels ruled with cool hairlines, navy ink text,
+ * one blue accent, soft radii and gentle shadows, amber strictly for
+ * warnings. Values mirror the live sbproxy.dev stylesheet variables.
  *
  * Tiers:
- *  - Ink (#16150F) is the commit tier: primary buttons, section
- *    rules, and the strongest text. Paper text sits on ink.
- *  - Green (#157A5B) is the single accent: links, focus, active nav,
- *    and the first chart series. Its tint (#E4F1EB) marks selection.
- *  - Amber (#B5651D) survives only as a warning color, never a CTA.
+ *  - Navy ink (#0A1733) is the commit tier: primary buttons, section
+ *    rules, and the strongest text. Light text sits on ink.
+ *  - Blue (#2154E8) is the single accent: links, focus, active nav,
+ *    and the first chart series. Its tint (#E8EFFD) marks selection.
+ *  - Green (#178A50) survives only as the ok/healthy state color.
+ *  - Amber (#C2410C) survives only as a warning color, never a CTA.
  *
- * Chart palette: five categorical hues validated for lightness,
- * chroma, CVD separation, and contrast on the white panel surface
- * (green, gold, blue, clay, plum -- assign in this fixed order,
- * never cycled).
+ * Chart palette: five categorical hues chosen for lightness, chroma,
+ * CVD separation, and contrast on the white panel surface (blue,
+ * gold, green, clay, plum -- assign in this fixed order, never
+ * cycled). Series 1 is the brand blue.
  */
 
 :root {
@@ -30,73 +30,73 @@
   --sb-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
     Consolas, "Liberation Mono", monospace;
 
-  /* Paper surfaces. The page is warm paper; cards and tables are the
-     white "artifact panels" reserved for content. */
-  --sb-bg: #f6f4ee;
-  --sb-bg-sunken: #efece3;
+  /* Surfaces. The page is white; cards and tables are white panels
+     separated by cool hairlines, with a faint blue-gray sunken tier. */
+  --sb-bg: #ffffff;
+  --sb-bg-sunken: #f2f6fd;
   --sb-surface: #ffffff;
-  --sb-surface-2: #faf9f5;
-  --sb-surface-hover: #f1efe8;
+  --sb-surface-2: #f8fafd;
+  --sb-surface-hover: #eef3fb;
 
-  /* Ink text scale. */
-  --sb-text: #16150f;
-  --sb-text-muted: #4e4a3f;
-  --sb-text-faint: #57534a;
+  /* Navy ink text scale. */
+  --sb-text: #0a1733;
+  --sb-text-muted: #3d4a68;
+  --sb-text-faint: #5c6a8a;
 
   /* Ink, the commit tier: primary buttons and the strongest rules. */
-  --sb-ink: #16150f;
-  --sb-ink-strong: #000000;
-  --sb-ink-soft: #2e2c24;
-  --sb-on-ink: #f6f4ee;
+  --sb-ink: #0a1733;
+  --sb-ink-strong: #081026;
+  --sb-ink-soft: #16223f;
+  --sb-on-ink: #f5f8ff;
 
-  /* Green, the single accent: links, focus, selected states. */
-  --sb-accent: #157a5b;
-  --sb-accent-strong: #0f5f46;
-  --sb-accent-tint: #e4f1eb;
-  --sb-accent-tint-strong: #cde7dc;
-  --sb-accent-ring: rgba(21, 122, 91, 0.3);
+  /* Blue, the single accent: links, focus, selected states. */
+  --sb-accent: #2154e8;
+  --sb-accent-strong: #163bb0;
+  --sb-accent-tint: #e8effd;
+  --sb-accent-tint-strong: #d6e2fb;
+  --sb-accent-ring: rgba(33, 84, 232, 0.3);
 
-  /* Rules. Full-strength ink for section rules, hairlines inside. */
-  --sb-border: #e7e3d9;
-  --sb-border-strong: #d8d3c6;
-  --sb-border-ink: #16150f;
-  --sb-border-accent: rgba(21, 122, 91, 0.35);
+  /* Rules. Navy ink for the strongest rules, cool hairlines inside. */
+  --sb-border: #e4e9f2;
+  --sb-border-strong: #c9d2e3;
+  --sb-border-ink: #0a1733;
+  --sb-border-accent: rgba(33, 84, 232, 0.35);
 
-  /* State colors. Amber appears here as a warning only. */
-  --sb-ok: #157a5b;
-  --sb-ok-bg: #e4f1eb;
-  --sb-warn: #b5651d;
-  --sb-warn-bg: #f7ead9;
-  --sb-warn-fg: #8a4c14;
+  /* State colors. Green is ok only; amber is a warning only. */
+  --sb-ok: #178a50;
+  --sb-ok-bg: #e2f4ea;
+  --sb-warn: #c2410c;
+  --sb-warn-bg: #fbeadf;
+  --sb-warn-fg: #93400f;
   --sb-err: #b4223f;
   --sb-err-bg: #f8e6ea;
   --sb-info: #31639c;
   --sb-info-bg: #e7edf5;
 
   /* Categorical chart hues, fixed order (validated on the white
-     panel surface). Series 1 is the brand green. */
-  --sb-chart-1: #157a5b;
+     panel surface). Series 1 is the brand blue. */
+  --sb-chart-1: #2154e8;
   --sb-chart-2: #9c7a10;
-  --sb-chart-3: #31639c;
+  --sb-chart-3: #178a50;
   --sb-chart-4: #a64d2b;
   --sb-chart-5: #8e4d9e;
 
   /* Dark code panel (site console palette), kept as the one
-     deliberate dark accent on the paper chrome. */
-  --sb-code-bg: #171512;
-  --sb-code-fg: #e9e5da;
-  --sb-code-key: #7fcba4;
-  --sb-code-str: #c9b98f;
-  --sb-code-val: #7fcba4;
-  --sb-code-num: #c9b98f;
-  --sb-code-com: #8c877b;
-  --sb-code-punct: #b5b0a3;
+     deliberate dark accent on the white chrome. */
+  --sb-code-bg: #0a1020;
+  --sb-code-fg: #c7d2e8;
+  --sb-code-key: #7da2ff;
+  --sb-code-str: #9db8f5;
+  --sb-code-val: #7da2ff;
+  --sb-code-num: #9db8f5;
+  --sb-code-com: #5f6c8c;
+  --sb-code-punct: #8fa0c2;
 
-  /* Square corners everywhere; the pill survives only for status
-     dots and scrollbar thumbs. */
-  --sb-radius-sm: 0;
-  --sb-radius: 0;
-  --sb-radius-lg: 0;
+  /* Soft radii, matching the site's rounded system. The pill remains
+     for status dots, chips, and scrollbar thumbs. */
+  --sb-radius-sm: 6px;
+  --sb-radius: 10px;
+  --sb-radius-lg: 14px;
   --sb-radius-pill: 999px;
 
   /* Spacing rhythm. */
@@ -112,7 +112,6 @@
   --sb-sidebar-w: 232px;
   --sb-content-max: 1160px;
 
-  /* Flat system: no shadows. Kept as a named token so components do
-     not reinvent one. */
-  --sb-shadow: none;
+  /* Gentle layered shadow for white panels on the white page. */
+  --sb-shadow: 0 1px 2px rgba(10, 23, 51, 0.05), 0 4px 12px rgba(10, 23, 51, 0.05);
 }
