@@ -91,7 +91,12 @@ fn caller_supplied_session_id_survives_round_trip() {
 }
 
 #[test]
-fn invalid_session_id_drops_then_auto_generates_fresh() {
+fn an_invalid_session_id_is_dropped_rather_than_replaced() {
+    // A caller who sends a malformed session id is not anonymous, they are
+    // wrong, and the two want different answers. Minting a fresh id here
+    // would fork that caller into a new identity on every retry, silently,
+    // which is worse than tracking no session at all. `headers-reference.md`
+    // states this as the one exception to auto-generation.
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&config_yaml(&upstream.base_url())).expect("start");
 
@@ -102,20 +107,19 @@ fn invalid_session_id_drops_then_auto_generates_fresh() {
             &[("X-Sb-Session-Id", "not-a-valid-ulid")],
         )
         .expect("send");
-    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.status, 200,
+        "a bad session id must not fail the request"
+    );
 
-    let echoed = resp
-        .headers
-        .get("x-sb-session-id")
-        .expect("anonymous default must auto-generate after dropping the bad header");
     assert!(
-        is_valid_ulid(echoed),
-        "fallback must be a fresh ULID, got {echoed:?}"
+        resp.headers.get("x-sb-session-id").is_none(),
+        "a dropped session must not be replaced with a fresh one, got {:?}",
+        resp.headers.get("x-sb-session-id")
     );
-    assert_ne!(
-        echoed, "not-a-valid-ulid",
-        "the proxy must not echo the invalid input"
-    );
+
+    // The neighbouring test covers the other half: with no header at all, the
+    // anonymous default does mint one. Together they pin the distinction.
 }
 
 #[test]

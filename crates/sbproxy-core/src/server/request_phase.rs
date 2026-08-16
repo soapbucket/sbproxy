@@ -88,17 +88,41 @@ fn request_requires_graphql_replay(
     origin_idx: usize,
 ) -> bool {
     match request_effective_action(session, pipeline, origin_idx) {
-        // Ambiguous, so take the safe reading: validation may be
-        // pending. Assuming the base action would let the idempotency
-        // pre-check serve a cached response before the current GraphQL
-        // action has validated it, which is the replay this flag
-        // exists to prevent.
-        EffectiveAction::Indeterminate => true,
+        // Ambiguous, so take the safe reading: validation may be pending.
+        // Assuming the base action would let the idempotency pre-check serve
+        // a cached response before the current GraphQL action has validated
+        // it, which is the replay this flag exists to prevent.
+        //
+        // Safe only where there is a GraphQL action to be ambiguous about. A
+        // `body:` forward rule always previews as indeterminate, so without
+        // this an ordinary proxy origin that routes on a body field would
+        // claim a GraphQL validation was pending, and the validation step
+        // would then refuse the request for not being GraphQL.
+        EffectiveAction::Indeterminate => origin_can_validate_graphql(pipeline, origin_idx),
         EffectiveAction::Resolved(action) => matches!(
             action,
             Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
         ),
     }
+}
+
+/// Whether any action this origin could route to validates GraphQL.
+///
+/// Used to decide what an unevaluable route preview might have selected, so
+/// it deliberately looks at every candidate rather than at one.
+fn origin_can_validate_graphql(pipeline: &CompiledPipeline, origin_idx: usize) -> bool {
+    fn validates(action: &Action) -> bool {
+        matches!(action, Action::GraphQL(graphql) if graphql.validation_enabled())
+    }
+    if pipeline.actions.get(origin_idx).is_some_and(validates) {
+        return true;
+    }
+    pipeline
+        .forward_rules
+        .get(origin_idx)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .any(|rule| validates(&rule.action))
 }
 
 /// Resolve the base or header/path/query-matched forward-rule action without

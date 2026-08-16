@@ -4442,6 +4442,52 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
+    /// An MCP catalogue is injectable only by keys on its own tenant.
+    ///
+    /// The lookup used to be process-global by server name, so a key on any
+    /// tenant could name any gateway and get its tools. Scoping it is the
+    /// point, and the same-name case is what proves the scoping is real:
+    /// two tenants may both run a gateway called `toolhub`, and each must see
+    /// only its own.
+    #[test]
+    fn an_mcp_catalogue_is_reachable_only_from_its_own_tenant() {
+        fn source(name: &str) -> Arc<sbproxy_modules::action::McpInjectSource> {
+            let action = sbproxy_modules::action::McpAction::from_config(serde_json::json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": name, "version": "1.0.0"},
+                "federated_servers": [{"origin": "upstream.example.com"}]
+            }))
+            .expect("mcp fixture compiles");
+            action.inject_source()
+        }
+
+        let mut registry = McpInjectRegistry::default();
+        registry
+            .insert("tenant-a", "toolhub", source("toolhub"))
+            .expect("tenant-a toolhub");
+        registry
+            .insert("tenant-b", "toolhub", source("toolhub"))
+            .expect("a second tenant may reuse the name");
+
+        assert!(registry.get("tenant-a", "toolhub").is_some());
+        assert!(registry.get("tenant-b", "toolhub").is_some());
+        assert!(
+            registry.get("tenant-c", "toolhub").is_none(),
+            "a tenant with no gateway of that name must not borrow another's"
+        );
+        assert!(
+            registry.get("", "toolhub").is_none(),
+            "an empty tenant must not act as a wildcard"
+        );
+
+        // Same tenant, same name, twice is an operator error rather than a
+        // silent last-one-wins.
+        assert!(registry
+            .insert("tenant-a", "toolhub", source("toolhub"))
+            .is_err());
+    }
+
     #[test]
     fn routing_state_namespace_is_workspace_and_rule_scoped() {
         let workspace_a = routing_action_identity("workspace-a", "shared-origin", None);

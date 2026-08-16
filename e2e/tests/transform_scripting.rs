@@ -102,9 +102,14 @@ origins:
     let resp = proxy.get("/", "lua-bad.local").expect("GET");
     let body = resp.text().unwrap_or_default();
     assert!(
-        body.contains("\"error\""),
-        "expected generic error envelope when lua script fails, got: {}",
+        resp.status >= 500,
+        "a failed lua response transform must not report success, got {}: {}",
+        resp.status,
         body
+    );
+    assert!(
+        !body.contains("secret"),
+        "upstream payload must not leak through: {body}"
     );
 }
 
@@ -222,9 +227,14 @@ origins:
     let resp = proxy.get("/", "js-bad.local").expect("GET");
     let body = resp.text().unwrap_or_default();
     assert!(
-        body.contains("\"error\""),
-        "expected generic error envelope when js throws, got: {}",
+        resp.status >= 500,
+        "a throwing js response transform must not report success, got {}: {}",
+        resp.status,
         body
+    );
+    assert!(
+        !body.contains("totallyUndefinedSymbol"),
+        "the script's own error text must not reach the client: {body}"
     );
 }
 

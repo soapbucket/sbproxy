@@ -205,9 +205,14 @@ origins:
     let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
     let resp = proxy.get("/", "schema-bad.local").expect("GET");
     let body = resp.text().unwrap_or_default();
+    // A response transform that fails under `closed` ends the response with a
+    // server error. It used to overwrite the buffered body and leave the 200
+    // the upstream sent, which reported success for a response that failed:
+    // cacheable, and green on every dashboard.
     assert!(
-        body.contains("\"error\""),
-        "expected generic error envelope when schema validation fails, got: {}",
+        resp.status >= 500,
+        "a failed response transform must not report success, got {}: {}",
+        resp.status,
         body
     );
     assert!(

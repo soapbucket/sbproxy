@@ -986,6 +986,14 @@ the source held by an in-flight request. If that governed intersection is
 empty or the tenant-local reference is unknown, SBproxy sends an empty tool
 array; it never falls back to caller-supplied tools.
 
+The tenant is worth checking on an existing config. The reference used to
+resolve by name across the whole node, so a key could reach a catalogue on any
+tenant. It is now scoped, and a reference that crosses a tenant boundary
+resolves to nothing: the request still succeeds, with no tools. Give the MCP
+origin the same `tenant_id` as the `ai_proxy` origin whose keys name it. The
+refusal is logged with the reference and the route's tenant, so grep for
+`inject_mcp references an unknown MCP gateway` to find one.
+
 ### Governed admission: strict and approximate
 
 A governed key with at least one of `max_requests_per_minute`,
