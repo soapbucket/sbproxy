@@ -598,8 +598,12 @@ pub enum McpDowngradePolicy {
 impl From<McpDowngradePolicy> for sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy {
     fn from(value: McpDowngradePolicy) -> Self {
         match value {
-            McpDowngradePolicy::Warn => sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Warn,
-            McpDowngradePolicy::Block => sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block,
+            McpDowngradePolicy::Warn => {
+                sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Warn
+            }
+            McpDowngradePolicy::Block => {
+                sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block
+            }
         }
     }
 }

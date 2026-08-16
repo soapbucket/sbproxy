@@ -6276,8 +6276,18 @@ mod mcp_governance_evidence_tests {
     #[test]
     fn rule_id_appears_only_when_the_caller_supplies_one() {
         let without = mcp_governance_event_data(
-            "search", "acme-server", "req-123", None, "2025-06-18", "acme", "api.example.com",
-            Some("rbac_denied"), None, None, 1, None,
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            Some("rbac_denied"),
+            None,
+            None,
+            1,
+            None,
         );
         assert!(without.get("sbproxy.decision.rule_id").is_none());
 

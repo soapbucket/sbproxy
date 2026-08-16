@@ -236,7 +236,8 @@ fn observe(
         );
     };
 
-    let protocol_downgrade = protocol_rank(observed_protocol) < protocol_rank(&prior.negotiated_protocol);
+    let protocol_downgrade =
+        protocol_rank(observed_protocol) < protocol_rank(&prior.negotiated_protocol);
     let auth_downgrade = prior.auth_required && !observed_auth_required;
 
     // Protocol takes priority when a single contact somehow trips both
@@ -254,11 +255,12 @@ fn observe(
     let Some(kind) = kind else {
         // Equal or stronger than the recorded high-water mark: raise it
         // and allow.
-        let stronger_protocol = if protocol_rank(observed_protocol) > protocol_rank(&prior.negotiated_protocol) {
-            observed_protocol.to_string()
-        } else {
-            prior.negotiated_protocol.clone()
-        };
+        let stronger_protocol =
+            if protocol_rank(observed_protocol) > protocol_rank(&prior.negotiated_protocol) {
+                observed_protocol.to_string()
+            } else {
+                prior.negotiated_protocol.clone()
+            };
         return (
             McpPeerProfile {
                 negotiated_protocol: stronger_protocol,
@@ -488,8 +490,13 @@ mod tests {
             last_seen: first_seen,
         };
         let later = first_seen + std::time::Duration::from_secs(60);
-        let (profile, verdict) =
-            observe(Some(&prior), LEGACY, false, PeerDowngradePolicy::Warn, later);
+        let (profile, verdict) = observe(
+            Some(&prior),
+            LEGACY,
+            false,
+            PeerDowngradePolicy::Warn,
+            later,
+        );
         assert_eq!(
             verdict,
             ObservationVerdict::Warned(PeerDowngradeKind::Protocol)
@@ -498,7 +505,10 @@ mod tests {
         // not drop: the profile still remembers this peer demonstrated
         // the modern era.
         assert_eq!(profile.negotiated_protocol, MODERN);
-        assert_eq!(profile.last_seen, later, "an allowed contact still updates last_seen");
+        assert_eq!(
+            profile.last_seen, later,
+            "an allowed contact still updates last_seen"
+        );
     }
 
     #[test]
@@ -576,8 +586,13 @@ mod tests {
             last_seen: first_seen,
         };
         let later = first_seen + std::time::Duration::from_secs(60);
-        let (profile, verdict) =
-            observe(Some(&prior), LEGACY, true, PeerDowngradePolicy::Block, later);
+        let (profile, verdict) = observe(
+            Some(&prior),
+            LEGACY,
+            true,
+            PeerDowngradePolicy::Block,
+            later,
+        );
         assert_eq!(verdict, ObservationVerdict::Allowed);
         assert!(profile.auth_required);
     }
@@ -703,11 +718,26 @@ mod tests {
     #[test]
     fn peer_key_changes_when_any_of_its_four_inputs_changes() {
         let base = peer_key("srv", "https://a.example.com", "auto", "warn");
-        assert_ne!(base, peer_key("other", "https://a.example.com", "auto", "warn"));
-        assert_ne!(base, peer_key("srv", "https://b.example.com", "auto", "warn"));
-        assert_ne!(base, peer_key("srv", "https://a.example.com", MODERN, "warn"));
-        assert_ne!(base, peer_key("srv", "https://a.example.com", "auto", "block"));
-        assert_eq!(base, peer_key("srv", "https://a.example.com", "auto", "warn"));
+        assert_ne!(
+            base,
+            peer_key("other", "https://a.example.com", "auto", "warn")
+        );
+        assert_ne!(
+            base,
+            peer_key("srv", "https://b.example.com", "auto", "warn")
+        );
+        assert_ne!(
+            base,
+            peer_key("srv", "https://a.example.com", MODERN, "warn")
+        );
+        assert_ne!(
+            base,
+            peer_key("srv", "https://a.example.com", "auto", "block")
+        );
+        assert_eq!(
+            base,
+            peer_key("srv", "https://a.example.com", "auto", "warn")
+        );
     }
 
     #[test]
@@ -722,13 +752,27 @@ mod tests {
 
         assert_eq!(
             observe_and_record_capped(
-                &mut profiles, "t1", "k1", MODERN, false, PeerDowngradePolicy::Block, now, cap,
+                &mut profiles,
+                "t1",
+                "k1",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
             ),
             ObservationVerdict::Allowed
         );
         assert_eq!(
             observe_and_record_capped(
-                &mut profiles, "t2", "k2", LEGACY, false, PeerDowngradePolicy::Block, now, cap,
+                &mut profiles,
+                "t2",
+                "k2",
+                LEGACY,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
             ),
             ObservationVerdict::Allowed
         );
@@ -737,7 +781,14 @@ mod tests {
         // so this first overflow contact still just records.
         assert_eq!(
             observe_and_record_capped(
-                &mut profiles, "t3", "k3", MODERN, false, PeerDowngradePolicy::Block, now, cap,
+                &mut profiles,
+                "t3",
+                "k3",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
             ),
             ObservationVerdict::Allowed
         );
@@ -749,7 +800,14 @@ mod tests {
         // false positives under saturation, never a silent bypass.
         assert_eq!(
             observe_and_record_capped(
-                &mut profiles, "t4", "k4", LEGACY, false, PeerDowngradePolicy::Block, now, cap,
+                &mut profiles,
+                "t4",
+                "k4",
+                LEGACY,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
             ),
             ObservationVerdict::Refused(PeerDowngradeKind::Protocol)
         );
@@ -757,7 +815,14 @@ mod tests {
         // hit is unaffected.
         assert_eq!(
             observe_and_record_capped(
-                &mut profiles, "t2", "k2", MODERN, false, PeerDowngradePolicy::Block, now, cap,
+                &mut profiles,
+                "t2",
+                "k2",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
             ),
             ObservationVerdict::Allowed
         );
