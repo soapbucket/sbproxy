@@ -1,6 +1,6 @@
 # Webhook signing
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Webhook signing](../../docs/assets/webhook-signing.gif)
 
@@ -21,25 +21,38 @@ The receiver URL `https://hooks.example.com/sbproxy` is illustrative. Point it a
 # at on_request and another at on_response.
 curl -s -H 'Host: localhost' http://127.0.0.1:8080/get -o /dev/null
 
-# At your receiver you should see two POSTs with shape like:
+# At your receiver you should see two POSTs. Both carry the same header
+# set; the body shape differs between the two events.
 #
-# Headers:
-#   User-Agent: sbproxy/0.1.0
-#   X-Sbproxy-Event: on_request
+# Headers (both events):
+#   User-Agent: sbproxy/<version>
+#   X-Sbproxy-Event: on_request | on_response
 #   X-Sbproxy-Instance: sbproxy-host-7c4d8b9a
 #   X-Sbproxy-Request-Id: 01j9x4...
 #   X-Sbproxy-Config-Revision: a7b3f9c11d80
 #   X-Sbproxy-Timestamp: 1714200000
 #   X-Sbproxy-Signature: v1=4f1e6c...
 #
-# Body (JSON):
+# on_request body (JSON) - fired before the upstream is contacted, so it
+# carries the inbound request shape (method, path, client_ip, headers):
 #   {
 #     "event":"on_request",
-#     "proxy":{"instance_id":"...","version":"0.1.0","config_revision":"..."},
+#     "proxy":{"instance_id":"...","version":"...","config_revision":"..."},
 #     "request":{"id":"01j9x4...","received_at":"2026-04-25T07:32:00Z"},
 #     "origin":{"name":"localhost"},
 #     "method":"GET","path":"/get","host":"localhost","client_ip":"127.0.0.1",
 #     "headers":{...}
+#   }
+#
+# on_response body (JSON) - fired after the response is ready. It drops
+# method/client_ip/headers and adds status and duration_ms instead:
+#   {
+#     "event":"on_response",
+#     "proxy":{"instance_id":"...","version":"...","config_revision":"..."},
+#     "request":{"id":"01j9x4...","received_at":"2026-04-25T07:32:00Z"},
+#     "origin":{"name":"localhost"},
+#     "host":"localhost","path":"/get",
+#     "status":200,"duration_ms":153
 #   }
 
 # Sample receiver-side verification (Python):

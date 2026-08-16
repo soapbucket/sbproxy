@@ -1,6 +1,6 @@
 # Managed local model
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-16*
 
 This example runs the built-in pinned Qwen bootstrap artifact through the
 canonical single-node model host. `proxy.model_host` owns the deployment;
@@ -21,6 +21,15 @@ The pull command selects the canonical deployment, uses its exact variant and
 engine, writes to `./.cache/sbproxy-models`, and applies the configured cache
 budget. It verifies the artifact but starts no engine.
 
+**Known issue:** `model_host.cache.directory` in `sb.yml` is the relative
+path `./.cache/sbproxy-models`, as shown above. `validate` and `models pull`
+both accept it and complete cleanly, but `serve` currently fails at engine
+launch with `artifact_not_ready: verified snapshot path must be absolute`,
+because the resolved snapshot path is never canonicalized before the engine
+driver's absolute-path check runs. Point `model_host.cache.directory` at an
+absolute path (e.g. `/var/lib/sbproxy/models` or an exported
+`${SB_STATE_DIR}`-style variable) to work around it until this is fixed.
+
 ## Start the gateway
 
 ```bash
@@ -28,7 +37,8 @@ sbproxy serve -f examples/model-host-managed/sb.yml
 ```
 
 Startup prepares the artifact, provisions the pinned llama.cpp engine, and
-warms `local-qwen` before publishing the request pipeline.
+warms `local-qwen` before publishing the request pipeline. See the known
+issue above if this fails immediately with `artifact_not_ready`.
 
 Send a completion from another terminal:
 

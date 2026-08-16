@@ -1,6 +1,6 @@
 # Classifier-backed prompt routing
 
-*Last modified: 2026-07-22*
+*Last modified: 2026-08-16*
 
 Classify prompts locally with an operator-supplied sentence-embedding model,
 then route each predicted class through the existing AI policy plane. The
@@ -28,8 +28,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   | jq -r .model
 ```
 
-The response model is `gpt-4o-mini` when the classifier emits
-`documentation`. Classifier output is a non-enforcing routing label in both
+The response `model` field starts with `gpt-4o-mini` when the classifier
+emits `documentation` (OpenAI returns the resolved dated snapshot, e.g.
+`gpt-4o-mini-2024-07-18`, not the bare alias). A coding or unclassified
+prompt keeps the originally requested model instead, e.g. `gpt-4.1` comes
+back as `gpt-4.1-2025-04-14`. Classifier output is a non-enforcing routing label in both
 the serial and mesh guardrail paths. The class appears in
 `ai.guardrails.labels` for the CEL policy to consume and never contributes to
 a security block quorum.

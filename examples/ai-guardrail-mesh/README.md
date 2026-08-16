@@ -50,5 +50,5 @@ curl -s -H 'Host: ai.local' -H 'Content-Type: application/json' \
 curl -s -H 'Host: ai.local' -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Contact me at test@example.com about forbidden-term issue"}]}' \
   http://127.0.0.1:8080/v1/chat/completions
-# 400 {"error":{"code":"pii,regex","message":"PII detected: email; Content blocked: matched regex pattern \"forbidden-term\"","type":"guardrail_violation"}}
+# 400 {"error":{"code":"pii,regex","message":"PII detected: email; Content blocked: matched regex pattern \"forbidden-term\"","request_id":"<differs on every request>","type":"guardrail_violation"}}
 ```

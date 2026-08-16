@@ -1,6 +1,6 @@
 # Rate limiting policy
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Rate limiting policy](../../docs/assets/rate-limiting.gif)
 
@@ -38,16 +38,22 @@ The burst of 10 passes; the rest are throttled. Inspect a rejected response:
 ```bash
 $ curl -i -H 'Host: api.local' http://127.0.0.1:8080/get
 HTTP/1.1 429 Too Many Requests
-content-type: text/plain
-retry-after: 1
+content-type: application/json
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 2
+retry-after: 2
 
-rate limit exceeded
+{"error":"rate limited"}
 ```
+
+`X-RateLimit-*` and `Retry-After` are opt-in: this example sets `headers.enabled: true` (and `headers.include_retry_after: true`) on the policy. Leave `headers` unset and the policy still enforces the limit, it just adds no headers to either the 200 or the 429.
 
 ## What this exercises
 
 - `rate_limiting` policy - token bucket with `requests_per_second` and `burst`
 - `key: 'connection.remote_ip'` partitioning - each source IP gets its own bucket. `key` is a CEL expression, so it can key on anything the request context carries (a JWT claim, a resolved key id, a header)
+- `headers.enabled` / `headers.include_retry_after` - opt-in `X-RateLimit-*` and `Retry-After` headers
 - Pre-upstream rejection - 429 is returned without consulting `test.sbproxy.dev`, with `Retry-After` set so well-behaved clients can back off
 
 ## See also

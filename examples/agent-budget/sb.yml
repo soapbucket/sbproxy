@@ -8,8 +8,10 @@
 # Run:
 #   make run CONFIG=examples/agent-budget/sb.yml
 #
-# Try it: 60+ requests with the same Cursor-shaped User-Agent get
-# 429s on the 61st in a 60s window.
+# Try it: 60+ requests with the same Cursor-shaped User-Agent drain
+# the 60-token bucket and start getting 429s (the bucket also
+# refills at 1 token/second, so the exact cutover shifts with how
+# long the requests take).
 #   for i in $(seq 1 70); do
 #     curl -s -o /dev/null -w '%{http_code}\n' \
 #       -H 'Host: ai.local' \

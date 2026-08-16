@@ -42,14 +42,16 @@
 #   make run CONFIG=examples/ai-routing-policy/sb.yml
 #
 # Test (a hard prompt routes to the frontier model; watch the access
-# log's route reason):
+# log's route reason). The difficulty heuristic blends keyword signals
+# with prompt length, so the prompt needs to be long enough as well as
+# hit the code / math / reasoning keywords to clear the 0.7 threshold:
 #   curl http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
 #       "model": "gpt-4o-mini",
 #       "messages": [{"role": "user",
-#         "content": "Prove step by step that the following function terminates:\n```\ndef f(n):\n    while n > 1:\n        n = n // 2\n    return n\n```"}]
+#         "content": "Prove step by step, using the theorem about geometric series, that the following function terminates for every positive integer n. Analyze the loop invariant, derive a closed-form equation for the number of iterations, and explain why the recursion cannot enter an infinite loop:\n```\ndef f(n):\n    while n > 1:\n        n = n // 2\n    return n\n```"}]
 #     }'
 
 proxy:
@@ -65,11 +67,17 @@ origins:
 
       providers:
         - name: cheap
+          # provider_type tells the gateway which vendor API this custom
+          # provider name talks to. Without it, a name outside the built-in
+          # catalog (like "cheap") has no known base_url and every request
+          # falls back to a localhost endpoint, which 502s.
+          provider_type: openai
           api_key: ${OPENAI_API_KEY}
           default_model: gpt-4o-mini
           models:
             - gpt-4o-mini
         - name: frontier
+          provider_type: openai
           api_key: ${OPENAI_API_KEY}
           default_model: gpt-4o
           models:

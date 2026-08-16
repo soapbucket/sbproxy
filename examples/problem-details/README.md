@@ -1,6 +1,6 @@
 # Problem-Details default renderer
 
-*Last modified: 2026-05-11*
+*Last modified: 2026-08-16*
 
 ![Problem-Details default renderer](../../docs/assets/problem-details.gif)
 
@@ -10,9 +10,12 @@ RFC 9457 `application/problem+json` default renderer for everything else
 via `problem_details:`.
 
 The two blocks compose: per-status custom pages win when matched, and
-the problem-details renderer catches every other proxy-generated error
-(403 policy denials, 404 from missing routes, etc.) with a structured
-body that downstream clients can introspect without scraping prose.
+the problem-details renderer catches every other authentication denial
+on this origin (a bad or missing API key, a failed JWT check, and so
+on) with a structured body that downstream clients can introspect
+without scraping prose. It does not currently apply to policy denials
+(`ip_filter`, `waf`, rate limiting, etc.) or to upstream-generated
+errors; those keep their own response shapes.
 
 ## Run
 
@@ -32,16 +35,18 @@ curl -sv -H 'Host: api.local' -H 'X-Api-Key: secret-key' http://127.0.0.1:8080/g
 # < HTTP/1.1 200 OK
 ```
 
-When the proxy emits an error code that does *not* match the
-`error_pages` table, the response body is rendered per RFC 9457:
+When the `authentication` block on this origin denies a request with a
+status code that does *not* match the `error_pages` table (this example
+only authors a custom page for 401, so any other authentication failure
+qualifies), the response body is rendered per RFC 9457 instead:
 
 ```json
 {
   "type": "https://api.example.com/errors/403",
   "title": "Forbidden",
   "status": 403,
-  "detail": "policy denied",
-  "instance": "/restricted"
+  "detail": "authentication failed",
+  "instance": "/get"
 }
 ```
 
@@ -49,8 +54,8 @@ When the proxy emits an error code that does *not* match the
 
 - `problem_details.enabled: true` opt-in
 - `problem_details.type_base_uri` stable `type` URIs
-- `problem_details.include_detail: false` suppresses the internal
-  error string from the `detail` field (omit to keep it)
+- `problem_details.include_detail: true` keeps the internal error
+  string in the `detail` field (set to `false` to suppress it)
 - Composition with `error_pages` per-status custom bodies
 - Composition with `authentication.api_key`
 

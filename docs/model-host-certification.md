@@ -1,6 +1,6 @@
 # Model host hardware certification
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 This page is the evidence ledger for the self-host matrix, and the procedure
 that reproduces it. Passing a simulated GPU test is never recorded as live
@@ -47,7 +47,7 @@ billed.
 | Deterministic model-host suites | passed 2026-07-30 | Artifact, driver, fit, admission, reconcile, reload, capability, and CLI suites. |
 | CPU admission | passed 2026-07-30 | Local admission and cold-start policy on an accelerator-free path. |
 | Apple Metal probe | named lane `apple_metal_probe` | Compiles `probe_metal.rs` with `--features gpu-apple` and asserts one unified-memory device plus a 0.5B Q4 plan that fits the working-set budget. Invoked by `run apple_metal_probe` or `run all`. Off Apple Silicon the lane records `unsupported`. Linux CI does not run it (`run local` omits it; every GitHub CI job is ubuntu-latest). |
-| Apple Silicon Metal | passed 2026-08-02 | Apple M4 Max, macOS 26.5.2 (25F84), 36 GiB, revision `e2858994` on a clean tree. All 12 checks: cold start ready in 17s, nonempty completion, public model name echoed, truthful status (`llama_cpp b9905`, digest `830f2915`), stop reaped the engine, clean SIGTERM in 61s with no orphan and the public port released, and a second run that downloaded nothing and matched the digest. The 2026-07-30 run's one failure was the listener release; that check now passes against the widened exit window. Live RSS must stay within 25% overshoot of the planned `memory.total_bytes` envelope (WOR-2200); that comparison is recorded in `record.json` on subsequent runs. |
+| Apple Silicon Metal | passed 2026-08-02 | Apple M4 Max, macOS 26.5.2 (25F84), 36 GiB, revision `e2858994` on a clean tree. All 12 checks: cold start ready in 17s, nonempty completion, public model name echoed, truthful status (`llama_cpp b9905`, digest `830f2915`), stop reaped the engine, clean SIGTERM in 61s with no orphan and the public port released, and a second run that downloaded nothing and matched the digest. The 2026-07-30 run's one failure was the listener release; that check now passes against the widened exit window. Live RSS must stay within 25% overshoot of the planned `memory.total_bytes` envelope; that comparison is recorded in `record.json` on subsequent runs. |
 | NVIDIA CUDA single GPU | passed 2026-07-30 | Live vLLM container completion on an NVIDIA L4: NVML probe, fit plan, public model echo, full status, and a stop that returned the device to 0 MiB. |
 | NVIDIA multi-GPU | unsupported | Needs two visible devices. The billing account this project runs under is capped at one GPU, so the lane has never had hardware to run on. Detail below. |
 | Air-gapped | passed 2026-07-30 | Offline, manual, and file pull policies short-circuit transport; a digest mismatch fails closed. |
@@ -94,7 +94,7 @@ pass until the updated lane reruns on Apple hardware.
 - **Failing check:** the public port was still bound 60 seconds after
   shutdown, by a surviving `sbproxy` process
 
-### Certified Mac classes (WOR-2200)
+### Certified Mac classes
 
 Two pinned llama.cpp builds exist. They are not interchangeable, and only
 one currently has a dated live record:

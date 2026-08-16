@@ -1,6 +1,6 @@
 # IP filter
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![IP filter](../../docs/assets/ip-filter.gif)
 
@@ -20,7 +20,7 @@ No setup required. Local curl traffic always lands on `127.0.0.1`, which sits in
 # 200 - request from 127.0.0.1 matches the whitelist
 $ curl -i -H 'Host: ipfilter.local' http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
-content-type: application/json
+content-type: application/json; charset=utf-8
 ...
 {
   "method": "GET",
@@ -38,10 +38,10 @@ content-type: application/json
 # 403 - if you swap the whitelist to a CIDR that excludes 127.0.0.1
 $ curl -i -H 'Host: ipfilter.local' http://127.0.0.1:8080/get
 HTTP/1.1 403 Forbidden
-content-type: text/plain
-content-length: 24
+content-type: application/json
+content-length: 21
 
-forbidden by ip_filter
+{"error":"forbidden"}
 ```
 
 ```bash

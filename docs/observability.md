@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -259,25 +259,25 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_script_compile_total` | 12 | Labels: `engine` (cel\|lua\|js\|wasm), `result` (ok\|parse_error\|sandbox_reject). |
 | `sbproxy_script_invocations_total` | 20 | Same `engine`, plus `result` (ok\|runtime_error\|timeout\|memory_cap\|instruction_cap). |
 | `sbproxy_script_duration_seconds_bucket` | 52 | `engine` label only; histogram buckets 0.1ms..10s. |
-| `sbproxy_rate_limit_decisions_total` | 4 000 | Labels: `policy` (sanitised route pattern), `result` (allow\|throttle_route\|throttle_tenant\|disabled). |
+| `sbproxy_rate_limit_decisions_total` | 4 000 | Labels: `policy` (sanitized route pattern), `result` (allow\|throttle_route\|throttle_tenant\|disabled). |
 | `sbproxy_idempotency_cache_results_total` | 16 | Labels: `backend` (default), `result` (hit\|miss\|conflict\|not_applicable). |
 | `sbproxy_idempotency_cache_duration_seconds_bucket` | 11 | `backend` label only; histogram buckets 50us..1s. |
 | `sbproxy_response_body_bytes_bucket` | 18 | Labels: `direction` (pre_compress\|post_compress); histogram buckets 256B..16MiB. |
 | `sbproxy_compression_decisions_total` | 16 | Labels: `codec` (gzip\|br\|zstd\|identity), `result` (applied\|skipped_size\|skipped_accept\|disabled). |
 | `sbproxy_compression_ratio_bucket` | 40 | Labels: `codec`; histogram of `post/pre` size when compression applied. |
-| `sbproxy_plugin_registered_total` | 500 | Labels: `kind` (action\|auth\|policy\|transform), `plugin` (sanitised). Emitted once at startup per registration. |
+| `sbproxy_plugin_registered_total` | 500 | Labels: `kind` (action\|auth\|policy\|transform), `plugin` (sanitized). Emitted once at startup per registration. |
 | `sbproxy_plugin_init_total` | 1 500 | Labels: `kind`, `plugin`, `result` (ok\|config_invalid\|panic). |
 | `sbproxy_plugin_init_duration_seconds_bucket` | 18 000 | Same labels as `_init_total` plus 12 histogram buckets 100us..10s. |
 | `sbproxy_acme_renewals_total` | 6 | Labels: `result` (ok\|http_error\|order_invalid\|account_invalid\|rate_limited\|other). |
 | `sbproxy_acme_renewal_duration_seconds_bucket` | 60 | Same `result` plus 10 histogram buckets 100ms..5min. |
 | `sbproxy_ocsp_fetch_total` | 5 | Labels: `result` (ok\|http_error\|parse_error\|unknown_status\|no_responder). |
-| `sbproxy_cert_expiry_seconds` | 256 | Labels: `host` (sanitised). Gauge; negative means already expired. |
-| `sbproxy_vault_resolution_total` | 200 | Labels: `backend` (sanitised), `result` (ok\|not_found\|backend_error\|denied). |
+| `sbproxy_cert_expiry_seconds` | 256 | Labels: `host` (sanitized). Gauge; negative means already expired. |
+| `sbproxy_vault_resolution_total` | 200 | Labels: `backend` (sanitized), `result` (ok\|not_found\|backend_error\|denied). |
 | `sbproxy_vault_resolution_duration_seconds_bucket` | 2 400 | Same labels plus 12 histogram buckets 100us..5s. |
 | `sbproxy_key_store_outage_total` | 40 | Labels: `entrypoint` (header_sweep\|impersonation_ticket\|bearer\|oidc_claim\|native_key), `posture` (closed\|degraded\|open\|observe), `outcome` (denied\|admitted). Every value is a compile-time constant, so the family is bounded by 5 x 4 x 2 whatever the config says; `posture` reserves all four spellings even though `observe` is refused at config-compile time for this key, because the cap should hold against the enum rather than against today's validation. One observation per gate, not per request. |
 | `sbproxy_key_store_unavailable` | 4 | Labels: `posture`. Gauge; 1 while the last inbound-key resolution could not reach the virtual key store. Exactly one series is live at a time, because a posture change removes the previous label value; the cap is the enum bound, not the expected series count. |
 | `sbproxy_grpc_status_total` | 17 | Labels: `code` (canonical lowercase name; closed enum from tonic). |
-| `sbproxy_mcp_tool_dispatch_total` | 4 000 | Labels: `tool` (sanitised), `result` (ok\|tool_error\|tool_not_found\|policy_denied). |
+| `sbproxy_mcp_tool_dispatch_total` | 4 000 | Labels: `tool` (sanitized), `result` (ok\|tool_error\|tool_not_found\|policy_denied). |
 | `sbproxy_mcp_tool_dispatch_duration_seconds_bucket` | 12 000 | `tool` label plus 12 histogram buckets 100us..10s. |
 | `sbproxy_mcp_resource_fetch_total` | 4 | Labels: `result` (ok\|not_found\|upstream_error\|policy_denied). |
 | `sbproxy_mcp_federation_peers_up` | 1 | Gauge; live federation peer count as of the last refresh. |
@@ -285,32 +285,32 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_operator_reconcile_duration_seconds_bucket` | 22 | `kind` label plus 11 histogram buckets 1ms..60s. |
 | `sbproxy_operator_leader_transitions_total` | 3 | Labels: `result` (elected\|renewed\|lost). |
 | `sbproxy_operator_leader_is_leader` | 1 | Gauge; 1 when this replica holds the lease. |
-| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitised), `user` (sanitised), `tag` (sanitised; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_attributed_total` and indexes the same observation by who-paid attribution. |
-| `sbproxy_label_cardinality_overflow_per_tenant_total` | 8 000 | Labels: `metric` (sanitised name of the demoted family), `label` (sanitised label key that overflowed), `tenant_id`. Same demotion signal as `sbproxy_label_cardinality_overflow_total` but partitioned by tenant so a noisy-tenant root-cause investigation does not have to scan every metric. |
-| `sbproxy_a2a_hops_total` | 60 | Labels: `route`, `spec` (a2a-spec version), `decision` (allow\|deny\|warn). Counts each per-request A2A hop the proxy observes. |
+| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitized), `user` (sanitized), `tag` (sanitized; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_attributed_total` and indexes the same observation by who-paid attribution. |
+| `sbproxy_label_cardinality_overflow_per_tenant_total` | 8 000 | Labels: `metric` (sanitized name of the demoted family), `label` (sanitized label key that overflowed), `tenant_id`. Same demotion signal as `sbproxy_label_cardinality_overflow_total` but partitioned by tenant so a noisy-tenant root-cause investigation does not have to scan every metric. |
+| `sbproxy_a2a_hops_total` | 60 | Labels: `route`, `spec` (a2a-spec version), `decision`. Not a small closed enum: an allowed hop reports `allow:verified` or `allow:unverified`; a denied hop reports `deny:<reason>` (`depth`, `cycle`, `callee_not_allowed`, `push_target_blocked`, `caller_denied`, or `undetected`); a hop the policy could not detect as A2A reports `skip:undetected`, `observe:undetected`, or `degraded:undetected` depending on the policy's configured failure posture. Counts each per-request A2A hop the proxy observes. |
 | `sbproxy_a2a_chain_depth_bucket` | 60 | `route`, `spec`; histogram buckets 1..32 chain hops. Tracks A2A call-graph depth before truncation. |
 | `sbproxy_a2a_denied_total` | 40 | Labels: `route`, `reason` (depth_cap\|policy_block\|loop_detected\|other). Per-request denial counter on the A2A surface. |
-| `sbproxy_agent_budget_decisions_total` | 400 | Labels: `agent_id` (sanitised, capped via the same demotion path as other agent_*) `outcome` (allow\|throttle\|deny). Drives the per-agent budget enforcement audit. |
-| `sbproxy_agent_detect_total` | 3 000 | Labels: `agent_id` (sanitised, empty when anonymous), `provenance` (signed\|unsigned-named\|unsigned-anonymous). Per-request agent-detect scorer verdicts. |
+| `sbproxy_agent_budget_decisions_total` | 400 | Labels: `agent_id` (sanitized, capped via the same demotion path as other agent_*) `outcome` (allow\|throttle\|deny). Drives the per-agent budget enforcement audit. |
+| `sbproxy_agent_detect_total` | 3 000 | Labels: `agent_id` (sanitized, empty when anonymous), `provenance` (signed\|unsigned-named\|unsigned-anonymous). Per-request agent-detect scorer verdicts. |
 | `sbproxy_agent_detect_score_bucket` | 11 | Histogram buckets over the 0-100 agent-detect score. No labels. |
 | `sbproxy_agent_detect_inference_seconds_bucket` | 9 | Histogram buckets 50us..10ms for in-process scorer latency. No labels. |
 | `sbproxy_trust_tier_requests_total` | 4 | Label: `tier` (`suspicious`\|`strong`\|`named`\|`anonymous`). One closed-set observation per request after identity enrichment and authentication. |
 | `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|enumeration). Counts BOLA / BFLA / enumeration violations the object-authz policy refused. |
 | `sbproxy_waf_persistent_blocks_total` | 600 | Labels: `origin`, `event` (rule_match\|ip_blocklisted\|anomaly_threshold), `key_kind` (ip\|jwt_sub\|api_key\|session). Counts the WAF blocks that landed on the persistent (cross-process) blocklist as opposed to the in-process rate-limit decision path. |
-| `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitised). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |
+| `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitized). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | 6 | Labels: `result` (ok\|backend_error\|kid_still_missing). Counts on-demand JWKS refetches triggered by an unknown `kid` in a presented JWT. |
 | `sbproxy_mtls_handshake_total` | 5 | Labels: `result` (ok\|cert_invalid\|cert_expired\|no_client_cert\|other). Counter on the mTLS path; pair with `sbproxy_cert_expiry_seconds` to alert before certs expire. |
-| `sbproxy_ocsp_staple_age_seconds` | 256 | Labels: `host` (sanitised). Gauge of the age in seconds of the currently stapled OCSP response per host. Should stay well under the OCSP `nextUpdate` minus the renewal margin. |
+| `sbproxy_ocsp_staple_age_seconds` | 256 | Labels: `host` (sanitized). Gauge of the age in seconds of the currently stapled OCSP response per host. Should stay well under the OCSP `nextUpdate` minus the renewal margin. |
 | `sbproxy_synthetic_probe_failures_total` | 32 | Labels: `reason` (timeout\|status_5xx\|tls_handshake\|connect\|dns\|other). Background-probe failure counter; signals an upstream gone bad before customer traffic notices. |
-| `sbproxy_capture_dropped_total` | 6 000 | Labels: `workspace` (sanitised), `dimension` (token\|cost\|attribution\|other), `reason` (queue_full\|backend_error\|policy_block\|budget_exhausted). Per-workspace tokenomics capture-drop counter (rolls up the budget-dropped sub-counter below). |
-| `sbproxy_capture_budget_dropped_total` | 2 000 | Labels: `workspace` (sanitised), `dimension` (token\|cost\|attribution\|other). Subset of `sbproxy_capture_dropped_total` for the budget-exhausted reason; carried separately so a budget-tuning loop can isolate this signal. |
+| `sbproxy_capture_dropped_total` | 6 000 | Labels: `workspace` (sanitized), `dimension` (token\|cost\|attribution\|other), `reason` (queue_full\|backend_error\|policy_block\|budget_exhausted). Per-workspace tokenomics capture-drop counter (rolls up the budget-dropped sub-counter below). |
+| `sbproxy_capture_budget_dropped_total` | 2 000 | Labels: `workspace` (sanitized), `dimension` (token\|cost\|attribution\|other). Subset of `sbproxy_capture_dropped_total` for the budget-exhausted reason; carried separately so a budget-tuning loop can isolate this signal. |
 | `sbproxy_mirror_state_drift_total` | 1 | Counter; per-request increments when the request-mirror's primary and shadow responses diverge enough that a downstream replay would notice. Always sample to a debug log so the trigger is investigatable. |
-| `sbproxy_policy_audit_events_total` | 1 200 | Labels: `verdict` (allow\|deny\|warn), `surface` (http\|mcp\|a2a\|admin), `policy_id` (sanitised). Per-event audit-channel counter; the policy-decision path emits one per evaluated policy. |
-| `sbproxy_policy_audit_events_dropped_total` | 40 | Labels: `tenant` (sanitised). Counts the policy-audit events dropped because the per-tenant queue was full. A non-zero rate here means the operator should raise `policy.audit.queue_size` or shed load. |
+| `sbproxy_policy_audit_events_total` | 1 200 | Labels: `verdict` (allow\|deny\|warn), `surface` (http\|mcp\|a2a\|admin), `policy_id` (sanitized). Per-event audit-channel counter; the policy-decision path emits one per evaluated policy. |
+| `sbproxy_policy_audit_events_dropped_total` | 40 | Labels: `tenant` (sanitized). Counts the policy-audit events dropped because the per-tenant queue was full. A non-zero rate here means the operator should raise `policy.audit.queue_size` or shed load. |
 | `sbproxy_decision_audit_events_total` | 126 | Labels: `event` (the decision event's stable label), `outcome` (allow\|deny\|flag\|mutate\|decline\|error\|timeout). Counts decision-audit records accepted by the audit bus. Both labels are closed by construction, so the cap is the exact product of 18 events and 7 outcomes rather than an estimate. Read it beside the drop counter below: on its own a drop counter cannot tell a healthy quiet feed from a broken one, because both read zero. |
 | `sbproxy_decision_audit_events_dropped_total` | 18 000 | Labels: `event`, `tenant`. Counts decision-audit records lost before publication, because the shared audit queue was full or its consumer was gone. The cap is 18 closed event values against the shared `tenant` budget of 1000; in practice the family is sparse, since it only writes when a record is dropped. A non-zero rate is a lossy audit trail, and a lossy trail reads as an absence of decisions, so alert on it. |
 | `sbproxy_policy_decision_duration_seconds_bucket` | 60 | Labels: `surface`; histogram buckets 100us..1s. Time-to-decision per policy surface. Pair with `sbproxy_policy_evaluation_duration_seconds_bucket` for end-to-end policy latency. |
-| `sbproxy_mcp_policy_hook_invocations_total` | 2 000 | Labels: `verdict` (allow\|deny\|warn), `mcp_server` (sanitised), `tool_name` (sanitised). Counts per-tool MCP policy-hook decisions. |
+| `sbproxy_mcp_policy_hook_invocations_total` | 2 000 | Labels: `verdict` (allow\|deny\|warn), `mcp_server` (sanitized), `tool_name` (sanitized). Counts per-tool MCP policy-hook decisions. |
 | `sbproxy_judge_calls_total` | 60 | Labels: `provider` (openai\|anthropic\|...), `verdict` (pass\|fail\|abstain), `cached` (true\|false). Counter for the AI judge surface (rubric / scorer eval calls). |
 | `sbproxy_judge_latency_seconds_bucket` | 240 | Labels: `provider`, `cached`; histogram buckets 100ms..30s. Per-judge call latency. |
 | `sbproxy_judge_cost_usd` | 10 | Labels: `provider`. Counter; per-provider judge spend in USD. |
@@ -319,7 +319,7 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_ai_cost_dollars_attributed_total` | 8 000 | Labels: same shape as `sbproxy_ai_tokens_attributed_total` but valued in USD, and without `direction`. Pair with the tokens counter to derive the per-attribution unit cost. `sum by (agent_id)` over this counter is the Prometheus answer to "which agent spent this"; the durable rollups below answer the same question across restarts. |
 | `sbproxy_ai_wasted_tokens_total` | 8 000 | Labels: `kind` (duplicate_request\|abandoned_stream\|validation_failed\|context_bloat\|failover_loser) plus the standard attribution labels. Counts tokens spent that did NOT survive to a useful response. Drives the FOCUS waste-signal export. |
 | `sbproxy_ai_wasted_cost_dollars_total` | 8 000 | Same shape as `sbproxy_ai_wasted_tokens_total` but valued in USD. |
-| `sbproxy_ai_cascade_tier_outcomes_total` | 200 | Labels: `tier` (the cascade-rule tier name, sanitised), `outcome` (advanced\|blocked\|served). Counts each cascade-rule tier outcome the AI router observed. |
+| `sbproxy_ai_cascade_tier_outcomes_total` | 200 | Labels: `tier` (the cascade-rule tier name, sanitized), `outcome` (advanced\|blocked\|served). Counts each cascade-rule tier outcome the AI router observed. |
 | `sbproxy_ai_native_bypass_total` | 100 | Labels: `inbound_format`, `provider_format`. Counts requests where the inbound surface format matched the provider format so the AI dispatch could bypass the translate-and-re-translate path. |
 | `sbproxy_ai_output_throughput_tokens_per_second_bucket` | 800 | Labels: `provider`, `model`; histogram buckets 1..1000 tokens/sec. Per-completion output throughput; pair with `sbproxy_ai_ttft_seconds_bucket` for the full latency story. |
 | `sbproxy_ai_ratelimit_rejected_total` | 1 000 | Labels: `axis` (provider\|model\|virtual_key), `key_hash` (truncated stable hash of the rate-limited key), `model`. Counts AI requests refused at the per-axis rate limiter before reaching the provider. |
@@ -380,7 +380,7 @@ GET /api/usage/spend?window=24h&group_by=model
 GET /api/usage/spend?from=1760000000&to=1760086400&group_by=team
 ```
 
-`window` is one of `1h | 24h | 7d | 30d`; `from` / `to` are Unix seconds and override the window; `group_by` is one of `provider | model | tenant | team | api_key | project | origin | agent | total`. Rollup rows written by builds that predate the `origin` or `agent` dimension group under the empty segment, so a history that spans an upgrade shows the older traffic as one unattributed series rather than dropping it. The response carries `bucket_secs` (3600 while the window is inside the hourly retention, 86400 past it), time-ordered `buckets` (`ts_secs`, `group`, `requests`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `ok`, `blocked`, `error`), and window `totals` in the same shape. Calling `/api/usage/spend` with no parameters keeps returning the legacy process-lifetime totals. The admin Spend page renders this history with a range selector, so yesterday's spend still renders after a restart.
+`window` is one of `1h | 24h | 7d | 30d`; `from` / `to` are Unix seconds and override the window; `group_by` is one of `provider | model | tenant | team | api_key | project | origin | agent | property:<key> | total`, where `property:<key>` groups by a promoted attribution property (percent-encode the colon, or send it raw; both decode the same). Rollup rows written by builds that predate the `origin` or `agent` dimension group under the empty segment, so a history that spans an upgrade shows the older traffic as one unattributed series rather than dropping it. The response carries `bucket_secs` (3600 while the window is inside the hourly retention, 86400 past it), time-ordered `buckets` (`ts_secs`, `group`, `requests`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `ok`, `blocked`, `error`), and window `totals` in the same shape. Calling `/api/usage/spend` with no parameters keeps returning the legacy process-lifetime totals. The admin Spend page renders this history with a range selector, so yesterday's spend still renders after a restart.
 
 The bucket schema doubles as the ingestion contract for external spend pipelines: the same events feed the rollups and the usage sinks, so a durable analytics store can consume the identical dimensions.
 
@@ -461,7 +461,7 @@ Required on every line:
 | `msg` | string | Human-readable message |
 | `target` | string | Module path |
 | `event_type` | string enum | See list below |
-| `schema_version` | string | `"1"` for the Wave 1 schema |
+| `schema_version` | string | `"2"` for the current structured-log schema (redaction markers moved to the `[REDACTED:<NAME>]` shape at v2; the pre-v2 `<redacted:name>` form is gone) |
 
 Required when the line is request-scoped:
 
@@ -496,18 +496,20 @@ Agent-to-agent lines additionally carry the run correlation columns, so a multi-
 
 Read `a2a_identity_verified` before aggregating on `a2a_context_id`. An unverified caller picks its own context id, so it can merge its usage into another caller's run or shard one run across unbounded distinct ids. A per-run total computed without that filter is a number the caller chose. The `sbproxy_a2a_hops_total` metric splits hops the same way with its `allow:verified` and `allow:unverified` decision labels.
 
-Event types pinned for Wave 1: `request_started`, `request_completed`, `request_error`, `policy_evaluated`, `policy_blocked`, `action_challenge_issued`, `action_redeemed`, `ledger_call`, `audit_emit`, `notify_dispatch`, `boot`, `config_reload`, `health_status_change`.
+`event_type` is the `EventType` enum from `crates/sbproxy-observe/src/events.rs`, and it is closed at 11 values: `request_started`, `request_completed`, `request_error`, `auth_denied`, `policy_denied`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, `guardrail_triggered`, `config_reloaded`. The same enum drives the `events:` webhook sink, so a log line's `event_type` and the event names an operator can subscribe to under `events.types:` are the same closed set.
 
 ### Redaction policy
 
-Sensitive fields are matched by **field key**, not by value heuristics. Field names that the redactor matches: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-stripe-signature`, `stripe-signature`, `*_secret`, `*_token`, `*_key`, `prompt`, `messages`, `ja3`, `ja4`.
+Sensitive fields are matched by **field key** (case-insensitively), not by value heuristics. `crates/sbproxy-observe/src/logging.rs`'s `match_denylist` is the built-in baseline: `dpop`; `authorization` / `proxy-authorization`; `cookie` / `set-cookie`; `x-stripe-signature` / `stripe-signature`; any key containing `stripe_sk`, plus `stripe_secret_key`, `x-stripe-key`, `x_stripe_key`; `ledger_hmac_key` / `sbproxy_ledger_hmac_key`; `kya_token`, any key starting with `kya_`, `x-kya`, `x_kya`; `oauth_client_secret`; `payment_receipt_secret`, `x-sb-receipt-secret`, `x_sb_receipt_secret`; `prompt` / `messages`; `envelope_payload_raw`; any bundle-declared `secret_vars` / `masked_vars` field; and, only on external-scope sinks, `ja3`, `ja3_hash`, `ja4`, `ja4_hash` (kept on internal sinks). A final generic pass catches anything not already matched above that is `api_key`, `x-api-key`, an operator-configured swept header, or ends in `_secret`, `_token`, `_key`, `-secret`, `-token`, or `-key`.
 
-Each match replaces the value with a marker. As of schema v2, every marker uses the `[REDACTED:<NAME>]` shape (the pre-v2 `<redacted:name>` form is gone):
+Each match replaces the value with a marker. As of schema v2, most built-ins carry a name-specific marker (`[REDACTED:AUTHORIZATION]`, `[REDACTED:STRIPE_SECRET_KEY]`, `[REDACTED:PROMPT_BODY]`, and so on); the generic suffix pass at the end is the one exception and always emits `[REDACTED:API_KEY]`, whatever the field was actually called. The pre-v2 `<redacted:name>` marker shape is gone:
 
 ```json
 { "headers": { "authorization": "[REDACTED:AUTHORIZATION]" } }
 { "stripe_sk": "[REDACTED:STRIPE_SECRET_KEY]" }
 { "messages": "[REDACTED:PROMPT_BODY]" }
+{ "payment_receipt_secret": "[REDACTED:PAYMENT_RECEIPT_SECRET]" }
+{ "widget_token": "[REDACTED:API_KEY]" }
 ```
 
 ### Operator-extensible redaction
@@ -685,7 +687,7 @@ origins:
 
 #### Reversible PII redaction (AI origins)
 
-Customer copilots and internal assistants need the LLM to personalise its response with the same value the user typed (the customer's name, order number, or email). A destructive redactor would replace that value with `[REDACTED:EMAIL]` on the way out, the LLM would echo the marker back, and the response would no longer feel personal. The reversible pass solves this: the request body is masked with a placeholder before forwarding upstream, the LLM responds with the placeholder echoed in its reply, and the gateway restores the original value before writing the response to the client. The original lives only in memory for the request lifetime; it is never written to access log, audit log, or trace span.
+Customer copilots and internal assistants need the LLM to personalize its response with the same value the user typed (the customer's name, order number, or email). A destructive redactor would replace that value with `[REDACTED:EMAIL]` on the way out, the LLM would echo the marker back, and the response would no longer feel personal. The reversible pass solves this: the request body is masked with a placeholder before forwarding upstream, the LLM responds with the placeholder echoed in its reply, and the gateway restores the original value before writing the response to the client. The original lives only in memory for the request lifetime; it is never written to access log, audit log, or trace span.
 
 Opt-in per rule via `reversible: true` on the `pii:` block, which sits inside the `ai_proxy` action (the same placement as [examples/pii-redaction/sb.yml](../examples/pii-redaction/sb.yml)):
 

@@ -1,6 +1,6 @@
 # agent_budget: per-agent semantic rate limit
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![agent_budget: per-agent semantic rate limit](../../docs/assets/agent-budget.gif)
 
@@ -18,7 +18,12 @@ make run CONFIG=examples/agent-budget/sb.yml
 
 ```bash
 # Same User-Agent (Cursor) → same agent_id → one shared bucket.
-# First 60 in a 60s window return 200; the next 10 return 429.
+# The bucket starts full at 60 tokens (from requests_per_minute) and
+# refills at 1 token/second, so the first ~60 requests return 200 and
+# the rest return 429 once it's empty. The exact cutover isn't a clean
+# 60/10 split: tokens keep trickling back in while the loop is still
+# running, so a few extra requests past 60 can succeed depending on
+# how long each round trip takes.
 for i in $(seq 1 70); do
   curl -s -o /dev/null -w '%{http_code}\n' \
     -H 'Host: ai.local' \
@@ -27,6 +32,6 @@ for i in $(seq 1 70); do
 done
 ```
 
-Switch the User-Agent string to one the resolver maps to a different `agent_id` and observe a separate bucket. Set `on_anonymous: shared` to put all anonymous traffic in one fallback bucket; set `on_exceed: downgrade` to have the AI gateway pick a cheaper provider instead of returning 429.
+Switch the User-Agent string to one the resolver maps to a different `agent_id` and observe a separate bucket. Set `on_anonymous: shared` to put all anonymous traffic in one fallback bucket; set `on_exceed: downgrade` to have the AI gateway pick a cheaper provider instead of returning 429. Note that `burst` caps simultaneous in-flight requests per agent, not extra per-minute quota, so a serial loop like the one above never touches it.
 
 See [docs/agent-budget.md](../../docs/agent-budget.md) for the full schema.

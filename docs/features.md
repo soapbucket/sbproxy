@@ -1,5 +1,5 @@
 # SBproxy Features Hub
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-16*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
@@ -22,7 +22,7 @@ Traffic can be distributed across upstream targets using 8 algorithms (including
 * **Examples:** [Load Balancer](../examples/load-balancer/), [Active Health Checks](../examples/active-health-checks/), [Circuit Breaker](../examples/circuit-breaker/), [LB Deployment](../examples/load-balancer-deployment/)
 
 ### Authentication & Authorization
-Protect your endpoints with 7 built-in authentication types: API Keys, Basic Auth, Bearer tokens, JWT (with JWKS), Forward Auth, Digest, and mTLS. You can also enforce fine-grained access control.
+Protect your endpoints with 10 built-in authentication types: API Keys, Basic Auth, Bearer tokens, JWT (with JWKS), Forward Auth, Digest, mTLS, Web Bot Auth, CAP, and OIDC. You can also enforce fine-grained access control.
 * **Docs:** [OIDC Auth](auth-oidc.md), [Object Authz](object-authz.md), [Key Management](key-management.md), [Web Bot Auth](web-bot-auth.md)
 * **Examples:** [Auth JWT](../examples/auth-jwt/), [Auth Forward](../examples/auth-forward/), [mTLS Client Auth](../examples/mtls-client-auth/), [API Key](../examples/auth-api-key/), [Basic Auth](../examples/auth-basic/), [Bearer Token](../examples/auth-bearer/), [Bearer DPoP](../examples/auth-bearer-dpop/), [CAP Auth](../examples/auth-cap/), [Inbound Keys](../examples/keys-inbound-headers/), [Sessions](../examples/sessions/)
 

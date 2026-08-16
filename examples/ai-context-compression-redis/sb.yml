@@ -13,8 +13,9 @@ proxy:
     bind: 127.0.0.1
     port: 9090
     username: admin
-    # Demo password for local validate/run. Change before any non-loopback bind.
-    password: demo-change-me
+    # No credential lives in this file; the README's Prerequisites section
+    # has you export ADMIN_PASSWORD before starting sbproxy.
+    password: ${ADMIN_PASSWORD}
 
   # compression.state.backend: redis binds to this process-wide Redis store.
   l2_cache_settings:

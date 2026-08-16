@@ -1,6 +1,6 @@
 # DLP catalog
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![DLP catalog](../../docs/assets/dlp-catalog.gif)
 
@@ -21,7 +21,7 @@ curl -i -H 'Host: api.local' \
 # HTTP/1.1 403 Forbidden
 # content-type: application/json
 #
-# {"error":"forbidden","reason":"dlp: detector aws_access matched"}
+# {"error":"dlp: detector aws_access matched"}
 
 # Tag path: a Slack token in a header is forwarded but tagged.
 curl -i -H 'Host: tag.local' \

@@ -1,6 +1,6 @@
 # Forward auth
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![Forward auth](../../docs/assets/auth-forward.gif)
 
@@ -22,7 +22,7 @@ Auth service answers 200, request is forwarded:
 $ curl -i -H 'Host: fwd.local' -H 'Authorization: Bearer demo' \
        http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
-content-type: application/json
+content-type: application/json; charset=utf-8
 
 {"method":"GET","url":"/get","headers":{"authorization":"Bearer demo","host":"test.sbproxy.dev",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 ```
@@ -43,9 +43,9 @@ To see the rejection path, change `url` in the config to `https://test.sbproxy.d
 ```bash
 $ curl -i -H 'Host: fwd.local' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
 
 ## What this exercises

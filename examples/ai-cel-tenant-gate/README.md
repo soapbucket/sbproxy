@@ -1,6 +1,6 @@
 # CEL tenant gate on AI traffic
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![CEL tenant gate on AI traffic](../../docs/assets/ai-cel-tenant-gate.gif)
 
@@ -21,7 +21,7 @@ curl -i http://127.0.0.1:8080/v1/chat/completions \
   -H 'Host: ai.local' -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 # HTTP/1.1 403 Forbidden
-# X-Tenant header required for AI access
+# {"error":"X-Tenant header required for AI access"}
 ```
 
 ```bash
@@ -31,7 +31,7 @@ curl -i http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 # HTTP/1.1 403 Forbidden
-# tenant not provisioned for AI access
+# {"error":"tenant not provisioned for AI access"}
 ```
 
 ```bash

@@ -1,6 +1,6 @@
 # Rate limit by JWT claim
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Rate limit by JWT claim](../../docs/assets/ratelimit-by-claim.gif)
 
@@ -24,17 +24,21 @@ TOKEN_A='eyJhbGciOiJIUzI1NiJ9.eyJ0ZW5hbnRfaWQiOiJhY21lIn0.SIG'
 # Tenant B: { "tenant_id": "globex" }.
 TOKEN_B='eyJhbGciOiJIUzI1NiJ9.eyJ0ZW5hbnRfaWQiOiJnbG9iZXgifQ.SIG'
 
-# Tenant A burns through its bucket. The first 20 (burst) succeed instantly,
-# then the limiter throttles to 100/min steady state.
+# Tenant A burns through its bucket. The first ~20 (burst) succeed
+# (a few more may slip through from mid-loop refill at 100/min), then
+# the limiter throttles to 100/min steady state.
 for i in $(seq 1 25); do
   curl -s -o /dev/null -w '%{http_code}\n' \
     -H 'Host: api.local' -H "Authorization: Bearer $TOKEN_A" \
     http://127.0.0.1:8080/anything
 done
-# 200 200 200 ... 200 (20x)
+# 200 200 200 ... 200 (~20x)
 # 429 429 ...
-# Last 429 carries: Retry-After: 1
-# X-Ratelimit-Limit: 100  X-Ratelimit-Remaining: 0
+# Last 429 carries: Retry-After: <a couple seconds, varies with timing>
+# X-Ratelimit-Limit: 20  X-Ratelimit-Remaining: 0
+#
+# X-Ratelimit-Limit reports the bucket's burst capacity (20), not
+# requests_per_minute (100).
 
 # Tenant B's bucket is untouched. It still has its full burst.
 for i in $(seq 1 5); do

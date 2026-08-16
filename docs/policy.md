@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -241,7 +241,7 @@ Both header signals are the caller's to send or withhold, and an undetected requ
 Knobs:
 
 - `max_chain_depth`: hard ceiling on hops. Capped at 32 regardless of the configured value. Exceeding it returns 429.
-- `cycle_detection`: `strict` (exact `agent_id` + `request_id` pair must not repeat), `by_agent_id` (default; callee `agent_id` must not appear earlier in the chain), or `by_callable_endpoint` (`agent_id` + endpoint must not repeat). Cycles return 409.
+- `cycle_detection`: `strict` (exact `agent_id` + `request_id` pair must not repeat; the request id checked is the parent request's, so a peer that omits it is not checked for cycles), `by_agent_id` (default; callee `agent_id` must not appear earlier in the chain), or `by_callable_endpoint` (`agent_id` + endpoint must not repeat). Cycles return 409.
 - `allow_cycles`: when true, the cycle check is skipped.
 - `callee_allowlist`: when non-empty, only listed callees pass. Off-list callees return 403.
 - `caller_denylist`: agents on this list never get past the policy. Returns 403.

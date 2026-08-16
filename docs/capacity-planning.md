@@ -1,5 +1,5 @@
 # Capacity planning
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 How fast SBproxy runs is measured and published. How big a pod it needs is
 not. This page says exactly which is which, gives you a starting point that
@@ -15,7 +15,7 @@ about memory, pod sizing, and what happens when you get the sizing wrong.
 |---|---|---|---|
 | Requests per second, 12 scenarios | Published, `c3-standard-8` | [performance.md](performance.md) | No. Harness is in a separate repo. |
 | p50 / p99 latency per scenario | Published | [performance.md](performance.md) | No. Same harness. |
-| Throughput against 7 competing proxies and gateways | Published, campaign `20260424-220610` | [`BENCHMARK.md`](../BENCHMARK.md) | No. Same harness. |
+| Throughput against 11 competing proxies and gateways | Published, campaign `20260424-220610` | [`BENCHMARK.md`](../BENCHMARK.md) | No. Same harness. |
 | Three-node mesh throughput and failover | Published | [performance.md](performance.md) | No. Same harness. |
 | Resident set at idle | 77.5 MB, one process, one machine, one config | [sidecar-deployment.md](sidecar-deployment.md) | Yes, one command. |
 | Resident set under load | **Unknown.** Nothing published. | none | Yes, and the harness is already here. |

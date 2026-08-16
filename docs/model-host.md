@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -1063,7 +1063,7 @@ readiness probe and dispatch path are identical.
 engines:
   sglang:
     launch: uv
-    version: 0.4.6.post1
+    version: 0.5.2
     acceleration: cuda
 models:
   - model: qwen3-32b
@@ -1073,10 +1073,10 @@ models:
 Choose SGLang when you want RadixAttention prefix caching, higher structured-output
 throughput, or better behavior under high-concurrency agent traffic. It shares
 tensor parallelism, quantization, and context sizing with vLLM, and the runtime
-owns `--model-path`, `--host`, `--port`, and `--tp-size` so config cannot
-contradict the device placement. Its stable extra-argument allowlist is
-`--enable-torch-compile`, `--disable-radix-cache`, `--schedule-conservativeness`,
-and `--mem-fraction-static`.
+owns `--model-path`, `--host`, `--port`, `--tp-size`, and `--mem-fraction-static`
+so config cannot contradict the device placement or fight the fit planner's
+memory sizing. Its stable extra-argument allowlist is `--enable-torch-compile`,
+`--disable-radix-cache`, and `--schedule-conservativeness`.
 
 vLLM stays the default. SGLang is an explicit opt-in: `engine: auto` never
 resolves to it, and you name `engine: sglang` on a model or an `sglang` block

@@ -1,6 +1,22 @@
 # ai-waste-signals
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
+
+> **Known issue: `duplicate_request` and `context_bloat` never fire.**
+> `response_dedup` below is not a recognized config key: the proxy accepts
+> it silently (no validation error, no warning) and it has no effect, so
+> the "Drive a `duplicate_request` waste event" walkthrough does not
+> actually produce a cache hit. Sending the same payload twice makes two
+> full upstream calls (confirmed: two different response ids, near-identical
+> latency, `served_from_cache: false` on both access-log rows). More
+> generally, the `duplicate_request` and `context_bloat` waste kinds are
+> defined in the metric taxonomy (`sbproxy_ai_wasted_tokens_total{kind=...}`
+> registers and accepts both label values) but nothing in the request path
+> currently records either one; only `validation_failed`, `abandoned_stream`,
+> and `failover_loser` are wired up to real events. This is a product gap,
+> not a config mistake: fixing it needs a `response_dedup` implementation
+> (or equivalent) and a `context_bloat` detector wired into the AI dispatch
+> path, tracked for follow-up.
 
 Tokenomics layer: surface tokens spent with no outcome. The proxy
 emits two Prometheus counters per waste class so a FinOps dashboard
@@ -25,11 +41,11 @@ Attribution labels without a value (here `feature`, `agent_type`, and `environme
 
 | kind | Triggered by |
 |---|---|
-| `duplicate_request` | Exact-context resend; the `response_dedup` layer caught it. Re-tagging the spend as wasted is the canonical reuse signal. |
-| `abandoned_stream` | The client cancelled or the upstream completed but the client never read it. Input + reasoning tokens still billed. |
-| `validation_failed` | The request completed upstream but the gateway's structured-output / guardrail validation rejected the result; the spend happened anyway. |
-| `context_bloat` | Input token count significantly above the route's rolling median (free-form heuristic signal an oversized prompt was sent). |
-| `failover_loser` | A cascade tier returned a body but lost (5xx, refusal, or below its quality threshold) to a later tier; the losing tier's tokens bought no served outcome. |
+| `duplicate_request` | **Not currently emitted; see the known-issue note above.** Documented intent: exact-context resend caught by a `response_dedup` layer, re-tagged as wasted spend. |
+| `abandoned_stream` | The client cancelled or the upstream completed but the client never read it. Input + reasoning tokens still billed. Live. |
+| `validation_failed` | The request completed upstream but the gateway's structured-output / guardrail validation rejected the result; the spend happened anyway. Live. |
+| `context_bloat` | **Not currently emitted; see the known-issue note above.** Documented intent: input token count significantly above the route's rolling median. |
+| `failover_loser` | A cascade tier returned a body but lost (5xx, refusal, or below its quality threshold) to a later tier; the losing tier's tokens bought no served outcome. Live. |
 
 ## Run
 
@@ -40,10 +56,13 @@ make run CONFIG=examples/ai-waste-signals/sb.yml
 
 ## Drive a `duplicate_request` waste event
 
-The `response_dedup` layer in this config catches exact-context
-resends; the second call hits the cached response. The waste-tagger
-registers the duplicate as wasted spend on the duplicate's wire
-shape.
+**Currently a no-op; see the known-issue note at the top.** The intent:
+a `response_dedup` layer catches exact-context resends and the second
+call hits a cached response, with the waste-tagger registering the
+duplicate as wasted spend. As shipped, both calls below make a full,
+separate upstream request (different response ids, comparable latency,
+`served_from_cache: false` on both access-log rows), and no
+`duplicate_request` sample appears on either counter.
 
 ```bash
 PAYLOAD='{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hello"}]}'
@@ -68,7 +87,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 curl -s http://127.0.0.1:8080/metrics | grep -E "^sbproxy_ai_wasted"
 ```
 
-Expected (counter samples; values depend on the actual prompt):
+As shipped, no `kind="duplicate_request"` sample appears at all (see the
+known-issue note at the top); both calls above are plain cache misses. This
+is the sample shape once `response_dedup` and the `duplicate_request` waste
+kind are wired up:
 
 ```
 sbproxy_ai_wasted_tokens_total{agent_type="",environment="",feature="",kind="duplicate_request",model="claude-haiku-4-5",project="demo",provider="anthropic",surface="chat_completions",team="demo-team"} 5

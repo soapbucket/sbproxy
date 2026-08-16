@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -8,7 +8,7 @@ SBproxy is an AI gateway that governs traffic in both directions. Most AI gatewa
 
 | Tool | Type | AI Gateway | General Proxy | Single Binary | Scripting |
 |------|------|-----------|---------------|---------------|-----------|
-| **SBproxy** | Proxy + AI gateway | Yes (200+ models) | Yes | Yes (Rust) | CEL + Lua + WASM + JS |
+| **SBproxy** | Proxy + AI gateway | Yes (200+ models) | Yes | Yes (Rust) | CEL + Rego + Lua + WASM + JS |
 | LiteLLM | AI gateway only | Yes (100+ providers) | No | No (Python) | No |
 | Portkey | AI gateway (SaaS) | Yes | No | No (Node.js) | No |
 | Helicone | AI observability | Proxy + observability | No | No (managed or self-host) | No |
@@ -75,7 +75,7 @@ SBproxy fits when you need a production reverse proxy *and* an AI gateway in the
 
 - **You run both kinds of traffic.** HTTP and LLM. Most teams glue Nginx or Traefik together with LiteLLM, Portkey, or a SaaS AI gateway. Two systems to configure, deploy, and monitor. SBproxy is one binary, one config, one place to put policies.
 - **You care about overhead.** Sub-millisecond p99 on the proxy path. One binary, no interpreter and no database on the request path; the last measured idle resident set was 77.5 MB on a minimal sidecar config, and memory under load has not been measured (see [capacity-planning.md](capacity-planning.md)). LiteLLM wants 4 CPU and 8 GB plus Python, PostgreSQL, and Redis. Managed gateways add a public network hop.
-- **You want scripting that ships in the binary.** CEL for routing (compiled once, evaluates in microseconds), Lua for transforms, JavaScript via QuickJS, and sandboxed WebAssembly for plugins. No C modules to compile, no separate plugin daemon.
+- **You want scripting that ships in the binary.** CEL for routing (compiled once, evaluates in microseconds), Rego for policy evaluation via the Regorus interpreter, Lua for transforms, JavaScript via QuickJS, and sandboxed WebAssembly for plugins. No C modules to compile, no separate plugin daemon.
 - **You need MCP federation.** SBproxy proxies and federates Model Context Protocol traffic alongside HTTP and AI. No other general-purpose proxy ships this.
 - **You want to self-host without a database.** Single binary. No PostgreSQL.
   Redis is optional. Configure it for Redis-backed features such as exact
@@ -111,7 +111,7 @@ SBproxy reaches 200+ models through 72 native providers behind one OpenAI-compat
 | Upstream creds encrypted at rest | Yes (AEAD envelope or vault ref) | Varies |
 | Verifiable, signed usage ledger | Yes | No |
 | Clustering substrate (gossip mesh, no Postgres) | Yes | No |
-| Scripting | CEL + Lua + WASM + JS | No |
+| Scripting | CEL + Rego + Lua + WASM + JS | No |
 | Rate limiting | Built-in (node-local; cluster-wide needs a shared backend) | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |
 | Guardrails | 10 built-in types (PII, injection, ...) | External integrations |
@@ -171,7 +171,7 @@ capabilities via plugins in 2024.
 | Implementation | Native binary on Pingora | Lua/C (OpenResty) |
 | Database | Not required | PostgreSQL (or DB-less mode) |
 | AI gateway | Native | Plugin-based |
-| Plugin system | CEL + Lua + WASM + JS + registry | Lua plugins |
+| Plugin system | CEL + Rego + Lua + WASM + JS + registry | Lua plugins |
 | HTTP/3 | Planned | No |
 | Rate limiting | Built-in, distributed | Plugin |
 | Authentication | 7+ built-in types | Plugin-based |
@@ -194,16 +194,16 @@ Caddy is a Go reverse proxy known for automatic HTTPS.
 | AI gateway | Yes (200+ models) | No |
 | Config format | YAML | Caddyfile or JSON |
 | Rate limiting | Built-in, distributed | Community module |
-| Scripting | CEL + Lua + WASM + JS | Modules |
+| Scripting | CEL + Rego + Lua + WASM + JS | Modules |
 | HTTP/3 | Planned | Yes |
 | Compression | Gzip, Brotli, Zstd | Gzip, Brotli, Zstd |
 | Circuit breaker | Built-in (3-state) | Latency-based |
 | Health checks | Active + passive | Active + passive |
 | Retries | Configurable with backoff | Configurable |
 | PROXY protocol | Yes (v1) | Yes (v1/v2) |
-| Service discovery | DNS SRV, Consul | SRV, A/AAAA |
+| Service discovery | Config-based + DNS (A/AAAA re-resolution) | SRV, A/AAAA |
 | Load balancing | 8 algorithms | 12+ algorithms |
-| WAF | Built-in baseline (16 CRS-derived rules, no SecLang engine) | Community module |
+| WAF | Built-in baseline (12 CRS-derived rules, no SecLang engine) | Community module |
 | DDoS protection | Built-in | No |
 | gRPC proxy | Yes | Yes |
 | MCP federation | Yes | No |
@@ -229,11 +229,11 @@ Traefik is a cloud-native reverse proxy with automatic service discovery.
 |---|---------|---------|
 | Service discovery | Config-based + DNS | Docker, K8s, Consul |
 | AI gateway | Yes | No |
-| Middleware | CEL + Lua + WASM + JS + built-in | Declarative chain |
+| Middleware | CEL + Rego + Lua + WASM + JS + built-in | Declarative chain |
 | HTTP/3 | Planned | Experimental |
 | Rate limiting | Built-in, distributed | Traefik Hub only (paid) |
 | MCP federation | Yes | No |
-| Plugin system | CEL + Lua + WASM + JS | WASM/Yaegi |
+| Plugin system | CEL + Rego + Lua + WASM + JS | WASM/Yaegi |
 
 Choose Traefik if you need automatic service discovery from Docker or Kubernetes labels.
 
@@ -250,7 +250,7 @@ Nginx is the most widely deployed reverse proxy.
 | AI gateway | Yes | No |
 | gRPC proxy | Yes | Yes |
 | MCP federation | Yes | No |
-| Scripting | CEL + Lua + WASM + JS | Lua (OpenResty) / C modules |
+| Scripting | CEL + Rego + Lua + WASM + JS | Lua (OpenResty) / C modules |
 | HTTP/3 | Planned | Yes (newer builds) |
 | Active health checks | Built-in | NGINX Plus only |
 | Dynamic config | Feature flags | NGINX Plus only |
@@ -275,7 +275,7 @@ directly means writing your proxy logic in Rust against its `ProxyHttp` trait.
 |---|---------|---------|
 | Out-of-the-box config | YAML, hot reload | None, you write Rust |
 | Auth, policies, transforms, AI | Built-in | DIY |
-| Plugin ecosystem | CEL + Lua + WASM + JS + native | DIY in Rust |
+| Plugin ecosystem | CEL + Rego + Lua + WASM + JS + native | DIY in Rust |
 | Operational tooling | Metrics, dashboards, events | DIY |
 
 Choose Pingora directly if you have narrow custom requirements and a team comfortable
@@ -298,7 +298,7 @@ Envoy is a high-performance L4/L7 proxy designed for service mesh deployments.
 | Rate limiting | Built-in | External gRPC service |
 | Caching | Built-in | No |
 | Authentication | 7+ built-in types | External service or filters |
-| Extensibility | CEL + Lua + WASM + JS | WASM |
+| Extensibility | CEL + Rego + Lua + WASM + JS | WASM |
 
 Choose Envoy if you're building a service mesh or need L4 TCP proxying with advanced
 traffic management.

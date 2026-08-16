@@ -1,10 +1,10 @@
 # AI gateway: SSE streaming
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![AI gateway: SSE streaming](../../docs/assets/ai-streaming.gif)
 
-Streaming is on by default in the AI gateway. The minimal Anthropic origin in this example handles `"stream": true` requests end-to-end: sbproxy opens a server-sent-events connection to the upstream, forwards each chunk as it arrives, and harvests token usage from the final chunk into the `sbproxy_ai_tokens_total` counter. The streaming analytics module records time-to-first-token, tokens per second, and average inter-token latency for every streamed request. No special config is required; the behaviour is selected by the client request body.
+Streaming is on by default in the AI gateway. The minimal Anthropic origin in this example handles `"stream": true` requests end-to-end: sbproxy opens a server-sent-events connection to the upstream, forwards each chunk as it arrives, and harvests token usage from a dedicated usage chunk near the end of the stream into the `sbproxy_ai_tokens_total` counter. The streaming analytics module records time-to-first-token, tokens per second, and average inter-token latency for every streamed request. No special config is required; the behaviour is selected by the client request body.
 
 ## Run
 
@@ -29,18 +29,22 @@ $ curl --no-buffer -s http://127.0.0.1:8080/v1/chat/completions \
       "messages": [{"role": "user", "content":
         "Stream a short story about a lighthouse keeper, six sentences."}]
     }'
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-haiku-4-5","choices":[{"index":0,"delta":{"role":"assistant","content":"The "},"finish_reason":null}]}
+data: {"id":"msg_...","object":"chat.completion.chunk","model":"claude-haiku-4-5-20251001","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-haiku-4-5","choices":[{"index":0,"delta":{"content":"lighthouse "},"finish_reason":null}]}
+data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"The "},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-haiku-4-5","choices":[{"index":0,"delta":{"content":"keeper "},"finish_reason":null}]}
+data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"lighthouse "},"finish_reason":null}]}
 
 ...
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-haiku-4-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":18,"completion_tokens":97,"total_tokens":115}}
+data: {"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":97,"total_tokens":115}}
+
+data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
+
+Only the first chunk carries `id` and `model`; every later chunk omits both. `usage` and `finish_reason` arrive on two separate trailing chunks rather than combined into one, and `model` echoes the upstream provider's full versioned model id (Anthropic's dated snapshot), not the alias from the request body.
 
 Python, OpenAI SDK:
 
@@ -68,7 +72,7 @@ A non-streaming request to the same endpoint still works and returns a single JS
 
 - `ai_proxy` action - SSE streaming front door over Anthropic upstream
 - `text/event-stream` response framing - one `data:` line per delta, `data: [DONE]` terminator
-- Token accounting on the final chunk - `sbproxy_ai_tokens_total` increment
+- Token accounting on a dedicated usage chunk before the terminal `finish_reason` chunk - `sbproxy_ai_tokens_total` increment
 - Streaming analytics - TTFT, TPS, and inter-token latency metrics emitted per stream
 
 ## See also

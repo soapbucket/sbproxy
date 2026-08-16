@@ -1,10 +1,10 @@
 # Forward rules
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![Forward rules](../../docs/assets/forward-rules.gif)
 
-A single origin on `gateway.local` dispatches incoming requests to three different inline child origins based on path. Requests to `/api/*` proxy to `dummyjson.com` with the `/api` prefix stripped, `/admin/*` returns a static JSON banner, and anything else falls through to the default action that proxies to `test.sbproxy.dev/anything`. Forward rules are evaluated in order; first match wins. Each rule embeds a full child origin via the `origin:` field so rules can carry their own action and request modifiers.
+A single origin on `gateway.local` dispatches incoming requests to four different inline child origins based on path, header, or query string. Requests to `/api/*` proxy to `dummyjson.com` with the `/api` prefix stripped, `/admin/*` returns a static JSON banner, any request carrying `X-Beta-User: true` returns a beta-cohort banner regardless of path, any request with `?env=staging` returns a staging banner, and anything else falls through to the default action that proxies to `test.sbproxy.dev/anything`. Forward rules are evaluated in order; first match wins. Each rule embeds a full child origin via the `origin:` field so rules can carry their own action and request modifiers.
 
 ## Run
 
@@ -32,12 +32,20 @@ curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/health
 # Verify the X-Routed-By header set by the /api/* child origin.
 curl -si -H 'Host: gateway.local' http://127.0.0.1:8080/api/products/1 | grep -i x-routed-by
 # x-routed-by: forward-rule-api
+
+# Header-based dispatch: X-Beta-User: true wins regardless of path.
+curl -s -H 'Host: gateway.local' -H 'X-Beta-User: true' http://127.0.0.1:8080/anything
+# {"tier":"beta","message":"beta cohort routing"}
+
+# Query-based dispatch: ?env=staging wins regardless of path.
+curl -s -H 'Host: gateway.local' 'http://127.0.0.1:8080/anything?env=staging'
+# {"env":"staging","message":"staging routing via query param"}
 ```
 
 ## What this exercises
 
-- `forward_rules` - path-based dispatch to inline child origins
-- `path.prefix` rule matcher
+- `forward_rules` - path-, header-, and query-based dispatch to inline child origins
+- `path.prefix`, `header`, and `query` rule matchers
 - Inline child `origin:` blocks with their own `action` and `request_modifiers`
 - `static` action as a non-proxy default for stub responses
 - URL path rewriting via `request_modifiers.url.path.replace`

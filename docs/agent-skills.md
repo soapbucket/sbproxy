@@ -1,6 +1,6 @@
 # Agent Skills v0.2.0
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 SBproxy serves an Agent Skills v0.2.0 discovery manifest at
 `/.well-known/agent-skills/index.json`. Cooperative agents fetch the
@@ -166,10 +166,14 @@ entirely (no empty advertisement).
 ## `resources.listChanged` capability and manifest refresh
 
 When `agent_skills:` is configured, the `initialize` response also
-advertises `capabilities.resources.listChanged: true`. The manifest is
-exposed to MCP clients as a resource; `listChanged` is the signal that
-the resource set can change and the client should subscribe to
-refresh notifications instead of caching the manifest forever.
+advertises `capabilities.resources.listChanged: true`. `listChanged`
+signals that a resource set can change and the client should not
+cache it forever. The flag is set from the presence of `agent_skills:`
+config (or a federated upstream that advertises its own resources);
+it does not mean the agent skills manifest is enumerable through
+`resources/list` or fetchable through `resources/read`. Those two
+methods only serve the MCP federation resource registry, which is a
+separate system from the agent-skills well-known projection.
 
 ```json
 "capabilities": {
@@ -178,24 +182,22 @@ refresh notifications instead of caching the manifest forever.
 }
 ```
 
-How a client uses this depends on its transport:
+The proxy does run a persistent server-to-client stream: a `GET` with
+`Accept: text/event-stream` opens an SSE channel that pushes
+`notifications/resources/list_changed` when the MCP federation
+resource registry changes. That registry only tracks resources
+fetched from federated upstream MCP servers, so an `agent_skills:`
+config reload does not push a notification over this channel today.
+A client that wants to notice a manifest change has to re-fetch
+`/.well-known/agent-skills/index.json` on its own cadence: the
+endpoint sets no `Cache-Control` or `Last-Modified` header and does
+not support conditional `If-Modified-Since` / `If-None-Match`
+requests, so every fetch returns the full manifest body.
 
-* **Persistent server-push transport** (the MCP streamable HTTP
-  transport's GET-SSE channel, when present): the client opens the
-  SSE channel and waits for a `notifications/resources/list_changed`
-  push. The proxy will emit that frame when the manifest regenerates,
-  once the server-side SSE push channel ships in a future release.
-* **Request/response only** (the common case today): the client
-  treats the manifest like any other long-cached HTTP resource and
-  uses the `Cache-Control` / `Last-Modified` headers on the
-  well-known endpoint, polling with `If-Modified-Since` when its
-  internal cadence allows. The advertised `listChanged: true` is the
-  hint that polling IS expected; without it, a client might cache
-  the manifest indefinitely.
-
-The capability is omitted entirely when `agent_skills:` is not
-configured, so a legacy client that keys off field presence does not
-subscribe to a channel that has nothing to emit.
+The `resources` capability is omitted when neither `agent_skills:` is
+configured on the origin nor any federated upstream advertises
+resources, so a legacy client that keys off field presence does not
+subscribe to a channel that has nothing to emit for it.
 
 ## Inspection
 

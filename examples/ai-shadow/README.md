@@ -1,6 +1,6 @@
 # AI shadow / side-by-side evaluation
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Each request is forwarded to the primary provider as usual; a copy is also sent to the shadow provider concurrently. The shadow response is drained and never reaches the client; metadata is logged at `target=sbproxy_ai_shadow` so it can be filtered into a dedicated stream with provider, status, latency_ms, prompt_tokens, completion_tokens, and finish_reason. Useful for validating a model swap before flipping primary traffic, comparing finish_reason or token counts across providers, and spot-checking guardrail or routing changes without exposing experimental output to users. `sample_rate: 0.1` mirrors 10% of traffic; set to 1.0 to mirror every request (doubles spend on the shadow leg).
 

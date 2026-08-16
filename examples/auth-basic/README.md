@@ -1,10 +1,10 @@
 # HTTP Basic authentication
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![HTTP Basic authentication](../../docs/assets/auth-basic.gif)
 
-Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials get a 401 carrying a `WWW-Authenticate: Basic realm="sbproxy demo"` challenge so browsers prompt the user. Credentials are matched against the static `users` list before `test.sbproxy.dev` is contacted. Passwords are stored in plain in this example so it stays reproducible; in production you would interpolate them from the environment or the vault.
+Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials, or with the wrong password, get a plain `401` with a JSON body; the configured `realm` is not currently emitted as a `WWW-Authenticate` challenge, so browsers will not auto-prompt for credentials on this origin (see the note under "Try it"). Credentials are matched against the static `users` list before `test.sbproxy.dev` is contacted. Passwords are stored in plain in this example so it stays reproducible; in production you would interpolate them from the environment or the vault.
 
 ## Run
 
@@ -16,16 +16,20 @@ No env vars required.
 
 ## Try it
 
-No credentials, browser-style challenge:
+No credentials:
 
 ```bash
 $ curl -i -H 'Host: basic.local' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-www-authenticate: Basic realm="sbproxy demo"
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
+
+Note: no `WWW-Authenticate` header is sent, so a browser will not pop its native
+credentials dialog against this origin; the request just gets a 401. The `realm`
+field in `sb.yml` is accepted by config validation but is not currently wired
+into the response.
 
 Valid credentials, request forwarded:
 
@@ -55,7 +59,7 @@ HTTP/1.1 401 Unauthorized
 ## What this exercises
 
 - `authentication.type: basic_auth` - HTTP Basic with allowlisted users
-- `realm` - presented in the `WWW-Authenticate` challenge so browsers prompt
+- `realm` - accepted in config; not currently surfaced on the wire (see note above)
 - `users` list - `username` / `password` pairs validated locally
 
 ## See also

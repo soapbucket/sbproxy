@@ -1,6 +1,6 @@
 # API key authentication
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![API key authentication](../../docs/assets/auth-api-key.gif)
 
@@ -21,9 +21,9 @@ Missing key, request is rejected before the upstream is contacted:
 ```bash
 $ curl -i -H 'Host: api.local' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
 
 Valid key, request is forwarded:
@@ -43,9 +43,9 @@ Wrong key, also rejected:
 $ curl -i -H 'Host: api.local' -H 'X-Api-Key: not-on-the-list' \
        http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
 
 The second valid key works the same way:

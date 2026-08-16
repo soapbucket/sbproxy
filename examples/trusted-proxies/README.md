@@ -1,6 +1,6 @@
 # Trusted proxies
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Trusted proxies](../../docs/assets/trusted-proxies.gif)
 
@@ -18,20 +18,22 @@ sbproxy serve -f sb.yml
 # Localhost is in 127.0.0.1/32, so XFF is honoured.
 curl -s -H 'Host: localhost' \
      -H 'X-Forwarded-For: 203.0.113.7' \
-     http://127.0.0.1:8080/headers | jq '.headers["X-Forwarded-For"], .headers["X-Real-Ip"]'
+     http://127.0.0.1:8080/headers | jq '.headers["x-forwarded-for"], .headers["x-real-ip"]'
 # "203.0.113.7, 127.0.0.1"
 # "203.0.113.7"
 
 # A request from outside the trust list (simulate by removing 127.0.0.1/32
 # and reloading) would see XFF stripped before processing:
-# {"X-Forwarded-For": "127.0.0.1", "X-Real-Ip": "127.0.0.1"}
+# {"x-forwarded-for": "127.0.0.1", "x-real-ip": "127.0.0.1"}
 
 # IPv6 example. The config also trusts 2001:db8::/32.
 curl -s -H 'Host: localhost' \
      -H 'Forwarded: for="[2001:db8::1]"' \
-     http://127.0.0.1:8080/headers | jq '.headers["Forwarded"]'
+     http://127.0.0.1:8080/headers | jq '.headers["forwarded"]'
 # "for=\"[2001:db8::1]\""
 ```
+
+Note: `test.sbproxy.dev` runs behind a hosting CDN that treats `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, and `X-Forwarded-Proto` as security-sensitive and overwrites them with its own edge-observed values before building the JSON body. So the live response from the commands above will show the CDN's values, not sbproxy's, even though sbproxy applied the trust-list logic correctly on its own hop (confirmed by reading the forwarding-header code directly). To see sbproxy's own resolved values rather than the upstream's echo of them, point the origin at a backend you control and inspect what it receives, or check sbproxy's access log, which records the resolved `client_ip` for every request.
 
 ## What this exercises
 

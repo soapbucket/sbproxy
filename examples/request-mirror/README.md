@@ -1,6 +1,6 @@
 # Request mirror
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Request mirror](../../docs/assets/request-mirror.gif)
 
@@ -18,7 +18,7 @@ sbproxy serve -f sb.yml
 # Single request: client sees the test.sbproxy.dev body. The mirror at test.sbproxy.dev/echo
 # also receives the request asynchronously.
 curl -s -H 'Host: localhost' http://127.0.0.1:8080/get | jq .url
-# "https://test.sbproxy.dev/get"
+# "/get"
 
 # Quick burst to show that the client never blocks on the mirror.
 for i in $(seq 1 5); do

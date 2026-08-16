@@ -24,9 +24,11 @@
 #   curl -H 'Host: api.local' http://127.0.0.1:8080/get
 #
 # What the upstream sees:
-#   - TLS SNI: cdn.provider.net    (from sni_override)
-#   - TCP peer: 203.0.113.7:443    (from resolve_override)
-#   - HTTP Host: api.local          (default; would override here)
+#   - TLS SNI: cdn.provider.net       (from sni_override)
+#   - TCP peer: 203.0.113.7:443       (from resolve_override)
+#   - HTTP Host: api.example.com      (default: the URL's host, not the
+#                                      client's Host header; host_override
+#                                      would replace this)
 
 proxy:
   http_bind_port: 8080

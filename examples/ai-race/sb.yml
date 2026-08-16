@@ -4,13 +4,12 @@
 #
 # Trade-off: race minimizes p99 latency by always taking the fastest
 # provider for any given request; the cost is N times the API spend
-# (one paid completion per provider per request). Pair with
-# `resilience` so persistently slow providers fall out of the
-# eligible set instead of getting dialed for every request forever.
-#
-# Race is wired through the same `Router::eligible_indices` filter
-# the other strategies use, so circuit-breaker / outlier-detection
-# ejections continue to apply.
+# (one paid completion per provider per request). `resilience.outlier_detection`
+# below is meant to eject a persistently failing provider from the race, but
+# as of this pass it does not: the race dispatch path in
+# crates/sbproxy-core/src/server/ai_dispatch.rs never feeds a losing racer's
+# outcome to the circuit breaker or outlier detector, so ejection never
+# fires for race traffic (SUSPECTED PRODUCT BUG; see examples/ai-race/README.md).
 #
 # Run:
 #   export OPENAI_API_KEY=sk-...

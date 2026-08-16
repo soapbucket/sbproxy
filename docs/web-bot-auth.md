@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 ![an unsigned crawler request rejected with 401 and a signature-required challenge](assets/web-bot-auth.gif)
 
@@ -184,7 +184,7 @@ A signature that omits any required component fails verification. Components are
 
 ## Pairing with AI Crawl Control
 
-`bot_auth` and `ai_crawl_control` (F1.7) compose:
+`bot_auth` and `ai_crawl_control` compose:
 
 ```yaml
 origins:

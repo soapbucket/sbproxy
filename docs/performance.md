@@ -1,5 +1,5 @@
 # Performance
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
@@ -125,7 +125,7 @@ number.
 | Instance type (proxy + origin) | `c3-standard-8` (8 vCPU Sapphire Rapids, dedicated) |
 | Instance type (loadgen) | `c3-standard-22` |
 | Region / zone | `us-central1-a` |
-| Build profile | `release` with `lto = "fat"`, `codegen-units = 1`, `strip = true` |
+| Build profile | `release` with `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"` |
 | Allocator | mimalloc |
 | Run duration | 60 seconds, 3 replicates per scenario, median reported |
 | Logging | Compile-stripped debug/trace via `tracing` `release_max_level_info` |

@@ -1,6 +1,6 @@
 # Request limit
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Request limit](../../docs/assets/request-limit.gif)
 
@@ -22,12 +22,7 @@ $ curl -i -H 'Host: limit.local' \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{
-  "args": {},
-  "data": "{\"hello\":\"world\"}",
-  "json": {"hello":"world"},
-  ...
-}
+{"method":"POST","url":"/post","headers":{...},"query":{},"timestamp":"..."}
 ```
 
 ```bash
@@ -37,20 +32,28 @@ $ curl -i -H 'Host: limit.local' \
        --data-binary "$(head -c 4096 /dev/urandom | base64)" \
        http://127.0.0.1:8080/post
 HTTP/1.1 413 Payload Too Large
-content-type: text/plain
+content-type: application/json
 
-request body exceeds max_body_size
+{"error":"request entity too large"}
 ```
 
 ```bash
 # URL longer than 256 chars - rejected
 $ curl -i -H 'Host: limit.local' \
-       "http://127.0.0.1:8080/post?$(head -c 300 /dev/urandom | base64 | tr -d '\n' | cut -c1-300)"
-HTTP/1.1 414 URI Too Long
-content-type: text/plain
+       "http://127.0.0.1:8080/post?$(python3 -c "print('a'*300)")"
+HTTP/1.1 413 Payload Too Large
+content-type: application/json
 
-request URL exceeds max_url_length
+{"error":"request entity too large"}
 ```
+
+Every `request_limit` violation returns the same generic `413` with
+`{"error":"request entity too large"}`, regardless of which specific cap
+(body, header count, header size, URL length, query length) tripped. The
+policy does compute a specific reason internally (e.g. `"URL length 312
+exceeds limit 256"`), but that detail only reaches the `debug`-level proxy
+log, never the client response, so do not rely on the status code or body
+to tell the caps apart.
 
 ## What this exercises
 

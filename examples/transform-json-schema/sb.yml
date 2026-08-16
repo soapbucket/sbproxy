@@ -8,8 +8,12 @@
 # Two origins:
 #   - `schema-ok.local` returns a body that matches the schema, so the
 #     transform lets it through.
-#   - `schema-bad.local` returns a body that violates the schema, so the
-#     transform rejects it (proxy returns 502 / synthetic error).
+#   - `schema-bad.local` returns a body that violates the schema. On a
+#     `type: proxy` action, `fail_on_error: true` rejects with a 502.
+#     KNOWN LIMITATION: on `type: static` (as used by both origins
+#     below), a transform failure is currently only logged as a warning
+#     and the original static body is still served with its configured
+#     status; `fail_on_error` has no effect here. See README.md.
 #
 # Run:
 #   make run CONFIG=examples/transform-json-schema/sb.yml

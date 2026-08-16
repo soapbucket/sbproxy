@@ -1,6 +1,6 @@
 # CAP token authentication
 
-*Last modified: 2026-05-07*
+*Last modified: 2026-08-16*
 
 ![CAP token authentication](../../docs/assets/auth-cap.gif)
 
@@ -46,25 +46,29 @@ python3 -m pip install cryptography
 Missing token, request rejected:
 
 ```bash
-$ curl -i -H 'Host: cap.localhost' http://127.0.0.1:8080/blog/article
+$ curl -i -H 'Host: cap.localhost' http://127.0.0.1:8080/anything/blog/article
 HTTP/1.1 401 Unauthorized
-WWW-Authenticate: CAP error="missing_token"
+WWW-Authenticate: License
 ```
+
+(RSL 1.0 names the challenge scheme `License`, not `CAP`; an invalid token adds an `error="<code>"` parameter, shown further down.)
 
 Valid token in the documented `CAP-Token` header, request forwarded:
 
 ```bash
 $ TOKEN=$(cat /tmp/cap.jwt)
 $ curl -i -H 'Host: cap.localhost' -H "CAP-Token: $TOKEN" \
-       http://127.0.0.1:8080/blog/article
+       http://127.0.0.1:8080/anything/blog/article
 HTTP/1.1 200 OK
 ```
+
+The path is `/anything/blog/article`, not `/blog/article`: the token's default `glob` claim is `/anything/blog/**`, matching the shared `test.sbproxy.dev` fixture's catch-all echo route so a successful CAP verification actually gets a `200` from the upstream instead of that origin's 404 page.
 
 The token also flows through the `Authorization: CAP <jwt>` scheme:
 
 ```bash
 $ curl -i -H 'Host: cap.localhost' -H "Authorization: CAP $TOKEN" \
-       http://127.0.0.1:8080/blog/article
+       http://127.0.0.1:8080/anything/blog/article
 HTTP/1.1 200 OK
 ```
 
@@ -73,7 +77,7 @@ Tampered signature, rejected with 401:
 ```bash
 $ BAD="${TOKEN%.*}.AAAAtamperedSignatureBytesAreNotARealEd25519Signature"
 $ curl -is -H 'Host: cap.localhost' -H "CAP-Token: $BAD" \
-       http://127.0.0.1:8080/blog/article | head -n 1
+       http://127.0.0.1:8080/anything/blog/article | head -n 1
 HTTP/1.1 401 Unauthorized
 ```
 
@@ -82,7 +86,7 @@ Wrong audience, rejected with 403 (the token is signed correctly but does not au
 ```bash
 $ python3 examples/auth-cap/mint.py --aud api.different.com > /tmp/cap-bad-aud.jwt
 $ curl -is -H 'Host: cap.localhost' -H "CAP-Token: $(cat /tmp/cap-bad-aud.jwt)" \
-       http://127.0.0.1:8080/blog/article | head -n 1
+       http://127.0.0.1:8080/anything/blog/article | head -n 1
 HTTP/1.1 403 Forbidden
 ```
 

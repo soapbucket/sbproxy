@@ -2,9 +2,13 @@
 
 > **Snippet, depends on a live upstream.** `federated_servers[].origin` here
 > is `github.example.com`, an RFC 2606 reserved placeholder, not a running
-> MCP server, so this config cannot be run end-to-end as-shipped: `tools/list`
-> against it hits a DNS error. Point the origin at your own MCP server to
-> exercise the RBAC and quota behavior below. See
+> MCP server, so this config cannot be run end-to-end as-shipped: federation
+> degrades per-server, so `gh` is silently absent from `tools/list` (an
+> empty `{"tools":[]}`, not a client-visible error) and any `tools/call`
+> against it fails closed with `"unknown tool"` before RBAC or quota
+> checks ever run, since a tool must first resolve in a live catalog
+> snapshot. Point the origin at your own MCP server to exercise the RBAC
+> and quota behavior below. See
 > [`examples/mcp-federation`](../mcp-federation/) for the base federation
 > mechanics and the same caveat spelled out in full.
 
@@ -17,7 +21,7 @@ Run it:
 sbproxy serve -f sb.yml
 ```
 
-What proves it is working:
+What proves it is working, once `origin` points at a real MCP server:
 
 - A `tools/call` for `gh.search_repos` is allowed and forwarded.
 - A `tools/call` for any other tool returns a JSON-RPC error and the

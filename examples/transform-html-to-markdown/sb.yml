@@ -1,10 +1,10 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # HTML to Markdown transform.
 #
-# Scrapes test.sbproxy.dev/html (a public Moby-Dick excerpt page) and converts the
-# HTML body into Markdown using ATX-style headings (`#`, `##`, ...). Useful for
-# feeding HTML pages into LLM pipelines that prefer Markdown, or for archiving
-# pages in a portable format.
+# Scrapes test.sbproxy.dev/html (a small fixed-shape HTML fixture the project
+# serves for this purpose) and converts the HTML body into Markdown using
+# ATX-style headings (`#`, `##`, ...). Useful for feeding HTML pages into LLM
+# pipelines that prefer Markdown, or for archiving pages in a portable format.
 #
 # Run:
 #   make run CONFIG=examples/transform-html-to-markdown/sb.yml

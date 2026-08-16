@@ -1,5 +1,5 @@
 # Headers reference
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-16*
 
 Every header SBproxy reads or stamps, with the config that triggers it.
 This is the single source of truth; `docs/manual.md` and the marketing
@@ -18,7 +18,7 @@ also forwarded or stripped depending on trust.
 
 | Header | Description | Source |
 |---|---|---|
-| `X-Request-Id` | Correlation ID. If present (and `proxy.correlation_id.enabled`, the default), its value is adopted as the request's correlation ID; otherwise the proxy mints a UUID v4. The header name is configurable via `proxy.correlation_id.header`. | `crates/sbproxy-core/src/server/request_phase.rs` |
+| `X-Request-Id` | Correlation ID. If present (and `proxy.correlation_id.enabled`, the default), its value is adopted as the request's correlation ID; otherwise the proxy mints a UUID v7 (32 lowercase hex characters, no hyphens). The header name is configurable via `proxy.correlation_id.header`. | `crates/sbproxy-core/src/server/request_phase.rs` |
 | `x-sb-session-id` | Caller-supplied session ULID. Captured when it parses; invalid values are dropped and counted. The admin Sessions page reconstructs only the requests still present in the in-memory ring. | `crates/sbproxy-observe/src/capture.rs` |
 | `x-sb-parent-session-id` | Caller-supplied parent session ULID for chaining agent sessions. Never auto-generated. When both sessions remain in the request ring, the admin console links their hierarchy. | `crates/sbproxy-observe/src/capture.rs` |
 | `x-sb-user-id` | Caller-supplied user identifier. First in the user-ID resolution order, ahead of the JWT `sub` claim and forward-auth headers. | `crates/sbproxy-observe/src/capture.rs` |

@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -171,10 +171,10 @@ A change is compatible only if it holds on all three.
 
 | Change | Grade |
 | ------ | ----- |
-| Input: property removed, newly required, type narrowed, enum narrowed | major |
-| Input: optional property added, enum widened | minor |
-| Output: property removed, type narrowed | major |
-| Output: property added | minor |
+| Input: property removed, newly required, type changed, enum narrowed | major |
+| Input: property added, no longer required, enum widened | minor |
+| Output: property removed, type changed, no longer required | major |
+| Output: property added, newly required, enum widened, enum narrowed | minor |
 | Response shape changed under the same call | major |
 | Description changed meaning or selection intent | major, flagged security-relevant |
 | Description reworded but equivalent; title only | patch |

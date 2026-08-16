@@ -2,15 +2,17 @@
 # RFC 9457 problem-details default renderer.
 #
 # Authoring `problem_details:` on an origin tells the proxy to render any
-# proxy-generated error response that is not matched by a custom
-# `error_pages` entry as `application/problem+json` per RFC 9457. The two
-# blocks compose: per-status custom pages still win when authored.
+# authentication-denial response on that origin that is not matched by a
+# custom `error_pages` entry as `application/problem+json` per RFC 9457.
+# The two blocks compose: per-status custom pages still win when authored.
+# (Policy denials such as ip_filter, waf, and rate limiting are a
+# separate code path and do not go through problem_details.)
 #
 # This example has a single origin protected by API key authentication.
 # Requests without the `X-Api-Key` header get a 401 from the proxy. The
 # `error_pages` block matches 401 explicitly with a hand-authored JSON
-# body. Any *other* proxy-generated error on this origin (e.g. a 403 from
-# a future policy deny) falls through to the problem-details renderer.
+# body. Any *other* authentication-denial status on this origin falls
+# through to the problem-details renderer.
 #
 # Run:
 #   sbproxy serve -f sb.yml
@@ -19,9 +21,12 @@
 #   # 401 hits the custom error_pages entry (authored body wins).
 #   curl -sv -H 'Host: api.local' http://127.0.0.1:8080/get 2>&1 | grep -E '^< HTTP|^\{'
 #
-#   # If we forced a different code (e.g. by adding a policy that denies
-#   # with 403), problem-details kicks in and renders the response as
-#   # application/problem+json with type, title, status, detail, instance.
+#   # If a different authentication failure on this origin produced a
+#   # status other than 401 (the only one error_pages covers here),
+#   # problem-details would render it as application/problem+json with
+#   # type, title, status, detail, instance. This only applies to
+#   # authentication denials, not to policy denials (ip_filter, waf,
+#   # rate limiting, ...), which keep their own response shapes.
 
 proxy:
   http_bind_port: 8080

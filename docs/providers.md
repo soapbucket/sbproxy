@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-16*
 
 SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
@@ -224,9 +224,9 @@ providers:
     display_name: My Provider      # human label (required)
     aliases: [mine, myprov]        # optional alternative lookup names
     default_base_url: https://api.my-provider.com/v1   # required
-    auth_header: Authorization     # header carrying the key (default Authorization)
-    auth_prefix: "Bearer "         # prefix prepended to the key ("" for raw keys)
-    format: openai                 # wire format: openai | anthropic | google | bedrock | custom
+    auth_header: Authorization     # header carrying the key (required)
+    auth_prefix: "Bearer "         # prefix prepended to the key ("" for raw keys, defaults to "")
+    format: openai                 # wire format: openai | anthropic | google | bedrock | custom (required)
     supports_streaming: true
     supports_embeddings: false
     supports_chat: true            # set false for embeddings/rerank-only providers

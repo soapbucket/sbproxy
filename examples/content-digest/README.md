@@ -1,6 +1,6 @@
 # content_digest: RFC 9530 request-body verification
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Demonstrates the `content_digest` policy on a webhook receiver. The proxy hashes every inbound body and compares the result to the `Content-Digest:` header the sender supplied. Mismatch or missing header (with `on_missing: require`) rejects 400 before forwarding to upstream. Useful for any integrity-critical inbox: webhook receivers, payment callbacks, agent endpoints, audit-ingest paths.
 
@@ -22,7 +22,7 @@ curl -X POST -H 'Host: webhook.local' \
   -H "Content-Digest: sha-256=:${DIGEST}:" \
   -H 'Content-Type: application/json' \
   -d "$BODY" \
-  http://127.0.0.1:8080/webhook
+  http://127.0.0.1:8080/echo
 ```
 
 Send the wrong digest or omit it entirely to see the 400:

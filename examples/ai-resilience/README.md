@@ -1,6 +1,6 @@
 # AI gateway resilience primitives
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 Three independent resilience signals run on the AI provider pool. Any one can eject a provider from the routing list. (1) `circuit_breaker` is the classic Closed -> Open -> HalfOpen state machine; five consecutive 5xx or transport errors flip a provider Open for 30s and two successful HalfOpen probes close it again. (2) `outlier_detection` watches a 60-second sliding window; once a provider hits 50% failure rate over five or more requests it is ejected for 30s. (3) `health_check` makes an active HTTP probe to `/models` every 30s, carrying the provider's own credential; three consecutive failures eject and two consecutive successes reinstate. Only a 5xx or an unanswered request counts as a probe failure, so a 401 or a 404 from a vendor that does not serve `/models` cannot eject a provider that is otherwise healthy. When every provider is ejected the router falls back to the unfiltered enabled list rather than refusing the request, so a misconfigured threshold never causes a total outage.
 
@@ -27,8 +27,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 # trips Open within 5 consecutive failures and traffic shifts entirely
 # to Anthropic until the open duration elapses.
 curl -s http://127.0.0.1:8080/metrics 2>/dev/null \
-  | grep -E 'sbproxy_ai_(requests|failovers|request_duration)'
+  | grep -E 'sbproxy_ai_(requests_attributed|provider_attempts|request_duration)'
 ```
+
+There is no metric literally named `sbproxy_ai_failovers`; per-provider outcome (including failovers between providers) is on `sbproxy_ai_provider_attempts_total{provider,outcome}`.
 
 ```bash
 # Outlier detection complements the breaker by ejecting on aggregate

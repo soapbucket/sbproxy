@@ -1,6 +1,6 @@
 # Template transform (minijinja)
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Template transform (minijinja)](../../docs/assets/transform-template.gif)
 
@@ -33,7 +33,7 @@ content-type: text/plain; charset=utf-8
 
 Order ORD-1042 for Ada Lovelace
 ----
-1 x Analytical Engine @ $9999
+1 x Analytical Engine @ $9999.0
 3 x Punch Cards (1000-pack) @ $14.5
 ----
 Total: $10042.5
@@ -44,7 +44,7 @@ Total: $10042.5
 $ curl -s -H 'Host: tmpl.local' http://127.0.0.1:8080/
 Order ORD-1042 for Ada Lovelace
 ----
-1 x Analytical Engine @ $9999
+1 x Analytical Engine @ $9999.0
 3 x Punch Cards (1000-pack) @ $14.5
 ----
 Total: $10042.5

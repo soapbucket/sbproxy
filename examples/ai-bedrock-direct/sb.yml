@@ -59,6 +59,13 @@ origins:
       providers:
         - name: bedrock
           api_key: ${BEDROCK_AUTH}
+          # The registry's default_base_url is the literal, unsubstituted
+          # `https://bedrock-runtime.{region}.amazonaws.com` (there is no
+          # `region:` field that fills it in), so every Bedrock provider
+          # must override `base_url` with a real region or every request
+          # fails at URL-parse time. Override AWS_REGION for a region
+          # other than us-east-1.
+          base_url: https://bedrock-runtime.${AWS_REGION:-us-east-1}.amazonaws.com
           default_model: anthropic.claude-sonnet-4-5-20250929-v1:0
           models:
             - anthropic.claude-sonnet-4-5-20250929-v1:0

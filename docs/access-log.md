@@ -1,6 +1,6 @@
 # Access log
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 ![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
 
@@ -228,7 +228,7 @@ truncated to `max_value_bytes` (default 1024) with a trailing `"..."`
 that counts toward the cap.
 
 A hardcoded denylist of sensitive headers (`authorization`, `cookie`,
-`set-cookie`, `proxy-authorization`, `x-api-key`) is excluded from `*`
+`set-cookie`, `proxy-authorization`, `x-api-key`, `x-sb-api`) is excluded from `*`
 and glob matches. An exact name opts a denied header into capture, and the
 proxy logs a `WARN` at config load so the choice is visible. There are two
 hard exclusions: `dpop` is never loggable, and every header configured as a
@@ -281,6 +281,27 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `response_headers` | object? | Captured response headers, same shape as `request_headers`. |
 | `attribution` | object? | Resolved business attribution tags (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id) merged from the credential `attrs:` and `SB-Attr-*` headers. Same tag set the per-attribution spend metric is labeled by. Absent when none resolved. |
 | `custom` | object? | Operator-defined custom fields from `observability.log.custom_fields:`. See below. Absent when none configured or none resolved. |
+| `envelope_request_id` | string? | Capture envelope ULID, distinct from `request_id` (UUIDv7). Joins this line to the typed capture-envelope stream. |
+| `session_id` | string? | Session identifier: caller-supplied, or auto-generated for anonymous traffic. |
+| `parent_session_id` | string? | Parent session identifier; never auto-generated. Absent when the request carried none. |
+| `tenant_id` | string | Tenant resolved from the matched origin's `tenant_id`. `__default__` for single-tenant deployments. Empty (and omitted) for log rows emitted before the request matched an origin, such as an early 404 on an unknown host. |
+| `principal_kind` | string? | Which kind of principal authenticated the request: `bearer`, `api_key`, `jwt`, `basic_auth`, `oidc`, `forward_auth`, `bot_auth`, `digest`, `cap`, `noop`, `virtual_key`, or `none`. `none` covers origins with no auth provider configured. |
+| `api_key_id` | string? | Stable identifier of the credential (virtual key) that authenticated the request, mirroring the `api_key_id` metric label. Never the raw secret. Absent for un-credentialed requests. |
+| `key_provider` | string? | Recognized native provider label when the request was governed by [native-key policy](key-management.md#attributing-native-provider-keys). Never contains credential material. |
+| `key_mode` | string? | Inbound credential mode: `none`, `minted`, or `native`. |
+| `served_from_cache` | bool? | `true` when the response came from cache (hot or reserve) without contacting the upstream. |
+| `fallback_triggered` | bool? | `true` when the primary upstream failed and a `fallback_origin` served the response. |
+| `retry_count` | int? | Number of upstream retries attempted before the terminal outcome. `0` means the first attempt succeeded. |
+
+A smaller set of additional fields cover agent detection (`agent_id`,
+`agent_class`, `agent_vendor`), AI cost and guardrails (`cost_usd_micros`,
+`guardrail_category`, `guardrail_action`), payment settlement and crawler
+pricing (`payment_rail`, `tier`, `price`, `currency`, `rail`, `txhash`), and
+A2A envelope linkage (`a2a_context_id`, `a2a_identity_verified`). Each is
+documented alongside the feature that produces it rather than repeated here;
+see [agent-budget.md](agent-budget.md), [payment-settlement.md](payment-settlement.md),
+[ai-crawl-control.md](ai-crawl-control.md), [guardrails.md](guardrails.md), and
+[a2a-gateway.md](a2a-gateway.md).
 
 Optional fields are omitted from the JSON object when their value is
 `None`.

@@ -1,6 +1,6 @@
 # Code review rubric
 
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-16*
 
 The checklist an automated reviewer runs against a branch before it
 becomes a PR, and the shape its output takes so the result can be pasted
@@ -163,6 +163,21 @@ past capacity" is.
 - **Fallbacks are reachable and correct.** A decline path that is the
   common case must be the cheapest to express and must not be
   implemented as an error.
+- **A feature that only fires from `response_filter` does nothing for
+  actions that never reach that hook, and the config gives the
+  operator no way to tell.** Anything that injects behavior from
+  Pingora's `response_filter` (a header, a cookie, a rewrite) silently
+  does nothing for `type: static` and `type: mock` origins,
+  which write their response during the request phase and never reach
+  `response_filter`. A 2026-08-16 pass hit this same root cause four
+  independent times in one sweep of shipped examples: SRI header
+  injection, session cookies, CSRF tokens, and `security_headers`'s
+  richer CSP path all no-op on a `static` action while working
+  correctly on `type: proxy`. Each was found separately, by unrelated
+  examples, because nothing short of a live request against the
+  specific action type surfaces it. When a hook lands, ask which
+  action types it actually runs under, not just whether the policy or
+  transform layer accepts the config.
 
 ## 6. Code smell
 
@@ -235,6 +250,22 @@ more than missing code because it is trusted.
   Writing the three security pages, that command found six errors a
   careful manual pass had already missed, including two required fields
   and a detector name that does not exist.
+- **Does a config example that constructs actually behave as documented
+  at runtime?** Passing `sbproxy validate` or the `construct_examples`
+  sweep proves a config compiles and its pipeline builds; it proves
+  nothing about what a live request through it returns. A 2026-08-16
+  pass that booted all 203 shipped examples with the real binary and
+  replayed every documented curl found more than a dozen genuine
+  runtime bugs that every static check had missed clean: response
+  bodies documented as `text/plain` that are actually
+  `application/json` (auth-api-key, cel-policy, ddos-protection, csrf,
+  auth-bearer, ip-filter, request-validator, and others, independently,
+  each time), and examples pointing a backend at `127.0.0.1` with no
+  `proxy.extensions.upstream.allow_private_cidrs`, so the SSRF guard
+  502s the walkthrough before the documented feature ever runs
+  (upstream-retries, grpc-h2c, retry-on-status, keys-inbound-headers,
+  json-schema). Neither class is visible from the config alone; both
+  need a live request.
 - **Does a documented field parse but do something else?** The failure
   above the one people look for. A key can be accepted, warned about at
   load, and then quietly do less than the doc says. `dlp` takes

@@ -1,6 +1,6 @@
 # DDoS protection
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![DDoS protection](../../docs/assets/ddos-protection.gif)
 
@@ -34,12 +34,16 @@ $ for i in $(seq 1 15); do
 
 ```bash
 # Once blocked, even a single request returns 429 with Retry-After
+# (and X-RateLimit-* headers showing the block's remaining time)
 $ curl -i -H 'Host: ddos.local' http://127.0.0.1:8080/echo
 HTTP/1.1 429 Too Many Requests
-retry-after: 10
-content-type: text/plain
+content-type: application/json
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 8
+Retry-After: 8
 
-source IP blocked by ddos_protection
+{"error":"ddos protection: too many requests"}
 ```
 
 ```bash
@@ -52,7 +56,7 @@ HTTP/1.1 200 OK
 
 - `ddos_protection` policy - per-IP burst detection with auto-block
 - `detection.request_rate_threshold` and `detection.detection_window` for the trip condition
-- `mitigation.block_duration` and `mitigation.auto_block` for the hard-block behaviour
+- `mitigation.block_duration` and `mitigation.auto_block` for the hard-block behavior
 - `whitelist` of IPs and CIDRs that bypass the check
 - `echo` action - reflects each accepted request
 

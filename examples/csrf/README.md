@@ -1,8 +1,20 @@
 # CSRF protection
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![CSRF protection](../../docs/assets/csrf.gif)
+
+> **Known issue: no cookie on a `static` action.** As shipped, the safe-method
+> request below does not actually receive a `set-cookie` header: the CSRF
+> enforcer stashes the cookie on the request context for the proxy response
+> path to write, but the `static` action's response is built on a different
+> path that never reads it. The cookie is written correctly when the origin's
+> `action` is `proxy` (confirmed against this same policy block pointed at an
+> upstream instead of `static`). This is a proxy bug, not a config error;
+> tracked for a fix. Steps 2 and 4 below (rejecting a missing or forged
+> token) still work as documented since they do not depend on cookie
+> issuance; step 3 (accepting a valid token) cannot currently be reproduced
+> against this example's shipped config.
 
 Demonstrates the `csrf` policy. Safe methods (`GET`, `HEAD`, `OPTIONS`) are exempt and serve as the channel through which the proxy issues the `csrf_token` cookie. State-changing methods (`POST`, `PUT`, `DELETE`, `PATCH`) must echo the token back in the `X-CSRF-Token` request header; mismatches and missing tokens are rejected with `403`. The action is `static` so the example is self-contained and shows the policy in isolation. Listener is `127.0.0.1:8080`, Host header is `csrf.local`.
 
@@ -28,9 +40,9 @@ content-type: application/json
 # 2. POST without a token - rejected
 $ curl -i -X POST -H 'Host: csrf.local' http://127.0.0.1:8080/submit
 HTTP/1.1 403 Forbidden
-content-type: text/plain
+content-type: application/json
 
-csrf token missing or invalid
+{"error":"CSRF token missing or invalid"}
 ```
 
 ```bash

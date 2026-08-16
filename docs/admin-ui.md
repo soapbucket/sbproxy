@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-16*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -87,9 +87,9 @@ server-side rewrite map).
 ![The admin sign-in form: username and password fields on a plain card](assets/admin-login.png)
 
 Hitting the admin server's root (`/`, `/admin`) redirects to the
-console at `/ui/`, so the bare host in a browser lands somewhere useful
+console at `/admin/ui/`, so the bare host in a browser lands somewhere useful
 instead of on an API 404. From there, any page you open without a live
-session sends you to `/ui/login` with the page you wanted preserved in
+session sends you to `/admin/ui/login` with the page you wanted preserved in
 the `next` query parameter, and signing in returns you to it.
 
 On load, the app calls `GET /admin/session` to recover an existing

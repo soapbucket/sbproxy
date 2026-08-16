@@ -1,10 +1,10 @@
 # HTML to Markdown transform
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![HTML to Markdown transform](../../docs/assets/transform-html-to-markdown.gif)
 
-Demonstrates the `html_to_markdown` transform. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and converts the HTML body into Markdown using ATX-style headings (`#`, `##`, ...). A `response_modifier` rewrites the `Content-Type` header to `text/markdown; charset=utf-8` so the body is delivered with the right MIME. Useful for feeding HTML into LLM pipelines that prefer Markdown, or for archiving pages in a portable format. The origin is reached on `127.0.0.1:8080` via the `tomd.local` Host header.
+Demonstrates the `html_to_markdown` transform. The proxy fetches `https://test.sbproxy.dev/html` (a small fixed-shape HTML fixture the project serves for this purpose) and converts the HTML body into Markdown using ATX-style headings (`#`, `##`, ...). A `response_modifier` rewrites the `Content-Type` header to `text/markdown; charset=utf-8` so the body is delivered with the right MIME. Useful for feeding HTML into LLM pipelines that prefer Markdown, or for archiving pages in a portable format. The origin is reached on `127.0.0.1:8080` via the `tomd.local` Host header.
 
 ## Run
 
@@ -17,11 +17,11 @@ sbproxy serve -f sb.yml
 ```bash
 # Original upstream is HTML
 $ curl -s https://test.sbproxy.dev/html | head -5
-<!DOCTYPE html>
-<html>
-  <head>
-  </head>
-  <body>
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>test.sbproxy.dev sample</title></head>
+<body>
+  <h1>Sample HTML</h1>
 ```
 
 ```bash
@@ -30,15 +30,21 @@ $ curl -i -H 'Host: tomd.local' http://127.0.0.1:8080/html
 HTTP/1.1 200 OK
 content-type: text/markdown; charset=utf-8
 
-# Herman Melville - Moby-Dick
+# Sample HTML
 
-Availing himself of the mild, summer-cool weather that now reigned in these latitudes, ...
+This document exists so sbproxy HTML transforms have a fixed-shape upstream to point at.
+
+- One
+- Two
+- Three
+
+Visit [sbproxy.dev](https://sbproxy.dev) for docs.
 ```
 
 ```bash
 # Heading style is ATX - look for leading hashes, not setext underlines
 $ curl -s -H 'Host: tomd.local' http://127.0.0.1:8080/html | grep -E '^#'
-# Herman Melville - Moby-Dick
+# Sample HTML
 ```
 
 ## What this exercises

@@ -55,6 +55,4 @@ origins:
           default_model: gemini-3.5-flash
           models:
             - gemini-3.5-flash
-            - gemini-3.5-flash
-            - gemini-3.5-flash
       routing: round_robin

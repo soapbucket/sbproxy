@@ -14,19 +14,25 @@
 #
 # Waste classes (the `kind` label):
 #
-#   duplicate_request  - exact-context resend; the response_dedup
-#                        layer caught it. Re-tagging the spend as
-#                        wasted is the canonical reuse signal.
+#   duplicate_request  - NOT CURRENTLY EMITTED. Documented intent:
+#                        exact-context resend caught by a
+#                        response_dedup layer, re-tagged as wasted
+#                        spend. `response_dedup` below is not a
+#                        recognized config key (accepted silently,
+#                        no effect), and nothing in the request path
+#                        records this kind. Confirmed: two identical
+#                        calls both make a full upstream request.
 #   abandoned_stream   - the client cancelled or the upstream
 #                        completed but the client never read it.
-#                        Input + reasoning tokens still billed.
+#                        Input + reasoning tokens still billed. Live.
 #   validation_failed  - the request completed upstream but the
 #                        gateway's structured-output / guardrail
 #                        validation rejected the result; the spend
-#                        happened anyway.
-#   context_bloat      - input token count significantly above the
-#                        route's rolling median (free-form heuristic
-#                        signal an oversized prompt was sent).
+#                        happened anyway. Live.
+#   context_bloat      - NOT CURRENTLY EMITTED, same as
+#                        duplicate_request above. Documented intent:
+#                        input token count significantly above the
+#                        route's rolling median.
 #
 # These are OBSERVATIONAL counters + a USD gauge. They do NOT
 # enforce; pair with the existing budget enforcer (`ai-budget`) for
@@ -39,9 +45,10 @@
 # Run:
 #   make run CONFIG=examples/ai-waste-signals/sb.yml
 #
-# Drive a duplicate-request waste event (response_dedup recognises
-# the second call as a dup and the proxy serves the cached response;
-# the second's input tokens get tagged as wasted):
+# Drive a duplicate-request waste event (documented intent only, see
+# above: response_dedup is a no-op today, so both calls make a full
+# separate upstream request and neither counter gets a
+# duplicate_request sample):
 #   PAYLOAD='{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hello"}]}'
 #   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' \
 #     -H "Authorization: Bearer ${ANTHROPIC_API_KEY}" -d "$PAYLOAD" | head -c 80
@@ -50,10 +57,6 @@
 #
 # Read the waste counters off the data-plane metrics endpoint:
 #   curl -s http://127.0.0.1:8080/metrics | grep -E "^sbproxy_ai_wasted"
-#
-# Expected:
-#   sbproxy_ai_wasted_tokens_total{kind="duplicate_request",...} > 0
-#   sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",...} > 0
 
 proxy:
   http_bind_port: 8080

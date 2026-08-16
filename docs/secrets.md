@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-16*
 
 SBproxy resolves every secret-bearing config value through one reference grammar, checked by one function. A provider credential under `credentials:`, a `source:` block's `credential` field, the `pepper` and `master_key` under `key_management.crypto`, and the value each provider URI on this page resolves to are all meant to go through that same grammar, in the same order, with the same failure behavior. There is nothing field-specific to learn: a form that works in one secret-bearing field works in all of them.
 
@@ -51,7 +51,7 @@ Four shapes make up the current vocabulary. Anything that does not match one of 
 Two older shapes still work, each logging a one-time warning, and neither is what to write in new config:
 
 * **`vault://env/NAME`** resolves `NAME` from the environment, identically to `${NAME}` or `env:NAME`. It predates the provider-specific schemes above; replace it with `${NAME}` or `env:NAME`.
-* **`vault://<alias>/...`** for `alias` in `aws`, `k8s`, `file`, `hashi` rewrites to the matching provider-specific scheme (`awssm://`, `k8ssecret://`, `secretfile://`, `vault://`) with `<alias>` carried over as the backend name. Still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced.
+* **`vault://<alias>/...`** for `alias` in `aws`, `k8s`, `file`, `hashi` rewrites to the matching provider-specific scheme (`awssm://`, `k8ssecret://`, `secretfile://`, `vault://`) with `<alias>` carried over as the backend name. Still accepted with a warning as of SBproxy 1.11.0; the warning names 1.2.0 as the scheduled removal version, but no release has actually removed it yet.
 
 Run this to rewrite known legacy aliases across a config file:
 
@@ -61,7 +61,7 @@ sbproxy config migrate sb.yml --out sb.migrated.yml
 
 ### Removed Forms
 
-The Go-era `secret:<name>` colon form (no `//`) is gone. It is not a fallback and does not pass through: writing it fails config load with a message pointing at the replacement, `localsecret://<backend>/<name>` with a backend declared under `proxy.secrets.backends`. The `proxy.secrets.map` key that used to serve this form still parses but has no effect. Do not confuse the removed colon form with `secret://`/`localsecret://`, the URI scheme documented above, which is deprecated-but-working (`secret://`) or current (`localsecret://`), not removed.
+The Go-era `secret:<name>` colon form (no `//`) is gone. It is not a fallback and does not pass through: writing it fails config load with a message pointing at the replacement, `localsecret://<backend>/<name>` with a backend declared under `proxy.secrets.backends`. The `proxy.secrets.map` key that used to serve this form no longer resolves it, but the key is not fully inert: a non-empty map still installs the process secret resolver even when no backends are declared, and `sbproxy plan` validates any leftover `secret:<name>` string reference against the map's keys, reporting an undeclared one as a `missing-vault-key` finding. Do not confuse the removed colon form with `secret://`/`localsecret://`, the URI scheme documented above, which is deprecated-but-working (`secret://`) or current (`localsecret://`), not removed.
 
 > **Implementation note.** The vocabulary above is transcribed from `crates/sbproxy-vault/src/resolver.rs`'s `SecretResolver::resolve`, the target every secret-bearing field is meant to route through. Most already do: provider credentials, the `source:` block's `credential` field, and at-rest key material under `key_management.crypto` all resolve through it. Two call sites are narrower today, for different reasons:
 >

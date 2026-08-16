@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -563,7 +563,7 @@ through.
 
 The block below is the reference document the config crate validates
 against. Every field is explained after it. Nothing here is resolved,
-opened, or dialled at load: `sbproxy validate` runs this on a machine that
+opened, or dialed at load: `sbproxy validate` runs this on a machine that
 holds none of the credentials.
 
 ```yaml

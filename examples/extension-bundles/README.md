@@ -1,8 +1,8 @@
 # Local extension bundles
 
-*Last modified: 2026-08-03*
+*Last modified: 2026-08-16*
 
-This example loads six extension bundles from a directory next to `sb.yml`. Three routes exercise five HTTP hooks. Four more JavaScript hooks receive normalized AI events, one JavaScript hook receives credential-free payment events such as x402 verification, and the Proxy-Wasm module also handles live AI stream events.
+This example loads seven extension bundles from a directory next to `sb.yml`. Four routes exercise six HTTP hooks. Four more JavaScript hooks receive normalized AI events, one JavaScript hook receives credential-free payment events such as x402 verification, and the Proxy-Wasm module also handles live AI stream events.
 
 ## Run the HTTP hooks
 
@@ -45,6 +45,28 @@ curl -i -H 'Host: filtered.extension.local' \
   http://127.0.0.1:8080/echo
 # HTTP/1.1 200
 # x-extension-filter: proxy-wasm
+```
+
+The fourth route runs a JavaScript auth hook before the action: it verifies an HMAC-SHA256 request signature over `"${keyId}.${timestamp}"`, keyed by `SBPROXY_HMAC_SECRET`.
+
+```bash
+export SBPROXY_HMAC_SECRET=worked-example-secret
+ts=1723600000; key=acct-42
+sig=$(printf '%s.%s' "$key" "$ts" \
+  | openssl dgst -sha256 -hmac "$SBPROXY_HMAC_SECRET" -hex \
+  | sed 's/^.*= //')
+
+curl -i -H 'Host: authenticated.extension.local' \
+  -H "X-Key-Id: $key" -H "X-Timestamp: $ts" -H "X-Signature: $sig" \
+  http://127.0.0.1:8080/
+# HTTP/1.1 200
+# hello from JavaScript
+
+curl -i -H 'Host: authenticated.extension.local' \
+  http://127.0.0.1:8080/
+# HTTP/1.1 401
+# WWW-Authenticate: HMAC realm="sbproxy"
+# valid request signature required
 ```
 
 The first two action hooks finish their requests with bounded local responses. The third route shows how forwarding is wired: `type: proxy` owns the upstream, and its Proxy-Wasm filter runs around that forwarded traffic. A bundle action has no upstream of its own, so `outcome: "proxy"` is rejected with `unsupported_action_outcome`.

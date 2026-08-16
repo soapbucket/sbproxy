@@ -42,13 +42,19 @@ Send a request to either gateway:
 
 ```bash
 curl --include http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Host: localhost' \
   -H 'content-type: application/json' \
   -d '{"model":"qwen","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The response exposes only the logical model and an allowlisted route class of
-`local` or `peer`. It never includes the engine port, model-plane endpoint, or
-worker identity.
+The `Host: localhost` header is required: it is the origin key in `sb.yml`,
+and without it the request has no matching origin and gets a 404 rather than
+reaching the deployment.
+
+The response carries `x-sbproxy-logical-model` and `x-sbproxy-route-class`
+headers (confirmed: `qwen` and `local`) but no port, model-plane endpoint, or
+worker identity. `sbproxy cluster status --format json` (above) is where that
+detail lives, gated behind the admin API.
 
 Stop one process. The surviving status retains the failed node in `nodes`, adds
 it to `unhealthy_nodes`, and excludes it from model eligibility. Start it again

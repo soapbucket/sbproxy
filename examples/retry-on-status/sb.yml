@@ -39,6 +39,19 @@
 proxy:
   http_bind_port: 8080
 
+  # Only because the deliberately-failing backend above runs on
+  # loopback: the SSRF guard refuses private/loopback upstream
+  # addresses unless allowlisted. A production config pointing at a
+  # real upstream does not need this block. Without it every request
+  # that round-robins onto 127.0.0.1:9503 502s at connect time (a
+  # different failure than the 503-retry this example demonstrates)
+  # instead of reaching the backend to get the 503 that retry_on
+  # discards.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
 origins:
   "localhost":
     action:

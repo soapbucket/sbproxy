@@ -7,12 +7,36 @@
 # provenance an auditor reads downstream would name it rather than the
 # authority the values came from.
 proxy:
-  http_bind_port: 8080
+  # Distinct from the authority's own 8080 so both nodes can run on one
+  # box for this walkthrough; a real fleet would have them on separate
+  # hosts and this would not matter.
+  http_bind_port: 8081
+
+  # The README's "see who owns what" / "watch a write get refused" /
+  # "build an editor" sections read this node's own admin API on 9091.
+  # Distinct from the authority's 9090 admin port for the same reason
+  # as http_bind_port above.
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9091
+    username: admin
+    password: ${ADMIN_PASSWORD}
 
   config_authority:
     upstream:
-      # The authority's bundle listener, not its admin port.
-      url: https://control.example.com:9443
+      # The authority's bundle listener, not its admin port. This
+      # matches `sb.yml`'s `config_authority.publish.bind` in this
+      # example (loopback, no TLS block set, so plaintext). A real
+      # deployment reaches the authority over TLS on a routable
+      # address instead.
+      url: http://127.0.0.1:9443
+      # Plaintext http is refused unless acknowledged explicitly: the
+      # fetch carries the fleet credential, so an operator has to opt
+      # in to sending it unencrypted. Loopback-only here, matching
+      # `sb.yml`'s comment above; drop this once the authority has a
+      # real `tls:` block and a routable `https://` upstream.
+      allow_insecure_http: true
       # `overlay` merges the authority's document over this file, leaving
       # anything it does not mention alone. `replace` makes the authority's
       # document the whole configuration and implies

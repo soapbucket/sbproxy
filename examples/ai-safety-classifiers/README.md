@@ -1,6 +1,6 @@
 # Classifier-backed safety guardrails
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-08-16*
 
 Enforce `jailbreak`, `content_safety`, and `toxicity` with one local
 sentence-embedding model and the shipped precomputed centroids. The example
@@ -20,13 +20,17 @@ sbproxy examples/ai-safety-classifiers/sb.yml
 The released binary includes `inprocess-classify`. A source build without
 default features must enable that feature.
 
-Try a clean, non-streaming request:
+Try a clean, non-streaming request. Ask for a short answer: the output
+`toxicity` guardrail below has `max_chars: 2000`, and an open-ended prompt
+like "Explain how a B-tree index works" routinely produces a reply longer
+than that, which fails closed as a buffer overflow rather than passing a
+clean verdict.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Host: ai.local' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-4o-mini","stream":false,"messages":[{"role":"user","content":"Explain how a B-tree index works."}]}'
+  -d '{"model":"gpt-4o-mini","stream":false,"messages":[{"role":"user","content":"In one short sentence, explain how a B-tree index works."}]}'
 ```
 
 Then exercise a semantic jailbreak fixture that does not contain the legacy

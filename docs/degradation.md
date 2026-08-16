@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -51,7 +51,7 @@ content-length: 99
 Date: Sun, 02 Aug 2026 05:08:13 GMT
 Connection: keep-alive
 
-{"note":"admitted under failure_posture: degraded, with no per-key policy or budget","served":true}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+{"note":"admitted under failure_posture: degraded, with no per-key policy or budget","served":true}
 ```
 
 The second presents a token of the same shape that the origin does not know. Same dead store, same posture, different answer, because `degraded` fell through to the origin's auth rather than admitting anything:
@@ -69,14 +69,10 @@ content-length: 24
 Date: Sun, 02 Aug 2026 05:08:13 GMT
 Connection: keep-alive
 
-{"error":"unauthorized"}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+{"error":"unauthorized"}
 ```
 
-The admitted request is the one that leaves a record. This is the whole difference between `degraded` and `open`:
-
-```
-
-```
+The admitted request is the one that leaves a record. This is the whole difference between `degraded` and `open`.
 
 Change the one line to `failure_posture: closed`, the default, and both requests become `503 key store unavailable` without reaching the origin's auth at all.
 

@@ -1,6 +1,6 @@
 # Subresource Integrity (SRI) inspection
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Subresource Integrity (SRI) inspection](../../docs/assets/sri.gif)
 
@@ -24,7 +24,9 @@ content-type: text/html
 <!doctype html>
 <html>
   <head>
+    <!-- This stylesheet has no integrity attribute. SRI logs a violation. -->
     <link rel="stylesheet" href="https://cdn.example.com/theme.css">
+    <!-- This script has integrity. SRI is happy. -->
     <script src="https://cdn.example.com/lib.js"
             integrity="sha384-OLBgp1GsljhM2TJ-sbHjaiH9txEUvgdDTAzHv2P24donTt6_529l+9Ua0vFImLlb"
             crossorigin="anonymous"></script>
@@ -36,15 +38,26 @@ content-type: text/html
 ```
 
 ```bash
-# Inspect the violation counter on the metrics endpoint
-$ curl -s http://127.0.0.1:9091/api/metrics | grep sbproxy_policy_triggers_total
-sbproxy_policy_triggers_total{policy_type="sri",result="violation"} 1
+# Inspect the violation counter. It is served on the main data-plane
+# port too (no admin listener required):
+$ curl -s http://127.0.0.1:8080/metrics | grep sbproxy_policy_triggers_total
+sbproxy_policy_triggers_total{origin="sri.local",policy_type="sri",action="violation",agent_id="",agent_class=""} 1
 ```
 
 ```bash
 # Proxy logs (stderr) include a structured warning per violating tag:
-# WARN sbproxy_security::sri tag=link href=https://cdn.example.com/theme.css reason=missing_integrity
+# WARN sbproxy_core::server::proxy_http: sri: subresource missing or weak integrity attribute hostname="sri.local" tag="link" url="https://cdn.example.com/theme.css" reason=MissingIntegrity
 ```
+
+## Known limitation
+
+The response-body SRI scan hooks into Pingora's upstream `response_filter`,
+which only runs for proxied (`type: proxy`) origins. A `static` action (used
+here so the example runs offline) never passes through that filter, so on
+the current build **neither the warning nor the metric above actually fires**
+for this config. The response body itself is still served byte-for-byte as
+written above. To see the scan fire today, point `sri.local` at a `type:
+proxy` origin serving the same HTML instead of `type: static`.
 
 ## What this exercises
 

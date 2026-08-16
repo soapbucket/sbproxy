@@ -1,8 +1,8 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
-SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
+SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
 | Engine | Implementation | Best for |
 |--------|----------------|----------|
@@ -930,8 +930,10 @@ Sandbox tunables:
 |---|---|---|
 | `module_path` | required | Filesystem path to a `.wasm` module compiled for `wasm32-wasi`. Resolved relative to the proxy's working directory. |
 | `module_bytes` | optional | Inline bytes of a precompiled module. One of `module_path` or `module_bytes` must be set. |
+| `sha256` | optional | Lowercase hex SHA-256 digest the selected module bytes must match; a mismatch is refused before compilation. |
 | `timeout_ms` | 1000 | Hard wall-clock cap per invocation. Enforced via wasmtime's epoch interruption. |
 | `max_memory_pages` | 256 | Linear-memory cap in 64 KiB pages. 256 = 16 MiB. |
+| `max_fuel` | 1,000,000,000 | Deterministic, instruction-granular cap on one invocation, complementing `timeout_ms`. |
 
 There is no filesystem access, no network access, no environment variables, and no clock skew the host can observe.
 
@@ -1279,12 +1281,12 @@ To see custom scripting and transforms in action, refer to these runnable exampl
 
 | Example | What it is | How to use it | Outcome |
 |---------|------------|---------------|---------|
-| [`transform-javascript`](../examples/transform-javascript/) | Advanced payload rewriting via JavaScript. | Attach `engine: javascript` in your `transforms:` block. | Complete, sandboxed V8 execution for deep body surgery. |
-| [`transform-json`](../examples/transform-json/) | Fast structural JSON edits. | Use the native `json:` transform steps. | Cleanly add, remove, or rename JSON fields without a full JS runtime. |
-| [`transform-json-schema`](../examples/transform-json-schema/) | Inbound JSON validation. | Apply a `json_schema` policy. | Blocks invalid or malformed JSON payloads before they hit upstream. |
-| [`transform-markdown`](../examples/transform-markdown/) | HTML to Markdown conversion. | Use `engine: markdown`. | Drastically reduces the token count of scraped web content before feeding it to LLMs. |
-| [`transform-template`](../examples/transform-template/) | Dynamic payload rendering. | Use the `template` transform with Go templates. | Inject proxy state or dynamic values into outgoing payloads. |
-| [`variables-template`](../examples/variables-template/) | Context variable injection. | Access `ctx` inside template transforms. | Passes unique proxy variables (like Request IDs) seamlessly to upstreams. |
+| [`transform-javascript`](../examples/transform-javascript/) | Payload rewriting via JavaScript. | Use `type: javascript` in your `transforms:` block. | Sandboxed QuickJS execution for JSON body edits. |
+| [`transform-json`](../examples/transform-json/) | Fast structural JSON edits. | Use `type: json` with `rename` / `remove` / `set` steps. | Cleanly add, remove, or rename JSON fields without a full JS runtime. |
+| [`transform-json-schema`](../examples/transform-json-schema/) | Response JSON validation. | Apply a `type: json_schema` transform. | Rejects a malformed upstream response with a synthetic 502 before it reaches the client. |
+| [`transform-markdown`](../examples/transform-markdown/) | Markdown to HTML conversion. | Use `type: markdown`. | Renders a Markdown response body as HTML via `pulldown-cmark`. |
+| [`transform-template`](../examples/transform-template/) | Dynamic payload rendering. | Use the `template` transform with minijinja (Jinja-style) syntax. | Renders a structured JSON body into a plain-text (or other) summary. |
+| [`variables-template`](../examples/variables-template/) | Origin variable and env var interpolation. | Reference `{{ variables.<name> }}` / `{{ env.<NAME> }}` in modifier fields. | Injects config-defined values into headers sent upstream, resolved once when the config compiles (not per request). |
 
 ## See also
 

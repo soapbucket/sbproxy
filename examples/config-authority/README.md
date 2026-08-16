@@ -1,6 +1,6 @@
 # Config authority: fleet configuration distribution
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-08-16*
 
 One node signs a configuration and the rest of the fleet verifies it and applies it, so a change ships once instead of being copied to every box. Every payload carries an Ed25519 signature and a monotonic revision, and the authority validates it exactly the way boot does before it signs anything.
 
@@ -238,12 +238,12 @@ curl -sS -u admin:"$ADMIN_PASSWORD" \
   "locally_owned": false,
   "layers": {
     "base": {"kind": "local"},
-    "authority": {"authority_id": "control-plane", "revision": 2, "mode": "overlay"}
+    "authority": {"authority_id": "control-plane-lab", "revision": 2, "mode": "overlay"}
   },
   "provenance": {
     "proxy.http_bind_port": "local",
-    "proxy.admin.bind_port": "local",
-    "origins.api.action.url": "authority"
+    "proxy.admin.port": "local",
+    "origins.edge.example.com.action.url": "authority"
   }
 }
 ```
@@ -255,13 +255,13 @@ curl -sS -u admin:"$ADMIN_PASSWORD" \
 The subscriber's own file is still on disk, and editing the parts the authority owns would look like it worked and then vanish at the next poll. So the write is refused instead:
 
 ```bash
-# The authority sets origins.api.action.url, so this edit cannot survive.
+# The authority sets origins.edge.example.com.action.url, so this edit cannot survive.
 curl -sS -u admin:"$ADMIN_PASSWORD" -X PUT \
   --data-binary @- http://127.0.0.1:9091/admin/config <<'YAML'
 proxy:
   http_bind_port: 8080
 origins:
-  api:
+  edge.example.com:
     action:
       type: proxy
       url: https://not-the-authoritys-value.test
@@ -270,10 +270,10 @@ YAML
 
 ```json
 {
-  "error": "this node does not own the edited path: origins.api.action.url",
+  "error": "this node does not own the edited path: origins.edge.example.com.action.url",
   "code": "config_not_locally_owned",
-  "conflicts": [{"path": "origins.api.action.url", "owner": "authority"}],
-  "remedy": "authority control-plane owns these paths at revision 2; publish the change through the authority with `sbproxy authority publish`"
+  "conflicts": [{"path": "origins.edge.example.com.action.url", "owner": "authority"}],
+  "remedy": "authority control-plane-lab owns these paths at revision 2; publish the change through the authority with `sbproxy authority publish`"
 }
 ```
 
@@ -286,7 +286,7 @@ curl -sS -u admin:"$ADMIN_PASSWORD" -X PUT \
 proxy:
   http_bind_port: 8081
 origins:
-  api:
+  edge.example.com:
     action:
       type: proxy
       url: https://test.sbproxy.dev
@@ -311,7 +311,7 @@ curl -sS -u admin:"$ADMIN_PASSWORD" -D /tmp/schema-headers \
 grep -i etag /tmp/schema-headers
 ```
 
-The document is around 300KB and immutable for a given build, so send the `ETag` back as `If-None-Match` and get a `304` on every load after the first.
+The document is around 440KB and immutable for a given build, so send the `ETag` back as `If-None-Match` and get a `304` on every load after the first.
 
 ## Reference
 

@@ -1,6 +1,6 @@
 # JSON Schema editor integration
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Shows the one-line `# yaml-language-server: $schema=...` directive that wires `schemas/sb-config.schema.json` into your editor. VS Code (with the YAML extension), the IntelliJ / JetBrains family, and Helix all honour it and validate `sb.yml` as you type: field-name autocomplete, typed values (`http_bind_port: "hello"` underlines red), closed-enum dropdowns, and rustdoc tooltips. The schema is generated from the Rust config types, so it cannot drift from the binary. The config itself is a minimal single-origin proxy; the interesting part is line 1.
 

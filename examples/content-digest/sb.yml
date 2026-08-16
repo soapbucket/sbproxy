@@ -38,4 +38,4 @@ origins:
     policies:
       - type: content_digest
         on_missing: require
-        reject_status: 400
+        status: 400

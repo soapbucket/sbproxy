@@ -1,6 +1,6 @@
 # Kubernetes operator quickstart
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
@@ -13,7 +13,7 @@ Before you begin, make sure you have:
   cluster-scoped `sbproxies.sbproxy.dev` and `sbproxyconfigs.sbproxy.dev`
   CRDs.
 - Registry access from each node to pull
-  `ghcr.io/soapbucket/sbproxy:1.10.0`.
+  `ghcr.io/soapbucket/sbproxy:1.11.0`.
 - An operator image you have built and pushed yourself. There is not a
   published one; see "Build the operator image first" below.
 
@@ -28,14 +28,14 @@ helm version
 
 ## Build the operator image first
 
-The data plane image ships on every release. The operator image does not: the release workflow pushes `ghcr.io/soapbucket/sbproxy` and nothing else, so the chart's default `image.repository` of `ghcr.io/soapbucket/sbproxy-k8s-operator` is a path that does not resolve. Install the chart unchanged and the operator pod sits in `ImagePullBackOff`.
+The data plane image ships on every release. The operator image does not: the release workflow pushes `ghcr.io/soapbucket/sbproxy` and `docker.io/soapbucket/sbproxy`, nothing under `sbproxy-k8s-operator`, so the chart's default `image.repository` of `ghcr.io/soapbucket/sbproxy-k8s-operator` is a path that does not resolve. Install the chart unchanged and the operator pod sits in `ImagePullBackOff`.
 
 That is the one piece of this quickstart you have to supply. Build the image from the checkout and push it where your nodes can reach it:
 
 ```bash
 # A registry your cluster nodes can pull from.
 export OPERATOR_REPO=registry.example.com/soapbucket/sbproxy-k8s-operator
-export OPERATOR_TAG=1.10.0
+export OPERATOR_TAG=1.11.0
 
 docker build -t "$OPERATOR_REPO:$OPERATOR_TAG" \
   -f crates/sbproxy-k8s-operator/Dockerfile.ci .
@@ -77,7 +77,7 @@ spec:
         action:
           type: mock
           status: 200
-          body: "hello from sbproxy\\n"
+          body: "hello from sbproxy"
 ---
 apiVersion: sbproxy.dev/v1alpha1
 kind: SBProxy
@@ -85,7 +85,7 @@ metadata:
   name: demo
   namespace: sbproxy-system
 spec:
-  image: ghcr.io/soapbucket/sbproxy:1.10.0
+  image: ghcr.io/soapbucket/sbproxy:1.11.0
   configRef: demo-config
   replicas: 1
   port: 8080
@@ -115,7 +115,7 @@ In another terminal, call the data plane:
 curl -i -H 'Host: demo.example.com' http://127.0.0.1:8080/
 ```
 
-Expect HTTP 200 and `hello from sbproxy`. Check the operator when the workload does not appear or the proxy rejects the configuration:
+Expect HTTP 200 and a body of `"hello from sbproxy"`, quotes included: the mock action always JSON-encodes `body`, so a plain string comes back as a quoted JSON string with a `Content-Type: application/json` header. Check the operator when the workload does not appear or the proxy rejects the configuration:
 
 ```bash
 kubectl logs -n sbproxy-system deployment/sbproxy-k8s-operator

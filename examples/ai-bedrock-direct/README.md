@@ -1,6 +1,6 @@
 # AI gateway: AWS Bedrock direct (Converse API)
 
-*Last modified: 2026-05-15*
+*Last modified: 2026-08-16*
 
 Direct integration with AWS Bedrock's model-agnostic Converse API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to the Converse shape on the way out and converts the response back to OpenAI shape on the way in. Because Converse is model-agnostic, the same configuration fans out across Claude on Bedrock, Llama on Bedrock, Mistral on Bedrock, and Titan, with no per-model branching at the gateway layer. The translator hoists `system` role messages, moves sampling knobs under `inferenceConfig`, rewrites `tools` to `toolConfig.tools[].toolSpec`, drops OpenAI-only fields, rewrites the path to `/model/{modelId}/converse`, then reassembles `choices[].message.content` from Bedrock's content blocks and renames usage fields.
 
@@ -15,7 +15,7 @@ export BEDROCK_AUTH="Bearer ${AWS_SESSION_TOKEN}"
 make run CONFIG=examples/ai-bedrock-direct/sb.yml
 ```
 
-Requires AWS credentials with `bedrock:InvokeModel` permission for the listed models.
+Requires AWS credentials with `bedrock:InvokeModel` permission for the listed models. The registry's default Bedrock URL carries a literal, unsubstituted `{region}` placeholder (there is no `region:` config field that fills it in), so the provider sets `base_url` explicitly; it defaults to `us-east-1` and reads `AWS_REGION` if you need a different one.
 
 ## Try it
 
@@ -59,5 +59,5 @@ The response shape is OpenAI even though Bedrock served it. `usage.prompt_tokens
 ## See also
 
 - [docs/ai-gateway.md](../../docs/ai-gateway.md), AI gateway overview
-- [docs/providers.md](../../docs/providers.md), per-provider behaviour and translator details
+- [docs/providers.md](../../docs/providers.md), per-provider behavior and translator details
 - [docs/configuration.md](../../docs/configuration.md), configuration schema

@@ -20,14 +20,15 @@
 #
 # Test:
 #   # 401 - missing token
-#   curl -i -H 'Host: cap.localhost' http://127.0.0.1:8080/blog/article
+#   curl -i -H 'Host: cap.localhost' http://127.0.0.1:8080/anything/blog/article
 #
-#   # 200 - valid token, glob match
+#   # 200 - valid token, glob match (test.sbproxy.dev/anything/... echoes
+#   # the request back; that is the shared fixture's catch-all route)
 #   curl -i -H 'Host: cap.localhost' \
 #        -H "CAP-Token: $(cat /tmp/cap.jwt)" \
-#        http://127.0.0.1:8080/blog/article
+#        http://127.0.0.1:8080/anything/blog/article
 #
-#   # 403 - same token, path outside the /blog/** glob
+#   # 403 - same token, path outside the /anything/blog/** glob
 #   curl -i -H 'Host: cap.localhost' \
 #        -H "CAP-Token: $(cat /tmp/cap.jwt)" \
 #        http://127.0.0.1:8080/api/private

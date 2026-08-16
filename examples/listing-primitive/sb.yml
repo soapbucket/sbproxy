@@ -46,7 +46,7 @@
 #   curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/.well-known/agent-skills/example-api/index.json
 #
 # Test the re-hosted artifact body:
-#   curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/skills/place-order.md
+#   curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/.well-known/agent-skills/example-api/skills/place-order.md
 
 # sbproxy-docs:begin
 proxy:

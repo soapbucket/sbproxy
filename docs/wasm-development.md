@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-16*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -38,7 +38,9 @@ Whatever the module writes to stdout becomes the new response body.
 If the module writes nothing, the body becomes empty. If `_start`
 traps (panics, hits the timeout, exhausts memory), the transform
 fails and the request follows the standard transform error path
-(see `transforms.fail_on_error` in `configuration.md`).
+(see `transforms.failure_posture` in `configuration.md`; default
+`open` skips the failed transform and forwards the unmodified
+upstream body).
 
 That is the whole ABI. No imports beyond standard WASI. No exports
 beyond `_start`. Any `wasm32-wasi` binary that reads stdin and
@@ -158,6 +160,8 @@ Field reference:
 | `module_bytes` | required (or `module_path`) | Inline bytes. Most useful when configs are fetched from a control plane that already has the module bytes. |
 | `timeout_ms` | 1000 | Hard wall-clock cap. Enforced via wasmtime's epoch interruption, ticked once per millisecond. A module that doesn't yield within this many ticks is aborted with `Trap`. |
 | `max_memory_pages` | 256 | Linear-memory cap in 64 KiB pages. 256 pages = 16 MiB. Raise for transforms that buffer large bodies. Allocations past this cap trap. |
+| `max_fuel` | 1,000,000,000 | Maximum wasmtime fuel (roughly, instructions) one invocation may consume. A deterministic, instruction-granular complement to `timeout_ms`; lower it to put a hard ceiling on per-call CPU. Exhausting the budget traps. |
+| `sha256` | none | Optional lowercase hex SHA-256 the selected module bytes must match. Checked before compilation; a mismatch fails config load without compiling or naming the path in the error. |
 
 Module compilation happens once at config load. A bogus path or a
 malformed `.wasm` fails the load (the proxy will not start with a

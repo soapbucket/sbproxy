@@ -1,6 +1,6 @@
 # Sidecar deployment
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 SBproxy is north-south first: most operators run it as a
 top-of-rack gateway in front of an LLM provider or an internal
@@ -170,10 +170,11 @@ proxy:
   http_bind_port: 15001
 
 origins:
-  # Catch-all hostname. The sidecar instruments every outbound
-  # call the workload makes; layer policy on top without
-  # rewriting the destination.
-  "*":
+  # Origin keys are exact hostnames; a bare `*` catch-all is refused
+  # at config compile. app.local stands in for one destination the
+  # workload calls; add one origin block per destination host you
+  # authorize.
+  "app.local":
     action:
       type: proxy
       url: https://test.sbproxy.dev
@@ -207,11 +208,13 @@ The knobs, in order:
   `proxy` level: no Redis, no Postgres, no separate metrics
   listener. `/health` and `/metrics` are served on this same
   port.
-* The `"*"` origin is a catch-all hostname, so every outbound
-  call the workload makes hits the same policy stack regardless
-  of destination. Point `action.url` at the upstream you want to
-  front; for local experiments the example uses the hosted test
-  origin.
+* Origin keys are exact hostnames; SBproxy refuses a bare `*`
+  catch-all at config compile (a leading `*.` label such as
+  `*.example.com` is supported, but not an unqualified wildcard).
+  Add one origin block per destination host the workload calls, each
+  running the same policy stack. Point `action.url` at the upstream
+  you want to front; for local experiments the example uses the
+  hosted test origin.
 * `rate_limiting` is the per-pod outbound budget.
   `requests_per_minute` sizes the steady state, `burst` absorbs
   spikes, and the `headers` block emits rate-limit headers

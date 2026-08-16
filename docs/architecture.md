@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -45,8 +45,11 @@ Key properties:
 - Hot reload. Config changes are applied without restarting. The watcher detects file
   changes and atomically swaps the compiled origin map via `arc-swap`. In-flight requests
   finish on their snapshot; new requests pick up the new map immediately.
-- Embeddable. The `sbproxy-core` crate exposes a small `run` / `shutdown` API for use as a
-  library inside another Rust binary.
+- Embeddable. The `sbproxy-core` crate exposes `run(config_path, GraceConfig)` as its public
+  entry point for use as a library inside another Rust binary. Shutdown is signal-driven
+  (SIGINT for a fast stop, SIGTERM for a graceful drain) inside Pingora's own server loop;
+  `GraceConfig` configures the drain grace period, but there is no separate callable
+  `shutdown()` function for an embedder to invoke.
 
 ---
 
@@ -62,25 +65,54 @@ sbproxy/
                               compilation (RawOrigin -> CompiledOrigin).
     sbproxy-plugin/       - Plugin trait definitions and `inventory` registry
                               (PUBLIC API for third-party modules).
-    sbproxy-modules/      - Built-in modules:
-                              action/   - proxy, loadbalancer, redirect, static,
-                                          echo, mock, beacon, websocket, grpc,
-                                          ai_proxy, mcp, noop, storage
-                              auth/     - api_key, basic_auth, bearer, jwt,
-                                          digest, forward_auth, jwks
-                              policy/   - rate_limit, ip_filter, waf, ddos,
+    sbproxy-modules/      - Built-in modules (representative type strings,
+                              not exhaustive; the authoritative list is the
+                              match arms in sbproxy-modules/src/compile.rs):
+                              action/   - proxy, load_balancer, redirect,
+                                          static, echo, mock, beacon,
+                                          websocket, grpc, graphql, ai_proxy,
+                                          mcp, storage, noop
+                              auth/     - api_key, basic_auth, bearer, jwt
+                                          (with an optional jwks_url for
+                                          RS256 key resolution), digest,
+                                          forward_auth, bot_auth (Web Bot
+                                          Auth), cap, oidc
+                              policy/   - rate_limiting, ip_filter, waf, ddos,
                                           csrf, security_headers, request_limit,
-                                          assertion, sri, cel
+                                          assertion, sri, rego, expression
+                                          (CEL-based)
                               transform/- json, json_projection, html, markdown,
-                                          template, lua, javascript, css,
+                                          template, lua_json, javascript, css,
                                           encoding, format_convert, normalize,
                                           payload_limit, replace_strings,
-                                          html_to_markdown, sse_chunking, noop
+                                          html_to_markdown, sse_chunking, cel,
+                                          noop
     sbproxy-ai/           - AI gateway: 72 native providers, routing,
                               guardrails, budget enforcement, virtual keys,
                               semantic cache, usage ledger.
+    sbproxy-rag/          - Bounded retrieval-augmented generation runtime
+                              for the AI gateway: extracts a query, embeds
+                              it, searches a vector store, selects a bounded
+                              context window.
+    sbproxy-model-host/   - Local model-serving subsystem: model catalog,
+                              GPU fit planner, engine supervisor. Single-node,
+                              engine-agnostic.
+    sbproxy-classifiers/  - Pure-Rust ONNX inference and tokenizer wrapper
+                              for in-process detectors (guardrails, agent
+                              scoring).
+    sbproxy-classifier-client/ - gRPC client for the classifier sidecar's
+                              InferenceService (used by compression's
+                              token_prune lever and other sidecar-backed
+                              detectors).
+    sbproxy-classifier-proto/  - Shared gRPC InferenceService contract
+                              between the client and the sidecar.
+    sbproxy-classifier-sidecar/ - Standalone OSS classifier sidecar binary:
+                              serves InferenceService over gRPC, backed by
+                              the tract ONNX engine.
     sbproxy-extension/    - Scripting and extension runtimes:
                               cel/       - cel-rust expression evaluation
+                              rego/      - Rego (OPA) policy evaluation via
+                                           the Regorus interpreter
                               lua/       - mlua + Luau scripting
                               wasm/      - wasmtime sandboxed plugins
                               js/        - QuickJS via rquickjs
@@ -89,6 +121,9 @@ sbproxy/
                               header modifiers, error pages, forward rules.
     sbproxy-cache/        - Response cache trait, memory backend,
                               pluggable store interface, cache key partitioning.
+    sbproxy-storage/      - Storage abstraction (ephemeral KV, persistent KV,
+                              set, pub/sub) with a Redis backend, shared by
+                              the OSS mesh and the dynamic key plane.
     sbproxy-security/     - Cross-cutting security primitives: crypto helpers,
                               host filter (bloom + HashMap lookup), client-IP
                               extraction with trusted-proxy CIDRs, PII redactor,
@@ -96,6 +131,11 @@ sbproxy/
                               detection and bot/agent verification helpers.
                               The WAF, DDoS, CSRF, and security_headers
                               policies live in sbproxy-modules/src/policy/.
+    sbproxy-agent-detect/  - Agent fingerprinting: scores TLS / HTTP /
+                              payload signals into a single typed
+                              `AgentDetection` (0-100 score, named id,
+                              provenance, confidence) that policies and
+                              scripting read off the request context.
     sbproxy-tls/          - TLS termination via rustls 0.23 with the `ring`
                               crypto provider, ACME auto-cert (Let's Encrypt),
                               HTTP/3 listener wiring (currently disabled
@@ -104,8 +144,25 @@ sbproxy/
     sbproxy-transport/    - Outbound transport: retry with exponential backoff,
                               request coalescing, hedged requests,
                               circuit breaker, upstream rate limiting.
-    sbproxy-vault/        - Secret management. Encrypted local vault,
-                              rotation hooks, secret reference resolution.
+    sbproxy-vault/        - Secret management across multiple backends (local
+                              encrypted file, AWS Secrets Manager, Azure,
+                              GCP, HashiCorp Vault, Kubernetes), rotation
+                              hooks, secret-reference URI resolution.
+    sbproxy-keystore/     - Mutable system of record for inbound virtual
+                              keys and upstream credentials: pluggable
+                              backends, a fail-closed TTL cache, at-rest
+                              hashing and encryption.
+    sbproxy-billing/      - Authoritative payment settlement domain,
+                              independent of the request pipeline.
+    sbproxy-meter/        - Attested consumption metering: the vocabulary a
+                              usage receipt is written in.
+    sbproxy-mesh/         - Shared local/distributed cluster substrate:
+                              identity, SWIM liveness, typed state, caches,
+                              metrics, managed models.
+    sbproxy-capability/   - Executable capability registry: one vocabulary
+                              for what a build of SBproxy claims to support.
+    sbproxy-openapi/      - Emits an OpenAPI 3.0 document describing the
+                              routes a compiled config exposes.
     sbproxy-observe/      - tracing-based structured logging,
                               Prometheus metrics, typed event bus.
     sbproxy-platform/     - Infrastructure primitives: KV store abstraction,
@@ -113,6 +170,15 @@ sbproxy/
     sbproxy-httpkit/      - HTTP utilities: client IP extraction,
                               host:port splitting, buffer pools, body limit
                               readers.
+    sbproxy-util/         - Small dependency-free helpers shared across the
+                              workspace (duration parsing, UTF-8 truncation,
+                              and similar).
+    sbproxy-k8s-controller/ - Kubernetes Gateway API controller: watches
+                              GatewayClass / Gateway / HTTPRoute / GRPCRoute
+                              and renders an sb.yml the data plane reads.
+    sbproxy-k8s-operator/ - OSS Kubernetes operator scaffold: reconciles
+                              SBProxy and SBProxyConfig CRDs into
+                              Deployments, Services, and ConfigMaps.
   examples/               - Working sb.yml examples per feature
   docs/                   - Documentation
   e2e/                    - End-to-end test harness
@@ -381,7 +447,7 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     v
 +------------------+
 | Router           |  Selects provider and model based on routing strategy
-|                  |  (16 strategies; see the table below).
+|                  |  (17 selectable strategies; see the table below).
 +------------------+
     |
     v
@@ -481,6 +547,14 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `cascade`           | Tiered dispatch from cheapest to most expensive (provider, model) pairs; a response below the tier's quality threshold retries on the next tier. |
 | `cost_quality`      | Score the prompt's difficulty and route simple prompts to a cheap model, hard prompts to a frontier model, on a `cost_threshold` dial. |
 | `outcome_aware`     | Route on realized cost-per-success; see [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). |
+| `headroom`          | Prefer the provider with the lowest request-quota pressure (`1 - remaining/limit`) from fresh header-derived snapshots. Unknown or stale signals sort after known fresh observations. |
+| `reset_aware`       | Prefer the provider whose quota window resets soonest among candidates waiting for positive capacity; providers already reporting remaining capacity sort first. |
+
+An eighteenth wire value, `token_rate`, parses but is refused at config load: it would score
+providers by remaining tokens-per-minute headroom against a per-provider limit no
+configuration field supplies, so every limit would be zero and the score would silently
+collapse to `least_token_usage`. The config compiler rejects it outright and names
+`least_token_usage` as the replacement rather than aliasing it quietly.
 
 ### Streaming
 
@@ -492,32 +566,21 @@ from the stream's terminal frames and recorded against budgets when the stream c
 The per-guardrail streaming policy table is in
 [ai-gateway.md](ai-gateway.md#streaming-policy).
 
-### Streaming cache recorder hook
+### Streaming and the semantic cache
 
-`StreamCacheRecorderHook` (in `sbproxy-core/src/hooks.rs`) is an optional seam for
-recording streaming AI responses. It mirrors the shape
-of `SemanticLookupHook` and `StreamSafetyHook`: a trait, a per-session context type
-(`StreamCacheCtx`), and a unit slot on the `Hooks` bundle that defaults to `None`.
+Semantic caching is not a hook. It compiles per action into a
+`SemanticCacheRuntimeRegistry` owned by the pipeline (one slot per compiled origin action
+plus one per forward-rule action that carries its own `semantic_cache:` block), so the
+request path reaches it directly rather than through an optional extension slot. A
+forward rule without its own `semantic_cache:` block never inherits the origin's, because
+it may route to a different model, guardrail set, or credential policy.
 
-The hook lives in the core crate because the emit point is on the SSE forwarding hot path.
-Threading chunks across a crate boundary at runtime would be expensive; landing the trait
-in `sbproxy-core` keeps the per-chunk fan-out cheap and lets an implementation plug in
-through `PipelineLifecycleHook::on_startup` exactly like every other slot.
-
-When the slot is wired, `relay_ai_stream` calls `start_session` once at stream start,
-forwards a copy of every chunk into the returned channel, and emits exactly one terminal
-`StreamCacheEvent::End { complete }`. The `complete` flag is true on a clean
-end-of-stream and false on every other terminal condition (client cancel, upstream
-error, mid-stream abort). A `StreamCacheGuard` RAII wrapper owns this terminal-event
-invariant: `guard.finish()` sends `complete: true`, and the guard's `Drop` impl sends
-`complete: false` if `finish` was never called.
-
-Caching policy decisions (deterministic tool calls only, image data by reference only),
-replay pacing (`as_fast_as_possible` vs `natural`), eviction, and persistence are chosen
-by the recorder implementation. The proxy passes the AI handler's
-`semantic_cache.streaming` config block through verbatim as a `serde_json::Value` so a
-recorder can read the shape it expects without core validation. A pipeline lifecycle
-extension fills the slot from `PipelineLifecycleHook::on_startup`.
+A streaming request skips semantic-cache embedding, lookup, and write outright: an SSE
+stream cannot be admitted as one buffered cache entry, and gating only the later write
+would still pay for the embedding call and still touch the backend. There is no
+streaming-response cache recorder in the current codebase; the `Hooks` bundle in
+`sbproxy-core/src/hooks.rs` has slots for `startup`, `prompt_classifier`,
+`intent_detection`, `quality_scoring`, and `stream_safety` only.
 
 ### MCP federation
 
@@ -595,7 +658,7 @@ Configurable per origin:
 | `memory`  | Single-instance deployments. LRU eviction. No persistence. |
 | `file`    | Survives restarts. Suitable for low-traffic origins with slow upstreams. |
 | `memcached` | Distributed cache via memcached protocol. |
-| `redis`   | Shared cache across multiple proxy instances. Requires Redis 6+. JSON serialization with TTL. Circuit breaker on Redis failures. |
+| `redis`   | Shared cache across multiple proxy instances. JSON serialization with TTL (`SET key value EX ttl`). Pooled connections (default 8) track a healthy/failed status per store for observability; a failed connection is discarded and replaced rather than fast-failed by a breaker. |
 
 The `CacheStore` trait (in `sbproxy-cache::store`) is the pluggable surface; new backends
 are added without touching the pipeline.

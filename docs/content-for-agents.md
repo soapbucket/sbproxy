@@ -1,6 +1,6 @@
 # Content for agents
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 This guide is the operator-facing companion to the content-shaping pillar. If you have SBproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-origin editorial signal that ties everything together.
 
@@ -358,7 +358,7 @@ This is fail-safe over precision. A future revision can add a per-origin `pii_ex
 
 Four response-body transforms are added to the response pipeline in this order:
 
-1. **`boilerplate`**: drops `<nav>`, `<footer>`, and `<aside>` elements, plus `<div>` elements whose `class` or `id` matches a comment, ad, or sidebar token (`comments`, `comment`, `comment-section`, `comment-list`, `comments-section`, `ad`, `ads`, `advert`, `advertisement`, `sidebar`), from the HTML body before any other transform sees it. Matching is case-insensitive and regex-based. Cuts token counts on typical news / blog pages by 30 to 60 percent without losing article content. Operators who want stricter stripping can add a `replace_strings` or `html` transform after `boilerplate` runs.
+1. **`boilerplate`**: drops `<nav>`, `<footer>`, and `<aside>` elements, plus `<div>` elements whose `class` matches a comment, ad, or sidebar token (`comments`, `comment`, `comment-section`, `comment-list`, `comments-section`, `ad`, `ads`, `advert`, `advertisement`, `sidebar`) or whose `id` matches the narrower set `comments`, `sidebar`, `ads`, `advertisement`, from the HTML body before any other transform sees it. Matching is case-insensitive and regex-based. Cuts token counts on typical news / blog pages by 30 to 60 percent without losing article content. Operators who want stricter stripping can add a `replace_strings` or `html` transform after `boilerplate` runs.
 2. **`markup`**: HTML to Markdown via a regex-based converter (the `pulldown-cmark` crate in this codebase only parses Markdown into HTML; it plays no part in this direction). Stamps `MarkdownProjection { body, title, token_estimate }` on the request context. Title is extracted from the first H1 heading in the produced Markdown, falling back to the HTML `<title>` element when H1 is absent. Token estimate is computed once here using the configured `token_bytes_ratio` (default 0.25 tokens per byte for English prose) and is the only place the estimate is computed; downstream stages read it from the context.
 3. **`citation_block`**: prepends a single citation line to the Markdown body when the matched tier asserts `citation_required: true`. The line carries the source URL and the license URN (falling back to `unknown` and `all-rights-reserved` respectively when unavailable); there is no fetched-at timestamp in the citation line:
 

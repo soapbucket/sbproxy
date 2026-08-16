@@ -47,11 +47,13 @@ make run CONFIG=examples/response-cache-per-origin-keys/sb.yml
 ```
 
 ```bash
-# Miss, then hit.
+# Miss, then hit. sbproxy only stamps x-sbproxy-cache on a hit (HIT or
+# STALE), so the first grep below prints nothing; the second does.
 curl -s -D - -o /dev/null -H 'Host: tenant-a.local' \
   http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
 curl -s -D - -o /dev/null -H 'Host: tenant-a.local' \
   http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
+# x-sbproxy-cache: HIT
 
 # Nothing on disk carries a response header or body.
 grep -rc 'content-type' /tmp/sbproxy-per-origin-cache/

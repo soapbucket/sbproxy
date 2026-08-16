@@ -1,6 +1,6 @@
 # Defense in depth
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Layered authentication, authorisation, and inspection on a single origin. The chain answers a different question at each layer: `ip_filter` (is this source on the allow list?), WAF (do the URI and headers look benign? the WAF does not read request bodies), `rate_limiting` (is this IP within its RPS budget?), `concurrent_limit` (is this IP within its in-flight cap?), JWT auth (is this user authenticated?), `request_validator` (does the body match the contract?), security headers and CORS injected on the response. The layers run in policy / auth / transform order. A failure in any layer short-circuits with the configured status; the upstream only sees requests that survived everything. mTLS is intentionally not enabled here (see [examples/mtls-client-auth/](../mtls-client-auth/) for the standalone demo); pair the two by setting `proxy.mtls` when the deployment requires certificate-based service identity in addition to JWT user auth.
 
@@ -11,6 +11,21 @@ sbproxy serve -f sb.yml
 ```
 
 No setup required. The example uses an HMAC JWT with a placeholder secret; replace `secret`, `audience`, and `issuer` for a real deployment.
+
+Mint a token that matches `sb.yml`'s `secret` / `audience` / `issuer` (stdlib only, no dependencies):
+
+```bash
+export JWT=$(python3 -c '
+import base64, hashlib, hmac, json, time
+def b64url(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+header = {"alg": "HS256", "typ": "JWT"}
+now = int(time.time())
+payload = {"sub": "alice", "aud": "api.example.com", "iss": "https://auth.example.com", "iat": now, "exp": now + 3600}
+signing_input = b64url(json.dumps(header, separators=(",", ":")).encode()) + "." + b64url(json.dumps(payload, separators=(",", ":")).encode())
+sig = hmac.new(b"change-me-to-a-real-secret", signing_input.encode(), hashlib.sha256).digest()
+print(signing_input + "." + b64url(sig))
+')
+```
 
 ## Try it
 
@@ -25,7 +40,7 @@ curl -i -H 'Host: localhost' \
 ```bash
 # Valid JWT, valid body shape - 200 reaches the upstream.
 curl -i -H 'Host: localhost' \
-     -H 'Authorization: Bearer <jwt>' \
+     -H "Authorization: Bearer $JWT" \
      -H 'Content-Type: application/json' \
      -d '{"name":"alice","age":30}' \
      http://127.0.0.1:8080/anything
@@ -34,7 +49,7 @@ curl -i -H 'Host: localhost' \
 ```bash
 # Valid JWT but body fails request_validator JSON Schema - 400.
 curl -i -H 'Host: localhost' \
-     -H 'Authorization: Bearer <jwt>' \
+     -H "Authorization: Bearer $JWT" \
      -H 'Content-Type: application/json' \
      -d '{"name":""}' \
      http://127.0.0.1:8080/anything

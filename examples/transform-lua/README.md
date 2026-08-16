@@ -1,10 +1,10 @@
 # Lua JSON transform
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Lua JSON transform](../../docs/assets/transform-lua.gif)
 
-Demonstrates the `lua_json` transform. The script entrypoint is `function modify_json(data, ctx)` where `data` is the decoded JSON value (a Lua table), not a string. A self-contained `static` action seeds the input so the example runs offline. The script uppercases `title`, derives a `word_count` field from the `body`, drops `body`, and stamps `transformed_by = "lua"` before returning the modified table for the proxy to re-serialise to JSON. The origin is reached on `127.0.0.1:8080` via the `lua.local` Host header.
+Demonstrates the `lua_json` transform. The script entrypoint is `function modify_json(data, ctx)` where `data` is the decoded JSON value (a Lua table), not a string. A self-contained `static` action seeds the input so the example runs offline. The script uppercases `title`, derives a `word_count` field from the `body`, drops `body`, stamps `transformed_by = "lua"`, and stamps `tenant` from `ctx.principal.tenant_id` (`__default__` here, since no auth provider ran) before returning the modified table for the proxy to re-serialise to JSON. The origin is reached on `127.0.0.1:8080` via the `lua.local` Host header.
 
 ## Run
 
@@ -30,7 +30,8 @@ $ curl -s -H 'Host: lua.local' http://127.0.0.1:8080/ | jq
   "title": "LUA TRANSFORMS KEEP THEIR COOL",
   "userId": 7,
   "word_count": 8,
-  "transformed_by": "lua"
+  "transformed_by": "lua",
+  "tenant": "__default__"
 }
 ```
 
@@ -58,6 +59,7 @@ lua
 - `lua_json` transform with the canonical `function modify_json(data, ctx)` entrypoint
 - Reading and mutating a parsed JSON table directly inside Lua (no string parsing)
 - Field derivation (`word_count` from `body`), mutation (`string.upper`), and removal (`data.body = nil`)
+- `ctx.principal.tenant_id` read from the unified identity every script surface receives
 - `static` action - inline JSON body so the example runs offline
 
 ## See also

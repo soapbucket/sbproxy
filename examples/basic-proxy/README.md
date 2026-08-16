@@ -1,6 +1,6 @@
 # Basic reverse proxy
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Basic reverse proxy](../../docs/assets/basic-proxy.gif)
 
@@ -26,13 +26,14 @@ $ curl -s -H 'Host: myapp.example.com' http://127.0.0.1:8080/echo
   "headers": {
     "host": "test.sbproxy.dev",
     "user-agent": "curl/8.4.0",
-    "x-forwarded-for": "127.0.0.1",
-    "x-forwarded-proto": "http"
+    ...
   },
   "query": {},
   "timestamp": "..."
 }
 ```
+
+`test.sbproxy.dev` runs behind a hosting CDN that adds its own platform headers (and may overwrite `x-forwarded-for`/`x-forwarded-proto` with what it observes at its own edge), so the full header list you get back depends on your network path. The part sbproxy itself controls is the `host` rewrite to the upstream host, which is deterministic and shown above.
 
 ```bash
 $ curl -s -H 'Host: myapp.example.com' http://127.0.0.1:8080/health

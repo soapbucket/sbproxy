@@ -1,6 +1,6 @@
 # AI gateway: an operator-authored routing policy
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 The built-in routing strategies pick from a fixed menu. `ai_routing_policy` hands the routing decision itself to operator code: one sandboxed CEL expression reads the gateway-computed `ai` decision view and returns a plan (an ordered candidate list plus a reason), or `null` to decline to the configured `routing` strategy. Declining is the cheap common path, so a policy with an opinion about a few kinds of request costs nothing for the rest.
 
@@ -35,7 +35,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-A hard prompt (code plus step-by-step reasoning) scores above the 0.7 threshold, so the plan routes it to the frontier model and the access log carries `hard prompt` as the route reason:
+A hard prompt (code, a proof keyword, and multi-step reasoning, long enough that the length signal also contributes) scores above the 0.7 threshold, so the plan routes it to the frontier model and the access log carries `hard prompt` as the route reason. A shorter prompt hitting the same keywords is not enough on its own: the heuristic blends prompt length in too, so the difficulty score needs both the keyword signals and enough words to clear 0.7:
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -44,7 +44,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{
     "model": "gpt-4o-mini",
     "messages": [{"role": "user",
-      "content": "Prove step by step that the following function terminates:\n```\ndef f(n):\n    while n > 1:\n        n = n // 2\n    return n\n```"}]
+      "content": "Prove step by step, using the theorem about geometric series, that the following function terminates for every positive integer n. Analyze the loop invariant, derive a closed-form equation for the number of iterations, and explain why the recursion cannot enter an infinite loop:\n```\ndef f(n):\n    while n > 1:\n        n = n // 2\n    return n\n```"}]
   }'
 ```
 

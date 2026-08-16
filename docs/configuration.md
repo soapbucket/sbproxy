@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1410,6 +1410,8 @@ origins:
 | `tls` | bool | false | Force TLS regardless of URL scheme |
 | `authority` | string | | Override the HTTP/2 `:authority` pseudo-header |
 | `timeout_secs` | int | 30 | Request timeout in seconds |
+| `grpc_web` | bool | false | Allow browser gRPC-Web clients (HTTP/1.1 with base64 or binary framing) to reach the native gRPC upstream. |
+| `transcode` | object | unset | REST-to-gRPC transcoding: `descriptor_set` (path to a compiled protobuf `FileDescriptorSet`) and `routes[]`, each a `{method, path, grpc_method, body}` binding an HTTP route to a unary gRPC call. `path` uses `google.api.http`-style templates; `body` names the field the HTTP body decodes into, or is omitted (or `"*"`) to decode the whole body as the request message. |
 
 ### ai_proxy
 
@@ -1825,7 +1827,7 @@ model_rate_limits:
 
 #### Per-surface rate limits (`per_surface_rate_limits`)
 
-Keyed by AI surface label. The labels are the same stable strings emitted on the `sbproxy_ai_surface_requests_total` metric: `chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`. Surfaces without an entry are uncapped. When the cap is hit, the proxy returns 429 before any upstream call.
+Keyed by AI surface label. The labels are the same stable strings emitted on the `sbproxy_ai_surface_requests_total` metric: `chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`, `messages`, `responses`. Surfaces without an entry are uncapped. When the cap is hit, the proxy returns 429 before any upstream call.
 
 ```yaml
 per_surface_rate_limits:
@@ -4515,10 +4517,10 @@ origins:
 ## Problem details (RFC 9457)
 
 The `problem_details` block opts the origin into RFC 9457
-`application/problem+json` responses for proxy-generated errors that
-are not matched by an `error_pages` entry. The two blocks compose:
+`application/problem+json` responses for authentication-denial errors
+that are not matched by an `error_pages` entry. The two blocks compose:
 per-status custom pages still win when authored; `problem_details`
-catches everything else with a structured body.
+catches every other authentication denial with a structured body.
 
 ```yaml
 origins:
@@ -4534,28 +4536,32 @@ origins:
       include_detail: true
 ```
 
-A proxy-generated 403 on this origin (no `error_pages` entry) renders as:
+An authentication denial on this origin with a status other than 401
+(no `error_pages` entry matches it) renders as:
 
 ```json
 {
   "type": "https://api.example.com/errors/403",
   "title": "Forbidden",
   "status": 403,
-  "detail": "policy denied",
-  "instance": "/restricted"
+  "detail": "authentication failed",
+  "instance": "/get"
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | When true, render unmatched proxy-generated errors as `application/problem+json`. |
+| `enabled` | bool | false | When true, render unmatched authentication-denial errors as `application/problem+json`. |
 | `type_base_uri` | string | | Base URI for the `type` field; the status code is appended (e.g. `https://api.example.com/errors/503`). When unset the renderer emits the RFC 9457 default `about:blank`. |
 | `include_detail` | bool | true | When false, the `detail` field is suppressed (operators can avoid leaking internal error text). |
 
-The renderer fires from the same proxy-generated error path that
-`error_pages` participates in (authentication denials, policy denials,
-default 404). Upstream-returned status codes are not rewritten; the
-renderer only handles errors the proxy itself generates.
+The renderer fires from the same code path that `error_pages`
+participates in for authentication denials (a bad API key, a failed
+JWT check, forward_auth rejecting a request, and so on). It does not
+currently apply to policy denials (`ip_filter`, `waf`, rate limiting,
+etc.) or to a default 404 for an unmatched route; those keep their own
+response shapes. Upstream-returned status codes are not rewritten
+either; the renderer only handles errors the proxy itself generates.
 
 See [`examples/problem-details/`](https://github.com/soapbucket/sbproxy/tree/main/examples/problem-details).
 

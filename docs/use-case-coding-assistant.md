@@ -1,6 +1,6 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-16*
 
 > **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
@@ -10,7 +10,7 @@
 
 Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. SBproxy closes that gap with one Apache-2.0 binary that routes to 72 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
 
-One status note up front. The managed runtime, verified artifact path, typed engines, admission, and reload transaction are implemented. Apple Silicon Metal passed on 2026-07-11. NVIDIA vLLM, CUDA, and live GCP certification remain pending, with deterministic and local test evidence only. `sbproxy doctor` reports what your current box can do; [model-host.md](model-host.md) keeps the exact boundary.
+One status note up front. The managed runtime, verified artifact path, typed engines, admission, and reload transaction are implemented. Apple Silicon Metal and single-GPU NVIDIA CUDA (live vLLM) are both certified on real hardware. Multi-GPU and a live three-node GCP fleet remain unsupported, blocked by a one-GPU billing quota cap rather than by missing code. `sbproxy doctor` reports what your current box can do; [model-host-certification.md](model-host-certification.md) keeps the exact boundary.
 
 ## What you will build
 

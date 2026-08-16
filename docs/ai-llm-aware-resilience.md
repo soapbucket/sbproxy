@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -26,12 +26,14 @@ Each upstream failure is classified into a `FailureCause`:
 | `auth` | `401`, `403` | no |
 | `bad_request` | a malformed `400`/`422` | no |
 
-Each cause maps to a fallback trigger: a context-window failure routes to a
-larger-context model, a content-policy failure to a more permissive one,
-and everything else to the general fallback list. This separation is the
-seam the richer LLM-aware actions build on: a context-window failure can
-drive compress-and-retry over the existing context-compression path, and a
-content-policy failure a redact-and-retry.
+Each cause also carries a fallback trigger (any, context-window, or
+content-policy) that separates it from the general fallback list. Of the
+two specific triggers, only content-policy is wired to actual provider
+routing today, through `content_policy_fallback` below. There is no
+`context_window_fallbacks` list and no automatic reroute to a "larger"
+model: a context-window failure instead goes through the compress-in-place
+path described next, or the operator lists a larger-context model earlier
+in the provider order.
 
 ## Per-error retry policy
 
@@ -50,7 +52,10 @@ action:
 During failover the loop retries when the status is in the default retry
 set (`500`/`502`/`503`) or when the classified cause clears the policy. A
 class with an explicit count caps its retries; a class with no entry uses
-its default retryability. The overall `max_attempts` still bounds the total.
+its default retryability. The classification used for this decision is
+status-only (the retryable classes do not need the body); the total attempt
+count is still capped internally at the configured provider count, up to a
+maximum of 5, not by a separate config key.
 
 ## Context-window fitting compatibility
 
@@ -145,9 +150,11 @@ Adaptive cooldowns are already in effect when `circuit_breaker` or
 `outlier_detection` is configured: every upstream outcome feeds the
 per-provider breaker and the sliding-window outlier detector, and a
 provider that crosses its failure threshold is ejected from selection until
-it recovers, alongside the PeakEWMA latency model. Failover itself routes to
-a different provider, so a retry never re-runs a side-effecting request
-against the same upstream.
+it recovers. The PeakEWMA latency model is a separate, independently
+selected routing strategy (`routing: { strategy: peak_ewma }`); it does not
+run automatically alongside `circuit_breaker` or `outlier_detection`.
+Failover itself routes to a different provider, so a retry never re-runs a
+side-effecting request against the same upstream.
 
 ## Calling it
 
@@ -203,8 +210,14 @@ Neither deployment was touched and no retry was counted.
 To watch the retry policy itself, point a provider at an upstream you control
 and have it answer `429`. Each rejected attempt logs at `WARN` with the
 message `AI proxy: provider returned error, trying next` and the fields
-`provider`, `status`, and `attempt`, where `attempt` is a zero-based index.
-With `rate_limit: 3` you see that line for attempts `0`, `1`, and `2` against
-`openai-primary` before the chain advances to `openai-secondary`. A `400` that
+`provider`, `status`, and `attempt`, where `attempt` is a zero-based index
+into the fallback chain, one entry per configured provider, not a
+per-provider retry counter. `max_attempts` is capped at the provider count,
+so in the two-deployment example above a `429` from `openai-primary`
+(`attempt` `0`) logs the line once and the chain advances to
+`openai-secondary` (`attempt` `1`); with only two providers configured, the
+chain is exhausted there regardless of `rate_limit: 3`, so a third attempt
+never happens against either deployment. Watching `rate_limit: 3` actually
+cap a retry needs three or more providers in the chain. A `400` that
 classifies as `bad_request` logs the line once and advances immediately,
 because its policy entry is `0`.

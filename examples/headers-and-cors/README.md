@@ -1,6 +1,6 @@
 # Header injection and CORS
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![Header injection and CORS](../../docs/assets/headers-and-cors.gif)
 
@@ -33,14 +33,15 @@ $ curl -s -H 'Host: api.local' -H 'Cookie: should-be-stripped=1' \
 
 The `Cookie` header is absent because `request_modifiers.delete` stripped it.
 
-Inspect the response headers added by SBproxy:
+Inspect the response headers added by SBproxy. The upstream echoes its own headers in
+between, so filter for the two `response_modifiers` add rather than assuming a fixed
+line count:
 
 ```bash
-$ curl -is -H 'Host: api.local' http://127.0.0.1:8080/get | head -n 6
+$ curl -is -H 'Host: api.local' http://127.0.0.1:8080/get | grep -iE '^HTTP/|^(x-served-by|cache-control):'
 HTTP/1.1 200 OK
-content-type: application/json
+Cache-Control: public, max-age=60
 x-served-by: sbproxy
-cache-control: public, max-age=60
 ```
 
 CORS preflight from a browser-style origin:

@@ -6,10 +6,13 @@
 # unimplemented-feature claims in user-facing docs. Code reality:
 #
 #   - crates/sbproxy-ai/data/ai_providers.yml has 72 entries.
-#   - crates/sbproxy-ai/src/routing.rs defines 15 routing strategies
+#   - crates/sbproxy-ai/src/routing.rs defines 18 routing strategies
 #     (RoundRobin, Weighted, FallbackChain, Random, LowestLatency,
 #     LeastConnections, CostOptimized, TokenRate, LeastTokenUsage,
-#     PrefixAffinity, PeakEwma, Sticky, Race, Cascade, CostQuality).
+#     PrefixAffinity, Sticky, Race, PeakEwma, Cascade, CostQuality,
+#     OutcomeAware, Headroom, ResetAware). TokenRate is refused at
+#     config load (WOR-2233, superseded by LeastTokenUsage), so 17
+#     are actually selectable.
 #   - crates/sbproxy-modules/src/action/routing/ ships two built-in
 #     RoutingStrategy implementations: first-healthy and lora-aware.
 #   - crates/sbproxy-observe/src/decision.rs defines 8 decision engines

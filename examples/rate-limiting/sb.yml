@@ -34,3 +34,9 @@ origins:
         # `connection.remote_ip` is the per-IP bucket; leaving `key` unset
         # gives the same partitioning.
         key: 'connection.remote_ip'
+        # `X-RateLimit-*` and `Retry-After` are opt-in: unset (or
+        # `enabled: false`), the policy still enforces the limit but adds
+        # no headers.
+        headers:
+          enabled: true
+          include_retry_after: true

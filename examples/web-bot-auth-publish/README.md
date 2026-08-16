@@ -1,6 +1,6 @@
 # Web Bot Auth publish: SBproxy as a signing agent
 
-*Last modified: 2026-05-31*
+*Last modified: 2026-08-16*
 
 Demonstrates the `web_bot_auth_publish` per-origin config. SBproxy serves its own JWKS-shaped signing-key directory at `/.well-known/http-message-signatures-directory` and a Signature Agent Card discovery doc at `/.well-known/web-bot-auth/agent-card`. Verifiers (Cloudflare, AWS WAF, third-party origins running a Web Bot Auth verifier) fetch the directory to verify the `Signature-Input` + `Signature` headers SBproxy attaches to outbound requests when the corresponding signer is wired upstream.
 
@@ -27,7 +27,7 @@ Response body (formatted for readability):
     {
       "kty": "OKP",
       "crv": "Ed25519",
-      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPbqsj1oz3Wm9FTo4Y",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
       "kid": "sbproxy-key-2026-05-31",
       "key_ops": ["sign"],
       "tag": "web-bot-auth"

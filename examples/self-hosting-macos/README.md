@@ -1,6 +1,6 @@
 # Self-host on a Mac, admin included
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Stand up a self-hosted model on an Apple Silicon Mac with the embedded
 admin API and UI switched on. One binary from Homebrew, one config
@@ -44,6 +44,25 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   | jq -r '.choices[0].message.content'
 ```
 
+**SUSPECTED PRODUCT BUG (confirmed, not fixed here):** as of this
+pass, this request fails immediately (502, no download traffic) rather
+than pulling weights. Repro: boot this `sb.yml` (fresh cache directory
+too, so it is not a stale-cache artifact) and send the request above.
+Within ~3 seconds the gateway logs `AI proxy: local engine unavailable,
+failing over: prepare_failed: prepare deployment: verified artifact
+<digest> has no usable model shape metadata` and returns
+`bad gateway`. The model-host job record for the pull shows
+`completed_bytes: 0, total_bytes: 0` and terminates as `"ready"` in
+under 25ms, so whatever "shape metadata" step runs after the pull
+never gets real GGUF header data to inspect. For comparison, the same
+`llama_cpp` engine and cache machinery served a smaller model correctly
+in this pass when configured through `proxy.model_host.deployments`
+(catalog `model:`/`variant:` form, see `examples/model-cluster-symmetric`)
+rather than through this example's `providers[].serve.models` form with
+an explicit `model: "hf:...:Q4_K_M"` + `gguf_file:`, which is the
+combination that fails here. That difference in code path is the
+likeliest place to start.
+
 ## Admin surface
 
 Open the UI at <http://127.0.0.1:9090/admin/ui> and log in with
@@ -61,7 +80,10 @@ serve it over TLS; `docs/admin.md` walks through that hardening.
 ## Usage ledger
 
 Every completed call appends to a hash-chained ledger the admin UI's
-usage view reads from. Inspect and verify it:
+usage view reads from. This step depends on the first request above
+actually completing, which the bug noted there currently prevents (the
+ledger file exists but stays empty). Once that is fixed, inspect and
+verify it:
 
 ```bash
 jq -r '.event.model' /tmp/sb-macos-ledger.jsonl | sort | uniq -c

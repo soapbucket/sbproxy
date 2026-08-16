@@ -40,13 +40,17 @@
 #       -H 'Host: ai.local' \
 #       -H 'Content-Type: application/json' \
 #       -d '{
-#         "model": "dall-e-3",
+#         "model": "gpt-image-1",
 #         "prompt": "a small cat",
 #         "size": "1024x1024",
 #         "n": 1
 #       }'
 #   done
-#   # The first 30 requests in each minute return 200, the rest 429.
+#   # The first 30 requests in each minute reach the provider; the rest
+#   # return 429 with no upstream call. Image generation is slow, so a
+#   # response among the first 30 can still lose the race against
+#   # sbproxy's own upstream timeout and come back 502 independent of
+#   # the rate limiter; that is not the cap firing.
 
 origins:
   "ai.local":
@@ -58,7 +62,7 @@ origins:
           default_model: gpt-4o-mini
           models:
             - gpt-4o-mini
-            - dall-e-3
+            - gpt-image-1
             - tts-1
             - whisper-1
 

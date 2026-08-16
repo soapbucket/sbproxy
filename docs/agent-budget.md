@@ -1,5 +1,5 @@
 # agent_budget policy
-*Last modified: 2026-08-11*
+*Last modified: 2026-08-16*
 
 ![70 rapid requests from a Cursor user agent: 200s until the per-agent budget trips and the rest return 429](assets/agent-budget.gif)
 
@@ -156,9 +156,14 @@ A response's token count is only known after the response completes, so
 
 Two consequences of that shape are worth knowing:
 
-* The request that crosses the cap is served. Its usage lands on the
-  counter, and the *next* request from that agent is refused. An hourly
-  budget can therefore overshoot by at most one response.
+* The request that crosses the cap is served, and so does every other
+  request from the same agent already admitted and still in flight: none
+  of them can be charged until their response completes, so a concurrent
+  admission check cannot see it yet. The next check to run *after* a
+  charge lands is the one that refuses. Under `burst: 1` that bounds the
+  overshoot to one response; a higher `burst`, or none configured, lets
+  that many concurrent responses land unaccounted for before the counter
+  catches up.
 * A response that reports no usage consumes zero. That covers upstream
   error responses, providers that omit the `usage` block, and surfaces
   that never report token counts at all (non-AI traffic through the
@@ -196,9 +201,9 @@ every boundary.
 
 ## Observability
 
-* `sbproxy_policy_triggers_total{origin, policy_type="agent_budget", action="block"}` increments on `deny` denials.
-* `sbproxy_ai_budget_utilization_ratio{origin, agent_id}` gauge reports the current utilization per agent.
-* Access log: `policy_action` set to the verdict; `agent_id`, `agent_class`, `agent_vendor` carry the resolved agent identity.
+* `sbproxy_policy_triggers_total{origin, policy_type="agent_budget", action="deny"}` increments on `deny` denials.
+* `sbproxy_agent_budget_decisions_total{agent_id, outcome}` increments on every sub-budget trip, with `outcome` set to `deny`, `log`, or `downgrade` to match whichever `on_exceed` mode fired.
+* Access log: `agent_id`, `agent_class`, `agent_vendor` carry the resolved agent identity. There is no per-policy verdict field on this stream; the verdict is the two metrics above.
 
 ## Why per-agent
 

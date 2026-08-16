@@ -1,6 +1,6 @@
 # OpenAPI 3.0 emission
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 The gateway publishes an OpenAPI 3.0 document describing the routes it exposes, derived from the live config. Three things land together: rich path matchers (`template` for `/users/{id}`, `regex` as the escape hatch, plus `prefix` and `exact`, with per-segment regex constraints supported inline as `{id:[0-9]+}`); OpenAPI Parameter Object declarations on each forward rule that mirror the spec verbatim and pass through directly into `parameters[]`; and two emit surfaces, one admin-only at `GET /api/openapi.{json,yaml}` (basic auth, all hosts) and one per-host at `GET /.well-known/openapi.{json,yaml}` opt-in via `expose_openapi: true` on the origin. Prefix matchers carry the `x-sbproxy-prefix-match` extension because OpenAPI has no native concept of "starts-with"; whole-path regex matchers carry `x-sbproxy-regex-path` and named captures become path parameters.
 
@@ -19,18 +19,21 @@ The example enables the admin listener on port 9090 (defaults `admin:changeme`) 
 curl -s -H 'Host: api.localhost' \
   http://127.0.0.1:8080/.well-known/openapi.json | jq '.paths | keys'
 # [
+#   "/__regex__/^_v(?P<version>[0-9]+)_items",
+#   "/api/",
 #   "/health",
-#   "/users/{id}/posts/{post_id}",
-#   "/static/{rest}",
-#   "/v{version}/items"
+#   "/static/{*rest}",
+#   "/users/{id:[0-9]+}/posts/{post_id}"
 # ]
 ```
+
+Template and prefix matchers land in `paths` verbatim, regex constraints included (`{id:[0-9]+}`, `{*rest}`); the `regex:` matcher has no standard OpenAPI path syntax to borrow, so it gets a synthetic `/__regex__/<pattern>` key carrying the raw pattern in `x-sbproxy-regex-path`, and the prefix matcher (`/api/`) gets `x-sbproxy-prefix-match: true`.
 
 ```bash
 # Truncated JSON for a single path showing the Parameter Objects.
 curl -s -H 'Host: api.localhost' \
   http://127.0.0.1:8080/.well-known/openapi.json \
-  | jq '.paths."/users/{id}/posts/{post_id}".get.parameters'
+  | jq '.paths."/users/{id:[0-9]+}/posts/{post_id}".get.parameters'
 # [
 #   { "name": "id", "in": "path", "required": true,
 #     "schema": { "type": "integer", "format": "int64" } },

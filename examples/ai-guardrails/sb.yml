@@ -30,13 +30,17 @@
 #   make run CONFIG=examples/ai-guardrails/sb.yml
 #
 # Test (clean request, succeeds):
+#   The prompt spells out "raw JSON only, no markdown code fences" because
+#   Claude Haiku otherwise tends to wrap its reply in a ```json fence, which
+#   the schema output guardrail rejects (it parses the content field
+#   directly and does not strip markdown).
 #   curl http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
 #       "model": "claude-haiku-4-5",
 #       "messages": [{"role": "user", "content":
-#         "Reply as JSON with keys summary and tags. Topic: sandwiches."}]
+#         "Reply as JSON with keys summary and tags. Topic: sandwiches. Output raw JSON only: start your response with the character { and end with }. Do not use markdown code fences or any other formatting."}]
 #     }'
 #
 # Test (injection, expect 4xx):

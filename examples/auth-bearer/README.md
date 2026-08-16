@@ -1,6 +1,6 @@
 # Bearer token authentication
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![Bearer token authentication](../../docs/assets/auth-bearer.gif)
 
@@ -21,9 +21,9 @@ Missing token, request rejected:
 ```bash
 $ curl -i -H 'Host: bearer.local' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
 
 Valid token, request forwarded:
@@ -33,7 +33,7 @@ $ curl -i -H 'Host: bearer.local' \
        -H 'Authorization: Bearer svc-token-alpha' \
        http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
-content-type: application/json
+content-type: application/json; charset=utf-8
 
 {"method":"GET","url":"/get","headers":{"authorization":"Bearer svc-token-alpha","host":"test.sbproxy.dev",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 ```

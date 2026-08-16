@@ -1,6 +1,6 @@
 # JWT authentication
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Validates HS256 JWTs against a static HMAC secret (`dev-secret-change-me`). The JWT must carry the configured issuer (`https://issuer.local`) and audience (`sbproxy-demo`); requests with a missing, malformed, or wrong-issuer token are rejected with 401 inside the proxy. Valid tokens flow through to `test.sbproxy.dev` unchanged. Rotate the secret out of YAML in production via `${ENV_VAR}` interpolation; the static value is here only so the example is reproducible.
 
@@ -19,9 +19,9 @@ No token, request rejected:
 ```bash
 $ curl -i -H 'Host: jwt.local' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
 
 Valid token, request forwarded. The example token below is signed with the example secret, carries the expected issuer/audience, and has `exp: 4102444800` (2100-01-01, far enough out that the example keeps working):

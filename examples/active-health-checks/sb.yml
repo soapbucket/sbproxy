@@ -14,15 +14,28 @@
 # IPv6 targets work too: `http://[2001:db8::1]:8080`. The probe URL
 # builder preserves bracketing.
 #
+# A target's `url` only ever contributes scheme/host/port to routing;
+# any path segment on it (like the `/status/503` below) is cosmetic
+# and ignored when forwarding real traffic, so both targets serve
+# `GET /get` identically. What differs is each target's own
+# `health_check.path`, which the proxy probes on an absolute basis
+# (it replaces, not appends to, the target's path). The second
+# target's probe path is pinned to `/status/503`, which always
+# answers 503, so it fails every probe and is excluded after
+# `unhealthy_threshold` (3) consecutive failures, automatically,
+# with no manual intervention needed.
+#
 # Run:
 #   make run CONFIG=examples/active-health-checks/sb.yml
 #
 # Test:
 #   curl -H 'Host: localhost' http://127.0.0.1:8080/get
-#   # While both targets respond 2xx on /status/200, traffic alternates
-#   # between them. Take one down: after 3 consecutive failed probes
-#   # (~30s with the defaults) it is excluded; bring it back, after
-#   # 2 consecutive 2xx probes it returns to rotation.
+#   # Every response looks identical (both targets resolve to the same
+#   # upstream host), so this does not reveal which target answered.
+#   # Roughly 20s after startup (tokio's first probe tick fires
+#   # immediately, so the 3rd failing probe lands at ~2x interval_secs)
+#   # the second target is marked unhealthy and dropped from rotation;
+#   # traffic keeps flowing through the first target the whole time.
 
 proxy:
   http_bind_port: 8080
@@ -42,7 +55,7 @@ origins:
             healthy_threshold: 2
         - url: https://test.sbproxy.dev/status/503
           health_check:
-            path: /status/200
+            path: /status/503
             interval_secs: 10
             timeout_ms: 2000
             unhealthy_threshold: 3

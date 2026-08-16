@@ -7,7 +7,7 @@
       "name": "missing CAP token returns 401",
       "request": {
         "method": "GET",
-        "path": "/blog/article",
+        "path": "/anything/blog/article",
         "headers": {
           "Host": "cap.localhost"
         }
@@ -20,7 +20,7 @@
       "name": "tampered signature returns 401",
       "request": {
         "method": "GET",
-        "path": "/blog/article",
+        "path": "/anything/blog/article",
         "headers": {
           "Host": "cap.localhost",
           "CAP-Token": "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhcCtqd3QiLCJraWQiOiJjYXAtMjAyNi1xMi0wMDEifQ.eyJpc3MiOiJpc3N1ZXIuZXhhbXBsZS5jb20iLCJzdWIiOiJhZ2VudF9hY21lXzAwMSIsImF1ZCI6ImNhcC5sb2NhbGhvc3QiLCJjYXBfdiI6MSwicnBzIjoyLjAsImJ5dGVzIjoxMDczNzQxODI0MCwiZ2xvYiI6Ii9ibG9nLyoqIiwiaWF0IjoxNzc4MjEwNDUyLCJleHAiOjE3NzgyMTQwNTIsImp0aSI6IjAxSjdIWjhYOVIzQ0FQU0FNUEwifQ.AAAAtamperedSignatureBytesAreNotARealEd25519Signature"
@@ -34,7 +34,7 @@
       "name": "wrong audience returns 403",
       "request": {
         "method": "GET",
-        "path": "/blog/article",
+        "path": "/anything/blog/article",
         "headers": {
           "Host": "cap.localhost",
           "CAP-Token": "${SBPROXY_SMOKE_CAP_TOKEN_WRONG_AUD}"
@@ -48,7 +48,7 @@
       "name": "valid token returns 200",
       "request": {
         "method": "GET",
-        "path": "/blog/article",
+        "path": "/anything/blog/article",
         "headers": {
           "Host": "cap.localhost",
           "CAP-Token": "${SBPROXY_SMOKE_CAP_TOKEN_VALID}"

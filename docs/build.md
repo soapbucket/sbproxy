@@ -1,5 +1,5 @@
 # Build pipeline
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-16*
 
 How the proxy container images are built, what stays warm between
 runs, and what the expected wall-clock numbers are. Companion to
@@ -68,8 +68,9 @@ total. `Dockerfile.gateway` and `Dockerfile.worker` reuse the same spine
 through `builder` (see above) rather than repeating it here:
 
 1. **chef-base**: `rust:1.94-bookworm` plus the apt deps (`pkg-config`,
-   `libclang-dev`, `build-essential`, `cmake`, `perl`) plus a pinned
-   `cargo-chef@0.1.71`. Reused by every later Rust stage.
+   `libclang-dev`, `build-essential`, `cmake`, `perl`,
+   `protobuf-compiler`) plus a pinned `cargo-chef@0.1.71`. Reused by
+   every later Rust stage.
 2. **admin-ui** (cloudbuild only): `node:22-slim`, `npm ci` and
    `npm run build` under `ui/`. `ui/dist` is gitignored, so the image
    build must produce it; the builder stage copies it in before cargo

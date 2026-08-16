@@ -1,8 +1,18 @@
 # Sessions
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Sessions](../../docs/assets/sessions.gif)
+
+> **Known issue: no cookie on a `static` action.** As shipped, the request
+> below does not actually receive a `set-cookie` header. Session-cookie
+> issuance is written on the proxy response path that only runs when the
+> origin's `action` is `proxy`; a `static` action's response is built on a
+> different path that never reaches it. Confirmed by pointing this same
+> `session:` block at an `action: proxy` origin instead, where the cookie is
+> issued correctly. This is a proxy bug, not a config error; tracked for a
+> fix. Until then this example cannot demonstrate cookie issuance as
+> written; swap the action to `proxy` against any upstream to see it work.
 
 The `session` block on `app.local` configures the encrypted cookie used to carry session state across requests. Cookie name is `sb_session`, max age is 3600 seconds, `http_only` is on, `same_site` is `Lax`, and `allow_non_ssl: true` lets the example run on plain HTTP for local testing. The action is a static JSON response so you can observe cookie issuance directly without a real backend.
 

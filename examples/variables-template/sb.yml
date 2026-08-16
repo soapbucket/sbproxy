@@ -4,8 +4,9 @@
 # The variables block declares static, per-origin key-value pairs that are
 # available to the template engine as `{{ variables.<name> }}`. Environment
 # variables surface as `{{ env.<NAME> }}`. This example wires both into request
-# headers so test.sbproxy.dev echoes them back, demonstrating that interpolation
-# happens at request time.
+# headers so test.sbproxy.dev echoes them back. Both forms resolve once, at
+# config load (interpolate_config_vars runs during config compilation), not
+# per request: change DEPLOY_REGION and restart to see a new value.
 #
 # Run:
 #   # The proxy resolves env vars at config-load time. Export anything you want

@@ -214,8 +214,9 @@ that implies.
 or a tool call reaches a host nobody approved. In the worst version this is an
 internal address.
 
-**What the gateway does.** Egress is deny-by-default per origin and per
-federated server, and the SSRF guard refuses upstreams that resolve to private
+**What the gateway does.** For an OpenAPI-backed federated server
+(`type: openapi`), egress is deny-by-default per origin and per federated
+server, and the authorizer refuses destinations that resolve to private
 address space unless explicitly allowed.
 
 <!-- sbproxy-config-excerpt -->
@@ -232,7 +233,11 @@ address space unless explicitly allowed.
             hosts: [api.example.com]
 ```
 
-**Still yours.** SBproxy does not implement per-upstream certificate pinning.
+**Still yours.** This egress control is scoped to OpenAPI-backed servers. A
+plain `type: mcp` federated server dials its configured `origin` directly:
+there is no deny-by-default allowlist and no private-address check on that
+path today, so keeping the origin honest is a network-design problem, not a
+config one. SBproxy also does not implement per-upstream certificate pinning.
 TLS validation is standard chain validation. If you need to pin a specific key
 for an upstream, that is not available here today.
 
@@ -262,6 +267,14 @@ optional there. A wildcard hostname cannot, and without `public_origin` every
 Refusals are recorded as `mcp_transport_denied` security audit events with a
 closed reason label, so a SIEM rule can route on the failure mode without
 parsing prose.
+
+This gate classifies a request as 2026-07-28 traffic from
+`MCP-Protocol-Version` and `Mcp-Method` alone, which every compliant client
+sets and a cross-origin browser `fetch()` cannot set without a preflight. A
+request that omits both headers is classified as legacy here and reaches
+authentication before the gateway refuses it, once there is a body to read.
+The catalog and the OAuth challenge stay behind that later, body-aware check
+either way, so the gap is an extra authentication round-trip, not disclosure.
 
 Ordinary auth composes on top: see [auth-oidc.md](auth-oidc.md) and
 [mcp.md](mcp.md) for the OAuth discovery surface.

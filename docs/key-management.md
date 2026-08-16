@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -576,9 +576,10 @@ Two kinds of secret, two different treatments.
 Inbound virtual keys are **hashed**, never stored in a form you can read back.
 The at-rest verifier is `HMAC-SHA256(secret, pepper)`. The server pepper means a
 stolen store is useless without it, which a bare SHA-256 of the key would not
-give you. A minted token has the shape `sk-<key_id>-<secret>`; the `key_id` is a
-public prefix, the `secret` is shown once and never stored. Verification is
-constant-time.
+give you. A minted token has the shape `sbp_<key_id>_<secret>`; the `key_id` is
+a public prefix, the `secret` is shown once and never stored. Verification is
+constant-time. A legacy `sk-<key_id>-<secret>` shape is still accepted for keys
+minted before the `sbp_` prefix and for config-seeded keys.
 
 Upstream provider credentials are **encrypted**, because the proxy has to present
 them to the provider. Two options: a vault reference (`vault://`, `awssm://`,
@@ -669,7 +670,7 @@ new one gets a knob that can say which kind of "allow" it means.
 ## Key identity and policy revisions
 
 `key_id` is the immutable public identity of a key. It is the stable part of the
-token prefix (`sk-<key_id>-...`) and the identity used for policy and usage
+token prefix (`sbp_<key_id>_...`) and the identity used for policy and usage
 attribution. Rotation changes the secret but keeps the same `key_id`. The admin
 API does not accept `key_id` in a policy patch.
 
@@ -706,7 +707,7 @@ Mint a key. The plaintext token comes back exactly once.
 curl -s -u admin:change-me -X POST http://127.0.0.1:9090/admin/keys \
   -H 'Content-Type: application/json' \
   -d '{"name":"ci-runner","max_requests_per_minute":60,"allowed_models":["gpt-4o-mini"]}'
-# { "token": "sk-ab12cd34-...", "key": { "key_id": "ab12cd34", ... } }
+# { "token": "sbp_a1b2c3d4e5f60789_...", "key": { "key_id": "a1b2c3d4e5f60789", ... } }
 ```
 
 ![a virtual key minted, listed, rotated with a grace window, and revoked through the admin API with no reload](assets/ai-dynamic-keys.gif)
@@ -777,6 +778,8 @@ field leaves it unchanged.
 | `metadata` | string-to-string object | `{}` | same field |
 | `tenant` | string | `null` | `tenant_id` |
 | `expires_at` | RFC 3339 timestamp | `null` | same field |
+| `credential_id` | string | `null` | not exposed in read responses |
+| `allow_content_capture` | `true` or `false` | rejects `null`; PATCH `false` to reset | same field |
 
 `key_id` is immutable and is never accepted in PATCH. `status` changes only
 through the block, unblock, and revoke action routes. Revocation is terminal.
@@ -795,7 +798,7 @@ Preview a stored key against an optional request sample:
 
 ```bash
 curl -s -u admin:change-me -X POST \
-  http://127.0.0.1:9090/admin/keys/ab12cd34/effective-policy/preview \
+  http://127.0.0.1:9090/admin/keys/a1b2c3d4e5f60789/effective-policy/preview \
   -H 'Content-Type: application/json' \
   -d '{
     "origin_tenant_id":"acme",
@@ -829,11 +832,11 @@ Fetch the current record, then patch only the fields you intend to change:
 
 ```bash
 curl -s -u admin:change-me \
-  http://127.0.0.1:9090/admin/keys/ab12cd34 \
+  http://127.0.0.1:9090/admin/keys/a1b2c3d4e5f60789 \
   | jq '{key_id: .key.key_id, policy_revision: .key.policy_revision}'
 
 curl -s -u admin:change-me -X PATCH \
-  http://127.0.0.1:9090/admin/keys/ab12cd34 \
+  http://127.0.0.1:9090/admin/keys/a1b2c3d4e5f60789 \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":3,"max_requests_per_minute":60,
        "max_budget_usd":50,"compression_profile":"compact",
@@ -845,7 +848,7 @@ A stale write returns `409` without exposing record contents:
 ```json
 {
   "error": "key policy revision conflict",
-  "key_id": "ab12cd34",
+  "key_id": "a1b2c3d4e5f60789",
   "expected_revision": 3,
   "current_revision": 4
 }
@@ -873,7 +876,7 @@ revision is optional on action routes, but doing so lets operator automation
 detect a stale decision explicitly.
 
 ```bash
-curl -s -u admin:change-me -X POST http://127.0.0.1:9090/admin/keys/ab12cd34/revoke \
+curl -s -u admin:change-me -X POST http://127.0.0.1:9090/admin/keys/a1b2c3d4e5f60789/revoke \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":3}'
 ```
@@ -883,10 +886,10 @@ valid for a grace window (default one hour). Both tokens work during the window,
 so a client fleet can pick up the new token before the old one stops working.
 
 ```bash
-curl -s -u admin:change-me -X POST http://127.0.0.1:9090/admin/keys/ab12cd34/rotate \
+curl -s -u admin:change-me -X POST http://127.0.0.1:9090/admin/keys/a1b2c3d4e5f60789/rotate \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":3,"grace_secs":3600}'
-# { "token": "sk-ab12cd34-<new>", "grace_expires_at": "...", "key": { ... } }
+# { "token": "sbp_a1b2c3d4e5f60789_<new>", "grace_expires_at": "...", "key": { ... } }
 ```
 
 List, get, and conflict responses never carry a verifier hash, an envelope, or
@@ -1149,7 +1152,7 @@ can set tags and metadata but cannot seed lifecycle status; a seeded key starts
 active and lifecycle changes go through the API. For example:
 
 ```bash
-curl -s -u admin:change-me -X PATCH http://127.0.0.1:9090/admin/keys/ab12cd34 \
+curl -s -u admin:change-me -X PATCH http://127.0.0.1:9090/admin/keys/a1b2c3d4e5f60789 \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":3,"allowed_models":["gpt-4o-mini"],
        "blocked_providers":["unapproved-provider"],"allowed_tools":[],

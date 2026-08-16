@@ -20,6 +20,15 @@
 # target is tripped at once, the LB falls back to the unfiltered
 # list rather than 502'ing the client.
 #
+# The two targets below MUST be different hosts, not the same host
+# with different paths. A `load_balancer` target's own URL path is
+# never applied to outbound requests (only `Action::Proxy` does that
+# base-path prefixing). The client's request path passes straight
+# through to whichever target got selected, so two targets that only
+# differ by path are indistinguishable to the breaker. Target 2 below
+# is a closed local port instead, so it fails at the TCP-connect
+# stage every time, independent of the requested path.
+#
 # Run:
 #   make run CONFIG=examples/circuit-breaker/sb.yml
 #
@@ -32,6 +41,15 @@
 
 proxy:
   http_bind_port: 8080
+
+  # Only because target 2 below is a loopback address standing in for
+  # a hard-down replica: the SSRF guard refuses private upstream
+  # addresses unless allowlisted. A production config pointing at a
+  # real second replica does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
 
 origins:
   "localhost":
@@ -51,4 +69,6 @@ origins:
         ejection_duration_secs: 30
       targets:
         - url: https://test.sbproxy.dev
-        - url: https://test.sbproxy.dev/status/503
+        # Closed port: every connection attempt fails immediately
+        # with ECONNREFUSED, simulating a hard-down replica.
+        - url: http://127.0.0.1:9

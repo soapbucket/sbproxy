@@ -1,10 +1,10 @@
 # Fallback origin
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![Fallback origin](../../docs/assets/fallback-origin.gif)
 
-The primary action proxies to `test.sbproxy.dev/status/503`, which always returns 503. The `fallback_origin` block defines a backup origin served when the primary returns a status listed in `on_status` (502, 503, 504) or fails at the transport level (`on_error: true`). Clients see the fallback's static action: a 200 response carrying a friendly degraded JSON body. `add_debug_header: true` stamps an `X-Fallback` header so callers can tell when the fallback path was taken.
+The primary action proxies to `test.sbproxy.dev/status/503`, which always returns 503. The `fallback_origin` block defines a backup origin served when the primary returns a status listed in `on_status` (502, 503, 504) or fails at the transport level (`on_error: true`). Clients see the fallback's static action: a 200 response carrying a friendly degraded JSON body. `add_debug_header: true` stamps an `X-Fallback-Trigger` header (value `status` or `error`) so callers can tell when the fallback path was taken, and why.
 
 ## Run
 
@@ -20,15 +20,17 @@ The primary upstream `test.sbproxy.dev/status/503` is reachable from the public 
 # Primary returns 503; the proxy substitutes the fallback's static action.
 curl -sv -H 'Host: api.local' http://127.0.0.1:8080/ 2>&1 | grep -E '^< HTTP|x-fallback'
 # < HTTP/1.1 200 OK
-# < x-fallback: true
+# < x-fallback-trigger: status
 
 # Inspect the degraded response body.
 curl -s -H 'Host: api.local' http://127.0.0.1:8080/
 # {"status":"degraded","message":"primary upstream temporarily unavailable, serving degraded response","retry_after_secs":30}
 
-# The X-Fallback header is the fingerprint that the fallback path fired.
+# The X-Fallback-Trigger header is the fingerprint that the fallback path fired,
+# and why (`status` here, since the primary's response status matched `on_status`;
+# it would read `error` if a transport-level failure had tripped `on_error` instead).
 curl -sI -H 'Host: api.local' http://127.0.0.1:8080/ | grep -i x-fallback
-# x-fallback: true
+# x-fallback-trigger: status
 ```
 
 ## What this exercises

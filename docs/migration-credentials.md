@@ -1,6 +1,6 @@
 # Migration: credentials block
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 The legacy `virtual_keys:` YAML array under `origins[].action.providers` is no longer supported. The canonical replacement is the unified `credentials:` block, configurable at proxy, tenant, or origin scope.
 
@@ -95,7 +95,7 @@ origins:
 
 The legacy `max_tokens_per_minute: 60000` has no equivalent and is dropped; if the key needs a token ceiling, use `attrs.budget.max_tokens`.
 
-Behavior is identical at runtime: the compile-time lowering materialises the credentials of type `ai_provider` as entries in the legacy `VirtualKeyConfig` registry the AI dispatch already reads. Existing access-log columns (`project`, `user`, `metadata`) and per-credential attribution metrics keep populating from the unified `Principal` write.
+Behavior is identical at runtime: the compile-time lowering materializes the credentials of type `ai_provider` as entries in the legacy `VirtualKeyConfig` registry the AI dispatch already reads. Existing access-log columns (`project`, `user`, `metadata`) and per-credential attribution metrics keep populating from the unified `Principal` write.
 
 ## Multi-tenant scope
 
@@ -114,7 +114,7 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `name` | string | Stable operator-supplied name. Unique within the declaring scope. |
 | `type` | enum | One of `ai_provider`, `bearer`, `api_key`, `jwt`, `basic`, `oidc_client`, `outbound_token_exchange`, `outbound_client_credentials`. |
 | `provider` | string | Provider name for `ai_provider` credentials. Matches an entry in the origin's `providers:` list. |
-| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
+| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus the legacy `${ENV}` and `file:` forms. The removed `secret:<name>` colon form (no `//`) is rejected; use `secret://<backend>/<name>` instead. |
 | `principals` | list | Principal selectors. Empty matches every principal. |
 | `attrs` | object | Attribution attributes lowered onto matched principals, except the documented compatibility-only fields. See below. |
 | `models.allow` / `models.deny` | lists | Stack on top of the origin-level allowlist. Most-restrictive wins. |

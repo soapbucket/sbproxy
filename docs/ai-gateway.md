@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -787,6 +787,12 @@ before dispatch. `allow_unreserved` admits an attempt only when the backend is
 unavailable; it does not bypass a real quota denial. Every such admission
 increments `sbproxy_ai_quota_pool_fail_open_total{pool}`.
 
+`failure_posture` is the preferred spelling and supersedes `failure_mode`
+when both are set: `closed` behaves the same as `failure_mode: closed`, and
+`degraded` behaves the same as `allow_unreserved`. `open` is also accepted.
+`observe` is rejected here, because a reservation that could not be taken has
+no counterfactual verdict to record.
+
 ### Per-surface rate limits
 
 Per-model and per-tenant rate limits cap each user, key, or model independently. The AI gateway also supports per-surface caps that apply to a classified API surface (chat completions, assistants, image generation, audio speech, ...) so expensive paths can be throttled without affecting cheap ones.
@@ -808,7 +814,7 @@ origins:
           requests_per_minute: 600
 ```
 
-Keys are the `AiSurface` labels emitted on metrics (`chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`). Surfaces without an entry are uncapped. When the cap fires, the proxy returns 429 before any upstream call.
+Keys are the `AiSurface` labels emitted on metrics (`chat_completions`, `messages`, `responses`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`). Surfaces without an entry are uncapped. When the cap fires, the proxy returns 429 before any upstream call.
 
 The sliding window is one minute, shared across all configured origins
 (state is process-global). Realtime runs configured hard-budget admission
@@ -1710,11 +1716,11 @@ Provider capability is the source of truth for which surfaces a configured provi
 | `fine_tuning` | POST, GET | `/v1/fine_tuning/jobs[/{id}[/cancel \| /events]]` | OpenAI |
 | `files` | POST, GET, DELETE | `/v1/files[/{id}[/content]]` | OpenAI |
 | `realtime` | GET (WebSocket upgrade) | `/v1/realtime` | OpenAI |
-| `image_generation` | POST | `/v1/images/generations` | OpenAI, Gemini |
-| `image_edits` | POST (multipart) | `/v1/images/edits` | OpenAI, Gemini |
-| `image_variations` | POST (multipart) | `/v1/images/variations` | OpenAI, Gemini |
-| `audio_transcription` | POST (multipart) | `/v1/audio/transcriptions`, `/v1/audio/translations` | OpenAI, Gemini |
-| `audio_speech` | POST | `/v1/audio/speech` | OpenAI, Gemini |
+| `image_generation` | POST | `/v1/images/generations` | OpenAI |
+| `image_edits` | POST (multipart) | `/v1/images/edits` | OpenAI |
+| `image_variations` | POST (multipart) | `/v1/images/variations` | OpenAI |
+| `audio_transcription` | POST (multipart) | `/v1/audio/transcriptions`, `/v1/audio/translations` | OpenAI |
+| `audio_speech` | POST | `/v1/audio/speech` | OpenAI |
 | `moderations` | POST | `/v1/moderations` | OpenAI |
 | `reranking` | POST | `/v1/rerank`, `/v1/reranking` | Cohere |
 
@@ -2569,13 +2575,13 @@ To help you get started with the AI gateway, we provide several runnable example
 
 | Example | What it is | How to use it | Outcome |
 |---------|------------|---------------|---------|
-| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Configure `type: bedrock`; SigV4 signing is operator-provided, and the gateway forwards the signed `Authorization` header verbatim. | Exposes Bedrock via the standard OpenAI-compatible API. |
-| [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Configure `type: gemini` with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
-| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | Use `model_group` in routing config. | Requests load-balance automatically across multiple underlying models. |
+| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Add a provider named `bedrock` (or set `provider_type: bedrock` on any name); SigV4 signing is operator-provided, and the gateway forwards the signed `Authorization` header verbatim. | Exposes Bedrock via the standard OpenAI-compatible API. |
+| [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Add a provider named `gemini` (or set `provider_type: gemini`) with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
+| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | List multiple providers that declare the same model name in `models`; there is no separate `model_group` key. | The routing strategy load-balances requests for that model name across every declaring provider. |
 | [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
-| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Configure `fallbacks:` for a provider. | 5xx errors from the primary provider are transparently retried. |
-| [`ai-cost-optimized`](../examples/ai-cost-optimized/) | Cost-optimized routing. | Set `strategy: cost_optimized`. | Traffic is routed to the cheapest capable model for the given prompt length. |
-| [`ai-attribution-tags`](../examples/ai-attribution-tags/) | Request tagging for cost attribution. | Pass `tags:` in request headers or config. | Emitted metrics and logs include the tags for fine-grained cost allocation. |
+| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
+| [`ai-cost-optimized`](../examples/ai-cost-optimized/) | Cost-optimized routing. | Set `routing.strategy: cost_optimized` and a per-provider `weight`. | Traffic is routed to the provider scoring lowest on `in_flight_requests * 1000 + weight`. |
+| [`ai-attribution-tags`](../examples/ai-attribution-tags/) | Request tagging for cost attribution. | Set `credentials[].attrs.tags` in config, or send `SB-Attr-*` headers (for example `SB-Attr-Project`) per request. | Emitted metrics and logs include the tags for fine-grained cost allocation. |
 
 ## See also
 

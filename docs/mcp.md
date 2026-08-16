@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -166,9 +166,11 @@ Successful results carry `resultType: "complete"` and
 `io.modelcontextprotocol/serverInfo`. List and discovery results carry
 `ttlMs: 0` and `cacheScope: "private"`, and every `listChanged` is
 `false` because subscriptions are not implemented. Three error codes are
-specific to this era: `-32020` for a malformed or missing routing
-carrier, `-32021` for a rejected envelope, and `-32022` for an
-unsupported protocol version.
+reserved for this era: `-32020` for a malformed or missing routing
+carrier and `-32022` for an unsupported protocol version are both raised
+on the request path today. `-32021` is reserved for a missing required
+client capability; the constant and its HTTP-status mapping exist, but
+no code path raises it yet.
 
 The gateway deliberately does not advertise or serve subscriptions,
 Tasks, MCP Apps, MRTR generation, or arbitrary protocol extensions on

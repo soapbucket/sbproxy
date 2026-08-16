@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-16*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -152,9 +152,10 @@ sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
                         [--log-format compact|pretty|json]
                         [--shutdown-grace-ms <ms>] [--grace-time <secs>]
                         [--disable-sb-flags]
-sbproxy validate <path> [--format text|json]
+sbproxy validate <path> [--format text|json] [--no-fetch]
 sbproxy --config <path> --check
-sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
+sbproxy --config <path> --locked
+sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>] [--no-fetch]
 sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
                         [--validate-only]
 sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
@@ -174,19 +175,24 @@ sbproxy config authority subscriber revoke {--credential-id <id> | --subscriber-
 sbproxy config pull <path> --dry-run [--format text|json]
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
 sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
-                           [--engine auto|vllm|llama_cpp]
+                           [--engine auto|vllm|sglang|llama_cpp|mistralrs]
                            [--accel auto|cuda|metal|cpu]
                            [--port <port>] [--admin-port <port>]
                            [--cache-dir <path>] [--dry-run]
-sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>]
+sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>|
+                lock|verify-lock|prune]
 sbproxy cluster {init|token create|enroll|status}
 sbproxy update [--self] [--engines] [--models] [--check] [--yes]
                         [--cache-dir <path>] [--format text|json]
 sbproxy ai ledger <subcommand>
+sbproxy ai prompt optimize --prompt <path> --eval-set <path> --endpoint <url>
+                        --task-model <model> --name <name> --prompt-version <v>
+                        --output <path> [--metric exact-match|contains|json-exact]
+sbproxy audit verify <path> [--signing-seed-hex <hex>] [--format text|json]
 sbproxy admin hash-password [--password <value> | --password-stdin]
-sbproxy doctor [--format text|json]
+sbproxy doctor [<config>] [--format text|json] [--strict]
 sbproxy service install <catalog-id> [--name <alias>] [--variant <id>]
-                              [--engine auto|vllm|llama_cpp]
+                              [--engine auto|vllm|sglang|llama_cpp|mistralrs]
                               [--accel auto|cuda|metal|cpu]
                               [--port <port>] [--admin-port <port>]
                               [--cache-dir <path>] [--dry-run] [--format text|json]
@@ -209,10 +215,11 @@ The full subcommand set, one line each:
 | `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked, `authority` operates a config authority (generate its key, publish, watch the rollout, roll back, manage subscriber credentials), `pull --dry-run` previews the bundle a subscriber would apply next. |
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
-| `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, or drain and stop one. |
+| `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, drain and stop one, write or check a lockfile (`lock`, `verify-lock`), or reclaim unreferenced cache blobs (`prune`). |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
-| `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
+| `ai` | AI gateway tools: `ai ledger` verifies or reports on the usage ledger, `ai prompt optimize` compiles a shorter static system prompt against a customer-owned evaluation set. |
+| `audit` | Audit-trail tools: `audit verify` re-derives the tamper-evident security audit chain from genesis and reports the first record that does not check out. |
 | `admin` | Admin-account maintenance: `hash-password` prints the `password_hash` value for `proxy.admin.operators[].password_hash`. |
 | `doctor` | Diagnose what this binary can do on the current host. |
 | `service` | Install, remove, or check a per-user `launchd` agent (macOS only) that runs a certified catalog model in the background; reuses the same secure config generation as `run`. |
@@ -286,6 +293,15 @@ default is `--format text`.
 sbproxy validate /etc/sbproxy/sb.yml --format json
 ```
 
+Add `--no-fetch` to validate the pointer file alone, without resolving a
+`source:` block. Use this on a machine with no network access or no
+credential for the source repository, rather than let a git-sourced
+config validate a document it never actually fetched.
+
+```bash
+sbproxy validate /etc/sbproxy/sb.yml --no-fetch
+```
+
 ### `plan` - diff a proposed config against a baseline
 
 Compiles the proposed YAML, parses both baseline and proposed into
@@ -301,7 +317,12 @@ refuse on drift.
 sbproxy plan -f proposed.yml
 sbproxy plan -f proposed.yml --against live.yml --format json
 sbproxy plan -f proposed.yml --out /tmp/sb.plan
+sbproxy plan -f proposed.yml --no-fetch
 ```
+
+`--no-fetch` skips resolving a `source:` block on either side of the
+diff. Without it, a git-sourced config is planned against the document
+the repository actually serves, not the pointer file on disk.
 
 Exit codes:
 
@@ -713,6 +734,36 @@ sbproxy models stop local-qwen --format json
 `stop` drains active requests before stopping the engine and leaves verified
 weights in cache.
 
+`lock`, `verify-lock`, and `prune` manage a lockfile pinning the exactly
+resolved serving stack, independent of the artifact commands above:
+
+```bash
+sbproxy models lock -f /etc/sbproxy/sb.yml --out sbproxy-models.lock
+sbproxy models verify-lock --lockfile sbproxy-models.lock
+sbproxy models prune --dry-run
+```
+
+`lock` requires `-f/--config`: it resolves every configured serve/deployment
+entry against the catalog and writes each one's exact artifact digest,
+variant, and engine to the lockfile (default path
+`sbproxy-models.lock` next to the config). `verify-lock` reads a lockfile
+(same default path resolution) and diffs it against the verified local
+cache, printing `ok` or a `missing` / `digest_mismatch` drift per model;
+it exits `0` when every model matches and `2` when any has drifted.
+`prune` reclaims content-addressed weight blobs that no cached artifact
+references; `--dry-run` reports what would be reclaimed without deleting
+anything.
+
+The lockfile is what the global `--locked` flag enforces at boot: passed to
+`serve` (or the no-subcommand run form), it refuses to start unless every
+configured serve entry resolves to the artifact digest recorded in
+`sbproxy-models.lock`, exiting `2` on drift or on a missing lockfile. Other
+subcommands ignore `--locked`.
+
+```bash
+sbproxy --config sb.yml --locked
+```
+
 ### `doctor` - what can this binary do on this host
 
 Prints a host-capability report: the capability features the binary
@@ -890,6 +941,56 @@ in every install, so a `password_hash` hashed against it is
 offline-crackable by anyone with the source; pin
 `key_management.crypto.pepper` before relying on this for anything
 beyond local development. See [admin.md](admin.md#authentication-and-roles).
+
+### `ai ledger` and `ai prompt optimize` - AI gateway tools
+
+```bash
+sbproxy ai ledger verify /var/lib/sbproxy/usage-ledger.jsonl
+sbproxy ai ledger report /var/lib/sbproxy/value-ledger.redb --format json
+```
+
+`ledger verify` re-derives the verifiable usage ledger's hash chain (and,
+with `--signing-seed-hex`, its signatures) and reports the first broken
+entry. It reads the file directly, offline, and exits `0` when the ledger
+verifies, `1` otherwise. `ledger report` aggregates a value ledger (the
+redb file the AI handler keeps at `<cache_dir>/value-ledger.redb`) into
+the same per-model savings report the admin `GET /admin/model-host/value`
+route serves, with no server running; a missing file reports an empty
+ledger rather than an error.
+
+```bash
+sbproxy ai prompt optimize \
+  --prompt system-prompt.txt \
+  --eval-set eval.jsonl \
+  --endpoint https://api.example.com/v1 \
+  --task-model gpt-4o-mini \
+  --name support-agent \
+  --prompt-version v3 \
+  --output optimized.json
+```
+
+`prompt optimize` compiles a shorter static system prompt against a
+customer-owned JSONL evaluation set, evaluating candidates against the
+`--task-model` through the given `--endpoint` and stopping once the
+aggregate quality drop would exceed `--noise-tolerance` (default `0.02`).
+The result is a JSON artifact at `--output` recording the prompt-store
+`--name` and `--prompt-version`.
+
+### `audit verify` - check the security audit chain
+
+```bash
+sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl
+sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl --signing-seed-hex <hex>
+```
+
+Re-derives the tamper-evident security audit chain written by
+`audit.sink: chain` (the file named by `audit.path`) from genesis and
+reports the first record that does not check out. Reads the file and
+nothing else: no config, no admin API, no running proxy, so an auditor
+with a copy of the chain and the public key can run this against a file
+the proxy that wrote it no longer has. Without `--signing-seed-hex` only
+the hash chain is checked; passing it also verifies every signature.
+Exits `0` when the trail verifies, `1` otherwise.
 
 ### `completions` - shell tab-completion scripts
 
@@ -1725,7 +1826,7 @@ SBproxy watches the directory containing the configuration file via `notify`, ra
 
 A save arrives as a burst of events, not one event, so the watcher waits for the burst to go quiet (250 ms, capped at 2 seconds for a directory that never goes quiet) before reading. Back-to-back editor writes therefore coalesce into a single reload rather than one apiece, and the read sees a finished file rather than one still being written.
 
-It then compares the file's content against what is currently loaded, and does nothing when they match. Activity on a neighbouring file, or a no-op save of the config itself, costs no reload. This matters beyond efficiency: a reload swaps the compiled pipeline, which ends every live MCP session and makes callers re-initialize.
+It then compares the file's content against what is currently loaded, and does nothing when they match. Activity on a neighboring file, or a no-op save of the config itself, costs no reload. This matters beyond efficiency: a reload swaps the compiled pipeline, which ends every live MCP session and makes callers re-initialize.
 
 When the content has genuinely changed, the swap is atomic, and a config that fails to compile leaves the previous pipeline serving.
 
@@ -2180,8 +2281,8 @@ spec:
 
 ## 13. Environment variables reference
 
-The binary reads ten environment variables, most of them fallbacks for
-CLI flags. Variables are applied at process start; changes require a
+The binary reads fourteen environment variables, most of them fallbacks
+for CLI flags. Variables are applied at process start; changes require a
 restart.
 
 | Variable | CLI Flag | Default | Description |
@@ -2199,6 +2300,7 @@ restart.
 | `SB_ADMIN_PASSWORD` | `--password` | (unset) | Admin Basic Auth password for the same commands. Never printed, and cleared from memory once the request header is built. |
 | `SB_APPLY_CONFIG` | (none) | (unset) | Path to the proposed YAML used by `sbproxy apply -p <plan-file>`. Required for the `-p` flow because the plan file does not embed the YAML path. |
 | `SB_APPLY_BASELINE` | (none) | (unset) | Optional baseline override for `sbproxy apply -p`. When set, apply compares the plan's recorded baseline revision against this YAML's revision; otherwise the empty config is the baseline. |
+| `SBPROXY_CLUSTER_TOKEN` | `--token` | (unset) | One-time enrollment token for `sbproxy cluster enroll`. Prefer this over a command-line value, which stays in shell history. |
 
 In addition, the standard `RUST_LOG` env var is honored when neither
 `--log-level` nor `SB_LOG_LEVEL` is set, and

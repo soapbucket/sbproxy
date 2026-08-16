@@ -1,6 +1,6 @@
 # AI gateway: per-team virtual keys
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-08-16*
 
 Two virtual keys, two teams. The frontend team's key is allow-listed to
 `claude-haiku-4-5`; the data team's key also gets `claude-sonnet-4-5`. A key
@@ -144,10 +144,13 @@ separate `model_tokenizer` estimates from `heuristic` estimates.
 
 ## A note on unknown keys
 
-Matching a virtual key gives a request its identity and per-key model scoping; it is not a blanket authentication gate. An unrecognized bearer token simply matches no key: it picks up no per-team scoping and falls through to the action-level gates (and, with no `auth:` provider configured, would reach the upstream). To reject unknown callers outright, pair the gateway with an `auth:` provider, for example the `api_key` or `bearer` provider in [docs/configuration.md](../../docs/configuration.md) or OIDC login in [docs/auth-oidc.md](../../docs/auth-oidc.md).
+Matching a virtual key gives a request its identity and per-key model scoping; on its own it is not a blanket authentication gate. This example closes that gap with `action.require_governed_key: true`, so here an unrecognized bearer token is rejected outright: `401 {"error":"governed credential required"}`, confirmed before any upstream call.
+
+Without `require_governed_key: true`, an unrecognized bearer token would simply match no key: it would pick up no per-team scoping and fall through to the action-level gates (and, with no `auth:` provider configured, would reach the upstream). Pairing the gateway with an `auth:` provider instead, for example the `api_key` or `bearer` provider in [docs/configuration.md](../../docs/configuration.md) or OIDC login in [docs/auth-oidc.md](../../docs/auth-oidc.md), is the alternative way to reject unknown callers when you are not otherwise pinning every caller to a virtual key.
 
 ## What this exercises
 
+- `action.require_governed_key: true` - rejects a request whose bearer token matches no configured virtual key with `401` before any upstream call, rather than letting it fall through ungoverned (see "A note on unknown keys" below).
 - `models.allow` on a credential - per-key model scoping. A key that requests a model outside its allow-list is rejected with a `403` before any upstream call.
 - `tags` and `project` under `attrs:` - propagate to the `sbproxy_ai_key_*` metrics and the access log for per-team attribution.
 - `attrs.budget` and the per-credential `rate_limit` policy - recorded as attribution metadata on the matched key. Enforced spend and rate ceilings are configured at the action level (the `budget:` block and rate-limit policies); see [docs/ai-gateway.md](../../docs/ai-gateway.md).

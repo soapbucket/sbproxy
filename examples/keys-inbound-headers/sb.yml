@@ -33,16 +33,25 @@
 #
 # The proxy consumes x-api-key and never forwards it upstream.
 #
-# Sidecar instead: keep sending your own upstream credential and put the
-# minted key in x-sb-api. SBproxy governs the request without holding the
-# upstream secret.
+# Native credential instead: keep sending only your own upstream credential,
+# with no minted key on any swept header. This is a separate governed mode,
+# not something layered on top of a minted key: once a minted key resolves
+# from any swept header, SBproxy governs the request with the origin's own
+# configured `api_key` and never looks at the caller's credential, no matter
+# what else is present. Presenting a minted key in x-sb-api alongside your
+# own credential in Authorization does not forward that credential; only
+# the operator's `api_key` above reaches the upstream. Requires the
+# `native_key_policy` allowlist below and the matching
+# `accept_native_credentials_for` on the provider entry; without both, a
+# recognized caller-owned credential is refused with 403 before dispatch.
 #   curl -s http://127.0.0.1:8080/v1/messages \
 #     -H 'Host: anthropic.local' \
 #     -H 'Authorization: Bearer <your own upstream key>' \
-#     -H "x-sb-api: $TOKEN" \
 #     -H 'Content-Type: application/json' \
 #     -d '{"model":"claude-3-5-sonnet-20241022","max_tokens":64,
 #          "messages":[{"role":"user","content":"hi"}]}'
+#
+# SBproxy forwards that credential unmodified and never holds or stores it.
 
 proxy:
   http_bind_port: 8080
@@ -75,6 +84,15 @@ proxy:
       # Leave false unless this origin has no other auth provider. When true a
       # request carrying no minted key is refused with a 401.
       require: false
+      # provider_hints ships non-empty by default, so a caller-owned key
+      # (sk-proj-..., sk-ant-...) landing in a swept header is recognized as
+      # a native provider credential. Without an explicit allowlist here,
+      # SBproxy refuses every recognized credential with 403 before
+      # dispatch (a boot-time WARN names the recognized providers when this
+      # is missing). Required for the "sidecar" pattern below, where the
+      # caller keeps sending their own upstream credential.
+      native_key_policy:
+        allowed_providers: [openai]
 
 origins:
   anthropic.local:
@@ -82,4 +100,9 @@ origins:
       type: ai_proxy
       providers:
         - name: openai
+          # Also required for the sidecar pattern: without this opt-in, a
+          # recognized native credential still has no destination allowed
+          # to receive it, and the provider entry only ever uses its own
+          # api_key below.
+          accept_native_credentials_for: openai
           api_key: env:OPENAI_API_KEY

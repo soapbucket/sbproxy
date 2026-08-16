@@ -1,6 +1,6 @@
 # Upstream retries
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-08-16*
 
 ![Upstream retries](../../docs/assets/upstream-retries.gif)
 
@@ -25,16 +25,20 @@ time curl -i -H 'Host: localhost' http://127.0.0.1:8080/get
 #
 # real    0m0.42s    (connection refused is fast; retries add the backoff)
 
-# Bring up a backend on :9999 and the first attempt succeeds.
+# Bring up a backend on :9999 and the first attempt succeeds. Request `/`
+# (not `/get`) since a bare http.server 404s on any path that is not a real
+# file in its directory, and `/` always serves a directory listing.
 python3 -m http.server 9999 &
-curl -s -H 'Host: localhost' http://127.0.0.1:8080/get -o /dev/null -w '%{http_code}\n'
+curl -s -H 'Host: localhost' http://127.0.0.1:8080/ -o /dev/null -w '%{http_code}\n'
 # 200
 kill %1
 
-# Watch the proxy log to see the retry attempts:
-#   retry attempt=1 reason=connect_error backoff_ms=100
-#   retry attempt=2 reason=connect_error backoff_ms=200
-#   retry attempt=3 reason=connect_error backoff_ms=400
+# Watch the proxy log to see the retry attempts (Pingora's own connect-error
+# line, one per attempt; `retry: true` on the first two, `retry: false` and
+# a 502 on the third):
+#   WARN pingora_proxy: Fail to proxy: Upstream ConnectRefused ... tries: 1, retry: true, GET /get, Host: localhost
+#   WARN pingora_proxy: Fail to proxy: Upstream ConnectRefused ... tries: 2, retry: true, GET /get, Host: localhost
+#   ERROR pingora_proxy: Fail to proxy: Upstream ConnectRefused ... status: 502, tries: 3, retry: false, GET /get, Host: localhost
 ```
 
 ## What this exercises

@@ -2,7 +2,7 @@
 # Custom regex DLP guardrail on AI traffic.
 #
 # Built-in PII detection covers the obvious patterns (email, phone,
-# SSN, credit card). Real organisations have their own confidential
+# SSN, credit card). Real organizations have their own confidential
 # vocabulary: project codenames, internal doc IDs, source-control
 # URLs, support ticket numbers. A regex guardrail extends the input
 # pipeline with arbitrary patterns so confidential data never leaves
@@ -35,7 +35,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{"model":"gpt-4o-mini","messages":[
-#         {"role":"user","content":"Summarise the public release notes."}
+#         {"role":"user","content":"Summarize the public release notes."}
 #     ]}'
 #
 # Test (codename leak -> 4xx):

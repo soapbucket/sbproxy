@@ -27,9 +27,9 @@
 # Run:
 #   make run CONFIG=examples/defense-in-depth/sb.yml
 #
-# Test:
+# Test (see README.md for a one-liner that mints a matching JWT into $JWT):
 #   curl -H 'Host: localhost' \
-#        -H 'Authorization: Bearer <jwt>' \
+#        -H "Authorization: Bearer $JWT" \
 #        -H 'Content-Type: application/json' \
 #        -d '{"name":"alice","age":30}' \
 #        http://127.0.0.1:8080/anything

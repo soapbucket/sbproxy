@@ -43,7 +43,7 @@ curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers | has(
 - `action.disable_via_header`
 - `action.disable_forwarded_port_header`
 - The full `disable_*_header` opt-out family on the action
-- Default forwarding-header injection behaviour
+- Default forwarding-header injection behavior
 
 ## See also
 

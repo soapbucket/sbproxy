@@ -1,12 +1,12 @@
 # Custom engines
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-08-16*
 
 The model host launches a short list of engines it knows by name: llama.cpp,
-vLLM, and SGLang. Operators ask for more. TensorRT-LLM for NVIDIA-tuned
-serving, Kokoro for speech, a container built in-house. This page records the
-decision about how a new engine gets in, and why the answer is not a config
-field that takes an image and a command line.
+vLLM, SGLang, and mistral.rs. Operators ask for more. TensorRT-LLM for
+NVIDIA-tuned serving, Kokoro for speech, a container built in-house. This page
+records the decision about how a new engine gets in, and why the answer is not
+a config field that takes an image and a command line.
 
 ## The question
 

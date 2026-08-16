@@ -1,6 +1,6 @@
 # Prompt injection at the agent boundary
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 Prompt-injection scanning on the hop between two agents rather than on the hop between a person and a model. The message carrying the injection was written by another agent, and no human read it on the way through.
 
@@ -86,7 +86,7 @@ curl -i -H 'Host: agents.local' \
 {"error":"a2a_push_target_blocked","reason":"..."}
 ```
 
-The reason names the class of block (scheme, private address) and never echoes a resolved address, so the denial cannot be used to map the network.
+The reason names the class of block (scheme, private address) and includes the address that triggered it: the literal IP the caller sent for an IP-literal target, or the resolved IP for a hostname target. The hostname case does echo the resolution result back to the caller (see `blocked: hostname 'localhost' resolves to private IP ::1`), which is worth knowing if this error surfaces to an untrusted caller.
 
 Registration-time validation is not the whole story. The proxy refuses obviously hostile targets at the door, but the party that later dials the URL is the upstream agent, not the proxy, so this cannot close the DNS-rebinding window between registration and delivery. Closing that needs the agent to pin the address it validated.
 

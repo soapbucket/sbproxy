@@ -1,5 +1,5 @@
 # Headless detection
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-16*
 
 Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer.
 
@@ -65,10 +65,10 @@ Pair with `request.agent.score` and the JA4 verdict for a layered defense: a ben
 When both `rule_pack_path` and `onnx_model_path` are set, exact
 rule-pack identity matches win and the ONNX scorer runs on rule misses.
 
-## The fingerprint catalogue ships empty
+## The fingerprint catalog ships empty
 
-`tls_fingerprint_matches(ja4, agent_class_id)` reads a catalogue of known
-JA3 / JA4 / JA4H values per agent class. That catalogue contains the class
+`tls_fingerprint_matches(ja4, agent_class_id)` reads a catalog of known
+JA3 / JA4 / JA4H values per agent class. That catalog contains the class
 names and **no fingerprints**.
 
 The reason is licensing rather than laziness. A JA4 value is a measurement
@@ -93,7 +93,7 @@ proxy:
       catalog_file: /etc/sbproxy/tls-fingerprints.json
 ```
 
-It replaces the embedded catalogue wholesale rather than merging into it,
+It replaces the embedded catalog wholesale rather than merging into it,
 so the file you wrote is the whole truth and nothing ships underneath it
 that you did not put there. The schema is
 `crates/sbproxy-classifiers/data/tls-fingerprints.json`.
@@ -101,7 +101,7 @@ that you did not put there. The schema is
 ### Capturing a value
 
 The proxy already computes the fingerprint of every live handshake and
-exposes it as `request.tls.ja4`, so a known-good client is one catalogue
+exposes it as `request.tls.ja4`, so a known-good client is one catalog
 line. Stamp it into a response header with a CEL transform and read it
 back:
 
@@ -112,7 +112,7 @@ transforms:
       - { op: set, name: x-ja4, value_expr: "request.tls.ja4" }
 ```
 
-Then send one request from the client you want to catalogue and record
+Then send one request from the client you want to catalog and record
 what comes back. An access-log field works equally well for collecting
 values from real traffic over time.
 

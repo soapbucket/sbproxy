@@ -1,10 +1,10 @@
 # ClickHouse attribution
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 A canonical ClickHouse schema for the SBproxy access log, plus sample queries for the three reports an operator most often wants: monthly project cost, top users by token spend, and tag-level burndown against a budget. The schema mirrors the JSON shape emitted by the structured logger (`sbproxy-observe::access_log::AccessLogEntry`), so a Vector / Fluent Bit pipeline can ingest the proxy's stdout into ClickHouse without an intermediate transform.
 
-This guide assumes a recent ClickHouse (v24.3 or newer; `JSONEachRow` and `TIMESTAMP` semantics are unchanged across the LTS line). The schema uses `MergeTree` for the raw rows and `AggregatingMergeTree` for the materialised pre-aggregations.
+This guide assumes a recent ClickHouse (v24.3 or newer; `JSONEachRow` and `TIMESTAMP` semantics are unchanged across the LTS line). The schema uses `MergeTree` for the raw rows and `AggregatingMergeTree` for the materialized pre-aggregations.
 
 ## Why ClickHouse
 
@@ -162,7 +162,7 @@ GROUP BY project, month
 ORDER BY month DESC, usd_spend DESC;
 ```
 
-The query partitions by month and project. `cost_usd_micros` is the materialised column from the schema; rows without a settled price contribute zero. Pass the operator's workspace_id as a parameter so a SaaS deployment can serve the report to multiple tenants from one table without a per-tenant view.
+The query partitions by month and project. `cost_usd_micros` is the materialized column from the schema; rows without a settled price contribute zero. Pass the operator's workspace_id as a parameter so a SaaS deployment can serve the report to multiple tenants from one table without a per-tenant view.
 
 ## Sample query 2: top-10 users by token spend in the last 24h
 
@@ -221,7 +221,7 @@ ORDER BY percent_used DESC;
 
 The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team instead, set the credential's `attrs.team` or send an inbound `SB-Attr-Team` header; both land in the `attribution` map under `team`. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
 
-## Materialised view: per-day-per-project pre-aggregation
+## Materialized view: per-day-per-project pre-aggregation
 
 Dashboards that render six months of monthly rollups every 30 seconds do not need to scan the raw 1.8B-row table on every refresh. A daily pre-aggregation collapses the volume to a few thousand rows per workspace:
 
@@ -255,7 +255,7 @@ WHERE project IS NOT NULL
 GROUP BY day, workspace_id, project;
 ```
 
-Read it with `*Merge` finalisers:
+Read it with `*Merge` finalizers:
 
 ```sql
 SELECT

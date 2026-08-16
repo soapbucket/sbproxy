@@ -6,7 +6,22 @@
 # pointing at the proxy's intake endpoint. Browsers POST violation
 # reports to that endpoint; the proxy logs each report under the
 # `sbproxy::page_shield` tracing target so logpush sinks (or the
-# enterprise connection-monitor) can analyse them.
+# enterprise connection-monitor) can analyze them.
+#
+# SUSPECTED PRODUCT BUG (confirmed by testing, not fixed here): the
+# response-phase policies (page_shield, security_headers, sri,
+# assertion) only run in Pingora's upstream response_filter, which a
+# `type: static` or `type: mock` action never reaches (it writes the
+# response directly in the request phase and returns; see the comment
+# on `ctx.response_status = Some(s.status)` in
+# crates/sbproxy-core/src/server/action_dispatch.rs, and the
+# response_phase_enforcer! macro doc comment in
+# crates/sbproxy-core/src/builtin_enforcers/response_phase.rs). A
+# static-action origin with a page_shield policy compiles and reports
+# policy_verdict_event verdict=allow in the log, but the CSP header
+# never reaches the client. This origin therefore proxies to a real,
+# always-on demo host instead of serving a static body, so the header
+# actually appears; that is a workaround for this example, not a fix.
 #
 # Run:
 #   make run CONFIG=examples/page-shield/sb.yml
@@ -27,11 +42,8 @@ proxy:
 origins:
   "app.local":
     action:
-      type: static
-      status_code: 200
-      content_type: text/html
-      body: |
-        <!doctype html><html><body><h1>page</h1></body></html>
+      type: proxy
+      url: https://test.sbproxy.dev
 
     policies:
       - type: page_shield

@@ -1,6 +1,6 @@
 # AI gateway: multi-provider with fallback and guardrails
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 A two-provider AI gateway with input guardrails and a soft budget cap. The `fallback_chain` strategy tries Anthropic first (priority 1) and falls back to OpenRouter (priority 2) on a non-2xx upstream or timeout. Two input guardrails fire before any provider is contacted: the `injection` guardrail uses the built-in pattern set, and the `pii` guardrail blocks emails, phone numbers, SSNs, and credit card numbers. A workspace-scoped daily budget of 1M tokens is recorded with `on_exceed: log`, so the gauge moves but requests still flow.
 
@@ -29,11 +29,13 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
 {
   "id": "msg_01...",
   "object": "chat.completion",
-  "model": "claude-haiku-4-5",
+  "model": "claude-haiku-4-5-20251001",
   "choices": [{"message": {"role": "assistant", "content": "4"}, "finish_reason": "stop"}],
   "usage": {"prompt_tokens": 14, "completion_tokens": 1, "total_tokens": 15}
 }
 ```
+
+Anthropic returns the resolved dated snapshot in `.model` (`claude-haiku-4-5-20251001`), not the bare alias you requested.
 
 Prompt injection attempt is blocked at the edge:
 
@@ -49,7 +51,7 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":{"message":"Prompt injection detected: matched pattern \"...\"","type":"guardrail_violation","code":"injection"}}
+{"error":{"code":"injection","message":"Prompt injection detected: matched pattern \"...\"","request_id":"...","type":"guardrail_violation"}}
 ```
 
 PII in the prompt also blocks:

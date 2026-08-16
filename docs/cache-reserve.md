@@ -1,5 +1,5 @@
 # Cache Reserve
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
@@ -196,6 +196,10 @@ pub struct ReserveMetadata {
     pub created_at: SystemTime,
     pub expires_at: SystemTime,
     pub content_type: Option<String>,
+    // Ordered response headers needed to replay and promote the entry
+    // (including ETag and Last-Modified). `serde(default)` so metadata
+    // written before this field existed still decodes.
+    pub headers: Vec<(String, String)>,
     pub vary_fingerprint: Option<String>,
     pub size: u64,
     pub status: u16,

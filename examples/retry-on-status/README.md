@@ -1,6 +1,6 @@
 # Retry on status
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-08-16*
 
 Demonstrates status-code retries across a two-target load balancer. The `retry` block lists `503` in `retry_on`, so a matching upstream response is discarded before any bytes reach the client and target selection runs again. One target points at a deliberately failing local backend, the other at the healthy `test.sbproxy.dev` placeholder; with `algorithm: round_robin` the retry pass advances to the next target, so every request returns 200 even when it first lands on the failing backend.
 
@@ -34,9 +34,17 @@ for i in 1 2 3 4; do
   curl -s -H 'Host: localhost' http://127.0.0.1:8080/get -o /dev/null -w '%{http_code}\n'
 done
 
-# Stop the python backend and lower max_attempts to see the cap:
-# with both targets failing, the client receives the real 503 and
-# x-sbproxy-retry-skip-reason: max_attempts_exhausted.
+# To see the cap, both targets need to genuinely fail within the
+# attempt budget. Stopping the python backend alone will not do it:
+# the second target is the real test.sbproxy.dev, which stays healthy,
+# so round-robin still finds a 200. Lowering max_attempts to 1 will
+# not do it either: `enabled()` on the retry config is `max_attempts >
+# 1`, so max_attempts: 1 turns status-retries off entirely rather than
+# capping them at one, and no x-sbproxy-retry-skip-reason header is
+# emitted at all. Point both targets at local always-503 backends
+# instead (leave max_attempts at its default of 2) and the second
+# 503 comes back to the client with:
+#   x-sbproxy-retry-skip-reason: max_attempts_exhausted
 ```
 
 Each fired retry increments `sbproxy_upstream_status_retries_total{origin, status}` on `/metrics`.

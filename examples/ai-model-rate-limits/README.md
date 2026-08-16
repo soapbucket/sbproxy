@@ -1,6 +1,6 @@
 # AI gateway: per-model rate limits
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 Different models cost and behave differently, so they each need their own rate cap. The `model_rate_limits` map keys by model name and applies sliding one-minute windows for both requests and tokens. The cap fires regardless of which provider serves the model, so an alias or fallback chain that lands on the same upstream model still counts against the same window. Three caps are configured: `claude-sonnet-4-5` at 60 RPM / 200,000 TPM, `claude-haiku-4-5` at 240 RPM / 600,000 TPM, and the OpenRouter passthrough `anthropic/claude-sonnet-4.5` at 30 RPM / 100,000 TPM.
 
@@ -29,15 +29,21 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
 HTTP/1.1 200 OK
 ```
 
-Burst past the Sonnet cap (60 RPM):
+Burst past the Sonnet cap (60 RPM). The requests must land in the same
+window, so fire them concurrently rather than one at a time - a plain
+sequential loop spends more than a minute waiting on real upstream round
+trips, and the cap's token bucket refills as it goes, so a sequential burst
+of 80 comes back 80x200 with none rejected:
 
 ```bash
-$ for i in $(seq 1 80); do
-    curl -s -o /dev/null -w '%{http_code}\n' \
-      http://127.0.0.1:8080/v1/chat/completions \
-      -H 'Host: ai.local' -H 'Content-Type: application/json' \
-      -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"ping"}]}'
-  done | sort | uniq -c
+$ { for i in $(seq 1 80); do
+      curl -s -o /dev/null -w '%{http_code}\n' \
+        http://127.0.0.1:8080/v1/chat/completions \
+        -H 'Host: ai.local' -H 'Content-Type: application/json' \
+        -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"ping"}]}' &
+    done
+    wait
+  } | sort | uniq -c
      60 200
      20 429
 ```
@@ -53,7 +59,7 @@ HTTP/1.1 429 Too Many Requests
 content-type: application/json
 retry-after: 14
 
-{"error":{"message":"model rate limit exceeded","type":"rate_limit_error"}}
+{"error":{"message":"rate limit exceeded","request_id":"...","retryable":true,"type":"rate_limit_error"}}
 ```
 
 Other models are unaffected. While Sonnet is throttled, Haiku continues to serve traffic:

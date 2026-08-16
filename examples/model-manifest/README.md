@@ -1,6 +1,6 @@
 # Model manifest
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-08-16*
 
 This example uses a catalog v2 manifest as the immutable source of
 truth for managed model bytes. `models.yaml` names the logical models
@@ -41,10 +41,12 @@ make run CONFIG=examples/model-manifest/sb.yml
 `catalog_file: models.yaml` resolves relative to the directory holding
 `sb.yml`, not the process working directory. Because the Qwen entry is
 `pull: on_boot`, startup does not publish the request pipeline until its
-artifact is verified. Warming does not allocate a port, reserve VRAM,
-or start llama.cpp. The first request performs fit and residency
-planning, then launches llama.cpp with only the verified local GGUF
-path.
+artifact is verified, and `on_boot` also marks the deployment for a warm
+launch: the gateway performs fit and residency planning and starts
+llama.cpp with the verified local GGUF path before the listener opens,
+so the first request hits an already-running engine instead of paying a
+cold start. `offline-coder` (`pull: manual`) skips all of this until an
+operator runs `sbproxy models pull` explicitly.
 
 ## Catalog v2 fields
 

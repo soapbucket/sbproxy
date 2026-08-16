@@ -1,13 +1,14 @@
 # Listings
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 A `Listing` is a published, versioned view of an existing Resource (an
 origin, an MCP server, or a docs surface). Listings live in the same
 Repo as the rest of the proxy config, are version-controlled with it,
 and are validated through the same `sbproxy plan` pipeline. The
-primitive is the foundation the future hosted-Catalog surface and the
-Listing-scoped agent-skills extension build on.
+primitive is the foundation the future hosted-Catalog surface builds
+on. The Listing-scoped agent-skills extension (`spec.skills[]`) already
+ships on it today; see "Agent-skills" below.
 
 ## Where Listings live
 
@@ -33,7 +34,7 @@ count and any errors in the same place as the rest of the diff.
 
 ## Schema
 
-Every Listing uses the Kubernetes-flavoured manifest shape:
+Every Listing uses the Kubernetes-flavored manifest shape:
 
 ```yaml
 apiVersion: sbproxy.dev/v1
@@ -172,6 +173,9 @@ Rules enforced today:
 - `empty-listing-resources` (error): `spec.resources` is empty.
 - `duplicate-listing-name` (error): two manifests in the same Repo
   share a `metadata.name`.
+- `listing-load-error` (error): a file under `listings/` failed to
+  load entirely: unreadable, invalid YAML, or an `apiVersion`/`kind`
+  header that does not match `sbproxy.dev/v1` / `Listing`.
 
 Validation failures surface as plan errors, not config-load errors.
 The proxy still starts when a Listing is stale; the operator sees the
@@ -184,7 +188,7 @@ finding the next time `sbproxy plan` runs against the Repo.
   `resources[].ref: origins/<hostname>`. The origin's
   `authentication.type` constrains what `spec.auth.strategies` the
   Listing can advertise.
-- **Projections** (`docs/llms.md`, robots.txt, RSL): runtime
+- **Projections** (`llms.txt`, robots.txt, RSL): runtime
   surfaces emitted from the live config. Listings are an input to a
   future Catalog projection (out of scope here). The shape lands here
   so projections can read from a stable Listing surface when the

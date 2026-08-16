@@ -1,6 +1,6 @@
 # WAF (OWASP Core Rule Set)
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![WAF (OWASP Core Rule Set)](../../docs/assets/waf.gif)
 
@@ -27,19 +27,21 @@ content-type: application/json
 $ curl -i -H 'Host: waf.local' \
        "http://127.0.0.1:8080/get?id=1%27%20OR%20%271%27=%271"
 HTTP/1.1 403 Forbidden
-content-type: text/plain
+content-type: application/json
 
-blocked by waf
+{"error":"WAF: SQL injection detected"}
 ```
 
 ```bash
-# Reflected XSS pattern - also blocked
+# Reflected XSS pattern, also blocked. URL-encode the payload: a raw
+# `<script>` in the request line is invalid per RFC 7230 and gets a 400
+# from the HTTP layer before the WAF policy ever runs.
 $ curl -i -H 'Host: waf.local' \
-       "http://127.0.0.1:8080/get?q=<script>alert(1)</script>"
+       "http://127.0.0.1:8080/get?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
 HTTP/1.1 403 Forbidden
-content-type: text/plain
+content-type: application/json
 
-blocked by waf
+{"error":"WAF: XSS detected"}
 ```
 
 ```bash
@@ -47,6 +49,9 @@ blocked by waf
 $ curl -i -H 'Host: waf.local' \
        "http://127.0.0.1:8080/get?file=../../../../etc/passwd"
 HTTP/1.1 403 Forbidden
+content-type: application/json
+
+{"error":"WAF: path traversal detected"}
 ```
 
 ## What this exercises

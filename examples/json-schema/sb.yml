@@ -22,6 +22,14 @@
 proxy:
   http_bind_port: 8080
 
+  # Only because the demo upstream in "Try it" runs on this machine: the
+  # SSRF guard refuses private upstream addresses unless allowlisted. A
+  # production config pointing at a real upstream does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
 origins:
   "api.example.com":
     action:

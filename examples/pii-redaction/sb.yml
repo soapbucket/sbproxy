@@ -13,7 +13,9 @@
 # Run:
 #   make run CONFIG=examples/pii-redaction/sb.yml
 #
-# Test (the upstream sees redacted PII; httpbin echoes it back):
+# Test (the upstream sees redacted PII; an echoing upstream shows it
+# back to you, see the README's "Known issue" note if test.sbproxy.dev
+# stops echoing request bodies under /anything):
 #   curl -s -H 'Host: ai.localhost' http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'content-type: application/json' \
 #     -d '{

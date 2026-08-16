@@ -1,6 +1,6 @@
 # Redis-backed AI context compression
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-08-16*
 
 This example runs the ordered AI context-compression pipeline with a
 process-wide Redis state backend. A dedicated `openai-summarizer` provider
@@ -58,8 +58,19 @@ X-Sb-Session-Id: 01HQRP1KJVH3JPCJ8SAVAV6F4Z
 The value must be a valid 26-character ULID. This example sets
 `sessions.auto_generate: never`, so a missing or invalid header does not create
 compression state. The `summary_buffer` lever skips with a missing-session
-outcome while the request continues through the remaining pipeline. A valid
-captured value is echoed in the response as `X-Sb-Session-Id`.
+outcome while the request continues through the remaining pipeline.
+
+**SUSPECTED PRODUCT BUG:** the session ID is not actually echoed back on an
+`ai_proxy` response. `X-Sb-Session-Id` echo is implemented once, in the
+generic `type: proxy` response path
+(`crates/sbproxy-core/src/server/proxy_http.rs`, guarded on `ctx.session_id`),
+but the AI-gateway dispatch path this example uses
+(`crates/sbproxy-core/src/server/ai_dispatch.rs`) never sets that header on
+its own responses, even though it reads `ctx.session_id` internally to key
+the Redis summary record. Repro: send a request with a valid
+`X-Sb-Session-Id` to this example (confirmed with `curl -D -`) and the
+compression pipeline log line correctly shows `"backend":"redis"` picking up
+the session, but the response headers contain no `x-sb-session-id` at all.
 
 The caller must reuse the same ULID and resend the full history on later
 turns. Any request worker can handle a turn because the state key is isolated
@@ -262,6 +273,7 @@ curl --fail-with-body -sS \
   | tee /tmp/sbproxy-compression-turn-1.response.json
 
 grep -i '^x-sb-session-id:' /tmp/sbproxy-compression-turn-1.headers
+# Currently prints nothing; see the SUSPECTED PRODUCT BUG note above.
 TURN_1_REPLY="$(jq -r '.choices[0].message.content' \
   /tmp/sbproxy-compression-turn-1.response.json)"
 

@@ -58,4 +58,9 @@ origins:
         sample_rate: 0.1
         timeout_ms: 30000
         task_timeout_ms: 30000
-        # model: claude-haiku-4-5   # uncomment to override
+        # Without this override the shadow leg would forward the
+        # primary request's model name (e.g. gpt-4o-mini) to Anthropic
+        # unchanged, and Anthropic has no such model, so every shadow
+        # call would fail with 404. Set this to a model the shadow
+        # provider actually serves.
+        model: claude-haiku-4-5

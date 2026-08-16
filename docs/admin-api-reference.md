@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-16*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -280,8 +280,8 @@ the policy model these records drive.
 | POST | `/admin/credentials` | Create a credential (`vault_ref` or `secret`, envelope-sealed at rest). |
 | GET | `/admin/credentials/{id}` | Fetch one credential. |
 | PATCH | `/admin/credentials/{id}` | Update credential metadata, provider, or material. |
-| DELETE | `/admin/credentials/{id}` | Delete a credential. |
-| POST | `/admin/credentials/{id}/revoke`, `/block`, `/unblock` | Same lifecycle actions as keys. |
+| DELETE | `/admin/credentials/{id}` | Delete a credential. `409` while any key's `credential_id` still points at it. |
+| POST | `/admin/credentials/{id}/revoke`, `/block`, `/unblock` | Set the credential's status. Unlike the key lifecycle actions below, this has no `expected_revision` check and no terminal-state guard: a revoked credential can still be blocked or unblocked again. |
 
 All of these return `409 {"error":"key_management is not enabled"}`
 when the process has no dynamic key plane configured (no `keystore:`
@@ -300,9 +300,7 @@ missing key/credential id is `404`.
   "name": "checkout-service",
   "status": "active",
   "max_requests_per_minute": 600,
-  "max_tokens_per_minute": null,
-  "priority": null,
-  "budget": {"max_tokens": null, "max_cost_usd": 25.0},
+  "budget": {"max_cost_usd": 25.0},
   "allowed_models": ["gpt-4o-mini", "claude-haiku-4-5"],
   "blocked_models": [],
   "allowed_providers": [],
@@ -312,6 +310,7 @@ missing key/credential id is `404`.
   "principal_selectors": [],
   "inject_tools": [],
   "bypass_prompt_injection": false,
+  "allow_content_capture": false,
   "project": null,
   "user": null,
   "tags": ["team:checkout"],
@@ -330,13 +329,18 @@ populated for records that own a tenant (`tenant_id` set); a tenantless
 record inherits the request's origin tenant, so it has no single
 runtime digest. Get one per-origin from the effective-policy preview
 instead. `rotation_pending` is true while a prior secret is still
-valid inside its rotation grace window.
+valid inside its rotation grace window. `allow_content_capture` gates
+whether `GET /api/requests/{request_id}/content` can sample this key's
+traffic; it is always present. `max_tokens_per_minute`, `priority`,
+`route_to_model`, `compression_profile`, `inject_mcp`, and
+`budget.max_tokens` are omitted from the response entirely when unset,
+rather than serialized as `null`.
 
 `POST /admin/keys` accepts the same policy fields as `PATCH` (name,
 budgets, allow/block lists, `route_to_model`, `compression_profile`,
 `inject_tools`, `inject_mcp`, `principal_selectors`, `tags`, `metadata`,
-`tenant`, `expires_at`, ...) and returns `201` with
-`{"token": "<plaintext, shown once>", "key": <KeyView>}`.
+`tenant`, `expires_at`, `allow_content_capture`, ...) and returns `201`
+with `{"token": "<plaintext, shown once>", "key": <KeyView>}`.
 
 ### Optimistic concurrency and terminal state
 
@@ -378,8 +382,9 @@ key record itself is not at fault in that case.
 
 Body is an optional sample request shape (`model`, `provider`, `tools`,
 `principal`, `origin_tenant_id`, `active_pii_rules`,
-`prompt_injection_detected`, `usage`, `at`). Every field is optional; an
-empty body still returns the resolved policy. Response:
+`prompt_injection_detected`, `estimated_tokens`, `estimated_micro_usd`,
+`usage`, `at`). Every field is optional; an empty body still returns
+the resolved policy. Response:
 
 ```json
 {
@@ -416,6 +421,8 @@ reserves budget; it is pure evaluation against the stored record.
   "name": "openai-prod",
   "provider": "openai",
   "kind": "ai_provider",
+  "header": "authorization",
+  "scheme": "Bearer ",
   "status": "active",
   "tenant_id": null,
   "storage": "vault_ref",
@@ -430,9 +437,17 @@ reserves budget; it is pure evaluation against the stored record.
 rest), or `plaintext` (legacy records only). The actual secret is
 never present in any response; `vault_ref` only appears for
 vault-referenced credentials, since the reference itself is not a
-secret. `POST`/`PATCH` bodies accept `vault_ref` *or* `secret` (a
-plaintext value the server envelope-seals immediately); supplying
-neither is a `400`.
+secret. `header` and `scheme` name the upstream header this credential
+is presented in (default `authorization` / `Bearer `; send an empty
+`scheme` for a raw-value header such as `x-api-key`); both are set at
+creation time and are not among the fields `PATCH` can change.
+
+`POST` bodies accept `vault_ref` *or* `secret` (a plaintext value the
+server envelope-seals immediately); supplying neither is a `400`.
+`PATCH` also accepts `vault_ref` or `secret` to rotate the material,
+but unlike `POST` it does not require either: a `PATCH` body with
+neither field present succeeds (`200`) and leaves the existing
+material unchanged.
 
 ---
 
@@ -784,7 +799,7 @@ from the live counters:
 
 Passing any of `window` (`1h`, `24h`, `7d`, `30d`), `group_by`
 (`total`, `model`, `provider`, `tenant`, `team`, `api_key`, `project`,
-`origin`, or `property:<key>`), `from`, or `to` (Unix seconds)
+`origin`, `agent`, or `property:<key>`), `from`, or `to` (Unix seconds)
 switches to the windowed shape served from the durable usage rollups
 (these survive a restart, unlike the process-lifetime counters):
 
@@ -894,6 +909,10 @@ state. Passwords are never included.
 [{"username": "viewer", "role": "read_only"}]
 ```
 
+An operator scoped to one billing tenant on the meter routes carries an
+additional `tenant` field naming that scope; it is omitted for an
+operator who may read the whole deployment.
+
 ### `GET /api/audit/recent`
 
 Recent rate-limit budget audit rows (suspend, throttle, resume
@@ -931,17 +950,23 @@ audit trail is whatever your log pipeline or OTel collector ships the
 
 ### `GET /api/rate_limits/budget`
 
-Per-workspace rate-limit budget state: tier (`normal`, `throttle`,
-`auto_suspend`) and any active suspend cool-down, from the
+Per-workspace rate-limit budget state: tier (`Normal`, `Soft`,
+`Throttle`, or `AutoSuspend`; capitalized, not the lowercase form the
+rest of this API uses) and any active suspend cool-down, from the
 `RateLimitBudgetRegistry` snapshot. `404 {"error":"no rate_limits: block configured"}`
 when the workspace-budget feature is off.
 
 ### `POST /api/rate_limits/resume`
 
-Manually clears a workspace's escalation state back to `normal`.
-Body: `{"workspace": "<id>"}`. `400` for a missing/empty workspace,
-`404` when the workspace has not been tracked (no traffic seen) or no
-`rate_limits:` block is configured.
+Manually clears a workspace's escalation state back to normal.
+Body: `{"workspace": "<id>"}`. Success is `200 {"workspace": "<id>",
+"tier": "normal"}`: this route's success body hardcodes a lowercase
+`"normal"` literal rather than reusing the capitalized `Normal` value
+`GET /api/rate_limits/budget` and `GET /api/rate_limits/effective`
+report, so do not pattern-match `tier` case-sensitively across these
+three routes. `400` for a missing/empty workspace, `404` when the
+workspace has not been tracked (no traffic seen) or no `rate_limits:`
+block is configured.
 
 ### `GET /api/rate_limits/effective`
 
@@ -949,21 +974,26 @@ Effective requests-per-second ceiling and tier for one workspace right
 now: `?workspace=<id>` (defaults to `default`).
 
 ```json
-{"workspace": "default", "effective_rps": 1000, "tier": "normal"}
+{"workspace": "default", "effective_rps": 1000, "tier": "Normal"}
 ```
 
+`tier` is `Normal`, `Soft`, `Throttle`, or `AutoSuspend`, same
+capitalized vocabulary as `GET /api/rate_limits/budget`. `effective_rps`
+drops to `1` while `tier` is `AutoSuspend`.
 `404 {"error":"no rate_limits: block configured"}` when unconfigured.
 
 ### `POST /api/rate_limits/clock/advance`
 
 **Test/dev-only.** Advances the rate limiter's clock by `?secs=N`
-seconds. This only does anything when `proxy.rate_limits.clock:
-manual` is set, a mode that exists so integration tests can assert
-token-bucket refill and suspend-cooldown behavior deterministically,
-without sleeping in wall time. Production configs use the default
-`system` clock, for which this route returns
-`400 {"error":"clock is not in manual mode"}`. There is no reason to
-call this against a real deployment.
+seconds. Success is `200 {"advanced_secs": N}`. This only does
+anything when `proxy.rate_limits.clock: manual` is set, a mode that
+exists so integration tests can assert token-bucket refill and
+suspend-cooldown behavior deterministically, without sleeping in wall
+time. Production configs use the default `system` clock, for which
+this route returns `400 {"error":"clock is not in manual mode"}`.
+`404 {"error":"no rate_limits: block configured"}` when no
+`rate_limits:` block is configured at all. There is no reason to call
+this against a real deployment.
 
 ### `GET /api/ui-settings`
 
@@ -1146,6 +1176,12 @@ Success returns the usual metadata plus the only content-bearing field:
   "summary": "Bounded generated running summary."
 }
 ```
+
+`summary` passes through the secret redactor (the same one applied to
+captured AI trace content) before it is returned: a summarizer that
+echoed a secret the caller pasted into the conversation does not leak
+it back out through this route. The stored record itself keeps the
+exact, unredacted bytes; only this read path redacts.
 
 Successful content responses include all three safety headers:
 
@@ -1507,10 +1543,17 @@ installed.
 
 A few subsystems are allowed to fail without refusing the reload,
 because a stale AI catalog is better than a proxy pinned on an old
-config: the AI provider registry, the dynamic key plane, the listings
-registry, the sink dispatcher, and the pipeline lifecycle hook. When one
-of them fails, the swap still happens, `fully_applied` is `false`, and
-`degraded` names what did not take effect:
+config: the AI provider registry (`ai_provider_registry`), the dynamic
+key plane (`key_plane`), the listings registry (`listings`), and the
+sink dispatcher (`sink_dispatcher`). When one of them fails, the swap
+still happens, `fully_applied` is `false`, and `degraded` names what
+did not take effect:
+
+`degraded` can also carry `pipeline_lifecycle_hook`, kept only as a
+compatibility label for older reload responses: atomic candidate
+publication now rejects a lifecycle-hook failure before the swap, so
+that failure refuses the reload outright (see the status table below)
+rather than ever landing in this array on a current build.
 
 ```json
 {
@@ -1640,22 +1683,31 @@ none of them create or delete a deployment; that is what the
 
 ### `GET`/`PUT /admin/model-host/deployments` errors
 
-`PUT` is only served on this process when a runtime manager is
-installed at all (`404` otherwise, from the model-host manager not
-being present). A stale `expected_revision` is `409 revision_conflict`;
-an invalid or secret-bearing body is `400 invalid_bundle`; a
-non-`admin_managed` authority (i.e. `file_managed` or a cluster
-verifier node) returns `403` explaining the deployment map is managed
-elsewhere. See [model-host.md](model-host.md#authenticated-catalog-and-local-deployment-api)
+Both routes are served from an always-present runtime handle, even
+when `proxy.model_host` is unconfigured (an empty desired state
+answers `GET`); there is no manager-absent `404` here. A stale
+`expected_revision` is `409 revision_conflict`; a malformed or
+unparseable body is `400 invalid_body`; a body that parses but fails
+semantic validation (including a deployment referencing an unknown
+catalog model or variant) is `400 invalid_desired`,
+`400 unknown_catalog_model`, or `400 unknown_catalog_variant`; a
+non-`admin_managed` authority (the default `file_managed`, or a
+cluster verifier node) returns `403 authority_read_only` explaining
+the deployment map is managed elsewhere. See
+[model-host.md](model-host.md#authenticated-catalog-and-local-deployment-api)
 for the full request schema and validation order.
 
 ### `GET /admin/model-host/value`
 
 ```json
 {
-  "models": [{"model": "gpt-4o-mini", "local_completions": 0, "cloud_completions": 42}],
+  "models": [{"model": "gpt-4o-mini", "local_completions": 0, "cloud_completions": 42, "saved_micros": 0, "cloud_spent_micros": 8400}],
+  "total_saved_micros": 0,
+  "total_cloud_spent_micros": 8400,
+  "total_local_completions": 0,
+  "total_cloud_completions": 42,
   "compression": [{"model": "gpt-4o-mini", "lever": "window_fit", "tokens_saved": 18432, "gross_cost_saved_micros": 2765, "token_count_precision": "model_tokenizer"}],
-  "compression_totals": {"window_fit": {"tokens_saved": 18432, "gross_cost_saved_micros": 2765}},
+  "compression_totals": {"window_fit": {"tokens_saved": 18432, "gross_cost_saved_micros": 2765, "token_count_precision": "model_tokenizer"}},
   "total_compression_tokens_saved": 18432,
   "total_compression_gross_cost_saved_micros": 2765
 }
@@ -1667,11 +1719,15 @@ cloud provider, or is compressed completes successfully. A model's
 `cloud_spent_micros` are the two halves of one split, priced against the
 same configured `reference`, so the saved figure is gross and the
 difference is net. Both halves are keyed on the model the caller asked
-for rather than the id the answering provider billed under. See
+for rather than the id the answering provider billed under. The four
+`total_saved_micros` / `total_cloud_spent_micros` /
+`total_local_completions` / `total_cloud_completions` fields sum those
+same two halves across every model line. See
 [model-host.md](model-host.md#value-delivered) for the lane rules.
 `compression` is sorted by model and lever;
-`compression_totals` aggregates by lever name. A known target-model
-tokenizer produces `model_tokenizer` precision; the UTF-8
+`compression_totals` aggregates by lever name, carrying the same
+`token_count_precision` signal as each `compression[]` entry. A known
+target-model tokenizer produces `model_tokenizer` precision; the UTF-8
 byte-length fallback produces `heuristic`. Both are sbproxy estimates,
 not provider billing totals. The ledger is a bounded in-memory
 structure (at most 1,000 model lanes, with overflow folded into
@@ -1779,16 +1835,23 @@ when `key_management` has no keystore backend configured.
 ### `GET /admin/cache/semantic`
 
 `?limit=N` (default 50, max 100) recent lookup decisions per AI origin
-that has a semantic (embedding) cache configured:
+that has a semantic (embedding) cache configured, one entry per origin
+*and* forward rule (a forward rule with its own `semantic_cache:` block
+reports separately rather than being folded into its origin):
 
 ```json
-{"caches": [{"origin": "ai.example.com", "recent": [{"reason": "hit", "score": 0.94, "threshold": 0.85}]}]}
+{"caches": [{"origin": "ai.example.com", "backend": "redis", "recent": [{"reason": "hit", "score": 0.94, "threshold": 0.85, "at_unix": 1784300000}]}]}
 ```
 
-`reason` is `hit`, `no_entry`, `expired`, `below_threshold`, or
-`cross_scope`. `caches: []` when no origin has an embedding cache
-configured. See [local-inference.md](local-inference.md) for the
-semantic-cache feature this debugs.
+A cache scoped to a forward rule additionally carries a `forward_rule`
+index alongside `origin` and `backend`. `reason` is `hit`, `no_entry`,
+`expired`, `below_threshold`, `incompatible`, or `backend_error`.
+`score` is the matched cosine score on a hit, or the closest
+candidate's score on a `below_threshold` miss; `null` otherwise.
+`at_unix` is the Unix-seconds timestamp of the lookup. `caches: []`
+when no origin has an embedding cache configured. See
+[local-inference.md](local-inference.md) for the semantic-cache
+feature this debugs.
 
 ---
 
@@ -1797,7 +1860,9 @@ semantic-cache feature this debugs.
 ### `GET /admin/cluster/status`
 
 Returns one versioned snapshot for the complete cluster view. This is an
-authenticated read route and returns `405` for other methods.
+authenticated read route and returns `405` for other methods, and
+`503 {"error":"cluster owner is not initialized"}` if the process's
+cluster owner has not finished starting up yet.
 
 ```json
 {
@@ -2048,15 +2113,20 @@ and rate-limit view, and (despite older notes to the contrary) the
 full cluster roster, health rail, and unhealthy-node alerts, reading
 `GET /admin/cluster/status` and `GET /admin/cluster/metrics`. See
 [admin-ui.md](admin-ui.md) for the page-by-page reference. `GET /`
-does not redirect there; it returns a small static HTML landing page
-(`200 text/html`) that lists the main API endpoints. Both routes are
-authenticated like the rest of `/api/*` and `/admin/*`.
+(and `GET /admin`, `GET /admin/`) redirects with a `302` to
+`/admin/ui/`. The redirect is dispatched before the auth gate: the
+target carries no data, and requiring credentials just to be told
+where the login page lives is a dead end. The SPA then gates itself
+and shows its own login. `/admin/ui/` itself, and the rest of
+`/admin/*` and `/api/*`, are authenticated as documented above.
 
 The dashboard is only present when the binary was built with it
 embedded: build the UI assets first (`cd ui && npm ci && npm run
-build`), then compile the proxy with `--features embed-admin-ui`.
-Default builds skip the embed and `/admin/ui` returns a `404` whose
-body spells out those two steps.
+build`, matching the committed `ui/package-lock.json`), then compile
+the proxy with `--features embed-admin-ui`. Default builds skip the
+embed and `/admin/ui` returns a `404`. Its body currently tells
+operators to run `pnpm install && pnpm build` instead, which does not
+match this repo's npm-based `ui/` tree; use the npm commands above.
 
 ---
 
@@ -2064,12 +2134,18 @@ body spells out those two steps.
 
 Exposes the runtime prompt-store overlay. `GET /admin/prompts`
 returns the in-memory snapshot (every active prompt + pinned
-version + last-mutation metadata) as JSON. `POST /admin/prompts`
-mutators add a new version, pin a version, or roll back; mutations
-persist to the operator-configured redb file when
+version + last-mutation metadata) as JSON. Two sub-path mutators act
+on one `<host>/<name>` prompt: `POST
+/admin/prompts/<host>/<name>/versions` adds a new version, and `PUT
+/admin/prompts/<host>/<name>/pin` pins which version is the active
+default, which is also how an operator rolls back, by pinning a version
+older than the current default. Both are `404
+{"error":"unknown prompt admin action"}` for any other action segment,
+and `405` on the wrong method for the action they do recognize.
+Mutations persist to the operator-configured redb file when
 `admin.prompt_persistence_path` is set, so changes survive restart.
 
-The full set of POST shapes and request schemas is documented in
+The full set of request/response shapes is documented in
 [ai-gateway.md](./ai-gateway.md) under "Stored prompts". This
 reference only catalogs the route surface; the request/response
 contracts live with the feature.
@@ -2104,8 +2180,13 @@ loopback call cannot satisfy. Pass `"debug": true` in either POST body
 to get a `debug` block with a server-logged request id and the config
 revision for correlation.
 
-Unauthenticated requests see `401 Unauthorized`; other verbs return
-`405 Method Not Allowed`.
+Unauthenticated requests see `401 Unauthorized`. These three routes
+match on exact method-and-path pairs in the async connection handler;
+a request with the right path but the wrong verb (`GET` on `/chat` or
+`/dispatch`, `POST` on `/endpoints`) does not hit a dedicated
+"wrong method" branch, falls through to the same catch-all as an
+unrecognized path, and comes back `404 {"error":"Not Found"}` rather
+than `405`.
 
 ---
 

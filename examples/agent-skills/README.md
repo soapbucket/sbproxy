@@ -1,5 +1,5 @@
 # Agent Skills v0.2.0
-*Last modified: 2026-05-09*
+*Last modified: 2026-08-16*
 
 Demonstrates the Agent Skills v0.2.0 well-known projection. SBproxy
 serves a discovery manifest at
@@ -43,7 +43,7 @@ curl -s -H 'Host: test.sbproxy.dev' \
       "name": "deploy-via-pr",
       "type": "skill-md",
       "description": "Open a pull request to deploy a config change.",
-      "url": "https://test.sbproxy.dev/skills/deploy-via-pr.md",
+      "url": "http://test.sbproxy.dev/skills/deploy-via-pr.md",
       "digest": "sha256:..."
     }
   ]

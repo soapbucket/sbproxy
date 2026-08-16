@@ -28,6 +28,15 @@
 proxy:
   http_bind_port: 8080
 
+  # Only because the demo upstream is a closed port on this machine: the
+  # SSRF guard refuses private/loopback upstream addresses unless
+  # allowlisted. A production config pointing at a real upstream does not
+  # need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
 origins:
   "localhost":
     action:

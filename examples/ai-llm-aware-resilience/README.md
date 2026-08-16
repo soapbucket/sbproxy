@@ -1,5 +1,7 @@
 # LLM-aware resilience
 
+*Last modified: 2026-08-16*
+
 Classify each upstream failure into an LLM-specific cause and apply a retry
 count per error class, instead of treating every 5xx the same.
 
@@ -44,9 +46,11 @@ curl -s -H 'Host: ai.local' -H 'Content-Type: application/json' \
 # 400 {"error":"invalid JSON body"} - no API key needed to see this one
 ```
 
-Watch the log for `retry attempt=` lines to see the per-error-class retry
-count in action: a `429` from the primary deployment retries up to 3
-times before the chain advances to the secondary.
+Run with `--log-level debug` (the default level is `info`, which does not
+show this) to see the per-error-class retry count in action: a `429` from
+the primary deployment retries up to 3 times before the chain advances to
+the secondary. The line is `AI provider retry backoff` with structured
+`provider` / `attempt` / `delay_ms` fields, not a `retry attempt=...` line.
 
 ## Stateful context compression
 

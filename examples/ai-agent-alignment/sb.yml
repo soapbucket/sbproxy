@@ -70,9 +70,21 @@
 #     }'
 #
 # Expected behaviour:
-#   The first request reaches Anthropic; the second and third are
-#   rejected with HTTP 400 before any upstream call. The reason
-#   string in the JSON body names the failing rule + offending tool.
+#   The second and third requests are rejected with HTTP 400 before
+#   any upstream call; the reason string in the JSON body names the
+#   failing rule + offending tool. Confirmed against a live Anthropic
+#   account.
+#
+#   SUSPECTED PRODUCT BUG: the first request passes the guardrail but
+#   currently fails against a real Anthropic account with a 400 FROM
+#   ANTHROPIC ("messages.1.content: Input should be a valid array"),
+#   not from sbproxy. crates/sbproxy-ai/src/translators/anthropic.rs
+#   request_to_native() does not translate an OpenAI-shaped assistant
+#   message's `tool_calls` (+ `content: null`) into Anthropic's native
+#   `content: [{"type": "tool_use", ...}]` shape on the request side,
+#   so `content: null` is forwarded as-is. See examples/ai-agent-alignment/README.md
+#   for the full repro.
+#
 #   Flip `mode: block` to `mode: flag` to keep the request going
 #   while still recording the violation on the access log.
 

@@ -1,6 +1,6 @@
 # access-log
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-08-16*
 
 ![access-log](../../docs/assets/access-log.gif)
 
@@ -39,6 +39,7 @@ fields and nothing more:
   "timestamp": "2026-08-01T14:56:33.863503+00:00",
   "request_id": "019fbdd3ab8272e2a87d91f409911437",
   "origin": "api.local",
+  "config_revision": "8f10eba811d1",
   "method": "GET",
   "path": "/anything",
   "protocol": "HTTP/1.1",

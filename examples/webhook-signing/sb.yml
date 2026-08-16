@@ -5,7 +5,8 @@
 # - when `secret` is set on the callback - an HMAC-SHA256 signature
 # so the receiver can verify it wasn't forged.
 #
-# Body shape:
+# Body shape (on_request, fired before the upstream is contacted, so it
+# carries the inbound request):
 #   {
 #     "event": "on_request",
 #     "proxy": {
@@ -23,6 +24,19 @@
 #     "host": "localhost",
 #     "client_ip": "203.0.113.7",
 #     "headers": { ... }
+#   }
+#
+# Body shape (on_response, fired after the response is ready; drops
+# method/client_ip/headers, adds status and duration_ms):
+#   {
+#     "event": "on_response",
+#     "proxy": { "instance_id": "...", "version": "...", "config_revision": "..." },
+#     "request": { "id": "01j9x4...", "received_at": "2026-04-25T07:32:00Z" },
+#     "origin": { "name": "localhost" },
+#     "host": "localhost",
+#     "path": "/api/users",
+#     "status": 200,
+#     "duration_ms": 153
 #   }
 #
 # Headers on the webhook request:

@@ -19,7 +19,9 @@
 #   make run CONFIG=examples/response-cache-per-origin-keys/sb.yml
 #
 # Test:
-#   # Each tenant caches independently.
+#   # Each tenant caches independently. x-sbproxy-cache is only stamped on
+#   # a hit (HIT or STALE), so the first call below prints nothing and the
+#   # second prints `x-sbproxy-cache: HIT`.
 #   curl -s -D - -o /dev/null -H 'Host: tenant-a.local' \
 #     http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
 #   curl -s -D - -o /dev/null -H 'Host: tenant-a.local' \

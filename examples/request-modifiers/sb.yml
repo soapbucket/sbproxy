@@ -3,8 +3,10 @@
 #
 # Demonstrates the full typed shape of request_modifiers: header set/add/remove,
 # URL path replace, query set/add/remove, method override, and JSON body
-# replacement. Upstream is test.sbproxy.dev, which echoes back the headers, path,
-# query, method, and JSON body it observed so you can verify each rewrite.
+# replacement. Upstream is test.sbproxy.dev, which echoes back the method, the
+# relative URL (path + query, lowercased header names) it observed, so you can
+# verify every rewrite except the body (the echo response does not include
+# the request body it received).
 #
 # Run:
 #   make run CONFIG=examples/request-modifiers/sb.yml

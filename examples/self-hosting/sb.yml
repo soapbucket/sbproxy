@@ -30,9 +30,15 @@ origins:
               - model: qwen3-14b
                 keep_alive: 30m
         # Spill target: overflow to the cloud when local is saturated,
-        # honoring per-request zdr / no_prompt_training.
+        # honoring per-request zdr / no_prompt_training. Model-based
+        # eligibility filtering only tries a provider that claims the
+        # requested model, so this provider has to claim qwen3-14b too;
+        # model_map rewrites it to gpt-4o-mini before the request goes out.
         - name: openai
           api_key: ${OPENAI_API_KEY}
           default_model: gpt-4o-mini
           models:
             - gpt-4o-mini
+            - qwen3-14b
+          model_map:
+            qwen3-14b: gpt-4o-mini

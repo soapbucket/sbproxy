@@ -1,5 +1,5 @@
 # content_digest policy
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 The `content_digest` policy verifies an inbound request body against the digest the client advertises in the `Content-Digest:` header (RFC 9530). On mismatch, malformed header, or unsupported algorithm, the proxy rejects the request before forwarding. The intended audience is integrity-critical inboxes: webhook receivers, agent endpoints, payment callbacks, audit-ingest paths.
 
@@ -22,7 +22,7 @@ origins:
         on_missing: require
         # HTTP status returned on every failure path (missing when
         # required, mismatch, malformed, unsupported algorithm).
-        reject_status: 400
+        status: 400
 ```
 
 ## Failure modes
@@ -30,17 +30,17 @@ origins:
 | Condition | Behavior |
 |---|---|
 | Header present, digest matches | Pass; sets `ctx.content_digest_verified = true` |
-| Header present, digest mismatch | Reject with `reject_status` |
-| Header present, algorithm not in {sha-256, sha-512} | Reject with `reject_status` |
-| Header present, parse error | Reject with `reject_status` |
-| Header absent, `on_missing: require` | Reject with `reject_status` |
+| Header present, digest mismatch | Reject with `status` |
+| Header present, algorithm not in {sha-256, sha-512} | Reject with `status` |
+| Header present, parse error | Reject with `status` |
+| Header absent, `on_missing: require` | Reject with `status` |
 | Header absent, `on_missing: skip` | Pass through unverified |
 
 ## Calling it
 
 The runnable configuration is
 [`examples/content-digest/`](../examples/content-digest/): the block above,
-`on_missing: require` and `reject_status: 400`, in front of a proxied webhook
+`on_missing: require` and `status: 400`, in front of a proxied webhook
 origin. Start it:
 
 ```bash
@@ -108,7 +108,7 @@ is not a well-formed digest; it reports malformed rather than mismatch. If you
 are testing the mismatch path, use a real base64 digest of different content,
 as above, or you will be exercising the parser instead.
 
-All four responses carry `reject_status`, so changing that one field moves
+All four responses carry `status`, so changing that one field moves
 every failure path together. There is no way to answer `400` on a mismatch and
 `422` on a missing header.
 

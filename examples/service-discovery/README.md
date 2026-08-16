@@ -1,6 +1,6 @@
 # DNS-based service discovery
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-16*
 
 ![DNS-based service discovery](../../docs/assets/service-discovery.gif)
 
@@ -17,21 +17,22 @@ No setup required. The example points at `test.sbproxy.dev` so the rotation happ
 ## Try it
 
 ```bash
-# Repeated requests spread across the upstream's current IP set.
+# Repeated requests keep succeeding as the proxy re-resolves and rotates
+# across the upstream's current IP set.
 for i in 1 2 3 4; do
-  curl -s -H 'Host: localhost' http://127.0.0.1:8080/ip
+  curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: localhost' http://127.0.0.1:8080/get
 done
 ```
 
 ```bash
-# Confirm the SNI / Host header is preserved (httpbin echoes the Host).
-curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers.Host'
+# Confirm the SNI / Host header is preserved (the echo service echoes the Host).
+curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers.host'
 ```
 
 ```bash
 # Drop AAAA records on dual-stack hosts by setting ipv6: false in sb.yml,
-# then restart and verify only IPv4 addresses are dialed.
-curl -s -H 'Host: localhost' http://127.0.0.1:8080/ip
+# then restart and verify requests still succeed with only IPv4 addresses dialed.
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: localhost' http://127.0.0.1:8080/get
 ```
 
 ## What this exercises

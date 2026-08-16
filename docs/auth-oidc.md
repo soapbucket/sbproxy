@@ -1,6 +1,6 @@
 # OIDC Relying-Party login
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 The `oidc` auth provider turns SBproxy into an OpenID Connect
 Relying Party. Unlike the `jwt` provider, which only validates a
@@ -252,11 +252,14 @@ the projected trust headers, so keep the trust-header projection
 narrow.
 
 For long-lived sessions or for sessions that need server-side
-revocation, the `oidc::store` helpers offer a server-side
-session-store hook (KV-backed) that operators can wire under the
-existing `kv` storage. The default is stateless because the
-cookie shape covers the common case and avoids the operational
-cost of a session store.
+revocation, the `oidc::store` module ships a `SessionStore` trait and
+a `KvSessionStore` implementation backed by the existing `kv` storage
+abstraction. There is no `sb.yml` field that enables it today: wiring
+it into the request path is a code change (a custom build that
+constructs a `KvSessionStore` and threads it through), not a
+configuration option. The default is stateless because the cookie
+shape covers the common case and avoids the operational cost of a
+session store.
 
 ## Relationship to the other auth providers
 

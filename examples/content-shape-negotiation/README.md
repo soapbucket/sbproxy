@@ -1,6 +1,6 @@
 # Content-shape negotiation
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ![Content-shape negotiation](../../docs/assets/content-shape-negotiation.gif)
 
@@ -65,7 +65,7 @@ $ curl -i -H 'Host: shape.local' \
        -H 'Accept: text/html' \
        http://127.0.0.1:8080/article
 HTTP/1.1 200 OK
-content-type: text/html
+content-type: text/html; charset=utf-8
 
 <!doctype html>
 <html>...</html>

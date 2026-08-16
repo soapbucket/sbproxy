@@ -1,6 +1,6 @@
 # AI gateway: hierarchical budget with downgrade
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 Two stacked budget limits with `on_exceed: downgrade`. The workspace-wide cap allows up to USD 500 of spend per month and downgrades to `claude-haiku-4-5` when exceeded. The per-API-key cap allows up to 1,000,000 tokens per day and downgrades to `anthropic/claude-3-haiku` (served by OpenRouter) when exceeded. Whichever limit fires first applies its `downgrade_to` model rewrite to subsequent requests until the period rolls over. Requests below both caps run on `claude-haiku-4-5` (the configured default). Each downgrade fires the `sbproxy_ai_budget_utilization_ratio` gauge so dashboards can show how close each scope is to its cap.
 
@@ -16,7 +16,7 @@ Both API keys are required so the downgrade path can land on a real provider.
 
 ## Try it
 
-A request under both caps runs on Haiku, the configured default:
+A request under both caps runs on Haiku, the configured default. Anthropic resolves the `claude-haiku-4-5` alias to a dated snapshot and echoes that back in `.model`, so the response carries the dated ID rather than the alias:
 
 ```bash
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -24,10 +24,10 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{
       "model": "claude-haiku-4-5",
-      "messages": [{"role": "user", "content": "Summarise the budget config."}]
+      "messages": [{"role": "user", "content": "Summarize the budget config."}]
     }' \
   | jq -r '.model'
-claude-haiku-4-5
+claude-haiku-4-5-20251001
 ```
 
 After workspace monthly spend crosses USD 500, the workspace limit rewrites request bodies to its `downgrade_to` model, `claude-haiku-4-5`. Since that is the same model this example already runs on, the response model does not change here; the rewrite becomes visible when clients ask for a pricier model:
@@ -38,10 +38,10 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{
       "model": "claude-haiku-4-5",
-      "messages": [{"role": "user", "content": "Summarise the budget config."}]
+      "messages": [{"role": "user", "content": "Summarize the budget config."}]
     }' \
   | jq -r '.model'
-claude-haiku-4-5
+claude-haiku-4-5-20251001
 ```
 
 If the API-key daily token cap fires first, the rewrite lands on the OpenRouter Haiku route and the response model changes:

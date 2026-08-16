@@ -1,6 +1,6 @@
 # Getting started: agent identity verification and discovery
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-16*
 
 ## What you will build
 
@@ -84,10 +84,14 @@ origins:
       contact_url: "mailto:abuse@example.com"
 ```
 
-Every field above appears in `schemas/sb-config.schema.json` and in the
-`examples/web-bot-auth` and `examples/web-bot-auth-publish` configs. To
-generate a real key for the test agent, create an Ed25519 keypair and paste
-its public half, as hex, into the first `agents[].public_key` field:
+Every field above appears in the `examples/web-bot-auth` and
+`examples/web-bot-auth-publish` configs. The `web_bot_auth_publish` fields
+are also typed in `schemas/sb-config.schema.json`; the `authentication`
+block is validated by the proxy at config-compile time rather than by the
+JSON schema, so its fields (`bot_auth`, `agents[]`, `clock_skew_seconds`,
+and so on) do not appear there as named properties. To generate a real key
+for the test agent, create an Ed25519 keypair and paste its public half, as
+hex, into the first `agents[].public_key` field:
 
 ```bash
 openssl genpkey -algorithm ed25519 -out openai-bot.pem
@@ -107,7 +111,9 @@ Enforcement: an unsigned request is rejected with `401`.
 ```bash
 curl -i -H 'Host: blog.local' http://127.0.0.1:8080/article
 # HTTP/1.1 401 Unauthorized
-# bot_auth: signature required
+# content-type: application/json
+#
+# {"error":"bot_auth: signature required"}
 ```
 
 A request whose `keyid` is not in the directory is also rejected with `401`. The verifier rejects on the directory miss before it even checks the signature math.
@@ -159,7 +165,7 @@ The body is a JWKS document with one key entry:
     {
       "kty": "OKP",
       "crv": "Ed25519",
-      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPbqsj1oz3Wm9FTo4Y",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
       "kid": "sbproxy-key-2026-05-31",
       "key_ops": ["sign"],
       "tag": "web-bot-auth"
@@ -178,11 +184,11 @@ curl -i -H 'Host: blog.local' \
 
 ## You are done when
 
-- An unsigned request to `/article` returns `401` with the body `bot_auth: signature required`.
+- An unsigned request to `/article` returns `401` with a JSON body `{"error":"bot_auth: signature required"}`.
 - A request whose `keyid` is not in the `agents` directory returns `401`.
 - A request signed by a directory key returns `200` and reaches the upstream.
 - `GET /.well-known/http-message-signatures-directory` returns `200` with `Content-Type: application/http-message-signatures-directory+json` and a JSON body containing a `keys` array whose single entry has `"kid": "sbproxy-key-2026-05-31"`.
-- `GET /.well-known/web-bot-auth/agent-card` returns `200` with an `"name": "SBproxy"` body.
+- `GET /.well-known/web-bot-auth/agent-card` returns `200` with `"name": "SBproxy"` in the body.
 
 ## Next steps
 

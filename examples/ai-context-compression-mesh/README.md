@@ -1,6 +1,6 @@
 # Mesh-replicated AI context compression
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-08-16*
 
 This example runs the ordered AI context-compression pipeline with session
 summaries stored on the cluster replication substrate instead of Redis. It is
@@ -33,7 +33,18 @@ each node's `state_dir`.
 ## Run two nodes locally
 
 Each node runs this same file with per-node environment overrides, exactly
-like [model-cluster-symmetric](../model-cluster-symmetric/). Node A:
+like [model-cluster-symmetric](../model-cluster-symmetric/). sbproxy does not
+create `state_dir` for you; the replicated-state substrate fails the whole
+bootstrap (`open replicated state shard: ... No such file or directory`) if
+the directory is missing, so create both nodes' state directories before
+starting either one:
+
+```bash
+mkdir -p ./state/mesh-node-a ./state/mesh-node-b
+```
+
+Node A (keep this shell open; the admin password it generates here is only
+valid for node A's admin API on port 9090):
 
 ```bash
 export OPENAI_API_KEY='<set this in your shell>'
@@ -62,26 +73,54 @@ sbproxy serve --log-format json \
   -f examples/ai-context-compression-mesh/sb.yml
 ```
 
+A node started alone (or before its peer joins) logs
+`mesh_split_brain_detected: entering quarantine` and any `summary_buffer`
+lever fails closed with `state_unavailable`: the request still succeeds, just
+without the replicated summary, because `replication.factor: 2` needs a
+second live node to reach write quorum. That is expected until both nodes
+are up and have gossiped.
+
 ## Exercise the summary state
 
 Send a long conversation with a stable session ID to node A, then repeat the
 turn against node B. The second node reuses the replicated summary instead of
-re-summarizing:
+re-summarizing. `min_tokens: 4096` only fires `summary_buffer` once the
+conversation is long enough, so build one that clears the threshold:
 
 ```bash
 SESSION_ID=01J0000000000000000000TEST
+
+HISTORY="$(awk 'BEGIN {
+  for (i = 0; i < 500; i++) {
+    printf "Decision %d: launch stays within budget, preserves audit logs, and keeps Friday as the review deadline. ", i
+  }
+}')"
+
+jq -n --arg history "$HISTORY" '{
+  model: "gpt-4o",
+  messages: [
+    {role: "system", content: "You are a concise project reviewer."},
+    {role: "user", content: $history},
+    {role: "assistant", content: "I recorded the historical constraints."},
+    {role: "user", content: "The launch budget is fixed at ten thousand dollars."},
+    {role: "assistant", content: "Budget noted."},
+    {role: "user", content: "The security review must remain a release gate."},
+    {role: "assistant", content: "Security remains a gate."},
+    {role: "user", content: "List the top two delivery risks."}
+  ]
+}' > /tmp/long-conversation.json
 
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Host: ai.local' \
   -H "X-Sb-Session-Id: ${SESSION_ID}" \
   -H 'Content-Type: application/json' \
-  -d @long-conversation.json | jq .
+  -d @/tmp/long-conversation.json | jq .
 
 curl -s http://127.0.0.1:8081/v1/chat/completions \
   -H 'Host: ai.local' \
   -H "X-Sb-Session-Id: ${SESSION_ID}" \
   -H 'Content-Type: application/json' \
-  -d @long-conversation.json | jq .
+  -d @/tmp/long-conversation.json | jq .
 ```
 
 Inspect the replicated session metadata from either node's Admin API:

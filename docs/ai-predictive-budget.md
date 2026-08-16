@@ -1,5 +1,5 @@
 # Predictive budgets with soft-landing
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-16*
 
 A fixed-window budget enforces a hard cliff: requests pass until the cap,
 then block at 100%. Soft-landing degrades gracefully as a scope approaches
@@ -36,7 +36,7 @@ action:
 |---|---|---|
 | `limits[].scope` | required | Which window the spend accumulates in. One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`. `workspace` keys on the request Host. Do not pair `model` with soft-landing: the downgrade rewrites the model and the scope key is recomputed against it, so crossing `downgrade_at` moves spend into a fresh empty bucket and the cap never fires. |
 | `limits[].max_cost_usd` | optional | The cost cap for the window. A limit may also carry `max_tokens`; when both are set the tightest of the two fractions wins. |
-| `limits[].period` | `total` when omitted | `daily`, `weekly`, `monthly`, `total`, `lifetime`, or a LiteLLM-style duration such as `30d` or `1h`. `daily` is a fixed bucket aligned to UTC midnight, not a rolling 24 hours, so a window that straddles 00:00 UTC resets. An unrecognized value is a load error rather than a silent fallthrough. |
+| `limits[].period` | `total` when omitted | `daily`, `weekly`, `monthly`, `total`, `lifetime`, or a LiteLLM-style duration such as `30d` or `1h`. `daily` is a fixed bucket aligned to UTC midnight, not a rolling 24 hours, so a window that straddles 00:00 UTC resets. An unrecognized value is not caught at config load: it is silently treated as cumulative (the same as `total`/`lifetime`), so a typo in this field does not fail loudly. |
 | `on_exceed` | `block` | What happens at 100%. `block` refuses with 402, `log` allows and records, `downgrade` rewrites the model and refuses with 402 anyway if no target resolves. |
 | `soft_landing` | absent | Opt-in. Without it the hard-block behavior above is unchanged. |
 | `soft_landing.warn_at` | `0.8` | Past this fraction, a request is allowed and a warning is logged. |
@@ -118,7 +118,7 @@ The fraction itself is a gauge, served unauthenticated on the data-plane
 port:
 
 ```
-# HELP sbproxy_ai_budget_utilization_ratio Budget utilization as ratio 0-1
+# HELP sbproxy_ai_budget_utilization_ratio Budget utilization as a fraction of the limit; above 1 is over budget
 # TYPE sbproxy_ai_budget_utilization_ratio gauge
 sbproxy_ai_budget_utilization_ratio{scope="workspace"} 6000.969059999999
 ```

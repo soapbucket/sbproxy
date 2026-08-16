@@ -28,6 +28,16 @@ proxy:
   # plaintext gRPC clients can pass through.
   http2_cleartext: true
 
+  # Only because the demo gRPC server runs on loopback: the SSRF guard
+  # refuses private/loopback upstream addresses unless allowlisted. A
+  # production config pointing at a real upstream does not need this
+  # block. Without it every request 502s with "SSRF: upstream resolved
+  # to private network" even though the h2c listener itself is working.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
 origins:
   "grpc.example.com":
     action:

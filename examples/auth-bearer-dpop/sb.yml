@@ -16,13 +16,12 @@
 #     -H 'Authorization: Bearer service-token-1'
 #   # HTTP/1.1 401
 #
-#   # With a valid DPoP proof signed by the key whose RFC 7638
-#   # thumbprint is NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs:
-#   curl -i http://127.0.0.1:8080/anything \
-#     -H 'Host: api.local' \
-#     -H 'Authorization: Bearer service-token-1' \
-#     -H "DPoP: $DPOP_PROOF"
-#   # HTTP/1.1 200
+#   # With a valid DPoP proof signed by a key whose thumbprint matches
+#   # `dpop_jkt` below: HTTP/1.1 200. See the README for a script that
+#   # generates a throwaway key, prints its thumbprint (to paste into
+#   # `dpop_jkt`), and mints a proof for this exact request. The
+#   # placeholder below is not a usable key: nobody has published the
+#   # private half of it, so no proof can ever match it as shipped.
 #
 # Generating a DPoP proof is the client's job; libraries exist
 # for Python, Go, Java, JS (search for "dpop client library").
@@ -48,5 +47,9 @@ origins:
           # signing key, base64url-no-pad. Operators derive it
           # once when minting the bearer secret + share the
           # public JWK with the client.
+          #
+          # This is a placeholder, not a real key thumbprint: see the
+          # README to generate your own key and replace it before the
+          # "valid proof" curl example will return 200.
           metadata:
-            dpop_jkt: "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+            dpop_jkt: "REPLACE-WITH-YOUR-OWN-JKT-see-README"

@@ -1,5 +1,5 @@
 # JSON Schema for `sb.yml`
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-16*
 
 SBproxy publishes a generated JSON Schema for the typed `sb.yml` envelope.
 Editors that understand the schema (VS Code with the YAML extension, the
@@ -138,12 +138,13 @@ regenerate the committed schema:
 cargo run -p sbproxy-config --bin generate-schema > schemas/sb-config.schema.json
 ```
 
-The CI gate runs the same command and diffs the result against
-the committed file; a Rust type change that does not regenerate
-the schema fails the `config schema is current` step
-on the `build / test` job. The generator is deterministic (the
-`preserve_order` feature on `schemars` pins object property
-order across runs), so the diff is byte-for-byte.
+The CI gate runs `scripts/check-config-schema.sh`, which regenerates the
+schema and diffs it against the committed file; a Rust type change that does
+not regenerate the schema fails the `generated artifacts are current` step
+on the `build / test` job (that step also runs the config-readers,
+model-host-capabilities, and metrics-stability drift checks). The generator
+is deterministic (the `preserve_order` feature on `schemars` pins object
+property order across runs), so the diff is byte-for-byte.
 
 ## Caveats
 

@@ -3,16 +3,20 @@
 
 Usage:
     python3 examples/auth-cap/mint.py [--aud HOST] [--sub AGENT_ID]
-                                         [--glob /blog/**] [--rps 2.0]
+                                         [--glob /anything/blog/**] [--rps 2.0]
                                          [--bytes 10737418240] [--ttl 3600]
 
 The default claims are tuned to match the verifier configured in
-`sb.yml` and the smoke.json `valid` case:
+`sb.yml` and the smoke.json `valid` case. The glob targets
+`/anything/blog/**` because the example forwards to the shared
+`test.sbproxy.dev` fixture, and `/anything/*` is that fixture's
+catch-all echo route (a bare `/blog/**` path is not served there and
+would 404 after a successful CAP verification):
 
     iss   issuer.example.com
     sub   agent_acme_001
     aud   cap.localhost
-    glob  /blog/**
+    glob  /anything/blog/**
     rps   2.0
     bytes 10 GiB / day
     ttl   3600s (exp = now + ttl)
@@ -106,7 +110,7 @@ def main() -> int:
     ap.add_argument("--iss", default="issuer.example.com")
     ap.add_argument("--sub", default="agent_acme_001")
     ap.add_argument("--aud", default="cap.localhost")
-    ap.add_argument("--glob", default="/blog/**")
+    ap.add_argument("--glob", default="/anything/blog/**")
     ap.add_argument("--rps", type=float, default=2.0)
     ap.add_argument("--bytes", dest="bytes_per_day",
                     type=int, default=10_737_418_240,
