@@ -120,11 +120,7 @@ pub fn next_seq(tenant_id: &str) -> u64 {
 /// test sharing this test binary's process, which is exactly the kind
 /// of cross-test global-state pollution this crate's own tests
 /// elsewhere go out of their way to avoid.
-fn next_seq_capped(
-    counters: &mut HashMap<String, AtomicU64>,
-    tenant_id: &str,
-    cap: usize,
-) -> u64 {
+fn next_seq_capped(counters: &mut HashMap<String, AtomicU64>, tenant_id: &str, cap: usize) -> u64 {
     if let Some(counter) = counters.get(tenant_id) {
         return counter.fetch_add(1, Ordering::SeqCst);
     }

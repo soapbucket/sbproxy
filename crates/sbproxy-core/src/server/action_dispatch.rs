@@ -3978,9 +3978,9 @@ pub(super) async fn handle_mcp_action(
                                             .to_string(),
                                     )
                                 } else {
-                                    quarantine_deny
-                                        .as_ref()
-                                        .map(|reason_code| format!("tool output quarantined ({reason_code})"))
+                                    quarantine_deny.as_ref().map(|reason_code| {
+                                        format!("tool output quarantined ({reason_code})")
+                                    })
                                 };
 
                                 // WOR-1644: attribute the call into the
@@ -4875,20 +4875,14 @@ fn mcp_governance_event_data(
     });
 
     let mut fields = serde_json::Map::new();
-    fields.insert(
-        "gen_ai.operation.name".to_string(),
-        "execute_tool".into(),
-    );
+    fields.insert("gen_ai.operation.name".to_string(), "execute_tool".into());
     fields.insert("gen_ai.tool.name".to_string(), tool_name.into());
     fields.insert("gen_ai.tool.call.id".to_string(), request_id.into());
     fields.insert("mcp.method.name".to_string(), "tools/call".into());
     if let Some(session_id) = mcp_session_id {
         fields.insert("mcp.session.id".to_string(), session_id.into());
     }
-    fields.insert(
-        "mcp.protocol.version".to_string(),
-        protocol_version.into(),
-    );
+    fields.insert("mcp.protocol.version".to_string(), protocol_version.into());
     if verdict == "deny" {
         fields.insert("error.type".to_string(), "policy_denied".into());
     }
@@ -5917,7 +5911,10 @@ mod mcp_governance_evidence_tests {
         );
         assert_eq!(data["sbproxy.decision.verdict"], "deny");
         assert_eq!(data["error.type"], "policy_denied");
-        assert_eq!(data["sbproxy.decision.reason"], "tool output quarantined (dual_llm)");
+        assert_eq!(
+            data["sbproxy.decision.reason"],
+            "tool output quarantined (dual_llm)"
+        );
         assert!(data.get("mcp.session.id").is_none());
         assert!(data.get("sbproxy.tool.arguments_hash").is_none());
     }
@@ -5952,7 +5949,9 @@ mod mcp_governance_evidence_tests {
             "a bearer-token-shaped fragment leaked into the evidence reason: {reason}"
         );
         assert!(
-            !data.to_string().contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc"),
+            !data
+                .to_string()
+                .contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc"),
             "the raw secret leaked into the event payload somewhere: {data:?}"
         );
     }

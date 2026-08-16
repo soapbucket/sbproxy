@@ -1114,7 +1114,11 @@ mod tests {
         let after = dropped("file", "queue_full");
 
         assert_eq!(second, Err(EventPublishError::QueueFull));
-        assert_eq!(after - before, 1, "the overrun attempt must still be counted");
+        assert_eq!(
+            after - before,
+            1,
+            "the overrun attempt must still be counted"
+        );
     }
 
     #[test]
