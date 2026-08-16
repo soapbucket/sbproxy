@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod behavioral;
 pub mod digest;
+pub mod generate;
 pub mod lint;
 pub mod lockfile;
 pub mod oracle;
@@ -21,8 +22,10 @@ pub mod structural;
 
 pub use behavioral::behavioral_findings;
 pub use digest::{
-    contract_digest, contract_digest_v2, contract_of, is_contract_digest_v1, is_contract_digest_v2,
+    baseline_contract_v2, baseline_entry_v2, contract_digest, contract_digest_v2, contract_of,
+    is_contract_digest_v1, is_contract_digest_v2,
 };
+pub use generate::{build_lockfile, diff_lockfile, Drift};
 pub use lint::{lint_bump, BumpVerdict};
 pub use lockfile::{Lockfile, ToolLock};
 pub use oracle::{evaluate_compatibility, evaluate_compatibility_full, OracleInputs};

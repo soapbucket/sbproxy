@@ -795,9 +795,27 @@ The block also composes across scopes, and it composes **per event label** rathe
 
 Two mistakes are refused at config load rather than ignored, both because a misconfigured audit feed is silent and silence is indistinguishable from a feed with nothing to say. An `events:` key naming no decision this proxy makes fails the load, and the error lists every accepted label. `ai.stream.event: true` fails too, because that event fires once per streamed chunk; enable `ai.close` instead, which carries the stream's summary once the response finishes. Writing `ai.stream.event: false` stays legal, since saying out loud that a feed is off is a reasonable thing to want in a config.
 
-**What is wired today.** Three events publish: `cache.admit`, `cache.key`, and `route.decide`. Those are exactly the three decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
+**What is wired today.** Three events publish on this shape: `cache.admit`, `cache.key`, and `route.decide`, plus `policy` when `policy_record_format: decision` is set. Those are exactly the three decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
 
-`policy` is a deliberate absence rather than a gap. That path already publishes on this same bus as a policy-verdict record, and it carries no free-text reason, so a second record for one decision would double the volume on the densest security event without adding anything an analyst can read. Converging the two shapes is its own change with its own compatibility story.
+**`policy` is converging onto this shape, behind a flag.** That path has always published on this same bus as a `PolicyVerdictEvent` under the `policy_verdict_event:` prefix, serialized through its serde derive rather than as OCSF. Same bus, same class of event, two formats, so reconstructing every control decision on one request meant parsing both and joining them by hand. The legacy shape also carries no free-text reason, which made the most security-relevant event in the system the one that could not say why it decided.
+
+`policy_record_format` selects the shape, and exactly one record publishes either way:
+
+```yaml
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+        policy_record_format: decision   # legacy (default this release) | decision
+```
+
+- `legacy`, the default this release, is the shape shipped since the audit bus landed. Nothing changes on upgrade, and a startup warning names the setting and the deprecation.
+- `decision` publishes a `DecisionAudit` on the `decision_audit_event:` prefix instead, carrying a reason plus `policy_id`, `policy_surface`, `verdict`, and `decision_latency_ms` as fields under `unmapped`, so "every deny by the waf policy" is a term query rather than a regex over prose.
+
+Emitting both during the window was rejected: it doubles volume on the densest event in the system and gives an analyst two rows for one decision, which is the thing convergence exists to fix. Set `decision` once your consumer reads the shared shape; the default changes in the next major release.
+
+Unlike every other event here, `policy` publishes regardless of `enabled:` and the `events:` map, exactly as it always has. `policy_record_format` chooses an encoding, never whether to emit, so turning on the converged shape cannot silently cost you the feed.
 
 The remaining labels parse and validate and emit nothing yet: `auth`, `rate_limit`, `waf`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle`. If you enable one and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
 

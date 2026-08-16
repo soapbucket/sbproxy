@@ -6041,6 +6041,76 @@ pub struct DecisionAuditConfig {
     /// walk it differently.
     #[serde(default)]
     pub events: std::collections::BTreeMap<String, bool>,
+    /// Which wire shape a `policy` decision publishes (WOR-2448).
+    ///
+    /// Policy decisions have always published a `PolicyVerdictEvent`
+    /// under the `policy_verdict_event:` prefix, serialized through its
+    /// serde derive. Every other decision publishes a `DecisionAudit`
+    /// rendered as OCSF under `decision_audit_event:`. Same bus, same
+    /// class of event, two formats, so an analyst reconstructing every
+    /// control decision on one request parses both and joins them by
+    /// hand.
+    ///
+    /// This selects between them for the `policy` event, and nothing
+    /// else. Exactly one record is published either way: emitting both
+    /// during a migration would double volume on the densest event in
+    /// the system and give an analyst two rows for one decision.
+    ///
+    /// `legacy` is the default this release, so an upgrade changes
+    /// nothing your filters depend on and a startup warning names the
+    /// deprecation instead. Set `decision` once your consumer reads the
+    /// shared shape. The default changes in the next major release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_record_format: Option<PolicyRecordFormat>,
+}
+
+/// Wire shape for `policy` decision records (WOR-2448).
+///
+/// A deprecation dial rather than a preference. The two variants are the
+/// before and after of one migration, and `legacy` exists to give
+/// operators a release in which to move their consumers rather than to
+/// be a supported alternative.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRecordFormat {
+    /// `policy_verdict_event:` carrying a serde-serialized
+    /// `PolicyVerdictEvent`. The shape shipped since the audit bus
+    /// landed, and the default this release.
+    ///
+    /// Its known gap is that it carries no free-text reason, so the most
+    /// security-relevant event in the system is the one that cannot say
+    /// why it decided. That gap is not fixable in this shape without
+    /// changing it, which is what the migration is for.
+    #[default]
+    Legacy,
+    /// `decision_audit_event:` carrying a `DecisionAudit` rendered as
+    /// OCSF API Activity 6003, with the policy id, surface, verdict, and
+    /// latency as selectable fields under `unmapped`, plus the reason
+    /// the legacy shape has no room for.
+    ///
+    /// One shape for every control decision, which is the only version
+    /// of this surface an analyst can query as a whole.
+    Decision,
+}
+
+impl PolicyRecordFormat {
+    /// Stable label, for log lines and tests.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Decision => "decision",
+        }
+    }
 }
 
 impl DecisionAuditConfig {
@@ -6109,6 +6179,27 @@ pub struct DecisionAuditScopes {
 }
 
 impl DecisionAuditScopes {
+    /// Which wire shape `policy` records take for this process
+    /// (WOR-2448).
+    ///
+    /// Read from the proxy scope only, and deliberately not composed per
+    /// tenant or origin the way [`Self::publishes`] is. Two tenants
+    /// cannot sensibly disagree about the encoding of a shared bus: the
+    /// drain stamps one prefix per record kind and a consumer's filter
+    /// selects one parser's input, so a per-tenant format would hand
+    /// that parser records it cannot read. Emission is per scope;
+    /// encoding is per process.
+    ///
+    /// The proxy block is also the only place `decision_audit:` is
+    /// accepted today, so there is no scope this could be written at and
+    /// silently ignored.
+    pub fn policy_record_format(&self) -> PolicyRecordFormat {
+        self.proxy
+            .as_ref()
+            .and_then(|c| c.policy_record_format)
+            .unwrap_or_default()
+    }
+
     /// Whether any scope configured anything at all.
     ///
     /// The emit sites test this first so a deployment that never wrote

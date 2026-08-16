@@ -7,11 +7,14 @@
 # it, `mode: block` removes the tool from tools/list and fails its
 # tools/call with an error naming the grade the change required.
 #
-# Author the lockfile from your live
-# gateway, commit it next to this config, and declare bumps here as
-# your upstreams evolve. Proof it works: change a tool description
-# upstream and watch sbproxy_mcp_tool_compat_verdicts_total pick up a
-# violation (warn), or the tool vanish from tools/list (block).
+# Write the lockfile with `sbproxy mcp lock -f sb.yml`, commit it next
+# to this config, and check it in CI with `sbproxy mcp verify-lock`,
+# which exits 2 on drift. Declare bumps here as your upstreams evolve,
+# and regenerate after reviewing a change.
+#
+# Proof it works: change a tool description upstream and watch
+# sbproxy_mcp_tool_compat_verdicts_total pick up a violation (warn), or
+# the tool vanish from tools/list (block).
 proxy:
   http_bind_port: 8080
 origins:
