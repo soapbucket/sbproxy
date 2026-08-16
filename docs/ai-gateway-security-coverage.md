@@ -51,12 +51,14 @@ it.
 6. **Telemetry does not leak the traffic it audits.** Prompt-linked
    audit carries digests and lengths; sinks run secret and field-key
    redaction; verbatim content is an explicit opt-in.
-7. **Egress is inventoried.** Every upstream endpoint the gateway
-   reaches is recorded with its authorization status (allowed, denied,
-   or ungated) and last-seen time, and is readable from the admin API.
-   Traffic that never crosses the gateway is invisible to it; the
-   deployment recipe for making the gateway the only path is part of
-   the control, not an afterthought.
+7. **Provider-endpoint egress is inventoried.** Every AI provider
+   endpoint the gateway reaches is recorded with its authorization
+   status (allowed, denied, or ungated) and last-seen time, and is
+   readable from the admin API. Other egress purposes (token exchange,
+   MCP auth, artifacts, webhooks) pass the same authorizer but are not
+   yet inventoried. Traffic that never crosses the gateway is invisible
+   to it; the deployment recipe for making the gateway the only path is
+   part of the control, not an afterthought.
 8. **Change control is tamper-evident.** Security refusals and config
    changes append to hash-chained, signed files that verify offline;
    a chain that cannot open fails the boot; an append failure is a

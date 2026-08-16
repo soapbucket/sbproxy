@@ -4321,14 +4321,32 @@ fn emit_mcp_prompt_audit(
     );
 }
 
-/// WOR-2473: first 16 hex characters (64 bits) of the SHA-256 digest
-/// of `value`, used to fingerprint `mcp_audit` content fields without
-/// shipping the content itself. Sixteen hex characters is enough to
-/// correlate repeated calls in a SIEM without being a usable partial
-/// preimage of typical prompt / tool-argument payload sizes.
+/// Process-lifetime random salt for [`sha256_hex_prefix`], generated
+/// once on first use via the same RNG idiom
+/// `sbproxy_ai::prompt_fingerprint`'s `pf_` salt uses
+/// (`rand::random::<u128>()` behind a `OnceLock`). Kept local to this
+/// module rather than importing that crate's salt because it is a
+/// private helper there, not a shared export.
+fn mcp_audit_salt() -> &'static [u8; 16] {
+    static SALT: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| rand::random::<u128>().to_le_bytes())
+}
+
+/// WOR-2473: first 16 hex characters (64 bits) of the salted SHA-256
+/// digest of `value`, used to fingerprint `mcp_audit` content fields
+/// without shipping the content itself. The digest is keyed with a
+/// per-process random salt (see [`mcp_audit_salt`]), the same scheme
+/// `sbproxy_ai::prompt_fingerprint`'s `pf_` value uses: the same value
+/// digests identically within one process lifetime, but the digest is
+/// not a usable partial preimage of a guessable short prompt or
+/// tool-argument payload, and it cannot be matched against a digest
+/// computed in a different process or deployment.
 fn sha256_hex_prefix(value: &str) -> String {
     use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(value.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(mcp_audit_salt());
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
     hex::encode(digest)[..16].to_string()
 }
 

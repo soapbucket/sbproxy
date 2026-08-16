@@ -377,8 +377,8 @@ pub struct AuditConfig {
     /// recorded, preserving exactly the old behavior. Requires `sink: chain`.
     /// Must differ from `path` because the two audit event types (config and
     /// security) have different payload formats and verify independently.
-    /// `key_audit` is deliberately not chainable yet—its before/after diff
-    /// contents require a separate contents-based ruling first.
+    /// `key_audit` is deliberately not chainable yet, since its before/after
+    /// diff contents require a separate contents-based ruling first.
     #[serde(default)]
     pub config_path: Option<String>,
 }

@@ -46,11 +46,24 @@ pub(crate) fn shared_budget() -> Option<&'static Arc<dyn AsyncKVStore>> {
     SHARED_BUDGET.get()
 }
 
-/// Set once a shared-store read or write fails, cleared once one
-/// succeeds. Gates the WARN/INFO transition logs below so a flapping
-/// Redis link logs one degrade line and one recovery line, not one per
-/// request (WOR-2474).
-static DEGRADED: AtomicBool = AtomicBool::new(false);
+/// Set once the shared-store READ path fails, cleared once a read
+/// succeeds. Gates the WARN/INFO transition logs in `read_counter` so a
+/// flapping Redis link logs one degrade line and one recovery line, not
+/// one per request (WOR-2474).
+///
+/// Kept separate from `DEGRADED_WRITE` because a store can fail one
+/// direction while serving the other: Redis at `maxmemory` with a
+/// no-eviction policy rejects `INCRBY` (writes) while still answering
+/// `GET` (reads). A single shared latch would flip on every request in
+/// that partial outage (a read success clearing it, the following
+/// write failure setting it again), which is exactly the per-request
+/// log spam the latch exists to prevent.
+static DEGRADED_READ: AtomicBool = AtomicBool::new(false);
+
+/// Set once the shared-store WRITE path fails, cleared once a write
+/// succeeds. See `DEGRADED_READ` for why this is a separate latch
+/// rather than one shared between the two ops.
+static DEGRADED_WRITE: AtomicBool = AtomicBool::new(false);
 
 fn tokens_key(scope_key: &str) -> Vec<u8> {
     format!("sbproxy:budget:{scope_key}:tok").into_bytes()
@@ -95,21 +108,21 @@ async fn record_shared_spend_to(
         {
             Ok(_) => {
                 sbproxy_observe::metrics::set_budget_share_unavailable(0);
-                if DEGRADED.swap(false, Ordering::Relaxed) {
+                if DEGRADED_WRITE.swap(false, Ordering::Relaxed) {
                     tracing::info!(
                         target: "sbproxy::budget",
-                        "shared budget store recovered; cluster-wide enforcement resumed"
+                        "shared budget store write recovered; cluster-wide enforcement resumed"
                     );
                 }
             }
             Err(e) => {
                 tracing::debug!(error = %e, scope = scope_key, "shared budget: token incr failed (fail-open)");
                 sbproxy_observe::metrics::record_budget_share_fail_open("write");
-                if !DEGRADED.swap(true, Ordering::Relaxed) {
+                if !DEGRADED_WRITE.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         target: "sbproxy::budget",
                         error = %e,
-                        "shared budget store unreachable; enforcement degraded to per-instance tracking (fail-open)"
+                        "shared budget store write unreachable; enforcement degraded to per-instance tracking (fail-open)"
                     );
                 }
             }
@@ -124,21 +137,21 @@ async fn record_shared_spend_to(
         {
             Ok(_) => {
                 sbproxy_observe::metrics::set_budget_share_unavailable(0);
-                if DEGRADED.swap(false, Ordering::Relaxed) {
+                if DEGRADED_WRITE.swap(false, Ordering::Relaxed) {
                     tracing::info!(
                         target: "sbproxy::budget",
-                        "shared budget store recovered; cluster-wide enforcement resumed"
+                        "shared budget store write recovered; cluster-wide enforcement resumed"
                     );
                 }
             }
             Err(e) => {
                 tracing::debug!(error = %e, scope = scope_key, "shared budget: cost incr failed (fail-open)");
                 sbproxy_observe::metrics::record_budget_share_fail_open("write");
-                if !DEGRADED.swap(true, Ordering::Relaxed) {
+                if !DEGRADED_WRITE.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         target: "sbproxy::budget",
                         error = %e,
-                        "shared budget store unreachable; enforcement degraded to per-instance tracking (fail-open)"
+                        "shared budget store write unreachable; enforcement degraded to per-instance tracking (fail-open)"
                     );
                 }
             }
@@ -215,10 +228,10 @@ async fn read_counter(store: &Arc<dyn AsyncKVStore>, key: &[u8]) -> Option<u64> 
     match store.get(key).await {
         Ok(value) => {
             sbproxy_observe::metrics::set_budget_share_unavailable(0);
-            if DEGRADED.swap(false, Ordering::Relaxed) {
+            if DEGRADED_READ.swap(false, Ordering::Relaxed) {
                 tracing::info!(
                     target: "sbproxy::budget",
-                    "shared budget store recovered; cluster-wide enforcement resumed"
+                    "shared budget store read recovered; cluster-wide enforcement resumed"
                 );
             }
             match value {
@@ -231,11 +244,11 @@ async fn read_counter(store: &Arc<dyn AsyncKVStore>, key: &[u8]) -> Option<u64> 
         Err(e) => {
             tracing::debug!(error = %e, "shared budget: read failed (fail-open)");
             sbproxy_observe::metrics::record_budget_share_fail_open("read");
-            if !DEGRADED.swap(true, Ordering::Relaxed) {
+            if !DEGRADED_READ.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     target: "sbproxy::budget",
                     error = %e,
-                    "shared budget store unreachable; enforcement degraded to per-instance tracking (fail-open)"
+                    "shared budget store read unreachable; enforcement degraded to per-instance tracking (fail-open)"
                 );
             }
             None

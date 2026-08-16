@@ -10788,7 +10788,7 @@
           ]
         },
         "config_path": {
-          "description": "Optional path where `config_audit` events are chained. Opt-in; when absent, `config_audit` remains a tracing stream and is not durably recorded, preserving exactly the old behavior. Requires `sink: chain`. Must differ from `path` because the two audit event types (config and security) have different payload formats and verify independently. `key_audit` is deliberately not chainable yet—its before/after diff contents require a separate contents-based ruling first.",
+          "description": "Optional path where `config_audit` events are chained. Opt-in; when absent, `config_audit` remains a tracing stream and is not durably recorded, preserving exactly the old behavior. Requires `sink: chain`. Must differ from `path` because the two audit event types (config and security) have different payload formats and verify independently. `key_audit` is deliberately not chainable yet, since its before/after diff contents require a separate contents-based ruling first.",
           "default": null,
           "type": [
             "string",

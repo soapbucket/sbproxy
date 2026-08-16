@@ -33,7 +33,7 @@ authorization of the call. [mcp-security.md](mcp-security.md).
 **The proxy itself.** Its own attack surface, the assumptions it makes, and the
 trust boundaries it draws. [threat-model.md](threat-model.md).
 
-Separately from all three: reporting a vulnerability in SBproxy, verifying a
+Separately from all four: reporting a vulnerability in SBproxy, verifying a
 release signature, and checking build provenance live in
 [`SECURITY.md`](../SECURITY.md) at the repository root.
 
@@ -137,9 +137,10 @@ Per-upstream certificate pinning is not implemented. TLS uses standard chain
 validation. If your threat model requires pinning a specific key for a specific
 upstream, that is not available here today.
 
-There is no lockfile generator for MCP tool versioning yet, so the baseline that
-feature reads is hand-assembled. The recipe is documented and tested, but the
-ergonomics are rough. [tool-versioning.md](tool-versioning.md).
+`sbproxy mcp lock` generates the MCP tool-versioning baseline from the live
+catalog, and `sbproxy mcp verify-lock` diffs against it and exits nonzero on
+drift. Wiring `verify-lock` into your own CI, so drift actually blocks a
+merge, is still on you. [tool-versioning.md](tool-versioning.md).
 
 Unsanctioned MCP servers are addressed by architecture rather than by a feature.
 If agent egress is required to traverse the gateway, an unapproved server is one

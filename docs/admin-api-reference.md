@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, log level
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -929,6 +929,62 @@ audit trail is whatever your log pipeline or OTel collector ships the
 `security_audit`, `key_audit`, `config_audit`, and
 `sbproxy::admin::audit` tracing targets to.
 
+### `GET /api/egress`
+
+Returns the versioned egress inventory: every upstream destination the
+gateway has reached (or attempted to reach) since process start, with its
+most recent authorization outcome. Both `admin` and `read_only` operators
+may call the route.
+
+```json
+{
+  "schema_version": 1,
+  "summary": {"total": 3, "denied": 1, "ungated": 1},
+  "endpoints": [
+    {
+      "purpose": "ai_provider",
+      "host": "api.openai.com",
+      "port": 443,
+      "scheme": "https",
+      "status": "allowed",
+      "last_reason": null,
+      "origin": "openai-primary",
+      "first_seen_unix_ms": 1755000000000,
+      "last_seen_unix_ms": 1755003600000,
+      "allowed_count": 42,
+      "denied_count": 0
+    }
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `schema_version` | Version of this response contract. |
+| `summary.total` | Number of distinct `(purpose, host, port)` destinations tracked. |
+| `summary.denied` | Destinations whose most recent sighting was denied. |
+| `summary.ungated` | Destinations reached with no authorizer attached. |
+| `endpoints[].purpose` | Egress purpose label, for example `ai_provider`. |
+| `endpoints[].host`, `port`, `scheme` | Destination, parsed from the reached URL. Never the full URL, query string, or credentials. |
+| `endpoints[].status` | `allowed`, `denied`, or `ungated`, the most recent sighting's outcome; `ungated` means no authorizer was attached for that call. |
+| `endpoints[].last_reason` | Denial reason, present only when `status` is `denied`. |
+| `endpoints[].origin` | Configuration-scoped attribution: an origin id, provider name, or sink name. Never a request-scoped value. |
+| `endpoints[].first_seen_unix_ms`, `last_seen_unix_ms` | First and most recent sighting, in Unix milliseconds. |
+| `endpoints[].allowed_count`, `denied_count` | Sighting counts by outcome; `allowed` and `ungated` sightings both count toward `allowed_count`. |
+
+The inventory is process-lifetime and in-memory: it clears on restart and
+is capped at 1,024 tracked destinations, after which a new destination
+stops being tracked while every already-tracked one keeps updating. Today
+the AI-provider egress gate is the only writer; other egress purposes
+(token exchange, MCP auth, artifacts, webhooks) pass the same authorizer
+but are not yet inventoried here.
+
+| Status | When |
+|---|---|
+| `200` | Snapshot serialized successfully. |
+| `401` | Missing or invalid admin authentication. |
+| `405` | Method other than GET. |
+
 ### `GET /api/rate_limits/budget`
 
 Per-workspace rate-limit budget state: tier (`normal`, `throttle`,
@@ -946,10 +1002,10 @@ Body: `{"workspace": "<id>"}`. `400` for a missing/empty workspace,
 ### `GET /api/rate_limits/effective`
 
 Effective requests-per-second ceiling and tier for one workspace right
-now: `?workspace=<id>` (defaults to `default`).
+now: `?workspace=<id>` (defaults to `__default__`).
 
 ```json
-{"workspace": "default", "effective_rps": 1000, "tier": "normal"}
+{"workspace": "__default__", "effective_rps": 1000, "tier": "normal"}
 ```
 
 `404 {"error":"no rate_limits: block configured"}` when unconfigured.

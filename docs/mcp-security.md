@@ -132,10 +132,12 @@ Renames are caught too. The digest covers the name, so a renamed tool would
 otherwise look like a brand new one; the gate re-digests each baseline with the
 old name substituted in to recognize the same contract wearing a new label.
 
-**Still yours.** Producing the baseline. There is no `sbproxy mcp lock` command
-yet, so the lockfile is hand-assembled today. The recipe is documented in
-[tool-versioning.md](tool-versioning.md) and a test asserts the shipped example
-matches what the gate computes, but this is the rough edge of the feature.
+**Still yours.** Producing the baseline is no longer hand work: `sbproxy mcp
+lock` generates it from the live catalog, and `sbproxy mcp verify-lock` diffs
+against it and exits nonzero on drift, documented in
+[tool-versioning.md](tool-versioning.md), where a test also asserts the
+shipped example matches what the gate computes. Wiring `verify-lock` into
+your own CI, so drift actually blocks a merge, is still yours to do.
 
 ## Text in a tool definition that a reviewer cannot see
 

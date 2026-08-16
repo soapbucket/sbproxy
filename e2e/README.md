@@ -89,7 +89,7 @@ cargo test -p sbproxy-e2e --locked --test settlement_gate -- --test-threads=1
 
 ## What is covered
 
-135 test files grouped by feature family. Run
+190 test files grouped by feature family. Run
 `ls tests/ | grep <prefix>` for the full list inside a family.
 
 | Family | Tests | Example scenarios |
