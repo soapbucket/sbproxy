@@ -6491,12 +6491,15 @@ fn run_one_fixture(
     let report = compiled.coverage_report()?;
     let coverage = report
         .into_iter()
-        .map(|file| RegoTestCoverageOutput {
-            fixture: fixture_label.to_owned(),
-            path: file.path,
-            covered_lines: file.covered.len(),
-            not_covered_lines: file.not_covered,
-            percent: file.percent(),
+        .map(|file| {
+            let percent = file.percent();
+            RegoTestCoverageOutput {
+                fixture: fixture_label.to_owned(),
+                path: file.path,
+                covered_lines: file.covered.len(),
+                not_covered_lines: file.not_covered,
+                percent,
+            }
         })
         .collect();
 
