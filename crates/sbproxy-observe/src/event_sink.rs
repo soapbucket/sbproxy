@@ -662,11 +662,14 @@ pub fn install_event_egress(egress: EventEgress) -> Result<(), &'static str> {
 /// Whether an installed egress would even attempt to deliver
 /// `event_type` (WOR-2384).
 ///
-/// Exactly the gate [`publish_proxy_event`] and [`publish_proxy_event_checked`]
-/// already apply before calling their `build` closure, exposed on its
-/// own for a caller with its own expensive prerequisites to a
-/// publish call: a per-tenant sequence number, a redaction pass. That
-/// caller can check this first and skip building the prerequisites
+/// The single predicate [`publish_proxy_event`] and
+/// [`publish_proxy_event_checked`] both gate their `build` closure on:
+/// they call this rather than re-deriving `EGRESS.get().is_some_and(..)`
+/// themselves, so the "would anything accept this" question has exactly
+/// one implementation instead of three that have to be kept in
+/// agreement by hand. Exposed publicly too, for a caller with its own
+/// expensive prerequisites to a publish call (a per-tenant sequence
+/// number, a redaction pass) to check first and skip building them
 /// entirely rather than paying for work nobody will receive, the same
 /// way `build` itself is skipped.
 pub fn wants_event(event_type: EventType) -> bool {
@@ -675,42 +678,48 @@ pub fn wants_event(event_type: EventType) -> bool {
 
 /// Publish an event, building it only if somebody is listening.
 ///
-/// `build` runs only when an egress is installed **and** its `types:`
-/// filter selects `event_type`. That ordering is the point: bridging a
-/// request-path funnel into this costs one relaxed load and one bitmask
-/// test on a proxy with no `events:` block, and a `policy_denied` sink
-/// does not pay to serialize every completed request.
+/// `build` runs only when [`wants_event`] says yes. That ordering is
+/// the point: bridging a request-path funnel into this costs one
+/// relaxed load and one bitmask test on a proxy with no `events:`
+/// block, and a `policy_denied` sink does not pay to serialize every
+/// completed request.
 pub fn publish_proxy_event(event_type: EventType, build: impl FnOnce() -> ProxyEvent) {
+    if !wants_event(event_type) {
+        return;
+    }
+    // `wants_event` returning `true` already proved `EGRESS` is set,
+    // and it is a set-once `OnceLock` that never reverts to unset, so
+    // this second lookup cannot legitimately miss; the `else` exists
+    // only because the compiler cannot see that invariant.
     let Some(egress) = EGRESS.get() else {
         return;
     };
-    if !egress.wants(event_type) {
-        return;
-    }
     egress.publish(build());
 }
 
 /// [`publish_proxy_event`]'s fail-closed sibling (WOR-2384): `build`
-/// still runs only when an egress is installed and selects
-/// `event_type`, but a caller that must know whether delivery worked
-/// gets `Err` back instead of a fire-and-forget guarantee it cannot
-/// verify.
+/// still runs only when [`wants_event`] says yes, but a caller that
+/// must know whether delivery worked gets `Err` back instead of a
+/// fire-and-forget guarantee it cannot verify.
 ///
 /// `Err(`[`EventPublishError::NoSinkConfigured`]`)` covers both "no
 /// egress is installed" and "an egress is installed but its `types:`
-/// filter does not select `event_type`". A caller deciding whether to
+/// filter does not select `event_type`", which is exactly what
+/// [`wants_event`] answers `false` for. A caller deciding whether to
 /// refuse a request cannot act on the difference between those two: in
 /// both, nothing was ever going to deliver this event.
 pub fn publish_proxy_event_checked(
     event_type: EventType,
     build: impl FnOnce() -> ProxyEvent,
 ) -> Result<(), EventPublishError> {
+    if !wants_event(event_type) {
+        return Err(EventPublishError::NoSinkConfigured);
+    }
+    // See `publish_proxy_event`'s matching comment: this cannot
+    // legitimately miss once `wants_event` has already said yes.
     let Some(egress) = EGRESS.get() else {
         return Err(EventPublishError::NoSinkConfigured);
     };
-    if !egress.wants(event_type) {
-        return Err(EventPublishError::NoSinkConfigured);
-    }
     egress.publish_checked(build())
 }
 
@@ -1105,7 +1114,7 @@ mod tests {
         let egress = EventEgress::over_channel(tx, EventTypeMask::all(), "file");
 
         assert!(egress
-            .publish_checked(event(EventType::McpGovernance))
+            .publish_checked(event(EventType::McpGovernanceDecision))
             .is_ok());
         assert!(rx.try_recv().is_ok());
     }
@@ -1122,9 +1131,9 @@ mod tests {
 
         let before = dropped("file", "queue_full");
         assert!(egress
-            .publish_checked(event(EventType::McpGovernance))
+            .publish_checked(event(EventType::McpGovernanceDecision))
             .is_ok());
-        let second = egress.publish_checked(event(EventType::McpGovernance));
+        let second = egress.publish_checked(event(EventType::McpGovernanceDecision));
         let after = dropped("file", "queue_full");
 
         assert_eq!(second, Err(EventPublishError::QueueFull));
@@ -1142,7 +1151,7 @@ mod tests {
         let egress = EventEgress::over_channel(tx, EventTypeMask::all(), "webhook");
 
         let before = dropped("webhook", "worker_stopped");
-        let result = egress.publish_checked(event(EventType::McpGovernance));
+        let result = egress.publish_checked(event(EventType::McpGovernanceDecision));
         let after = dropped("webhook", "worker_stopped");
 
         assert_eq!(result, Err(EventPublishError::WorkerStopped));
@@ -1156,12 +1165,12 @@ mod tests {
         // other tests in this binary may already have set the
         // process-global egress, so this asserts the property that
         // holds either way rather than assuming a fresh process.
-        let result = publish_proxy_event_checked(EventType::McpGovernance, || {
-            event(EventType::McpGovernance)
+        let result = publish_proxy_event_checked(EventType::McpGovernanceDecision, || {
+            event(EventType::McpGovernanceDecision)
         });
         match EGRESS.get() {
             None => assert_eq!(result, Err(EventPublishError::NoSinkConfigured)),
-            Some(egress) if !egress.wants(EventType::McpGovernance) => {
+            Some(egress) if !egress.wants(EventType::McpGovernanceDecision) => {
                 assert_eq!(result, Err(EventPublishError::NoSinkConfigured))
             }
             Some(_) => {
@@ -1187,15 +1196,39 @@ mod tests {
     }
 
     #[test]
-    fn wants_event_agrees_with_what_publish_proxy_event_would_have_gated_on() {
-        // Same defensive shape as the other `EGRESS.get()`-reading
-        // tests: other tests in this binary may already have installed
-        // the process-global egress, so this asserts the property that
-        // holds either way.
-        let result = wants_event(EventType::McpGovernance);
-        match EGRESS.get() {
-            None => assert!(!result, "nothing installed must never want an event"),
-            Some(egress) => assert_eq!(result, egress.wants(EventType::McpGovernance)),
+    fn publish_proxy_event_checked_invocation_and_outcome_match_wants_event() {
+        // WOR-2384 addendum: an earlier version of this test re-derived
+        // the same `EGRESS.get().is_some_and(|e| e.wants(..))`
+        // expression inline and compared it to `wants_event()`, which
+        // cannot ever disagree with an identical copy of itself. This
+        // drives the real `publish_proxy_event_checked` with a counting
+        // closure instead, the same pattern
+        // `publish_proxy_event_does_not_build_when_nothing_is_installed`
+        // uses, and checks what it actually did against `wants_event`'s
+        // independently-computed answer.
+        let built = AtomicUsize::new(0);
+        let wanted = wants_event(EventType::McpGovernanceDecision);
+        let result = publish_proxy_event_checked(EventType::McpGovernanceDecision, || {
+            built.fetch_add(1, Ordering::SeqCst);
+            event(EventType::McpGovernanceDecision)
+        });
+        let invoked = built.load(Ordering::SeqCst) == 1;
+
+        assert_eq!(
+            invoked, wanted,
+            "the build closure ran ({invoked}) but wants_event said {wanted}"
+        );
+        if !wanted {
+            assert_eq!(
+                result,
+                Err(EventPublishError::NoSinkConfigured),
+                "an unwanted type must report NoSinkConfigured rather than attempting delivery"
+            );
         }
+        // When `wanted` is true, `result` depends on the real queue
+        // state of whatever egress another test in this binary
+        // installed (`Ok`, `QueueFull`, and `WorkerStopped` are all
+        // legitimate outcomes there), so only the not-wanted case has
+        // one correct answer to assert on here.
     }
 }

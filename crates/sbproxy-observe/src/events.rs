@@ -216,7 +216,7 @@ pub enum EventType {
     /// Event name `mcp_governance_decision`. An MCP `tools/call` dispatch
     /// was decided (allowed or refused), emitted from the same funnel
     /// every MCP tool dispatch already passes through (WOR-2384).
-    McpGovernance,
+    McpGovernanceDecision,
 }
 
 impl ProxyEvent {
@@ -271,7 +271,7 @@ pub const ALL_EVENT_TYPES: [EventType; 12] = [
     EventType::BudgetExceeded,
     EventType::GuardrailTriggered,
     EventType::ConfigReloaded,
-    EventType::McpGovernance,
+    EventType::McpGovernanceDecision,
 ];
 
 impl EventType {
@@ -295,7 +295,7 @@ impl EventType {
             Self::BudgetExceeded => "budget_exceeded",
             Self::GuardrailTriggered => "guardrail_triggered",
             Self::ConfigReloaded => "config_reloaded",
-            Self::McpGovernance => "mcp_governance_decision",
+            Self::McpGovernanceDecision => "mcp_governance_decision",
         }
     }
 
@@ -323,7 +323,7 @@ impl EventType {
             Self::BudgetExceeded => 8,
             Self::GuardrailTriggered => 9,
             Self::ConfigReloaded => 10,
-            Self::McpGovernance => 11,
+            Self::McpGovernanceDecision => 11,
         }
     }
 }
@@ -476,7 +476,7 @@ mod tests {
             (EventType::BudgetExceeded, "\"budget_exceeded\""),
             (EventType::GuardrailTriggered, "\"guardrail_triggered\""),
             (EventType::ConfigReloaded, "\"config_reloaded\""),
-            (EventType::McpGovernance, "\"mcp_governance_decision\""),
+            (EventType::McpGovernanceDecision, "\"mcp_governance_decision\""),
         ];
 
         for (variant, expected) in variants {
@@ -499,6 +499,33 @@ mod tests {
                 serialized,
                 format!("\"{}\"", variant.as_str()),
                 "as_str disagrees with serde for {variant:?}"
+            );
+        }
+    }
+
+    /// WOR-2384: the previous test pins the bare `EventType`'s own
+    /// serialization; this pins the same thing one layer up, on the
+    /// envelope that actually reaches a file or a webhook. A struct
+    /// derive routes a field through that field type's own `Serialize`
+    /// impl, so this cannot observably differ from
+    /// `event_type_as_str_matches_serde` today, but a future
+    /// hand-written `Serialize` on `ProxyEvent` (or a `#[serde(with =
+    /// ..)]` on the field) could take a different path for the type
+    /// name than `EventType`'s own impl does, and this is the test that
+    /// would catch it. The gap this closes is exactly the one that
+    /// shipped: `EventType`'s bare serialization matching `as_str()`
+    /// was never actually the same question as "what does a SIEM
+    /// reading the NDJSON line see", even though for every variant so
+    /// far the two have had one answer.
+    #[test]
+    fn proxy_event_envelope_serializes_the_same_type_name_as_as_str() {
+        for variant in ALL_EVENT_TYPES {
+            let envelope = make_event(variant);
+            let json = serde_json::to_value(&envelope).expect("serialize envelope");
+            assert_eq!(
+                json["event_type"],
+                variant.as_str(),
+                "the envelope's event_type field disagrees with as_str() for {variant:?}"
             );
         }
     }

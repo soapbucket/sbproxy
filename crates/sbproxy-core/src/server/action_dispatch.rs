@@ -4865,7 +4865,7 @@ fn emit_mcp_governance_evidence(
 ) -> bool {
     use sbproxy_observe::events::{EventType, ProxyEvent};
 
-    let event_type = EventType::McpGovernance;
+    let event_type = EventType::McpGovernanceDecision;
     let fail_closed = mcp_governance_fail_closed(ctx.pipeline.config.events.as_ref(), event_type);
 
     // WOR-2384: skip everything below -- the per-tenant sequence
@@ -5922,14 +5922,14 @@ mod mcp_governance_evidence_tests {
     #[test]
     fn fail_closed_reads_the_configured_type_list() {
         assert!(
-            !mcp_governance_fail_closed(None, EventType::McpGovernance),
+            !mcp_governance_fail_closed(None, EventType::McpGovernanceDecision),
             "no events: block at all must not fail-closed"
         );
 
         let empty = EventsConfig::default();
         assert!(!mcp_governance_fail_closed(
             Some(&empty),
-            EventType::McpGovernance
+            EventType::McpGovernanceDecision
         ));
 
         let unrelated = EventsConfig {
@@ -5938,7 +5938,7 @@ mod mcp_governance_evidence_tests {
         };
         assert!(!mcp_governance_fail_closed(
             Some(&unrelated),
-            EventType::McpGovernance
+            EventType::McpGovernanceDecision
         ));
 
         let configured = EventsConfig {
@@ -5947,7 +5947,7 @@ mod mcp_governance_evidence_tests {
         };
         assert!(mcp_governance_fail_closed(
             Some(&configured),
-            EventType::McpGovernance
+            EventType::McpGovernanceDecision
         ));
     }
 
@@ -6002,6 +6002,38 @@ mod mcp_governance_evidence_tests {
         assert!(
             data.get("sbproxy.decision.reason").is_none(),
             "an allow must not carry a reason: {data:?}"
+        );
+
+        // WOR-2384 fix round 2: the field-name pins above cover the
+        // `data` payload `mcp_governance_event_data` builds, but that
+        // payload is only ever shipped inside a `ProxyEvent` envelope
+        // whose own `event_type` field is a *different* piece of
+        // serialization, driven by `EventType`'s own `Serialize` impl
+        // rather than anything in this function. A real regression
+        // shipped exactly there: `EventType::McpGovernanceDecision`'s
+        // derived `#[serde(rename_all = "snake_case")]` output and its
+        // hand-written `as_str()` disagreed (`"mcp_governance"` vs
+        // `"mcp_governance_decision"`), which every assertion above is
+        // structurally unable to notice, because none of them touch
+        // `EventType` at all. Pin both the wire name itself and a real
+        // envelope's serialized form here, next to the payload pins,
+        // so this test module is a complete pin for what ships on the
+        // wire for this event type, not just its `data` half.
+        assert_eq!(
+            sbproxy_observe::events::EventType::McpGovernanceDecision.as_str(),
+            "mcp_governance_decision"
+        );
+        let envelope = sbproxy_observe::events::ProxyEvent::new(
+            sbproxy_observe::events::EventType::McpGovernanceDecision,
+            "api.example.com".to_string(),
+            "acme".to_string(),
+            data,
+        );
+        let envelope_json = serde_json::to_value(&envelope).expect("serialize envelope");
+        assert_eq!(
+            envelope_json["event_type"],
+            "mcp_governance_decision",
+            "the envelope's wire type name drifted from the config/SIEM vocabulary: {envelope_json:?}"
         );
     }
 
@@ -7436,7 +7468,7 @@ mod mcp_catalog_snapshot_tests {
                 path: events_path.clone(),
             },
             sbproxy_observe::event_sink::EventTypeMask::from_types(&[
-                sbproxy_observe::events::EventType::McpGovernance,
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
             ]),
             64,
         )
