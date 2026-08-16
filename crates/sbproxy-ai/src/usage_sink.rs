@@ -1969,8 +1969,10 @@ mod tests {
 
         let bucket = "wor-2476-override-bucket";
         let override_host = "minio.internal.test";
-        let builder = AmazonS3Builder::new()
-            .with_config(AmazonS3ConfigKey::Endpoint, format!("https://{override_host}"));
+        let builder = AmazonS3Builder::new().with_config(
+            AmazonS3ConfigKey::Endpoint,
+            format!("https://{override_host}"),
+        );
 
         let url = s3_authorization_url(bucket, &builder);
         assert_eq!(
@@ -2016,10 +2018,9 @@ mod tests {
         );
         let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
         assert!(
-            snapshot
-                .iter()
-                .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
-                    && e.host == override_host),
+            snapshot.iter().any(
+                |e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == override_host
+            ),
             "the override host must be stamped in the inventory"
         );
         assert!(

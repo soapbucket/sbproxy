@@ -1278,10 +1278,8 @@ mod tests {
     /// structure, so there is nowhere for the secret to hide.
     #[test]
     fn a_key_mutation_with_a_secret_before_after_value_never_writes_the_secret_to_the_chain() {
-        let path = std::env::temp_dir().join(format!(
-            "sb-audit-key-secret-{}.jsonl",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sb-audit-key-secret-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let seed = "34".repeat(32);
         let chain = crate::audit_chain::KeyAuditChain::open(&path, &seed, "audit-secret-test")

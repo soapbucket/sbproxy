@@ -127,7 +127,9 @@ use sbproxy_meter::ledger::{LedgerPayload, UsageLedger};
 pub use ed25519_dalek::VerifyingKey;
 pub use sbproxy_meter::ledger::{verifying_key_from_seed_hex, LedgerVerifyResult};
 
-use crate::audit::{AdminActionAuditEntry, ConfigAuditEntry, KeyAuditChainEntry, SecurityAuditEntry};
+use crate::audit::{
+    AdminActionAuditEntry, ConfigAuditEntry, KeyAuditChainEntry, SecurityAuditEntry,
+};
 
 /// HMAC-SHA256, keyed by the derived key-audit fingerprint key.
 type HmacSha256 = Hmac<Sha256>;
@@ -1554,7 +1556,10 @@ mod tests {
         }
 
         let result = verify_config_audit_chain(&path, None).expect("file is readable");
-        assert!(!result.ok, "a key mutation is not a config record: {result:?}");
+        assert!(
+            !result.ok,
+            "a key mutation is not a config record: {result:?}"
+        );
         assert_eq!(result.broken_seq, Some(0), "it stops at the first record");
 
         let _ = std::fs::remove_file(&path);
@@ -1635,14 +1640,21 @@ mod tests {
         let fp1 = hmac_fingerprint(&key_a, &value).expect("value fingerprints");
         let fp2 = hmac_fingerprint(&key_a, &value).expect("value fingerprints");
         assert_eq!(fp1, fp2, "same value + same key -> same fingerprint");
-        assert_eq!(fp1.len(), 32, "truncated to 32 hex chars for log ergonomics");
+        assert_eq!(
+            fp1.len(),
+            32,
+            "truncated to 32 hex chars for log ergonomics"
+        );
 
         let fp3 = hmac_fingerprint(&key_b, &value).expect("value fingerprints");
         assert_ne!(fp1, fp3, "a different derived key must not agree");
 
         let other_value = serde_json::json!({ "status": "blocked" });
         let fp4 = hmac_fingerprint(&key_a, &other_value).expect("value fingerprints");
-        assert_ne!(fp1, fp4, "a different value under the same key must not agree");
+        assert_ne!(
+            fp1, fp4,
+            "a different value under the same key must not agree"
+        );
     }
 
     #[test]
