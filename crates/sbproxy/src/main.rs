@@ -6256,26 +6256,62 @@ struct RegoTestCase {
 }
 
 /// Fixture files a directory argument to `sbproxy rego test` is
-/// searched for, recursively. A file argument is used as-is regardless
-/// of its name.
-fn discover_rego_test_fixtures(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+/// searched for, recursively, plus any I/O fault the walk hit along
+/// the way. A file argument is used as-is regardless of its name.
+///
+/// An unreadable subdirectory, an entry that disappears mid-walk, or a
+/// broken symlink is recorded as a [`RegoTestFixtureError`] naming the
+/// directory or entry, and the walk continues into every sibling and
+/// every other pending directory - the same per-fault isolation
+/// [`run_one_fixture`] gives a broken fixture, so one bad subdirectory
+/// cannot hide the fixtures sitting right next to it. Only `path`
+/// itself being unreadable (the top-level argument, checked before any
+/// walking starts) is a hard `Err`: there is nothing to isolate a
+/// fault from when nothing has been discovered yet.
+fn discover_rego_test_fixtures(
+    path: &std::path::Path,
+) -> anyhow::Result<(Vec<PathBuf>, Vec<RegoTestFixtureError>)> {
     let metadata =
         std::fs::metadata(path).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
     if metadata.is_file() {
-        return Ok(vec![path.to_path_buf()]);
+        return Ok((vec![path.to_path_buf()], Vec::new()));
     }
     let mut fixtures = Vec::new();
+    let mut errors = Vec::new();
     let mut pending = vec![path.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|error| anyhow::anyhow!("read directory {}: {error}", dir.display()))?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                errors.push(RegoTestFixtureError {
+                    fixture: dir.display().to_string(),
+                    error: format!("read directory: {error}"),
+                });
+                continue;
+            }
+        };
         for entry in entries {
-            let entry = entry
-                .map_err(|error| anyhow::anyhow!("read directory {}: {error}", dir.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(RegoTestFixtureError {
+                        fixture: dir.display().to_string(),
+                        error: format!("read directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
             let entry_path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|error| anyhow::anyhow!("read directory {}: {error}", dir.display()))?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    errors.push(RegoTestFixtureError {
+                        fixture: entry_path.display().to_string(),
+                        error: format!("stat: {error}"),
+                    });
+                    continue;
+                }
+            };
             if file_type.is_dir() {
                 pending.push(entry_path);
                 continue;
@@ -6290,7 +6326,7 @@ fn discover_rego_test_fixtures(path: &std::path::Path) -> anyhow::Result<Vec<Pat
         }
     }
     fixtures.sort();
-    Ok(fixtures)
+    Ok((fixtures, errors))
 }
 
 /// Resolve a fixture's `module_path` against the directory containing
@@ -6327,12 +6363,17 @@ struct RegoTestCoverageOutput {
     percent: f64,
 }
 
-/// A fixture that never produced case or coverage results at all: an
-/// unreadable path, malformed YAML, a `module`/`module_path` conflict
-/// or omission, no `cases`, a non-positive `budget_ms`, or a module
-/// that failed to compile. Kept distinct from a case whose `expect`
-/// disagreed with the actual result, which is a verdict the fixture
-/// DID produce; see [`run_one_fixture`].
+/// A fault against a fixture, or against the directory walk that was
+/// looking for one, that never produced case or coverage results:
+/// an unreadable path, malformed YAML, a `module`/`module_path`
+/// conflict or omission, no `cases`, a non-positive `budget_ms`, a
+/// module that failed to compile (see [`run_one_fixture`]), or an
+/// unreadable subdirectory / broken entry the discovery walk hit
+/// before a fixture was even found (see
+/// [`discover_rego_test_fixtures`]). `fixture` names whichever of
+/// those - a fixture file or a directory/entry - the fault is against.
+/// Kept distinct from a case whose `expect` disagreed with the actual
+/// result, which is a verdict a fixture DID produce.
 #[derive(serde::Serialize, Debug)]
 struct RegoTestFixtureError {
     fixture: String,
@@ -6595,17 +6636,19 @@ fn run_rego_tests(
 /// # Errors
 ///
 /// Returns an error only when nothing could be discovered or run at
-/// all: an unreadable `path`, or a directory with no `*_test.yaml` /
-/// `*_test.yml` fixtures in it. A fault specific to one discovered
-/// fixture (unreadable, malformed, a bad `module`/`module_path`
-/// pairing, no cases, a non-positive `budget_ms`, or a module that
-/// fails to compile) does not propagate as an `Err`: it is recorded
-/// against that fixture and the sweep continues, which is why the
-/// exit code carries three states rather than two - see
+/// all: an unreadable `path` itself, or a directory with no
+/// `*_test.yaml` / `*_test.yml` fixtures in it and no discovery fault
+/// either. A fault specific to one discovered fixture (unreadable,
+/// malformed, a bad `module`/`module_path` pairing, no cases, a
+/// non-positive `budget_ms`, or a module that fails to compile), or
+/// hit while walking a directory looking for fixtures (an unreadable
+/// subdirectory, a broken entry), does not propagate as an `Err`: it
+/// is recorded and the sweep continues, which is why the exit code
+/// carries three states rather than two - see
 /// `RegoTestOutput::exit_code`.
 fn handle_rego_test(args: &RegoTestArgs) -> anyhow::Result<i32> {
-    let fixture_paths = discover_rego_test_fixtures(&args.path)?;
-    if fixture_paths.is_empty() {
+    let (fixture_paths, discovery_errors) = discover_rego_test_fixtures(&args.path)?;
+    if fixture_paths.is_empty() && discovery_errors.is_empty() {
         anyhow::bail!(
             "no rego test fixtures found at {}; pass a fixture YAML file directly, or a \
              directory containing *_test.yaml / *_test.yml files",
@@ -6613,7 +6656,14 @@ fn handle_rego_test(args: &RegoTestArgs) -> anyhow::Result<i32> {
         );
     }
 
-    let output = run_rego_tests(&fixture_paths, args.min_coverage)?;
+    let mut output = run_rego_tests(&fixture_paths, args.min_coverage)?;
+    // Discovery-time faults (an unreadable subdirectory, a broken
+    // entry) surface first, ahead of faults specific to a fixture that
+    // was actually found, so both classes land in the same `errors`
+    // list and the same exit-code precedence covers both.
+    let mut errors = discovery_errors;
+    errors.append(&mut output.errors);
+    output.errors = errors;
 
     match args.format {
         OutputFormat::Json => {
@@ -14129,12 +14179,14 @@ cases:
         // A file that must not be picked up: wrong suffix.
         std::fs::write(dir.join("notes.txt"), "not a fixture").expect("write decoy");
 
-        let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
+        let (found, discovery_errors) =
+            discover_rego_test_fixtures(&dir).expect("directory is readable");
         assert_eq!(
             found,
             vec![fixture_path],
             "only the *_test.yaml file must be discovered, found recursively"
         );
+        assert!(discovery_errors.is_empty(), "{discovery_errors:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14185,8 +14237,10 @@ cases:
         )
         .expect("write fixture");
 
-        let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
+        let (found, discovery_errors) =
+            discover_rego_test_fixtures(&dir).expect("directory is readable");
         assert_eq!(found, vec![nested.join("policy_test.yaml")], "{found:?}");
+        assert!(discovery_errors.is_empty(), "{discovery_errors:?}");
 
         let output = run_rego_tests(&found, None).expect("the sweep itself does not fail");
         assert!(
@@ -14217,8 +14271,10 @@ cases:
         std::fs::write(dir.join("good_test.yaml"), PASSING_FIXTURE).expect("write good fixture");
         std::fs::write(dir.join("broken_test.yaml"), BROKEN_FIXTURE).expect("write broken fixture");
 
-        let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
+        let (found, discovery_errors) =
+            discover_rego_test_fixtures(&dir).expect("directory is readable");
         assert_eq!(found.len(), 2, "{found:?}");
+        assert!(discovery_errors.is_empty(), "{discovery_errors:?}");
 
         let output = run_rego_tests(&found, None).expect("the sweep itself does not fail");
         assert_eq!(
@@ -14368,6 +14424,98 @@ cases: []
         assert!(output.errors[0].error.contains("no `cases`"), "{output:?}");
         assert_eq!(output.exit_code(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- fix round 2 (residual review finding: the discovery walk
+    // itself must isolate its own I/O faults, not just fixture faults)
+    // ---
+
+    #[cfg(unix)]
+    #[test]
+    fn rego_test_unreadable_subdirectory_does_not_abort_the_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Restores `path` to `mode` on drop, including during a
+        /// panic's unwind, so a failed assertion between locking the
+        /// directory down and this test's own explicit restore cannot
+        /// leave the scratch directory permanently un-removable at
+        /// 0o000. Hand-rolled rather than the `scopeguard` crate:
+        /// `scopeguard` is not a dependency of `crates/sbproxy` and
+        /// this is the minimal equivalent for exactly this one use.
+        struct RestorePermissionsOnDrop {
+            path: PathBuf,
+            mode: u32,
+        }
+
+        impl Drop for RestorePermissionsOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.mode),
+                );
+            }
+        }
+
+        let dir = rego_test_scratch_dir("unreadable-subdir");
+        std::fs::write(dir.join("good_test.yaml"), PASSING_FIXTURE).expect("write good fixture");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).expect("locked dir");
+        // A fixture inside `locked` that must never surface, proving the
+        // directory was genuinely skipped rather than merely empty.
+        std::fs::write(locked.join("hidden_test.yaml"), PASSING_FIXTURE)
+            .expect("write hidden fixture");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("lock down the subdirectory");
+        let restore = RestorePermissionsOnDrop {
+            path: locked.clone(),
+            mode: 0o700,
+        };
+
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running with a privilege (commonly root, or some CI
+            // sandboxes) that bypasses the owner-permission bits this
+            // test depends on. `restore` still fires on the way out;
+            // nothing to assert against an enforcement the OS never
+            // actually applied here.
+            drop(restore);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // `locked` stays 0o000 through both calls below: the direct
+        // discovery call and `handle_rego_test`'s own internal
+        // re-discovery must see the SAME unreadable directory, not one
+        // this test already relaxed after the first call.
+        let (found, discovery_errors) =
+            discover_rego_test_fixtures(&dir).expect("the sweep itself does not fail");
+        assert_eq!(
+            found,
+            vec![dir.join("good_test.yaml")],
+            "the good fixture outside the locked directory must still be found: {found:?}"
+        );
+        assert_eq!(discovery_errors.len(), 1, "{discovery_errors:?}");
+        assert!(
+            discovery_errors[0].fixture.ends_with("locked"),
+            "the error must name the unreadable directory: {discovery_errors:?}"
+        );
+
+        let output = run_rego_tests(&found, None).expect("the sweep itself does not fail");
+        assert_eq!(output.passed, 2, "the good fixture's cases must still run: {output:?}");
+        assert_eq!(output.failed, 0, "{output:?}");
+
+        let exit = handle_rego_test(&RegoTestArgs {
+            path: dir.clone(),
+            min_coverage: None,
+            format: OutputFormat::Text,
+        })
+        .expect("the handler runs end to end");
+        assert_eq!(
+            exit, 2,
+            "an unreadable subdirectory must exit 2, same as a broken fixture"
+        );
+
+        drop(restore);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
