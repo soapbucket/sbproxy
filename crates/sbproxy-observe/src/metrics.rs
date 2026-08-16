@@ -3575,13 +3575,16 @@ pub fn record_outbound_request_duration(
 /// Observe the wall-clock latency of one audit-channel emission in
 /// seconds (WOR-75 / `sbproxy_audit_emit_duration_seconds`).
 ///
-/// Called by [`crate::audit::ConfigAuditEntry::emit`] and
-/// [`crate::audit::SecurityAuditEntry::emit`] after the JSON has been
-/// pushed to the `config_audit` / `security_audit` tracing target.
-/// `channel` is one of `config`, `security`; `outcome` is `ok` when
-/// serialization succeeded and `serialize_error` when the JSON encode
-/// returned an error (in which case the audit was dropped, which is
-/// itself worth alerting on).
+/// Called by [`crate::audit::ConfigAuditEntry::emit`],
+/// [`crate::audit::SecurityAuditEntry::emit`],
+/// [`crate::audit::KeyAuditEntry::emit`], and
+/// [`crate::audit::AdminActionAuditEntry::emit`] after each channel's own
+/// tracing/ring step. `channel` is one of `config`, `security`, `key`,
+/// `admin`; `outcome` is `ok` on success, `serialize_error` when a
+/// channel's own JSON encode failed (the `config` and `security`
+/// channels only), and `chain_error` when a configured chain rejected
+/// the append (in each case the audit was dropped from that path, which
+/// is itself worth alerting on).
 ///
 /// An exemplar with the active trace + span IDs lands on the matching
 /// bucket; this is the primary way operators correlate a slow audit

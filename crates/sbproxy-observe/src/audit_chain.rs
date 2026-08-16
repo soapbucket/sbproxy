@@ -841,7 +841,9 @@ static KEY_AUDIT_FINGERPRINT_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 /// (see the module docs). A deployment that rotates
 /// `key_management.crypto.master_key` needs a restart for the fingerprint
 /// key to follow, exactly as it already needs one for previously sealed
-/// credential envelopes to stay openable under the old key today.
+/// credential envelopes to stay openable under the old key today. See
+/// [`KeyAuditChainEntry::key_epoch`] for how a reader tells that a
+/// rotation happened at all.
 pub fn install_key_audit_fingerprint_key(master_key: &[u8]) {
     let derived = sbproxy_security::hkdf_derive_purpose(
         master_key,
@@ -854,46 +856,147 @@ pub fn install_key_audit_fingerprint_key(master_key: &[u8]) {
     let _ = KEY_AUDIT_FINGERPRINT_KEY.set(key);
 }
 
-/// HMAC-SHA256 the canonical JSON encoding of `value` under `key`, hex
-/// encoded and truncated to 32 hex characters (16 bytes) for log
-/// ergonomics, the same truncation
-/// [`sbproxy_security::sealed_record`]'s published key fingerprints and
-/// the bundle secret-var fingerprint both apply to a derived value before
-/// it is safe to display. 128 bits of a keyed HMAC is not brute-forceable
-/// back to the field value by anyone without the derived key, which is
-/// the property this fingerprint needs; it is not a general-purpose hash.
+/// Whether a key-audit chain file is installed for this process.
 ///
-/// A free function, not a method, so it is testable without touching the
-/// process-wide `KEY_AUDIT_FINGERPRINT_KEY` slot: determinism and
-/// key-separation are properties of this function alone.
-fn hmac_fingerprint(key: &[u8; 32], value: &serde_json::Value) -> Option<String> {
-    let canonical = serde_json::to_vec(value).ok()?;
-    let mut mac = HmacSha256::new_from_slice(key).ok()?;
-    mac.update(&canonical);
-    let digest = mac.finalize().into_bytes();
-    Some(hex::encode(&digest[..16]))
+/// Exposed so [`crate::audit::KeyAuditEntry::emit`] can skip building a
+/// [`KeyAuditChainEntry`] entirely on a deployment that never turned the
+/// key chain on (WOR-2478 M8): [`append_key_audit`] already treats an
+/// uninstalled chain as a no-op, but constructing the entry that would
+/// have been thrown away is not free - every before/after field gets an
+/// HMAC computed for it - so the check moves in front of that work
+/// instead of after it.
+pub(crate) fn key_audit_chain_installed() -> bool {
+    KEY_CHAIN.get().is_some()
 }
 
-/// Fingerprint one field's value under the installed key-audit
-/// fingerprint key. `None` when no key has been installed yet: a
-/// fingerprint computed under no key would not be a fingerprint of
-/// anything, so this omits the field rather than deriving under an
-/// all-zero placeholder.
-fn fingerprint_field(value: &serde_json::Value) -> Option<String> {
+/// Key-audit diff field names the one production caller
+/// (`sbproxy-core`'s `admin_keys::audit_mutation_scoped`) emits today.
+/// Names on this list are copied into the chain verbatim - readable to
+/// an auditor without needing the fingerprint key at all, the same trade
+/// Vault's audit log makes for its own closed field-name vocabulary -
+/// because they are a closed, reviewed set rather than a caller-supplied
+/// string. A field name that is not on this list does not get to land in
+/// a file designed to be impossible to quietly amend either: see
+/// [`fingerprinted_field_name`] (WOR-2478 I3/M6). Grow this list in the
+/// same commit that adds a new field to a `KeyAuditEntry::with_diff`
+/// call site, not before.
+const KNOWN_KEY_AUDIT_FIELD_NAMES: &[&str] = &["status"];
+
+/// Prefix on a fingerprinted (non-allowlisted) field name in the chained
+/// map, so a reader can tell the two shapes apart at a glance: `status`
+/// reads as a name, `f:3f9c...` reads as a fingerprint.
+const FIELD_NAME_FINGERPRINT_PREFIX: &str = "f:";
+
+/// Hex characters kept from a field name/value fingerprint's full
+/// HMAC-SHA256 digest: 32 hex characters, 16 bytes, 128 bits.
+const FIELD_FINGERPRINT_HEX_LEN: usize = 32;
+
+/// Hex characters kept from the key-epoch tag's full HMAC-SHA256 digest.
+/// Deliberately much shorter than a field fingerprint: the epoch is not
+/// trying to resist brute force (there is nothing to invert - it is not
+/// a digest of any secret value, only of the fixed string `b"epoch"`
+/// under the derived key), only to give two records a short, glanceable
+/// "same key or not" tag. See [`KeyAuditChainEntry::key_epoch`].
+const KEY_EPOCH_HEX_LEN: usize = 8;
+
+/// HMAC-SHA256 `data` under `key`, hex encoded and truncated to the
+/// first `hex_len` hex characters, the shared primitive under every
+/// fingerprint and the epoch tag below. 128 bits (the field-fingerprint
+/// length) is not brute-forceable back to the input by anyone without
+/// the derived key, which is the property a field fingerprint needs;
+/// none of these calls is a general-purpose hash.
+///
+/// `Option`-returning rather than infallible: `Hmac::new_from_slice`
+/// only ever errs on a key length HMAC-SHA256 does not accept, which a
+/// fixed 32-byte `key` never hits in practice, but that is a fact about
+/// this call site rather than something the type system can promise, so
+/// the caller decides what "no fingerprint" means (omit the field)
+/// rather than this function taking down the process on an input it
+/// cannot actually receive.
+///
+/// A free function, not a method, so it is testable without touching the
+/// process-wide `KEY_AUDIT_FINGERPRINT_KEY` slot: determinism,
+/// key-separation, and (for values) name-binding are properties of the
+/// functions built on top of this one, not of any installed state.
+fn hmac_hex(key: &[u8; 32], data: &[u8], hex_len: usize) -> Option<String> {
+    let mut mac = HmacSha256::new_from_slice(key).ok()?;
+    mac.update(data);
+    let digest = mac.finalize().into_bytes();
+    let full = hex::encode(digest);
+    Some(full[..hex_len.min(full.len())].to_string())
+}
+
+/// HMAC-SHA256 a field's name-bound value: `name || 0x00 ||
+/// canonical(value)`. Binding the name into the value's own MAC
+/// (WOR-2478 I3/M6) means two mutations that set different fields to the
+/// same value no longer fingerprint identically: `{"status":"blocked"}`
+/// and some future `{"role":"blocked"}` disagree, where the bare value
+/// digest alone would not have.
+fn hmac_value(key: &[u8; 32], name: &str, value: &serde_json::Value) -> Option<String> {
+    let canonical = serde_json::to_vec(value).ok()?;
+    let mut data = Vec::with_capacity(name.len() + 1 + canonical.len());
+    data.extend_from_slice(name.as_bytes());
+    data.push(0);
+    data.extend_from_slice(&canonical);
+    hmac_hex(key, &data, FIELD_FINGERPRINT_HEX_LEN)
+}
+
+/// HMAC-SHA256 a field NAME, domain-separated from [`hmac_value`] by the
+/// `b"name\0"` prefix so the two keyspaces cannot be confused. Used only
+/// for a name that fails [`is_known_key_audit_field_name`]; see
+/// [`fingerprinted_field_name`].
+fn hmac_name(key: &[u8; 32], name: &str) -> Option<String> {
+    let mut data = Vec::with_capacity(5 + name.len());
+    data.extend_from_slice(b"name\0");
+    data.extend_from_slice(name.as_bytes());
+    hmac_hex(key, &data, FIELD_FINGERPRINT_HEX_LEN)
+}
+
+/// Whether `name` is on the closed, reviewed key-audit diff field-name
+/// vocabulary. See [`KNOWN_KEY_AUDIT_FIELD_NAMES`].
+fn is_known_key_audit_field_name(name: &str) -> bool {
+    KNOWN_KEY_AUDIT_FIELD_NAMES.contains(&name)
+}
+
+/// The map key one field lands under in the chained snapshot: `name`
+/// verbatim when it is on the closed allowlist, or its own keyed,
+/// domain-separated fingerprint (prefixed so it reads as one) when it is
+/// not (WOR-2478 I3/M6). An arbitrary caller-supplied field name can
+/// therefore never land verbatim in the chain file, only an allowlisted
+/// one can. Returns `None` exactly when [`hmac_name`] does, for a name
+/// that fails the allowlist (see that function's docs for when that is).
+fn fingerprinted_field_name(key: &[u8; 32], name: &str) -> Option<String> {
+    if is_known_key_audit_field_name(name) {
+        Some(name.to_string())
+    } else {
+        hmac_name(key, name).map(|hash| format!("{FIELD_NAME_FINGERPRINT_PREFIX}{hash}"))
+    }
+}
+
+/// Fingerprint one named field under the installed key-audit fingerprint
+/// key: the map key ([`fingerprinted_field_name`]) paired with the
+/// name-bound value fingerprint ([`hmac_value`]). `None` when no key has
+/// been installed yet: a fingerprint computed under no key would not be
+/// a fingerprint of anything, so the field is omitted rather than
+/// derived under an all-zero placeholder.
+fn fingerprint_named_field(name: &str, value: &serde_json::Value) -> Option<(String, String)> {
     let key = KEY_AUDIT_FINGERPRINT_KEY.get()?;
-    hmac_fingerprint(key, value)
+    let value_fingerprint = hmac_value(key, name, value)?;
+    let map_key = fingerprinted_field_name(key, name)?;
+    Some((map_key, value_fingerprint))
 }
 
 /// Fingerprint every top-level field of a key/credential before/after
-/// snapshot, keyed-HMAC-SHA256, hex-encoded (WOR-2478).
+/// snapshot (WOR-2478).
 ///
-/// A JSON object fingerprints one entry per key, field name to
-/// fingerprint, so a reader can tell which named field changed. Anything
-/// else a caller might pass as a snapshot (a scalar, an array, or simply
-/// absent) fingerprints as a single `"value"` entry, so a diff shaped
+/// A JSON object fingerprints one entry per key. Anything else a caller
+/// might pass as a snapshot (a scalar, an array, or simply absent)
+/// fingerprints as a single field named `"value"`, so a diff shaped
 /// either way still produces something. Called from
-/// [`crate::audit::KeyAuditEntry::emit`]; never the value itself, only its
-/// digest under a key only the operator's master secret can derive.
+/// [`crate::audit::KeyAuditEntry::emit`]; never the raw name or value,
+/// only their digests under a key only the operator's master secret can
+/// derive, and only when a fingerprint key has actually been installed
+/// (this omits the entry rather than fingerprinting with a placeholder).
 pub(crate) fn fingerprint_key_audit_snapshot(
     value: Option<&serde_json::Value>,
 ) -> BTreeMap<String, String> {
@@ -904,18 +1007,37 @@ pub(crate) fn fingerprint_key_audit_snapshot(
     match value.as_object() {
         Some(map) => {
             for (field, field_value) in map {
-                if let Some(fingerprint) = fingerprint_field(field_value) {
-                    out.insert(field.clone(), fingerprint);
+                if let Some((map_key, fingerprint)) = fingerprint_named_field(field, field_value)
+                {
+                    out.insert(map_key, fingerprint);
                 }
             }
         }
         None => {
-            if let Some(fingerprint) = fingerprint_field(value) {
-                out.insert("value".to_string(), fingerprint);
+            if let Some((map_key, fingerprint)) = fingerprint_named_field("value", value) {
+                out.insert(map_key, fingerprint);
             }
         }
     }
     out
+}
+
+/// The current key-audit fingerprint key's epoch tag, or an empty string
+/// before a fingerprint key has been installed (WOR-2478 I4). See
+/// [`KeyAuditChainEntry::key_epoch`] for what this is for; kept as a
+/// standalone free function ([`epoch_tag`]) underneath so the property
+/// "same key -> same tag, different key -> different tag" is testable
+/// without touching the process-wide slot.
+pub(crate) fn key_audit_fingerprint_epoch() -> String {
+    KEY_AUDIT_FINGERPRINT_KEY
+        .get()
+        .and_then(epoch_tag)
+        .unwrap_or_default()
+}
+
+/// `hex(HMAC(key, b"epoch"))[..8]`. See [`key_audit_fingerprint_epoch`].
+fn epoch_tag(key: &[u8; 32]) -> Option<String> {
+    hmac_hex(key, b"epoch", KEY_EPOCH_HEX_LEN)
 }
 
 #[cfg(test)]
@@ -1445,6 +1567,7 @@ mod tests {
             id: id.to_string(),
             actor: Some("operator-jo".to_string()),
             tenant_id: Some("acme".to_string()),
+            key_epoch: "test-epoch".to_string(),
             before_fingerprint,
             after_fingerprint,
         }
@@ -1629,44 +1752,128 @@ mod tests {
     }
 
     #[test]
-    fn key_audit_fingerprint_is_deterministic_and_key_dependent() {
+    fn key_audit_value_fingerprint_is_deterministic_key_dependent_and_name_bound() {
         // A pure-function test, independent of the process-wide
-        // fingerprint-key slot: same value + same key must always agree,
-        // and either operand changing must break that agreement.
+        // fingerprint-key slot: same name + same value + same key must
+        // always agree, and any one of the three changing must break
+        // that agreement.
         let key_a = [0x11u8; 32];
         let key_b = [0x22u8; 32];
         let value = serde_json::json!({ "status": "active" });
 
-        let fp1 = hmac_fingerprint(&key_a, &value).expect("value fingerprints");
-        let fp2 = hmac_fingerprint(&key_a, &value).expect("value fingerprints");
-        assert_eq!(fp1, fp2, "same value + same key -> same fingerprint");
+        let fp1 = hmac_value(&key_a, "status", &value).expect("value fingerprints");
+        let fp2 = hmac_value(&key_a, "status", &value).expect("value fingerprints");
+        assert_eq!(fp1, fp2, "same name + value + key -> same fingerprint");
         assert_eq!(
             fp1.len(),
-            32,
+            FIELD_FINGERPRINT_HEX_LEN,
             "truncated to 32 hex chars for log ergonomics"
         );
 
-        let fp3 = hmac_fingerprint(&key_b, &value).expect("value fingerprints");
+        let fp3 = hmac_value(&key_b, "status", &value).expect("value fingerprints");
         assert_ne!(fp1, fp3, "a different derived key must not agree");
 
         let other_value = serde_json::json!({ "status": "blocked" });
-        let fp4 = hmac_fingerprint(&key_a, &other_value).expect("value fingerprints");
+        let fp4 = hmac_value(&key_a, "status", &other_value).expect("value fingerprints");
         assert_ne!(
             fp1, fp4,
-            "a different value under the same key must not agree"
+            "a different value under the same name and key must not agree"
+        );
+
+        // WOR-2478 I3/M6(b): the value MAC binds the field name, so two
+        // fields set to the identical value must not fingerprint
+        // identically either.
+        let fp5 = hmac_value(&key_a, "role", &value).expect("value fingerprints");
+        assert_ne!(
+            fp1, fp5,
+            "the same value under a different field name must not agree"
         );
     }
 
     #[test]
-    fn fingerprint_key_audit_snapshot_names_every_field_and_is_empty_for_none() {
+    fn key_audit_value_fingerprint_is_stable_across_json_object_key_insertion_order() {
+        // WOR-2478 M7: guards the assumption that `serde_json::Value`'s
+        // map canonicalizes independent of insertion order (true today
+        // because this workspace does not enable serde_json's
+        // `preserve_order` feature; a BTreeMap-backed map always
+        // serializes in sorted key order regardless of how it was
+        // built). If that assumption ever breaks, this is the test that
+        // catches it rather than a silent fingerprint mismatch in
+        // production.
+        let key = [0x33u8; 32];
+
+        let mut forward = serde_json::Map::new();
+        forward.insert("x".to_string(), serde_json::json!(1));
+        forward.insert("y".to_string(), serde_json::json!(2));
+        let value_forward = serde_json::Value::Object(forward);
+
+        let mut reverse = serde_json::Map::new();
+        reverse.insert("y".to_string(), serde_json::json!(2));
+        reverse.insert("x".to_string(), serde_json::json!(1));
+        let value_reverse = serde_json::Value::Object(reverse);
+
+        let fp_forward = hmac_value(&key, "field", &value_forward).expect("value fingerprints");
+        let fp_reverse = hmac_value(&key, "field", &value_reverse).expect("value fingerprints");
+        assert_eq!(
+            fp_forward, fp_reverse,
+            "canonical serialization must not depend on object key insertion order"
+        );
+    }
+
+    #[test]
+    fn key_audit_epoch_is_stable_per_key_and_differs_across_keys() {
+        // WOR-2478 I4: same key -> same epoch every time; different key
+        // -> different epoch. Drives `epoch_tag` directly for the same
+        // reason the value-fingerprint tests above drive `hmac_value`
+        // directly: independent of the process-wide slot.
+        let key_a = [0x44u8; 32];
+        let key_b = [0x55u8; 32];
+
+        let epoch_a1 = epoch_tag(&key_a).expect("epoch tags");
+        let epoch_a2 = epoch_tag(&key_a).expect("epoch tags");
+        assert_eq!(epoch_a1, epoch_a2, "the same key must yield a stable epoch");
+        assert_eq!(
+            epoch_a1.len(),
+            KEY_EPOCH_HEX_LEN,
+            "the epoch tag is 8 hex characters"
+        );
+
+        let epoch_b = epoch_tag(&key_b).expect("epoch tags");
+        assert_ne!(
+            epoch_a1, epoch_b,
+            "a different key must yield a different epoch"
+        );
+    }
+
+    #[test]
+    fn fingerprint_key_audit_snapshot_keeps_allowlisted_names_verbatim_and_fingerprints_others() {
+        // WOR-2478 I3/M6(a): `status` is the one field name the
+        // production caller emits today, so it is on the closed
+        // allowlist and lands in the chain readable. `note` is not, so
+        // it must not land in the chain under its own name at all -
+        // only under its own keyed, prefixed fingerprint.
         install_key_audit_fingerprint_key(b"test-master-for-snapshot-fields");
         let snapshot = fingerprint_key_audit_snapshot(Some(&serde_json::json!({
             "status": "active",
             "note": "rotated",
         })));
-        assert_eq!(snapshot.len(), 2, "one fingerprint per field: {snapshot:?}");
-        assert!(snapshot.contains_key("status"));
-        assert!(snapshot.contains_key("note"));
+        assert_eq!(snapshot.len(), 2, "one entry per field: {snapshot:?}");
+        assert!(
+            snapshot.contains_key("status"),
+            "an allowlisted name is copied verbatim: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key("note"),
+            "a non-allowlisted name must never land verbatim: {snapshot:?}"
+        );
+        let fingerprinted_key = snapshot
+            .keys()
+            .find(|k| k.starts_with(FIELD_NAME_FINGERPRINT_PREFIX))
+            .expect("the non-allowlisted field lands under its fingerprinted name");
+        assert!(
+            !fingerprinted_key.contains("note"),
+            "the fingerprinted name must not embed the raw name either: {fingerprinted_key}"
+        );
 
         let empty = fingerprint_key_audit_snapshot(None);
         assert!(empty.is_empty(), "no snapshot, no fingerprints");

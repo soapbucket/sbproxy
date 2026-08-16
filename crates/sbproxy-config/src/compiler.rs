@@ -2179,6 +2179,37 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
     )
 }
 
+/// Lexically normalize an audit chain path for the pairwise-distinctness
+/// comparison in [`validate_audit`] (WOR-2478 M11).
+///
+/// Splits on `/`, drops empty segments (so a repeated or trailing slash
+/// collapses) and `.` segments, and rejoins, restoring a leading slash
+/// when the input had one. `/a/b.jsonl` and `/a/./b.jsonl` normalize to
+/// the same string, so a config that merely spells one chain path with a
+/// redundant `.` segment cannot slip past the check that exists to catch
+/// two channels sharing one file.
+///
+/// Deliberately does not resolve `..` (a `..` segment's target depends
+/// on what its parent actually resolves to on disk, which this function
+/// cannot know without touching the filesystem, and the paths being
+/// compared here may not exist yet) or symlinks. An operator who wants
+/// that guarantee should not need a `..` or a symlink to bypass a check
+/// that is trying to protect them from themselves; this closes the
+/// purely lexical gap, not every gap.
+fn normalize_chain_path(path: &str) -> String {
+    let leading_slash = path.starts_with('/');
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    let joined = segments.join("/");
+    if leading_slash {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 /// Validate the top-level `audit:` block (WOR-2318, WOR-2478).
 ///
 /// Each rule exists because the alternative is a deployment that
@@ -2219,7 +2250,10 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
 /// every other chain path this config names. Four channels means six
 /// pairwise checks rather than one; each is written out rather than
 /// looped, matching `config_path`'s check above, so the refusal message
-/// always names the two keys actually in conflict.
+/// always names the two keys actually in conflict. Every comparison runs
+/// against [`normalize_chain_path`]'s output rather than the raw string
+/// (WOR-2478 M11), so `/a/b.jsonl` and `/a/./b.jsonl` are caught as the
+/// same file even though they differ byte for byte.
 fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) -> Result<()> {
     if audit.sink == AuditSinkKind::Tracing {
         anyhow::bail!(
@@ -2278,7 +2312,9 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
     }
 
     if let Some(config_path) = audit.config_path.as_deref().map(str::trim) {
-        if Some(config_path) == audit.path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(config_path))
+            == audit.path.as_deref().map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the config channel cannot share the security chain file; the two payload \
                  types verify separately"
@@ -2287,13 +2323,20 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
     }
 
     if let Some(key_path) = audit.key_path.as_deref().map(str::trim) {
-        if Some(key_path) == audit.path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(key_path))
+            == audit.path.as_deref().map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the key channel cannot share the security chain file; the two payload types \
                  verify separately"
             );
         }
-        if Some(key_path) == audit.config_path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(key_path))
+            == audit
+                .config_path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the key channel cannot share the config chain file; the two payload types \
                  verify separately"
@@ -2302,19 +2345,31 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
     }
 
     if let Some(admin_path) = audit.admin_path.as_deref().map(str::trim) {
-        if Some(admin_path) == audit.path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(admin_path))
+            == audit.path.as_deref().map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the admin channel cannot share the security chain file; the two payload types \
                  verify separately"
             );
         }
-        if Some(admin_path) == audit.config_path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(admin_path))
+            == audit
+                .config_path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the admin channel cannot share the config chain file; the two payload types \
                  verify separately"
             );
         }
-        if Some(admin_path) == audit.key_path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(admin_path))
+            == audit
+                .key_path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the admin channel cannot share the key chain file; the two payload types \
                  verify separately"
@@ -8654,6 +8709,25 @@ origins:
         assert_eq!(
             audit.admin_path.as_deref(),
             Some("/var/lib/sbproxy/admin-audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn chain_paths_are_compared_after_normalizing_dot_segments() {
+        // WOR-2478 M11: `/a/./b.jsonl` and `/a/b.jsonl` name the same
+        // file lexically, so the pairwise check must catch this collision
+        // even though the two strings differ byte for byte.
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /a/b.jsonl\n  \
+             config_path: /a/./b.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a config_path that normalizes to the same file as path must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the config channel cannot share the security chain file; the two payload types \
+             verify separately"
         );
     }
 

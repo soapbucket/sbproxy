@@ -19,7 +19,14 @@ pub const REASON_JUDGE_TIMEOUT: &str = "judge_timeout";
 /// Closed fail-closed reason when the judge response is not strict typed JSON.
 pub const REASON_JUDGE_MALFORMED: &str = "judge_malformed_response";
 /// Closed fail-closed reason when egress denies the judge destination.
-pub const REASON_JUDGE_EGRESS_DENIED: &str = "judge_egress_denied";
+///
+/// `pub(crate)`, not `pub`: every production consumer is inside this
+/// crate (the quarantine call site below that emits it), and the one
+/// cross-crate reference this had was a `sbproxy-modules` test, which
+/// the pub-item ratchet correctly reads as "the only reason this needs
+/// to be public is a test" (WOR-2478's ratchet fix). That test now
+/// asserts on the literal reason string instead.
+pub(crate) const REASON_JUDGE_EGRESS_DENIED: &str = "judge_egress_denied";
 /// Fallback when the model quarantines without a safe reason code.
 pub const REASON_JUDGE_QUARANTINE: &str = "judge_quarantine";
 
@@ -34,7 +41,16 @@ pub struct UntrustedToolOutput {
 
 impl UntrustedToolOutput {
     /// Build from raw text blocks already extracted from MCP content.
-    pub fn from_text_blocks(text_blocks: impl IntoIterator<Item = String>) -> Self {
+    ///
+    /// `pub(crate)`, not `pub` (WOR-2478's ratchet fix): every
+    /// production consumer builds an [`UntrustedToolOutput`] through
+    /// [`Self::from_tool_result_value`] instead, which has a real
+    /// cross-crate production caller
+    /// (`sbproxy-core::server::action_dispatch`). This constructor's
+    /// only cross-crate reference was a `sbproxy-modules` test, which
+    /// now goes through `from_tool_result_value` too. In-crate tests
+    /// still use it directly for the terser call site.
+    pub(crate) fn from_text_blocks(text_blocks: impl IntoIterator<Item = String>) -> Self {
         Self {
             text_blocks: text_blocks.into_iter().collect(),
         }

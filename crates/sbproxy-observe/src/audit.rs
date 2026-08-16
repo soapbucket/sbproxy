@@ -565,7 +565,7 @@ pub struct KeyAuditEntry {
 /// `after` it carries a keyed-HMAC-SHA256 fingerprint of each field the
 /// snapshot named, so a chain reader can tell that two mutations set the
 /// same field to the same value without the chain file ever holding that
-/// value; see [`crate::audit_chain::fingerprint_key_audit_snapshot`] for
+/// value; see `crate::audit_chain::fingerprint_key_audit_snapshot` for
 /// how a fingerprint is computed and the key it runs under.
 ///
 /// `Deserialize` and `Clone` exist so this is a
@@ -587,9 +587,28 @@ pub struct KeyAuditChainEntry {
     /// Tenant the record belongs to, when scoped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
-    /// Field name to keyed-HMAC-SHA256 fingerprint (hex) of that field's
-    /// value before the mutation. Empty when the mutation carried no
-    /// `before` snapshot, or no fingerprint key has been installed yet.
+    /// A short, non-secret tag identifying which fingerprint key produced
+    /// this record's fingerprints: `hex(HMAC(derived_key, b"epoch"))[..8]`
+    /// (WOR-2478 I4). An ephemeral master key (no
+    /// `key_management.crypto.master_key` configured) re-derives a fresh
+    /// fingerprint key on every boot, and a rotated one re-derives on the
+    /// next; either silently re-bases every fingerprint that follows.
+    /// Two records with different `key_epoch` values were fingerprinted
+    /// under different keys, and their fingerprints must never be
+    /// compared for equality. Empty before a fingerprint key has been
+    /// installed, in step with `before_fingerprint` / `after_fingerprint`
+    /// also being empty under the same condition.
+    pub key_epoch: String,
+    /// Before-mutation field fingerprints, keyed by the field's own name
+    /// when that name is on the closed key-audit field-name allowlist, or
+    /// by the field name's own keyed fingerprint (prefixed `f:`)
+    /// otherwise (WOR-2478 I3/M6) - a caller-supplied field name never
+    /// lands verbatim in this map unless it was reviewed onto the
+    /// allowlist first. Each value is a keyed-HMAC-SHA256 fingerprint,
+    /// hex, that also binds the field's own name, so two different
+    /// fields set to the same value fingerprint differently. Empty when
+    /// the mutation carried no `before` snapshot, or no fingerprint key
+    /// has been installed yet.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub before_fingerprint: BTreeMap<String, String>,
     /// The same, for the value after the mutation.
@@ -601,12 +620,16 @@ pub struct KeyAuditChainEntry {
 
 /// A structured record of one authenticated admin-console action.
 ///
-/// Emitted on the `sbproxy::admin::audit` tracing target for every
-/// mutating admin API call, admin login attempt, and content inspection,
-/// so an operator can route admin activity to a dedicated sink and
-/// reconstruct who did what. Every field here is what the audit ring's
-/// `AuditRingEvent` already carries for the `admin` channel: the operator,
-/// the tenant, the public key id (never the secret), a request
+/// Not what performs the `sbproxy::admin::audit` tracing emission itself:
+/// each of the four call sites in `crates/sbproxy-core/src/admin.rs`
+/// independently logs to that tracing target immediately before building
+/// one of these (WOR-2094's original ring-push shape), and this type
+/// carries the same fact onward rather than duplicating the log line.
+/// [`Self::emit`] pushes a normalized copy onto the shared audit ring
+/// and, if a chain is installed, appends it to the durable admin chain
+/// (WOR-2478). Every field here is what the audit ring's
+/// `AuditRingEvent` already carries for the `admin` channel: the
+/// operator, the tenant, the public key id (never the secret), a request
 /// correlation id, and a bounded free-text `detail` (an HTTP method and
 /// path, or a role label; never a header value or a credential). Chained
 /// verbatim, the same as [`SecurityAuditEntry`] and [`ConfigAuditEntry`]:
@@ -635,14 +658,20 @@ pub struct AdminActionAuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     /// Bounded, machine-readable detail: an HTTP method and path, or a
-    /// role label. Capped the same way the audit ring caps it.
+    /// role label. Capped in [`Self::new`] by the same
+    /// `crate::audit_ring::bound_detail` helper the ring itself caps
+    /// `AuditRingEvent::detail` with (WOR-2478 I5), so the ring's copy
+    /// and the chain's copy of one action are never capped at two
+    /// different lengths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
 impl AdminActionAuditEntry {
-    /// Build an entry for `action`, stamped now.
-    #[allow(clippy::too_many_arguments)] // one call site per admin push site; a builder would be noise
+    /// Build an entry for `action`, stamped now. `detail` is bounded the
+    /// same way `AuditRingEvent::new` bounds it (WOR-2478 I5): both the
+    /// ring and the chain carry the same capped value for one action
+    /// rather than the ring silently disagreeing with what got chained.
     pub fn new(
         action: impl Into<String>,
         actor: Option<String>,
@@ -658,7 +687,7 @@ impl AdminActionAuditEntry {
             tenant_id,
             api_key_id,
             request_id,
-            detail,
+            detail: detail.map(|d| crate::audit_ring::bound_detail(&d)),
         }
     }
 
@@ -738,6 +767,16 @@ impl KeyAuditEntry {
     /// `ok` on success, `serialize_error` when the tracing JSON encode
     /// fails, `chain_error` when a configured key chain rejected the
     /// append.
+    ///
+    /// WOR-2478 M8: the [`KeyAuditChainEntry`] itself - the fingerprint
+    /// maps and the epoch tag - is only built when a key chain is
+    /// actually installed. `append_key_audit` already treats an
+    /// uninstalled chain as a no-op, but computing an HMAC per
+    /// before/after field on every mutation to build an entry that would
+    /// only be discarded is not free; a deployment that never set
+    /// `audit.key_path` pays one relaxed load of a `OnceLock` here and
+    /// nothing more, the same posture the other three channels already
+    /// have with no chain configured.
     pub fn emit(&self) {
         let started = std::time::Instant::now();
         let outcome = match serde_json::to_string(self) {
@@ -763,22 +802,27 @@ impl KeyAuditEntry {
         ));
         // WOR-2478: the durable half. Metadata only, plus a keyed-HMAC
         // fingerprint of each before/after field; the raw diff never
-        // reaches the chain.
-        let chain_entry = KeyAuditChainEntry {
-            timestamp: self.timestamp.clone(),
-            op: self.op.clone(),
-            resource: self.resource.clone(),
-            id: self.id.clone(),
-            actor: self.actor.clone(),
-            tenant_id: self.tenant_id.clone(),
-            before_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
-                self.before.as_ref(),
-            ),
-            after_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
-                self.after.as_ref(),
-            ),
+        // reaches the chain. Built only when a chain is installed (M8).
+        let chain_ok = if crate::audit_chain::key_audit_chain_installed() {
+            let chain_entry = KeyAuditChainEntry {
+                timestamp: self.timestamp.clone(),
+                op: self.op.clone(),
+                resource: self.resource.clone(),
+                id: self.id.clone(),
+                actor: self.actor.clone(),
+                tenant_id: self.tenant_id.clone(),
+                key_epoch: crate::audit_chain::key_audit_fingerprint_epoch(),
+                before_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
+                    self.before.as_ref(),
+                ),
+                after_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
+                    self.after.as_ref(),
+                ),
+            };
+            crate::audit_chain::append_key_audit(&chain_entry)
+        } else {
+            true
         };
-        let chain_ok = crate::audit_chain::append_key_audit(&chain_entry);
         let outcome = if !chain_ok { "chain_error" } else { outcome };
         crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
     }
@@ -1274,8 +1318,11 @@ mod tests {
     /// whose before/after diff carries something that looks exactly like
     /// a real upstream credential must never write that value to the
     /// chain file, in either its plaintext or fingerprinted form's
-    /// namesake bytes. Greps the raw file contents, not a parsed
-    /// structure, so there is nowhere for the secret to hide.
+    /// namesake bytes - and (WOR-2478 I3/M6(c)) the same holds for a
+    /// diff field's own NAME, not just its value: a caller that starts
+    /// diffing a field nobody reviewed must not get to name that field
+    /// in the chain either. Greps the raw file contents, not a parsed
+    /// structure, so there is nowhere for either canary to hide.
     #[test]
     fn a_key_mutation_with_a_secret_before_after_value_never_writes_the_secret_to_the_chain() {
         let path =
@@ -1292,11 +1339,39 @@ mod tests {
 
         let planted_secret = "sk-planted-canary-do-not-leak-4f8a91";
         let rotated_secret = "sk-rotated-canary-do-not-leak-9b21c7";
+        // A second canary planted as the diff's own FIELD NAME, not its
+        // value: `upstream_secret` is not on the key-audit field-name
+        // allowlist either, but naming the canary distinctly here means
+        // a regression that started copying non-allowlisted names
+        // verbatim would be caught by this assertion specifically,
+        // rather than only by the (also-not-allowlisted) `upstream_secret`
+        // name coincidentally being absent too.
+        let planted_field_name = "sk-planted-field-name-canary-77aa21";
+
+        let mut before = serde_json::Map::new();
+        before.insert(
+            "upstream_secret".to_string(),
+            serde_json::Value::String(planted_secret.to_string()),
+        );
+        before.insert(
+            planted_field_name.to_string(),
+            serde_json::Value::String("before".to_string()),
+        );
+        let mut after = serde_json::Map::new();
+        after.insert(
+            "upstream_secret".to_string(),
+            serde_json::Value::String(rotated_secret.to_string()),
+        );
+        after.insert(
+            planted_field_name.to_string(),
+            serde_json::Value::String("after".to_string()),
+        );
+
         KeyAuditEntry::new("update", "credential", "cred-secret-test")
             .with_actor("operator-secret-test")
             .with_diff(
-                Some(serde_json::json!({ "upstream_secret": planted_secret })),
-                Some(serde_json::json!({ "upstream_secret": rotated_secret })),
+                Some(serde_json::Value::Object(before)),
+                Some(serde_json::Value::Object(after)),
             )
             .emit();
 
@@ -1307,11 +1382,15 @@ mod tests {
         );
         assert!(
             !content.contains(planted_secret),
-            "the planted secret must never reach the chain file: {content}"
+            "the planted secret VALUE must never reach the chain file: {content}"
         );
         assert!(
             !content.contains(rotated_secret),
-            "the rotated secret must never reach the chain file either: {content}"
+            "the rotated secret VALUE must never reach the chain file either: {content}"
+        );
+        assert!(
+            !content.contains(planted_field_name),
+            "a caller-supplied field NAME must never reach the chain file verbatim: {content}"
         );
         assert!(
             content.contains("before_fingerprint") && content.contains("after_fingerprint"),
