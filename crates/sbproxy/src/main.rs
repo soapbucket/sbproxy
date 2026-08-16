@@ -191,6 +191,8 @@ enum Cmd {
     Run(RunArgs),
     /// Discover, cache, remove, and operate managed local models.
     Models(ModelsCmd),
+    /// MCP gateway tools (pin the federated tool catalogue, check it).
+    Mcp(McpCmd),
     /// Update the engines and cached models (add `--self` for the
     /// binary). `sbproxy update` checks the engine release feed and the
     /// cached models, then fetches, verifies, and swaps what is out of
@@ -984,6 +986,46 @@ struct ModelsCmd {
     sub: Option<ModelsSub>,
 }
 
+#[derive(clap::Args, Debug)]
+struct McpCmd {
+    #[command(subcommand)]
+    sub: McpSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpSub {
+    /// Discover the configured federated servers and write a lockfile
+    /// pinning every advertised tool at its current contract digest.
+    Lock(McpLockArgs),
+    /// Re-discover and diff against the committed baseline without
+    /// starting a listener. Exits 2 on drift, for CI.
+    VerifyLock(McpVerifyLockArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct McpLockArgs {
+    /// Lockfile path to write. Defaults to the mcp action's own
+    /// `tool_versioning.lockfile`, which is the file the running gate
+    /// reads. Only valid when the config has a single mcp action.
+    #[arg(long = "out")]
+    out: Option<PathBuf>,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct McpVerifyLockArgs {
+    /// Lockfile path to check. Defaults to the mcp action's own
+    /// `tool_versioning.lockfile`. Only valid when the config has a
+    /// single mcp action.
+    #[arg(long = "lockfile")]
+    lockfile: Option<PathBuf>,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelsSub {
     /// List catalog models with a per-GPU fit verdict and cache status.
@@ -1552,6 +1594,18 @@ fn main() {
                 "models",
                 2,
                 handle_models_subcommand(&cmd, global_config_path.as_deref()),
+            );
+        }
+        Some(Cmd::Mcp(cmd)) => {
+            run_subcommand(
+                "mcp",
+                2,
+                match &cmd.sub {
+                    McpSub::Lock(a) => handle_mcp_lock(a, global_config_path.as_deref()),
+                    McpSub::VerifyLock(a) => {
+                        handle_mcp_verify_lock(a, global_config_path.as_deref())
+                    }
+                },
             );
         }
         Some(Cmd::Update(args)) => {
@@ -5658,6 +5712,410 @@ fn handle_models_verify_lock(
         }
     }
     Ok(if drifts.is_empty() { 0 } else { 2 })
+}
+
+// --- `mcp lock` / `mcp verify-lock` handlers (WOR-2443) ---
+
+/// One `type: mcp` action found in a config, with the pieces the
+/// lockfile commands need.
+struct McpActionSite {
+    /// Where in the config document it was found, for error messages
+    /// that name the action an operator has to go edit.
+    location: String,
+    /// The parsed action config, ready to compile.
+    config: Box<sbproxy_modules::action::mcp::McpActionConfig>,
+}
+
+/// Find every `type: mcp` action in a config document.
+///
+/// Walks the whole document rather than the two or three paths an action
+/// is usually written at. An mcp action can sit under an origin, a
+/// route, or a forward rule, and a walker that enumerated those paths
+/// would silently skip a config shape someone adds later. Skipping is
+/// the bad failure here: the operator gets "no mcp action found" for a
+/// config that plainly has one.
+fn find_mcp_actions(doc: &serde_yaml::Value, path: &str, found: &mut Vec<McpActionSite>) {
+    match doc {
+        serde_yaml::Value::Mapping(map) => {
+            let is_mcp = map
+                .get(serde_yaml::Value::from("type"))
+                .and_then(|t| t.as_str())
+                == Some("mcp");
+            if is_mcp {
+                // A malformed mcp action is reported by the caller that
+                // needs it, not here: this function answers "where are
+                // they", and failing the whole walk on one bad block
+                // would hide the good ones.
+                if let Ok(config) = serde_yaml::from_value::<
+                    sbproxy_modules::action::mcp::McpActionConfig,
+                >(doc.clone())
+                {
+                    found.push(McpActionSite {
+                        location: path.to_string(),
+                        config: Box::new(config),
+                    });
+                }
+                return;
+            }
+            for (key, value) in map {
+                let key = key.as_str().unwrap_or("?");
+                let child = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                find_mcp_actions(value, &child, found);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, value) in items.iter().enumerate() {
+                find_mcp_actions(value, &format!("{path}[{index}]"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Load a config and return every mcp action in it.
+fn mcp_action_sites(config_path: Option<&std::path::Path>) -> anyhow::Result<Vec<McpActionSite>> {
+    let Some(config_path) = config_path else {
+        anyhow::bail!(
+            "mcp lock requires -f/--config: the lockfile pins the tools that config federates"
+        );
+    };
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
+    // Interpolate before parsing, the same way boot does. A federated
+    // server origin written as `${MCP_HOST}` has to resolve here too, or
+    // the CLI tries to dial the literal placeholder and reports a
+    // connection failure that names a host nobody configured.
+    let yaml = interpolate_env_vars(&yaml);
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+        .map_err(|error| anyhow::anyhow!("parse config '{}': {error}", config_path.display()))?;
+    let mut found = Vec::new();
+    find_mcp_actions(&doc, "", &mut found);
+    if found.is_empty() {
+        anyhow::bail!(
+            "config '{}' has no `type: mcp` action to lock",
+            config_path.display()
+        );
+    }
+    Ok(found)
+}
+
+/// Discover the live tool catalogue for one mcp action.
+///
+/// Compiles the action exactly as boot does and refreshes through the
+/// same federation handle, so what gets pinned is what the gateway would
+/// advertise: the same namespacing, the same collision handling, the
+/// same OpenAPI-derived and stdio-backed tools. Reimplementing discovery
+/// here would produce a baseline for a catalogue nobody serves.
+///
+/// No listener is bound. This is the property `verify-lock` needs to run
+/// in CI.
+///
+/// The versioning gate is dropped for the discovery compile, and that is
+/// load bearing twice over. A `mode: block` gate filters tools it judges
+/// in violation, so regenerating a baseline through a live gate would
+/// drop exactly the tools whose contracts moved: the operator runs
+/// `mcp lock` to accept a change and gets a lockfile with the changed
+/// tool missing, which then reads as a removal. It also stops `mcp lock`
+/// printing `lockfile unreadable; gate fails open` on the very run whose
+/// job is to create that file.
+fn discover_mcp_tools(
+    site: &McpActionSite,
+) -> anyhow::Result<Vec<sbproxy_extension::mcp::federation::FederatedTool>> {
+    let mut config = (*site.config).clone();
+    config.tool_versioning = None;
+    let action = sbproxy_modules::action::mcp::McpAction::from_parsed(config)
+        .map_err(|error| anyhow::anyhow!("compile mcp action at {}: {error}", site.location))?;
+    let federation = std::sync::Arc::clone(&action.federation);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build discovery runtime: {error}"))?;
+    runtime.block_on(async move {
+        federation
+            .refresh_tools()
+            .await
+            .map_err(|error| anyhow::anyhow!("discover tools: {error}"))?;
+        Ok(federation.list_tools())
+    })
+}
+
+/// The declared-version table for an action, parsed to semver.
+fn declared_versions(
+    site: &McpActionSite,
+) -> anyhow::Result<std::collections::HashMap<String, semver::Version>> {
+    let mut out = std::collections::HashMap::new();
+    let Some(versioning) = site.config.tool_versioning.as_ref() else {
+        return Ok(out);
+    };
+    for (tool, raw) in &versioning.declared_versions {
+        let parsed = semver::Version::parse(raw).map_err(|error| {
+            anyhow::anyhow!(
+                "tool_versioning.declared_versions['{tool}'] at {} is not semver: {error}",
+                site.location
+            )
+        })?;
+        out.insert(tool.clone(), parsed);
+    }
+    Ok(out)
+}
+
+/// Where an action's baseline is written.
+///
+/// The action's own `tool_versioning.lockfile` is the answer whenever it
+/// has one, because that is the file the running gate reads. Writing
+/// anywhere else would produce a baseline the gate never loads, which
+/// looks like success and changes nothing.
+///
+/// The path is used exactly as written, with no rebasing onto the config
+/// directory, because the gate resolves it against the process working
+/// directory (`std::fs::read_to_string(&gate.lockfile_path)` at refresh
+/// time). Resolving it here against the config instead would put the
+/// file where the gate does not look whenever the two directories differ,
+/// which is the precise failure this function exists to avoid and would
+/// still report success.
+fn mcp_lockfile_path(
+    site: &McpActionSite,
+    out: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(out) = out {
+        return Ok(out.to_path_buf());
+    }
+    if let Some(configured) = site
+        .config
+        .tool_versioning
+        .as_ref()
+        .and_then(|v| v.lockfile.as_deref())
+        .filter(|p| !p.is_empty())
+    {
+        return Ok(PathBuf::from(configured));
+    }
+    anyhow::bail!(
+        "the mcp action at {} has no tool_versioning.lockfile; add one, or pass --out to choose \
+         a path",
+        site.location
+    )
+}
+
+/// The server label a generated baseline records.
+///
+/// The federated upstreams, sorted, rather than the gateway's own name.
+/// A baseline is a statement about what those upstreams advertised, so
+/// an operator reading a stale lockfile can see which set it covered.
+fn generated_for_label(site: &McpActionSite) -> String {
+    let mut names: Vec<&str> = site
+        .config
+        .federated_servers
+        .iter()
+        .map(|s| s.origin.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(", ")
+}
+
+#[derive(serde::Serialize)]
+struct McpLockRow {
+    tool: String,
+    semver: String,
+    contract_digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct McpLockOutput {
+    schema_version: u32,
+    command: &'static str,
+    path: PathBuf,
+    action: String,
+    generated_for: String,
+    tools: Vec<McpLockRow>,
+}
+
+fn handle_mcp_lock(
+    args: &McpLockArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let sites = mcp_action_sites(config_path)?;
+    if args.out.is_some() && sites.len() > 1 {
+        anyhow::bail!(
+            "--out names one file but this config has {} mcp actions ({}); drop --out to write \
+             each action's configured tool_versioning.lockfile",
+            sites.len(),
+            sites
+                .iter()
+                .map(|s| s.location.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let mut outputs = Vec::new();
+    for site in &sites {
+        let path = mcp_lockfile_path(site, args.out.as_deref())?;
+        let declared = declared_versions(site)?;
+        let tools = discover_mcp_tools(site)?;
+        if tools.is_empty() {
+            anyhow::bail!(
+                "the mcp action at {} advertised no tools; refusing to write an empty baseline, \
+                 which would pin nothing and pass every check",
+                site.location
+            );
+        }
+        let generated_for = generated_for_label(site);
+        let lockfile = sbproxy_extension::mcp::compat::build_lockfile(
+            generated_for.clone(),
+            &tools,
+            &declared,
+        );
+        let yaml = lockfile
+            .to_yaml()
+            .map_err(|error| anyhow::anyhow!("serialize lockfile: {error}"))?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                anyhow::anyhow!("create lockfile directory '{}': {error}", parent.display())
+            })?;
+        }
+        std::fs::write(&path, &yaml)
+            .map_err(|error| anyhow::anyhow!("write lockfile '{}': {error}", path.display()))?;
+        outputs.push(McpLockOutput {
+            schema_version: 1,
+            command: "mcp.lock",
+            path,
+            action: site.location.clone(),
+            generated_for,
+            tools: lockfile
+                .tools
+                .iter()
+                .map(|(tool, lock)| McpLockRow {
+                    tool: tool.clone(),
+                    semver: lock.semver.to_string(),
+                    contract_digest: lock.contract_digest.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&outputs)?),
+        OutputFormat::Text => {
+            for output in &outputs {
+                for row in &output.tools {
+                    println!("{} {} ({})", row.tool, row.semver, row.contract_digest);
+                }
+                println!(
+                    "wrote {} ({} tools from {})",
+                    output.path.display(),
+                    output.tools.len(),
+                    output.generated_for
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
+#[derive(serde::Serialize)]
+struct McpVerifyLockRow {
+    tool: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct McpVerifyLockOutput {
+    schema_version: u32,
+    command: &'static str,
+    lockfile: PathBuf,
+    action: String,
+    drift: usize,
+    tools: Vec<McpVerifyLockRow>,
+}
+
+fn handle_mcp_verify_lock(
+    args: &McpVerifyLockArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let sites = mcp_action_sites(config_path)?;
+    if args.lockfile.is_some() && sites.len() > 1 {
+        anyhow::bail!(
+            "--lockfile names one file but this config has {} mcp actions; drop it to check each \
+             action against its configured tool_versioning.lockfile",
+            sites.len()
+        );
+    }
+
+    let mut outputs = Vec::new();
+    let mut stale = 0usize;
+    for site in &sites {
+        let path = mcp_lockfile_path(site, args.lockfile.as_deref())?;
+        let yaml = std::fs::read_to_string(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "read lockfile '{}': {error}; run `sbproxy mcp lock` to create it",
+                path.display()
+            )
+        })?;
+        let baseline = sbproxy_extension::mcp::compat::Lockfile::from_yaml(&yaml)
+            .map_err(|error| anyhow::anyhow!("parse lockfile '{}': {error}", path.display()))?;
+        let tools = discover_mcp_tools(site)?;
+        let drift = sbproxy_extension::mcp::compat::diff_lockfile(&baseline, &tools);
+        stale += drift.iter().filter(|d| d.is_stale()).count();
+        outputs.push(McpVerifyLockOutput {
+            schema_version: 1,
+            command: "mcp.verify-lock",
+            lockfile: path,
+            action: site.location.clone(),
+            drift: drift.iter().filter(|d| d.is_stale()).count(),
+            tools: drift
+                .iter()
+                .map(|d| McpVerifyLockRow {
+                    tool: d.tool().to_string(),
+                    status: d.kind(),
+                    detail: match d {
+                        sbproxy_extension::mcp::compat::Drift::Changed { from, to, .. } => {
+                            Some(format!("{from} -> {to}"))
+                        }
+                        sbproxy_extension::mcp::compat::Drift::UnknownScheme { digest, .. } => {
+                            Some(format!(
+                                "digest scheme not implemented by this build: {digest}"
+                            ))
+                        }
+                        _ => None,
+                    },
+                })
+                .collect(),
+        });
+    }
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&outputs)?),
+        OutputFormat::Text => {
+            for output in &outputs {
+                for row in &output.tools {
+                    match &row.detail {
+                        Some(detail) => println!("{} {} ({detail})", row.tool, row.status),
+                        None => println!("{} {}", row.tool, row.status),
+                    }
+                }
+                if output.drift == 0 {
+                    println!("{} matches the live catalogue", output.lockfile.display());
+                } else {
+                    println!(
+                        "{} is stale: {} tool(s) drifted; run `sbproxy mcp lock` after reviewing",
+                        output.lockfile.display(),
+                        output.drift
+                    );
+                }
+            }
+        }
+    }
+    // Exit 2 on drift, matching `models verify-lock`, so CI fails on a
+    // baseline that no longer describes what is served.
+    Ok(if stale == 0 { 0 } else { 2 })
 }
 
 // --- `--locked` serve-time lockfile enforcement (WOR-1864) ---

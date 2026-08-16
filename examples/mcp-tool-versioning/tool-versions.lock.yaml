@@ -1,12 +1,16 @@
-# Committed baseline. One digest and declared semver per advertised
-# tool; the embedded contract lets the gateway grade changes
-# structurally instead of only detecting them.
+# Committed baseline, as written by `sbproxy mcp lock`. One digest and
+# declared semver per advertised tool; the embedded contract lets the
+# gateway grade changes structurally instead of only detecting them.
+#
+# Regenerate with `sbproxy mcp lock -f sb.yml` after reviewing an
+# upstream change, and check it in CI with `sbproxy mcp verify-lock`,
+# which exits 2 on drift.
 version: 1
 generated_for: mcp.example.com
 tools:
   search:
     semver: "1.0.0"
-    contract_digest: "sha256:56d47fc4c5280f5723d3e355c8149bc402abd636d3c6bebb979b93abaecce0db"
+    contract_digest: "mcp-contract-v2-sha256:9aaf5ff606591ef611788a262874bbe58aa57d39e751c10527aa894d984cb47e"
     contract:
       name: search
       description: search public repositories

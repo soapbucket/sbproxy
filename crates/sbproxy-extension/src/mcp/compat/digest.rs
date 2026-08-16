@@ -150,6 +150,44 @@ pub fn contract_of(tool: &crate::mcp::federation::FederatedTool) -> Value {
     })
 }
 
+/// The contract a fresh baseline pins a live tool at, under the v2 scheme.
+///
+/// [`contract_of`] is the frozen legacy projection and carries only the
+/// three fields [`FederatedTool`] itself has. A tool whose upstream
+/// document survived federation intact carries the whole thing on
+/// `contract`, including the `outputSchema` and `annotations` that the
+/// v2 recipe grades, so a baseline generated from the legacy projection
+/// would pin less than the gate compares.
+///
+/// A tool with no strict contract (an `inputSchema` that is not an
+/// object, which the modern wire does not admit) keeps the legacy
+/// projection rather than dropping out of the baseline entirely. Being
+/// pinned on three fields beats not being pinned at all.
+///
+/// This is the generator's half of the single-owner rule in
+/// [`contract_of`], and the gate's v2 branch resolves through here too,
+/// so `sbproxy mcp lock` and the running gate cannot construct
+/// different contracts for the same tool (WOR-2443).
+///
+/// [`FederatedTool`]: crate::mcp::federation::FederatedTool
+pub fn baseline_contract_v2(tool: &crate::mcp::federation::FederatedTool) -> Value {
+    tool.contract.as_ref().map_or_else(
+        || contract_of(tool),
+        crate::mcp::protocol::contracts::McpToolContract::as_value,
+    )
+}
+
+/// The contract and digest a fresh v2 baseline pins `tool` at.
+///
+/// One call so a generator cannot pair a contract from one recipe with a
+/// digest from another. The embedded contract is what lets a later
+/// change be graded structurally instead of only detected.
+pub fn baseline_entry_v2(tool: &crate::mcp::federation::FederatedTool) -> (Value, String) {
+    let contract = baseline_contract_v2(tool);
+    let digest = contract_digest_v2(&contract);
+    (contract, digest)
+}
+
 /// Project a tool value down to its contract fields, dropping everything else.
 fn project_contract(tool: &Value) -> Value {
     project_fields(tool, &CONTRACT_FIELDS)
@@ -266,10 +304,26 @@ mod tests {
             let contract = lock.contract.as_ref().unwrap_or_else(|| {
                 panic!("example tool `{name}` must embed its contract so this can be checked")
             });
+            // Digest under the scheme the entry declares, not a fixed
+            // one. Hardcoding v1 here would keep passing after the entry
+            // moved to v2, because it would be checking a recipe the
+            // gate no longer applies to that entry: a test that still
+            // goes green while measuring the wrong thing.
+            let expected = if is_contract_digest_v2(&lock.contract_digest) {
+                contract_digest_v2(contract)
+            } else if is_contract_digest_v1(&lock.contract_digest) {
+                contract_digest(contract)
+            } else {
+                panic!(
+                    "example tool `{name}` declares digest scheme `{}`, which no recipe here \
+                     implements",
+                    lock.contract_digest
+                )
+            };
             assert_eq!(
-                contract_digest(contract),
-                lock.contract_digest,
-                "example tool `{name}` has a digest the gate would not compute; regenerate it"
+                expected, lock.contract_digest,
+                "example tool `{name}` has a digest the gate would not compute; regenerate it \
+                 with `sbproxy mcp lock`"
             );
         }
     }

@@ -227,6 +227,27 @@ more than missing code because it is trusted.
   there indefinitely. This review found a `type: cel` block in
   `headless-detection.md` using a `response_headers:` key with no
   implementation, anywhere, ever.
+  The way to check is cheap and worth doing every time: assemble the
+  excerpts into one complete config and run `sbproxy validate` against
+  it. Read the output rather than the exit status, because a config that
+  parses but cannot construct its modules reports
+  `compiled, but a module failed to construct` and still exits 0.
+  Writing the three security pages, that command found six errors a
+  careful manual pass had already missed, including two required fields
+  and a detector name that does not exist.
+- **Does a documented field parse but do something else?** The failure
+  above the one people look for. A key can be accepted, warned about at
+  load, and then quietly do less than the doc says. `dlp` takes
+  `direction: response` and logs that response-side scanning is not
+  implemented before scanning the request anyway, so a page describing
+  it as an outbound control is wrong in the way that matters, and no
+  key-existence check catches it. Grep the module for `not implemented`
+  and for load-time warnings before describing what a field does.
+- **Do metric names in prose match the registry exactly?** PromQL is
+  literal, so a counter written without its `_total` suffix hands the
+  reader a query that matches nothing. This review found
+  `sbproxy_ai_wasted_tokens` in `key-management.md` where the family is
+  `sbproxy_ai_wasted_tokens_total`.
 - **Did a change turn a known gap into a promise?** The most expensive
   doc bug in this class. Extending a doc to say a feature "works on both
   paths" when one path is a no-op in release builds converts an
@@ -246,6 +267,20 @@ more than missing code because it is trusted.
   the only signal a reader has about staleness.
 - **US English, no em-dashes**, per the workspace convention. Fix the
   source string for anything generated rather than the generated page.
+
+Two traps worth knowing before you automate any of this.
+
+The generated JSON schema does not validate module config. Policy and
+action bodies are free-form there, so a schema check passes on field
+names that do not exist and gives false confidence in exactly the
+category where the mistakes are. Check module fields against the struct
+or against a swept example instead.
+
+And a doc that names something which does not exist is sometimes correct
+on purpose. `observability.md` and `ai-crawl-control.md` each name a
+metric that was never emitted, because each sentence is telling the
+reader it is not there. A checker will flag both. Read the sentence
+before you fix it.
 
 Worth stating plainly: a doc correction found while reviewing unrelated
 code is worth making and worth calling out in the PR, not silently
