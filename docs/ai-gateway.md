@@ -842,9 +842,9 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `reranking` | `body["query"]` |
 | `moderations` | `body["input"]` |
 
-A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. A request whose inbound `Content-Type` starts with `multipart/` bypasses the built-in input check, because its body is forwarded byte-transparently and never parsed as JSON. Built-in output scanning for those requests is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
+A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. A request whose inbound `Content-Type` starts with `multipart/` bypasses the built-in input check on the surfaces that actually accept multipart bodies (image edits, image variations, audio transcription, audio translation, file uploads, and any request the proxy cannot classify), because its body is forwarded byte-transparently and never parsed as JSON; see [Multipart bodies](#multipart-bodies) below for which surfaces those are and what happens on the rest. Built-in output scanning for those requests is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
 
-That gate keys on the `Content-Type` and not on the classified surface, which is worth reading twice. Image edits, image variations, and audio transcription are the surfaces that legitimately send multipart, but nothing stops a caller putting a multipart `Content-Type` on `/v1/chat/completions` and taking the same path. Each bypassed check increments `sbproxy_ai_multipart_inspection_skipped_total`, labeled by `check` (`input_guardrails` or `pii_redaction`) and by `surface`, so a skipped guardrail shows up on a dashboard instead of looking exactly like a clean request. Traffic on `audio_transcription` is the expected shape. A nonzero rate on a JSON surface is somebody routing around your guardrails, and it is worth an alert.
+A multipart `Content-Type` on a classified JSON surface such as `chat_completions` or `embeddings` does not take that path. `AiSurface::accepts_multipart` is the allowlist, and a multipart `Content-Type` on any surface it excludes is refused with `403` and a `security_audit` entry (`multipart_disallowed_surface`; see [audit-log.md](audit-log.md)) before any budget check, guardrail, or upstream dispatch runs. Each bypassed check on a surface the allowlist does permit still increments `sbproxy_ai_multipart_inspection_skipped_total`, labeled by `check` (`input_guardrails` or `pii_redaction`) and by `surface`; that counter can no longer fire for `chat_completions` or any other disallowed surface, since those requests are refused before reaching it. It now means legitimate multipart surfaces that skipped body inspection, and a nonzero rate on `audio_transcription` or `image_edits` is expected traffic, not a bypass attempt.
 
 ### Gateway-side retrieval (RAG)
 
@@ -1767,25 +1767,34 @@ these methods is not implemented yet.
 
 ### Multipart bodies
 
-Image edits, image variations, audio transcription, and audio translation send
-multipart request bodies. The proxy detects multipart from the inbound
-`Content-Type`; when it starts with `multipart/`, the body is forwarded with
-that Content-Type preserved. The detection is on the Content-Type alone, so any
-surface can end up on this path, not only the four above. A governed key's model
-policy is checked against the bounded `model` part, and `route_to_model` or a
-budget downgrade rewrites only that part. A required model with no interpretable
-model part fails closed. Because the gateway cannot safely apply JSON PII
-redaction to arbitrary multipart bytes, a credential with
-`require_pii_redaction` is rejected before idempotency, cache, or provider
-dispatch.
+Image edits, image variations, audio transcription, audio translation, and file
+uploads send multipart request bodies; a request the proxy cannot classify also
+takes this path. `AiSurface::accepts_multipart` is the allowlist for all of
+these, and it is checked against the classified surface, not only against the
+inbound `Content-Type`. The proxy still detects multipart from the inbound
+`Content-Type`; when it starts with `multipart/` on one of the allowed
+surfaces, the body is forwarded with that Content-Type preserved. A multipart
+`Content-Type` on any other classified surface, such as `chat_completions` or
+`embeddings`, is a caller relabeling a JSON surface to route around body
+inspection, and it is refused with `403` before this branch runs, along with a
+`security_audit` entry (`multipart_disallowed_surface`); see
+[audit-log.md](audit-log.md). A governed key's model policy is checked against
+the bounded `model` part, and `route_to_model` or a budget downgrade rewrites
+only that part. A required model with no interpretable model part fails closed.
+Because the gateway cannot safely apply JSON PII redaction to arbitrary
+multipart bytes, a credential with `require_pii_redaction` is rejected before
+idempotency, cache, or provider dispatch.
 
 Everything downstream of the JSON parse is skipped for these requests: the
 built-in input guardrails, origin-level `pii:` request redaction, body-aware
 `prompt_injection_v2` scanning, and the AI policy plane. Only the
 credential-level `require_pii_redaction` gate above rejects; the rest are
 permitted and counted under
-`sbproxy_ai_multipart_inspection_skipped_total`. Scan that counter before you
-assume a configured guardrail covers your upload traffic.
+`sbproxy_ai_multipart_inspection_skipped_total`. The counter now means
+legitimate multipart surfaces that skipped body inspection: it can no longer
+fire for `chat_completions` or any other classified JSON surface, since those
+requests are refused before reaching it. Scan the counter before you assume a
+configured guardrail covers your upload traffic.
 
 Provider *request* translation does not run for multipart, so the inbound bytes
 reach the provider unchanged. The response is still translated and rewrapped

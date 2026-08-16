@@ -7,15 +7,23 @@ a good place to enforce things the service behind it might have forgotten. This
 page is the map: what the gateway is responsible for, what it is not, and where
 to read next.
 
-There are three surfaces worth keeping separate in your head, because they fail
+There are four surfaces worth keeping separate in your head, because they fail
 differently and the controls do not transfer.
 
-## The three surfaces
+## The four surfaces
 
 **Your API traffic.** Ordinary request and response governance: who is calling,
 what they may reach, how much of it, and what comes back. Most of this is
 familiar and most of it is solved by putting a policy in the path.
 [api-security.md](api-security.md).
+
+**Your AI model traffic.** Prompts, completions, and the spend attached to
+them. The payload is conversation, the cost is metered per token, and the
+provider on the other end is somebody else's computer. The controls that
+matter are guardrails in the request path, budget enforcement that actually
+denies, an inventory of every provider endpoint reached, and telemetry that
+does not leak the traffic it audits.
+[ai-gateway-security-coverage.md](ai-gateway-security-coverage.md).
 
 **Your MCP and agent traffic.** Different, and harder, because the payload is
 partly instruction. A tool description reaches a model that treats it as
@@ -25,7 +33,7 @@ authorization of the call. [mcp-security.md](mcp-security.md).
 **The proxy itself.** Its own attack surface, the assumptions it makes, and the
 trust boundaries it draws. [threat-model.md](threat-model.md).
 
-Separately from all three: reporting a vulnerability in SBproxy, verifying a
+Separately from all four: reporting a vulnerability in SBproxy, verifying a
 release signature, and checking build provenance live in
 [`SECURITY.md`](../SECURITY.md) at the repository root.
 
@@ -60,6 +68,45 @@ consequences. Neither is detection, and the docs say so wherever the distinction
 matters, because a control you believe in that does not work is worse than a
 gap you have written down.
 
+## AI traffic, in brief
+
+The coverage page carries the row-by-row detail, including an honest mapping
+against the OWASP LLM Top 10 (2026 edition). The short version:
+
+Request and response bodies run through configured guardrails, and a verdict on
+a streamed response must equal the verdict the same bytes would get buffered
+whole; a streaming mode that cannot keep that promise is refused at config
+compile rather than approximated. A multipart Content-Type on a JSON-only AI
+surface, chat completions for example, is refused outright, so a caller cannot
+relabel a request past body inspection. [guardrails.md](guardrails.md),
+[ai-gateway.md](ai-gateway.md).
+
+The `pii:` block redacts AI request and response bodies. The `dlp` policy scans
+URI and headers only and never masks. They cover different surfaces and should
+not be confused. [prompt-injection-v2.md](prompt-injection-v2.md) states the
+detector's limits plainly: the default is a substring heuristic, and no
+detection model ships in the binary.
+
+Budgets deny at the cap across seven scopes, and denial of wallet is treated as
+enforcement rather than observation. Counters are per replica unless a shared
+store is configured, and when that store fails, enforcement degrades to
+per-instance tracking with a metric and a warning rather than silence.
+[ai-gateway.md](ai-gateway.md#budgets).
+
+Every provider endpoint the gateway reaches is recorded with its authorization
+status, allowed, denied, or ungated, and is readable at `GET /api/egress`.
+Outbound dials pass a default-deny, DNS-pinned egress authorizer.
+
+Serving-path request budgets key by tenant, and a panicking tenant policy now
+denies that one request instead of crashing the process. Neither changes the
+recommendation in [multi-tenant.md](multi-tenant.md): mutually untrusting
+tenants get one process per trust boundary.
+
+Prompt-linked audit records carry salted digests and lengths, never content.
+Security refusals and, when opted in, config changes append to hash-chained,
+signed files that `sbproxy audit verify --channel` checks offline.
+[audit-log.md](audit-log.md).
+
 ## Defaults worth knowing
 
 A few behaviors are on without configuration, which is usually what you want but
@@ -68,11 +115,16 @@ occasionally surprising.
 Upstreams that resolve to private address space are refused unless allowed, so
 an SSRF attempt against cloud metadata does not leave the gateway.
 
+A multipart body on a JSON-only AI surface is refused before any budget,
+guardrail, or upstream work happens, and the refusal emits a security audit
+record.
+
 MCP catalogs are scanned on every refresh for text that conceals content from a
 reader and for static poisoning indicators. Both report; neither blocks.
 
 Redaction runs before observability fan-out, so a value redacted from a response
-does not reappear in a log or a trace.
+does not reappear in a log or a trace. Prompt-linked audit lines carry digests,
+not content.
 
 Denials emit structured security audit records with stable event types and
 closed reason labels, and never carry the offending header value.
@@ -85,27 +137,33 @@ Per-upstream certificate pinning is not implemented. TLS uses standard chain
 validation. If your threat model requires pinning a specific key for a specific
 upstream, that is not available here today.
 
-There is no lockfile generator for MCP tool versioning yet, so the baseline that
-feature reads is hand-assembled. The recipe is documented and tested, but the
-ergonomics are rough. [tool-versioning.md](tool-versioning.md).
+`sbproxy mcp lock` generates the MCP tool-versioning baseline from the live
+catalog, and `sbproxy mcp verify-lock` diffs against it and exits nonzero on
+drift. Wiring `verify-lock` into your own CI, so drift actually blocks a
+merge, is still on you. [tool-versioning.md](tool-versioning.md).
 
 Unsanctioned MCP servers are addressed by architecture rather than by a feature.
 If agent egress is required to traverse the gateway, an unapproved server is one
 that egress policy refuses. If it is not required, the gateway never sees it.
+
+GET and multipart AI surfaces do not debit token budgets, and DLP does not read
+request bodies. Both limits are stated in the coverage page's rows rather than
+smoothed over.
 
 ## Reading order
 
 If you are securing a deployment for the first time:
 
 1. [threat-model.md](threat-model.md), to see the assumptions you are inheriting.
-2. [api-security.md](api-security.md) or [mcp-security.md](mcp-security.md),
+2. [api-security.md](api-security.md), [mcp-security.md](mcp-security.md), or
+   [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md),
    depending on what you are putting behind it.
 3. [audit-log.md](audit-log.md), because the controls are worth much less
    without somewhere to send what they record.
 4. [`SECURITY.md`](../SECURITY.md), for release verification and how to report
    something.
 
-If you are responding to a security review, the two topic pages are written to
+If you are responding to a security review, the topic pages are written to
 be handed over directly. Each threat class states what the gateway does, the
 configuration that does it, and what remains yours. The last part is there so
 the review is with you rather than about you.

@@ -223,7 +223,7 @@ fn sustained_throttle_promotes_to_auto_suspend() {
         .iter()
         .find(|e| e["action"] == "rate_limit_suspend" && e["target_kind"] == "workspace")
         .unwrap_or_else(|| panic!("expected rate_limit_suspend audit row, got {arr:?}"));
-    assert_eq!(suspend_row["target_id"], "default");
+    assert_eq!(suspend_row["target_id"], "__default__");
     assert!(
         suspend_row["reason"]
             .as_str()
@@ -247,7 +247,7 @@ fn sustained_throttle_promotes_to_auto_suspend() {
     // 1 rps regardless of the workspace plan.
     let plan = admin_get(
         admin_port,
-        "/api/rate_limits/effective?workspace=default",
+        "/api/rate_limits/effective?workspace=__default__",
         "admin",
         "rl-budget",
     );
@@ -280,7 +280,7 @@ fn auto_suspend_cooldown_returns_to_normal() {
     // Confirm we are suspended.
     let plan_before = admin_get(
         admin_port,
-        "/api/rate_limits/effective?workspace=default",
+        "/api/rate_limits/effective?workspace=__default__",
         "admin",
         "rl-budget",
     );
@@ -304,7 +304,7 @@ fn auto_suspend_cooldown_returns_to_normal() {
     // step down from suspend, NOT all the way back to `Soft`).
     let plan_after = admin_get(
         admin_port,
-        "/api/rate_limits/effective?workspace=default",
+        "/api/rate_limits/effective?workspace=__default__",
         "admin",
         "rl-budget",
     );

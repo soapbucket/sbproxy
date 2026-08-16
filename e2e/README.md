@@ -89,12 +89,12 @@ cargo test -p sbproxy-e2e --locked --test settlement_gate -- --test-threads=1
 
 ## What is covered
 
-135 test files grouped by feature family. Run
+190 test files grouped by feature family. Run
 `ls tests/ | grep <prefix>` for the full list inside a family.
 
 | Family | Tests | Example scenarios |
 |---|---|---|
-| AI gateway (`ai_*`) | 16 | Provider routing, fallback / cascade / cost-optimized / lowest-latency, streaming, virtual keys, guardrails, budgets, context relay, model rate limits, OpenAI / Anthropic / Bedrock / Gemini direct |
+| AI gateway (`ai_*`) | 17 | Provider routing, fallback / cascade / cost-optimized / lowest-latency, streaming, virtual keys, guardrails, budgets, context relay, model rate limits, OpenAI / Anthropic / Bedrock / Gemini direct, security policy pack (multipart refusal on JSON surfaces, tenant-keyed workspace budgets) |
 | AI surface matrix (`matrix_*`) | 2 | Every (provider × surface) cell from `provider_supports_surface` returns the expected pass / 501 verdict end-to-end |
 | Policies (`policy_*` + named) | 13 | CEL expression, WAF + OWASP CRS, CSRF, IP filter, content-shape, AP2, exposed_credentials, openapi_validation, object_authz BOLA / BFLA, content_digest, agent_budget, semantic_constraint |
 | Auth (`auth_*` + `api_key_*`, `basic_auth_*`, `bearer_*`, `jwt_*`, `oidc_*`, `forward_auth_*`, `dpop_*`, `bot_auth_*`) | 12 | API key, basic, bearer (+ DPoP-bound + mTLS-bound), JWT (JWKS + introspection), forward_auth subrequest, OIDC RP login + session cookie, Web Bot Auth signed-request verification + key-directory refresh |

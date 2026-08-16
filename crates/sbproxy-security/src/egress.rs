@@ -654,10 +654,256 @@ pub fn record_egress_refused(
     );
 }
 
+/// Outcome recorded for one observed egress destination.
+///
+/// [`Self::Ungated`] covers a purpose reached with no [`EgressAuthorizer`]
+/// gating it (or authorization skipped); a later [`Self::Allowed`] or
+/// [`Self::Denied`] sighting for the same `(purpose, host, port)`, once
+/// an authorizer is configured, overwrites the status recorded here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressSightingStatus {
+    /// A configured [`EgressAuthorizer`] allowed this destination.
+    Allowed,
+    /// A configured [`EgressAuthorizer`] denied this destination.
+    Denied,
+    /// No authorizer gated this destination for this purpose.
+    Ungated,
+}
+
+impl EgressSightingStatus {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Ungated => "ungated",
+        }
+    }
+}
+
+/// One process-lifetime-bounded inventory entry: an upstream destination
+/// the gateway reached (or attempted to reach) for a given purpose.
+///
+/// Fields are deliberately narrow: `host`/`port`/`scheme` are the only
+/// URL-derived data ever stored. The parsed [`Url`] itself (which can
+/// carry userinfo and a query string) never enters this struct or the
+/// inventory behind it, matching the label discipline in
+/// [`record_egress_refused`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EgressSighting {
+    /// Purpose label (see [`EgressPurpose::as_label`]).
+    pub purpose: &'static str,
+    /// Destination host, or `"unparseable"` when the recorded URL failed
+    /// to parse or carried no host component.
+    pub host: String,
+    /// Destination port, or `0` when the recorded URL failed to parse.
+    pub port: u16,
+    /// Destination scheme, or `"unparseable"` when the recorded URL
+    /// failed to parse.
+    pub scheme: String,
+    /// Most recent status recorded for this destination.
+    pub status: &'static str,
+    /// Most recent denial reason, set when the most recent sighting was
+    /// [`EgressSightingStatus::Denied`].
+    pub last_reason: Option<&'static str>,
+    /// Caller-supplied, configuration-scoped attribution (an origin id,
+    /// provider name, or sink name), never a request-scoped value.
+    pub origin: String,
+    /// Unix milliseconds of the first sighting of this destination.
+    pub first_seen_unix_ms: u64,
+    /// Unix milliseconds of the most recent sighting of this destination.
+    pub last_seen_unix_ms: u64,
+    /// Count of sightings recorded as [`EgressSightingStatus::Allowed`]
+    /// or [`EgressSightingStatus::Ungated`].
+    pub allowed_count: u64,
+    /// Count of sightings recorded as [`EgressSightingStatus::Denied`].
+    pub denied_count: u64,
+}
+
+/// Mutable inventory state for one `(purpose, host, port)` key. Kept
+/// separate from [`EgressSighting`] so the key's own fields are not
+/// duplicated inside the map's values.
+#[derive(Debug, Clone)]
+struct EgressSightingInner {
+    scheme: String,
+    status: &'static str,
+    last_reason: Option<&'static str>,
+    origin: String,
+    first_seen_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    allowed_count: u64,
+    denied_count: u64,
+}
+
+/// Entry ceiling for the egress sightings inventory.
+///
+/// Unlike [`RESOLVER_CACHE_MAX_ENTRIES`], reaching this cap does not
+/// clear the map: the inventory exists to answer "what has this process
+/// ever reached", so wiping it on saturation would erase the exact
+/// history an operator is trying to audit. Instead a new key is dropped
+/// once the map is full, a `saturated` warning fires once per process,
+/// and every already-tracked destination keeps updating normally.
+const EGRESS_INVENTORY_MAX_ENTRIES: usize = 1024;
+
+type EgressInventory = HashMap<(EgressPurpose, String, u16), EgressSightingInner>;
+
+fn egress_inventory() -> &'static std::sync::Mutex<EgressInventory> {
+    static INVENTORY: std::sync::OnceLock<std::sync::Mutex<EgressInventory>> =
+        std::sync::OnceLock::new();
+    INVENTORY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Latches true the first time the inventory refuses a new key, so the
+/// saturation warning logs once per process rather than once per call.
+fn egress_inventory_saturated() -> &'static std::sync::atomic::AtomicBool {
+    static SATURATED: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+        std::sync::OnceLock::new();
+    SATURATED.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record one observed egress destination in the process-wide inventory.
+///
+/// `url` is parsed only for its `host`/`port`/`scheme`; the parsed
+/// [`Url`] is never stored, so a URL carrying userinfo or a query string
+/// leaves neither in the inventory. A `url` that fails to parse, or
+/// parses without a host, is recorded under host `"unparseable"` and
+/// port `0` rather than dropped, so a malformed destination still shows
+/// up as a signal instead of disappearing silently.
+///
+/// `status` sets the sighting's status on this call, so the latest call
+/// always wins: a later [`EgressSightingStatus::Allowed`] or
+/// [`EgressSightingStatus::Denied`] from a configured
+/// [`EgressAuthorizer`] overwrites a prior
+/// [`EgressSightingStatus::Ungated`] sighting for the same destination.
+/// [`EgressSightingStatus::Allowed`] and [`EgressSightingStatus::Ungated`]
+/// both increment `allowed_count`; [`EgressSightingStatus::Denied`]
+/// increments `denied_count` and stores `reason`'s label. The map is
+/// capped at 1024 entries; once full, a new `(purpose, host, port)` key
+/// is dropped rather than recorded, and a `saturated` warning is logged
+/// once per process.
+pub fn record_egress_seen(
+    purpose: EgressPurpose,
+    url: &str,
+    origin: &str,
+    status: EgressSightingStatus,
+    reason: Option<EgressDenied>,
+) {
+    let (host, port, scheme) = match Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unparseable").to_string();
+            let port = parsed.port_or_known_default().unwrap_or(0);
+            (host, port, parsed.scheme().to_string())
+        }
+        Err(_) => ("unparseable".to_string(), 0u16, "unparseable".to_string()),
+    };
+    let now_ms = now_unix_ms();
+    let status_label = status.as_label();
+    let reason_label = reason.map(EgressDenied::as_label);
+    let origin = origin.to_string();
+    let key = (purpose, host, port);
+
+    let mut inventory = match egress_inventory().lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    if !inventory.contains_key(&key) && inventory.len() >= EGRESS_INVENTORY_MAX_ENTRIES {
+        if !egress_inventory_saturated().swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "sbproxy::egress",
+                max_entries = EGRESS_INVENTORY_MAX_ENTRIES,
+                "egress sightings inventory is full; new destinations are no longer recorded"
+            );
+        }
+        return;
+    }
+
+    let entry = inventory.entry(key).or_insert_with(|| EgressSightingInner {
+        scheme: String::new(),
+        status: status_label,
+        last_reason: None,
+        origin: String::new(),
+        first_seen_unix_ms: now_ms,
+        last_seen_unix_ms: now_ms,
+        allowed_count: 0,
+        denied_count: 0,
+    });
+
+    entry.scheme = scheme;
+    entry.status = status_label;
+    entry.last_reason = reason_label;
+    entry.origin = origin;
+    entry.last_seen_unix_ms = now_ms;
+    match status {
+        EgressSightingStatus::Allowed | EgressSightingStatus::Ungated => {
+            entry.allowed_count += 1;
+        }
+        EgressSightingStatus::Denied => {
+            entry.denied_count += 1;
+        }
+    }
+}
+
+/// Snapshot the process-wide egress sightings inventory.
+///
+/// Sorted by `(purpose, host, port)` so repeated calls against an
+/// unchanged inventory return the same order.
+pub fn egress_inventory_snapshot() -> Vec<EgressSighting> {
+    let inventory = match egress_inventory().lock() {
+        Ok(guard) => guard,
+        Err(_) => return Vec::new(),
+    };
+    let mut sightings: Vec<EgressSighting> = inventory
+        .iter()
+        .map(|((purpose, host, port), inner)| EgressSighting {
+            purpose: purpose.as_label(),
+            host: host.clone(),
+            port: *port,
+            scheme: inner.scheme.clone(),
+            status: inner.status,
+            last_reason: inner.last_reason,
+            origin: inner.origin.clone(),
+            first_seen_unix_ms: inner.first_seen_unix_ms,
+            last_seen_unix_ms: inner.last_seen_unix_ms,
+            allowed_count: inner.allowed_count,
+            denied_count: inner.denied_count,
+        })
+        .collect();
+    sightings.sort_by(|a, b| {
+        (a.purpose, a.host.as_str(), a.port).cmp(&(b.purpose, b.host.as_str(), b.port))
+    });
+    sightings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// Serializes every test below that touches the process-global
+    /// egress sightings inventory, so they behave deterministically
+    /// whether the runner isolates each test in its own process
+    /// (nextest) or shares one process across threads (`cargo test`).
+    fn test_state_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Clears the global inventory and saturation latch. Callers must
+    /// hold [`test_state_lock`] first.
+    fn reset_egress_inventory() {
+        if let Ok(mut inventory) = egress_inventory().lock() {
+            inventory.clear();
+        }
+        egress_inventory_saturated().store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 
     struct MapResolver {
         map: HashMap<String, Vec<SocketAddr>>,
@@ -1108,5 +1354,223 @@ mod tests {
             )
             .expect_err("private IP must be denied unless allow_private");
         assert_eq!(err, EgressDenied::PrivateAddress);
+    }
+
+    #[test]
+    fn egress_seen_records_a_single_sighting_with_counts() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_egress_inventory();
+
+        record_egress_seen(
+            EgressPurpose::AiProvider,
+            "https://api.openai.com/v1/chat",
+            "openai",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+
+        let snapshot = egress_inventory_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        let sighting = &snapshot[0];
+        assert_eq!(sighting.purpose, EgressPurpose::AiProvider.as_label());
+        assert_eq!(sighting.host, "api.openai.com");
+        assert_eq!(sighting.port, 443);
+        assert_eq!(sighting.scheme, "https");
+        assert_eq!(sighting.status, "allowed");
+        assert_eq!(sighting.last_reason, None);
+        assert_eq!(sighting.origin, "openai");
+        assert_eq!(sighting.allowed_count, 1);
+        assert_eq!(sighting.denied_count, 0);
+        assert!(sighting.first_seen_unix_ms > 0);
+        assert_eq!(sighting.first_seen_unix_ms, sighting.last_seen_unix_ms);
+    }
+
+    #[test]
+    fn ungated_then_denied_flips_status_and_keeps_counts() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_egress_inventory();
+
+        record_egress_seen(
+            EgressPurpose::McpUpstream,
+            "https://mcp.example/tool",
+            "mcp",
+            EgressSightingStatus::Ungated,
+            None,
+        );
+        record_egress_seen(
+            EgressPurpose::McpUpstream,
+            "https://mcp.example/tool",
+            "mcp",
+            EgressSightingStatus::Denied,
+            Some(EgressDenied::UnlistedHost),
+        );
+
+        let snapshot = egress_inventory_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        let sighting = &snapshot[0];
+        assert_eq!(sighting.status, "denied", "the latest call's status wins");
+        assert_eq!(
+            sighting.last_reason,
+            Some(EgressDenied::UnlistedHost.as_label())
+        );
+        assert_eq!(
+            sighting.allowed_count, 1,
+            "the earlier ungated sighting's count is kept"
+        );
+        assert_eq!(sighting.denied_count, 1);
+    }
+
+    #[test]
+    fn cap_refuses_a_new_key_once_full_without_panicking() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_egress_inventory();
+
+        for i in 0..EGRESS_INVENTORY_MAX_ENTRIES {
+            let url = format!("https://host-{i}.example/");
+            record_egress_seen(
+                EgressPurpose::Webhook,
+                &url,
+                "cap-test",
+                EgressSightingStatus::Allowed,
+                None,
+            );
+        }
+        assert_eq!(
+            egress_inventory_snapshot().len(),
+            EGRESS_INVENTORY_MAX_ENTRIES
+        );
+
+        // A new key past the cap must be dropped, not panic.
+        record_egress_seen(
+            EgressPurpose::Webhook,
+            "https://host-overflow.example/",
+            "cap-test",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+        let snapshot = egress_inventory_snapshot();
+        assert_eq!(
+            snapshot.len(),
+            EGRESS_INVENTORY_MAX_ENTRIES,
+            "a new key past the cap must be dropped, not inserted"
+        );
+        assert!(
+            !snapshot.iter().any(|s| s.host == "host-overflow.example"),
+            "the dropped key must not appear in the snapshot"
+        );
+
+        // An already-tracked key must still update past the cap.
+        record_egress_seen(
+            EgressPurpose::Webhook,
+            "https://host-0.example/",
+            "cap-test",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+        let updated = egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.host == "host-0.example")
+            .expect("existing key must still be present");
+        assert_eq!(
+            updated.allowed_count, 2,
+            "an existing key keeps updating past the cap"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_sorted_by_purpose_host_port() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_egress_inventory();
+
+        record_egress_seen(
+            EgressPurpose::Webhook,
+            "https://b.example/",
+            "order-test",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+        record_egress_seen(
+            EgressPurpose::Webhook,
+            "https://a.example/",
+            "order-test",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+        record_egress_seen(
+            EgressPurpose::AiProvider,
+            "https://z.example/",
+            "order-test",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+
+        let snapshot = egress_inventory_snapshot();
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot[0].purpose, "ai_provider");
+        assert_eq!(snapshot[0].host, "z.example");
+        assert_eq!(snapshot[1].purpose, "webhook");
+        assert_eq!(snapshot[1].host, "a.example");
+        assert_eq!(snapshot[2].purpose, "webhook");
+        assert_eq!(snapshot[2].host, "b.example");
+    }
+
+    #[test]
+    fn unparseable_url_is_recorded_under_a_fixed_placeholder_host() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_egress_inventory();
+
+        record_egress_seen(
+            EgressPurpose::AiJudge,
+            "not a url",
+            "judge",
+            EgressSightingStatus::Ungated,
+            None,
+        );
+
+        let snapshot = egress_inventory_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].host, "unparseable");
+        assert_eq!(snapshot[0].port, 0);
+        assert_eq!(snapshot[0].scheme, "unparseable");
+    }
+
+    #[test]
+    fn serialized_sighting_never_carries_userinfo_or_query() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_egress_inventory();
+
+        record_egress_seen(
+            EgressPurpose::TokenExchange,
+            "https://svc-user:s3cr3t-token@auth.example:8443/oauth/token?client_secret=topsecret&scope=all",
+            "token-exchange",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+
+        let snapshot = egress_inventory_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].host, "auth.example");
+        assert_eq!(snapshot[0].port, 8443);
+        assert_eq!(snapshot[0].scheme, "https");
+
+        let serialized = serde_json::to_string(&snapshot[0]).expect("sighting serializes");
+        assert!(
+            !serialized.contains("s3cr3t-token"),
+            "no credential: {serialized}"
+        );
+        assert!(
+            !serialized.contains("svc-user"),
+            "no credential: {serialized}"
+        );
+        assert!(
+            !serialized.contains("client_secret"),
+            "no query: {serialized}"
+        );
+        assert!(!serialized.contains("topsecret"), "no query: {serialized}");
+        assert!(!serialized.contains("scope=all"), "no query: {serialized}");
+        assert!(
+            !serialized.contains("/oauth/token"),
+            "no full URL: {serialized}"
+        );
     }
 }

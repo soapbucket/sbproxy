@@ -117,6 +117,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
 - [security.md](security.md) - the security map: what the gateway enforces, what stays with your services, and which gaps are real.
 - [api-security.md](api-security.md) - API threat classes and the policy configuration for each, from object-level authorization to bot traffic.
+- [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - what the gateway enforces against the OWASP LLM Top 10 (2026) and the gateway-layer control set, with coverage stated as full, partial, or out of scope.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
 - [events.md](events.md) - the eleven typed events, the `events:` file and webhook sinks, and the in-process bus.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.

@@ -1,12 +1,12 @@
-# OWASP-LLM-01 official-style injection corpus.
+# OWASP LLM Top 10 2026, LLM01 official-style injection corpus.
 #
 # Sources (paraphrased from public material; the corpus paraphrases
 # the originals so the heuristic detector exercises both exact pattern
 # hits and near-miss phrasings the classifier should catch):
 #
-# - OWASP Top 10 for LLM Applications, LLM01 (Prompt Injection):
+# - OWASP LLM Top 10 2026, LLM01 (Prompt Injection):
 #   https://owasp.org/www-project-top-10-for-large-language-model-applications/
-# - OWASP LLM01 example payloads index:
+# - OWASP LLM Top 10 2026, LLM01 example payloads index:
 #   https://genai.owasp.org/llmrisk/llm01-prompt-injection/
 # - PROMPTBENCH (Microsoft Research):
 #   https://github.com/microsoft/promptbench

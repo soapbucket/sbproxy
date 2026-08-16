@@ -1896,6 +1896,68 @@ pub fn record_key_store_reachable(posture: &'static str) {
     set_key_store_unavailable(posture, 0);
 }
 
+/// Shared-budget reads/writes that could not reach the Redis/KV store and
+/// fell open to the per-instance tracker. Fired at the exact branch where
+/// the store error is still distinguishable from "no shared store
+/// configured" (budget_share.rs). WOR-2474.
+pub fn record_budget_share_fail_open(op: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_budget_share_fail_open_total",
+            "Shared budget store operations that failed and fell open to per-instance enforcement, by operation",
+            &["op"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[op]).inc();
+    }
+    set_budget_share_unavailable(1);
+}
+
+/// 1 while the last shared-budget store operation failed, 0 once one
+/// succeeds. Clears on any successful read or write, so it reports the
+/// store's reachability, not the staleness of the TTL cache. WOR-2474.
+pub fn set_budget_share_unavailable(state: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<IntGauge>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_budget_share_unavailable",
+            "1 while shared budget enforcement is degraded to per-instance tracking, 0 when the shared store answered",
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge {
+        gauge.set(state);
+    }
+}
+
+/// A policy enforcer panicked and the panic was contained to a 500 deny
+/// instead of crashing the proxy. Label is the enforcer's policy type,
+/// a closed set. WOR-2477.
+pub fn record_policy_panic(policy: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_policy_panic_total",
+            "Policy enforcer panics contained on the serving path, by policy type",
+            &["policy"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let policy = sanitize_label("policy", policy);
+        counter.with_label_values(&[policy.as_str()]).inc();
+    }
+}
+
 /// Record drop counters returned by the capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,
@@ -6882,6 +6944,63 @@ mod tests {
                 .iter()
                 .any(|(labels, _)| labels.contains("posture=degraded")),
             "the previous posture's series survived a posture change: {reloaded:?}"
+        );
+    }
+
+    /// Both halves of the budget-share degradation pair, in one test on
+    /// purpose, the same reason `key_store_outage_is_counted...` covers its
+    /// pair together: they share one process-global gauge.
+    ///
+    /// Three claims:
+    ///
+    /// 1. `record_budget_share_fail_open` counts on
+    ///    `sbproxy_budget_share_fail_open_total{op}` and carries the `op`
+    ///    label.
+    /// 2. It also raises `sbproxy_budget_share_unavailable` to 1.
+    /// 3. `set_budget_share_unavailable(0)` drops the gauge back to 0 once a
+    ///    shared-store operation succeeds again.
+    #[test]
+    fn budget_share_fail_open_is_counted_and_its_unavailable_gauge_tracks_the_current_state() {
+        record_budget_share_fail_open("read");
+
+        let counted = gathered_series("sbproxy_budget_share_fail_open_total");
+        assert!(
+            counted
+                .iter()
+                .any(|(labels, value)| labels.contains("op=read") && *value >= 1.0),
+            "sbproxy_budget_share_fail_open_total did not register or did not carry \
+             the op label: {counted:?}"
+        );
+
+        let during = gathered_series("sbproxy_budget_share_unavailable");
+        assert_eq!(
+            during.first().map(|(_, value)| *value),
+            Some(1.0),
+            "the gauge did not go to 1 while the shared store was unreachable: {during:?}"
+        );
+
+        set_budget_share_unavailable(0);
+        let after = gathered_series("sbproxy_budget_share_unavailable");
+        assert_eq!(
+            after.first().map(|(_, value)| *value),
+            Some(0.0),
+            "the gauge did not fall back to 0 once a resolution succeeded: {after:?}"
+        );
+    }
+
+    /// A contained policy-enforcer panic is counted on
+    /// `sbproxy_policy_panic_total{policy}` and carries the policy label.
+    #[test]
+    fn policy_panic_is_counted_with_its_policy_label() {
+        record_policy_panic("budget_share");
+
+        let counted = gathered_series("sbproxy_policy_panic_total");
+        assert!(
+            counted
+                .iter()
+                .any(|(labels, value)| labels.contains("policy=budget_share") && *value >= 1.0),
+            "sbproxy_policy_panic_total did not register or did not carry \
+             the policy label: {counted:?}"
         );
     }
 }

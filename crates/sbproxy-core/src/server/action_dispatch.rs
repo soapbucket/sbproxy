@@ -3645,11 +3645,17 @@ pub(super) async fn handle_mcp_action(
 
                                 // WOR-508: capture the inputs for the
                                 // prompt-linked audit envelope before
-                                // `arguments` is moved into the call. Gated
-                                // on a subscriber being interested in the
-                                // `mcp_audit` target (the enterprise audit
-                                // layer), so an OSS-only deployment pays no
-                                // clone.
+                                // `arguments` is moved into the call.
+                                // WOR-2473: this `tracing::enabled!` check
+                                // is true under stock config; the default
+                                // root filter is `info` and there is no
+                                // per-target directive suppressing
+                                // `mcp_audit`, so this clone is paid by
+                                // default on every deployment, not only
+                                // ones with an enterprise subscriber
+                                // attached. The fields built from it and
+                                // emitted below are digests and lengths,
+                                // never verbatim content.
                                 let mcp_audit_capture = if tracing::enabled!(
                                     target: "mcp_audit",
                                     tracing::Level::INFO
@@ -4234,9 +4240,16 @@ struct LedgerCapture {
 /// comes off `ctx`; payload redaction happens inside `emit_tool_call`.
 /// WOR-508: inputs captured before `arguments` is moved into the tool
 /// call, used by the enterprise audit layer to build the prompt-linked
-/// audit envelope. Only populated when a subscriber is listening on
-/// the `mcp_audit` tracing target, so an OSS-only deployment pays no
-/// clone.
+/// audit envelope.
+/// WOR-2473: the `mcp_audit` line this feeds IS emitted under stock
+/// config; the default root filter is `info` and there is no
+/// per-target directive suppressing it, so this capture happens on
+/// every deployment, not only ones with an enterprise subscriber
+/// attached. Because of that, the emission built from this capture
+/// carries digests and lengths only, never verbatim prompt or tool
+/// argument content. Verbatim content is a future explicit opt-in
+/// owned by the MCP evidence work (WOR-2384), not something this
+/// capture ships by default.
 struct McpAuditCapture {
     /// Canonical JSON of the tool arguments (the enterprise side
     /// digests this; the raw value never leaves the process).
@@ -4251,13 +4264,16 @@ struct McpAuditCapture {
 }
 
 /// WOR-508: emit a structured event on the `mcp_audit` tracing target
-/// carrying the inputs the enterprise audit layer needs to build an
-/// `McpPromptLinkedAudit` envelope (the prompt that caused the call,
-/// linked to the call). The OSS proxy cannot depend on the enterprise
-/// audit crate, so the bridge is a tracing event; with no subscriber
-/// the event is dropped at near-zero cost. The enterprise layer
-/// digests the arguments and PII-redacts the prompt excerpt before it
-/// reaches the hash-chained audit log.
+/// carrying the prompt-linked tool-call fields an audit subscriber
+/// needs to correlate a call with the prompt that caused it. The OSS
+/// proxy cannot depend on the enterprise audit crate, so the bridge is
+/// a tracing event.
+/// WOR-2473: this line is emitted under stock config, so the prompt
+/// and tool arguments are represented here only as a SHA-256 digest
+/// prefix and a length; the raw values never reach this event.
+/// Verbatim content for a downstream audit envelope is a future
+/// explicit opt-in owned by the MCP evidence work (WOR-2384), not
+/// something this event carries today.
 fn emit_mcp_prompt_audit(
     ctx: &RequestContext,
     tool_name: &str,
@@ -4283,6 +4299,11 @@ fn emit_mcp_prompt_audit(
     // that exfiltrates a credential pasted into a prompt.
     let tool_arguments = bound_mcp_audit_field(&cap.args_json);
     let prompt = bound_mcp_audit_field(&cap.prompt);
+    // WOR-2473: this line is emitted under stock config (default root
+    // filter is `info`, no per-target directive needed to see it), so
+    // it must never carry the raw prompt or raw tool arguments. Ship
+    // a digest and a length instead; verbatim content is a future
+    // explicit opt-in owned by the MCP evidence work (WOR-2384).
     tracing::info!(
         target: "mcp_audit",
         workspace_id = %ctx.tenant_id,
@@ -4291,12 +4312,43 @@ fn emit_mcp_prompt_audit(
         human_sponsor = %ctx.principal.sub,
         mcp_server = %cap.server,
         tool_name = %tool_name,
-        tool_arguments = %tool_arguments,
-        prompt = %prompt,
+        tool_arguments_sha256 = %sha256_hex_prefix(&tool_arguments),
+        tool_arguments_len = tool_arguments.len(),
+        prompt_sha256 = %sha256_hex_prefix(&prompt),
+        prompt_len = prompt.len(),
         upstream_status = upstream_status,
         duration_ms = cap.started.elapsed().as_millis() as u64,
         "mcp prompt-linked tool-call audit",
     );
+}
+
+/// Process-lifetime random salt for [`sha256_hex_prefix`], generated
+/// once on first use via the same RNG idiom
+/// `sbproxy_ai::prompt_fingerprint`'s `pf_` salt uses
+/// (`rand::random::<u128>()` behind a `OnceLock`). Kept local to this
+/// module rather than importing that crate's salt because it is a
+/// private helper there, not a shared export.
+fn mcp_audit_salt() -> &'static [u8; 16] {
+    static SALT: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| rand::random::<u128>().to_le_bytes())
+}
+
+/// WOR-2473: first 16 hex characters (64 bits) of the salted SHA-256
+/// digest of `value`, used to fingerprint `mcp_audit` content fields
+/// without shipping the content itself. The digest is keyed with a
+/// per-process random salt (see [`mcp_audit_salt`]), the same scheme
+/// `sbproxy_ai::prompt_fingerprint`'s `pf_` value uses: the same value
+/// digests identically within one process lifetime, but the digest is
+/// not a usable partial preimage of a guessable short prompt or
+/// tool-argument payload, and it cannot be matched against a digest
+/// computed in a different process or deployment.
+fn sha256_hex_prefix(value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(mcp_audit_salt());
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(digest)[..16].to_string()
 }
 
 /// Upper bound on one mcp_audit content field, matching the capture
@@ -5293,7 +5345,10 @@ async fn mcp_apply_tool_output_quarantine(
 
 #[cfg(test)]
 mod mcp_audit_redaction_tests {
-    use super::{bound_mcp_audit_field, MCP_AUDIT_FIELD_MAX_BYTES};
+    use super::{
+        bound_mcp_audit_field, emit_mcp_prompt_audit, sha256_hex_prefix, McpAuditCapture,
+        MCP_AUDIT_FIELD_MAX_BYTES,
+    };
 
     #[test]
     fn a_planted_secret_never_survives_into_the_audit_field() {
@@ -5312,6 +5367,110 @@ mod mcp_audit_redaction_tests {
         assert!(bounded.len() <= MCP_AUDIT_FIELD_MAX_BYTES + "...[truncated]".len());
         assert!(bounded.ends_with("...[truncated]"));
         assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    /// Collects the `mcp_audit` event's fields as text so the test can
+    /// assert on what actually crossed the tracing boundary, the same
+    /// technique `admin.rs`'s audit-log tests use: the emitted line is
+    /// the product here, not a side effect of one.
+    struct CaptureLayer {
+        sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut line = format!("{} ", event.metadata().target());
+            event.record(&mut FieldText(&mut line));
+            self.sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line);
+        }
+    }
+
+    struct FieldText<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldText<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value} ", field.name());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    /// WOR-2473: the `mcp_audit` line is emitted under stock config, so
+    /// it must never carry the raw prompt or raw tool arguments. This
+    /// pins the actual emitted fields, not just the `sha256_hex_prefix`
+    /// helper in isolation: it proves the call site was rewired to use
+    /// digests and lengths, not just that a digest helper exists.
+    #[test]
+    fn emitted_line_carries_digests_and_lengths_never_raw_content() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let prompt = "the human asked the agent to list files in the scratch workspace";
+        let tool_arguments = r#"{"path":"/workspace/scratch","recursive":true}"#;
+        // Neither string trips secret redaction or the size cap, so
+        // `bound_mcp_audit_field` is the identity here and the digest
+        // computed directly over these literals is the digest the
+        // emission must carry.
+        let expected_prompt_digest = sha256_hex_prefix(prompt);
+        let expected_args_digest = sha256_hex_prefix(tool_arguments);
+
+        let ctx = crate::context::RequestContext::new();
+        let cap = McpAuditCapture {
+            args_json: tool_arguments.to_string(),
+            prompt: prompt.to_string(),
+            server: "test-server".to_string(),
+            started: std::time::Instant::now(),
+        };
+
+        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = logged.clone();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer { sink });
+        tracing::subscriber::with_default(subscriber, || {
+            emit_mcp_prompt_audit(&ctx, "list_files", cap, &Ok(serde_json::json!({})));
+        });
+
+        let lines = logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("mcp_audit "))
+            .unwrap_or_else(|| panic!("no mcp_audit line was emitted: {lines:?}"));
+
+        assert!(
+            !line.contains(prompt),
+            "mcp_audit must not ship the raw prompt: {line}"
+        );
+        assert!(
+            !line.contains(tool_arguments),
+            "mcp_audit must not ship the raw tool arguments: {line}"
+        );
+        assert!(
+            line.contains(&expected_prompt_digest),
+            "mcp_audit must carry the prompt digest: {line}"
+        );
+        assert!(
+            line.contains(&expected_args_digest),
+            "mcp_audit must carry the tool_arguments digest: {line}"
+        );
+        assert!(
+            line.contains(&format!("prompt_len={}", prompt.len())),
+            "mcp_audit must carry the prompt length: {line}"
+        );
+        assert!(
+            line.contains(&format!("tool_arguments_len={}", tool_arguments.len())),
+            "mcp_audit must carry the tool_arguments length: {line}"
+        );
     }
 }
 

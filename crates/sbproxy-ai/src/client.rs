@@ -405,11 +405,45 @@ impl AiClient {
     /// production call site today, so the live resolver costs nothing
     /// until an operator turns egress on.
     fn gate_provider_url(&self, url: &str, provider_name: &str) -> Result<()> {
-        self.authorize_provider_url(url, &CachedSystemResolver)
-            .map_err(|e| {
+        use sbproxy_security::egress::{record_egress_seen, EgressSightingStatus};
+        // WOR-2476: every provider endpoint this client touches lands in
+        // the egress inventory, whether an authorizer is configured or
+        // not. "Ungated" is the honest status when no authorizer is
+        // attached; without it the report would claim "allowed" for
+        // endpoints nothing ever approved.
+        if self.egress.is_none() {
+            record_egress_seen(
+                EgressPurpose::AiProvider,
+                url,
+                provider_name,
+                EgressSightingStatus::Ungated,
+                None,
+            );
+            return Ok(());
+        }
+        match self.authorize_provider_url(url, &CachedSystemResolver) {
+            Ok(()) => {
+                record_egress_seen(
+                    EgressPurpose::AiProvider,
+                    url,
+                    provider_name,
+                    EgressSightingStatus::Allowed,
+                    None,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                record_egress_seen(
+                    EgressPurpose::AiProvider,
+                    url,
+                    provider_name,
+                    EgressSightingStatus::Denied,
+                    Some(e),
+                );
                 record_egress_refused(EgressPurpose::AiProvider, e, "unset", provider_name);
-                anyhow::anyhow!("egress denied: {e:?}")
-            })
+                Err(anyhow::anyhow!("egress denied: {e:?}"))
+            }
+        }
     }
 
     /// Send one already-built provider request under the governed
@@ -4339,6 +4373,27 @@ mod tests {
                 .unwrap_err(),
             EgressDenied::UnlistedHost
         );
+    }
+
+    #[test]
+    fn ungated_provider_url_is_recorded_in_the_egress_inventory() {
+        // WOR-2476: a client with no authorizer attached must still stamp
+        // the destination into the egress inventory, with an honest
+        // "ungated" status rather than silently skipping the record.
+        use sbproxy_security::egress::egress_inventory_snapshot;
+        let client = AiClient::new();
+        client
+            .gate_provider_url(
+                "http://ungated-sighting-test.invalid:9099/v1",
+                "test-provider",
+            )
+            .expect("no authorizer attached; gate must not deny");
+        let snapshot = egress_inventory_snapshot();
+        let sighting = snapshot
+            .iter()
+            .find(|s| s.host == "ungated-sighting-test.invalid")
+            .expect("ungated sighting must be present in the inventory");
+        assert_eq!(sighting.status, "ungated");
     }
 
     /// One-shot loopback fixture that serves `response` verbatim to the

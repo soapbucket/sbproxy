@@ -372,6 +372,15 @@ pub struct AuditConfig {
     /// must be present. Required when `sink: chain`; refused otherwise.
     #[serde(default)]
     pub sign_with: Option<String>,
+    /// Optional path where `config_audit` events are chained. Opt-in; when
+    /// absent, `config_audit` remains a tracing stream and is not durably
+    /// recorded, preserving exactly the old behavior. Requires `sink: chain`.
+    /// Must differ from `path` because the two audit event types (config and
+    /// security) have different payload formats and verify independently.
+    /// `key_audit` is deliberately not chainable yet, since its before/after
+    /// diff contents require a separate contents-based ruling first.
+    #[serde(default)]
+    pub config_path: Option<String>,
 }
 
 /// Accepted audit sink names.
@@ -402,8 +411,9 @@ pub enum AuditSinkKind {
     /// Append every `security_audit` event to a SHA-256 hash-chained,
     /// Ed25519-signed file at `path`, signed by the identity `sign_with`
     /// names. Editing or removing a record breaks the chain, and
-    /// `sbproxy audit verify` re-derives it from genesis. `config_audit`
-    /// and `key_audit` are not chained yet.
+    /// `sbproxy audit verify` re-derives it from genesis. When `config_path`
+    /// is set, `config_audit` events chain to that file; `key_audit` is not
+    /// chained yet.
     Chain,
 }
 

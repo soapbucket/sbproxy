@@ -91,6 +91,14 @@ the next version cut.
   refusals and upstream auth failures were one value and are now
   distinguishable; dashboards keyed on `outcome="auth_denied"` need
   updating. Usage rollups keep the legacy mapping.
+- **Single-tenant traffic now reports workspace `__default__`, not
+  `default`.** The rate-limit budget enforcer's workspace label on
+  `sbproxy_rate_limit_total` and `sbproxy_rate_limit_decisions_total`,
+  and the `target_id` on the matching rate-limit audit records, moved
+  to the synthetic `__default__` tenant name used elsewhere in the
+  multi-tenant work. Budget behavior is unchanged; only the label
+  value moved. Dashboards or alerts matching `workspace="default"`
+  need updating to `workspace="__default__"`.
 - **Meter receipts now fold extra attempts under `billable.retry: collapse`.**
   Provider fallback and HTTP origin retries previously billed only the
   final attempt as `delivered`, so the `retry` outcome never ran. Extra

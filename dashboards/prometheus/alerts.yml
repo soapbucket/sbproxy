@@ -223,3 +223,12 @@ groups:
         annotations:
           summary: "OCSP staple for {{ $labels.host }} is stale"
           description: "The cached OCSP staple for {{ $labels.host }} is {{ $value | humanizeDuration }} old against a 12h refresh cadence. The refresh loop is failing or dead; clients keep accepting the old staple only until it expires."
+
+      - alert: SBProxyBudgetEnforcementDegraded
+        expr: increase(sbproxy_budget_share_fail_open_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cluster budget enforcement degraded to per-instance tracking"
+          description: "The shared budget store failed {{ $value }} operations in 5m. Each replica is enforcing its own cap, so N replicas admit roughly N times the configured budget until the store recovers. Fail-open is by design; invisibility is not."

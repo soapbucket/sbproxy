@@ -28,7 +28,7 @@ Protect your endpoints with 10 built-in authentication types: API Keys, Basic Au
 
 ### Security & Guardrails
 A built-in Web Application Firewall (WAF) screens requests before they hit your upstream. It ships a curated, CRS-derived baseline of 16 rules: 4 built-in patterns plus a 12-rule managed bundle with CRS-style IDs and paranoia levels. The rule set extends through a signed remote rule feed, verified with HMAC-SHA256, cached on disk, and rejected when older than a configured staleness bound, and repeat offenders can be blocked persistently through strike-based blocking. Both corpora are independent flags and neither implies the other: `owasp_crs.enabled: true` gives you the 4 built-in patterns, and `owasp_crs.managed_bundle: true` adds the 12-rule bundle. Operators who need full OWASP CRS coverage (anomaly scoring, transformation pipelines, body processors) should put ModSecurity, Coraza, or a CDN WAF in front and keep SBproxy's WAF as a baseline layer. [WAF options](waf-options.md) records why there is no SecLang engine in the dataplane, and gives the recipes for running one in front, publishing your own rules through the signed feed, and layering the policies already in the binary. SBproxy also mitigates DDoS attacks and HTTP request smuggling, and enforces token-bucket rate limiting.
-* **Docs:** [WAF Options](waf-options.md), [Threat Model](threat-model.md), [Exposed Credentials](exposed-credentials.md), [Security Model Host](security-model-host.md)
+* **Docs:** [WAF Options](waf-options.md), [Threat Model](threat-model.md), [Exposed Credentials](exposed-credentials.md), [Security Model Host](security-model-host.md), [AI Gateway Security Coverage](ai-gateway-security-coverage.md), [Security Overview](security.md)
 * **Examples:** [WAF](../examples/waf/), [Layered WAF](../examples/waf-layered/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/), [CSRF](../examples/csrf/), [Defense in Depth](../examples/defense-in-depth/), [DLP Catalog](../examples/dlp-catalog/), [HSTS](../examples/hsts/), [Page Shield](../examples/page-shield/), [Security Headers](../examples/security-headers/), [SRI](../examples/sri/), [Request Limit](../examples/request-limit/)
 
 ### Scripting & Custom Transforms
@@ -64,7 +64,7 @@ Enforce hard or soft budgets on AI spend by workspace, user, or key. Soft-landin
 
 ### Guardrails & Policy
 Apply input/output guardrails using local classifiers or external APIs to detect toxicity, jailbreaks, and PII. You can use the Guardrail Mesh to fuse multiple safety verdicts and write complex rules with the AI CEL policy plane.
-* **Docs:** [Guardrails](guardrails.md), [AI Guardrail Mesh](ai-guardrail-mesh.md), [AI Policy CEL](ai-policy-cel.md), [Prompt Injection](prompt-injection-v2.md), [Classifier Sidecar](classifier-sidecar.md)
+* **Docs:** [Guardrails](guardrails.md), [AI Guardrail Mesh](ai-guardrail-mesh.md), [AI Policy CEL](ai-policy-cel.md), [Prompt Injection](prompt-injection-v2.md), [Classifier Sidecar](classifier-sidecar.md), [AI Gateway Security Coverage](ai-gateway-security-coverage.md)
 * **Examples:** [AI Guardrails](../examples/ai-guardrails/), [AI Safety Classifiers](../examples/ai-safety-classifiers/), [AI Regex DLP](../examples/ai-regex-dlp/)
 
 ### Context Compression & Caching

@@ -105,7 +105,10 @@ impl RequestEventSink for LoggingSink {
         // unlikely event it returns Err we simply skip the log line
         // rather than panicking on the request hot path.
         match serde_json::to_string(&event) {
-            Ok(json) => tracing::info!(target: "request_event", "{}", json),
+            Ok(json) => {
+                let line = crate::logging::redact_json_line(&json);
+                tracing::info!(target: "request_event", "{}", line)
+            }
             Err(e) => tracing::warn!(
                 target: "request_event",
                 error = %e,
@@ -177,7 +180,8 @@ impl FileEventSink {
                     for event in batch.drain(..) {
                         match serde_json::to_string(&event) {
                             Ok(line) => {
-                                if writeln!(writer, "{line}").is_err() {
+                                let redacted_line = crate::logging::redact_json_line(&line);
+                                if writeln!(writer, "{redacted_line}").is_err() {
                                     crate::metrics::record_telemetry_dropped(
                                         DROP_KIND,
                                         "write_error",
@@ -560,5 +564,58 @@ mod tests {
         let after = dropped_total("writer_stopped");
 
         assert_eq!(after - before, 1);
+    }
+
+    #[test]
+    fn request_event_sink_redacts_secrets_in_properties() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("request-events.ndjson");
+
+        let mut event = sample_event();
+        // Add a Bearer token to the properties map, which should be redacted
+        event.properties.insert(
+            "x".to_string(),
+            "Bearer sk-abc123def456ghi789jkl012".to_string(),
+        );
+
+        let sink = FileEventSink::create(&path).expect("file sink opens");
+        sink.publish(event);
+        drop(sink);
+
+        let written = std::fs::read_to_string(&path).expect("read back the ndjson");
+        assert!(!written.is_empty(), "file should not be empty");
+
+        // The line should not contain the unredacted token
+        assert!(
+            !written.contains("sk-abc123def456ghi789jkl012"),
+            "token should not appear in output: {}",
+            written
+        );
+
+        // Verify the line is still valid JSON (redaction should preserve structure)
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 1, "expected one line in output");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("output should be valid JSON");
+
+        // The properties should still exist but the value should be redacted
+        let properties = parsed
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties should exist and be an object");
+
+        assert!(
+            properties.contains_key("x"),
+            "properties should still have the x key"
+        );
+
+        // The value should be redacted (not the original token)
+        let value = properties.get("x").expect("x key should exist");
+        assert_ne!(
+            value.as_str(),
+            Some("Bearer sk-abc123def456ghi789jkl012"),
+            "x value should be redacted"
+        );
     }
 }

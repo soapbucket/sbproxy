@@ -206,9 +206,13 @@ impl DecisionEvent {
             // cache.admit: proxy_http.rs, the response-side plan arm.
             // cache.key: request_phase.rs, the request-side plan arm.
             // route.decide: ai_dispatch.rs, the accepted-plan arm.
-            Self::CacheAdmit | Self::CacheKey | Self::RouteDecide => true,
-            Self::Auth
-            | Self::Policy
+            // auth: server.rs `record_auth_decision`, the single seam
+            // every one of the fourteen auth call sites goes through.
+            // That funnel is what makes this `true` honest: wiring some
+            // sites and not others would silence the startup warning
+            // while the feed still missed decisions (WOR-2446).
+            Self::CacheAdmit | Self::CacheKey | Self::RouteDecide | Self::Auth => true,
+            Self::Policy
             | Self::RateLimit
             | Self::Waf
             | Self::AiGuardrailInput
@@ -803,6 +807,21 @@ pub struct DecisionDetails {
     /// key. Zero means the policy ran and added nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vary_count: Option<usize>,
+    /// Which authentication method decided.
+    ///
+    /// The closed-ish set the `sbproxy_auth_results_total` metric
+    /// already labels by (`virtual_key`, `forward_auth`, `api_key`,
+    /// `bearer`, and the rest), so a rule can select "every forward-auth
+    /// refusal" as a term query and correlate it with the metric that
+    /// alerted.
+    ///
+    /// Deliberately the method and not the subject. A resolved principal
+    /// is the one field on this path that is attacker-influenced and
+    /// frequently personal, and `DecisionDetails` is the half of the
+    /// record that ships unredacted. Anything about who authenticated
+    /// belongs in the reason, which is scrubbed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<String>,
     /// Which policy decided, by its stable config identity.
     ///
     /// The field an analyst pivots on first: "every deny by the waf
@@ -837,6 +856,20 @@ pub struct DecisionDetails {
 }
 
 impl DecisionDetails {
+    /// Detail for an authentication decision.
+    ///
+    /// One field today, and that is the whole contract: the method.
+    /// Adding a second later is a breaking change for every rule
+    /// selecting on this record, so the bar for what goes in is whether
+    /// a rule can be written against it that stays true, not whether the
+    /// value happens to be available at the call site.
+    pub fn auth(auth_type: &str) -> Self {
+        Self {
+            auth_type: (!auth_type.is_empty()).then(|| auth_type.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Detail for a policy decision.
     ///
     /// The field set that lets `policy` records answer the questions
@@ -1215,9 +1248,16 @@ mod tests {
 
     #[test]
     fn every_wired_event_is_listed_here() {
-        // Pins the three emitters that exist. A removed call site whose
-        // arm was not flipped shows up here; an *added* one still needs
-        // a human to flip its arm, which is the drift this cannot see.
+        // Pins the emitters that exist. A removed call site whose arm
+        // was not flipped shows up here; an *added* one still needs a
+        // human to flip its arm, which is the drift this cannot see.
+        //
+        // `auth` is wired through a single seam in `sbproxy-core`
+        // (`record_auth_decision`) rather than at its fourteen
+        // individual decision points, and a test over there greps for
+        // anyone bypassing it. That pairing is what makes this entry
+        // honest: this list claims the feed is complete, and only a
+        // funnel can keep that claim true as arms are added.
         let wired: Vec<&str> = DecisionEvent::ALL
             .iter()
             .filter(|e| e.has_emitter())
@@ -1225,7 +1265,7 @@ mod tests {
             .collect();
         assert_eq!(
             wired,
-            vec!["cache.key", "cache.admit", "route.decide"],
+            vec!["auth", "cache.key", "cache.admit", "route.decide"],
             "the wired set changed; update has_emitter and the docs that state coverage"
         );
     }

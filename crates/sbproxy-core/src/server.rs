@@ -3548,6 +3548,103 @@ async fn check_forward_auth(
     }
 }
 
+/// Record one authentication decision, on every surface that carries it.
+///
+/// The single seam for the `auth` decision event (WOR-2446). It records
+/// the per-feature metric, the shared decision family, and the audit
+/// record, so the three cannot disagree about what was decided or drift
+/// as call sites are added.
+///
+/// # Why this replaced fourteen bare metric calls
+///
+/// `record_auth` had fourteen production call sites across the
+/// virtual-key, forward-auth, and native-key paths. Wiring the audit at
+/// some of them and not others would have been worse than leaving it
+/// unwired: `DecisionEvent::Auth::has_emitter()` gates the startup
+/// warning that currently tells an operator this feed is silent, so a
+/// partial wiring silences that warning while the feed is still missing
+/// every decision the untouched sites make. A detector has to be as wide
+/// as the thing it detects, so the metric and the audit are emitted
+/// together or not at all.
+///
+/// # Why `origin_label` is not the origin the record carries
+///
+/// Callers pass `ctx.hostname`, the request `Host`, which is what the
+/// existing `sbproxy_auth_results_total` metric has always labelled by.
+/// The decision family cannot use it. Under a wildcard origin every
+/// subdomain is a distinct label value, and `origin` is budgeted at 200
+/// across every family that uses it, so exhausting it here would demote
+/// every not-yet-seen origin to `__other__` on unrelated metrics for the
+/// life of the process. The record and the family both take the
+/// config-bounded `origin_id`, the same choice `PolicyVerdictCtx` makes
+/// and for the same reason.
+///
+/// A request that matched no origin has no `origin_id` and no
+/// per-origin audit scope to consult, so it records the metric and the
+/// family under the default origin and publishes no record. There is no
+/// configured origin whose block could have asked for one.
+pub(crate) fn record_auth_decision(
+    ctx: &RequestContext,
+    origin_label: &str,
+    auth_type: &str,
+    allowed: bool,
+    reason: &str,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    // The pre-existing per-feature metric, unchanged, still labelled by
+    // hostname so no dashboard or alert built on it moves.
+    sbproxy_observe::metrics::record_auth(origin_label, auth_type, allowed);
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let outcome = if allowed {
+        DecisionOutcome::Allow
+    } else {
+        DecisionOutcome::Deny
+    };
+    let origin_for_family = origin_id.as_deref().unwrap_or(DEFAULT_ORIGIN_LABEL);
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        outcome,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Auth,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        outcome,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        reason,
+        sbproxy_observe::decision::DecisionDetails::auth(auth_type),
+    );
+}
+
+/// Origin label for a decision made before any origin matched.
+///
+/// A closed constant rather than the empty string: the family's label
+/// budget treats an empty origin as the proxy-wide path, which would
+/// make "no origin matched" indistinguishable from "every origin".
+const DEFAULT_ORIGIN_LABEL: &str = "__unmatched__";
+
 /// Emit a `security_audit` entry for an authentication failure.
 /// Centralised so every Deny / Challenge / forward-auth-Err arm uses
 /// the same audit shape; the `event_type` argument differentiates
@@ -4188,13 +4285,22 @@ async fn check_policies(
         // and the dispatch future has to stay `Send`, which an `Entered`
         // held across the await would break.
         let enforce_span = sbproxy_observe::telemetry::policy_enforce_span(policy_id);
+        // WOR-2477: a panicking tenant policy used to crash the whole
+        // proxy, taking every other tenant with it. Contain it the way
+        // the transform-plugin runner already does
+        // (sbproxy-modules/src/transform/mod.rs) and fail just this one
+        // request closed. `ctx_any` is not read back on the panic arm
+        // below, so a partial mutation left behind by the unwound
+        // enforcer is never observed.
+        use futures::FutureExt as _;
         let enforced = tracing::Instrument::instrument(
-            compiled.enforcer.enforce(&req_snapshot, ctx_any),
+            std::panic::AssertUnwindSafe(compiled.enforcer.enforce(&req_snapshot, ctx_any))
+                .catch_unwind(),
             enforce_span,
         );
         let decision = match enforced.await {
-            Ok(d) => d,
-            Err(err) => {
+            Ok(Ok(d)) => d,
+            Ok(Err(err)) => {
                 // WOR-2423: a dynamic bundle hook running in the header
                 // phase declares the same `failure_posture` the buffered
                 // path already honors (WOR-2268); consulting it only on
@@ -4256,6 +4362,26 @@ async fn check_policies(
                 ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
                 ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
                 return Some((500, "policy error".to_string(), "plugin"));
+            }
+            Err(_panic) => {
+                // WOR-2477: unconditional fail-closed, unlike the
+                // `Ok(Err(err))` arm above. A returned `PluginError` is
+                // a policy the operator configured and can set a
+                // fail-open posture on; a panic is a bug in that
+                // policy's own code, so there is no posture to honor
+                // and no partial mutation of `ctx` left by the unwound
+                // future to trust. The counter makes a panicking policy
+                // visible in dashboards instead of only in logs.
+                sbproxy_observe::metrics::record_policy_panic(policy_id);
+                tracing::error!(
+                    target: "security_audit",
+                    policy = %policy_id,
+                    "policy enforcer panicked; request denied, proxy still serving"
+                );
+                sbproxy_plugin::PolicyDecision::Deny {
+                    status: 500,
+                    message: "policy enforcer panicked".to_string(),
+                }
             }
         };
         let translated = crate::policy_dispatch::translate_plugin_decision(
@@ -4373,9 +4499,21 @@ async fn check_buffered_dynamic_policies(
         let policy_id = compiled.enforcer.policy_type();
         let started = std::time::Instant::now();
         let ctx_any: &mut dyn std::any::Any = ctx;
-        let decision = match compiled.enforcer.enforce(&req_snapshot, ctx_any).await {
-            Ok(decision) => decision,
-            Err(error) => {
+        // WOR-2477: same containment as the header-phase dispatcher in
+        // `check_policies` above, applied here for the buffered-body
+        // seam. A panicking buffered dynamic policy used to crash the
+        // whole proxy exactly like the header-phase one did. `ctx_any`
+        // is not read back on the panic arm below, so a partial
+        // mutation left behind by the unwound enforcer is never
+        // observed.
+        use futures::FutureExt as _;
+        let enforce_result =
+            std::panic::AssertUnwindSafe(compiled.enforcer.enforce(&req_snapshot, ctx_any))
+                .catch_unwind()
+                .await;
+        let decision = match enforce_result {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(error)) => {
                 // The manifest posture decides this, not the host. A
                 // bundle that declares `failure_posture: open` is asking
                 // for its own breakage to be non-fatal, and denying
@@ -4439,6 +4577,23 @@ async fn check_buffered_dynamic_policies(
                 ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
                 ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
                 return Some((500, "policy error".to_string(), "plugin"));
+            }
+            Err(_panic) => {
+                // WOR-2477: unconditional fail-closed, unlike the
+                // `Ok(Err(error))` arm above, for the same reason as the
+                // header-phase dispatcher: a `failure_posture` is a
+                // manifest-declared response to a returned error, not a
+                // policy to honor when the policy's own code panicked.
+                sbproxy_observe::metrics::record_policy_panic(policy_id);
+                tracing::error!(
+                    target: "security_audit",
+                    policy = %policy_id,
+                    "policy enforcer panicked; request denied, proxy still serving"
+                );
+                sbproxy_plugin::PolicyDecision::Deny {
+                    status: 500,
+                    message: "policy enforcer panicked".to_string(),
+                }
             }
         };
         let translated = crate::policy_dispatch::translate_plugin_decision(
@@ -4855,3 +5010,213 @@ pub use lifecycle::*;
 
 #[cfg(test)]
 mod tests;
+
+/// WOR-2477: a panicking policy enforcer must be contained at both
+/// dispatch seams that call `PolicyEnforcer::enforce` (fail-closed 500,
+/// not a crashed proxy): the header-phase `check_policies` and the
+/// buffered-body-phase `check_buffered_dynamic_policies`. Kept as its
+/// own module, separate from `mod tests` above, so it stays
+/// self-contained inside this file.
+#[cfg(test)]
+mod wor_2477_panic_containment_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use pingora_core::protocols::l4::stream::Stream;
+    use sbproxy_config::{BundleBodyMode, BundleRuntime, FailureMode};
+    use sbproxy_modules::DynamicHookMetadata;
+    use sbproxy_observe::decision::DecisionEngine;
+    use sbproxy_observe::events::PolicySurface;
+    use sbproxy_plugin::{PluginResult, PolicyDecision, PolicyEnforcer};
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+    use crate::builtin_enforcers::CompiledEnforcer;
+
+    /// Stands in for a tenant policy with a real bug: every call
+    /// unwinds instead of returning a decision. The label is carried
+    /// per-instance so the header-phase and buffered-phase tests below
+    /// record on distinct `policy` series and can never race each
+    /// other's before/after counter snapshot.
+    struct PanickingEnforcer(&'static str);
+
+    impl PolicyEnforcer for PanickingEnforcer {
+        fn policy_type(&self) -> &str {
+            self.0
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<PolicyDecision>> + Send + '_>> {
+            Box::pin(async { panic!("simulated tenant policy bug (WOR-2477 test fixture)") })
+        }
+    }
+
+    /// Current value of `sbproxy_policy_panic_total{policy=<policy>}`,
+    /// 0.0 if the series has not been recorded yet. Mirrors the
+    /// `gathered_series` helper in `sbproxy_observe::metrics`'s own
+    /// tests, which this crate cannot reach directly since it is
+    /// private to that crate's test module.
+    fn panic_counter_value(policy: &str) -> f64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_policy_panic_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let matches = metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "policy" && pair.value() == policy);
+                if matches {
+                    return metric.get_counter().value();
+                }
+            }
+        }
+        0.0
+    }
+
+    /// Real (loopback) Pingora `Session` around a minimal GET request.
+    /// Same fixture shape `server/action_dispatch.rs` and
+    /// `server/ai_dispatch.rs` already use to drive dispatch functions
+    /// that take `&Session` outside of a live proxy: bind a listener,
+    /// have a client task write a raw HTTP/1.1 request, accept it, and
+    /// let Pingora parse its own downstream half.
+    async fn test_session() -> Session {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: wor-2477-panic-test.example\r\n\r\n")
+                .await
+                .expect("write request");
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        session
+    }
+
+    /// Drives a panicking enforcer through the real `check_policies`
+    /// dispatch seam (not a re-implementation of it) and asserts the
+    /// panic is contained: the request is denied closed with a 500,
+    /// `sbproxy_policy_panic_total` rises for the panicking policy's
+    /// label, and this test function itself returns normally, proving
+    /// the panic never escaped the dispatch loop to crash the runtime.
+    #[tokio::test]
+    async fn panicking_policy_enforcer_is_contained_and_counted() {
+        let policy_label = "wor_2477_panic_fixture";
+        let enforcers = vec![CompiledEnforcer {
+            surface: PolicySurface::Plugin,
+            engine: DecisionEngine::Plugin,
+            enforcer: Box::new(PanickingEnforcer(policy_label)),
+            dynamic_hook: None,
+            shared_admission: None,
+        }];
+        let mut ctx = RequestContext::new();
+        let verdict_ctx = PolicyVerdictCtx {
+            request_id: "wor-2477-test".to_string(),
+            workspace_id: String::new(),
+            origin: "wor-2477-test-origin".to_string(),
+            tenant: "wor-2477-test-tenant".to_string(),
+            record_format: sbproxy_config::types::PolicyRecordFormat::default(),
+        };
+        let before = panic_counter_value(policy_label);
+
+        let session = test_session().await;
+        let result = check_policies(&enforcers, &session, &mut ctx, &verdict_ctx).await;
+
+        assert_eq!(
+            result,
+            Some((500, "policy enforcer panicked".to_string(), "plugin")),
+            "a panicking enforcer must fail the request closed with a 500, not crash the proxy"
+        );
+        assert_eq!(
+            panic_counter_value(policy_label),
+            before + 1.0,
+            "sbproxy_policy_panic_total did not rise for the panicking policy"
+        );
+    }
+
+    /// Same containment property, driven through the buffered-body seam
+    /// (`check_buffered_dynamic_policies`) instead of the header-phase
+    /// one. Reuses the exact two-call sequence production code uses: the
+    /// header-phase `check_policies` call primes
+    /// `ctx.dynamic_request_body_plan` from each enforcer's
+    /// `dynamic_hook` (a `Buffered`-mode hook makes `check_policies`
+    /// skip enforcing it and instead mark it active for the body
+    /// phase), then `check_buffered_dynamic_policies` consumes that
+    /// plan once the body is available and is where the panic actually
+    /// fires.
+    #[tokio::test]
+    async fn panicking_buffered_dynamic_policy_enforcer_is_contained_and_counted() {
+        let policy_label = "wor_2477_panic_fixture_buffered";
+        let dynamic_hook = DynamicHookMetadata::new(
+            "wor-2477-test-bundle",
+            "policy",
+            BundleRuntime::Javascript,
+            BundleBodyMode::Buffered,
+            65_536,
+            FailureMode::Closed,
+        );
+        let enforcers = vec![CompiledEnforcer {
+            surface: PolicySurface::Plugin,
+            engine: DecisionEngine::Plugin,
+            enforcer: Box::new(PanickingEnforcer(policy_label)),
+            dynamic_hook: Some(dynamic_hook),
+            shared_admission: None,
+        }];
+        let mut ctx = RequestContext::new();
+        let verdict_ctx = PolicyVerdictCtx {
+            request_id: "wor-2477-test-buffered".to_string(),
+            workspace_id: String::new(),
+            origin: "wor-2477-test-origin".to_string(),
+            tenant: "wor-2477-test-tenant".to_string(),
+            record_format: sbproxy_config::types::PolicyRecordFormat::default(),
+        };
+        let before = panic_counter_value(policy_label);
+
+        let session = test_session().await;
+        // Header phase: skips enforcing the buffered-mode hook (it has
+        // no body yet) but records it as an active buffered policy on
+        // `ctx.dynamic_request_body_plan`, exactly as production does
+        // between the header and body phases of one request.
+        let header_result = check_policies(&enforcers, &session, &mut ctx, &verdict_ctx).await;
+        assert_eq!(
+            header_result, None,
+            "a Buffered-mode hook must not be enforced in the header phase"
+        );
+
+        // Body phase: the panic fires here.
+        let result = check_buffered_dynamic_policies(
+            &enforcers,
+            &session,
+            &mut ctx,
+            Bytes::new(),
+            &verdict_ctx,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some((500, "policy enforcer panicked".to_string(), "plugin")),
+            "a panicking buffered-phase enforcer must fail the request closed with a 500, \
+             not crash the proxy"
+        );
+        assert_eq!(
+            panic_counter_value(policy_label),
+            before + 1.0,
+            "sbproxy_policy_panic_total did not rise for the panicking buffered policy"
+        );
+    }
+}

@@ -22,6 +22,7 @@
 //! and the store's TTL expires them with the window.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use sbproxy_ai::UsageRecord;
@@ -44,6 +45,25 @@ pub(crate) fn install_shared_budget(store: Arc<dyn AsyncKVStore>) {
 pub(crate) fn shared_budget() -> Option<&'static Arc<dyn AsyncKVStore>> {
     SHARED_BUDGET.get()
 }
+
+/// Set once the shared-store READ path fails, cleared once a read
+/// succeeds. Gates the WARN/INFO transition logs in `read_counter` so a
+/// flapping Redis link logs one degrade line and one recovery line, not
+/// one per request (WOR-2474).
+///
+/// Kept separate from `DEGRADED_WRITE` because a store can fail one
+/// direction while serving the other: Redis at `maxmemory` with a
+/// no-eviction policy rejects `INCRBY` (writes) while still answering
+/// `GET` (reads). A single shared latch would flip on every request in
+/// that partial outage (a read success clearing it, the following
+/// write failure setting it again), which is exactly the per-request
+/// log spam the latch exists to prevent.
+static DEGRADED_READ: AtomicBool = AtomicBool::new(false);
+
+/// Set once the shared-store WRITE path fails, cleared once a write
+/// succeeds. See `DEGRADED_READ` for why this is a separate latch
+/// rather than one shared between the two ops.
+static DEGRADED_WRITE: AtomicBool = AtomicBool::new(false);
 
 fn tokens_key(scope_key: &str) -> Vec<u8> {
     format!("sbproxy:budget:{scope_key}:tok").into_bytes()
@@ -82,21 +102,59 @@ async fn record_shared_spend_to(
     ttl_secs: u64,
 ) {
     if tokens > 0 {
-        if let Err(e) = store
+        match store
             .incr_by_with_ttl(&tokens_key(scope_key), tokens as i64, ttl_secs)
             .await
         {
-            tracing::debug!(error = %e, scope = scope_key, "shared budget: token incr failed (fail-open)");
+            Ok(_) => {
+                sbproxy_observe::metrics::set_budget_share_unavailable(0);
+                if DEGRADED_WRITE.swap(false, Ordering::Relaxed) {
+                    tracing::info!(
+                        target: "sbproxy::budget",
+                        "shared budget store write recovered; cluster-wide enforcement resumed"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, scope = scope_key, "shared budget: token incr failed (fail-open)");
+                sbproxy_observe::metrics::record_budget_share_fail_open("write");
+                if !DEGRADED_WRITE.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "sbproxy::budget",
+                        error = %e,
+                        "shared budget store write unreachable; enforcement degraded to per-instance tracking (fail-open)"
+                    );
+                }
+            }
         }
     }
     // Cost is stored as micro-USD to keep the shared counter integral.
     let micros = (cost_usd * 1_000_000.0).round() as i64;
     if micros > 0 {
-        if let Err(e) = store
+        match store
             .incr_by_with_ttl(&micros_key(scope_key), micros, ttl_secs)
             .await
         {
-            tracing::debug!(error = %e, scope = scope_key, "shared budget: cost incr failed (fail-open)");
+            Ok(_) => {
+                sbproxy_observe::metrics::set_budget_share_unavailable(0);
+                if DEGRADED_WRITE.swap(false, Ordering::Relaxed) {
+                    tracing::info!(
+                        target: "sbproxy::budget",
+                        "shared budget store write recovered; cluster-wide enforcement resumed"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, scope = scope_key, "shared budget: cost incr failed (fail-open)");
+                sbproxy_observe::metrics::record_budget_share_fail_open("write");
+                if !DEGRADED_WRITE.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "sbproxy::budget",
+                        error = %e,
+                        "shared budget store write unreachable; enforcement degraded to per-instance tracking (fail-open)"
+                    );
+                }
+            }
         }
     }
 }
@@ -168,12 +226,31 @@ pub(crate) async fn record_shared_budget_usage(
 /// parse error (so the caller fails open to the local tracker).
 async fn read_counter(store: &Arc<dyn AsyncKVStore>, key: &[u8]) -> Option<u64> {
     match store.get(key).await {
-        Ok(Some(bytes)) => std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok()),
-        Ok(None) => Some(0),
+        Ok(value) => {
+            sbproxy_observe::metrics::set_budget_share_unavailable(0);
+            if DEGRADED_READ.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    target: "sbproxy::budget",
+                    "shared budget store read recovered; cluster-wide enforcement resumed"
+                );
+            }
+            match value {
+                Some(bytes) => std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok()),
+                None => Some(0),
+            }
+        }
         Err(e) => {
             tracing::debug!(error = %e, "shared budget: read failed (fail-open)");
+            sbproxy_observe::metrics::record_budget_share_fail_open("read");
+            if !DEGRADED_READ.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "sbproxy::budget",
+                    error = %e,
+                    "shared budget store read unreachable; enforcement degraded to per-instance tracking (fail-open)"
+                );
+            }
             None
         }
     }
@@ -225,6 +302,63 @@ mod tests {
         }
     }
 
+    /// An `AsyncKVStore` whose every operation fails, for exercising the
+    /// fail-open counters at the store seam (WOR-2474).
+    struct FailingStore;
+
+    #[async_trait]
+    impl AsyncKVStore for FailingStore {
+        async fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+            Err(anyhow::anyhow!("simulated shared budget store outage"))
+        }
+        async fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+            Err(anyhow::anyhow!("simulated shared budget store outage"))
+        }
+        async fn put_with_ttl(&self, _key: &[u8], _value: &[u8], _ttl: u64) -> Result<()> {
+            Err(anyhow::anyhow!("simulated shared budget store outage"))
+        }
+        async fn incr_with_ttl(&self, _key: &[u8], _ttl: u64) -> Result<i64> {
+            Err(anyhow::anyhow!("simulated shared budget store outage"))
+        }
+        async fn incr_by_with_ttl(&self, _key: &[u8], _amount: i64, _ttl: u64) -> Result<i64> {
+            Err(anyhow::anyhow!("simulated shared budget store outage"))
+        }
+        async fn delete(&self, _key: &[u8]) -> Result<()> {
+            Err(anyhow::anyhow!("simulated shared budget store outage"))
+        }
+    }
+
+    /// Every label of a gathered family, as `name=value` pairs joined by
+    /// commas, one entry per series, with the series value appended.
+    /// Copied from the identical helper in `key_plane.rs`.
+    fn gathered_series(family_name: &str) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for family in prometheus::gather() {
+            if family.name() != family_name {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                let value = match family.get_field_type() {
+                    prometheus::proto::MetricType::COUNTER => metric.get_counter().value(),
+                    prometheus::proto::MetricType::GAUGE => metric.get_gauge().value(),
+                    // Nothing calls this for a histogram or a summary, and
+                    // silently returning 0 for one would make a wrong
+                    // assertion pass rather than fail.
+                    other => {
+                        unreachable!("{family_name} is a {other:?}, not a counter or a gauge")
+                    }
+                };
+                out.push((labels.join(","), value));
+            }
+        }
+        out
+    }
+
     #[tokio::test]
     async fn record_then_read_roundtrips() {
         let store: Arc<dyn AsyncKVStore> = Arc::new(MockKv::default());
@@ -266,5 +400,59 @@ mod tests {
         // A zero-token, zero-cost record must not create counters.
         record_shared_spend_to(&store, "z", 0, 0.0, 60).await;
         assert!(store.get(&tokens_key("z")).await.unwrap().is_none());
+    }
+
+    /// A store that errors on every call must fire the fail-open counter
+    /// for both the read and write paths and raise the unavailable gauge;
+    /// once a healthy store answers, the gauge must fall back to 0
+    /// (WOR-2474).
+    #[tokio::test]
+    async fn store_errors_fire_fail_open_metrics_and_the_unavailable_gauge() {
+        let failing: Arc<dyn AsyncKVStore> = Arc::new(FailingStore);
+
+        // Drive the write path: both the token and cost increments error.
+        record_shared_spend_to(&failing, "tenant:broken", 10, 0.01, 60).await;
+        let write_count: f64 = gathered_series("sbproxy_budget_share_fail_open_total")
+            .into_iter()
+            .filter(|(labels, _)| labels.contains("op=write"))
+            .map(|(_, value)| value)
+            .sum();
+        assert!(
+            write_count >= 1.0,
+            "sbproxy_budget_share_fail_open_total{{op=\"write\"}} did not rise"
+        );
+
+        // Drive the read path.
+        let usage = read_shared_spend_from(&failing, "tenant:broken").await;
+        assert!(
+            usage.is_none(),
+            "a failing store must fail open to None, not a partial reading"
+        );
+        let read_count: f64 = gathered_series("sbproxy_budget_share_fail_open_total")
+            .into_iter()
+            .filter(|(labels, _)| labels.contains("op=read"))
+            .map(|(_, value)| value)
+            .sum();
+        assert!(
+            read_count >= 1.0,
+            "sbproxy_budget_share_fail_open_total{{op=\"read\"}} did not rise"
+        );
+
+        let degraded_gauge = gathered_series("sbproxy_budget_share_unavailable");
+        assert_eq!(
+            degraded_gauge.first().map(|(_, value)| *value),
+            Some(1.0),
+            "sbproxy_budget_share_unavailable should read 1 while the store is unreachable: {degraded_gauge:?}"
+        );
+
+        // Now drive the good mock store; the gauge must clear.
+        let healthy: Arc<dyn AsyncKVStore> = Arc::new(MockKv::default());
+        record_shared_spend_to(&healthy, "tenant:ok", 5, 0.01, 60).await;
+        let recovered_gauge = gathered_series("sbproxy_budget_share_unavailable");
+        assert_eq!(
+            recovered_gauge.first().map(|(_, value)| *value),
+            Some(0.0),
+            "sbproxy_budget_share_unavailable should fall back to 0 once the store answers: {recovered_gauge:?}"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-16*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
@@ -108,8 +108,8 @@ The resolution context is `(tenant_id, origin_idx, principal)`. A request that f
 
 What is NOT guaranteed:
 
-* **Process-level isolation.** Tenants share the proxy process; a tenant whose policy triggers a panic crashes the whole proxy. Production deployments running mutually-untrusting tenants should run one proxy per trust boundary.
-* **Resource quotas.** Per-tenant CPU / memory caps require an outer orchestrator (cgroups, k8s ResourceQuota). The traffic-shaping knobs that ship are per-origin rate-limit policies, per-credential rate limits and budgets, and the workspace-level `rate_limits:` escalation ladder; there is no dedicated tenant-keyed rate limiter on the serving path today, and none of these caps raw resources.
+* **Process-level isolation.** Tenants still share one proxy process. A panicking tenant policy now denies that one request with a 500 and increments `sbproxy_policy_panic_total{policy}`, instead of crashing the proxy; this narrows the blast radius of a tenant-triggered panic but does not turn co-tenancy into hard isolation, since a fault outside policy evaluation can still affect every tenant. Production deployments running mutually-untrusting tenants should still run one proxy per trust boundary.
+* **Resource quotas.** Per-tenant CPU and memory caps still require an outer orchestrator (cgroups, k8s ResourceQuota). Per-origin rate-limit policies and per-credential rate limits and budgets remain scoped as before. The workspace-level `rate_limits:` escalation ladder is now tenant-keyed: it buckets by the origin's configured tenant, an origin with no `tenant_id` falls into the `__default__` bucket, matching the old single-tenant behavior exactly, and per-tenant series appear on `sbproxy_rate_limit_total{workspace}`. The label value itself changed on upgrade, from `default` to `__default__`; update any dashboard or alert matching `workspace="default"`. That budget shapes request rate, not raw CPU or memory, so it does not cap what a tenant can consume on the shared process.
 
 ## Per-tenant cardinality budgets
 

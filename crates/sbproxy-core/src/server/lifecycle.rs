@@ -355,12 +355,21 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// `proxy.web_bot_auth`, that the block is present, and that its seed is
 /// 64 hex characters, so anything unresolvable here is a bug in that
 /// check rather than an operator error, and it says so.
+///
+/// WOR-2478: when `audit.config_path` is also set, opens and installs the
+/// second, config-change chain under the same signing identity right
+/// after the security chain above. Same fail-the-boot rationale: an
+/// operator who named the file wants the failure loud, not a proxy that
+/// starts believing it is recording a trail it never opened.
 fn install_audit_chain(
     audit: &sbproxy_config::types::AuditConfig,
     web_bot_auth: Option<&sbproxy_config::types::WebBotAuthConfig>,
 ) -> anyhow::Result<()> {
     use sbproxy_config::types::AuditSinkKind;
-    use sbproxy_observe::audit_chain::{install_security_audit_chain, SecurityAuditChain};
+    use sbproxy_observe::audit_chain::{
+        install_config_audit_chain, install_security_audit_chain, ConfigAuditChain,
+        SecurityAuditChain,
+    };
 
     if audit.sink != AuditSinkKind::Chain {
         return Ok(());
@@ -395,10 +404,35 @@ fn install_audit_chain(
                 "security audit trail is hash-chained and signed; verify it with \
                  `sbproxy audit verify`"
             );
-            Ok(())
         }
         Err(error) => anyhow::bail!("audit.sink is `chain` but {error}"),
     }
+
+    // Opt-in second chain for `config_audit` events, same signing identity
+    // as the security chain above (one proxy, one key, two files). Absent
+    // `audit.config_path`, `config_audit` stays exactly what it always
+    // was: a tracing stream with no durable record.
+    if let Some(config_path) = audit.config_path.as_deref() {
+        let config_chain = ConfigAuditChain::open(
+            std::path::Path::new(config_path),
+            &signer.ed25519_seed_hex,
+            &signer.key_id,
+        )?;
+        let config_kid = config_chain.key_id().to_string();
+        match install_config_audit_chain(config_chain) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %config_path,
+                    kid = %config_kid,
+                    "config audit trail is hash-chained and signed; verify it with \
+                     `sbproxy audit verify`"
+                );
+            }
+            Err(error) => anyhow::bail!("audit.config_path is set but {error}"),
+        }
+    }
+
+    Ok(())
 }
 
 /// A constructed request-event sink, ready to hand to the setter.
@@ -4025,18 +4059,76 @@ fn install_early_terminate_guard(
 /// So this warns rather than refuses, once at boot, naming each event
 /// so the message is actionable rather than a count.
 fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig) {
+    let unwired = unwired_decision_audit_events(compiled);
+    if unwired.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        events = %unwired.join(", "),
+        wired = %wired_decision_audit_events(compiled).join(", "),
+        "decision_audit enables events that nothing publishes yet; they emit no records until \
+         their emitters ship"
+    );
+}
+
+/// Whether `event` lands a record on the decision-audit feed under this
+/// config.
+///
+/// Not the same question as [`DecisionEvent::has_emitter`], and `policy`
+/// is why. That event has always reached the audit bus, but until
+/// `policy_record_format: decision` it arrives as a `PolicyVerdictEvent`
+/// on its own prefix rather than as a decision-audit record, so whether
+/// it counts as wired *here* depends on config rather than on a const
+/// (WOR-2448).
+///
+/// Asking the const alone would tell an operator who set
+/// `policy_record_format: decision` and `events: {policy: true}` that
+/// nothing publishes `policy`, while the records they asked for were
+/// landing on the feed they were reading. A warning that is wrong about
+/// the one event an operator deliberately turned on is worse than no
+/// warning.
+fn publishes_decision_audit(
+    event: sbproxy_observe::decision::DecisionEvent,
+    compiled: &sbproxy_config::CompiledConfig,
+) -> bool {
+    use sbproxy_config::types::PolicyRecordFormat;
+    use sbproxy_observe::decision::DecisionEvent;
+
+    if event == DecisionEvent::Policy {
+        return compiled.decision_audit.policy_record_format() == PolicyRecordFormat::Decision;
+    }
+    event.has_emitter()
+}
+
+/// The events publishing decision-audit records under this config.
+fn wired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig) -> Vec<&'static str> {
+    sbproxy_observe::decision::DecisionEvent::ALL
+        .iter()
+        .filter(|event| publishes_decision_audit(**event, compiled))
+        .map(|event| event.as_label())
+        .collect()
+}
+
+/// The events this config enables that publish nothing.
+///
+/// Split out of the warning so it can be tested directly: the warning
+/// itself only logs, and a feed that silently names the wrong events is
+/// exactly the failure this whole surface exists to avoid.
+pub(super) fn unwired_decision_audit_events(
+    compiled: &sbproxy_config::CompiledConfig,
+) -> Vec<&'static str> {
     use sbproxy_observe::decision::DecisionEvent;
 
     let scopes = &compiled.decision_audit;
     if scopes.is_empty() {
-        return;
+        return Vec::new();
     }
     // Any scope enabling an event is worth naming, because the operator
     // asked for it somewhere. Reporting per scope would repeat the same
     // missing emitter once per tenant and origin.
-    let unwired: Vec<&str> = DecisionEvent::ALL
+    DecisionEvent::ALL
         .iter()
-        .filter(|event| !event.has_emitter())
+        .filter(|event| !publishes_decision_audit(**event, compiled))
         .filter(|event| {
             let label = event.as_label();
             scopes.publishes(label, None, None)
@@ -4050,21 +4142,7 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
                     .any(|origin| scopes.publishes(label, None, Some(origin)))
         })
         .map(|event| event.as_label())
-        .collect();
-    if unwired.is_empty() {
-        return;
-    }
-    tracing::warn!(
-        events = %unwired.join(", "),
-        wired = %DecisionEvent::ALL
-            .iter()
-            .filter(|event| event.has_emitter())
-            .map(|event| event.as_label())
-            .collect::<Vec<_>>()
-            .join(", "),
-        "decision_audit enables events that nothing publishes yet; they emit no records until \
-         their emitters ship"
-    );
+        .collect()
 }
 
 /// Warn while `policy` records still ship in the legacy shape
@@ -6009,6 +6087,112 @@ mod event_egress_tests {
         assert!(
             error.to_string().contains("events.signing_secret"),
             "the failure names the key: {error}"
+        );
+    }
+
+    #[test]
+    fn install_audit_chain_installs_both_chains_when_config_path_is_set() {
+        // WOR-2478: `audit.config_path` opts a second, config-change chain
+        // into the same boot call that opens the security chain, under
+        // the same signing identity. The two slots this claims
+        // (`sbproxy_observe::audit_chain::CHAIN` and `CONFIG_CHAIN`) are
+        // private and process-wide, so the only externally observable
+        // proof either one installed is that a second install of the same
+        // slot is refused.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let security_path = dir.path().join("security-audit.jsonl");
+        let config_path = dir.path().join("config-audit.jsonl");
+        let signer = sbproxy_config::types::WebBotAuthConfig {
+            key_id: "audit-test-kid".to_string(),
+            ed25519_seed_hex: "cc".repeat(32),
+            directory_url: None,
+        };
+        let audit = sbproxy_config::types::AuditConfig {
+            sink: sbproxy_config::types::AuditSinkKind::Chain,
+            path: Some(security_path.display().to_string()),
+            sign_with: Some("web_bot_auth".to_string()),
+            config_path: Some(config_path.display().to_string()),
+        };
+
+        match install_audit_chain(&audit, Some(&signer)) {
+            Ok(()) => {
+                assert!(
+                    security_path.exists(),
+                    "the security chain file is opened at boot"
+                );
+                assert!(
+                    config_path.exists(),
+                    "the config chain file is opened alongside it"
+                );
+
+                let redundant_seed = "dd".repeat(32);
+                let redundant_security = sbproxy_observe::audit_chain::SecurityAuditChain::open(
+                    &dir.path().join("unused-security.jsonl"),
+                    &redundant_seed,
+                    "unused",
+                )
+                .expect("chain opens");
+                let security_reinstall =
+                    sbproxy_observe::audit_chain::install_security_audit_chain(redundant_security);
+                assert!(
+                    security_reinstall.is_err(),
+                    "the security slot this boot call claimed is already taken"
+                );
+
+                let redundant_config = sbproxy_observe::audit_chain::ConfigAuditChain::open(
+                    &dir.path().join("unused-config.jsonl"),
+                    &redundant_seed,
+                    "unused",
+                )
+                .expect("chain opens");
+                let config_reinstall =
+                    sbproxy_observe::audit_chain::install_config_audit_chain(redundant_config);
+                assert!(
+                    config_reinstall.is_err(),
+                    "the config slot this boot call claimed is already taken"
+                );
+            }
+            Err(error) if error.to_string().contains("already registered") => {
+                // Another test in this process claimed a slot first (the
+                // `cargo test` fallback path; nextest gives every test its
+                // own process, which is what the gate actually runs).
+                // Nothing left for this test to prove.
+            }
+            Err(error) => panic!("unexpected boot failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn install_audit_chain_fails_boot_when_config_paths_parent_cannot_be_created() {
+        // Same fail-the-boot posture as the security half above (see
+        // `a_file_egress_whose_path_cannot_be_opened_fails_the_boot` for
+        // the sibling case on the events sink): an operator who named
+        // `audit.config_path` wants a proxy that refuses to start over one
+        // that starts and silently records nothing.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let security_path = dir.path().join("security-audit.jsonl");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"occupies the path a directory needs")
+            .expect("write blocker file");
+        let config_path = blocker.join("config-audit.jsonl");
+
+        let signer = sbproxy_config::types::WebBotAuthConfig {
+            key_id: "audit-test-kid-2".to_string(),
+            ed25519_seed_hex: "ee".repeat(32),
+            directory_url: None,
+        };
+        let audit = sbproxy_config::types::AuditConfig {
+            sink: sbproxy_config::types::AuditSinkKind::Chain,
+            path: Some(security_path.display().to_string()),
+            sign_with: Some("web_bot_auth".to_string()),
+            config_path: Some(config_path.display().to_string()),
+        };
+
+        let error = install_audit_chain(&audit, Some(&signer))
+            .expect_err("a config chain whose parent cannot be created must not boot quietly");
+        assert!(
+            error.to_string().contains("audit.config_path"),
+            "the failure names the key that turned the chain on: {error}"
         );
     }
 }
