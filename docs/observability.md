@@ -793,7 +793,14 @@ The block also composes across scopes, and it composes **per event label** rathe
 
 Two mistakes are refused at config load rather than ignored, both because a misconfigured audit feed is silent and silence is indistinguishable from a feed with nothing to say. An `events:` key naming no decision this proxy makes fails the load, and the error lists every accepted label. `ai.stream.event: true` fails too, because that event fires once per streamed chunk; enable `ai.close` instead, which carries the stream's summary once the response finishes. Writing `ai.stream.event: false` stays legal, since saying out loud that a feed is off is a reasonable thing to want in a config.
 
-**What is wired today.** Three events publish on this shape: `cache.admit`, `cache.key`, and `route.decide`, plus `policy` when `policy_record_format: decision` is set. Those are exactly the three decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
+**What is wired today.** Four events publish: `auth`, `cache.admit`, `cache.key`, and `route.decide`, plus `policy` when `policy_record_format: decision` is set.
+
+They do not all publish on the same terms, and the difference matters when you are reading a quiet feed:
+
+- `cache.admit`, `cache.key`, and `route.decide` are the decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
+- `auth` publishes on every outcome, allow and deny both. A feed carrying only refusals cannot tell "nobody authenticated" from "the emitter covers half the arms", and every auth decision in the proxy goes through one seam so that stays true as arms are added.
+- `policy` publishes regardless of `enabled:` and the `events:` map, as it always has. `policy_record_format` chooses its encoding, never whether to emit.
+
 
 **`policy` is converging onto this shape, behind a flag.** That path has always published on this same bus as a `PolicyVerdictEvent` under the `policy_verdict_event:` prefix, serialized through its serde derive rather than as OCSF. Same bus, same class of event, two formats, so reconstructing every control decision on one request meant parsing both and joining them by hand. The legacy shape also carries no free-text reason, which made the most security-relevant event in the system the one that could not say why it decided.
 
@@ -815,7 +822,7 @@ Emitting both during the window was rejected: it doubles volume on the densest e
 
 Unlike every other event here, `policy` publishes regardless of `enabled:` and the `events:` map, exactly as it always has. `policy_record_format` chooses an encoding, never whether to emit, so turning on the converged shape cannot silently cost you the feed.
 
-The remaining labels parse and validate and emit nothing yet: `auth`, `rate_limit`, `waf`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle`. If you enable one and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
+The remaining labels parse and validate and emit nothing yet: `rate_limit`, `waf`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle`. Two of those are misleading as written: `waf` and the rate-limiting family are policy modules, so their decisions already reach the bus as `policy` records carrying `policy_id: "waf"` and friends. Select on `policy_id` rather than waiting for a separate emitter. If you enable one and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
 
 **What the record promises about its reason.** The `reason` field is scrubbed before the record exists at all: the type that field carries has exactly one constructor and that constructor runs the scrub, so no emit site can publish a raw string, whatever it believes redaction means. Four passes, in this order:
 

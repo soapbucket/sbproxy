@@ -4461,6 +4461,163 @@ fn decision_event_total(labels: &[(&str, &str)]) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// A one-origin pipeline whose `origin_id` is `name`.
+///
+/// Built through `compile_config` rather than by hand so the origin id
+/// these tests assert on is the one the compiler actually derives.
+fn auth_test_pipeline(name: &str) -> std::sync::Arc<crate::pipeline::CompiledPipeline> {
+    let yaml = format!(
+        r#"origins:
+  "{name}":
+    action:
+      type: static
+      body: ok
+"#
+    );
+    let config = sbproxy_config::compile_config(&yaml).expect("fixture config");
+    std::sync::Arc::new(
+        crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline"),
+    )
+}
+
+/// The unwired warning has to be right about `policy` (WOR-2448).
+///
+/// `policy` is the one event whose wiring is a config question rather
+/// than a constant: it always reaches the audit bus, but only lands on
+/// the decision-audit feed in the converged shape. Asking
+/// `has_emitter()` alone tells an operator who deliberately turned that
+/// shape on that nothing publishes `policy`, while the records they
+/// asked for are landing on the feed they are reading.
+#[test]
+fn the_unwired_warning_follows_the_policy_record_format() {
+    fn unwired_for(format: &str) -> Vec<&'static str> {
+        let yaml = format!(
+            r#"proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        policy_record_format: {format}
+        events:
+          policy: true
+origins:
+  "audit.test":
+    action:
+      type: static
+      body: ok
+"#
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("fixture config");
+        super::lifecycle::unwired_decision_audit_events(&compiled)
+    }
+
+    assert!(
+        unwired_for("legacy").contains(&"policy"),
+        "under the legacy shape a policy record never reaches this feed, so naming it is the \
+         honest answer"
+    );
+    assert!(
+        !unwired_for("decision").contains(&"policy"),
+        "under the converged shape policy publishes on exactly this feed; warning that nothing \
+         publishes it is wrong about the one event the operator turned on"
+    );
+}
+
+/// Every auth decision goes through the one seam (WOR-2446).
+///
+/// Greps the source rather than trusting review, because the failure it
+/// guards against is silent and asymmetric. `DecisionEvent::Auth` now
+/// reports `has_emitter() == true`, which is what stops the startup
+/// warning naming `auth` as an enabled-but-unwired feed. That claim is
+/// only honest while *every* auth decision publishes. A new arm that
+/// reaches for `metrics::record_auth` directly still compiles, still
+/// moves the old metric, and silently drops its decision from the audit
+/// feed an operator has been told is complete.
+///
+/// The one permitted call is inside `record_auth_decision` itself.
+#[test]
+fn nothing_records_an_auth_metric_outside_the_decision_seam() {
+    // The two files that hold every auth decision point. Named
+    // explicitly rather than walked, so moving a decision into a third
+    // file is a deliberate edit here and not a silent escape.
+    let sources = [
+        ("server.rs", include_str!("../server.rs")),
+        ("request_phase.rs", include_str!("request_phase.rs")),
+        ("ai_dispatch.rs", include_str!("ai_dispatch.rs")),
+    ];
+    for (name, src) in sources {
+        let direct = src.matches("metrics::record_auth(").count();
+        let permitted = usize::from(name == "server.rs");
+        assert_eq!(
+            direct, permitted,
+            "{name} calls metrics::record_auth directly {direct} time(s), expected {permitted}. \
+             Route it through `record_auth_decision` instead: a bare metric call records the \
+             decision on the old family and omits it from the audit feed, while \
+             `DecisionEvent::Auth::has_emitter()` still tells the operator the feed is wired"
+        );
+    }
+}
+
+#[test]
+fn an_auth_decision_records_the_shared_family_on_both_outcomes() {
+    // Allow and deny both, because a feed that only carries refusals is
+    // the failure mode this ticket is about: an operator reading it
+    // cannot tell "nobody authenticated" from "the emitter only covers
+    // half the arms".
+    let pipeline = auth_test_pipeline("auth-origin");
+    for (allowed, outcome) in [(true, "allow"), (false, "deny")] {
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = pipeline.clone();
+        ctx.origin_idx = Some(0);
+        ctx.hostname = "auth.example.com".into();
+        ctx.tenant_id = "acme-corp".into();
+        let labels = [
+            ("event", "auth"),
+            ("origin", "auth-origin"),
+            ("outcome", outcome),
+        ];
+        let before = decision_event_total(&labels);
+        super::record_auth_decision(&ctx, ctx.hostname.as_ref(), "api_key", allowed, "test");
+        let after = decision_event_total(&labels);
+        assert!(
+            after > before,
+            "auth {outcome} must record on the shared decision family; before={before} \
+             after={after}"
+        );
+    }
+}
+
+#[test]
+fn an_auth_decision_is_labelled_by_origin_id_not_the_request_host() {
+    // The label trap this path shares with the policy family. `origin`
+    // is budgeted at 200 across every metric that uses it, and under a
+    // wildcard origin the request Host is attacker-chosen, so labelling
+    // by hostname would let a caller exhaust the budget and permanently
+    // demote every not-yet-seen origin to `__other__` on unrelated
+    // families for the life of the process.
+    let pipeline = auth_test_pipeline("billing-api");
+    let mut ctx = RequestContext::new();
+    ctx.pipeline = pipeline;
+    ctx.origin_idx = Some(0);
+    ctx.hostname = "anything.attacker.example".into();
+    ctx.tenant_id = "acme-corp".into();
+
+    let by_id = [("event", "auth"), ("origin", "billing-api")];
+    let by_host = [("event", "auth"), ("origin", "anything.attacker.example")];
+    let before = decision_event_total(&by_id);
+    super::record_auth_decision(&ctx, ctx.hostname.as_ref(), "api_key", false, "test");
+    assert!(
+        decision_event_total(&by_id) > before,
+        "the decision family must be labelled by the config-bounded origin id"
+    );
+    assert_eq!(
+        decision_event_total(&by_host),
+        0.0,
+        "the request Host must never reach the origin label; it is attacker-chosen under a \
+         wildcard origin and shares a 200-value budget with every other origin-labelled family"
+    );
+}
+
 #[test]
 fn the_recorded_tenant_and_origin_are_the_populated_config_fields() {
     // The seam, not the mapping function. Two fields on this path are

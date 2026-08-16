@@ -4059,18 +4059,76 @@ fn install_early_terminate_guard(
 /// So this warns rather than refuses, once at boot, naming each event
 /// so the message is actionable rather than a count.
 fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig) {
+    let unwired = unwired_decision_audit_events(compiled);
+    if unwired.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        events = %unwired.join(", "),
+        wired = %wired_decision_audit_events(compiled).join(", "),
+        "decision_audit enables events that nothing publishes yet; they emit no records until \
+         their emitters ship"
+    );
+}
+
+/// Whether `event` lands a record on the decision-audit feed under this
+/// config.
+///
+/// Not the same question as [`DecisionEvent::has_emitter`], and `policy`
+/// is why. That event has always reached the audit bus, but until
+/// `policy_record_format: decision` it arrives as a `PolicyVerdictEvent`
+/// on its own prefix rather than as a decision-audit record, so whether
+/// it counts as wired *here* depends on config rather than on a const
+/// (WOR-2448).
+///
+/// Asking the const alone would tell an operator who set
+/// `policy_record_format: decision` and `events: {policy: true}` that
+/// nothing publishes `policy`, while the records they asked for were
+/// landing on the feed they were reading. A warning that is wrong about
+/// the one event an operator deliberately turned on is worse than no
+/// warning.
+fn publishes_decision_audit(
+    event: sbproxy_observe::decision::DecisionEvent,
+    compiled: &sbproxy_config::CompiledConfig,
+) -> bool {
+    use sbproxy_config::types::PolicyRecordFormat;
+    use sbproxy_observe::decision::DecisionEvent;
+
+    if event == DecisionEvent::Policy {
+        return compiled.decision_audit.policy_record_format() == PolicyRecordFormat::Decision;
+    }
+    event.has_emitter()
+}
+
+/// The events publishing decision-audit records under this config.
+fn wired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig) -> Vec<&'static str> {
+    sbproxy_observe::decision::DecisionEvent::ALL
+        .iter()
+        .filter(|event| publishes_decision_audit(**event, compiled))
+        .map(|event| event.as_label())
+        .collect()
+}
+
+/// The events this config enables that publish nothing.
+///
+/// Split out of the warning so it can be tested directly: the warning
+/// itself only logs, and a feed that silently names the wrong events is
+/// exactly the failure this whole surface exists to avoid.
+pub(super) fn unwired_decision_audit_events(
+    compiled: &sbproxy_config::CompiledConfig,
+) -> Vec<&'static str> {
     use sbproxy_observe::decision::DecisionEvent;
 
     let scopes = &compiled.decision_audit;
     if scopes.is_empty() {
-        return;
+        return Vec::new();
     }
     // Any scope enabling an event is worth naming, because the operator
     // asked for it somewhere. Reporting per scope would repeat the same
     // missing emitter once per tenant and origin.
-    let unwired: Vec<&str> = DecisionEvent::ALL
+    DecisionEvent::ALL
         .iter()
-        .filter(|event| !event.has_emitter())
+        .filter(|event| !publishes_decision_audit(**event, compiled))
         .filter(|event| {
             let label = event.as_label();
             scopes.publishes(label, None, None)
@@ -4084,21 +4142,7 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
                     .any(|origin| scopes.publishes(label, None, Some(origin)))
         })
         .map(|event| event.as_label())
-        .collect();
-    if unwired.is_empty() {
-        return;
-    }
-    tracing::warn!(
-        events = %unwired.join(", "),
-        wired = %DecisionEvent::ALL
-            .iter()
-            .filter(|event| event.has_emitter())
-            .map(|event| event.as_label())
-            .collect::<Vec<_>>()
-            .join(", "),
-        "decision_audit enables events that nothing publishes yet; they emit no records until \
-         their emitters ship"
-    );
+        .collect()
 }
 
 /// Warn while `policy` records still ship in the legacy shape

@@ -2010,10 +2010,12 @@ async fn resolve_request_virtual_key(
                 DynamicKeyOutcome::Resolved(record) => {
                     stamp_minted_key_mode(ctx);
                     ctx.inbound_key_header = Some(header.clone());
-                    sbproxy_observe::metrics::record_auth(
-                        ctx.hostname.as_str(),
+                    crate::server::record_auth_decision(
+                        ctx,
+                        ctx.hostname.as_ref(),
                         "virtual_key",
                         true,
+                        "dynamically resolved virtual key accepted",
                     );
                     return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
                         .map(Some);
@@ -2029,10 +2031,12 @@ async fn resolve_request_virtual_key(
                         ctx,
                         AuthTrustOutcome::InvalidProof.is_suspicious(),
                     );
-                    sbproxy_observe::metrics::record_auth(
-                        ctx.hostname.as_str(),
+                    crate::server::record_auth_decision(
+                        ctx,
+                        ctx.hostname.as_ref(),
                         "virtual_key",
                         false,
+                        "dynamically resolved virtual key refused",
                     );
                     emit_auth_audit(
                         "auth_denied",
@@ -2133,10 +2137,12 @@ async fn resolve_request_virtual_key(
             ctx.native_key_provider = Some(provider);
             ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
             crate::trust_tier::finalize(ctx, AuthTrustOutcome::Missing.is_suspicious());
-            sbproxy_observe::metrics::record_auth(
-                ctx.hostname.as_str(),
+            crate::server::record_auth_decision(
+                ctx,
+                ctx.hostname.as_ref(),
                 "native_provider_key",
                 false,
+                "caller-owned provider credential refused by policy",
             );
             emit_auth_audit(
                 "auth_denied",
