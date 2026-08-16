@@ -5981,6 +5981,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
     async fn a_rename_cannot_smuggle_a_contract_that_would_have_been_blocked() {
         // WOR-2444 acceptance 2, and the reason digest correlation is
         // not sufficient on its own. Renaming *and* editing the contract

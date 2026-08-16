@@ -189,13 +189,56 @@ mod tests {
     /// added to one of them.
     ///
     /// Greps the federation source rather than trusting review.
+    ///
+    /// One function is allowed to build the same three fields:
+    /// `legacy_serialized_tool_entry`, which is the frozen 2025-06-18
+    /// `tools/list` wire projection. It is not a contract and must not be
+    /// routed through `contract_of`, because the bytes legacy clients see and
+    /// the recipe the digest hashes are separate promises. Coupling them
+    /// would let a change to the digest silently change the frozen wire
+    /// output, which is the thing the legacy conformance suite exists to
+    /// prevent. So the check is on the enclosing function rather than on the
+    /// bare substring: a genuinely new hand-rolled contract lands in some
+    /// other function and still fails this.
     #[test]
     fn nothing_hand_rolls_a_contract_projection() {
+        const WIRE_SERIALIZER: &str = "legacy_serialized_tool_entry";
+        let src = include_str!("../federation.rs");
+
+        let mut offenders = Vec::new();
+        for (index, _) in src.match_indices(r#""inputSchema": tool.input_schema"#) {
+            let enclosing = src[..index]
+                .rmatch_indices("\nfn ")
+                .next()
+                .map(|(start, _)| {
+                    let rest = &src[start + "\nfn ".len()..];
+                    let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len().min(80));
+                    &rest[..end]
+                })
+                .unwrap_or("<none>");
+            if enclosing != WIRE_SERIALIZER {
+                offenders.push(enclosing);
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these functions in federation.rs hand-roll a contract projection: {offenders:?}. \
+             Call compat::contract_of instead, so the generator and the gate cannot disagree \
+             about a digest. Only {WIRE_SERIALIZER} may build these fields itself, and only \
+             because it serializes the frozen legacy wire rather than a contract."
+        );
+    }
+
+    /// The exemption above has to name a function that exists, or the guard
+    /// silently widens the day that function is renamed.
+    #[test]
+    fn the_wire_serializer_exemption_still_names_a_real_function() {
         let src = include_str!("../federation.rs");
         assert!(
-            !src.contains(r#""inputSchema": tool.input_schema"#),
-            "federation.rs hand-rolls a contract projection; call compat::contract_of instead, \
-             so the generator and the gate cannot disagree about a digest"
+            src.contains("fn legacy_serialized_tool_entry"),
+            "the contract-projection guard exempts legacy_serialized_tool_entry, which no \
+             longer exists; re-check whether its exemption is still warranted"
         );
     }
 
