@@ -18,10 +18,6 @@ use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
 use crate::context::RequestContext;
 
-/// OSS is single-tenant; all traffic resolves to the `default`
-/// workspace, which is the one the top-level `rate_limits:` block sizes.
-const DEFAULT_WORKSPACE: &str = "default";
-
 /// Newtype wrapper adapting [`RateLimitBudgetPolicy`] to [`PolicyEnforcer`].
 pub struct RateLimitBudgetEnforcer(pub Arc<RateLimitBudgetPolicy>);
 
@@ -40,10 +36,11 @@ fn response_info(policy: &RateLimitBudgetPolicy, decision: &BudgetDecision) -> R
 fn apply_budget_decision(
     policy: &RateLimitBudgetPolicy,
     decision: &BudgetDecision,
+    workspace: &str,
     ctx: &mut RequestContext,
 ) -> PolicyDecision {
     sbproxy_observe::metrics::record_rate_limit_decision(
-        DEFAULT_WORKSPACE,
+        workspace,
         if decision.allowed {
             "allow"
         } else {
@@ -92,13 +89,16 @@ impl PolicyEnforcer for RateLimitBudgetEnforcer {
             return Box::pin(async move { Ok(PolicyDecision::Allow) });
         };
 
-        // OSS is single-tenant: every request resolves to the `default`
-        // workspace, the same key the admin `/api/rate_limits/effective`
-        // query and the audit `target_id` use. (Enterprise multi-tenant
-        // resolves a per-tenant workspace here.)
-        let _ = &ctx.tenant_id;
-        let decision = registry.check(DEFAULT_WORKSPACE);
-        let outcome = apply_budget_decision(&policy, &decision, ctx);
+        // WOR-2477: key the workspace budget by the origin's configured
+        // tenant. Tenant ids come from proxy.tenants[] / origin config
+        // (compiler-validated, 256-char cap, reserved `__default__`), so
+        // the registry's per-key map stays operator-bounded; a request
+        // cannot mint a new key. Origins with no tenant fall into the
+        // `__default__` bucket, which is byte-for-byte the old behavior
+        // for single-tenant deployments.
+        let workspace = ctx.tenant_id.clone();
+        let decision = registry.check(workspace.as_str());
+        let outcome = apply_budget_decision(&policy, &decision, workspace.as_str(), ctx);
         Box::pin(async move { Ok(outcome) })
     }
 }
@@ -106,16 +106,23 @@ impl PolicyEnforcer for RateLimitBudgetEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbproxy_modules::policy::rate_limit_budget::Tier;
+    use sbproxy_config::types::{
+        RateLimitClockMode, RateLimitEscalationConfig, RateLimitsConfig, WorkspaceBudgetConfig,
+    };
+    use sbproxy_modules::policy::rate_limit_budget::{RateLimitBudgetRegistry, Tier};
 
-    fn decision_count(result: &str) -> u64 {
+    /// Arbitrary workspace label used by tests that only exercise the
+    /// counter-emission plumbing, not tenant-keyed routing itself.
+    const TEST_WORKSPACE: &str = "workspace";
+
+    fn decision_count(policy_label: &str, result: &str) -> u64 {
         prometheus::gather()
             .into_iter()
             .find(|family| family.name() == "sbproxy_rate_limit_decisions_total")
             .and_then(|family| {
                 family.get_metric().iter().find_map(|metric| {
                     let matches = metric.get_label().iter().all(|label| match label.name() {
-                        "policy" => label.value() == DEFAULT_WORKSPACE,
+                        "policy" => label.value() == policy_label,
                         "result" => label.value() == result,
                         _ => true,
                     });
@@ -140,12 +147,12 @@ mod tests {
             reset_secs: 1,
             window_secs: 1,
         };
-        let before_allow = decision_count("allow");
+        let before_allow = decision_count(TEST_WORKSPACE, "allow");
         assert!(matches!(
-            apply_budget_decision(&policy, &allowed, &mut ctx),
+            apply_budget_decision(&policy, &allowed, TEST_WORKSPACE, &mut ctx),
             PolicyDecision::Allow
         ));
-        assert_eq!(decision_count("allow"), before_allow + 1);
+        assert_eq!(decision_count(TEST_WORKSPACE, "allow"), before_allow + 1);
 
         let throttled = BudgetDecision {
             allowed: false,
@@ -155,12 +162,72 @@ mod tests {
             reset_secs: 1,
             window_secs: 1,
         };
-        let before_throttle = decision_count("throttle_tenant");
+        let before_throttle = decision_count(TEST_WORKSPACE, "throttle_tenant");
         assert!(matches!(
-            apply_budget_decision(&policy, &throttled, &mut ctx),
+            apply_budget_decision(&policy, &throttled, TEST_WORKSPACE, &mut ctx),
             PolicyDecision::Deny { status: 429, .. }
         ));
-        assert_eq!(decision_count("throttle_tenant"), before_throttle + 1);
+        assert_eq!(
+            decision_count(TEST_WORKSPACE, "throttle_tenant"),
+            before_throttle + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn tenants_get_independent_budget_buckets() {
+        // One-request budget: tenant-a's second request throttles,
+        // tenant-b's first request on the same enforcer does not, because
+        // WOR-2477 keys the registry's per-workspace map off
+        // `ctx.tenant_id` instead of a single shared default bucket.
+        let registry = RateLimitBudgetRegistry::new(&RateLimitsConfig {
+            workspace_default: WorkspaceBudgetConfig {
+                http_rps_sustained: 1,
+                http_rps_burst: 1,
+                soft_threshold_rps: None,
+            },
+            escalation: RateLimitEscalationConfig::default(),
+            clock: RateLimitClockMode::Manual,
+        });
+        let policy = RateLimitBudgetPolicy::from_config(serde_json::json!({
+            "type": "rate_limit_budget"
+        }))
+        .unwrap();
+
+        let mut ctx_a = RequestContext::new();
+        ctx_a.tenant_id = "tenant-a".into();
+        let workspace_a = ctx_a.tenant_id.as_str().to_string();
+
+        // tenant-a's first request consumes its one-request budget.
+        let first_a = registry.check(&workspace_a);
+        assert!(matches!(
+            apply_budget_decision(&policy, &first_a, &workspace_a, &mut ctx_a),
+            PolicyDecision::Allow
+        ));
+
+        // tenant-a's second request throttles on its own bucket.
+        let second_a = registry.check(&workspace_a);
+        let before_throttle_a = decision_count(&workspace_a, "throttle_tenant");
+        assert!(matches!(
+            apply_budget_decision(&policy, &second_a, &workspace_a, &mut ctx_a),
+            PolicyDecision::Deny { status: 429, .. }
+        ));
+        assert_eq!(
+            decision_count(&workspace_a, "throttle_tenant"),
+            before_throttle_a + 1
+        );
+
+        // tenant-b's first request is allowed: an independent bucket keyed
+        // off its own tenant_id, unaffected by tenant-a's throttle.
+        let mut ctx_b = RequestContext::new();
+        ctx_b.tenant_id = "tenant-b".into();
+        let workspace_b = ctx_b.tenant_id.as_str().to_string();
+        let first_b = registry.check(&workspace_b);
+        let before_allow_b = decision_count(&workspace_b, "allow");
+        assert!(matches!(
+            apply_budget_decision(&policy, &first_b, &workspace_b, &mut ctx_b),
+            PolicyDecision::Allow
+        ));
+        assert_eq!(decision_count(&workspace_b, "allow"), before_allow_b + 1);
     }
 
     #[test]

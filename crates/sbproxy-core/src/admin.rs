@@ -2464,7 +2464,9 @@ pub fn handle_admin_request(
     // exact-match arm below sees the full target including `?...`).
     let path_only = path.split('?').next().unwrap_or(path);
     if path_only == "/api/rate_limits/effective" {
-        let workspace = rl_query_param(path, "workspace").unwrap_or("default");
+        // `workspace` defaults to `__default__`, matching the tenant-keying
+        // convention the serving path enforces (see `context.rs`).
+        let workspace = rl_query_param(path, "workspace").unwrap_or("__default__");
         return match crate::rate_limit_budget::registry() {
             Some(reg) => {
                 let (rps, tier) = reg.effective(workspace);
@@ -2851,6 +2853,37 @@ pub fn handle_admin_request(
         let inventory =
             crate::extension_refresh::inventory_with_health(&pipeline.extension_inventory);
         return match serde_json::to_string(&inventory) {
+            Ok(body) => (200, "application/json", body),
+            Err(error) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {error}"}}"#),
+            ),
+        };
+    }
+    if path_only == "/api/egress" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        // WOR-2476: every upstream endpoint the gateway reached, with its
+        // authorization status and last-seen time. Bounded fields only:
+        // host, port, scheme -- never a full URL, query, or credential.
+        let endpoints = sbproxy_security::egress::egress_inventory_snapshot();
+        let summary = serde_json::json!({
+            "total": endpoints.len(),
+            "denied": endpoints.iter().filter(|e| e.status == "denied").count(),
+            "ungated": endpoints.iter().filter(|e| e.status == "ungated").count(),
+        });
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "summary": summary,
+            "endpoints": endpoints,
+        });
+        return match serde_json::to_string(&body) {
             Ok(body) => (200, "application/json", body),
             Err(error) => (
                 500,
@@ -5750,6 +5783,57 @@ mod tests {
         assert!(snapshot["bundles"].is_array());
         assert!(snapshot["hooks"].is_array());
         assert!(snapshot["collisions"].is_array());
+    }
+
+    #[test]
+    fn admin_egress_endpoint_requires_auth_and_only_answers_get() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, _) = handle_admin_request("GET", "/api/egress", &state, None, None);
+        assert_eq!(status, 401);
+
+        let (status, _, _) =
+            handle_admin_request("POST", "/api/egress", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn admin_egress_endpoint_returns_the_versioned_inventory_snapshot() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        sbproxy_security::egress::record_egress_seen(
+            sbproxy_security::egress::EgressPurpose::Webhook,
+            "https://seeded-admin-test.invalid:8443/hook?secret=x",
+            "admin-test",
+            sbproxy_security::egress::EgressSightingStatus::Ungated,
+            None,
+        );
+
+        let (status, content_type, body) =
+            handle_admin_request("GET", "/api/egress", &state, Some(&auth), None);
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&body).expect("egress inventory must be JSON");
+        assert_eq!(snapshot["schema_version"], 1);
+        let endpoints = snapshot["endpoints"]
+            .as_array()
+            .expect("endpoints must be an array");
+        let entry = endpoints
+            .iter()
+            .find(|e| e["host"] == "seeded-admin-test.invalid")
+            .expect("seeded sighting must appear in the inventory");
+        assert!(entry.get("host").is_some());
+        assert!(entry.get("status").is_some());
+        assert!(entry.get("last_seen_unix_ms").is_some());
+        assert!(
+            entry.get("url").is_none(),
+            "no raw url in an egress entry: {entry}"
+        );
+        assert!(!body.contains("secret=x"), "no query string: {body}");
     }
 
     #[tokio::test]

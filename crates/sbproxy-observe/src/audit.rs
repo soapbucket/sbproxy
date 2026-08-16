@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// A structured record of a single configuration change event.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` and `Clone` exist so this is a
+/// [`sbproxy_meter::ledger::LedgerPayload`]; see [`crate::audit_chain`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigAuditEntry {
     /// RFC 3339 timestamp of the change.
     pub timestamp: String,
@@ -81,8 +84,11 @@ impl ConfigAuditEntry {
     /// histogram with the active trace as exemplar so dashboards can
     /// flag a slow audit sink and hop straight to the originating span.
     /// The `outcome` label is `ok` when JSON serialization succeeds and
-    /// `serialize_error` when it does not (in which case the audit was
-    /// dropped, which is itself worth alerting on).
+    /// the entry reaches the chain (when one is configured),
+    /// `serialize_error` when the JSON encode fails, and `chain_error`
+    /// when a configured chain rejected the append (in each case the
+    /// audit was dropped from that path, which is itself worth
+    /// alerting on).
     pub fn emit(&self) {
         let started = std::time::Instant::now();
         let outcome = match serde_json::to_string(self) {
@@ -110,6 +116,15 @@ impl ConfigAuditEntry {
                 self.origins_modified.len(),
             )),
         ));
+        // WOR-2470: the durable, tamper-evident half, on the same terms
+        // as the security channel: ordered after the ring and the
+        // tracing line because those two are what the running system is
+        // watched through and neither should wait on a disk. A `false`
+        // here means the entry did not reach the chain it was promised,
+        // and folds into the `outcome` label below so that failure is
+        // visible on the histogram rather than silent.
+        let chain_ok = crate::audit_chain::append_config_audit(self);
+        let outcome = if !chain_ok { "chain_error" } else { outcome };
         // WOR-2318: the `events:` egress sees this channel as
         // `config_reloaded`.
         //
@@ -349,8 +364,9 @@ impl SecurityAuditEntry {
     /// WOR-75: the wall-clock time of one emission lands on the
     /// `sbproxy_audit_emit_duration_seconds{channel="security"}`
     /// histogram with the active trace as exemplar. The `outcome`
-    /// label is `ok` on success and `serialize_error` if the JSON
-    /// encode fails (the audit is dropped in that case).
+    /// label is `ok` on success, `serialize_error` if the JSON encode
+    /// fails, and `chain_error` if a configured chain rejected the
+    /// append (in each case the audit was dropped from that path).
     ///
     /// WOR-2318: when `audit.sink: chain` is configured the same entry is
     /// also appended to the hash-chained, Ed25519-signed file at
@@ -382,7 +398,11 @@ impl SecurityAuditEntry {
         // WOR-2318: the durable, tamper-evident half. Ordered after the
         // ring and the tracing line because those two are what the running
         // system is watched through and neither should wait on a disk.
-        crate::audit_chain::append_security_audit(self);
+        // WOR-2478: the append result folds into `outcome` below, so a
+        // chain that will not take the entry is visible on the histogram
+        // rather than silently discarded.
+        let chain_ok = crate::audit_chain::append_security_audit(self);
+        let outcome = if !chain_ok { "chain_error" } else { outcome };
         // WOR-2318: and the egress half. Last, and outside anything that
         // can block: this is a bitmask test and a `try_send` when an
         // `events:` sink is configured, one relaxed load when it is not.
@@ -958,4 +978,74 @@ mod tests {
             .publish_to_event_egress();
         ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![]).emit();
     }
+
+    // --- WOR-2478: config audit entries become chainable ---
+
+    /// End to end through the public emitter, which is the path a config
+    /// change actually takes: with a chain installed, `emit()` must reach
+    /// the file (not merely compile against `LedgerPayload`), and a
+    /// successful append must keep the `outcome` label at `ok` rather than
+    /// folding to `chain_error`.
+    ///
+    /// The chain is process-global and first-write-wins (see
+    /// `crate::audit_chain`'s own tests), so this tolerates another test in
+    /// the same process having already claimed the slot; under nextest
+    /// every test gets its own process, so that branch is only the `cargo
+    /// test --lib` fallback path.
+    #[test]
+    fn config_audit_emit_lands_on_an_installed_chain_with_an_ok_outcome() {
+        let path = std::env::temp_dir().join(format!(
+            "sb-audit-config-emit-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let seed = "cd".repeat(32);
+        let chain = crate::audit_chain::ConfigAuditChain::open(&path, &seed, "audit-emit-test")
+            .expect("chain opens");
+        if crate::audit_chain::install_config_audit_chain(chain).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let entry =
+            ConfigAuditEntry::new("api", vec!["chained.example".to_string()], vec![], vec![])
+                .with_actor("operator-chain-test")
+                .with_revisions(Some("r-chain-prior"), Some("r-chain-next"));
+        let emitted = serde_json::to_string(&entry).expect("entry serializes");
+        entry.emit();
+
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        assert!(
+            content.contains(&emitted),
+            "emit() reached the chain: {content}"
+        );
+
+        let ok_exemplar = crate::exemplars::last_recorded_for_test(
+            "sbproxy_audit_emit_duration_seconds",
+            &[("channel", "config"), ("outcome", "ok")],
+        );
+        assert!(
+            ok_exemplar.is_some(),
+            "a successful chain append must keep the outcome label at ok"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Note on the `chain_error` branch: `ConfigAuditEntry::emit` and
+    // `SecurityAuditEntry::emit` fold `chain_ok` (from
+    // `crate::audit_chain::append_config_audit` /
+    // `append_security_audit`) into `outcome` inline:
+    // `if !chain_ok { "chain_error" } else { outcome }`. Forcing
+    // `chain_ok` to `false` from this module has no injection point: a
+    // read-only chain file does not reproduce it (the ledger holds its
+    // file descriptor open for the process lifetime and POSIX checks
+    // permissions at `open(2)`, not per `write(2)`, so a later `chmod`
+    // never reaches the writer), and a payload that refuses to serialize
+    // would require changing `ConfigAuditEntry` / `SecurityAuditEntry`'s
+    // derive, which is out of scope here. `crate::audit_chain`'s own
+    // `a_failed_append_reports_false_and_latches_the_degraded_flag` test
+    // already proves `append` returns `false` on a failing chain via a
+    // serialize-refusing payload; the one-line fold above is verified by
+    // inspection rather than by a second injected failure.
 }

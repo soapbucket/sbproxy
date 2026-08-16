@@ -1,6 +1,6 @@
 # Guardrails on every prompt, local or hosted
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-16*
 
 ![One guardrail mesh blocking an injection aimed at a local model and redacting PII bound for a hosted one](assets/use-case-guardrails-everywhere.gif)
 
@@ -104,7 +104,7 @@ This is the redactor the mesh borrows for redact-and-continue. `redact_request: 
 
 Without the `mesh` block these three detectors would run serially and block on the first flag. The mesh runs all of them, counts the flags, and fuses: at `block_threshold: 2` a prompt is rejected only when two detectors agree, so one noisy pattern cannot hard-block traffic on its own. Below the quorum, `redact_on_flag` masks the prompt with the `pii` redactor above and forwards it. `cache: true` means a repeated prompt reuses its verdict, and the latency budget stops the cascade from launching expensive detectors once 50 ms are spent. The label set also feeds the `ai.guardrails.*` namespace of the [CEL policy plane](ai-policy-cel.md) if you want to route or audit on `flagged_count` instead of blocking.
 
-One caveat to carry: `detect_common` gives you the built-in substring pattern sets, which catch the OWASP-LLM-01 vocabulary but miss obfuscation, translation, and novel phrasings. This config uses them anyway because they boot with no model download. When you outgrow them, set the safety guardrail to explicit `mode: classifier`; [ai-safety-classifiers](../examples/ai-safety-classifiers/) shows the local enforcing configuration. [local-inference.md](local-inference.md) covers the shared ONNX embedding runtime, while [prompt-injection-v2.md](prompt-injection-v2.md) documents the separate scored prompt-injection detector interface.
+One caveat to carry: `detect_common` gives you the built-in substring pattern sets, which catch the OWASP LLM Top 10 2026 (LLM01) vocabulary but miss obfuscation, translation, and novel phrasings. This config uses them anyway because they boot with no model download. When you outgrow them, set the safety guardrail to explicit `mode: classifier`; [ai-safety-classifiers](../examples/ai-safety-classifiers/) shows the local enforcing configuration. [local-inference.md](local-inference.md) covers the shared ONNX embedding runtime, while [prompt-injection-v2.md](prompt-injection-v2.md) documents the separate scored prompt-injection detector interface.
 
 ## Run it
 

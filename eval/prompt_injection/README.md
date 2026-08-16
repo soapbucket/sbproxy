@@ -19,7 +19,7 @@ substring matcher; we keep the spirit of each pattern but vary the
 surface form so the corpus exercises both exact pattern hits and
 near-miss phrasings the heuristic should still catch.
 
-- OWASP Top 10 for LLM Applications, LLM01 (Prompt Injection):
+- OWASP LLM Top 10 2026, LLM01 (Prompt Injection):
   https://owasp.org/www-project-top-10-for-large-language-model-applications/
 - PROMPTBENCH (Microsoft Research): https://github.com/microsoft/promptbench
 - Prompt Injection corpus by Lakera:
@@ -31,6 +31,8 @@ The clean corpus is hand-written; it covers code questions, factual Q
 and A, language translation, recipes, light creative writing, and DevOps
 topics. None of the entries reference any of the high-confidence
 patterns in the heuristic detector.
+
+Edition tracked: 2026 (published 2026-08-03). LLM01 is unchanged from 2025; re-verify this corpus's framing when the list next revs.
 
 ## Thresholds
 

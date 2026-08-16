@@ -2179,10 +2179,10 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
     )
 }
 
-/// Validate the top-level `audit:` block (WOR-2318).
+/// Validate the top-level `audit:` block (WOR-2318, WOR-2478).
 ///
-/// Three rules, and each one exists because the alternative is a
-/// deployment that believes it has an audit trail.
+/// Each rule exists because the alternative is a deployment that
+/// believes it has an audit trail.
 ///
 /// `sink: tracing` is refused. Emission to the `security_audit`,
 /// `config_audit`, and `key_audit` targets is unconditional and always
@@ -2205,6 +2205,14 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
 /// `proxy.attestation.sign_with` names, deliberately, so a deployment
 /// that already publishes a key does not acquire a second key
 /// distribution problem by turning this on.
+///
+/// `config_path` follows `path`: it is refused without `sink: chain`,
+/// but `sink: chain` does not require it in return, because chaining
+/// `config_audit` is opt-in (WOR-2478). It must also differ from
+/// `path`, because the config channel and the security chain verify
+/// two different payload types independently; letting one file answer
+/// for both would make a verification failure on one look like a
+/// failure of the other.
 fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) -> Result<()> {
     if audit.sink == AuditSinkKind::Tracing {
         anyhow::bail!(
@@ -2229,6 +2237,13 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
                  signed. Set `sink: chain` or remove the identity."
             );
         }
+        if audit.config_path.is_some() {
+            anyhow::bail!(
+                "audit.config_path is set but audit.sink is not `chain`, so nothing would ever \
+                 be written to it. audit.config_path requires `audit.sink: chain`. Set `sink: \
+                 chain` or remove the path."
+            );
+        }
         return Ok(());
     }
 
@@ -2239,6 +2254,15 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
              `/var/lib/sbproxy/security-audit.jsonl`."
         ),
         Some(_) => {}
+    }
+
+    if let Some(config_path) = audit.config_path.as_deref().map(str::trim) {
+        if Some(config_path) == audit.path.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "the config channel cannot share the security chain file; the two payload \
+                 types verify separately"
+            );
+        }
     }
 
     match audit.sign_with.as_deref().map(str::trim) {
@@ -8364,6 +8388,64 @@ origins:
         assert!(
             error.to_string().contains("audit.path"),
             "the refusal names the key that would be ignored: {error}"
+        );
+    }
+
+    // --- WOR-2478: the `config_path` channel ---
+
+    #[test]
+    fn a_config_path_under_the_memory_sink_is_refused_rather_than_ignored() {
+        // The dangerous shape, same as `audit.path` under `sink: memory`:
+        // it reads as configured and chains nothing.
+        let error = compile_config(&audit_yaml(
+            "  sink: memory\n  config_path: /var/lib/sbproxy/config-audit.jsonl",
+            " {}",
+        ))
+        .err()
+        .expect("a config_path nothing writes to must not compile");
+        assert!(
+            error.to_string().contains("audit.config_path"),
+            "the refusal names the key that would be ignored: {error}"
+        );
+        assert!(
+            error.to_string().contains("audit.sink: chain"),
+            "the refusal names what config_path requires: {error}"
+        );
+    }
+
+    #[test]
+    fn a_config_path_equal_to_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a config_path that shares the chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the config channel cannot share the security chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn audit_chain_compiles_with_a_path_sign_with_and_a_distinct_config_path() {
+        let yaml = audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        );
+        let compiled = compile_config(&yaml).expect("compile");
+        let audit = compiled.audit.expect("audit block survives compilation");
+        assert_eq!(audit.sink, AuditSinkKind::Chain);
+        assert_eq!(
+            audit.path.as_deref(),
+            Some("/var/lib/sbproxy/security-audit.jsonl")
+        );
+        assert_eq!(
+            audit.config_path.as_deref(),
+            Some("/var/lib/sbproxy/config-audit.jsonl")
         );
     }
 

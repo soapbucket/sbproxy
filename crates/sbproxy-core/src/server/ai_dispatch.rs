@@ -4106,10 +4106,13 @@ pub(super) async fn handle_ai_proxy(
 
     // Multipart short-circuit: surfaces that carry multipart bodies
     // (audio transcriptions, image edits, image variations, file
-    // uploads) must not be JSON-parsed. We byte-forward the body
-    // with the inbound Content-Type preserved so the upstream provider
-    // parses it normally. A governed route override rewrites only the
-    // bounded `model` part before forwarding.
+    // uploads) must not be JSON-parsed. `AiSurface::accepts_multipart`
+    // is the authority on which surfaces those are; the gate just inside
+    // the branch below (WOR-2472) refuses any surface it does not allow
+    // before this byte-forward path runs. We byte-forward the body with
+    // the inbound Content-Type preserved so the upstream provider parses
+    // it normally. A governed route override rewrites only the bounded
+    // `model` part before forwarding.
     let request_content_type = session
         .req_header()
         .headers
@@ -4122,6 +4125,39 @@ pub(super) async fn handle_ai_proxy(
         .starts_with("multipart/");
 
     if is_multipart_request {
+        // WOR-2472: the multipart branch below bypasses the JSON-body
+        // guardrail, PII, and injection scanning that lives past line
+        // ~4806. That is acceptable only on surfaces whose wire format is
+        // actually multipart, per `AiSurface::accepts_multipart`. A
+        // multipart Content-Type on a classified JSON surface (chat
+        // completions, embeddings, ...) is a caller relabeling their way
+        // around body inspection; refuse it before any budget, guardrail,
+        // or upstream work happens.
+        if !surface.accepts_multipart() {
+            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                "multipart_disallowed_surface",
+                "multipart content-type on a JSON AI surface",
+                403,
+                Some(hostname.to_string()),
+                ctx.client_ip,
+                Some(ctx.request_id.to_string()),
+                Some(session.req_header().method.as_str().to_string()),
+            )
+            .with_tenant_id(ctx.tenant_id.as_str())
+            .with_key_context(
+                ctx.native_key_provider.clone(),
+                ctx.inbound_key_mode.as_str(),
+            )
+            .with_api_key_id(ctx.accountable_key_id())
+            .emit();
+            send_error(
+                session,
+                403,
+                "multipart/form-data is not accepted on this AI surface",
+            )
+            .await?;
+            return Ok(());
+        }
         if credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
             send_error(
                 session,
@@ -15713,6 +15749,48 @@ origins:
             multipart_inspection_skipped_count("pii_redaction", "audio_transcription") > pii_before,
             "configured request PII redaction was bypassed without being counted"
         );
+    }
+
+    /// WOR-2472: `AiSurface::accepts_multipart` does not allow chat
+    /// completions. A caller who sends the same multipart body a
+    /// legitimate audio-transcription request sends, but points it at
+    /// `/v1/chat/completions` instead, is relabeling their way around
+    /// every JSON-body guardrail, PII, and injection check this handler
+    /// does. Before WOR-2472 there was no gate keyed on the classified
+    /// surface at all, so this reached the upstream unscreened; now it
+    /// must be refused before any budget, guardrail, or upstream work.
+    #[tokio::test]
+    async fn multipart_on_chat_completions_is_refused_before_upstream() {
+        // Same body bytes a legitimate audio request sends; only the path
+        // differs.
+        let (upstream_url, upstream_hits) =
+            upstream_fixture(r#"{"id":"unreachable"}"#).await;
+        let config = builtin_guardrail_and_pii_config(&upstream_url);
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/chat/completions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart-on-disallowed-surface request is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("not accepted on this AI surface"),
+            "{response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
     }
 
     /// WOR-2312: the bypass this closes.

@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -54,7 +54,7 @@ pre-loads state at startup, not in `detect` itself.
 
 | Name | Description |
 |------|-------------|
-| `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Explicit choice and the no-artifact auto fallback. |
+| `heuristic-v1` | Case-insensitive substring matching against the OWASP LLM Top 10 2026 (LLM01) vocabulary plus a small "suspicious" cue list. Explicit choice and the no-artifact auto fallback. |
 | `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
 | `inprocess` | Runs the ONNX classifier inside the proxy via the pure-Rust tract engine. It can be selected explicitly or automatically when `detector` is omitted and a complete verified pair is staged. Prefer `sidecar` for process isolation. See [In-process detection](#in-process-detection-the-inprocess-detector). |
 
@@ -158,9 +158,9 @@ The repo ships golden corpora at `eval/prompt_injection/`, four files
 totalling 71 injection prompts and 93 clean prompts:
 
 - `golden_injection.txt`: 33 known-injection prompts paraphrased from
-  OWASP-LLM-01, PROMPTBENCH, and similar public corpora.
+  OWASP LLM Top 10 2026 (LLM01), PROMPTBENCH, and similar public corpora.
 - `golden_injection_owasp.txt`: 38 further injection prompts
-  paraphrased from the OWASP LLM01 taxonomy.
+  paraphrased from the OWASP LLM Top 10 2026 (LLM01) taxonomy.
 - `golden_clean.txt`: 35 known-clean prompts (typical user queries).
 - `golden_clean_v2.txt`: 58 additional known-clean prompts modeled on
   public conversation corpora (ShareGPT, WildChat, HH-RLHF): code
@@ -647,7 +647,7 @@ The heuristic detector is a substring matcher. It does not handle:
 - **Indirect injection.** Prompts that smuggle the attack through a
   retrieved document (RAG poisoning) sail through; the detector only
   sees the inbound prompt.
-- **Novel phrasings.** Anything outside the published OWASP-LLM-01
+- **Novel phrasings.** Anything outside the published OWASP LLM Top 10 2026 (LLM01)
   vocabulary is missed unless it happens to share a substring.
 
 These are the gaps an eligible ONNX classifier is intended to reduce.

@@ -849,6 +849,22 @@ pub fn apply_redaction(json: &str, sink: Sink) -> String {
     apply_redaction_for(json, sink, None, None)
 }
 
+/// Sink-agnostic line redaction: the ten secret regexes plus the
+/// field-key denylist (`prompt`, `messages`, `tool_arguments`, ...),
+/// without the per-tenant operator rules that `apply_redaction_for`
+/// layers on. For emitters that write JSON lines outside the
+/// StructuredLog path (request events, access log). WOR-2473.
+pub fn redact_json_line(input: &str) -> String {
+    let secrets_scrubbed = crate::redact::redact_secrets(input);
+    match serde_json::from_str::<serde_json::Value>(&secrets_scrubbed) {
+        Ok(mut value) => {
+            redact_value(&mut value, Sink::AccessLog, &[]);
+            serde_json::to_string(&value).unwrap_or(secrets_scrubbed)
+        }
+        Err(_) => secrets_scrubbed,
+    }
+}
+
 /// Tenant- and route-aware variant of [`apply_redaction`]. The hot
 /// emit path threads `StructuredLog.tenant_id` and `StructuredLog.route`
 /// into the resolver so the PII pass can pick a tenant- or origin-scope
@@ -1118,7 +1134,7 @@ fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'st
     if k == "payment_receipt_secret" || k == "x-sb-receipt-secret" || k == "x_sb_receipt_secret" {
         return Some("[REDACTED:PAYMENT_RECEIPT_SECRET]");
     }
-    if k == "prompt" || k == "messages" {
+    if k == "prompt" || k == "messages" || k == "tool_arguments" {
         return Some("[REDACTED:PROMPT_BODY]");
     }
     if k == "envelope_payload_raw" {
@@ -1397,6 +1413,22 @@ mod tests {
             !out.contains("<redacted:"),
             "legacy v1-shape marker leaked: {out}"
         );
+    }
+
+    #[test]
+    fn redact_json_line_covers_prompt_and_tool_arguments_keys() {
+        let line = r#"{"prompt":"steal the plans","tool_arguments":"{\"cmd\":\"rm\"}","ok":"x"}"#;
+        let out = redact_json_line(line);
+        assert!(out.contains("[REDACTED:PROMPT_BODY]"), "{out}");
+        assert!(!out.contains("steal the plans"), "{out}");
+        assert!(!out.contains("rm"), "{out}");
+        assert!(out.contains("\"ok\":\"x\""), "{out}");
+    }
+
+    #[test]
+    fn redact_json_line_on_non_json_still_scrubs_secrets() {
+        let out = redact_json_line("bearer sk-abc123def456ghi789jkl012");
+        assert!(!out.contains("sk-abc123def456ghi789jkl012"), "{out}");
     }
 
     #[test]

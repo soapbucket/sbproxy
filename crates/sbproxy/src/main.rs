@@ -180,8 +180,8 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
-    /// Audit-trail tools (verify the tamper-evident security audit
-    /// chain).
+    /// Audit-trail tools (verify the tamper-evident security or config
+    /// audit chain).
     Audit(AuditCmd),
     /// Admin-account maintenance (password hashing, ...).
     Admin(AdminCliCmd),
@@ -860,9 +860,11 @@ struct AuditCmd {
 
 #[derive(Subcommand, Debug)]
 enum AuditSub {
-    /// Re-derive the security audit chain written by `audit.sink: chain`
-    /// and report the first record that does not check out. Exit 0 when
-    /// the trail verifies, 1 when it does not.
+    /// Re-derive an audit chain from genesis and report the first record
+    /// that does not check out. `--channel security` (default) verifies
+    /// the trail `audit.sink: chain` writes; `--channel config` verifies
+    /// the config-authority decision trail. Exit 0 when the trail
+    /// verifies, 1 when it does not.
     Verify(AuditVerifyArgs),
 }
 
@@ -880,6 +882,13 @@ struct AuditVerifyArgs {
     /// single structured object for CI consumption.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Which chain to verify: `security` (default), the tamper-evident
+    /// trail `audit.sink: chain` writes, or `config`, the trail of
+    /// config-authority decisions. The two channels write different
+    /// payload shapes to different files, so pass the channel that
+    /// matches the file at `path`.
+    #[arg(long = "channel", value_parser = ["security", "config"], default_value = "security")]
+    channel: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -8920,21 +8929,26 @@ fn handle_audit_subcommand(cmd: &AuditCmd) -> anyhow::Result<i32> {
     }
 }
 
-/// `sbproxy audit verify`: re-derive the security audit chain from
-/// genesis and report the first record that does not check out.
+/// `sbproxy audit verify`: re-derive the security or config audit chain
+/// from genesis and report the first record that does not check out.
 ///
 /// Reads the file and nothing else. No config, no admin API, no running
 /// proxy: an auditor with a copy of the chain and the public key can run
 /// this against a file the proxy that wrote it no longer has, which is
 /// the point of signing the entries rather than merely logging them.
 fn handle_audit_verify(args: &AuditVerifyArgs) -> anyhow::Result<i32> {
-    use sbproxy_observe::audit_chain::{verify_security_audit_chain, verifying_key_from_seed_hex};
+    use sbproxy_observe::audit_chain::{
+        verify_config_audit_chain, verify_security_audit_chain, verifying_key_from_seed_hex,
+    };
 
     let verifying_key = match args.signing_seed_hex.as_deref() {
         Some(seed) => Some(verifying_key_from_seed_hex(seed)?),
         None => None,
     };
-    let result = verify_security_audit_chain(&args.path, verifying_key.as_ref())?;
+    let result = match args.channel.as_str() {
+        "config" => verify_config_audit_chain(&args.path, verifying_key.as_ref())?,
+        _ => verify_security_audit_chain(&args.path, verifying_key.as_ref())?,
+    };
     let path_str = args.path.to_string_lossy();
 
     match args.format {
@@ -12812,6 +12826,7 @@ hooks:
                 path: path.clone(),
                 signing_seed_hex: seed_hex.map(str::to_string),
                 format: OutputFormat::Json,
+                channel: "security".to_string(),
             })
         };
 
@@ -12855,6 +12870,27 @@ hooks:
                     );
                     assert_eq!(args.signing_seed_hex.as_deref(), Some("00"));
                     assert!(matches!(args.format, OutputFormat::Json));
+                    assert_eq!(args.channel, "security", "default channel is security");
+                }
+            },
+            other => panic!("expected Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_verify_subcommand_with_config_channel() {
+        let cli = parse(&[
+            "sbproxy",
+            "audit",
+            "verify",
+            "/var/lib/sbproxy/config-audit.jsonl",
+            "--channel",
+            "config",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Audit(cmd)) => match cmd.sub {
+                AuditSub::Verify(args) => {
+                    assert_eq!(args.channel, "config");
                 }
             },
             other => panic!("expected Audit, got {other:?}"),

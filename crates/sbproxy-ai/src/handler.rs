@@ -1530,6 +1530,25 @@ impl AiSurface {
         }
     }
 
+    /// Whether this surface legitimately carries a `multipart/form-data`
+    /// request body. The OpenAI-compatible API takes multipart on image
+    /// edits, image variations, audio transcription/translation, and file
+    /// uploads; every other classified surface is JSON. `Unknown` returns
+    /// true because unclassified pass-through paths may serve formats this
+    /// table has no opinion on; the gate exists to stop a multipart
+    /// Content-Type from relabeling a *known JSON* surface past the
+    /// body-aware checks (WOR-2472).
+    pub fn accepts_multipart(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ImageEdits
+                | AiSurface::ImageVariations
+                | AiSurface::AudioTranscription
+                | AiSurface::Files
+                | AiSurface::Unknown
+        )
+    }
+
     /// The OpenTelemetry GenAI `gen_ai.operation.name` for this surface
     /// (WOR-2085).
     ///
@@ -3615,5 +3634,19 @@ mod tests {
                 surface.label()
             );
         }
+    }
+
+    #[test]
+    fn multipart_acceptance_is_an_allowlist_of_multipart_surfaces() {
+        assert!(AiSurface::ImageEdits.accepts_multipart());
+        assert!(AiSurface::ImageVariations.accepts_multipart());
+        assert!(AiSurface::AudioTranscription.accepts_multipart());
+        assert!(AiSurface::Files.accepts_multipart());
+        assert!(AiSurface::Unknown.accepts_multipart());
+        assert!(!AiSurface::ChatCompletions.accepts_multipart());
+        assert!(!AiSurface::Embeddings.accepts_multipart());
+        assert!(!AiSurface::ImageGeneration.accepts_multipart());
+        assert!(!AiSurface::Messages.accepts_multipart());
+        assert!(!AiSurface::Responses.accepts_multipart());
     }
 }

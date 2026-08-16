@@ -502,7 +502,7 @@ impl AccessLogEntry {
     /// Render this entry as one redacted JSON line.
     pub fn redacted_json_line(&self) -> anyhow::Result<String> {
         let json = serde_json::to_string(self)?;
-        Ok(crate::redact::redact_secrets(&json))
+        Ok(crate::logging::redact_json_line(&json))
     }
 
     /// Append this entry to a file sink, rotating before write when the
@@ -1633,5 +1633,36 @@ mod tests {
         assert_eq!(v["request_headers"]["user-agent"], "curl/8.0");
         assert_eq!(v["request_headers"]["referer"], "https://example.com");
         assert_eq!(v["response_headers"]["x-cache"], "HIT");
+    }
+
+    #[test]
+    fn redacted_json_line_redacts_query_and_properties_secrets() {
+        // Verify that redacted_json_line (via crate::logging::redact_json_line)
+        // redacts secrets from both query and properties fields.
+        let mut entry = minimal_entry();
+        entry.query = Some("api_key=sk-abc123def456ghi789jkl012".into());
+
+        let mut props = BTreeMap::new();
+        props.insert(
+            "authorization".to_string(),
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".into(),
+        );
+        entry.properties = props;
+
+        let redacted = entry.redacted_json_line().unwrap();
+
+        // Verify neither secret appears in the redacted line.
+        assert!(
+            !redacted.contains("sk-abc123def456ghi789jkl012"),
+            "API key should be redacted from query"
+        );
+        assert!(
+            !redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "Bearer token should be redacted from properties"
+        );
+
+        // Verify redaction markers appear.
+        assert!(redacted.contains("sk-[REDACTED]"));
+        assert!(redacted.contains("Bearer [REDACTED]"));
     }
 }
