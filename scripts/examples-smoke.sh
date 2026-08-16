@@ -476,6 +476,8 @@ run_example() {
   # --- Liveness probe ---
   if ! wait_for_healthz "$admin_port" "$health_path"; then
     echo "[examples-smoke] $dir: FAIL - $health_path never returned 200 on :$admin_port" >&2
+    cleanup_example "$dir"
+    trap - EXIT INT TERM
     return 1
   fi
   echo "[examples-smoke] $dir: $health_path on :$admin_port -> OK"
@@ -483,6 +485,8 @@ run_example() {
   # --- Declarative cases (preferred) ---
   if [ "$(smoke_cases_count "$dir")" -gt 0 ]; then
     if ! run_declared_cases "$dir" "$data_port"; then
+      cleanup_example "$dir"
+      trap - EXIT INT TERM
       return 1
     fi
   fi
@@ -516,6 +520,8 @@ run_example() {
         *)
           echo "[examples-smoke] $dir: FAIL - $ep on :$data_port returned $code (expected 2xx)" >&2
           rm -f "$endpoints_file" "$seen_file"
+          cleanup_example "$dir"
+          trap - EXIT INT TERM
           return 1
           ;;
       esac
@@ -531,6 +537,8 @@ run_example() {
     true|True|TRUE|1|yes)
       if ! assert_audit_emitted "$admin_port"; then
         echo "[examples-smoke] $dir: FAIL - no audit-log entry observed on :$admin_port" >&2
+        cleanup_example "$dir"
+        trap - EXIT INT TERM
         return 1
       fi
       echo "[examples-smoke] $dir: audit-log on :$admin_port -> OK"
