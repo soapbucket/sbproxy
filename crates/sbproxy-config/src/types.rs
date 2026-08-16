@@ -69,6 +69,13 @@ pub struct ConfigFile {
     /// `security_audit` event to a hash-chained, signed file.
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+    /// Operator-authored egress allowlists that arm the AiProvider,
+    /// UsageSink, ModelArtifact, TokenExchange, and Telemetry purposes
+    /// (WOR-2476, WOR-2481). Absent, or a sub-block omitted within it,
+    /// keeps the corresponding purpose exactly as ungated as it was
+    /// before this section existed. See [`EgressTopLevelConfig`].
+    #[serde(default)]
+    pub egress: Option<EgressTopLevelConfig>,
     /// WOR-1186: emit the canonical session ledger (per-tool-call run
     /// records) from the live MCP `tools/call` path. Off unless this
     /// block is present and `enabled: true`.
@@ -430,6 +437,113 @@ pub enum AuditSinkKind {
     /// and admin-console channels into their own chain files under the
     /// same signing identity (WOR-2478).
     Chain,
+}
+
+/// Top-level `egress:` section: operator-authored allowlists that arm the
+/// per-purpose egress gates (WOR-2476), plus the OTLP exporter gate
+/// (WOR-2481).
+///
+/// Reuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI
+/// `egress:` block already ships
+/// (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot
+/// depend on `sbproxy-extension` (that dependency runs the other way), so
+/// the shape is redeclared here rather than shared by type.
+///
+/// Every sub-block is independently optional. A purpose whose sub-block is
+/// omitted stays legacy ungated: `AiClient`'s documented `None` contract,
+/// the usage sinks' unauthenticated dispatch, the model-artifact fetcher's
+/// unauthenticated download, the non-MCP token-exchange resolver, and the
+/// OTLP exporters all keep behaving exactly as they did before this
+/// section existed. `compile_config` compiles each configured sub-block
+/// into a [`sbproxy_security::egress::EgressAuthorizer`] once, on
+/// [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses
+/// this raw struct directly.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EgressTopLevelConfig {
+    /// Arms `EgressPurpose::AiProvider`: every upstream AI provider
+    /// dispatch the AI gateway's client makes.
+    #[serde(default)]
+    pub ai_providers: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::UsageSink`: webhook, Langfuse, Datadog, and
+    /// object-store usage-sink deliveries.
+    #[serde(default)]
+    pub usage_sinks: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::ModelArtifact`: the model-host artifact
+    /// fetcher's HTTP downloads.
+    #[serde(default)]
+    pub model_artifacts: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::TokenExchange` for the non-MCP outbound
+    /// credential resolver's OAuth token-endpoint calls. The MCP token
+    /// exchange path (`sbproxy_extension::mcp::auth`) has its own
+    /// `egress:` block and is unaffected by this section.
+    #[serde(default)]
+    pub token_exchange: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric,
+    /// and log exporter endpoints. Authorized once at boot, where each
+    /// exporter is constructed; a config reload does not re-verify an
+    /// already-running exporter (WOR-2481 tracks closing that gap).
+    #[serde(default)]
+    pub telemetry: Option<EgressPurposeConfig>,
+}
+
+/// One purpose's allowlist under the top-level `egress:` section.
+///
+/// Shares its vocabulary with the per-tool MCP/OpenAPI `egress:` block;
+/// see `sbproxy_extension::mcp::egress::EgressPolicy` for the enforcement
+/// semantics this compiles to. Only `hosts` (exact match) and
+/// `allow_private` are supported here; the per-tool block's `suffixes`
+/// has no equivalent in this section.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EgressPurposeConfig {
+    /// Default behavior for hosts that do not match `hosts`.
+    /// `allow_by_default` (the default) is inert: the purpose stays
+    /// legacy ungated even though `hosts` is present, mirroring the
+    /// per-tool block's `EgressMode::AllowByDefault` short-circuit. Set
+    /// `deny_by_default` to actually arm the gate.
+    #[serde(default)]
+    pub mode: EgressPurposeMode,
+    /// Exact hostnames, compared case-insensitively. Ignored under
+    /// `allow_by_default`.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// When true, resolved private/link-local addresses are permitted for
+    /// hosts on this allowlist (operator opt-in).
+    #[serde(default)]
+    pub allow_private: bool,
+}
+
+/// Egress behavior when a destination host does not match `hosts`
+/// (mirrors `sbproxy_extension::mcp::egress::EgressMode`, minus its
+/// `enforce` alias).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPurposeMode {
+    /// Only explicitly listed `hosts` may be contacted; compiles to a
+    /// real `EgressAuthorizer` that fails closed.
+    DenyByDefault,
+    /// All hosts may be contacted. Legacy default: an omitted `mode:`, or
+    /// an omitted sub-block entirely, compiles to no authorizer at all.
+    #[default]
+    AllowByDefault,
+}
+
+impl EgressPurposeMode {
+    /// True when this mode arms a real authorizer (fails closed).
+    pub fn is_enforce(self) -> bool {
+        matches!(self, Self::DenyByDefault)
+    }
 }
 
 /// WOR-1186: session-ledger emission configuration.

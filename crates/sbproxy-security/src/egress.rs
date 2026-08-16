@@ -102,6 +102,10 @@ pub enum EgressPurpose {
     EngineArtifact,
     /// Extension bundle hook outbound call (`net:outbound` grant).
     BundleHook,
+    /// OTLP trace/metric/log exporter endpoint (WOR-2481). Authorized once
+    /// at boot, where the exporter is constructed; config reload does not
+    /// re-verify it.
+    Telemetry,
 }
 
 impl EgressPurpose {
@@ -118,6 +122,7 @@ impl EgressPurpose {
             Self::ModelArtifact => "model_artifact",
             Self::EngineArtifact => "engine_artifact",
             Self::BundleHook => "bundle_hook",
+            Self::Telemetry => "telemetry",
         }
     }
 }
@@ -136,10 +141,12 @@ pub struct PurposeAllowlist {
     pub allow_private: bool,
 }
 
-/// Sketched top-level egress config (`proxy.egress`).
+/// Top-level egress config: one allowlist per purpose.
 ///
-/// Not wired to any config loader in this lane; callers construct it
-/// in tests or later adoption lanes.
+/// `sbproxy_config::compiler::compile_egress_gates` builds one of these
+/// per configured purpose from the operator-facing top-level `egress:`
+/// section (WOR-2476, WOR-2481); tests still construct it directly to
+/// exercise [`EgressAuthorizer`] without a config file.
 #[derive(Debug, Clone, Default)]
 pub struct EgressConfig {
     /// Allowlists keyed by purpose. Missing purpose => default deny.
@@ -882,6 +889,68 @@ pub fn egress_inventory_snapshot() -> Vec<EgressSighting> {
     sightings
 }
 
+// --- Configured-gate registry (WOR-2476, WOR-2481) ---
+//
+// The operator-facing top-level `egress:` config section
+// (`sbproxy_config::types::EgressTopLevelConfig`) compiles one
+// [`EgressAuthorizer`] per purpose it configures. `sbproxy-config` has no
+// business owning process-wide mutable state, and the consumers that need
+// the compiled authorizer (`AiClient`, the usage sinks, the model-artifact
+// fetcher, the outbound-credential resolver, the OTLP exporters) are spread
+// across five crates, several of them reached lazily, well past the config
+// compile call site. Rather than thread a parameter through every layer in
+// between, this registry mirrors [`egress_inventory`]'s shape: a
+// process-wide slot behind a free-function API, so any call site that
+// wants the currently configured authorizer for a purpose reads it with no
+// plumbing. `sbproxy_core::server::lifecycle` installs a fresh value for
+// each purpose at boot and on every successful config reload (in lockstep
+// with `reload_ai_client` and the other `install_*_from_config`
+// installers); the `Telemetry` purpose is the one exception, installed
+// once at boot only, since the OTLP exporters are never rebuilt on reload
+// (WOR-2481 tracks adding that).
+
+fn configured_gates() -> &'static std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Install (or clear) the process-wide authorizer configured for `purpose`.
+///
+/// `Some(authorizer)` arms the purpose: every later [`configured_gate`]
+/// read for `purpose` returns it. `None` clears whatever a previous config
+/// installed, so a reload that drops the purpose's `egress.*` sub-block
+/// returns it to the legacy ungated contract instead of pinning the last
+/// configured allowlist forever.
+pub fn install_configured_gate(purpose: EgressPurpose, authorizer: Option<EgressAuthorizer>) {
+    let mut gates = match configured_gates().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match authorizer {
+        Some(authorizer) => {
+            gates.insert(purpose, authorizer);
+        }
+        None => {
+            gates.remove(&purpose);
+        }
+    }
+}
+
+/// Read the process-wide authorizer currently configured for `purpose`.
+///
+/// `None` means the purpose's `egress.*` sub-block is omitted (or has
+/// never been installed), which every consumer treats as the legacy
+/// ungated contract: dispatch proceeds and the sighting is stamped
+/// [`EgressSightingStatus::Ungated`], never `Allowed`.
+pub fn configured_gate(purpose: EgressPurpose) -> Option<EgressAuthorizer> {
+    let gates = match configured_gates().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    gates.get(&purpose).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +972,14 @@ mod tests {
             inventory.clear();
         }
         egress_inventory_saturated().store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clears every installed configured-gate entry. Callers must hold
+    /// [`test_state_lock`] first, same as [`reset_egress_inventory`].
+    fn reset_configured_gates() {
+        if let Ok(mut gates) = configured_gates().lock() {
+            gates.clear();
+        }
     }
 
     struct MapResolver {
@@ -1572,5 +1649,42 @@ mod tests {
             !serialized.contains("/oauth/token"),
             "no full URL: {serialized}"
         );
+    }
+
+    #[test]
+    fn configured_gate_round_trips_install_and_clear() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_configured_gates();
+
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_none(),
+            "a purpose nothing installed must read back as unconfigured"
+        );
+
+        let mut allow = PurposeAllowlist::default();
+        allow.hosts.insert("sink.example.com".to_string());
+        allow.schemes.insert("https".to_string());
+        allow.ports.insert(443);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::UsageSink, allow);
+        let authorizer = EgressAuthorizer::new(EgressConfig { purposes });
+        install_configured_gate(EgressPurpose::UsageSink, Some(authorizer));
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_some(),
+            "an installed authorizer must read back"
+        );
+        assert!(
+            configured_gate(EgressPurpose::AiProvider).is_none(),
+            "installing one purpose must not arm another"
+        );
+
+        install_configured_gate(EgressPurpose::UsageSink, None);
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_none(),
+            "installing None must clear a previously configured purpose, so a reload that \
+             drops the sub-block returns to the legacy ungated contract"
+        );
+
+        reset_configured_gates();
     }
 }

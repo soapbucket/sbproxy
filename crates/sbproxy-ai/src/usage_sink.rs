@@ -11,9 +11,9 @@
 //! a failure: a broken sink cannot fail the request it is logging.
 
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
-    EgressAuthorizer, EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
-    RedirectRule,
+    configured_gate, evaluate_hop, record_egress_refused, record_egress_seen,
+    CachedSystemResolver, EgressAuthorizer, EgressDenied, EgressPurpose, EgressSightingStatus,
+    HostResolver, RedirectRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1275,10 +1275,24 @@ pub enum UsageSinkConfig {
 impl UsageSinkConfig {
     /// Build the runtime sink for this config entry. Returned as an `Arc` so a
     /// single instance is shared across every request for the origin.
+    ///
+    /// WOR-2476: every network-reaching sink variant (`Webhook`,
+    /// `Langfuse`, `Datadog`, `S3`, `Gcs`) attaches the process-wide
+    /// `EgressPurpose::UsageSink` authorizer via `with_egress` when the
+    /// top-level `egress.usage_sinks:` section configured one.
+    /// `JsonlFile`, `Ledger`, and `Otel` never reach the network, so
+    /// there is nothing here for an authorizer to gate.
     pub fn build(&self) -> std::sync::Arc<dyn UsageSink> {
+        let egress = configured_gate(EgressPurpose::UsageSink);
         match self {
             UsageSinkConfig::JsonlFile { path } => std::sync::Arc::new(JsonlFileSink::new(path)),
-            UsageSinkConfig::Webhook { url } => std::sync::Arc::new(WebhookSink::new(url)),
+            UsageSinkConfig::Webhook { url } => {
+                let mut sink = WebhookSink::new(url);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
+            }
             UsageSinkConfig::Ledger {
                 path,
                 signing_seed_hex,
@@ -1287,22 +1301,42 @@ impl UsageSinkConfig {
                 host,
                 public_key,
                 secret_key,
-            } => std::sync::Arc::new(LangfuseSink::new(host, public_key, secret_key)),
+            } => {
+                let mut sink = LangfuseSink::new(host, public_key, secret_key);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
+            }
             UsageSinkConfig::Datadog {
                 api_key,
                 site,
                 service,
-            } => std::sync::Arc::new(DatadogSink::new(
-                site,
-                api_key,
-                service.clone().unwrap_or_else(|| "sbproxy".to_string()),
-            )),
+            } => {
+                let mut sink = DatadogSink::new(
+                    site,
+                    api_key,
+                    service.clone().unwrap_or_else(|| "sbproxy".to_string()),
+                );
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
+            }
             UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
             UsageSinkConfig::S3 { bucket, prefix } => {
-                std::sync::Arc::new(ObjectStoreSink::s3(bucket, prefix))
+                let mut sink = ObjectStoreSink::s3(bucket, prefix);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
             }
             UsageSinkConfig::Gcs { bucket, prefix } => {
-                std::sync::Arc::new(ObjectStoreSink::gcs(bucket, prefix))
+                let mut sink = ObjectStoreSink::gcs(bucket, prefix);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
             }
         }
     }
@@ -1862,6 +1896,61 @@ mod tests {
             &["collector.example.com"],
         ));
         sink.record(&sample_event());
+    }
+
+    #[test]
+    fn config_build_arms_a_usage_sink_from_the_top_level_egress_registry() {
+        // WOR-2476: proves the whole seam, not just the `with_egress`
+        // builder in isolation. `UsageSinkConfig::build()` (what a
+        // compiled `AiHandlerConfig` actually calls) reads the
+        // process-wide `EgressPurpose::UsageSink` gate that
+        // `sbproxy_config::compiler::compile_egress_gates` would install
+        // from a `egress.usage_sinks.mode: deny_by_default` block, and
+        // the resulting sink refuses to dispatch to a host outside it.
+        sbproxy_security::egress::install_configured_gate(
+            EgressPurpose::UsageSink,
+            Some(enforce_purpose(
+                EgressPurpose::UsageSink,
+                &["collector.example.com"],
+            )),
+        );
+
+        let sink = UsageSinkConfig::Webhook {
+            url: "https://evil.example/ingest".to_string(),
+        }
+        .build();
+        // Must not panic: a WebhookSink that dispatched would
+        // `tokio::spawn` with no ambient runtime in this plain #[test].
+        sink.record(&sample_event());
+
+        let denied = sbproxy_security::egress::egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.purpose == EgressPurpose::UsageSink.as_label() && s.host == "evil.example")
+            .expect("the denied dispatch must be stamped in the inventory");
+        assert_eq!(denied.status, "denied");
+
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::UsageSink, None);
+    }
+
+    #[test]
+    fn config_build_leaves_a_usage_sink_ungated_when_the_registry_is_unset() {
+        // WOR-2476: an omitted `egress.usage_sinks:` sub-block (nothing
+        // installed in the registry) must preserve the exact legacy
+        // ungated contract: `build()` returns a sink with no authorizer
+        // attached, so `record()` proceeds. Guards the entry point tests
+        // above depend on staying `None` by default.
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::UsageSink, None);
+
+        let sink = UsageSinkConfig::Webhook {
+            url: "https://evil.example/ingest".to_string(),
+        }
+        .build();
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_none(),
+            "test precondition: the registry must be unset"
+        );
+        // Building must not fail or panic; the sink is legacy ungated.
+        let _ = sink;
     }
 
     /// One-shot loopback fixture serving `response` verbatim, reporting

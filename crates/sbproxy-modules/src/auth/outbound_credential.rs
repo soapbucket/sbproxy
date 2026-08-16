@@ -858,12 +858,17 @@ fn cred_cache() -> &'static DashMap<String, CachedCred> {
 ///
 /// Prefer [`resolve_cached_isolated`] for run-as-user paths so tokens
 /// for user A are never served to user B when subject tokens collide.
+///
+/// `egress` gates token-endpoint HTTP for `EgressPurpose::TokenExchange`
+/// (WOR-2476). `None` preserves legacy ungated token exchange.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_cached(
     origin_id: &str,
     cfg: &OutboundCredentialConfig,
     http: &reqwest::Client,
     subject_token: Option<&str>,
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+    egress: Option<&EgressAuthorizer>,
     trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Result<MintedCredential> {
     resolve_cached_isolated(
@@ -873,7 +878,7 @@ pub async fn resolve_cached(
         http,
         subject_token,
         secret_lookup,
-        None,
+        egress,
         trace_ctx,
     )
     .await

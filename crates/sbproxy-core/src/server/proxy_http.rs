@@ -2567,12 +2567,19 @@ impl ProxyHttp for SbProxy {
             // closed, so the token exchange has no ambient span to read
             // and the request's context is handed over explicitly.
             let cred_trace_ctx = ctx.trace_ctx.clone();
+            // WOR-2476: wires the `EgressPurpose::TokenExchange` gate
+            // from the top-level `egress.token_exchange:` section, when
+            // configured.
+            let token_exchange_egress = sbproxy_security::egress::configured_gate(
+                sbproxy_security::egress::EgressPurpose::TokenExchange,
+            );
             match sbproxy_modules::auth::outbound_credential::resolve_cached(
                 &ctx.hostname,
                 cred_cfg,
                 forward_auth_client(),
                 inbound_bearer.as_deref(),
                 &lookup,
+                token_exchange_egress.as_ref(),
                 cred_trace_ctx.as_ref(),
             )
             .await

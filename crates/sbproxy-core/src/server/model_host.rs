@@ -376,7 +376,9 @@ fn load_catalog_path(configured: Option<&str>, config_dir: &Path) -> Result<Arc<
 fn artifact_transport() -> Result<Arc<dyn ArtifactTransport>, String> {
     #[cfg(feature = "model-weights")]
     {
-        sbproxy_model_host::HttpArtifactTransport::new()
+        // WOR-2476: wires the `EgressPurpose::ModelArtifact` gate from
+        // the top-level `egress.model_artifacts:` section, when configured.
+        sbproxy_model_host::HttpArtifactTransport::with_configured_egress()
             .map(|transport| Arc::new(transport) as Arc<dyn ArtifactTransport>)
             .map_err(|error| error.to_string())
     }

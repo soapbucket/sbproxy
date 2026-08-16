@@ -208,6 +208,26 @@ impl HttpArtifactTransport {
         self
     }
 
+    /// Construct a transport wired to the process-wide `ModelArtifact`
+    /// egress gate, if the operator's top-level `egress.model_artifacts:`
+    /// sub-block configured one (WOR-2476).
+    ///
+    /// Equivalent to `Self::new()?.with_egress(authorizer)` when
+    /// `sbproxy_security::egress`'s configured-gate registry has an
+    /// authorizer installed for `EgressPurpose::ModelArtifact`, and plain
+    /// `Self::new()` (legacy ungated) otherwise. The production entry
+    /// point every server-construction call site should use in place of
+    /// bare `Self::new()`.
+    pub fn with_configured_egress() -> Result<Self, ArtifactError> {
+        let transport = Self::new()?;
+        Ok(
+            match sbproxy_security::egress::configured_gate(EgressPurpose::ModelArtifact) {
+                Some(authorizer) => transport.with_egress(authorizer),
+                None => transport,
+            },
+        )
+    }
+
     /// Follow the redirect chain for one artifact `GET`, re-authorizing
     /// each hop (WOR-2165).
     ///

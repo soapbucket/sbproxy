@@ -15,17 +15,20 @@ use sbproxy_platform::storage::{
 };
 use smallvec::SmallVec;
 
-use crate::snapshot::{CompiledConfig, CompiledOrigin};
+use sbproxy_security::egress::{EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist};
+
+use crate::snapshot::{CompiledConfig, CompiledEgressGates, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
     AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, ConfigFile,
-    ConnectionPoolConfig, EnforcementMode, EventSinkKind, EventsConfig, FailureMode, L2CacheConfig,
-    L2CacheParams, OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts,
-    UpstreamTimeoutsConfig, WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
-    DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_READ_TIMEOUT_MS, DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS, MAX_ATTESTATION_QUEUE_ENTRIES,
+    ConnectionPoolConfig, EgressPurposeConfig, EgressTopLevelConfig, EnforcementMode,
+    EventSinkKind, EventsConfig, FailureMode, L2CacheConfig, L2CacheParams,
+    OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
+    MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
@@ -2067,6 +2070,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         events: config_file.events,
         // WOR-1971: hand the complete top-level flag set to the binary.
         flags: config_file.flags,
+        // WOR-2476/WOR-2481: compile the top-level `egress:` block into
+        // one authorizer per configured purpose. Absent, this is
+        // `CompiledEgressGates::default()`, which arms nothing.
+        egress: compile_egress_gates(config_file.egress.as_ref()),
     })
 }
 
@@ -2408,6 +2415,65 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
     }
 
     Ok(())
+}
+
+/// Compile the top-level `egress:` section into one
+/// [`sbproxy_security::egress::EgressAuthorizer`] per configured purpose
+/// (WOR-2476, WOR-2481). `cfg` absent yields a default
+/// [`CompiledEgressGates`] (every field `None`), which arms nothing.
+fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> CompiledEgressGates {
+    let Some(cfg) = cfg else {
+        return CompiledEgressGates::default();
+    };
+    CompiledEgressGates {
+        ai_providers: compile_egress_purpose(EgressPurpose::AiProvider, cfg.ai_providers.as_ref()),
+        usage_sinks: compile_egress_purpose(EgressPurpose::UsageSink, cfg.usage_sinks.as_ref()),
+        model_artifacts: compile_egress_purpose(
+            EgressPurpose::ModelArtifact,
+            cfg.model_artifacts.as_ref(),
+        ),
+        token_exchange: compile_egress_purpose(
+            EgressPurpose::TokenExchange,
+            cfg.token_exchange.as_ref(),
+        ),
+        telemetry: compile_egress_purpose(EgressPurpose::Telemetry, cfg.telemetry.as_ref()),
+    }
+}
+
+/// Compile one purpose's sub-block into a real authorizer.
+///
+/// `None` when the sub-block is omitted, or when its `mode` is the inert
+/// `allow_by_default` default: either way the purpose stays legacy
+/// ungated, exactly the contract every consumer already honors for an
+/// absent authorizer. `deny_by_default` builds a real allowlist scoped to
+/// `hosts` (exact match, case-insensitive). Scheme and port are not
+/// exposed at this config layer: every purpose dials over `http`/`https`
+/// on `80`/`443`, which every production consumer this section arms
+/// already does.
+fn compile_egress_purpose(
+    purpose: EgressPurpose,
+    cfg: Option<&EgressPurposeConfig>,
+) -> Option<EgressAuthorizer> {
+    let cfg = cfg?;
+    if !cfg.mode.is_enforce() {
+        return None;
+    }
+    let mut allow = PurposeAllowlist {
+        hosts: cfg
+            .hosts
+            .iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .collect(),
+        allow_private: cfg.allow_private,
+        ..Default::default()
+    };
+    allow.schemes.insert("https".to_string());
+    allow.schemes.insert("http".to_string());
+    allow.ports.insert(443);
+    allow.ports.insert(80);
+    let mut purposes = std::collections::HashMap::new();
+    purposes.insert(purpose, allow);
+    Some(EgressAuthorizer::new(EgressConfig { purposes }))
 }
 
 /// Validate the top-level `events:` block (WOR-2318).
@@ -5088,6 +5154,197 @@ origins:
         assert!(
             compile_config(yaml).is_ok(),
             "top-level v1-compat metadata keys must still compile"
+        );
+    }
+
+    // WOR-2476/WOR-2481: the top-level `egress:` section.
+
+    #[test]
+    fn egress_section_rejects_an_unknown_sub_key() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+    bogus_key: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("unknown egress sub-key must fail compile");
+        assert!(
+            format!("{err:#}").contains("bogus_key"),
+            "error must name the offending key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn egress_section_rejects_an_unknown_top_level_purpose() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  mcp_upstream:
+    mode: deny_by_default
+    hosts: ["mcp.example.com"]
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a purpose this section does not expose must fail compile");
+        assert!(
+            format!("{err:#}").contains("mcp_upstream"),
+            "error must name the offending key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn omitted_egress_section_arms_nothing() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config with no egress: block compiles");
+        assert!(compiled.egress.ai_providers.is_none());
+        assert!(compiled.egress.usage_sinks.is_none());
+        assert!(compiled.egress.model_artifacts.is_none());
+        assert!(compiled.egress.token_exchange.is_none());
+        assert!(compiled.egress.telemetry.is_none());
+    }
+
+    #[test]
+    fn egress_purpose_omitted_from_the_section_stays_ungated() {
+        // Only `ai_providers` is configured; the other four purposes must
+        // still compile to `None` even though `egress:` itself is present.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        assert!(compiled.egress.ai_providers.is_some());
+        assert!(compiled.egress.usage_sinks.is_none());
+        assert!(compiled.egress.model_artifacts.is_none());
+        assert!(compiled.egress.token_exchange.is_none());
+        assert!(compiled.egress.telemetry.is_none());
+    }
+
+    #[test]
+    fn egress_allow_by_default_mode_stays_ungated_even_with_hosts_set() {
+        // The default `mode` is inert on purpose (WOR-2476): a `hosts`
+        // list with no explicit `deny_by_default` must not silently start
+        // gating a purpose an operator has not opted into.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    hosts: ["api.openai.com"]
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        assert!(
+            compiled.egress.ai_providers.is_none(),
+            "allow_by_default (the default) must compile to no authorizer"
+        );
+    }
+
+    #[test]
+    fn egress_deny_by_default_compiles_a_real_authorizer() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["collector.example.com"]
+    allow_private: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .usage_sinks
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::UsageSink,
+                    "https://attacker.test/collect",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedHost,
+            "a host outside the configured allowlist must be denied"
+        );
+    }
+
+    #[test]
+    fn egress_deny_by_default_with_empty_hosts_denies_everything() {
+        // Proves the acceptance shape the brief calls out directly: an
+        // empty `hosts:` list under `deny_by_default` refuses every
+        // destination, not just unlisted ones (there is nothing listed).
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    mode: deny_by_default
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .ai_providers
+            .expect("deny_by_default must compile a real authorizer even with empty hosts");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::AiProvider,
+                    "https://api.openai.com/v1/chat/completions",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedHost,
         );
     }
 

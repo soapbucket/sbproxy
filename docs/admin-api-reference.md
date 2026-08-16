@@ -996,9 +996,17 @@ is capped at 1,024 tracked destinations, after which a new destination
 stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
 judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
-model and engine artifact downloads, and extension bundle hooks.
-`mcp_upstream` is a reserved purpose label with no production call site
-yet, so it never appears.
+model and engine artifact downloads, extension bundle hooks, and the
+OTLP telemetry exporters. `mcp_upstream` is a reserved purpose label
+with no production call site yet, so it never appears.
+
+Until an operator configures the top-level `egress:` section (WOR-2476,
+WOR-2481), every purpose above is `ungated`: it appears in this
+inventory, but nothing was ever denied because nothing was armed. See
+[Egress allowlists](configuration.md#egress-allowlists) for the
+`ai_providers` / `usage_sinks` / `model_artifacts` / `token_exchange` /
+`telemetry` sub-blocks that turn a purpose's sightings into `allowed` or
+`denied`.
 
 | Status | When |
 |---|---|

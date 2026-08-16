@@ -1293,6 +1293,13 @@ fn reload_compiled_config_locked(
         warn_unwired_decision_audit_events(compiled);
         warn_legacy_policy_record_format(compiled);
 
+        // WOR-2476: arm the AiProvider, UsageSink, ModelArtifact, and
+        // TokenExchange gates from the compiled `egress:` section before
+        // any of their consumers can read the registry. Must run before
+        // `reload_ai_client` below, which reads `AiProvider` back out of
+        // it.
+        install_egress_gates_from_config(compiled);
+
         // Rebuild the AI client alongside the catalog. It lives behind an
         // `ArcSwap`, so this is a lock-free atomic swap from the reload
         // thread's perspective. The rebuild does not depend on the
@@ -4347,6 +4354,40 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
             );
         }
     }
+}
+
+/// WOR-2476: install the compiled top-level `egress:` authorizers into
+/// `sbproxy_security::egress`'s process-wide configured-gate registry.
+///
+/// Four of the five arms this section names live behind their own
+/// installer: `reload_ai_client` (called immediately after this, further
+/// down in [`reload_compiled_config_locked`]) reads `AiProvider` back out
+/// of the registry to build the AI client, and the usage-sink builder, the
+/// model-artifact fetcher, and the outbound-credential resolver each read
+/// their own purpose lazily, well after this function returns. Installing
+/// here rather than threading a parameter through every one of those call
+/// chains keeps this function the single seam that has to know the
+/// registry exists.
+///
+/// `Telemetry` is deliberately not installed here. The OTLP exporters are
+/// built once at process boot, before this reload path ever runs (see
+/// `sbproxy::main`'s `runtime_telemetry_config_for_cli`, which installs
+/// `Telemetry` itself from the same compiled config), and are never
+/// rebuilt on reload, so re-installing it on every reload here would only
+/// ever matter for a `Telemetry` sighting the exporters are not built
+/// again to observe. WOR-2481 tracks adding real reload re-verification.
+fn install_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
+    use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
+    install_configured_gate(EgressPurpose::AiProvider, compiled.egress.ai_providers.clone());
+    install_configured_gate(EgressPurpose::UsageSink, compiled.egress.usage_sinks.clone());
+    install_configured_gate(
+        EgressPurpose::ModelArtifact,
+        compiled.egress.model_artifacts.clone(),
+    );
+    install_configured_gate(
+        EgressPurpose::TokenExchange,
+        compiled.egress.token_exchange.clone(),
+    );
 }
 
 fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) -> bool {
