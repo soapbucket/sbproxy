@@ -925,6 +925,7 @@ pub struct ObjectStoreSink {
     kind: ObjectStoreKind,
     bucket: String,
     prefix: String,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl ObjectStoreSink {
@@ -934,6 +935,7 @@ impl ObjectStoreSink {
             kind: ObjectStoreKind::S3,
             bucket: bucket.into(),
             prefix: prefix.into(),
+            egress: None,
         }
     }
 
@@ -943,7 +945,14 @@ impl ObjectStoreSink {
             kind: ObjectStoreKind::Gcs,
             bucket: bucket.into(),
             prefix: prefix.into(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::UsageSink`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
@@ -955,6 +964,59 @@ impl UsageSink for ObjectStoreSink {
                 "usage sink: object store bucket missing"
             );
             return;
+        }
+        let tenant = event.tenant_id.clone().unwrap_or_default();
+        // WOR-2476: gate the object-store destination before any I/O,
+        // through the same `EgressPurpose::UsageSink` authorizer surface
+        // as the other usage sinks. `authorize_usage_http` collapses "no
+        // authorizer" to `Ok(())`, so the stamp inspects `self.egress`
+        // directly rather than trusting that result. There is no literal
+        // request URL here: `object_store`'s builders resolve the real
+        // dial target from the environment (`AWS_*` /
+        // `GOOGLE_APPLICATION_CREDENTIALS`, a possible custom endpoint
+        // override, etc.), not from a field on this struct. `auth_url` is
+        // the backend's well-known default service endpoint, the closest
+        // stand-in this HTTP-shaped authorizer can check against; an
+        // operator dialing a non-default (e.g. MinIO-compatible) endpoint
+        // via env override should allowlist that endpoint's real host.
+        let auth_url = object_store_authorization_url(self.kind, &self.bucket);
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::UsageSink,
+                    &auth_url,
+                    self.name(),
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::UsageSink,
+                &auth_url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &auth_url,
+                        self.name(),
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &auth_url,
+                        self.name(),
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, self.name());
+                    return;
+                }
+            },
         }
         let body = match serde_json::to_vec(event) {
             Ok(b) => b,
@@ -988,6 +1050,23 @@ impl UsageSink for ObjectStoreSink {
             ObjectStoreKind::S3 => "s3",
             ObjectStoreKind::Gcs => "gcs",
         }
+    }
+}
+
+/// Synthetic HTTPS URL representing an object-store backend's
+/// well-known default service endpoint, for egress authorization only
+/// (WOR-2476).
+///
+/// `ObjectStoreSink` carries no endpoint field of its own: the real
+/// dial target is resolved by [`object_store_put`]'s builders from the
+/// process environment. This gives the `EgressPurpose::UsageSink`
+/// authorizer, which is HTTP-URL-shaped, the closest stand-in it can
+/// check a host allowlist against. Never stored or logged with the raw
+/// bucket path; only host/port/scheme reach the sightings inventory.
+fn object_store_authorization_url(kind: ObjectStoreKind, bucket: &str) -> String {
+    match kind {
+        ObjectStoreKind::S3 => format!("https://{bucket}.s3.amazonaws.com/"),
+        ObjectStoreKind::Gcs => format!("https://storage.googleapis.com/{bucket}/"),
     }
 }
 
@@ -1794,5 +1873,35 @@ mod tests {
             !sink_hit.load(Ordering::SeqCst),
             "the redirect target must never be contacted"
         );
+    }
+
+    /// Red-first: before this change, `ObjectStoreSink::record` called
+    /// `object_store_put` with no `authorize_usage_http` call at all, so a
+    /// bucket outside a configured allowlist was still dialed. The
+    /// authorizer here only allows a different host, so the S3 put must
+    /// be refused before `object_store_put` (and its `tokio::spawn`, which
+    /// would panic in this non-`tokio::test` fn if reached) ever runs, and
+    /// the refusal must land in the sightings inventory as `Denied`.
+    #[test]
+    fn enforce_object_store_sink_skips_put_when_denied() {
+        let bucket = "wor-2476-denied-bucket";
+        let sink = ObjectStoreSink::s3(bucket, "prefix").with_egress(enforce_purpose(
+            EgressPurpose::UsageSink,
+            &["allowed-bucket.s3.amazonaws.com"],
+        ));
+
+        // No panic: `object_store_put`'s `tokio::spawn` is never reached
+        // outside a Tokio runtime, so reaching it here would abort the
+        // test rather than merely fail an assertion.
+        sink.record(&sample_event());
+
+        let expected_host = format!("{bucket}.s3.amazonaws.com");
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == expected_host)
+            .expect("denied object-store destination must be stamped in the inventory");
+        assert_eq!(entry.status, "denied");
+        assert_eq!(entry.last_reason, Some(EgressDenied::UnlistedHost.as_label()));
     }
 }
