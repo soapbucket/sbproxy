@@ -974,11 +974,13 @@ impl UsageSink for ObjectStoreSink {
         // request URL here: `object_store`'s builders resolve the real
         // dial target from the environment (`AWS_*` /
         // `GOOGLE_APPLICATION_CREDENTIALS`, a possible custom endpoint
-        // override, etc.), not from a field on this struct. `auth_url` is
-        // the backend's well-known default service endpoint, the closest
-        // stand-in this HTTP-shaped authorizer can check against; an
-        // operator dialing a non-default (e.g. MinIO-compatible) endpoint
-        // via env override should allowlist that endpoint's real host.
+        // override, etc.), not from a field on this struct. `auth_url`
+        // reads that same environment back for S3 (a real endpoint
+        // override, e.g. MinIO/R2, authorizes against its own host);
+        // GCS has no such accessor and always uses its well-known
+        // default endpoint. See `object_store_authorization_url` for
+        // the full derivation and the S3-vs-GCS inventory-granularity
+        // note.
         let auth_url = object_store_authorization_url(self.kind, &self.bucket);
         match self.egress.as_ref() {
             None => {
@@ -1053,20 +1055,63 @@ impl UsageSink for ObjectStoreSink {
     }
 }
 
-/// Synthetic HTTPS URL representing an object-store backend's
-/// well-known default service endpoint, for egress authorization only
-/// (WOR-2476).
+/// URL representing an object-store backend's destination, for egress
+/// authorization only (WOR-2476).
 ///
 /// `ObjectStoreSink` carries no endpoint field of its own: the real
 /// dial target is resolved by [`object_store_put`]'s builders from the
-/// process environment. This gives the `EgressPurpose::UsageSink`
-/// authorizer, which is HTTP-URL-shaped, the closest stand-in it can
-/// check a host allowlist against. Never stored or logged with the raw
-/// bucket path; only host/port/scheme reach the sightings inventory.
+/// process environment. For **S3**, `AmazonS3Builder::from_env()`
+/// already parses `AWS_ENDPOINT_URL` / `AWS_ENDPOINT` into a builder
+/// field, and reading it back via `get_config_value` is a synchronous
+/// struct-field read (no I/O, no `.build()`), so an operator-configured
+/// endpoint override (MinIO, R2, a self-hosted gateway, etc.) is used
+/// directly instead of being silently assumed away; only an unset
+/// override falls back to the well-known default AWS endpoint. **GCS**
+/// has no equivalent accessor in `object_store` 0.11, so it stays on
+/// its well-known default endpoint unconditionally. This also means the
+/// two backends land in the inventory at different granularity: the S3
+/// default is virtual-hosted style with the bucket in the host
+/// (`<bucket>.s3.amazonaws.com`), so each bucket is its own row, while
+/// the GCS default is path-style (`storage.googleapis.com/<bucket>`),
+/// so every GCS bucket collapses onto the same host and the same row.
+/// Never stored or logged with the raw bucket path; only host/port/
+/// scheme reach the sightings inventory.
 fn object_store_authorization_url(kind: ObjectStoreKind, bucket: &str) -> String {
     match kind {
-        ObjectStoreKind::S3 => format!("https://{bucket}.s3.amazonaws.com/"),
+        ObjectStoreKind::S3 => {
+            s3_authorization_url(bucket, &object_store::aws::AmazonS3Builder::from_env())
+        }
         ObjectStoreKind::Gcs => format!("https://storage.googleapis.com/{bucket}/"),
+    }
+}
+
+/// S3 authorization URL for `bucket`, given an already-configured
+/// `builder` (WOR-2476).
+///
+/// Split out from [`object_store_authorization_url`] so a test can
+/// construct `builder` explicitly via `AmazonS3Builder::with_config`
+/// instead of mutating real process environment variables: the
+/// env-mutation guard (`scripts/check-env-mutation.sh`) restricts
+/// direct `set_var`/`remove_var` to a documented per-crate
+/// `EnvVarGuard` (`src/test_env.rs`), and `sbproxy-ai` has no such
+/// guard today.
+fn s3_authorization_url(bucket: &str, builder: &object_store::aws::AmazonS3Builder) -> String {
+    use object_store::aws::AmazonS3ConfigKey;
+    match builder.get_config_value(&AmazonS3ConfigKey::Endpoint) {
+        Some(endpoint) if !endpoint.is_empty() => normalize_endpoint_url(&endpoint),
+        _ => format!("https://{bucket}.s3.amazonaws.com/"),
+    }
+}
+
+/// Ensure an operator-supplied `AWS_ENDPOINT_URL`-style value parses as
+/// an absolute URL for the egress authorizer, which only inspects
+/// host/port/scheme. A bare `host[:port]` with no scheme defaults to
+/// `https://`.
+fn normalize_endpoint_url(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
     }
 }
 
@@ -1905,6 +1950,84 @@ mod tests {
         assert_eq!(
             entry.last_reason,
             Some(EgressDenied::UnlistedHost.as_label())
+        );
+    }
+
+    /// An operator-configured S3 endpoint override must be authorized
+    /// (and stamped) at its own real host, not the synthetic
+    /// `<bucket>.s3.amazonaws.com` default (WOR-2476 follow-up).
+    ///
+    /// Builds the `AmazonS3Builder` explicitly via `with_config` rather
+    /// than `AmazonS3Builder::from_env`: `sbproxy-ai` has no
+    /// `EnvVarGuard` test helper, and `scripts/check-env-mutation.sh`
+    /// restricts direct `set_var`/`remove_var` to the documented
+    /// per-crate guards, so a real environment mutation is not an
+    /// option here.
+    #[test]
+    fn s3_authorization_url_and_sighting_use_the_resolved_endpoint_override() {
+        use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+
+        let bucket = "wor-2476-override-bucket";
+        let override_host = "minio.internal.test";
+        let builder = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::Endpoint, format!("https://{override_host}"));
+
+        let url = s3_authorization_url(bucket, &builder);
+        assert_eq!(
+            url,
+            format!("https://{override_host}"),
+            "an endpoint override must be used as-is, not collapsed into \
+             the synthetic <bucket>.s3.amazonaws.com default"
+        );
+
+        // The authorization decision itself must move with the URL: an
+        // allowlist scoped to the synthetic default must not authorize
+        // the real override host, and one scoped to the override host
+        // must.
+        let resolver = MapResolver::new(vec![(override_host, vec![public_addr(443)])]);
+        let synthetic_host = format!("{bucket}.s3.amazonaws.com");
+        let synthetic_only = enforce_purpose(EgressPurpose::UsageSink, &[synthetic_host.as_str()]);
+        let err = authorize_usage_http(
+            Some(&synthetic_only),
+            EgressPurpose::UsageSink,
+            &url,
+            &resolver,
+        )
+        .expect_err("an allowlist scoped to the synthetic default must deny the real override");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+
+        let override_allowed = enforce_purpose(EgressPurpose::UsageSink, &[override_host]);
+        authorize_usage_http(
+            Some(&override_allowed),
+            EgressPurpose::UsageSink,
+            &url,
+            &resolver,
+        )
+        .expect("an allowlist scoped to the override host must authorize it");
+
+        // And the sighting recorded for this destination must be keyed
+        // by the override host, not the synthetic default.
+        record_egress_seen(
+            EgressPurpose::UsageSink,
+            &url,
+            "s3",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
+                    && e.host == override_host),
+            "the override host must be stamped in the inventory"
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
+                    && e.host == synthetic_host),
+            "the synthetic default host must never be stamped once a real override resolves"
         );
     }
 }
