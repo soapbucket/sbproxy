@@ -27,18 +27,25 @@ the next version cut.
   drop-and-count contract.
 
 - **Federated MCP servers resist a silent protocol or auth downgrade.**
-  `federated_servers[].protocol` pins one upstream to a literal MCP era
-  (`2025-06-18` or `2026-07-28`); the default, `auto`, negotiates and
-  remembers, per tenant, the best era and strictest auth posture that
-  upstream has ever demonstrated. A later contact that looks weaker,
-  a legacy-only answer after showing the modern era, or a successful
-  call needing no credentials after having required them, is a
-  downgrade: `federated_servers[].downgrade: warn` (default) logs and
-  allows it, `block` refuses the call until the operator pins
-  `protocol` explicitly or edits that server entry. Both refusal paths
-  emit the `mcp_governance_decision` evidence event with
-  `rule_id: peer_downgrade` and a `SecurityAuditEntry` policy
-  violation.
+  `federated_servers[].protocol` pins one upstream to `2025-06-18`
+  (the only era outbound federation speaks today; pinning `2026-07-28`
+  is a config-compile error until outbound federation speaks it too);
+  the default, `auto`, negotiates and remembers, per tenant, the best
+  era and strictest auth posture that upstream has ever demonstrated.
+  A later contact that looks weaker, a legacy-only answer after
+  showing a stronger era, or a successful call needing no credentials
+  after having required them (classified from the upstream's real HTTP
+  response, a 401/407 for "required" and a clean unauthenticated
+  success for "not required"), is a downgrade:
+  `federated_servers[].downgrade: warn` (default) logs, counts, and
+  emits an `mcp_governance_decision` evidence event with verdict
+  `warn`; `block` refuses the call until the operator pins `protocol`
+  explicitly or edits that server entry. A refusal emits the same
+  event with verdict `deny`, and a `SecurityAuditEntry` policy
+  violation; `rule_id` is `peer_downgrade` for an actual downgrade and
+  `protocol_pin_mismatch` for a pinned peer answering the wrong era.
+  `resources/read` and `prompts/get` reach the same downgrade check for
+  the federated peer they contact, alongside `tools/call`.
 
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
