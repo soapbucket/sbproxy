@@ -702,6 +702,13 @@ fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
             sbproxy_security::random_aes256_key().to_vec()
         }
     };
+    // WOR-2478: derive the key-audit chain's fingerprint key from this same
+    // master secret, under a dedicated HKDF purpose, before `master` moves
+    // into the `KeyCrypto` handle below. `sbproxy-observe` never sees the
+    // master key itself, only the 32 bytes this call derives from it and
+    // retains; see that function's docs for why a later call (a hot
+    // reload) does not replace an already-installed key.
+    sbproxy_observe::audit_chain::install_key_audit_fingerprint_key(&master);
     Ok(KeyCrypto::new(pepper, master))
 }
 

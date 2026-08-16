@@ -84,7 +84,7 @@ pub mod usage_rollup;
 pub use access_log::AccessLogEntry;
 pub use agent_labels::AgentLabels;
 pub use alerting::{Alert, AlertChannelConfig, AlertDispatcher};
-pub use audit::{ConfigAuditEntry, KeyAuditEntry, SecurityAuditEntry};
+pub use audit::{AdminActionAuditEntry, ConfigAuditEntry, KeyAuditEntry, SecurityAuditEntry};
 pub use capture::{
     capture_parent_session_id, capture_properties, capture_session_id, capture_user_id,
     AutoGenerate, BudgetConfig, PropertiesConfig, PropertyDropCounts, RedactConfig,

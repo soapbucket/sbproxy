@@ -375,12 +375,26 @@ pub struct AuditConfig {
     /// Optional path where `config_audit` events are chained. Opt-in; when
     /// absent, `config_audit` remains a tracing stream and is not durably
     /// recorded, preserving exactly the old behavior. Requires `sink: chain`.
-    /// Must differ from `path` because the two audit event types (config and
-    /// security) have different payload formats and verify independently.
-    /// `key_audit` is deliberately not chainable yet, since its before/after
-    /// diff contents require a separate contents-based ruling first.
+    /// Must differ from `path`, `key_path`, and `admin_path`: every audit
+    /// channel has a different payload format and verifies independently.
     #[serde(default)]
     pub config_path: Option<String>,
+    /// Optional path where `key_audit` mutations are chained (WOR-2478).
+    /// Opt-in, same terms as `config_path`. The chained record is metadata
+    /// plus a keyed-HMAC fingerprint of each before/after field, never the
+    /// raw diff `key_audit`'s tracing target carries; see
+    /// `sbproxy_observe::audit`'s module docs. Requires `sink: chain`.
+    /// Must differ from `path`, `config_path`, and `admin_path`.
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Optional path where authenticated admin-console actions are
+    /// chained (WOR-2478): mutating admin API calls, logins, and content
+    /// inspection, the same events the `sbproxy::admin::audit` tracing
+    /// target and the admin ring's `admin` channel already carry. Opt-in,
+    /// same terms as `config_path`. Requires `sink: chain`. Must differ
+    /// from `path`, `config_path`, and `key_path`.
+    #[serde(default)]
+    pub admin_path: Option<String>,
 }
 
 /// Accepted audit sink names.
@@ -411,9 +425,10 @@ pub enum AuditSinkKind {
     /// Append every `security_audit` event to a SHA-256 hash-chained,
     /// Ed25519-signed file at `path`, signed by the identity `sign_with`
     /// names. Editing or removing a record breaks the chain, and
-    /// `sbproxy audit verify` re-derives it from genesis. When `config_path`
-    /// is set, `config_audit` events chain to that file; `key_audit` is not
-    /// chained yet.
+    /// `sbproxy audit verify` re-derives it from genesis. `config_path`,
+    /// `key_path`, and `admin_path` opt the `config_audit`, `key_audit`,
+    /// and admin-console channels into their own chain files under the
+    /// same signing identity (WOR-2478).
     Chain,
 }
 

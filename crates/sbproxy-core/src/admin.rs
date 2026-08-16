@@ -2729,17 +2729,17 @@ pub fn handle_admin_request(
             action = "inspect_request_content",
             "admin content inspection"
         );
-        sbproxy_observe::audit_ring::push_audit_event(
-            sbproxy_observe::audit_ring::AuditRingEvent::new(
-                "admin",
-                "inspect_request_content",
-                Some(operator),
-                Some(sample.tenant_id.clone()),
-                sample.api_key_id.clone(),
-                Some(request_id.to_string()),
-                None,
-            ),
-        );
+        // WOR-2478: tees into the durable admin chain, if one is
+        // installed, alongside the existing ring push.
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "inspect_request_content",
+            Some(operator),
+            Some(sample.tenant_id.clone()),
+            sample.api_key_id.clone(),
+            Some(request_id.to_string()),
+            None,
+        )
+        .emit();
         return match serde_json::to_string(&sample) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
@@ -3858,18 +3858,17 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 path = %path,
                 "admin action"
             );
-            // WOR-2094: same event on the console's audit sample.
-            sbproxy_observe::audit_ring::push_audit_event(
-                sbproxy_observe::audit_ring::AuditRingEvent::new(
-                    "admin",
-                    "admin_action",
-                    Some(p.username.clone()),
-                    None,
-                    None,
-                    None,
-                    Some(format!("{method} {path}")),
-                ),
-            );
+            // WOR-2094: same event on the console's audit sample. WOR-2478:
+            // and, if installed, into the durable admin chain.
+            sbproxy_observe::AdminActionAuditEntry::new(
+                "admin_action",
+                Some(p.username.clone()),
+                None,
+                None,
+                None,
+                Some(format!("{method} {path}")),
+            )
+            .emit();
         }
     }
     // A session-authenticated request synthesizes a Basic header so
@@ -4481,18 +4480,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
         None => {
             tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
             // WOR-2094: failed sign-ins are first-class security
-            // events on the console's audit sample.
-            sbproxy_observe::audit_ring::push_audit_event(
-                sbproxy_observe::audit_ring::AuditRingEvent::new(
-                    "admin",
-                    "login_failed",
-                    Some(user.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            );
+            // events on the console's audit sample. WOR-2478: and, if
+            // installed, on the durable admin chain.
+            sbproxy_observe::AdminActionAuditEntry::new(
+                "login_failed",
+                Some(user.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .emit();
             let _ = write_admin_response_headed(
                 sock,
                 401,
@@ -4507,17 +4505,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     let ttl_secs = 8 * 3600;
     let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
     tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
-    sbproxy_observe::audit_ring::push_audit_event(
-        sbproxy_observe::audit_ring::AuditRingEvent::new(
-            "admin",
-            "login",
-            Some(user.clone()),
-            None,
-            None,
-            None,
-            Some(format!("role: {}", role_label(role))),
-        ),
-    );
+    // WOR-2478: tees into the durable admin chain, if one is installed,
+    // alongside the existing ring push.
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "login",
+        Some(user.clone()),
+        None,
+        None,
+        None,
+        Some(format!("role: {}", role_label(role))),
+    )
+    .emit();
     let secure_attr = if secure { "; Secure" } else { "" };
     let cookie = format!(
         "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",

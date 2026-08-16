@@ -89,6 +89,16 @@ pub enum HkdfPurpose {
     /// keyspace as anything that signs or encrypts, so a leaked settlement
     /// database yields no key material for another surface.
     SettlementPayerScope,
+    /// WOR-2478: the keyed-HMAC key the tamper-evident audit chain uses to
+    /// fingerprint each field of a key/credential mutation's before/after
+    /// snapshot. The chain records the fingerprint in place of the raw
+    /// value, so a reader can tell two mutations set the same field to the
+    /// same value without the chain file ever holding that value. Modeled
+    /// on `sbproxy-keystore::crypto::derive_wrap_key`: the operator's
+    /// `key_management.crypto.master_key` as IKM, empty salt, and this
+    /// dedicated purpose keeps the fingerprint key out of the same
+    /// keyspace as the DEK-wrapping key derived from the same master.
+    KeyAuditFingerprint,
 }
 
 impl HkdfPurpose {
@@ -112,6 +122,7 @@ impl HkdfPurpose {
                 b"sbproxy.hkdf.bundle-secret-var-fingerprint.v1"
             }
             HkdfPurpose::SettlementPayerScope => b"sbproxy.hkdf.settlement-payer-scope.v1",
+            HkdfPurpose::KeyAuditFingerprint => b"sbproxy.hkdf.key-audit-fingerprint.v1",
         }
     }
 }
@@ -463,5 +474,16 @@ mod aead_tests {
         let a = hkdf_derive_purpose(b"master", b"salt-a", HkdfPurpose::ResponseCacheAtRest, 32);
         let b = hkdf_derive_purpose(b"master", b"salt-b", HkdfPurpose::ResponseCacheAtRest, 32);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn key_audit_fingerprint_purpose_has_distinct_keyspace() {
+        // WOR-2478: the key-audit chain's fingerprint key must never
+        // collide with the envelope-wrapping key derived from the same
+        // operator master, even though both use an empty salt.
+        let fingerprint = hkdf_derive_purpose(b"master", b"", HkdfPurpose::KeyAuditFingerprint, 32);
+        let envelope = hkdf_derive_purpose(b"master", b"", HkdfPurpose::KeyEnvelope, 32);
+        assert_ne!(fingerprint, envelope);
+        assert_eq!(fingerprint.len(), 32);
     }
 }

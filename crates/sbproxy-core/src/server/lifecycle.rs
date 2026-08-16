@@ -356,18 +356,23 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// 64 hex characters, so anything unresolvable here is a bug in that
 /// check rather than an operator error, and it says so.
 ///
-/// WOR-2478: when `audit.config_path` is also set, opens and installs the
-/// second, config-change chain under the same signing identity right
-/// after the security chain above. Same fail-the-boot rationale: an
-/// operator who named the file wants the failure loud, not a proxy that
-/// starts believing it is recording a trail it never opened.
+/// WOR-2478: when `audit.config_path`, `audit.key_path`, or
+/// `audit.admin_path` is also set, opens and installs that channel's own
+/// chain under the same signing identity right after the security chain
+/// above. Same fail-the-boot rationale: an operator who named the file
+/// wants the failure loud, not a proxy that starts believing it is
+/// recording a trail it never opened. The key channel's fingerprint key
+/// (as opposed to the chain file itself) is a separate concern installed
+/// later, once `key_management`'s master key resolves; see
+/// `sbproxy_observe::audit_chain::install_key_audit_fingerprint_key`.
 fn install_audit_chain(
     audit: &sbproxy_config::types::AuditConfig,
     web_bot_auth: Option<&sbproxy_config::types::WebBotAuthConfig>,
 ) -> anyhow::Result<()> {
     use sbproxy_config::types::AuditSinkKind;
     use sbproxy_observe::audit_chain::{
-        install_config_audit_chain, install_security_audit_chain, ConfigAuditChain,
+        install_admin_audit_chain, install_config_audit_chain, install_key_audit_chain,
+        install_security_audit_chain, AdminActionAuditChain, ConfigAuditChain, KeyAuditChain,
         SecurityAuditChain,
     };
 
@@ -429,6 +434,50 @@ fn install_audit_chain(
                 );
             }
             Err(error) => anyhow::bail!("audit.config_path is set but {error}"),
+        }
+    }
+
+    // WOR-2478: opt-in third chain for `key_audit` mutations, same
+    // signing identity.
+    if let Some(key_path) = audit.key_path.as_deref() {
+        let key_chain = KeyAuditChain::open(
+            std::path::Path::new(key_path),
+            &signer.ed25519_seed_hex,
+            &signer.key_id,
+        )?;
+        let key_kid = key_chain.key_id().to_string();
+        match install_key_audit_chain(key_chain) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %key_path,
+                    kid = %key_kid,
+                    "key audit trail is hash-chained and signed; verify it with \
+                     `sbproxy audit verify`"
+                );
+            }
+            Err(error) => anyhow::bail!("audit.key_path is set but {error}"),
+        }
+    }
+
+    // WOR-2478: opt-in fourth chain for admin-console actions, same
+    // signing identity.
+    if let Some(admin_path) = audit.admin_path.as_deref() {
+        let admin_chain = AdminActionAuditChain::open(
+            std::path::Path::new(admin_path),
+            &signer.ed25519_seed_hex,
+            &signer.key_id,
+        )?;
+        let admin_kid = admin_chain.key_id().to_string();
+        match install_admin_audit_chain(admin_chain) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %admin_path,
+                    kid = %admin_kid,
+                    "admin audit trail is hash-chained and signed; verify it with \
+                     `sbproxy audit verify`"
+                );
+            }
+            Err(error) => anyhow::bail!("audit.admin_path is set but {error}"),
         }
     }
 
@@ -6144,17 +6193,20 @@ mod event_egress_tests {
     }
 
     #[test]
-    fn install_audit_chain_installs_both_chains_when_config_path_is_set() {
-        // WOR-2478: `audit.config_path` opts a second, config-change chain
-        // into the same boot call that opens the security chain, under
-        // the same signing identity. The two slots this claims
-        // (`sbproxy_observe::audit_chain::CHAIN` and `CONFIG_CHAIN`) are
-        // private and process-wide, so the only externally observable
-        // proof either one installed is that a second install of the same
-        // slot is refused.
+    fn install_audit_chain_installs_all_four_chains_when_every_path_is_set() {
+        // WOR-2478: `audit.config_path`, `audit.key_path`, and
+        // `audit.admin_path` each opt a further chain into the same boot
+        // call that opens the security chain, under the same signing
+        // identity. The four slots this claims
+        // (`sbproxy_observe::audit_chain::CHAIN`, `CONFIG_CHAIN`,
+        // `KEY_CHAIN`, `ADMIN_CHAIN`) are private and process-wide, so the
+        // only externally observable proof any one installed is that a
+        // second install of the same slot is refused.
         let dir = tempfile::tempdir().expect("temp dir");
         let security_path = dir.path().join("security-audit.jsonl");
         let config_path = dir.path().join("config-audit.jsonl");
+        let key_path = dir.path().join("key-audit.jsonl");
+        let admin_path = dir.path().join("admin-audit.jsonl");
         let signer = sbproxy_config::types::WebBotAuthConfig {
             key_id: "audit-test-kid".to_string(),
             ed25519_seed_hex: "cc".repeat(32),
@@ -6165,6 +6217,8 @@ mod event_egress_tests {
             path: Some(security_path.display().to_string()),
             sign_with: Some("web_bot_auth".to_string()),
             config_path: Some(config_path.display().to_string()),
+            key_path: Some(key_path.display().to_string()),
+            admin_path: Some(admin_path.display().to_string()),
         };
 
         match install_audit_chain(&audit, Some(&signer)) {
@@ -6176,6 +6230,14 @@ mod event_egress_tests {
                 assert!(
                     config_path.exists(),
                     "the config chain file is opened alongside it"
+                );
+                assert!(
+                    key_path.exists(),
+                    "the key chain file is opened alongside it"
+                );
+                assert!(
+                    admin_path.exists(),
+                    "the admin chain file is opened alongside it"
                 );
 
                 let redundant_seed = "dd".repeat(32);
@@ -6203,6 +6265,32 @@ mod event_egress_tests {
                 assert!(
                     config_reinstall.is_err(),
                     "the config slot this boot call claimed is already taken"
+                );
+
+                let redundant_key = sbproxy_observe::audit_chain::KeyAuditChain::open(
+                    &dir.path().join("unused-key.jsonl"),
+                    &redundant_seed,
+                    "unused",
+                )
+                .expect("chain opens");
+                let key_reinstall =
+                    sbproxy_observe::audit_chain::install_key_audit_chain(redundant_key);
+                assert!(
+                    key_reinstall.is_err(),
+                    "the key slot this boot call claimed is already taken"
+                );
+
+                let redundant_admin = sbproxy_observe::audit_chain::AdminActionAuditChain::open(
+                    &dir.path().join("unused-admin.jsonl"),
+                    &redundant_seed,
+                    "unused",
+                )
+                .expect("chain opens");
+                let admin_reinstall =
+                    sbproxy_observe::audit_chain::install_admin_audit_chain(redundant_admin);
+                assert!(
+                    admin_reinstall.is_err(),
+                    "the admin slot this boot call claimed is already taken"
                 );
             }
             Err(error) if error.to_string().contains("already registered") => {
@@ -6239,12 +6327,48 @@ mod event_egress_tests {
             path: Some(security_path.display().to_string()),
             sign_with: Some("web_bot_auth".to_string()),
             config_path: Some(config_path.display().to_string()),
+            key_path: None,
+            admin_path: None,
         };
 
         let error = install_audit_chain(&audit, Some(&signer))
             .expect_err("a config chain whose parent cannot be created must not boot quietly");
         assert!(
             error.to_string().contains("audit.config_path"),
+            "the failure names the key that turned the chain on: {error}"
+        );
+    }
+
+    #[test]
+    fn install_audit_chain_fails_boot_when_admin_paths_parent_cannot_be_created() {
+        // WOR-2478: the same loud-fail posture, proved for the admin
+        // channel specifically so the extension is known to be reachable
+        // rather than merely mirrored in shape from the config case above.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let security_path = dir.path().join("security-audit.jsonl");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"occupies the path a directory needs")
+            .expect("write blocker file");
+        let admin_path = blocker.join("admin-audit.jsonl");
+
+        let signer = sbproxy_config::types::WebBotAuthConfig {
+            key_id: "audit-test-kid-3".to_string(),
+            ed25519_seed_hex: "ff".repeat(32),
+            directory_url: None,
+        };
+        let audit = sbproxy_config::types::AuditConfig {
+            sink: sbproxy_config::types::AuditSinkKind::Chain,
+            path: Some(security_path.display().to_string()),
+            sign_with: Some("web_bot_auth".to_string()),
+            config_path: None,
+            key_path: None,
+            admin_path: Some(admin_path.display().to_string()),
+        };
+
+        let error = install_audit_chain(&audit, Some(&signer))
+            .expect_err("an admin chain whose parent cannot be created must not boot quietly");
+        assert!(
+            error.to_string().contains("audit.admin_path"),
             "the failure names the key that turned the chain on: {error}"
         );
     }

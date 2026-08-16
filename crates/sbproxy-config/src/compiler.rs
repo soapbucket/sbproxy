@@ -2213,6 +2213,13 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
 /// two different payload types independently; letting one file answer
 /// for both would make a verification failure on one look like a
 /// failure of the other.
+///
+/// `key_path` and `admin_path` follow the identical pattern (WOR-2478):
+/// each is opt-in, each requires `sink: chain`, and each must differ from
+/// every other chain path this config names. Four channels means six
+/// pairwise checks rather than one; each is written out rather than
+/// looped, matching `config_path`'s check above, so the refusal message
+/// always names the two keys actually in conflict.
 fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) -> Result<()> {
     if audit.sink == AuditSinkKind::Tracing {
         anyhow::bail!(
@@ -2244,6 +2251,20 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
                  chain` or remove the path."
             );
         }
+        if audit.key_path.is_some() {
+            anyhow::bail!(
+                "audit.key_path is set but audit.sink is not `chain`, so nothing would ever be \
+                 written to it. audit.key_path requires `audit.sink: chain`. Set `sink: chain` \
+                 or remove the path."
+            );
+        }
+        if audit.admin_path.is_some() {
+            anyhow::bail!(
+                "audit.admin_path is set but audit.sink is not `chain`, so nothing would ever \
+                 be written to it. audit.admin_path requires `audit.sink: chain`. Set `sink: \
+                 chain` or remove the path."
+            );
+        }
         return Ok(());
     }
 
@@ -2261,6 +2282,42 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
             anyhow::bail!(
                 "the config channel cannot share the security chain file; the two payload \
                  types verify separately"
+            );
+        }
+    }
+
+    if let Some(key_path) = audit.key_path.as_deref().map(str::trim) {
+        if Some(key_path) == audit.path.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "the key channel cannot share the security chain file; the two payload types \
+                 verify separately"
+            );
+        }
+        if Some(key_path) == audit.config_path.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "the key channel cannot share the config chain file; the two payload types \
+                 verify separately"
+            );
+        }
+    }
+
+    if let Some(admin_path) = audit.admin_path.as_deref().map(str::trim) {
+        if Some(admin_path) == audit.path.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "the admin channel cannot share the security chain file; the two payload types \
+                 verify separately"
+            );
+        }
+        if Some(admin_path) == audit.config_path.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "the admin channel cannot share the config chain file; the two payload types \
+                 verify separately"
+            );
+        }
+        if Some(admin_path) == audit.key_path.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "the admin channel cannot share the key chain file; the two payload types \
+                 verify separately"
             );
         }
     }
@@ -8446,6 +8503,157 @@ origins:
         assert_eq!(
             audit.config_path.as_deref(),
             Some("/var/lib/sbproxy/config-audit.jsonl")
+        );
+    }
+
+    // --- WOR-2478: the `key_path` and `admin_path` channels ---
+
+    #[test]
+    fn a_key_path_under_the_memory_sink_is_refused_rather_than_ignored() {
+        let error = compile_config(&audit_yaml(
+            "  sink: memory\n  key_path: /var/lib/sbproxy/key-audit.jsonl",
+            " {}",
+        ))
+        .err()
+        .expect("a key_path nothing writes to must not compile");
+        assert!(
+            error.to_string().contains("audit.key_path"),
+            "the refusal names the key that would be ignored: {error}"
+        );
+        assert!(
+            error.to_string().contains("audit.sink: chain"),
+            "the refusal names what key_path requires: {error}"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_under_the_memory_sink_is_refused_rather_than_ignored() {
+        let error = compile_config(&audit_yaml(
+            "  sink: memory\n  admin_path: /var/lib/sbproxy/admin-audit.jsonl",
+            " {}",
+        ))
+        .err()
+        .expect("an admin_path nothing writes to must not compile");
+        assert!(
+            error.to_string().contains("audit.admin_path"),
+            "the refusal names the key that would be ignored: {error}"
+        );
+        assert!(
+            error.to_string().contains("audit.sink: chain"),
+            "the refusal names what admin_path requires: {error}"
+        );
+    }
+
+    #[test]
+    fn a_key_path_equal_to_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a key_path that shares the security chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the key channel cannot share the security chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn a_key_path_equal_to_config_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/config-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a key_path that shares the config chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the key channel cannot share the config chain file; the two payload types verify \
+             separately"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_equal_to_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an admin_path that shares the security chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the admin channel cannot share the security chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_equal_to_config_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/config-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an admin_path that shares the config chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the admin channel cannot share the config chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_equal_to_key_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/key-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/key-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an admin_path that shares the key chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the admin channel cannot share the key chain file; the two payload types verify \
+             separately"
+        );
+    }
+
+    #[test]
+    fn audit_chain_compiles_with_all_four_distinct_paths() {
+        let yaml = audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/key-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/admin-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        );
+        let compiled = compile_config(&yaml).expect("compile");
+        let audit = compiled.audit.expect("audit block survives compilation");
+        assert_eq!(audit.sink, AuditSinkKind::Chain);
+        assert_eq!(
+            audit.path.as_deref(),
+            Some("/var/lib/sbproxy/security-audit.jsonl")
+        );
+        assert_eq!(
+            audit.config_path.as_deref(),
+            Some("/var/lib/sbproxy/config-audit.jsonl")
+        );
+        assert_eq!(
+            audit.key_path.as_deref(),
+            Some("/var/lib/sbproxy/key-audit.jsonl")
+        );
+        assert_eq!(
+            audit.admin_path.as_deref(),
+            Some("/var/lib/sbproxy/admin-audit.jsonl")
         );
     }
 

@@ -865,8 +865,10 @@ enum AuditSub {
     /// Re-derive an audit chain from genesis and report the first record
     /// that does not check out. `--channel security` (default) verifies
     /// the trail `audit.sink: chain` writes; `--channel config` verifies
-    /// the config-authority decision trail. Exit 0 when the trail
-    /// verifies, 1 when it does not.
+    /// the config-authority decision trail; `--channel key` verifies the
+    /// key/credential-mutation trail; `--channel admin` verifies the
+    /// admin-console action trail. Exit 0 when the trail verifies, 1 when
+    /// it does not.
     Verify(AuditVerifyArgs),
 }
 
@@ -885,11 +887,17 @@ struct AuditVerifyArgs {
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
     /// Which chain to verify: `security` (default), the tamper-evident
-    /// trail `audit.sink: chain` writes, or `config`, the trail of
-    /// config-authority decisions. The two channels write different
-    /// payload shapes to different files, so pass the channel that
-    /// matches the file at `path`.
-    #[arg(long = "channel", value_parser = ["security", "config"], default_value = "security")]
+    /// trail `audit.sink: chain` writes; `config`, the trail of
+    /// config-authority decisions; `key`, the trail of key/credential
+    /// mutations (metadata and fingerprints, never the raw diff); or
+    /// `admin`, the trail of authenticated admin-console actions. Each
+    /// channel writes a different payload shape to its own file, so pass
+    /// the channel that matches the file at `path`.
+    #[arg(
+        long = "channel",
+        value_parser = ["security", "config", "key", "admin"],
+        default_value = "security"
+    )]
     channel: String,
 }
 
@@ -9387,8 +9395,9 @@ fn handle_audit_subcommand(cmd: &AuditCmd) -> anyhow::Result<i32> {
     }
 }
 
-/// `sbproxy audit verify`: re-derive the security or config audit chain
-/// from genesis and report the first record that does not check out.
+/// `sbproxy audit verify`: re-derive the security, config, key, or admin
+/// audit chain from genesis and report the first record that does not
+/// check out.
 ///
 /// Reads the file and nothing else. No config, no admin API, no running
 /// proxy: an auditor with a copy of the chain and the public key can run
@@ -9396,7 +9405,8 @@ fn handle_audit_subcommand(cmd: &AuditCmd) -> anyhow::Result<i32> {
 /// the point of signing the entries rather than merely logging them.
 fn handle_audit_verify(args: &AuditVerifyArgs) -> anyhow::Result<i32> {
     use sbproxy_observe::audit_chain::{
-        verify_config_audit_chain, verify_security_audit_chain, verifying_key_from_seed_hex,
+        verify_admin_audit_chain, verify_config_audit_chain, verify_key_audit_chain,
+        verify_security_audit_chain, verifying_key_from_seed_hex,
     };
 
     let verifying_key = match args.signing_seed_hex.as_deref() {
@@ -9405,6 +9415,8 @@ fn handle_audit_verify(args: &AuditVerifyArgs) -> anyhow::Result<i32> {
     };
     let result = match args.channel.as_str() {
         "config" => verify_config_audit_chain(&args.path, verifying_key.as_ref())?,
+        "key" => verify_key_audit_chain(&args.path, verifying_key.as_ref())?,
+        "admin" => verify_admin_audit_chain(&args.path, verifying_key.as_ref())?,
         _ => verify_security_audit_chain(&args.path, verifying_key.as_ref())?,
     };
     let path_str = args.path.to_string_lossy();
@@ -13349,6 +13361,46 @@ hooks:
             Some(Cmd::Audit(cmd)) => match cmd.sub {
                 AuditSub::Verify(args) => {
                     assert_eq!(args.channel, "config");
+                }
+            },
+            other => panic!("expected Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_verify_subcommand_with_key_channel() {
+        let cli = parse(&[
+            "sbproxy",
+            "audit",
+            "verify",
+            "/var/lib/sbproxy/key-audit.jsonl",
+            "--channel",
+            "key",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Audit(cmd)) => match cmd.sub {
+                AuditSub::Verify(args) => {
+                    assert_eq!(args.channel, "key");
+                }
+            },
+            other => panic!("expected Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_verify_subcommand_with_admin_channel() {
+        let cli = parse(&[
+            "sbproxy",
+            "audit",
+            "verify",
+            "/var/lib/sbproxy/admin-audit.jsonl",
+            "--channel",
+            "admin",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Audit(cmd)) => match cmd.sub {
+                AuditSub::Verify(args) => {
+                    assert_eq!(args.channel, "admin");
                 }
             },
             other => panic!("expected Audit, got {other:?}"),
