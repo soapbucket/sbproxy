@@ -59,11 +59,12 @@ pub const MAX_TRACKED_TENANTS: usize = 4096;
 const OVERFLOW_TENANT: &str = "\u{0}sbproxy-evidence-seq-overflow";
 
 /// Registry state: one atomic counter per tracked tenant, guarded by a
-/// single lock. The lock is held only for the lookup-or-insert; the
-/// values are atomics so a caller that only needs the increment (every
-/// caller, today) pays one `fetch_add` under the lock rather than a
-/// read-modify-write race a plain `u64` would need the lock to prevent
-/// anyway.
+/// single lock. `next_seq_capped` holds the lock across the
+/// lookup-or-insert *and* the `fetch_add` (both are cheap, and
+/// splitting them would let two threads race the insert); the values
+/// are atomics so a future caller that only needs to read the current
+/// count, without incrementing it, could do so without taking the
+/// lock at all.
 struct SeqRegistry {
     counters: HashMap<String, AtomicU64>,
 }

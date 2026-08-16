@@ -25,7 +25,7 @@ There is also a separate in-process `EventBus` that embedders can register closu
 | `budget_exceeded` | An AI spend or quota budget was exhausted. |
 | `guardrail_triggered` | An AI guardrail flagged or blocked content. |
 | `config_reloaded` | The proxy configuration changed. |
-| `mcp_governance_decision` | An MCP `tools/call` dispatch was decided: allowed, or refused by a governance gate (dual-LLM quarantine, modern output-schema validation). |
+| `mcp_governance_decision` | An MCP `tools/call` was decided: allowed, refused by a governance gate (dual-LLM quarantine, modern output-schema validation), or refused before dispatch (RBAC, per-tool quota). |
 
 Circuit-breaker activity is a metric (`sbproxy_circuit_breaker_transitions_total`), not an event. See [metrics-stability.md](metrics-stability.md).
 
@@ -40,7 +40,7 @@ Six. The other six are enum variants an embedder can publish, and configuring a 
 | `auth_denied` | Every authentication rejection, including forward-auth and digest challenges. |
 | `policy_denied` | Every policy block (rate limit, IP filter, WAF, object authorization, A2A, prompt injection) and every HTTP framing violation. |
 | `config_reloaded` | A configuration change through the admin API, carrying the revision pair and the origin delta. |
-| `mcp_governance_decision` | The same MCP tool-call funnel every dispatch already passes through, alongside the decision-audit record. |
+| `mcp_governance_decision` | The same MCP tool-call funnel every dispatch already passes through, alongside the decision-audit record, plus the RBAC and per-tool-quota denial sites that refuse a call before it ever reaches that funnel. |
 
 `request_started`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, and `guardrail_triggered` have no emitter in this build. The cache path reports through `sbproxy_cache_*`, and the AI path reports through `sbproxy_ai_*` and the [usage ledger](ai-usage-ledger.md), which is where the gateway's own accounting lives. Point a sink at those six only if your own code publishes them.
 
@@ -171,6 +171,8 @@ events:
 `mcp_governance_decision` is the only publisher wired to this today. When it is named in `fail_closed` and the record cannot be handed to the queue (`queue_full`, `worker_stopped`, or no sink is configured to deliver it at all), the MCP tool call that would have produced that record is refused with a JSON-RPC internal error rather than served with no evidence behind it. `sbproxy_mcp_evidence_fail_closed_total{tenant}` counts every refusal.
 
 A `fail_closed` entry does not have to also appear in `types`, but if it does not, nothing will ever deliver that type, so every governed call is refused. That is a valid configuration (it reads as "block MCP tool calls until the sink is fixed"), not a bug, but it is worth naming so it is not the surprise that turns up in an incident review.
+
+`sbproxy.evidence.seq` only advances while something installed would actually receive `mcp_governance_decision`, so the sequence covers the period evidence emission is enabled: turning it off freezes the counter rather than creating a gap, and turning it back on resumes from where it left off.
 
 ## Shutdown does not flush
 

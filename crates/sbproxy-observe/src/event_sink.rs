@@ -659,6 +659,20 @@ pub fn install_event_egress(egress: EventEgress) -> Result<(), &'static str> {
         .map_err(|_| "event egress already registered")
 }
 
+/// Whether an installed egress would even attempt to deliver
+/// `event_type` (WOR-2384).
+///
+/// Exactly the gate [`publish_proxy_event`] and [`publish_proxy_event_checked`]
+/// already apply before calling their `build` closure, exposed on its
+/// own for a caller with its own expensive prerequisites to a
+/// publish call: a per-tenant sequence number, a redaction pass. That
+/// caller can check this first and skip building the prerequisites
+/// entirely rather than paying for work nobody will receive, the same
+/// way `build` itself is skipped.
+pub fn wants_event(event_type: EventType) -> bool {
+    EGRESS.get().is_some_and(|egress| egress.wants(event_type))
+}
+
 /// Publish an event, building it only if somebody is listening.
 ///
 /// `build` runs only when an egress is installed **and** its `types:`
@@ -1170,5 +1184,18 @@ mod tests {
             EventPublishError::NoSinkConfigured.as_str(),
             "no_sink_configured"
         );
+    }
+
+    #[test]
+    fn wants_event_agrees_with_what_publish_proxy_event_would_have_gated_on() {
+        // Same defensive shape as the other `EGRESS.get()`-reading
+        // tests: other tests in this binary may already have installed
+        // the process-global egress, so this asserts the property that
+        // holds either way.
+        let result = wants_event(EventType::McpGovernance);
+        match EGRESS.get() {
+            None => assert!(!result, "nothing installed must never want an event"),
+            Some(egress) => assert_eq!(result, egress.wants(EventType::McpGovernance)),
+        }
     }
 }

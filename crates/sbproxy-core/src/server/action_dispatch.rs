@@ -3570,6 +3570,13 @@ pub(super) async fn handle_mcp_action(
                             } else {
                                 None
                             };
+                            // WOR-2384: shared by both pre-dispatch
+                            // denial branches below, which both emit a
+                            // governance evidence event naming the
+                            // resolved server before returning their
+                            // refusal.
+                            let governed_server =
+                                federated.as_ref().map(|t| t.server_name.as_str()).unwrap_or("unknown");
                             if denied_by_rbac {
                                 tracing::warn!(
                                     target: "sbproxy::mcp::rbac",
@@ -3583,11 +3590,34 @@ pub(super) async fn handle_mcp_action(
                                     "mcp_rbac",
                                     "deny",
                                 );
-                                JsonRpcResponse::error(
-                                    request.id.clone(),
-                                    INVALID_PARAMS,
-                                    &format!("tool '{}' is denied by RBAC policy for caller", name,),
-                                )
+                                // WOR-2384: this denial returns before
+                                // ever reaching `emit_mcp_tool_attribution`
+                                // (no tool was dispatched), so without
+                                // this call a SIEM consuming
+                                // `mcp_governance_decision` would see
+                                // every allowed call and none of the
+                                // RBAC refusals -- exactly backwards for
+                                // a security evidence feed.
+                                if emit_mcp_governance_evidence(
+                                    ctx,
+                                    &name,
+                                    governed_server,
+                                    mcp_session_id.as_deref(),
+                                    is_modern,
+                                    None,
+                                    Some("rbac_denied"),
+                                ) {
+                                    mcp_evidence_unavailable_response(request.id.clone())
+                                } else {
+                                    JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        INVALID_PARAMS,
+                                        &format!(
+                                            "tool '{}' is denied by RBAC policy for caller",
+                                            name,
+                                        ),
+                                    )
+                                }
                             } else if let Some(err) = quota_error {
                                 tracing::warn!(
                                     target: "sbproxy::mcp::quota",
@@ -3601,18 +3631,36 @@ pub(super) async fn handle_mcp_action(
                                     "mcp_quota",
                                     "deny",
                                 );
-                                // JSON-RPC application-defined error code
-                                // `-32099`: per the JSON-RPC 2.0 spec, the
-                                // range `-32000..=-32099` is reserved for
-                                // implementation-defined server errors.
-                                // We pick the top of the range for the
-                                // quota lane so future per-tool gates
-                                // (cost, concurrency) can sit beside it.
-                                JsonRpcResponse::error(
-                                    request.id.clone(),
-                                    -32099,
-                                    &format!("tool quota exceeded for {}", err.tool_name),
-                                )
+                                // WOR-2384: same reasoning as the RBAC
+                                // branch above -- a quota refusal never
+                                // reaches the post-dispatch funnel
+                                // either.
+                                if emit_mcp_governance_evidence(
+                                    ctx,
+                                    &name,
+                                    governed_server,
+                                    mcp_session_id.as_deref(),
+                                    is_modern,
+                                    None,
+                                    Some("quota_exceeded"),
+                                ) {
+                                    mcp_evidence_unavailable_response(request.id.clone())
+                                } else {
+                                    // JSON-RPC application-defined error
+                                    // code `-32099`: per the JSON-RPC 2.0
+                                    // spec, the range `-32000..=-32099`
+                                    // is reserved for implementation-
+                                    // defined server errors. We pick the
+                                    // top of the range for the quota
+                                    // lane so future per-tool gates
+                                    // (cost, concurrency) can sit beside
+                                    // it.
+                                    JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        -32099,
+                                        &format!("tool quota exceeded for {}", err.tool_name),
+                                    )
+                                }
                             } else {
                                 // Per-server timeout. The
                                 // dispatcher inside `call_tool` shares one
@@ -3983,6 +4031,18 @@ pub(super) async fn handle_mcp_action(
                                     })
                                 };
 
+                                // WOR-2384: redacted and hashed once,
+                                // before either consumer, and shared by
+                                // the `mcp_audit` tracing line below and
+                                // the governance evidence event above
+                                // it in the funnel, rather than each
+                                // independently redacting and hashing
+                                // the same tool-argument bytes under the
+                                // same salt.
+                                let tool_arguments_hash = mcp_audit_capture
+                                    .as_ref()
+                                    .map(|cap| sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json)));
+
                                 // WOR-1644: attribute the call into the
                                 // usage plane. Metrics always fire;
                                 // cost and the usage-sink row appear
@@ -4001,7 +4061,7 @@ pub(super) async fn handle_mcp_action(
                                     call_started.elapsed(),
                                     mcp_session_id.as_deref(),
                                     is_modern,
-                                    mcp_audit_capture.as_ref(),
+                                    tool_arguments_hash.as_deref(),
                                     governance_denial_reason.as_deref(),
                                 );
 
@@ -4009,7 +4069,13 @@ pub(super) async fn handle_mcp_action(
                                 // inputs to the enterprise audit layer over
                                 // the `mcp_audit` tracing target.
                                 if let Some(cap) = mcp_audit_capture {
-                                    emit_mcp_prompt_audit(ctx, &name, cap, &outcome);
+                                    emit_mcp_prompt_audit(
+                                        ctx,
+                                        &name,
+                                        cap,
+                                        &outcome,
+                                        tool_arguments_hash.as_deref(),
+                                    );
                                 }
 
                                 if evidence_refused {
@@ -4027,11 +4093,7 @@ pub(super) async fn handle_mcp_action(
                                     // `emit_mcp_tool_attribution`, at the
                                     // point the delivery failure was
                                     // actually observed.
-                                    JsonRpcResponse::error(
-                                        request.id.clone(),
-                                        INTERNAL_ERROR,
-                                        "mcp governance evidence could not be recorded; refusing per events.fail_closed (evidence_unavailable)",
-                                    )
+                                    mcp_evidence_unavailable_response(request.id.clone())
                                 } else if modern_output_invalid {
                                     JsonRpcResponse::error(
                                         request.id.clone(),
@@ -4323,11 +4385,20 @@ struct McpAuditCapture {
 /// Verbatim content for a downstream audit envelope is a future
 /// explicit opt-in owned by the MCP evidence work (WOR-2384), not
 /// something this event carries today.
+///
+/// `precomputed_tool_arguments_hash`: WOR-2384's governance evidence
+/// event hashes these exact same redacted argument bytes under the
+/// same salt (see `sha256_hex_prefix`'s doc comment). The call site
+/// computes that digest once and passes it here so this line and that
+/// event agree on one value rather than each hashing independently;
+/// `None` falls back to hashing locally, which keeps this function
+/// correct on its own for any caller that has not done that work.
 fn emit_mcp_prompt_audit(
     ctx: &RequestContext,
     tool_name: &str,
     cap: McpAuditCapture,
     outcome: &anyhow::Result<serde_json::Value>,
+    precomputed_tool_arguments_hash: Option<&str>,
 ) {
     // No clean upstream response on an error / timeout; report 0 per
     // the envelope's `upstream_status` contract, 200 on a served call.
@@ -4348,6 +4419,10 @@ fn emit_mcp_prompt_audit(
     // that exfiltrates a credential pasted into a prompt.
     let tool_arguments = bound_mcp_audit_field(&cap.args_json);
     let prompt = bound_mcp_audit_field(&cap.prompt);
+    let tool_arguments_hash = match precomputed_tool_arguments_hash {
+        Some(hash) => hash.to_string(),
+        None => sha256_hex_prefix(&tool_arguments),
+    };
     // WOR-2473: this line is emitted under stock config (default root
     // filter is `info`, no per-target directive needed to see it), so
     // it must never carry the raw prompt or raw tool arguments. Ship
@@ -4361,7 +4436,7 @@ fn emit_mcp_prompt_audit(
         human_sponsor = %ctx.principal.sub,
         mcp_server = %cap.server,
         tool_name = %tool_name,
-        tool_arguments_sha256 = %sha256_hex_prefix(&tool_arguments),
+        tool_arguments_sha256 = %tool_arguments_hash,
         tool_arguments_len = tool_arguments.len(),
         prompt_sha256 = %sha256_hex_prefix(&prompt),
         prompt_len = prompt.len(),
@@ -4602,7 +4677,7 @@ fn emit_mcp_tool_attribution(
     duration: std::time::Duration,
     mcp_session_id: Option<&str>,
     is_modern: bool,
-    mcp_audit_capture: Option<&McpAuditCapture>,
+    tool_arguments_hash: Option<&str>,
     governance_denial_reason: Option<&str>,
 ) -> bool {
     let (result_label, is_error): (&'static str, bool) = match outcome {
@@ -4650,7 +4725,7 @@ fn emit_mcp_tool_attribution(
         server,
         mcp_session_id,
         is_modern,
-        mcp_audit_capture,
+        tool_arguments_hash,
         governance_denial_reason,
     );
 
@@ -4726,6 +4801,23 @@ fn emit_mcp_tool_attribution(
     evidence_refused
 }
 
+/// WOR-2384: the JSON-RPC response for a call refused only because its
+/// evidence record could not be delivered under `events.fail_closed`.
+///
+/// One error message, shared by every call site that can produce this
+/// refusal (the post-dispatch funnel and the RBAC/quota pre-dispatch
+/// denials), so a client -- or an operator reading a support ticket --
+/// sees the same text regardless of which path triggered it.
+fn mcp_evidence_unavailable_response(
+    id: Option<serde_json::Value>,
+) -> sbproxy_extension::mcp::types::JsonRpcResponse {
+    sbproxy_extension::mcp::types::JsonRpcResponse::error(
+        id,
+        sbproxy_extension::mcp::types::INTERNAL_ERROR,
+        "mcp governance evidence could not be recorded; refusing per events.fail_closed (evidence_unavailable)",
+    )
+}
+
 /// WOR-2384: whether `events.fail_closed` names `event_type` in the
 /// config pinned to this request's own pipeline generation.
 ///
@@ -4748,20 +4840,27 @@ fn mcp_governance_fail_closed(
 }
 
 /// WOR-2384: emit the `mcp_governance_decision` [`sbproxy_observe::events::EventType`]
-/// for one dispatched MCP tool call, and report whether the caller must
-/// refuse the call because delivery was fail-closed configured and
-/// failed.
+/// for one dispatched (or pre-dispatch-refused) MCP tool call, and
+/// report whether the caller must refuse the call because delivery was
+/// fail-closed configured and failed.
 ///
-/// Runs from [`emit_mcp_tool_attribution`], the single funnel every MCP
-/// tool dispatch already passes through for [`record_mcp_tool_decision`].
-#[allow(clippy::too_many_arguments)] // one call site; mirrors emit_mcp_tool_attribution's own field-per-argument shape
+/// Callers: [`emit_mcp_tool_attribution`] (the funnel every dispatched
+/// MCP tool call passes through, alongside [`record_mcp_tool_decision`])
+/// and the RBAC / per-tool-quota denial sites in [`handle_mcp_action`],
+/// which never reach that funnel because they return before a tool is
+/// dispatched at all.
+///
+/// `tool_arguments_hash` is `None` at the RBAC/quota sites: no call
+/// ever reached the point where `mcp_audit_capture` (or anything else)
+/// captured arguments to hash.
+#[allow(clippy::too_many_arguments)] // one shape reused at three call sites, mirroring emit_mcp_tool_attribution's own field-per-argument style
 fn emit_mcp_governance_evidence(
     ctx: &RequestContext,
     tool_name: &str,
     server: &str,
     mcp_session_id: Option<&str>,
     is_modern: bool,
-    mcp_audit_capture: Option<&McpAuditCapture>,
+    tool_arguments_hash: Option<&str>,
     governance_denial_reason: Option<&str>,
 ) -> bool {
     use sbproxy_observe::events::{EventType, ProxyEvent};
@@ -4769,21 +4868,34 @@ fn emit_mcp_governance_evidence(
     let event_type = EventType::McpGovernance;
     let fail_closed = mcp_governance_fail_closed(ctx.pipeline.config.events.as_ref(), event_type);
 
+    // WOR-2384: skip everything below -- the per-tenant sequence
+    // increment (and the mutex it takes), the redaction pass, the
+    // payload build -- when nothing installed would even attempt to
+    // accept this event. Two reasons this matters beyond "don't pay
+    // for work nobody uses": the sequence counter then only advances
+    // across the window evidence emission is actually enabled (see
+    // `evidence_seq`'s module doc and `docs/events.md`'s fail-closed
+    // section), which is what keeps it meaningful, and the first
+    // record a freshly-configured SIEM receives starts near 1 instead
+    // of picking up wherever an always-ticking counter had drifted to
+    // on a deployment that had never turned evidence on before.
+    if !sbproxy_observe::event_sink::wants_event(event_type) {
+        if !fail_closed {
+            return false;
+        }
+        // Fail-closed configured, but nothing installed would ever
+        // have delivered this type -- the same "no sink configured"
+        // fact `publish_proxy_event_checked` would report below,
+        // learned here without paying for a queue attempt to find out.
+        sbproxy_observe::metrics::record_mcp_evidence_fail_closed(&ctx.tenant_id);
+        return true;
+    }
+
     let protocol_version = if is_modern {
         sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION
     } else {
         sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION
     };
-    // Reuses the exact salted digest `mcp_audit` already computed for
-    // this same call (see `sha256_hex_prefix`'s doc comment) rather than
-    // hashing the arguments a second time under a different salt: the
-    // two events describe the same call, and an analyst correlating
-    // them needs one digest, not two disagreeing ones. Present only
-    // when `mcp_audit_capture` ran, which is the default under stock
-    // config (WOR-2473) and absent only when an operator has suppressed
-    // the `mcp_audit` tracing target below `info`.
-    let arguments_hash =
-        mcp_audit_capture.map(|cap| sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json)));
     let seq = sbproxy_observe::evidence_seq::next_seq(&ctx.tenant_id);
 
     let data = mcp_governance_event_data(
@@ -4796,7 +4908,7 @@ fn emit_mcp_governance_evidence(
         ctx.hostname.as_str(),
         governance_denial_reason,
         Some(sbproxy_observe::logging::operator_redact_state().as_ref()),
-        arguments_hash.as_deref(),
+        tool_arguments_hash,
         seq,
     );
     let event = ProxyEvent::new(
@@ -4842,10 +4954,11 @@ fn emit_mcp_governance_evidence(
 ///   decision-audit bus applies to every OCSF `reason` field, before it
 ///   ever reaches `sbproxy.decision.reason`. Every caller of this
 ///   function today passes a fixed, argument-free string (a quarantine
-///   reason code, or the schema-validation failure message), so nothing
-///   live currently depends on the scrub; it runs anyway so a future
-///   caller cannot turn this event into a leak channel just by handing
-///   it richer text.
+///   reason code, the schema-validation failure message, or a short
+///   `rbac_denied` / `quota_exceeded` reason code from a pre-dispatch
+///   denial), so nothing live currently depends on the scrub; it runs
+///   anyway so a future caller cannot turn this event into a leak
+///   channel just by handing it richer text.
 #[allow(clippy::too_many_arguments)] // pure builder; kept free of RequestContext so the semconv shape is unit-testable on its own
 fn mcp_governance_event_data(
     tool_name: &str,
@@ -5759,7 +5872,7 @@ mod mcp_audit_redaction_tests {
         let sink = logged.clone();
         let subscriber = tracing_subscriber::registry().with(CaptureLayer { sink });
         tracing::subscriber::with_default(subscriber, || {
-            emit_mcp_prompt_audit(&ctx, "list_files", cap, &Ok(serde_json::json!({})));
+            emit_mcp_prompt_audit(&ctx, "list_files", cap, &Ok(serde_json::json!({})), None);
         });
 
         let lines = logged
@@ -7300,5 +7413,114 @@ mod mcp_catalog_snapshot_tests {
                 "{case} must deny the same resolved target on tools/call, got: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wor_2384_rbac_denied_tools_call_emits_a_deny_governance_event() {
+        // WOR-2384 red-first: before this fix, an RBAC (or per-tool
+        // quota) denial returned straight out of the RBAC branch,
+        // before ever reaching `emit_mcp_tool_attribution`, so it
+        // produced neither a decision-audit record nor an
+        // `mcp_governance_decision` event. A SIEM consuming that
+        // stream would see every allowed tool call and none of the
+        // denials, which is exactly backwards for a security evidence
+        // feed. This drives a real RBAC-denied `tools/call` through
+        // `handle_mcp_action` with an event sink installed and reads
+        // the emitted NDJSON line back.
+        const TOOL_NAME: &str = "wor2384-governance-evidence-rbac-fixture";
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("governance-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernance,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        // `install_event_egress` is a process-wide, set-once slot (see
+        // `sbproxy_observe::event_sink`'s module docs). This is the
+        // only test in this crate that installs one, so this either
+        // succeeds exactly once here or fails loudly if that stops
+        // being true.
+        sbproxy_observe::install_event_egress(egress)
+            .expect("event egress installs exactly once per test binary");
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "governance-evidence-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "reader": {
+                    "default_allow": false,
+                    "tool_access": [{"principals": [], "allowed": []}]
+                }
+            },
+            "federated_servers": [{
+                "origin": "https://gov.example.com/mcp",
+                "prefix": "gov-server",
+                "rbac": "reader"
+            }]
+        }))
+        .expect("rbac-denied governance-evidence fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, "gov-server"))]),
+            None,
+        );
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": TOOL_NAME, "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .expect("tools/call denial message");
+        assert!(
+            message.contains("RBAC"),
+            "expected an RBAC denial, got: {message}"
+        );
+
+        // The event reaches the file through a bounded queue drained by
+        // a background worker thread, so poll rather than reading once.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found: Option<serde_json::Value> = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(&events_path) {
+                for line in contents.lines() {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        if event["data"]["gen_ai.tool.name"] == TOOL_NAME {
+                            found = Some(event);
+                        }
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let event = found.expect(
+            "an mcp_governance_decision event for the RBAC-denied call \
+             was not observed within 5s",
+        );
+
+        assert_eq!(event["event_type"], "mcp_governance_decision");
+        assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+        assert_eq!(event["data"]["error.type"], "policy_denied");
+        assert_eq!(event["data"]["sbproxy.decision.reason"], "rbac_denied");
+        assert_eq!(event["data"]["sbproxy.tool.server"], "gov-server");
+        assert!(
+            event["data"].get("sbproxy.tool.arguments_hash").is_none(),
+            "an RBAC denial never dispatched, so no arguments were ever captured to hash: {event:?}"
+        );
     }
 }
