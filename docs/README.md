@@ -72,6 +72,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
+- [opa-rego-policies.md](opa-rego-policies.md) - OPA-compatible policies via Rego: which config surfaces accept it, the `input` vocabulary, a worked tenant-gate example, and when to reach for Rego over CEL.
 - [extension-bundles.md](extension-bundles.md) - adding policies, transforms, actions, HTTP filters, and event hooks as loadable bundles, from a local directory or a verified git checkout, without linking a new proxy binary.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
