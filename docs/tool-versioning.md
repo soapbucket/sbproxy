@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -244,17 +244,55 @@ One pinned recipe rather than a per-caller one is the point of all this: two
 implementations that hash the same tool and disagree give you a gate that fires
 on nothing an operator changed. In this codebase `contract_of` is the only
 function that turns a live tool into a contract, and a test greps for anyone
-who hand-rolls a second one, because that has already happened twice.
+who hand-rolls a second one, because that has already happened twice. The
+generator resolves through the same owner, so `sbproxy mcp lock` cannot write a
+digest the running gate would not compute.
 
 A worked baseline is in `examples/mcp-tool-versioning/tool-versions.lock.yaml`,
 and a test asserts its digests are the ones the gateway computes, so the example
 cannot drift into the permanently-blocked state a hand-written digest lands in.
 
-Today the lockfile is hand-assembled from a tool's advertised contract. A
-`sbproxy mcp lock` subcommand that discovers a live catalog and writes the
-baseline is not shipped yet, so the practical path is to copy each tool's
-contract into the lockfile and let the test above, or a first `mode: warn` run,
-tell you the digest.
+## Writing and checking the baseline
+
+Two commands produce and verify the lockfile, so no one has to reimplement the
+digest recipe to use the gate.
+
+```bash
+sbproxy mcp lock -f sb.yml
+```
+
+`lock` compiles the `type: mcp` action the same way boot does, discovers the
+live catalog through the same federation handle the gateway serves from, and
+writes a baseline pinning every advertised tool. What gets pinned is therefore
+what the gateway would advertise: the same namespacing, the same collision
+handling, the same OpenAPI-derived and stdio-backed tools.
+
+It writes to the action's own `tool_versioning.lockfile`, resolved the way the
+running gate resolves it, against the working directory. `--out` overrides that
+for a config with a single `mcp` action. A config with several gets each
+action's own file, because a baseline written anywhere else is one the gate
+never loads.
+
+Each tool is pinned at its `declared_versions` entry when there is one, and at
+`1.0.0` otherwise. MCP does not expose an upstream version, so a first baseline
+is a statement about the contract rather than a claim about the upstream.
+
+```bash
+sbproxy mcp verify-lock -f sb.yml
+```
+
+`verify-lock` re-discovers and diffs against the committed file without binding
+a listener, and exits `2` on drift, so it belongs in CI next to the schema
+checks. It reports added, removed, and changed tools by name. A digest whose
+scheme this build does not implement is reported and does not fail the run, on
+the same reasoning as the gate's fail-open: a lockfile written by a newer build
+must not turn a rollback into a red pipeline.
+
+Regenerate after reviewing an upstream change, not before. Discovery for both
+commands runs with the versioning gate compiled out, which matters under
+`mode: block`: a live gate filters the tools it judges in violation, so
+regenerating through one would drop exactly the tool whose contract moved and
+the next check would call it a removal.
 
 One consequence worth stating plainly: the gate reports movement, and the
 oracle grades severity. The oracle models property, type, required and enum
@@ -330,7 +368,8 @@ lockfile but missing from the live catalog are reported as
 `outcome="removed_tool"` and never block anything else.
 
 See `examples/mcp-tool-versioning/` for a runnable configuration, including
-a complete `tool-versions.lock.yaml` to copy the format from. The lockfile is
+a complete `tool-versions.lock.yaml` as `sbproxy mcp lock` writes it. The
+lockfile is
 a committed YAML baseline: one entry per advertised tool carrying a declared
 semver, a contract digest, and optionally the embedded contract itself. The
 `contract` field is optional: a digest-only baseline still detects changes,
@@ -338,7 +377,8 @@ graded as at least a patch.
 
 ## Status
 
-The oracle engine, the `sb.yml` gate, and the runtime enforcement ship today.
+The oracle engine, the `sb.yml` gate, the runtime enforcement, and the
+`sbproxy mcp lock` / `sbproxy mcp verify-lock` baseline commands ship today.
 
 ## Related
 

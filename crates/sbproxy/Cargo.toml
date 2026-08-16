@@ -146,7 +146,12 @@ rand.workspace = true
 # WOR-1540: `ai ledger verify` reuses the verifiable-ledger crypto.
 sbproxy-ai.workspace = true
 sbproxy-modules.workspace = true
+# WOR-2443: `mcp lock` / `mcp verify-lock` build and diff a tool-versioning
+# baseline through the same contract-digest owner the running gate uses.
+sbproxy-extension.workspace = true
 sbproxy-observe.workspace = true
+# WOR-2443: parsing `tool_versioning.declared_versions` into pinned versions.
+semver.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-vault.workspace = true
 tracing-subscriber.workspace = true

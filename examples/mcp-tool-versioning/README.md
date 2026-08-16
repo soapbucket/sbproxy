@@ -33,7 +33,20 @@ What proves it is working:
 - Declare the matching bump under `declared_versions` and the next
   refresh clears the violation.
 
-The lockfile is a committed YAML baseline; copy the format from
-`tool-versions.lock.yaml` here (see `docs/tool-versioning.md` for the
-field reference). An unreadable lockfile fails open: nothing is
-blocked and the gateway logs a loud `lockfile_error`.
+The lockfile is a committed YAML baseline. Write it with:
+
+```bash
+sbproxy mcp lock -f sb.yml
+```
+
+which discovers the live catalogue and pins every advertised tool at
+its current contract digest, and check it in CI with:
+
+```bash
+sbproxy mcp verify-lock -f sb.yml
+```
+
+which re-discovers, diffs, and exits 2 on drift without binding a
+listener. See `docs/tool-versioning.md` for the field reference. An
+unreadable lockfile fails open: nothing is blocked and the gateway logs
+a loud `lockfile_error`.

@@ -3782,13 +3782,13 @@ fn live_contract_for_baseline(
     baseline_digest: &str,
 ) -> Option<(serde_json::Value, String)> {
     let live = if super::compat::is_contract_digest_v2(baseline_digest) {
-        // A tool whose `inputSchema` is not an object has no strict contract.
-        // It keeps the frozen legacy projection rather than dropping out of
-        // the gate entirely.
-        tool.contract.as_ref().map_or_else(
-            || super::compat::contract_of(tool),
-            McpToolContract::as_value,
-        )
+        // Resolved through the same function `sbproxy mcp lock` writes
+        // baselines with, so the gate cannot compare against a contract
+        // the generator would not have produced (WOR-2443). It also
+        // handles the tool whose `inputSchema` is not an object and so
+        // has no strict contract: that one keeps the frozen legacy
+        // projection rather than dropping out of the gate entirely.
+        super::compat::baseline_contract_v2(tool)
     } else {
         super::compat::contract_of(tool)
     };
