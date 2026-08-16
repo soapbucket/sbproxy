@@ -1015,8 +1015,8 @@ route := {"candidates": [{"provider_id": "openai", "model": "m"}], "reason": "r"
 
         let mut cfg = engine_config("rego", V0_STYLE);
         cfg.rego_v0 = true;
-        let policy = CompiledAiRoutingPolicy::compile(&cfg)
-            .expect("rego_v0: true compiles the same module");
+        let policy =
+            CompiledAiRoutingPolicy::compile(&cfg).expect("rego_v0: true compiles the same module");
         let pressed = AiDecisionView {
             budget_fraction: 0.9,
             ..Default::default()

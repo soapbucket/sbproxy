@@ -241,14 +241,8 @@ impl RegoPolicy {
             "policy `rego`: budget_ms must be greater than zero; a zero budget would refuse \
              every request before the rule ran"
         );
-        let compiled = CompiledRego::compile(
-            "policy `rego`",
-            &module,
-            query,
-            budget_ms,
-            data,
-            rego_v0,
-        )?;
+        let compiled =
+            CompiledRego::compile("policy `rego`", &module, query, budget_ms, data, rego_v0)?;
         Ok(Self {
             deny_status,
             deny_message,
@@ -493,7 +487,9 @@ allow if {
         }))
         .expect_err("a missing file must refuse");
         assert!(
-            error.to_string().contains("/nonexistent/definitely-not-here.rego"),
+            error
+                .to_string()
+                .contains("/nonexistent/definitely-not-here.rego"),
             "the refusal names the unreadable path: {error}"
         );
     }
