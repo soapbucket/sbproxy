@@ -11,7 +11,8 @@ use bytes::Bytes;
 use futures::Stream;
 #[cfg(feature = "weights")]
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, CachedSystemResolver, RedirectRule,
+    evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
+    EgressSightingStatus, RedirectRule,
 };
 use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use zeroize::Zeroize;
@@ -150,6 +151,18 @@ pub fn authorize_artifact_url(
 /// an operator configures egress.
 #[cfg(feature = "weights")]
 pub(crate) fn authorize_engine_download(url: &str) -> Result<(), String> {
+    // WOR-2476: the authorizer here is always `None` (no per-engine config
+    // exists yet to attach one), so every engine-artifact download is
+    // honestly `Ungated` until a real authorizer is threaded through.
+    // Stamping still proves the endpoint is reached, and this one choke
+    // point covers all three engine-release callers.
+    record_egress_seen(
+        EgressPurpose::EngineArtifact,
+        url,
+        "engine_artifact",
+        EgressSightingStatus::Ungated,
+        None,
+    );
     authorize_artifact_url(
         None,
         EgressPurpose::EngineArtifact,
@@ -265,21 +278,52 @@ impl ArtifactTransport for HttpArtifactTransport {
             .ok()
             .and_then(|url| url.host_str().map(str::to_string))
             .unwrap_or_else(|| "unset".to_string());
-        authorize_artifact_url(
-            self.egress.as_ref(),
-            EgressPurpose::ModelArtifact,
-            &request.url,
-            &CachedSystemResolver,
-        )
-        .map_err(|denied| {
-            record_egress_refused(
+        // WOR-2476: every artifact URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_artifact_url`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        if self.egress.is_none() {
+            record_egress_seen(
                 EgressPurpose::ModelArtifact,
-                denied,
-                "unset",
+                &request.url,
                 &artifact_host,
+                EgressSightingStatus::Ungated,
+                None,
             );
-            ArtifactError::Transport(format!("egress denied: {denied:?}"))
-        })?;
+        } else {
+            match authorize_artifact_url(
+                self.egress.as_ref(),
+                EgressPurpose::ModelArtifact,
+                &request.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::ModelArtifact,
+                        &request.url,
+                        &artifact_host,
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::ModelArtifact,
+                        &request.url,
+                        &artifact_host,
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(
+                        EgressPurpose::ModelArtifact,
+                        denied,
+                        "unset",
+                        &artifact_host,
+                    );
+                    return Err(ArtifactError::Transport(format!("egress denied: {denied:?}")));
+                }
+            }
+        }
 
         let mut builder = self.client.get(&request.url);
         if request.offset > 0 {

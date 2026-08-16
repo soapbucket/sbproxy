@@ -11,8 +11,9 @@
 //! a failure: a broken sink cannot fail the request it is logging.
 
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied,
-    EgressPurpose, HostResolver, RedirectRule,
+    evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
+    EgressAuthorizer, EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
+    RedirectRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -375,14 +376,47 @@ impl WebhookSink {
 impl UsageSink for WebhookSink {
     fn record(&self, event: &LlmUsageEvent) {
         let tenant = event.tenant_id.clone().unwrap_or_default();
-        if let Err(denied) = authorize_usage_http(
-            self.egress.as_ref(),
-            EgressPurpose::Webhook,
-            &self.url,
-            &CachedSystemResolver,
-        ) {
-            record_egress_refused(EgressPurpose::Webhook, denied, &tenant, "webhook");
-            return;
+        // WOR-2476: every webhook URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_usage_http`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::Webhook,
+                    &self.url,
+                    "webhook",
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::Webhook,
+                &self.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::Webhook,
+                        &self.url,
+                        "webhook",
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::Webhook,
+                        &self.url,
+                        "webhook",
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::Webhook, denied, &tenant, "webhook");
+                    return;
+                }
+            },
         }
         let body = match serde_json::to_vec(event) {
             Ok(b) => b,
@@ -586,14 +620,47 @@ impl LangfuseSink {
 impl UsageSink for LangfuseSink {
     fn record(&self, event: &LlmUsageEvent) {
         let tenant = event.tenant_id.clone().unwrap_or_default();
-        if let Err(denied) = authorize_usage_http(
-            self.egress.as_ref(),
-            EgressPurpose::UsageSink,
-            &self.url,
-            &CachedSystemResolver,
-        ) {
-            record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "langfuse");
-            return;
+        // WOR-2476: every usage-sink URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_usage_http`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::UsageSink,
+                    &self.url,
+                    "langfuse",
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::UsageSink,
+                &self.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "langfuse",
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "langfuse",
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "langfuse");
+                    return;
+                }
+            },
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
         let id = event
@@ -671,14 +738,47 @@ impl DatadogSink {
 impl UsageSink for DatadogSink {
     fn record(&self, event: &LlmUsageEvent) {
         let tenant = event.tenant_id.clone().unwrap_or_default();
-        if let Err(denied) = authorize_usage_http(
-            self.egress.as_ref(),
-            EgressPurpose::UsageSink,
-            &self.url,
-            &CachedSystemResolver,
-        ) {
-            record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "datadog");
-            return;
+        // WOR-2476: every usage-sink URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_usage_http`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::UsageSink,
+                    &self.url,
+                    "datadog",
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::UsageSink,
+                &self.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "datadog",
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "datadog",
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "datadog");
+                    return;
+                }
+            },
         }
         let body = datadog_log_body(event, &self.service);
         let url = self.url.clone();

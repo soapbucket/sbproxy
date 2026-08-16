@@ -5809,6 +5809,18 @@ mod tests {
             sbproxy_security::egress::EgressSightingStatus::Ungated,
             None,
         );
+        // WOR-2476: a second, distinct non-AI purpose. Before every gate
+        // site stamped a sighting, `ai_provider` was the only purpose the
+        // inventory could ever report; this proves the snapshot carries
+        // more than one purpose, and that a `denied` sighting round-trips
+        // its reason without leaking the URL that produced it.
+        sbproxy_security::egress::record_egress_seen(
+            sbproxy_security::egress::EgressPurpose::TokenExchange,
+            "https://seeded-admin-test-2.invalid:8443/token?secret=y",
+            "admin-test",
+            sbproxy_security::egress::EgressSightingStatus::Denied,
+            Some(sbproxy_security::egress::EgressDenied::UnlistedHost),
+        );
 
         let (status, content_type, body) =
             handle_admin_request("GET", "/api/egress", &state, Some(&auth), None);
@@ -5825,6 +5837,7 @@ mod tests {
             .iter()
             .find(|e| e["host"] == "seeded-admin-test.invalid")
             .expect("seeded sighting must appear in the inventory");
+        assert_eq!(entry["purpose"], "webhook");
         assert!(entry.get("host").is_some());
         assert!(entry.get("status").is_some());
         assert!(entry.get("last_seen_unix_ms").is_some());
@@ -5832,7 +5845,21 @@ mod tests {
             entry.get("url").is_none(),
             "no raw url in an egress entry: {entry}"
         );
+
+        let token_entry = endpoints
+            .iter()
+            .find(|e| e["host"] == "seeded-admin-test-2.invalid")
+            .expect("seeded token_exchange sighting must appear in the inventory");
+        assert_eq!(token_entry["purpose"], "token_exchange");
+        assert_eq!(token_entry["status"], "denied");
+        assert_eq!(token_entry["last_reason"], "unlisted_host");
+        assert!(
+            token_entry.get("url").is_none(),
+            "no raw url in an egress entry: {token_entry}"
+        );
+
         assert!(!body.contains("secret=x"), "no query string: {body}");
+        assert!(!body.contains("secret=y"), "no query string: {body}");
     }
 
     #[tokio::test]

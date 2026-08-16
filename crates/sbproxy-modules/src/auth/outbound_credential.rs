@@ -26,8 +26,8 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use dashmap::DashMap;
 use sbproxy_security::egress::{
-    record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied, EgressPurpose,
-    HostResolver,
+    record_egress_refused, record_egress_seen, CachedSystemResolver, EgressAuthorizer,
+    EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
 };
 use serde::Deserialize;
 
@@ -621,10 +621,43 @@ fn gate_token_endpoint(
     url: &str,
     origin_id: &str,
 ) -> Result<()> {
-    authorize_token_endpoint(egress, url, &CachedSystemResolver).map_err(|denied| {
-        record_egress_refused(EgressPurpose::TokenExchange, denied, "unset", origin_id);
-        anyhow::anyhow!("egress denied: {denied:?}")
-    })
+    // WOR-2476: every token endpoint lands in the egress inventory,
+    // whether an authorizer is configured or not. `authorize_token_endpoint`
+    // collapses "no authorizer" to `Ok(())`, so the stamp inspects `egress`
+    // directly rather than trusting that result.
+    if egress.is_none() {
+        record_egress_seen(
+            EgressPurpose::TokenExchange,
+            url,
+            origin_id,
+            EgressSightingStatus::Ungated,
+            None,
+        );
+        return Ok(());
+    }
+    match authorize_token_endpoint(egress, url, &CachedSystemResolver) {
+        Ok(()) => {
+            record_egress_seen(
+                EgressPurpose::TokenExchange,
+                url,
+                origin_id,
+                EgressSightingStatus::Allowed,
+                None,
+            );
+            Ok(())
+        }
+        Err(denied) => {
+            record_egress_seen(
+                EgressPurpose::TokenExchange,
+                url,
+                origin_id,
+                EgressSightingStatus::Denied,
+                Some(denied),
+            );
+            record_egress_refused(EgressPurpose::TokenExchange, denied, "unset", origin_id);
+            Err(anyhow::anyhow!("egress denied: {denied:?}"))
+        }
+    }
 }
 
 /// Resolve the outbound credential for `cfg`.

@@ -27,7 +27,9 @@ use super::protocol::{
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse, META_TRACEPARENT, SEP_414_RESERVED_META_KEYS};
-use sbproxy_security::egress::{AuthorizedDestination, EgressPurpose, HostResolver};
+use sbproxy_security::egress::{
+    record_egress_seen, AuthorizedDestination, EgressPurpose, EgressSightingStatus, HostResolver,
+};
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
 ///
@@ -2698,10 +2700,43 @@ impl McpFederation {
         let url = Url::parse(&format!("{base}{path}"))
             .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
         // Deny unlisted hosts before any I/O (WOR-1791 / G2).
-        let mut dest = backing
+        //
+        // WOR-2476: every OpenAPI tool URL lands in the egress inventory.
+        // Unlike the `Option<&EgressAuthorizer>` gates elsewhere, "no
+        // authorizer" here is `EgressMode::AllowByDefault`
+        // (`!mode.is_enforce()`), which `authorize()` itself
+        // short-circuits to a synthetic, always-`Ok` destination
+        // (`legacy_passthrough`) rather than surfacing as `None`.
+        let is_gated = backing.egress_policy.mode.is_enforce();
+        let mut dest = match backing
             .egress_policy
             .authorize(EgressPurpose::OpenApiTool, url.as_str(), resolver)
-            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
+        {
+            Ok(dest) => {
+                record_egress_seen(
+                    EgressPurpose::OpenApiTool,
+                    url.as_str(),
+                    federated_name,
+                    if is_gated {
+                        EgressSightingStatus::Allowed
+                    } else {
+                        EgressSightingStatus::Ungated
+                    },
+                    None,
+                );
+                dest
+            }
+            Err(e) => {
+                record_egress_seen(
+                    EgressPurpose::OpenApiTool,
+                    url.as_str(),
+                    federated_name,
+                    EgressSightingStatus::Denied,
+                    Some(e),
+                );
+                return Err(anyhow::anyhow!("egress denied: {e:?}"));
+            }
+        };
 
         let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
             .into_iter()

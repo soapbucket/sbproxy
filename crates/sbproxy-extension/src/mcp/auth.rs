@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use sbproxy_plugin::{McpExecutionContext, Principal, PrincipalSource};
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressPurpose,
-    RedirectRule,
+    evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
+    EgressAuthorizer, EgressPurpose, EgressSightingStatus, RedirectRule,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -365,16 +365,50 @@ async fn mint_token_exchange(
     // rather than a fixture, and `allow_private` can actually refuse an
     // IdP hostname that resolves onto the pod network.
     let endpoint_host = token_endpoint.host_str().unwrap_or("unset").to_string();
-    if let Some(auth) = egress {
-        auth.authorize(
+    // WOR-2476: every token endpoint lands in the egress inventory, whether
+    // an authorizer is configured or not. This gate previously had no
+    // `else` arm at all, so an omitted authorizer produced no record.
+    match egress {
+        Some(auth) => match auth.authorize(
             EgressPurpose::TokenExchange,
             endpoint,
             &CachedSystemResolver,
-        )
-        .map_err(|denied| {
-            record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, &endpoint_host);
-            UpstreamAuthError::EgressDenied
-        })?;
+        ) {
+            Ok(_) => {
+                record_egress_seen(
+                    EgressPurpose::TokenExchange,
+                    endpoint,
+                    &endpoint_host,
+                    EgressSightingStatus::Allowed,
+                    None,
+                );
+            }
+            Err(denied) => {
+                record_egress_seen(
+                    EgressPurpose::TokenExchange,
+                    endpoint,
+                    &endpoint_host,
+                    EgressSightingStatus::Denied,
+                    Some(denied),
+                );
+                record_egress_refused(
+                    EgressPurpose::TokenExchange,
+                    denied,
+                    tenant,
+                    &endpoint_host,
+                );
+                return Err(UpstreamAuthError::EgressDenied);
+            }
+        },
+        None => {
+            record_egress_seen(
+                EgressPurpose::TokenExchange,
+                endpoint,
+                &endpoint_host,
+                EgressSightingStatus::Ungated,
+                None,
+            );
+        }
     }
 
     let key = cache_key(endpoint, audience, subject_id, subject_token);
