@@ -193,6 +193,8 @@ enum Cmd {
     Models(ModelsCmd),
     /// MCP gateway tools (pin the federated tool catalogue, check it).
     Mcp(McpCmd),
+    /// Rego policy tools (the offline `opa test` analogue).
+    Rego(RegoCmd),
     /// Update the engines and cached models (add `--self` for the
     /// binary). `sbproxy update` checks the engine release feed and the
     /// cached models, then fetches, verifies, and swaps what is out of
@@ -1026,6 +1028,44 @@ struct McpVerifyLockArgs {
     format: OutputFormat,
 }
 
+#[derive(clap::Args, Debug)]
+struct RegoCmd {
+    #[command(subcommand)]
+    sub: RegoSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum RegoSub {
+    /// Run one or more Rego fixture files against the module(s) they
+    /// name and print a coverage summary. The offline `opa test`
+    /// analogue: every fixture compiles its module through the same
+    /// `CompiledRego::compile` a live `policy: rego` or
+    /// `ai_routing_policy` uses (`module_path` and `rego_v0` honored),
+    /// so a fixture that passes here behaves identically pasted into
+    /// config. Exit 0 when every case passes and (with `--min-coverage`)
+    /// coverage clears the threshold; 1 when a case fails, a fixture is
+    /// malformed, or coverage falls short.
+    Test(RegoTestArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct RegoTestArgs {
+    /// A single fixture YAML file, or a directory searched recursively
+    /// for `*_test.yaml` / `*_test.yml` fixture files (mirrors OPA's own
+    /// `*_test.rego` naming convention, in sbproxy's YAML fixture shape).
+    path: PathBuf,
+    /// Fail (exit 1) when aggregate line coverage across every fixture
+    /// module run in this invocation is below this percentage. Coverage
+    /// is always gathered and printed; this flag only changes the exit
+    /// code.
+    #[arg(long = "min-coverage", value_name = "PCT")]
+    min_coverage: Option<f64>,
+    /// Output format. `text` (default) prints one line per case plus a
+    /// coverage summary; `json` emits a single structured object for CI.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelsSub {
     /// List catalog models with a per-GPU fit verdict and cache status.
@@ -1605,6 +1645,15 @@ fn main() {
                     McpSub::VerifyLock(a) => {
                         handle_mcp_verify_lock(a, global_config_path.as_deref())
                     }
+                },
+            );
+        }
+        Some(Cmd::Rego(cmd)) => {
+            run_subcommand(
+                "rego",
+                2,
+                match &cmd.sub {
+                    RegoSub::Test(a) => handle_rego_test(a),
                 },
             );
         }
@@ -6116,6 +6165,370 @@ fn handle_mcp_verify_lock(
     // Exit 2 on drift, matching `models verify-lock`, so CI fails on a
     // baseline that no longer describes what is served.
     Ok(if stale == 0 { 0 } else { 2 })
+}
+
+// --- `rego test` (WOR-2482): the offline `opa test` analogue ---
+
+/// Default rule evaluated when a fixture does not name one. Matches
+/// `policies[] type: rego`'s own default, so a fixture pasted from a
+/// live policy does not need to repeat `query`.
+fn default_rego_test_query() -> String {
+    "data.sbproxy.allow".to_owned()
+}
+
+/// Default evaluation budget, matching `policies[] type: rego`.
+const fn default_rego_test_budget_ms() -> u64 {
+    50
+}
+
+/// Default `input` document for a case that omits one: an empty
+/// object, for a module whose query does not read `input` at all.
+fn default_rego_test_input() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Maximum size of one fixture YAML file. A test fixture is authored
+/// text, not a bulk dataset; the cap is the same order of magnitude as
+/// `read_bounded_cli_file`'s other CLI-input limits, and exists so a
+/// mistyped path (a large unrelated file) is refused before the YAML
+/// parser spends time reporting it is not a fixture.
+const MAX_REGO_TEST_FIXTURE_BYTES: usize = 4 * 1024 * 1024;
+
+/// One `sbproxy rego test` fixture file: the module under test, shared
+/// by every case in the file, and the cases to run against it.
+///
+/// Field names mirror `policies[] type: rego` (`module`, `module_path`,
+/// `query`, `data`, `budget_ms`, `rego_v0`) exactly, and take the same
+/// defaults, so the block pasted from a fixture into a `policies[]`
+/// entry, or the other way around, is the same policy.
+#[derive(serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct RegoTestFixture {
+    /// Inline Rego source. Mutually exclusive with `module_path`.
+    #[serde(default)]
+    module: Option<String>,
+    /// A `.rego` file to load. Resolved the same way `policies[] type:
+    /// rego`'s own `module_path` is: relative to the process's current
+    /// working directory, read fresh on every run. Mutually exclusive
+    /// with `module`.
+    #[serde(default)]
+    module_path: Option<String>,
+    /// The rule reference evaluated for every case in this file.
+    #[serde(default = "default_rego_test_query")]
+    query: String,
+    /// OPA-style base data: a JSON object the module reads as
+    /// `data.<name>`, separate from the module.
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+    /// Evaluation budget in milliseconds.
+    #[serde(default = "default_rego_test_budget_ms")]
+    budget_ms: u64,
+    /// Parse `module`/`module_path` as pre-OPA-1.0 Rego v0 instead of
+    /// the v1 default.
+    #[serde(default)]
+    rego_v0: bool,
+    /// The cases to run against the compiled module.
+    cases: Vec<RegoTestCase>,
+}
+
+/// One case inside a [`RegoTestFixture`]: an `input` document and the
+/// value `query` must return for it.
+#[derive(serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct RegoTestCase {
+    /// Human-readable name. Printed on every pass/fail line, so a
+    /// failing case is named in the output rather than only counted.
+    name: String,
+    /// The `input` document the query is evaluated against.
+    #[serde(default = "default_rego_test_input")]
+    input: serde_json::Value,
+    /// The value `query` must evaluate to for this case to pass,
+    /// compared as JSON against the query's actual result. An
+    /// undefined rule reads as JSON `null` (matching
+    /// [`sbproxy_extension::rego::CompiledRego::eval_value`]), so a
+    /// case expecting "no opinion" writes `expect: null`.
+    expect: serde_json::Value,
+}
+
+/// Fixture files a directory argument to `sbproxy rego test` is
+/// searched for, recursively. A file argument is used as-is regardless
+/// of its name.
+fn discover_rego_test_fixtures(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut fixtures = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| anyhow::anyhow!("read directory {}: {error}", dir.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| anyhow::anyhow!("read directory {}: {error}", dir.display()))?;
+            let entry_path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| anyhow::anyhow!("read directory {}: {error}", dir.display()))?;
+            if file_type.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            let is_fixture = matches!(
+                entry_path.file_name().and_then(|name| name.to_str()),
+                Some(name) if name.ends_with("_test.yaml") || name.ends_with("_test.yml")
+            );
+            if is_fixture {
+                fixtures.push(entry_path);
+            }
+        }
+    }
+    fixtures.sort();
+    Ok(fixtures)
+}
+
+#[derive(serde::Serialize, Debug)]
+struct RegoTestCaseOutput {
+    fixture: String,
+    case: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct RegoTestCoverageOutput {
+    fixture: String,
+    path: String,
+    covered_lines: usize,
+    not_covered_lines: Vec<u32>,
+    percent: f64,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct RegoTestOutput {
+    schema_version: u32,
+    command: &'static str,
+    cases: Vec<RegoTestCaseOutput>,
+    passed: usize,
+    failed: usize,
+    coverage: Vec<RegoTestCoverageOutput>,
+    coverage_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_coverage: Option<f64>,
+    coverage_ok: bool,
+}
+
+/// Run every case in `fixture_paths` and gather coverage, without
+/// printing anything or deciding an exit code.
+///
+/// Split out from [`handle_rego_test`] so the pass/fail/coverage
+/// verdict is a plain value a test can assert on directly, rather than
+/// something only observable by capturing this process's stdout.
+///
+/// # Errors
+///
+/// Returns an error for a usage or fixture-authoring fault: an
+/// unreadable path, a fixture that does not parse, or a module that
+/// does not compile. A fixture whose cases run cleanly but disagree
+/// with `expect` is not an error; it is reflected in the returned
+/// `failed` count and each case's `status`.
+fn run_rego_tests(
+    fixture_paths: &[PathBuf],
+    min_coverage: Option<f64>,
+) -> anyhow::Result<RegoTestOutput> {
+    let mut cases = Vec::new();
+    let mut coverage = Vec::new();
+    let mut failed = 0usize;
+
+    for fixture_path in fixture_paths {
+        let fixture_label = fixture_path.display().to_string();
+        let bytes =
+            read_bounded_cli_file(fixture_path, MAX_REGO_TEST_FIXTURE_BYTES, "rego test fixture")?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| anyhow::anyhow!("{fixture_label}: not UTF-8: {error}"))?;
+        let fixture: RegoTestFixture = serde_yaml::from_str(text)
+            .map_err(|error| anyhow::anyhow!("{fixture_label}: {error}"))?;
+        anyhow::ensure!(
+            !fixture.cases.is_empty(),
+            "{fixture_label}: has no `cases`; nothing to run"
+        );
+
+        let (module, site) = match (&fixture.module, &fixture.module_path) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "{fixture_label}: set either `module` (inline Rego source) or `module_path` \
+                 (a path to a .rego file), not both"
+            ),
+            (None, None) => anyhow::bail!(
+                "{fixture_label}: needs `module` (inline Rego source) or `module_path` (a path \
+                 to a .rego file)"
+            ),
+            (Some(module), None) => (module.clone(), fixture_label.clone()),
+            (None, Some(path)) => {
+                let module = std::fs::read_to_string(path).map_err(|error| {
+                    anyhow::anyhow!("{fixture_label}: loading module from {path}: {error}")
+                })?;
+                (module, path.trim_end_matches(".rego").to_owned())
+            }
+        };
+
+        let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
+            site,
+            &module,
+            fixture.query.clone(),
+            fixture.budget_ms,
+            fixture.data.clone(),
+            fixture.rego_v0,
+        )
+        .map_err(|error| anyhow::anyhow!("{fixture_label}: {error}"))?;
+        compiled.set_enable_coverage(true);
+
+        for case in &fixture.cases {
+            match compiled.eval_value(case.input.clone(), "") {
+                Ok(actual) if actual == case.expect => {
+                    cases.push(RegoTestCaseOutput {
+                        fixture: fixture_label.clone(),
+                        case: case.name.clone(),
+                        status: "pass",
+                        detail: None,
+                    });
+                }
+                Ok(actual) => {
+                    failed += 1;
+                    cases.push(RegoTestCaseOutput {
+                        fixture: fixture_label.clone(),
+                        case: case.name.clone(),
+                        status: "fail",
+                        detail: Some(format!("expected {}, got {actual}", case.expect)),
+                    });
+                }
+                Err(error) => {
+                    failed += 1;
+                    cases.push(RegoTestCaseOutput {
+                        fixture: fixture_label.clone(),
+                        case: case.name.clone(),
+                        status: "fail",
+                        detail: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+
+        let report = compiled
+            .coverage_report()
+            .map_err(|error| anyhow::anyhow!("{fixture_label}: coverage report: {error}"))?;
+        for file in report {
+            coverage.push(RegoTestCoverageOutput {
+                fixture: fixture_label.clone(),
+                path: file.path.clone(),
+                covered_lines: file.covered.len(),
+                not_covered_lines: file.not_covered.clone(),
+                percent: file.percent(),
+            });
+        }
+    }
+
+    let total_covered: usize = coverage.iter().map(|row| row.covered_lines).sum();
+    let total_not_covered: usize = coverage.iter().map(|row| row.not_covered_lines.len()).sum();
+    let total_lines = total_covered + total_not_covered;
+    let coverage_percent = if total_lines == 0 {
+        100.0
+    } else {
+        (total_covered as f64 / total_lines as f64) * 100.0
+    };
+    let coverage_ok = match min_coverage {
+        Some(min) => coverage_percent >= min,
+        None => true,
+    };
+    let passed = cases.len() - failed;
+
+    Ok(RegoTestOutput {
+        schema_version: 1,
+        command: "rego.test",
+        cases,
+        passed,
+        failed,
+        coverage,
+        coverage_percent,
+        min_coverage,
+        coverage_ok,
+    })
+}
+
+/// `sbproxy rego test`: run every case in one or more fixture files
+/// through the same engine construction `policy: rego` and
+/// `ai_routing_policy` use, and print a per-module coverage summary.
+///
+/// This is the offline `opa test` analogue the parity scout (WOR-2482)
+/// found missing: a fixture-driven way to prove a Rego module decides
+/// the way its author intends before it ever reaches `sb.yml`, plus the
+/// per-module line coverage Regorus's own
+/// `set_enable_coverage`/`get_coverage_report` already ship but nothing
+/// in this repository called before this command.
+///
+/// # Errors
+///
+/// Returns an error for a usage or fixture-authoring fault: an
+/// unreadable path, a fixture that does not parse, or a module that
+/// does not compile. A fixture whose cases run cleanly but disagree
+/// with `expect`, or whose coverage misses `--min-coverage`, is not an
+/// error; it is `Ok(1)`, the same "the check ran and reported a
+/// verdict" shape `audit verify` uses.
+fn handle_rego_test(args: &RegoTestArgs) -> anyhow::Result<i32> {
+    let fixture_paths = discover_rego_test_fixtures(&args.path)?;
+    if fixture_paths.is_empty() {
+        anyhow::bail!(
+            "no rego test fixtures found at {}; pass a fixture YAML file directly, or a \
+             directory containing *_test.yaml / *_test.yml files",
+            args.path.display()
+        );
+    }
+
+    let output = run_rego_tests(&fixture_paths, args.min_coverage)?;
+
+    match args.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        OutputFormat::Text => {
+            for case in &output.cases {
+                match &case.detail {
+                    Some(detail) => println!("FAIL {} :: {}: {detail}", case.fixture, case.case),
+                    None => println!("PASS {} :: {}", case.fixture, case.case),
+                }
+            }
+            for row in &output.coverage {
+                let missed = if row.not_covered_lines.is_empty() {
+                    String::new()
+                } else {
+                    format!(", missed lines {:?}", row.not_covered_lines)
+                };
+                println!(
+                    "coverage: {} {}/{} lines ({:.1}%){missed}",
+                    row.path,
+                    row.covered_lines,
+                    row.covered_lines + row.not_covered_lines.len(),
+                    row.percent,
+                );
+            }
+            let threshold = match args.min_coverage {
+                Some(min) if output.coverage_ok => format!(" (>= {min}% required)"),
+                Some(min) => format!(" (below the {min}% required)"),
+                None => String::new(),
+            };
+            println!(
+                "{} passed, {} failed, {:.1}% total coverage{threshold}",
+                output.passed, output.failed, output.coverage_percent
+            );
+        }
+    }
+
+    Ok(if output.failed == 0 && output.coverage_ok {
+        0
+    } else {
+        1
+    })
 }
 
 // --- `--locked` serve-time lockfile enforcement (WOR-1864) ---
@@ -13353,6 +13766,249 @@ hooks:
             },
             other => panic!("expected Audit, got {other:?}"),
         }
+    }
+
+    // --- `rego test` (WOR-2482) ---
+
+    #[test]
+    fn parses_rego_test_subcommand() {
+        let cli = parse(&[
+            "sbproxy",
+            "rego",
+            "test",
+            "policies/",
+            "--min-coverage",
+            "80",
+            "--format",
+            "json",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Rego(cmd)) => match cmd.sub {
+                RegoSub::Test(args) => {
+                    assert_eq!(args.path, std::path::PathBuf::from("policies/"));
+                    assert_eq!(args.min_coverage, Some(80.0));
+                    assert!(matches!(args.format, OutputFormat::Json));
+                }
+            },
+            other => panic!("expected Rego, got {other:?}"),
+        }
+    }
+
+    /// Unique per-test scratch directory under the OS temp dir, mirroring
+    /// the audit-verify CLI tests' convention (no `tempfile` dependency
+    /// in this crate).
+    fn rego_test_scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sb-rego-test-cli-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    const PASSING_FIXTURE: &str = r#"
+module: |
+  package sbproxy
+
+  default allow := false
+
+  allow if {
+      input.request.method == "GET"
+  }
+cases:
+  - name: get is allowed
+    input:
+      request:
+        method: GET
+    expect: true
+  - name: post is denied
+    input:
+      request:
+        method: POST
+    expect: false
+"#;
+
+    #[test]
+    fn rego_test_passing_suite_exits_zero_with_coverage_output() {
+        let dir = rego_test_scratch_dir("passing");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, PASSING_FIXTURE).expect("write fixture");
+
+        let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("a well-formed fixture runs");
+        assert_eq!(output.failed, 0, "{output:?}");
+        assert_eq!(output.passed, 2, "{output:?}");
+        assert!(
+            !output.coverage.is_empty(),
+            "a passing run must still produce coverage output: {output:?}"
+        );
+
+        let exit = handle_rego_test(&RegoTestArgs {
+            path: fixture_path,
+            min_coverage: None,
+            format: OutputFormat::Json,
+        })
+        .expect("the handler runs end to end");
+        assert_eq!(exit, 0, "a passing suite must exit 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const FAILING_FIXTURE: &str = r#"
+module: |
+  package sbproxy
+
+  default allow := false
+
+  allow if {
+      input.request.method == "GET"
+  }
+cases:
+  - name: get is allowed
+    input:
+      request:
+        method: GET
+    expect: true
+  - name: post is wrongly expected allowed
+    input:
+      request:
+        method: POST
+    expect: true
+"#;
+
+    #[test]
+    fn rego_test_failing_case_exits_nonzero_naming_the_case() {
+        let dir = rego_test_scratch_dir("failing");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, FAILING_FIXTURE).expect("write fixture");
+
+        let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("the fixture parses and its module compiles");
+        assert_eq!(output.failed, 1, "{output:?}");
+        let failing = output
+            .cases
+            .iter()
+            .find(|case| case.status == "fail")
+            .expect("exactly one case fails");
+        assert_eq!(
+            failing.case, "post is wrongly expected allowed",
+            "the failing case must be named in the result, not just counted"
+        );
+
+        let exit = handle_rego_test(&RegoTestArgs {
+            path: fixture_path,
+            min_coverage: None,
+            format: OutputFormat::Text,
+        })
+        .expect("the handler runs end to end");
+        assert_eq!(exit, 1, "a failing case must exit nonzero");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const PARTIAL_COVERAGE_FIXTURE: &str = r#"
+module: |
+  package sbproxy
+
+  default allow := false
+
+  allow if {
+      input.request.method == "GET"
+      input.request.path == "/health"
+  }
+cases:
+  - name: post never matches
+    input:
+      request:
+        method: POST
+        path: /health
+    expect: false
+  - name: put never matches either
+    input:
+      request:
+        method: PUT
+        path: /health
+    expect: false
+"#;
+
+    #[test]
+    fn rego_test_min_coverage_below_actual_passes_above_actual_fails() {
+        // Both cases fail the rule's first condition (method is never
+        // GET), so by Rego's own short-circuit body semantics the second
+        // condition (`input.request.path`) never executes across the
+        // whole fixture: coverage is guaranteed strictly between 0% and
+        // 100%, without this test depending on Regorus's exact line
+        // attribution to know which percentage that is.
+        let dir = rego_test_scratch_dir("coverage");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, PARTIAL_COVERAGE_FIXTURE).expect("write fixture");
+
+        let baseline = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("the fixture parses and its module compiles");
+        assert_eq!(baseline.failed, 0, "{baseline:?}");
+        assert!(
+            baseline.coverage_percent > 0.0 && baseline.coverage_percent < 100.0,
+            "the short-circuited branch must leave coverage partial: {baseline:?}"
+        );
+
+        let below = run_rego_tests(
+            std::slice::from_ref(&fixture_path),
+            Some(baseline.coverage_percent - 0.01),
+        )
+        .expect("reruns cleanly");
+        assert!(
+            below.coverage_ok,
+            "a --min-coverage below actual coverage must pass: {below:?}"
+        );
+
+        let above = run_rego_tests(
+            std::slice::from_ref(&fixture_path),
+            Some(baseline.coverage_percent + 0.01),
+        )
+        .expect("reruns cleanly");
+        assert!(
+            !above.coverage_ok,
+            "a --min-coverage above actual coverage must fail: {above:?}"
+        );
+
+        let exit_below = handle_rego_test(&RegoTestArgs {
+            path: fixture_path.clone(),
+            min_coverage: Some(baseline.coverage_percent - 0.01),
+            format: OutputFormat::Text,
+        })
+        .expect("the handler runs end to end");
+        assert_eq!(exit_below, 0, "below-threshold coverage must still exit 0");
+
+        let exit_above = handle_rego_test(&RegoTestArgs {
+            path: fixture_path,
+            min_coverage: Some(baseline.coverage_percent + 0.01),
+            format: OutputFormat::Text,
+        })
+        .expect("the handler runs end to end");
+        assert_eq!(exit_above, 1, "above-threshold coverage must exit nonzero");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rego_test_discovers_fixtures_recursively_in_a_directory() {
+        let dir = rego_test_scratch_dir("discovery");
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let fixture_path = nested.join("authz_test.yaml");
+        std::fs::write(&fixture_path, PASSING_FIXTURE).expect("write fixture");
+        // A file that must not be picked up: wrong suffix.
+        std::fs::write(dir.join("notes.txt"), "not a fixture").expect("write decoy");
+
+        let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
+        assert_eq!(
+            found,
+            vec![fixture_path],
+            "only the *_test.yaml file must be discovered, found recursively"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

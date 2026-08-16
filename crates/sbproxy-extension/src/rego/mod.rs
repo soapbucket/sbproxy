@@ -51,6 +51,20 @@
 //! CEL where either would do. It is called out in `docs/scripting.md`
 //! rather than papered over.
 //!
+//! # Coverage
+//!
+//! [`CompiledRego::set_enable_coverage`] and
+//! [`CompiledRego::coverage_report`] are thin wrappers over Regorus's
+//! own `set_enable_coverage`/`get_coverage_report`, which this crate
+//! already pays for (the `coverage` Cargo feature is part of Regorus's
+//! `full-opa` default). Nothing on the request path calls either: the
+//! sole caller is `sbproxy rego test`, the offline fixture-driven test
+//! loop, which enables coverage before running a fixture's cases and
+//! reads the report back to print a summary and enforce
+//! `--min-coverage`. A production `policy: rego` or `ai_routing_policy`
+//! engine never turns this on, so evaluating real traffic pays no
+//! coverage-tracking cost.
+//!
 //! # Rego v0 and `print()`
 //!
 //! Regorus defaults to Rego v1 (`if`/`contains` required), matching OPA
@@ -135,6 +149,41 @@ fn data_defines_query_path(data: &serde_json::Value, query: &str) -> bool {
         }
     }
     !cursor.is_null()
+}
+
+/// One source file's line coverage from a [`CompiledRego`] engine, read
+/// back via [`CompiledRego::coverage_report`].
+///
+/// Wraps Regorus's own `coverage::Report`/`coverage::File` (line
+/// granularity: Regorus does not track which named rule a line belongs
+/// to, only whether the interpreter executed it) in a type that does
+/// not leak the `regorus` crate through this module's public surface.
+#[derive(Debug, Clone)]
+pub struct RegoCoverage {
+    /// The name `compile` registered the module under (its `site`
+    /// argument, with `.rego` appended, since that is the string
+    /// `compile` passes to `add_policy`).
+    pub path: String,
+    /// Source line numbers the interpreter executed at least once.
+    pub covered: Vec<u32>,
+    /// Source line numbers the interpreter never reached.
+    pub not_covered: Vec<u32>,
+}
+
+impl RegoCoverage {
+    /// Percentage of `covered ∪ not_covered` lines that were covered.
+    ///
+    /// `100.0` when the module has no lines Regorus tracks coverage for
+    /// at all (for example a comment-only file), since there is nothing
+    /// for a case to have missed.
+    pub fn percent(&self) -> f64 {
+        let total = self.covered.len() + self.not_covered.len();
+        if total == 0 {
+            100.0
+        } else {
+            (self.covered.len() as f64 / total as f64) * 100.0
+        }
+    }
 }
 
 impl CompiledRego {
@@ -311,6 +360,41 @@ impl CompiledRego {
     /// The rule reference this policy evaluates.
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Enable or disable Regorus's line-coverage instrumentation on this
+    /// engine.
+    ///
+    /// Off by default, matching Regorus's own default, and nothing on
+    /// the request path calls this; see the module's "Coverage" section.
+    /// Toggling clears whatever coverage the engine has gathered so far
+    /// (Regorus's own documented behavior for `set_enable_coverage`).
+    pub fn set_enable_coverage(&mut self, enable: bool) {
+        self.engine.set_enable_coverage(enable);
+    }
+
+    /// Line coverage gathered across every evaluation since coverage was
+    /// last enabled or cleared, one entry per source file `compile`
+    /// registered (in practice exactly one: this type parses a single
+    /// module).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Regorus cannot assemble the report. The
+    /// public API offers no way to trigger this deliberately; the
+    /// underlying call is fallible so this mirrors it rather than
+    /// hiding a failure behind an empty report.
+    pub fn coverage_report(&self) -> Result<Vec<RegoCoverage>> {
+        let report = self.engine.get_coverage_report()?;
+        Ok(report
+            .files
+            .into_iter()
+            .map(|file| RegoCoverage {
+                path: file.path,
+                covered: file.covered.into_iter().collect(),
+                not_covered: file.not_covered.into_iter().collect(),
+            })
+            .collect())
     }
 
     /// Evaluate the pinned query against `ctx`.
@@ -502,6 +586,22 @@ allow if {
         let mut ctx = crate::cel::context::build_request_context(
             "GET",
             "/v1/chat",
+            &http::HeaderMap::new(),
+            None,
+            Some("203.0.113.7"),
+            "api.example.com",
+        );
+        crate::cel::context::populate_trust_tier_namespace(&mut ctx, "anonymous");
+        ctx
+    }
+
+    /// Like [`context`], with the method and path under the caller's
+    /// control, for coverage tests that need to steer which branch of a
+    /// rule body a request takes.
+    fn ctx_for(method: &str, path: &str) -> CelContext {
+        let mut ctx = crate::cel::context::build_request_context(
+            method,
+            path,
             &http::HeaderMap::new(),
             None,
             Some("203.0.113.7"),
@@ -768,6 +868,85 @@ allow {
         assert!(
             accepted.eval_bool(&context()).expect("evaluates"),
             "the v0 rule still decides once it parses"
+        );
+    }
+
+    // --- coverage ---
+
+    #[test]
+    fn coverage_report_reflects_which_branch_a_case_took() {
+        // Two comparisons in one rule body, AND-joined, so Rego's own
+        // short-circuit semantics (not a Regorus implementation detail)
+        // guarantee the second is skipped whenever the first fails.
+        // That guarantee is what this test leans on, rather than a
+        // hardcoded line number for what Regorus's coverage attributes
+        // to a bare `allow if {` declaration line.
+        const MODULE: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    input.request.method == "GET"
+    input.request.path == "/health"
+}
+"#;
+        let method_line = MODULE
+            .lines()
+            .position(|line| line.contains("input.request.method"))
+            .map(|index| index as u32 + 1)
+            .expect("fixture has a method comparison line");
+        let path_line = MODULE
+            .lines()
+            .position(|line| line.contains("input.request.path"))
+            .map(|index| index as u32 + 1)
+            .expect("fixture has a path comparison line");
+        assert_ne!(method_line, path_line);
+
+        let mut both_match =
+            CompiledRego::compile("coverage test", MODULE, "data.sbproxy.allow", 50, None, false)
+                .expect("module compiles");
+        both_match.set_enable_coverage(true);
+        assert!(
+            both_match
+                .eval_bool(&ctx_for("GET", "/health"))
+                .expect("evaluates"),
+            "a GET to /health matches both conditions"
+        );
+        let report = both_match.coverage_report().expect("coverage report");
+        assert_eq!(report.len(), 1, "one module was compiled");
+        assert_eq!(report[0].path, "coverage test.rego");
+        assert!(
+            report[0].covered.contains(&method_line) && report[0].covered.contains(&path_line),
+            "both comparisons execute when both match: {:?}",
+            report[0]
+        );
+
+        let mut short_circuits =
+            CompiledRego::compile("coverage test", MODULE, "data.sbproxy.allow", 50, None, false)
+                .expect("module compiles");
+        short_circuits.set_enable_coverage(true);
+        assert!(
+            !short_circuits
+                .eval_bool(&ctx_for("POST", "/health"))
+                .expect("evaluates"),
+            "a POST never matches"
+        );
+        let report = short_circuits.coverage_report().expect("coverage report");
+        assert!(
+            report[0].covered.contains(&method_line),
+            "the method comparison still runs and fails: {:?}",
+            report[0]
+        );
+        assert!(
+            report[0].not_covered.contains(&path_line),
+            "the path comparison is never reached once the method check fails: {:?}",
+            report[0]
+        );
+        assert!(
+            report[0].percent() < 100.0,
+            "an unreached line must pull coverage below full: {:?}",
+            report[0]
         );
     }
 
