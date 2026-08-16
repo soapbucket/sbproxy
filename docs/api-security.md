@@ -150,9 +150,15 @@ Validate against the contract you publish:
 ```yaml
     policies:
       - type: openapi_validation
+        spec_file: "./openapi.yaml"
         mode: enforce
         status: 400
       - type: request_validator
+        schema:
+          type: object
+          required: [order_id]
+          properties:
+            order_id: { type: string }
       - type: waf
 ```
 
@@ -204,17 +210,32 @@ regulated data leaving in ways you cannot account for.
     policies:
       - type: leaked_credentials
         action: block
+        sha1_file: "./pwned-sha1.txt"
       - type: dlp
-        direction: response
-        detectors: [email, phone, credit_card]
-        action: redact
+        detectors: [email, phone_us, credit_card, us_ssn]
+        action: block
 ```
 
 `leaked_credentials` catches the accidental case where a stack trace or debug
-field carries a key. `dlp` handles the regulated-data case, with redaction
-rather than refusal so a legitimate response still completes.
+field carries a key, matching against a list you supply as `passwords`,
+`sha1_hashes`, or a `sha1_file`.
 
-Redaction happens before observability fan-out, so a redacted value does not
+`dlp` handles the regulated-data case, and it has two limits worth knowing
+before you plan around it.
+
+It scans **requests only**. Setting `direction: response` or `both` is accepted
+and then warned about at load, and the scan still runs on the request side.
+So `dlp` catches regulated data on the way in, not on the way out.
+
+Its actions are `tag` and `block`, not redact. `tag` marks the request for
+downstream handling and lets it through; `block` refuses it. Redact-and-continue
+exists on the AI path instead, in the guardrail mesh, where a `pii` guardrail
+can strip matches rather than refuse the request. See
+[ai-gateway.md](ai-gateway.md).
+
+For data on the way out, the controls that actually run are
+`leaked_credentials` above and the response transforms. Where redaction does
+run, it runs before observability fan-out, so a redacted value does not
 reappear in a log or a trace.
 
 **Still yours.** Classifying your own data. The detectors find shapes, not
@@ -229,6 +250,7 @@ If your API is called from a browser, the boring headers are most of the work:
     policies:
       - type: security_headers
       - type: csrf
+        secret_key: "${CSRF_SIGNING_KEY}"
         cookie_name: csrf_token
         safe_methods: [GET, HEAD, OPTIONS]
       - type: sri
