@@ -305,7 +305,11 @@ fn day_from_unix_seconds(seconds: i64) -> anyhow::Result<String> {
 /// panicking or dropping the entry from the comparison.
 fn day_from_recorded_at(recorded_at: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(recorded_at)
-        .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%d").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_else(|_| recorded_at.chars().take(10).collect())
 }
 
@@ -552,7 +556,9 @@ mod tests {
             .join("openai-usage-export.json");
         let bytes = std::fs::read(&path).unwrap();
         let mut rows = parse_openai_usage_export(&bytes).unwrap();
-        rows.sort_by(|a, b| (a.day.as_str(), a.model.as_str()).cmp(&(b.day.as_str(), b.model.as_str())));
+        rows.sort_by(|a, b| {
+            (a.day.as_str(), a.model.as_str()).cmp(&(b.day.as_str(), b.model.as_str()))
+        });
         assert_eq!(rows.len(), 3, "two rows on day one, one on day two");
         assert_eq!(
             rows[0],
