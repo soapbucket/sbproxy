@@ -5172,28 +5172,55 @@ enum McpPeerDowngradeDecision {
 /// WOR-2384: consult the peer-profile downgrade check for one federated
 /// contact (`tools/call` dispatch, or a `resources/read` /
 /// `prompts/get` reaching the same peer), before the upstream is
-/// contacted. Both `last_negotiated_protocol` and `last_auth_required`
-/// (below) are populated by
+/// contacted. `last_negotiated_protocol` and `last_auth_required` are
+/// populated by
 /// [`sbproxy_extension::mcp::McpFederation::refresh_server_capabilities`]'s
 /// periodic `initialize` probe, not by this request itself, so this
 /// check is always comparing against the *last* classified contact,
 /// not necessarily "just now."
 ///
-/// Scope note (fix round 1, item 5): the auth-posture axis
-/// ([`sbproxy_extension::mcp::peer_profile::PeerDowngradeKind::AuthPosture`])
-/// now reads a real observation,
-/// [`sbproxy_extension::mcp::McpFederation::last_auth_required`],
-/// classified from the upstream's actual last contact (a clean
-/// unauthenticated `initialize` success records `false`; a classified
-/// 401/407 records `true`; anything else is not trustworthy evidence
-/// either way). When this cycle has no fresh classification for this
-/// server, this falls back to
+/// Fix round 2: a pinned `protocol:` is handled first and returns
+/// directly -- it only ever compares against a *fresh* protocol
+/// answer (nothing to check yet if this peer has never successfully
+/// answered `initialize`), and never consults the peer-profile
+/// registry at all. Everything below this point is `auto` mode.
+///
+/// The re-review of fix round 1 caught a structural defect here: a
+/// single `initialize` round trip produces EITHER a protocol answer
+/// (success) OR an auth classification (a 401/407) -- never both --
+/// and the old code bailed to `Allowed` whenever the protocol axis
+/// was unknown *this cycle*, before ever reading the auth axis. Since
+/// `server_protocol_versions` used to be rebuilt from scratch every
+/// cycle too, a 401 cycle always coincided with "protocol unknown,"
+/// so `observed_auth_required` was provably always `false` in
+/// production: the auth axis could never fire. Two changes fix this
+/// together:
+/// - [`sbproxy_extension::mcp::McpFederation::last_negotiated_protocol`]
+///   now persists the last positive protocol observation across a
+///   cycle that fails (see its doc comment), so an established peer's
+///   protocol survives a later 401 cycle instead of disappearing
+///   exactly when the auth signal matters most.
+/// - This function no longer bails out solely because the protocol
+///   axis is unknown *this contact*. It bails only when there is
+///   truly nothing to compare against on *either* axis, fresh or
+///   historical (no persisted protocol, no fresh auth classification,
+///   and no existing peer profile). When some signal exists but the
+///   protocol specifically is still unknown (the very first contact
+///   with a peer was itself a 401), the protocol axis defaults to the
+///   weakest rank rather than skipping the comparison -- the same
+///   "positive evidence required for the stronger claim" rule this
+///   codebase already applies to protocol-era classification
+///   elsewhere, applied here to "unknown" rather than to "legacy
+///   marker present."
+///
+/// The auth axis itself: a clean unauthenticated `initialize` success
+/// records `false`; a classified 401/407 records `true`; anything
+/// else is not trustworthy evidence either way. When *this* cycle has
+/// no fresh classification, this falls back to
 /// [`sbproxy_extension::mcp::peer_profile::peek`]'s currently recorded
-/// value rather than guessing: passing the profile's own current value
-/// straight back in can never look weaker than itself, so a missing
-/// observation can never manufacture a downgrade. A server with no
-/// profile yet and no fresh classification falls back to `false`
-/// (nothing has ever proven it requires auth).
+/// value rather than guessing: passing the profile's own current
+/// value straight back in can never look weaker than itself, so a
+/// missing observation can never manufacture a downgrade on its own.
 fn mcp_peer_downgrade_check(
     mcp: &sbproxy_modules::action::McpAction,
     ctx: &RequestContext,
@@ -5202,36 +5229,47 @@ fn mcp_peer_downgrade_check(
     let Some(prefix) = mcp.prefix_for(server_name) else {
         return McpPeerDowngradeDecision::Allowed;
     };
-    let Some(observed_protocol) = mcp.federation.last_negotiated_protocol(&prefix.name) else {
-        return McpPeerDowngradeDecision::Allowed;
-    };
+    let observed_protocol_fresh = mcp.federation.last_negotiated_protocol(&prefix.name);
 
-    if let Err(mismatch) =
-        sbproxy_extension::mcp::peer_profile::check_pin(prefix.protocol_pin(), &observed_protocol)
-    {
-        return McpPeerDowngradeDecision::Refused {
-            rule_id: sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID,
-            reason_code: sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID,
-            message: format!(
-                "federated server '{server_name}' answered protocol '{}', which does not match the pinned '{}'",
-                mismatch.observed, mismatch.expected,
-            ),
+    if let Some(pin) = prefix.protocol_pin() {
+        let Some(observed_protocol) = observed_protocol_fresh else {
+            // Pinned, but this peer has never successfully answered
+            // `initialize`: nothing to check against yet.
+            return McpPeerDowngradeDecision::Allowed;
+        };
+        return match sbproxy_extension::mcp::peer_profile::check_pin(Some(pin), &observed_protocol)
+        {
+            Ok(()) => McpPeerDowngradeDecision::Allowed,
+            Err(mismatch) => McpPeerDowngradeDecision::Refused {
+                rule_id: sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID,
+                reason_code: sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID,
+                message: format!(
+                    "federated server '{server_name}' answered protocol '{}', which does not match the pinned '{}'",
+                    mismatch.observed, mismatch.expected,
+                ),
+            },
         };
     }
-    if prefix.protocol_pin().is_some() {
-        // Pinned and matching: negotiation, and therefore the
-        // peer-profile registry, is not consulted at all.
+
+    // `auto` mode from here on: the peer-profile registry is
+    // consulted, not just the two federation-level maps.
+    let observed_auth_fresh = mcp.federation.last_auth_required(&prefix.name);
+    let prior_profile =
+        sbproxy_extension::mcp::peer_profile::peek(ctx.tenant_id.as_str(), &prefix.peer_key);
+    if observed_protocol_fresh.is_none() && observed_auth_fresh.is_none() && prior_profile.is_none()
+    {
+        // Genuinely nothing known about this peer yet, on either
+        // axis, ever.
         return McpPeerDowngradeDecision::Allowed;
     }
-
-    let observed_auth_required = mcp
-        .federation
-        .last_auth_required(&prefix.name)
-        .unwrap_or_else(|| {
-            sbproxy_extension::mcp::peer_profile::peek(ctx.tenant_id.as_str(), &prefix.peer_key)
-                .map(|profile| profile.auth_required)
-                .unwrap_or(false)
-        });
+    let observed_protocol = observed_protocol_fresh
+        .unwrap_or_else(|| sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string());
+    let observed_auth_required = observed_auth_fresh.unwrap_or_else(|| {
+        prior_profile
+            .as_ref()
+            .map(|profile| profile.auth_required)
+            .unwrap_or(false)
+    });
 
     use sbproxy_extension::mcp::peer_profile::ObservationVerdict;
     match sbproxy_extension::mcp::peer_profile::observe_and_record(
@@ -8319,7 +8357,20 @@ mod mcp_catalog_snapshot_tests {
         // now reads a real observation
         // (`McpFederation::last_auth_required`) instead of a hardcoded
         // `false`. A later observation of "no auth needed" after an
-        // earlier "auth required" is an AuthPosture downgrade. ---
+        // earlier "auth required" is an AuthPosture downgrade.
+        //
+        // Fix round 2 note: this scenario seeds BOTH axes together in
+        // one call, a combination `refresh_server_capabilities` cannot
+        // structurally produce from a single `initialize` round trip
+        // (success and a classified 401/407 are mutually exclusive
+        // outcomes of the same probe). It stays as a direct,
+        // isolated proof of `mcp_peer_downgrade_check`'s own
+        // comparison logic, decoupled from the refresh machinery.
+        // `wor_2384_auth_posture_downgrade_fires_through_real_refresh_and_dispatch`
+        // (below, outside this shared-egress test) is the proof that
+        // matters for the refresh machinery itself: no seeding at all,
+        // a real stub upstream, and the real `refresh_server_capabilities`
+        // -> dispatch sequence. ---
         {
             const TOOL_NAME: &str = "wor2384-governance-evidence-auth-downgrade-fixture";
             const SERVER: &str = "auth-downgrade-server";
@@ -8549,6 +8600,198 @@ mod mcp_catalog_snapshot_tests {
                 .unwrap_or_default()
                 .contains("weaker"),
             "prompts/get must be refused by the same downgraded profile: {prompt_get:?}"
+        );
+    }
+
+    /// A stub upstream that answers a SEQUENCE of full raw HTTP
+    /// responses, one per incoming connection, repeating the last one
+    /// once the sequence is exhausted. Returns the URL to put in
+    /// `origin:`. WOR-2384 fix round 2: the same fixture shape
+    /// `sbproxy_extension::mcp::federation`'s own test module uses for
+    /// the same purpose (driving multiple `refresh_server_capabilities`
+    /// cycles against one upstream with a real TCP round trip),
+    /// duplicated here because it is private to that crate's test
+    /// module.
+    fn scripted_responses_server(responses: Vec<String>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("scripted fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("scripted fixture address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut index = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let response = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+                index += 1;
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}/mcp")
+    }
+
+    fn scripted_initialize_401_response() -> String {
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    fn scripted_initialize_success_response(protocol_version: &str) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {}},
+            },
+            "id": 1,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn scripted_tool_call_response() -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "result": {"content": [{"type": "text", "text": "fixture"}]},
+            "id": 1,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[tokio::test]
+    async fn wor_2384_auth_posture_downgrade_fires_through_real_refresh_and_dispatch() {
+        // WOR-2384 fix round 2 (re-review of fix round 1, finding 5):
+        // the re-reviewer proved the AuthPosture axis was structurally
+        // unreachable from live traffic -- `refresh_server_capabilities`
+        // rebuilt `server_protocol_versions` from scratch every cycle,
+        // so a 401 cycle (which carries no protocol answer) always left
+        // the protocol axis `None`, and `mcp_peer_downgrade_check` bailed
+        // out on that alone before ever reading the auth axis. Fixed by
+        // (a) persisting a positive protocol observation across a later
+        // failing cycle, and (b) no longer bailing out solely because
+        // the protocol axis is unknown *this* contact -- see
+        // `mcp_peer_downgrade_check`'s doc comment for the full
+        // reasoning. This test proves the fix through the REAL refresh
+        // + dispatch path: no `seed_server_observations_for_test`
+        // anywhere here, only a stub upstream and explicit
+        // `refresh_server_capabilities` calls.
+        const TOOL_NAME: &str = "wor2384-auth-downgrade-realistic-fixture";
+        const SERVER: &str = "auth-downgrade-realistic-server";
+
+        let origin = scripted_responses_server(vec![
+            scripted_initialize_401_response(),
+            scripted_tool_call_response(),
+            scripted_initialize_success_response(
+                sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION,
+            ),
+        ]);
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "auth-downgrade-realistic-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": origin,
+                "prefix": SERVER,
+                "downgrade": "block"
+            }]
+        }))
+        .expect("auth-downgrade realistic fixture compiles");
+        // `seed_tools_for_test`'s side effect marks the federation
+        // primed, so `ensure_ready` (called unconditionally by every
+        // `mcp_handler_exchange` call below) never fires its OWN cold
+        // prime against this stub -- only the two explicit
+        // `refresh_server_capabilities` calls below ever contact it,
+        // in the exact order this stub's response script expects
+        // (initialize, tools/call, initialize).
+        action.federation.seed_tools_for_test(
+            HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+            None,
+        );
+
+        // Cycle 1: real probe, gets 401.
+        action.federation.refresh_server_capabilities().await;
+        assert_eq!(
+            action.federation.last_auth_required(SERVER),
+            Some(true),
+            "the 401 cycle must classify auth_required = true"
+        );
+        assert_eq!(
+            action.federation.last_negotiated_protocol(SERVER),
+            None,
+            "the first-ever cycle being a 401 leaves the protocol genuinely unknown"
+        );
+
+        // Dispatch #1: the fixed check no longer bails out just
+        // because the protocol is unknown; it defaults to the weakest
+        // rank and records the (defaulted-protocol, auth=true)
+        // baseline. First contact is never itself a refusal, so this
+        // falls through to a real (stub-served) tool dispatch.
+        let call1 = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": TOOL_NAME, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call1["error"]["message"]
+                .as_str()
+                .map(|m| !m.contains("weaker"))
+                .unwrap_or(true),
+            "the first contact must not itself be refused as a downgrade: {call1:?}"
+        );
+
+        // Cycle 2: real probe, now succeeds -- auth no longer
+        // required.
+        action.federation.refresh_server_capabilities().await;
+        assert_eq!(action.federation.last_auth_required(SERVER), Some(false));
+        assert_eq!(
+            action
+                .federation
+                .last_negotiated_protocol(SERVER)
+                .as_deref(),
+            Some(sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION)
+        );
+
+        // Dispatch #2: the AuthPosture downgrade fires through the
+        // real refresh + dispatch path.
+        let call2 = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": TOOL_NAME, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call2["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("weaker"),
+            "the auth-posture downgrade must refuse the second contact: {call2:?}"
         );
     }
 }

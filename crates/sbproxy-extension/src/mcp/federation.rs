@@ -1820,7 +1820,22 @@ impl McpFederation {
     /// Returns the number of upstreams that answered.
     pub async fn refresh_server_capabilities(&self) -> usize {
         let mut snapshot: HashMap<String, serde_json::Value> = HashMap::new();
-        let mut protocol_versions: HashMap<String, String> = HashMap::new();
+        // WOR-2384 fix round 2: unlike `snapshot` and `auth_required`,
+        // which are rebuilt from scratch every cycle, `protocol_versions`
+        // starts from the CURRENT stored map and is only ever advanced
+        // by a fresh positive observation. A single `initialize` round
+        // trip can only ever produce ONE of "here is the protocol
+        // version" (a success) or "here is the auth posture" (a
+        // classified 401/407) -- never both -- so rebuilding this map
+        // fresh every cycle would erase a peer's last known protocol on
+        // exactly the cycle where the auth signal matters most (a 401
+        // carries no protocol version at all), leaving the dispatch-time
+        // downgrade check with nothing to compare against right when an
+        // auth-posture observation needs a protocol to pair it with. See
+        // [`Self::last_negotiated_protocol`]'s doc comment for the read
+        // side of this contract.
+        let mut protocol_versions: HashMap<String, String> =
+            (*self.server_protocol_versions.load_full()).clone();
         let mut auth_required: HashMap<String, bool> = HashMap::new();
         for server in &self.servers {
             if server.openapi.is_some() {
@@ -1869,10 +1884,20 @@ impl McpFederation {
 
     /// The `protocolVersion` string `server_name` answered with on its
     /// last successful `initialize`, or `None` when it has never
-    /// answered (never probed yet, an OpenAPI-backed upstream, or every
-    /// probe so far has failed). Feeds the peer-profile downgrade check
-    /// (WOR-2384); call after at least one
+    /// answered at all (never probed yet, an OpenAPI-backed upstream, or
+    /// every probe ever attempted has failed). Feeds the peer-profile
+    /// downgrade check (WOR-2384); call after at least one
     /// [`Self::refresh_server_capabilities`].
+    ///
+    /// Unlike [`Self::last_auth_required`], this value **persists
+    /// across a cycle that fails** (see `refresh_server_capabilities`'s
+    /// doc comment): a 401/407 or a network error does not clear a
+    /// previously observed protocol version. A single `initialize`
+    /// round trip cannot produce both a protocol answer and an auth
+    /// classification, so without this persistence a cycle that
+    /// classifies auth posture would always report `None` here,
+    /// leaving the dispatch-time downgrade check nothing to pair the
+    /// fresh auth observation against.
     pub fn last_negotiated_protocol(&self, server_name: &str) -> Option<String> {
         self.server_protocol_versions
             .load()
@@ -1881,11 +1906,19 @@ impl McpFederation {
     }
 
     /// Whether `server_name` required authentication on its last
-    /// classifiable contact, or `None` when the last cycle could not
+    /// classifiable contact, or `None` when *this* cycle could not
     /// classify it (never probed yet, an OpenAPI-backed upstream, or a
     /// probe failure that was not a 401/407). Feeds the peer-profile
     /// auth-posture downgrade check (WOR-2384); call after at least one
     /// [`Self::refresh_server_capabilities`].
+    ///
+    /// Unlike [`Self::last_negotiated_protocol`], this value is rebuilt
+    /// fresh every cycle and does **not** persist a stale classification
+    /// forward on its own; a caller that needs "the best posture ever
+    /// observed" across a cycle with no fresh classification falls back
+    /// to the peer-profile registry's own recorded value instead (see
+    /// `mcp_peer_downgrade_check` in `sbproxy-core`), which is where
+    /// that persistence already lives.
     pub fn last_auth_required(&self, server_name: &str) -> Option<bool> {
         self.server_auth_required.load().get(server_name).copied()
     }
@@ -5842,6 +5875,98 @@ mod tests {
         let answered = fed.refresh_server_capabilities().await;
         assert_eq!(answered, 1);
         assert_eq!(fed.last_auth_required("stub-auth"), Some(false));
+    }
+
+    /// A stub upstream that answers a SEQUENCE of full raw HTTP
+    /// responses, one per incoming connection, repeating the last one
+    /// once the sequence is exhausted. Lets a test drive multiple
+    /// `refresh_server_capabilities` cycles against one upstream and
+    /// control exactly what each cycle observes.
+    fn sequential_http_server(responses: Vec<String>) -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("sequential fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("sequential fixture address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut index = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let response = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+                index += 1;
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        mock_server("sequential-stub", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    fn initialize_success_response(protocol_version: &str) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {}},
+            },
+            "id": 1,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn initialize_401_response() -> String {
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_negotiated_protocol_survives_a_later_cycle_that_401s() {
+        // WOR-2384 fix round 2: `server_protocol_versions` persists a
+        // positive protocol observation across a LATER cycle that
+        // fails to classify anything but auth posture -- unlike the
+        // old rebuild-from-scratch behavior, which the re-review
+        // caught as making the auth axis structurally unreachable (a
+        // 401 cycle used to wipe the protocol map to empty every
+        // time, and `mcp_peer_downgrade_check` bailed out before ever
+        // reading the auth signal, since a single `initialize` round
+        // trip can only ever produce a protocol answer OR an auth
+        // classification, never both).
+        let server = sequential_http_server(vec![
+            initialize_success_response(super::super::types::MODERN_PROTOCOL_VERSION),
+            initialize_401_response(),
+        ]);
+        let fed = McpFederation::new(vec![server]);
+
+        fed.refresh_server_capabilities().await;
+        assert_eq!(
+            fed.last_negotiated_protocol("sequential-stub").as_deref(),
+            Some(super::super::types::MODERN_PROTOCOL_VERSION)
+        );
+
+        fed.refresh_server_capabilities().await;
+        assert_eq!(
+            fed.last_negotiated_protocol("sequential-stub").as_deref(),
+            Some(super::super::types::MODERN_PROTOCOL_VERSION),
+            "a 401 cycle must not erase the protocol this peer already demonstrated"
+        );
+        assert_eq!(
+            fed.last_auth_required("sequential-stub"),
+            Some(true),
+            "the 401 cycle still classifies fresh auth-required evidence"
+        );
     }
 
     #[tokio::test]
