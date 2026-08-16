@@ -2353,6 +2353,27 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("build public-listener runtime: {error}"))?;
+    // WOR-2452: close the window between binding the public listener and
+    // Pingora owning SIGTERM. Pingora registers its terminate handler
+    // inside `UnixShutdownSignalWatch::recv()`, which is not polled until
+    // `run()`, so every moment from here until then runs with the default
+    // disposition: a SIGTERM kills the process outright.
+    //
+    // That matters because the socket is already accepting in the kernel
+    // sense the instant it is bound. A client connect() completes into
+    // the listen backlog whether or not anything has called accept(), so
+    // the proxy looks up from outside while still unable to shut down
+    // cleanly. A rolling deploy that signals in this window resets the
+    // connections the kernel already queued.
+    //
+    // tokio signal streams are additive, not exclusive: "A Signal stream
+    // can be created for a particular signal number multiple times. When
+    // a signal is received then all the associated channels will receive
+    // the signal notification." So registering here displaces the default
+    // disposition immediately and does not interfere with Pingora's own
+    // registration later; both receive.
+    install_early_terminate_guard(&listener_runtime);
+
     listener_runtime
         .block_on(proxy_service.prepare_listeners())
         .map_err(|error| anyhow::anyhow!("bind public listener: {error}"))?;
@@ -2735,6 +2756,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // which skips Rust destructors and used to orphan managed engine
     // subprocesses. `run()` returns after the same signal-driven lifecycle,
     // allowing the model-runtime guard below to stop every engine first.
+    // Pingora owns the signal from here. The early guard stands down
+    // rather than racing it: after this point a SIGTERM has a drain to
+    // run, and exiting from under it would abandon in-flight requests.
+    PINGORA_OWNS_SIGTERM.store(true, std::sync::atomic::Ordering::SeqCst);
     server.run(pingora_core::server::RunArgs::default());
     drop(listener_runtime);
     drop(_model_plane_shutdown);
@@ -3625,6 +3650,65 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
         count = sinks.len(),
         "WOR-1045 PR1: parsed sinks block; dispatch wiring lands in PR2"
     );
+}
+
+/// Set immediately before handing the process to Pingora's run loop.
+///
+/// After that point a SIGTERM has a drain to run, so the early guard
+/// must not exit from under it.
+static PINGORA_OWNS_SIGTERM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Handle SIGTERM during startup, before Pingora's handler exists.
+///
+/// Registers a terminate stream on `runtime` and exits cleanly if it
+/// fires while the process is still starting up. Without this the
+/// default disposition applies and the process is killed outright, which
+/// is what `sigterm_cleanly_releases_a_prepared_public_listener` caught
+/// as `SIGTERM exit was signal: 15` (WOR-2452).
+///
+/// Exiting is the correct graceful shutdown for this state, not a
+/// shortcut. The run loop has not started, so no request has been
+/// accepted and there is nothing to drain; anything the kernel queued
+/// into the listen backlog was never ours to answer.
+///
+/// Registering the stream **without** acting on it would be worse than
+/// the bug. The default disposition would still be displaced, so the
+/// process would ignore SIGTERM entirely during startup and a deploy
+/// would hang until the orchestrator escalated to SIGKILL. Trading a
+/// fast death for a slow one is not an improvement.
+fn install_early_terminate_guard(runtime: &tokio::runtime::Runtime) {
+    runtime.spawn(async {
+        let mut term = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(error) => {
+                // Startup continues: Pingora registers its own handler
+                // shortly and the window stays open rather than the boot
+                // failing over a signal stream.
+                tracing::warn!(
+                    error = %error,
+                    "could not install the startup SIGTERM guard; a signal before the run \
+                     loop starts will kill the process outright"
+                );
+                return;
+            }
+        };
+        term.recv().await;
+        if PINGORA_OWNS_SIGTERM.load(std::sync::atomic::Ordering::SeqCst) {
+            // Pingora's own stream received the same signal and is
+            // draining. Stand down.
+            return;
+        }
+        tracing::info!(
+            event = "shutdown_signal_received",
+            signal = "SIGTERM",
+            kind = "startup",
+            "SIGTERM received before the run loop started; exiting cleanly with nothing to drain"
+        );
+        std::process::exit(0);
+    });
 }
 
 /// Warn about decision-audit events an operator enabled that nothing
