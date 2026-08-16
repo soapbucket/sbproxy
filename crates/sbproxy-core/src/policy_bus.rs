@@ -1082,6 +1082,65 @@ mod tests {
         }
     }
 
+    /// Every publishing event scrubs its reason, checked event by event.
+    ///
+    /// WOR-2370 asks for this per emitting event rather than once for
+    /// the helper, because the failure is silent and the blast radius is
+    /// a customer's log store. A shared chokepoint is the right design
+    /// and is still not proof: an emitter that formats its reason and
+    /// hands it to a different publish path compiles, ships, and skips
+    /// the scrub, and nothing about the record looks wrong afterwards.
+    ///
+    /// The event list is derived from the contract rather than written
+    /// out, so wiring a new emitter without a redaction case fails here
+    /// instead of shipping unscrubbed. `ai.tool_call` is the one that
+    /// most needs it: its reason interpolates the guard's violation
+    /// text, which quotes model output.
+    #[test]
+    fn every_publishing_event_scrubs_its_reason() {
+        use sbproxy_observe::decision::EventCoverage;
+
+        let (_lock, mut rx) = take_bus();
+        let _redactor = OriginScopedRedactor::install();
+
+        for event in DecisionEvent::ALL {
+            // `policy` publishes through `emit_policy_verdict`, which
+            // routes here only under the converged format; it is
+            // covered by the server-side tests that drive that path.
+            if !matches!(event.coverage(), EventCoverage::Emitted) {
+                continue;
+            }
+            assert!(
+                emit_decision_audit(
+                    *event,
+                    DecisionEngine::BuiltIn,
+                    DecisionOutcome::Deny,
+                    "req-scrub-1",
+                    SCOPE_ORIGIN_ID,
+                    SCOPE_ROUTE,
+                    "acme-corp",
+                    &format!("{} refused: {SCOPE_MARKER}", event.as_label()),
+                ),
+                "`{}` must reach the bus for this to prove anything",
+                event.as_label()
+            );
+            let audit = next_decision(&mut rx, event.as_label());
+            assert!(
+                !audit.reason.as_str().contains(SCOPE_MARKER),
+                "`{}` published an unscrubbed reason: {}",
+                event.as_label(),
+                audit.reason.as_str()
+            );
+            assert!(
+                audit.reason.as_str().contains("[REDACTED:ORIGIN_SCOPE]"),
+                "`{}` must show the operator's rule fired, not merely that the marker \
+                 vanished: {}",
+                event.as_label(),
+                audit.reason.as_str()
+            );
+        }
+    }
+
     #[test]
     fn the_route_argument_picks_the_redactor_and_the_origin_argument_names_the_record() {
         // The transposition `RedactedReason::redact`'s own rustdoc warns

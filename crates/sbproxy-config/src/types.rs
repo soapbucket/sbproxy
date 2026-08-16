@@ -6008,14 +6008,14 @@ pub struct DecisionAuditConfig {
     /// is never published by any setting; `Some(false)` and `None` are
     /// both **off**, as is an absent block.
     ///
-    /// `proxy.observability.log.decision_audit` is the only place this
-    /// block is accepted in this release. The tenant and origin log
-    /// blocks deny unknown fields and carry no `decision_audit` key, so
-    /// writing one there fails config load with an `unknown field`
-    /// error rather than being read or quietly ignored. Scoped
-    /// overrides land in a later slice, and until they do there is no
-    /// parent for `None` to inherit from, which is why it reads as off
-    /// rather than as inherit.
+    /// Accepted at proxy, tenant, and origin scope. A tenant or origin
+    /// block composes over the proxy one per event label, so naming
+    /// `route.decide` under a tenant inherits the proxy's `cache.admit`
+    /// rather than replacing the map; see [`DecisionAuditScopes`].
+    ///
+    /// `None` reads as off rather than as inherit, because a scope that
+    /// wrote no block asked for nothing and the composition already
+    /// gives a wider scope its say.
     ///
     /// Off is the default because the decision events differ by orders
     /// of magnitude in how often they fire. `cache.key` runs once per
