@@ -2533,11 +2533,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // the signal notification." So registering here displaces the default
     // disposition immediately and does not interfere with Pingora's own
     // registration later; both receive.
-    install_early_terminate_guard(&listener_runtime);
+    //
+    // The phase subscription has to be taken here, while `server` is
+    // still ours: `run` consumes it and drops the broadcast sender.
+    install_early_terminate_guard(&listener_runtime, server.watch_execution_phase());
 
     listener_runtime
         .block_on(proxy_service.prepare_listeners())
         .map_err(|error| anyhow::anyhow!("bind public listener: {error}"))?;
+
+    hold_open_startup_signal_window();
 
     server.add_service(proxy_service);
 
@@ -2917,10 +2922,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // which skips Rust destructors and used to orphan managed engine
     // subprocesses. `run()` returns after the same signal-driven lifecycle,
     // allowing the model-runtime guard below to stop every engine first.
-    // Pingora owns the signal from here. The early guard stands down
-    // rather than racing it: after this point a SIGTERM has a drain to
-    // run, and exiting from under it would abandon in-flight requests.
-    PINGORA_OWNS_SIGTERM.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Pingora takes the signal from here. The early guard learns that
+    // from the execution-phase broadcast rather than from this call site,
+    // because "about to call run" and "listening for signals" are
+    // different facts and a SIGTERM can land between them. See
+    // `install_early_terminate_guard`.
     server.run(pingora_core::server::RunArgs::default());
     drop(listener_runtime);
     drop(_model_plane_shutdown);
@@ -3813,22 +3819,79 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
     );
 }
 
-/// Set immediately before handing the process to Pingora's run loop.
+/// Environment variable that widens the startup signal window.
 ///
-/// After that point a SIGTERM has a drain to run, so the early guard
-/// must not exit from under it.
-static PINGORA_OWNS_SIGTERM: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Deliberately not `pub`. The test that sets it lives in another crate
+/// and repeats the string, which would normally be the kind of coupling
+/// worth exporting a constant for; here it is not, because the test does
+/// not have to trust the name. It asserts the hold actually took effect
+/// (connected but not yet serving) before it signals, so a renamed or
+/// broken hook fails that precondition rather than quietly turning the
+/// regression test into one that measures nothing.
+const STARTUP_SIGNAL_WINDOW_HOLD_ENV: &str = "SBPROXY_TEST_STARTUP_SIGNAL_HOLD_MS";
+
+/// Hold the process inside the startup signal window, for tests only.
+///
+/// The window this sits in is real but short: on an unloaded machine the
+/// listener is bound and Pingora owns the signal within a few
+/// milliseconds. A test that tries to land a SIGTERM in it by timing
+/// alone is a coin flip, and a coin-flip test cannot tell "the guard
+/// works" from "the signal missed the window", which is the only thing
+/// the test exists to distinguish. Widening the window on request makes
+/// the same code path deterministic to hit.
+///
+/// The delay runs after the bind, so a client that connects sees the
+/// same accepting-but-not-serving socket a real deploy would, and it
+/// runs before `Server::run`, so [`install_early_terminate_guard`] is
+/// the only thing standing between a SIGTERM and the default
+/// disposition. Both properties are what make the resulting test
+/// discriminating rather than merely green.
+///
+/// Unset, malformed, or `0` means no hold, so the production path is a
+/// single failed `env::var` lookup.
+fn hold_open_startup_signal_window() {
+    let Ok(raw) = std::env::var(STARTUP_SIGNAL_WINDOW_HOLD_ENV) else {
+        return;
+    };
+    let Ok(millis) = raw.trim().parse::<u64>() else {
+        tracing::warn!(
+            var = STARTUP_SIGNAL_WINDOW_HOLD_ENV,
+            value = %raw,
+            "startup signal-window hold is not a whole number of milliseconds; ignoring"
+        );
+        return;
+    };
+    if millis == 0 {
+        return;
+    }
+    tracing::warn!(
+        var = STARTUP_SIGNAL_WINDOW_HOLD_ENV,
+        millis,
+        "holding open the startup signal window; this is a test hook and must never be set in \
+         production, where it delays serving by exactly this long"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+}
+
+/// How long the startup guard waits for Pingora to confirm it took a
+/// SIGTERM before deciding that Pingora missed it.
+///
+/// Pingora broadcasts `GracefulTerminate` the moment its own stream
+/// receives the signal, ahead of any draining, so the confirmation is a
+/// scheduling delay rather than a shutdown. Generous by two orders of
+/// magnitude on purpose: firing early would abandon a real drain, and
+/// the cost of being late is only that a deploy waits this long in a
+/// case that should never happen.
+const PINGORA_TERMINATE_HANDOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Handle SIGTERM during startup, before Pingora's handler exists.
 ///
-/// Registers a terminate stream on `runtime` and exits cleanly if it
-/// fires while the process is still starting up. Without this the
-/// default disposition applies and the process is killed outright, which
-/// is what `sigterm_cleanly_releases_a_prepared_public_listener` caught
-/// as `SIGTERM exit was signal: 15` (WOR-2452).
+/// Registers a terminate stream on `runtime` and exits cleanly if the
+/// signal arrives while the process is still starting up. Without this
+/// the default disposition applies and the process is killed outright,
+/// which is what WOR-2452 caught as `SIGTERM exit was signal: 15`.
 ///
-/// Exiting is the correct graceful shutdown for this state, not a
+/// Exiting is the correct graceful shutdown for that state, not a
 /// shortcut. The run loop has not started, so no request has been
 /// accepted and there is nothing to drain; anything the kernel queued
 /// into the listen backlog was never ours to answer.
@@ -3838,30 +3901,105 @@ static PINGORA_OWNS_SIGTERM: std::sync::atomic::AtomicBool =
 /// process would ignore SIGTERM entirely during startup and a deploy
 /// would hang until the orchestrator escalated to SIGKILL. Trading a
 /// fast death for a slow one is not an improvement.
-fn install_early_terminate_guard(runtime: &tokio::runtime::Runtime) {
-    runtime.spawn(async {
-        let mut term = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(s) => s,
-            Err(error) => {
-                // Startup continues: Pingora registers its own handler
-                // shortly and the window stays open rather than the boot
-                // failing over a signal stream.
-                tracing::warn!(
-                    error = %error,
-                    "could not install the startup SIGTERM guard; a signal before the run \
-                     loop starts will kill the process outright"
-                );
+///
+/// # Why the handover watches phases instead of a flag
+///
+/// The guard has to stand down once Pingora owns the signal, or it would
+/// exit from under a real drain. The obvious way to do that is a flag set
+/// just before `Server::run`, and it is wrong, because "we are about to
+/// call run" is not the same fact as "Pingora is listening for signals".
+///
+/// Pingora sends `ExecutionPhase::Running` and *then* calls
+/// `run_args.shutdown_signal.recv()`, and the terminate stream is
+/// registered inside that `recv`, not before it. tokio delivers a signal
+/// only to streams that already exist, so a SIGTERM landing between the
+/// flag and that registration would be dropped by a guard that had
+/// already stood down and never seen by a stream that did not yet exist.
+/// The process would then ignore SIGTERM outright: the slow death this
+/// function's whole design is trying to avoid, in a window a flag makes
+/// invisible.
+///
+/// So the guard resolves the ambiguity after the fact instead of
+/// predicting it. Before `Running` it owns the signal outright. At or
+/// after `Running` it waits [`PINGORA_TERMINATE_HANDOVER_GRACE`] for the
+/// `GracefulTerminate` broadcast that proves Pingora received the same
+/// signal, and stands down when it arrives. If it does not arrive, the
+/// signal fell in the gap and the guard exits rather than leaving the
+/// process unresponsive.
+fn install_early_terminate_guard(
+    runtime: &tokio::runtime::Runtime,
+    mut phases: tokio::sync::broadcast::Receiver<pingora_core::server::ExecutionPhase>,
+) {
+    use pingora_core::server::ExecutionPhase;
+    use tokio::sync::broadcast::error::RecvError;
+
+    runtime.spawn(async move {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(error) => {
+                    // Startup continues: Pingora registers its own handler
+                    // shortly and the window stays open rather than the boot
+                    // failing over a signal stream.
+                    tracing::warn!(
+                        error = %error,
+                        "could not install the startup SIGTERM guard; a signal before the run \
+                         loop starts will kill the process outright"
+                    );
+                    return;
+                }
+            };
+
+        // Track whether the run loop has reached the point where Pingora
+        // is about to take the signal. `Lagged` and `Closed` both resolve
+        // to "assume it has": either can mean `Running` was missed, and
+        // assuming the later state only ever costs the bounded wait
+        // below, while assuming the earlier one would exit from under a
+        // live drain.
+        let mut running = false;
+        loop {
+            tokio::select! {
+                phase = phases.recv() => match phase {
+                    Ok(ExecutionPhase::Running) => running = true,
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => running = true,
+                },
+                _ = term.recv() => break,
+            }
+        }
+
+        if running {
+            // Pingora is either handling this same signal or missed it by
+            // a hair. Its `GracefulTerminate` broadcast is the only
+            // evidence that distinguishes the two.
+            let confirmed = tokio::time::timeout(PINGORA_TERMINATE_HANDOVER_GRACE, async {
+                loop {
+                    match phases.recv().await {
+                        Ok(ExecutionPhase::GracefulTerminate) => return true,
+                        Ok(_) => {}
+                        Err(RecvError::Lagged(_)) => {}
+                        // The server was dropped, which only happens once
+                        // `run` has returned. Shutdown is already underway.
+                        Err(RecvError::Closed) => return true,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            if confirmed {
                 return;
             }
-        };
-        term.recv().await;
-        if PINGORA_OWNS_SIGTERM.load(std::sync::atomic::Ordering::SeqCst) {
-            // Pingora's own stream received the same signal and is
-            // draining. Stand down.
-            return;
+            tracing::warn!(
+                event = "shutdown_signal_received",
+                signal = "SIGTERM",
+                kind = "handover",
+                grace_ms = PINGORA_TERMINATE_HANDOVER_GRACE.as_millis() as u64,
+                "SIGTERM arrived as the run loop was taking over and Pingora did not report it; \
+                 exiting rather than leaving the process unresponsive to the signal"
+            );
+            std::process::exit(0);
         }
+
         tracing::info!(
             event = "shutdown_signal_received",
             signal = "SIGTERM",
