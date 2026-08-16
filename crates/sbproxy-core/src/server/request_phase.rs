@@ -2937,7 +2937,13 @@ pub(super) async fn request_filter(
         match outcome {
             InboundKeyPhase::Resolved => {
                 ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
-                sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
+                crate::server::record_auth_decision(
+                    ctx,
+                    &origin_label,
+                    "virtual_key",
+                    true,
+                    "minted virtual key accepted",
+                );
             }
             InboundKeyPhase::NotPresent => {
                 if !ai_action_resolves_overlapping_credentials {
@@ -3007,10 +3013,12 @@ pub(super) async fn request_filter(
                             ctx.deny_reason =
                                 Some("native_key_policy: provider not allowed".to_string());
                             finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
-                            sbproxy_observe::metrics::record_auth(
+                            crate::server::record_auth_decision(
+                                ctx,
                                 &origin_label,
                                 "native_provider_key",
                                 false,
+                                "caller-owned provider credential refused by policy",
                             );
                             emit_auth_audit(
                                 "auth_denied",
@@ -3027,7 +3035,13 @@ pub(super) async fn request_filter(
                 }
                 if crate::inbound_key::requires_minted_key(plane.inbound()) {
                     finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
-                    sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        "virtual_key",
+                        false,
+                        "virtual key missing or unrecognized",
+                    );
                     emit_auth_audit(
                         "auth_denied",
                         "virtual_key",
@@ -3046,7 +3060,13 @@ pub(super) async fn request_filter(
                 trust_outcome,
             } => {
                 finalize_inbound_key_trust(ctx, trust_outcome);
-                sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
+                crate::server::record_auth_decision(
+                    ctx,
+                    &origin_label,
+                    "virtual_key",
+                    false,
+                    "virtual key rejected",
+                );
                 emit_auth_audit(
                     "auth_denied",
                     "virtual_key",
@@ -3169,11 +3189,23 @@ pub(super) async fn request_filter(
                     // Store trust headers in context to apply in upstream_request_filter
                     // (direct session.req_header_mut().headers doesn't propagate to upstream)
                     ctx.trust_headers = Some(trust_headers);
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        true,
+                        "forward-auth service accepted the request",
+                    );
                 }
                 Err((status, msg, trust_outcome)) => {
                     crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        false,
+                        "forward-auth service refused the request",
+                    );
                     emit_auth_audit(
                         "forward_auth_denied",
                         &auth_type,
@@ -3307,11 +3339,23 @@ pub(super) async fn request_filter(
             match auth_result {
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        true,
+                        "credential accepted",
+                    );
                 }
                 AuthResult::RateLimited(info) => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::allow_anonymous());
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        true,
+                        "admitted anonymously while the credential is rate limited",
+                    );
                     crate::trust_tier::finalize(ctx, false);
                     let extra_headers = vec![
                         ("X-RateLimit-Limit".to_string(), info.limit.to_string()),
@@ -3333,7 +3377,13 @@ pub(super) async fn request_filter(
                     return Ok(true);
                 }
                 AuthResult::Deny(status, ref msg) => {
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        false,
+                        "credential rejected",
+                    );
                     emit_auth_audit(
                         "auth_denied",
                         &auth_type,
@@ -3355,7 +3405,13 @@ pub(super) async fn request_filter(
                     return Ok(true);
                 }
                 AuthResult::DenyWithHeaders(status, ref msg, ref extra_headers) => {
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        false,
+                        "credential rejected; challenge headers returned",
+                    );
                     emit_auth_audit(
                         "auth_denied_with_headers",
                         &auth_type,
@@ -3387,7 +3443,13 @@ pub(super) async fn request_filter(
                     return Ok(true);
                 }
                 AuthResult::DigestChallenge(challenge) => {
-                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
+                    crate::server::record_auth_decision(
+                        ctx,
+                        &origin_label,
+                        &auth_type,
+                        false,
+                        "digest challenge issued; no valid credential yet",
+                    );
                     emit_auth_audit(
                         "auth_digest_challenge",
                         &auth_type,

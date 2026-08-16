@@ -3548,6 +3548,103 @@ async fn check_forward_auth(
     }
 }
 
+/// Record one authentication decision, on every surface that carries it.
+///
+/// The single seam for the `auth` decision event (WOR-2446). It records
+/// the per-feature metric, the shared decision family, and the audit
+/// record, so the three cannot disagree about what was decided or drift
+/// as call sites are added.
+///
+/// # Why this replaced fourteen bare metric calls
+///
+/// `record_auth` had fourteen production call sites across the
+/// virtual-key, forward-auth, and native-key paths. Wiring the audit at
+/// some of them and not others would have been worse than leaving it
+/// unwired: `DecisionEvent::Auth::has_emitter()` gates the startup
+/// warning that currently tells an operator this feed is silent, so a
+/// partial wiring silences that warning while the feed is still missing
+/// every decision the untouched sites make. A detector has to be as wide
+/// as the thing it detects, so the metric and the audit are emitted
+/// together or not at all.
+///
+/// # Why `origin_label` is not the origin the record carries
+///
+/// Callers pass `ctx.hostname`, the request `Host`, which is what the
+/// existing `sbproxy_auth_results_total` metric has always labelled by.
+/// The decision family cannot use it. Under a wildcard origin every
+/// subdomain is a distinct label value, and `origin` is budgeted at 200
+/// across every family that uses it, so exhausting it here would demote
+/// every not-yet-seen origin to `__other__` on unrelated metrics for the
+/// life of the process. The record and the family both take the
+/// config-bounded `origin_id`, the same choice `PolicyVerdictCtx` makes
+/// and for the same reason.
+///
+/// A request that matched no origin has no `origin_id` and no
+/// per-origin audit scope to consult, so it records the metric and the
+/// family under the default origin and publishes no record. There is no
+/// configured origin whose block could have asked for one.
+pub(crate) fn record_auth_decision(
+    ctx: &RequestContext,
+    origin_label: &str,
+    auth_type: &str,
+    allowed: bool,
+    reason: &str,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    // The pre-existing per-feature metric, unchanged, still labelled by
+    // hostname so no dashboard or alert built on it moves.
+    sbproxy_observe::metrics::record_auth(origin_label, auth_type, allowed);
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let outcome = if allowed {
+        DecisionOutcome::Allow
+    } else {
+        DecisionOutcome::Deny
+    };
+    let origin_for_family = origin_id.as_deref().unwrap_or(DEFAULT_ORIGIN_LABEL);
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        outcome,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Auth,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        outcome,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        reason,
+        sbproxy_observe::decision::DecisionDetails::auth(auth_type),
+    );
+}
+
+/// Origin label for a decision made before any origin matched.
+///
+/// A closed constant rather than the empty string: the family's label
+/// budget treats an empty origin as the proxy-wide path, which would
+/// make "no origin matched" indistinguishable from "every origin".
+const DEFAULT_ORIGIN_LABEL: &str = "__unmatched__";
+
 /// Emit a `security_audit` entry for an authentication failure.
 /// Centralised so every Deny / Challenge / forward-auth-Err arm uses
 /// the same audit shape; the `event_type` argument differentiates

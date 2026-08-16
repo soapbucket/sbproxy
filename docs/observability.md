@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -793,11 +793,11 @@ The block also composes across scopes, and it composes **per event label** rathe
 
 Two mistakes are refused at config load rather than ignored, both because a misconfigured audit feed is silent and silence is indistinguishable from a feed with nothing to say. An `events:` key naming no decision this proxy makes fails the load, and the error lists every accepted label. `ai.stream.event: true` fails too, because that event fires once per streamed chunk; enable `ai.close` instead, which carries the stream's summary once the response finishes. Writing `ai.stream.event: false` stays legal, since saying out loud that a feed is off is a reasonable thing to want in a config.
 
-**What is wired today.** Three events publish: `cache.admit`, `cache.key`, and `route.decide`. Those are exactly the three decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
+**What is wired today.** Four events publish: `auth`, `cache.admit`, `cache.key`, and `route.decide`. The three cache and routing events are the decision points that compute an operator-authored `reason`, which is the thing an audit record exists to carry. `auth` publishes on every outcome, allow and deny both, because a feed carrying only refusals cannot tell "nobody authenticated" from "the emitter covers half the arms". Each publishes only on the arm where a script returned a plan; a declined event, a faulted engine, and an undecodable document all record on the `sbproxy_decision_event_*` families and publish nothing, because there is no rationale to carry and the metric already says what happened.
 
 `policy` is a deliberate absence rather than a gap. That path already publishes on this same bus as a policy-verdict record, and it carries no free-text reason, so a second record for one decision would double the volume on the densest security event without adding anything an analyst can read. Converging the two shapes is its own change with its own compatibility story.
 
-The remaining labels parse and validate and emit nothing yet: `auth`, `rate_limit`, `waf`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle`. If you enable one and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
+The remaining labels parse and validate and emit nothing yet: `rate_limit`, `waf`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`, and `payment.lifecycle`. Two of those are misleading as written: `waf` and the rate-limiting family are policy modules, so their decisions already reach the bus as `policy` records carrying `policy_id: "waf"` and friends. Select on `policy_id` rather than waiting for a separate emitter. If you enable one and see no records, that is the missing emitter rather than a broken feed, and `sbproxy_decision_audit_events_total{event}` flat at zero for an event you enabled says the same thing in metric form.
 
 **What the record promises about its reason.** The `reason` field is scrubbed before the record exists at all: the type that field carries has exactly one constructor and that constructor runs the scrub, so no emit site can publish a raw string, whatever it believes redaction means. Four passes, in this order:
 

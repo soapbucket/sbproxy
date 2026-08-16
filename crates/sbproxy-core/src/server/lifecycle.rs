@@ -4054,8 +4054,14 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
     }
     tracing::warn!(
         events = %unwired.join(", "),
+        wired = %DecisionEvent::ALL
+            .iter()
+            .filter(|event| event.has_emitter())
+            .map(|event| event.as_label())
+            .collect::<Vec<_>>()
+            .join(", "),
         "decision_audit enables events that nothing publishes yet; they emit no records until \
-         their emitters ship. cache.key, cache.admit, and route.decide are wired today"
+         their emitters ship"
     );
 }
 
