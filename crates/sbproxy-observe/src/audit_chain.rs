@@ -1007,8 +1007,7 @@ pub(crate) fn fingerprint_key_audit_snapshot(
     match value.as_object() {
         Some(map) => {
             for (field, field_value) in map {
-                if let Some((map_key, fingerprint)) = fingerprint_named_field(field, field_value)
-                {
+                if let Some((map_key, fingerprint)) = fingerprint_named_field(field, field_value) {
                     out.insert(map_key, fingerprint);
                 }
             }

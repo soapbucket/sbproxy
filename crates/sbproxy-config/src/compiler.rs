@@ -2313,7 +2313,10 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
 
     if let Some(config_path) = audit.config_path.as_deref().map(str::trim) {
         if Some(normalize_chain_path(config_path))
-            == audit.path.as_deref().map(|p| normalize_chain_path(p.trim()))
+            == audit
+                .path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
         {
             anyhow::bail!(
                 "the config channel cannot share the security chain file; the two payload \
@@ -2324,7 +2327,10 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
 
     if let Some(key_path) = audit.key_path.as_deref().map(str::trim) {
         if Some(normalize_chain_path(key_path))
-            == audit.path.as_deref().map(|p| normalize_chain_path(p.trim()))
+            == audit
+                .path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
         {
             anyhow::bail!(
                 "the key channel cannot share the security chain file; the two payload types \
@@ -2346,7 +2352,10 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
 
     if let Some(admin_path) = audit.admin_path.as_deref().map(str::trim) {
         if Some(normalize_chain_path(admin_path))
-            == audit.path.as_deref().map(|p| normalize_chain_path(p.trim()))
+            == audit
+                .path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
         {
             anyhow::bail!(
                 "the admin channel cannot share the security chain file; the two payload types \
