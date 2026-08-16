@@ -925,4 +925,65 @@ allow if {
             "the print() text reaches the event: {event:?}"
         );
     }
+
+    #[test]
+    fn trial_evaluation_prints_are_discarded_not_logged() {
+        // `compile`'s load-time trial (`prove_evaluable`) runs this same
+        // query against an empty input at every boot and reload, whether
+        // or not the policy ever sees real traffic. The print here does
+        // not depend on `input`, so it fires identically on the trial
+        // and on a real evaluation; only the trial's `take_prints()` is
+        // discarded rather than drained through `tracing`. This pins
+        // that split so a future refactor cannot fold the trial into
+        // `drain_prints` and start misattributing boot-time trial prints
+        // as request-scoped `rego_print` events.
+        const ALWAYS_PRINTS: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    print("trial or real, always prints")
+    true
+}
+"#;
+        let capture = RegoPrintCapture::default();
+
+        let mut policy = tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            CompiledRego::compile(
+                "policy `rego` (trial-print-test)",
+                ALWAYS_PRINTS,
+                "data.sbproxy.allow",
+                50,
+                None,
+                false,
+            )
+            .expect("module compiles")
+        });
+        assert!(
+            capture.events.lock().expect("capture lock").is_empty(),
+            "compile's load-time trial must not produce a rego_print event: {:?}",
+            capture.events.lock().expect("capture lock")
+        );
+
+        tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            assert!(
+                policy.eval_bool(&context()).expect("evaluates"),
+                "the rule decides true on a real evaluation too"
+            );
+        });
+        let events = capture.events.lock().expect("capture lock");
+        assert_eq!(
+            events.len(),
+            1,
+            "a real evaluation of the same print() must produce exactly one event: {events:?}"
+        );
+        assert!(
+            events[0].message.contains("trial or real, always prints"),
+            "{:?}",
+            events[0]
+        );
+    }
 }

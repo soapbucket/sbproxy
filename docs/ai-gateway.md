@@ -590,15 +590,15 @@ evaluates on a shared in-process interpreter with a 50 ms budget
 (`budget_ms` to change it, which must be greater than zero), a `query`
 defaulting to `data.sbproxy.route`, and load-time validation: a module
 whose query names no rule refuses at config load rather than declining
-forever. In place of inline `source`, Rego also accepts `module_path`,
-a filesystem path to a `.rego` file read when the config compiles (the
-two are mutually exclusive), and `rego_v0: true` for a module written
-before OPA 1.0's `if`/`contains` requirement; see
-[scripting.md](scripting.md#3a-rego-policies) for both. A `wasm` hook runs its compiled module under the sandbox
-budget its bundle manifest declares, not a knob in this block, and it
-resolves at config load too: a `type` no loaded bundle declares, or a
-config that loads no bundle at all, refuses then rather than at the
-first request.
+forever. In place of inline `source`, Rego also accepts `module_path`, a
+filesystem path to a `.rego` file read when the config compiles (the two are
+mutually exclusive), and `rego_v0: true` for a module written before OPA
+1.0's `if`/`contains` requirement; see
+[scripting.md](scripting.md#3a-rego-policies) for both. A `wasm` hook runs
+its compiled module under the sandbox budget its bundle manifest declares,
+not a knob in this block, and it resolves at config load too: a `type` no
+loaded bundle declares, or a config that loads no bundle at all, refuses
+then rather than at the first request.
 
 ## Resilience
 

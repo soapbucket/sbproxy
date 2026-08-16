@@ -602,7 +602,7 @@ The loaded text feeds the same compile path an inline `module` does, so everythi
 
 ### `rego_v0`: pre-OPA-1.0 syntax
 
-Regorus, like current OPA, defaults to Rego v1: rule bodies require `if`, and multi-value rules require `contains`. A module written before OPA 1.0 (November 2024) uses the older syntax, `allow { ... }` with no `if`, and fails to parse under the default. `rego_v0: true` (default `false`) calls Regorus's own v0 compatibility switch before parsing, so that module compiles unchanged:
+Regorus, like current OPA, defaults to Rego v1: rule bodies require `if`, and multi-value rules require `contains`. A module written before OPA 1.0 (December 2024) uses the older syntax, `allow { ... }` with no `if`, and fails to parse under the default. `rego_v0: true` (default `false`) calls Regorus's own v0 compatibility switch before parsing, so that module compiles unchanged:
 
 ```yaml
 policies:
