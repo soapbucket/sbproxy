@@ -2851,7 +2851,120 @@ fn blocked_input_decision(
 /// (span error, block metrics, envelope, status) so the original stage's
 /// wire behavior stays identical, and re-runs the evaluator with
 /// [`InputGuardrailStage::RagAugmented`] after RAG context injection.
+// Eight arguments because the recording wrapper adds `ctx` to a
+// pipeline that already needed seven. Bundling them into a struct would
+// move the same values behind a name that says nothing, and the
+// alternative, recording at each of the three call sites instead, is the
+// scattering this wrapper exists to prevent.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_ai_input_guardrails(
+    ctx: &RequestContext,
+    config: &AiHandlerConfig,
+    guardrail_pipeline: Option<&std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    surface: &sbproxy_ai::handler::AiSurface,
+    model: &str,
+    body: &mut serde_json::Value,
+    principal: &sbproxy_plugin::Principal,
+    stage: InputGuardrailStage,
+) -> InputGuardrailDecision {
+    let decision = evaluate_ai_input_guardrails_inner(
+        config,
+        guardrail_pipeline,
+        surface,
+        model,
+        body,
+        principal,
+        stage,
+    )
+    .await;
+    // WOR-2446: recorded here rather than at the three call sites,
+    // because a fourth caller would otherwise get the guardrail without
+    // the record and nothing would say so. The evaluator itself stays
+    // free of observability so its many internal return paths cannot
+    // each decide what to emit.
+    let (outcome, guardrail, flagged) = match &decision {
+        InputGuardrailDecision::Allow { flagged_count, .. } => (
+            sbproxy_observe::decision::DecisionOutcome::Allow,
+            None,
+            *flagged_count,
+        ),
+        InputGuardrailDecision::Block { name, .. } => (
+            sbproxy_observe::decision::DecisionOutcome::Deny,
+            Some(name.as_str()),
+            0,
+        ),
+    };
+    record_guardrail_decision(
+        ctx,
+        sbproxy_observe::decision::DecisionEvent::AiGuardrailInput,
+        outcome,
+        guardrail,
+        flagged,
+        stage.label(),
+    );
+    decision
+}
+
+/// Record one AI guardrail decision on the family and the audit feed.
+///
+/// Shared by the input and output funnels so the two families cannot
+/// disagree about how a guardrail decision is shaped. `stage` is the
+/// evaluation point (`initial`, `rag_augmented`, `output`), carried in
+/// the reason rather than as a field: it distinguishes two records for
+/// one request, which is a thing a human reads, while the field set is
+/// what a rule selects on.
+fn record_guardrail_decision(
+    ctx: &RequestContext,
+    event: sbproxy_observe::decision::DecisionEvent,
+    outcome: sbproxy_observe::decision::DecisionOutcome,
+    guardrail: Option<&str>,
+    flagged_count: usize,
+    stage: &str,
+) {
+    use sbproxy_observe::decision::DecisionEngine;
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        event,
+        DecisionEngine::BuiltIn,
+        outcome,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        event,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    let reason = match guardrail {
+        Some(name) => format!("{stage} guardrail {name} blocked the request"),
+        None => format!("{stage} guardrails allowed the request ({flagged_count} flagged)"),
+    };
+    crate::policy_bus::emit_decision_audit_detailed(
+        event,
+        DecisionEngine::BuiltIn,
+        outcome,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &reason,
+        sbproxy_observe::decision::DecisionDetails::guardrail(guardrail, flagged_count),
+    );
+}
+
+async fn evaluate_ai_input_guardrails_inner(
     config: &AiHandlerConfig,
     guardrail_pipeline: Option<&std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
     surface: &sbproxy_ai::handler::AiSurface,
@@ -4355,6 +4468,7 @@ pub(super) async fn handle_ai_proxy(
             };
             let mut synthetic_body = serde_json::json!({ "prompt": prompt_text });
             match evaluate_ai_input_guardrails(
+                ctx,
                 config,
                 multipart_pipeline.as_ref(),
                 &surface,
@@ -4417,6 +4531,7 @@ pub(super) async fn handle_ai_proxy(
             {
                 AiIdempotencyEngagement::Replayed { response } => {
                     if let Some(block) = ai_output_guardrail_block(
+                        ctx,
                         response.status,
                         None,
                         multipart_external,
@@ -5627,6 +5742,7 @@ pub(super) async fn handle_ai_proxy(
     // guardrail stage below; without it the original stage's value is final.
     #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
     let mut guardrail_flagged_count = match evaluate_ai_input_guardrails(
+        ctx,
         config,
         guardrail_pipeline.as_ref(),
         &surface,
@@ -5806,6 +5922,7 @@ pub(super) async fn handle_ai_proxy(
                         // before AI policy, budgets, caches, routing, or any
                         // provider dispatch can see it.
                         match evaluate_ai_input_guardrails(
+                            ctx,
                             config,
                             guardrail_pipeline.as_ref(),
                             &surface,
@@ -6483,6 +6600,7 @@ pub(super) async fn handle_ai_proxy(
     {
         AiIdempotencyEngagement::Replayed { response } => {
             if let Some(block) = ai_output_guardrail_block(
+                ctx,
                 response.status,
                 guardrail_pipeline.as_deref(),
                 output_external,
@@ -6831,6 +6949,7 @@ pub(super) async fn handle_ai_proxy(
                             // not a copy of the response.
                             let mut body = hit.response.body.clone();
                             if let Some(block) = ai_output_guardrail_block(
+                                ctx,
                                 hit.response.status,
                                 guardrail_pipeline.as_deref(),
                                 output_external,
@@ -9207,6 +9326,39 @@ async fn external_output_guardrail_block(
 }
 
 async fn ai_output_guardrail_block(
+    ctx: &RequestContext,
+    status: u16,
+    builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
+    external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    let block = ai_output_guardrail_block_inner(status, builtin, external, body, model).await;
+    // A non-2xx response is not a guardrail decision: the inner
+    // function returns before inspecting anything, so recording here
+    // would manufacture an allow for a response no guardrail read.
+    if !(200..300).contains(&status) {
+        return block;
+    }
+    let (outcome, name) = match &block {
+        Some(block) => (
+            sbproxy_observe::decision::DecisionOutcome::Deny,
+            Some(block.name.as_str()),
+        ),
+        None => (sbproxy_observe::decision::DecisionOutcome::Allow, None),
+    };
+    record_guardrail_decision(
+        ctx,
+        sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
+        outcome,
+        name,
+        0,
+        "output",
+    );
+    block
+}
+
+async fn ai_output_guardrail_block_inner(
     status: u16,
     builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
     external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],

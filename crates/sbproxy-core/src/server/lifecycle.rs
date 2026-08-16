@@ -4025,16 +4025,46 @@ fn install_early_terminate_guard(
 /// So this warns rather than refuses, once at boot, naming each event
 /// so the message is actionable rather than a count.
 fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig) {
-    let unwired = unwired_decision_audit_events(compiled);
-    if unwired.is_empty() {
-        return;
+    use sbproxy_observe::decision::EventCoverage;
+
+    let enabled_unwired = unwired_decision_audit_events(compiled);
+    let superseded: Vec<&str> = enabled_unwired
+        .iter()
+        .copied()
+        .filter(|label| {
+            sbproxy_observe::decision::DecisionEvent::from_label(label)
+                .is_some_and(|event| event.coverage() == EventCoverage::SupersededByPolicy)
+        })
+        .collect();
+    let unwired: Vec<&str> = enabled_unwired
+        .iter()
+        .copied()
+        .filter(|label| !superseded.contains(label))
+        .collect();
+
+    // Two messages, because they are two different problems and one
+    // wording cannot be true of both. An unwired event publishes
+    // nothing and the operator can only wait. A superseded one is
+    // already publishing, under `policy`, and the operator has a query
+    // to write today. Folding them together told an operator that `waf`
+    // emits nothing while their WAF denials were on the bus the whole
+    // time (WOR-2446).
+    if !superseded.is_empty() {
+        tracing::warn!(
+            events = %superseded.join(", "),
+            "decision_audit enables events whose decisions already publish as `policy` records: \
+             these run in the policy chain, so enable `policy` and select on the `policy_id` \
+             field instead. They will never emit under their own label"
+        );
     }
-    tracing::warn!(
-        events = %unwired.join(", "),
-        wired = %wired_decision_audit_events(compiled).join(", "),
-        "decision_audit enables events that nothing publishes yet; they emit no records until \
-         their emitters ship"
-    );
+    if !unwired.is_empty() {
+        tracing::warn!(
+            events = %unwired.join(", "),
+            wired = %wired_decision_audit_events(compiled).join(", "),
+            "decision_audit enables events that nothing publishes yet; they emit no records until \
+             their emitters ship"
+        );
+    }
 }
 
 /// Whether `event` lands a record on the decision-audit feed under this
@@ -4058,12 +4088,12 @@ fn publishes_decision_audit(
     compiled: &sbproxy_config::CompiledConfig,
 ) -> bool {
     use sbproxy_config::types::PolicyRecordFormat;
-    use sbproxy_observe::decision::DecisionEvent;
+    use sbproxy_observe::decision::{DecisionEvent, EventCoverage};
 
     if event == DecisionEvent::Policy {
         return compiled.decision_audit.policy_record_format() == PolicyRecordFormat::Decision;
     }
-    event.has_emitter()
+    matches!(event.coverage(), EventCoverage::Emitted)
 }
 
 /// The events publishing decision-audit records under this config.

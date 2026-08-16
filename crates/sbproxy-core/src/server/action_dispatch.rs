@@ -4422,6 +4422,70 @@ fn record_billable_tool_call(_ctx: &RequestContext, _tool_name: &str, _server: &
 /// `sbproxy_mcp_tool_cost_usd_total`, and emits one `LlmUsageEvent`
 /// (keyed by tenant, principal, server, tool) to every configured
 /// usage sink, so tool spend lands in the same stream as model spend.
+/// Record one MCP tool dispatch on the decision family and audit feed.
+///
+/// `mcp.tool` is a gateway decision in the sense the audit surface
+/// means: the proxy chose to run a tool call against an upstream, or
+/// refused it. An analyst asking "what did this agent actually invoke"
+/// has no other structured answer, since the tool name lives in a
+/// JSON-RPC body nobody logs whole.
+///
+/// The outcome maps from the dispatch result label rather than being
+/// recomputed. `policy_denied` and `tool_not_found` are refusals the
+/// gateway made, `tool_error` is the upstream failing after the gateway
+/// allowed the call, and `ok` is a clean allow. Collapsing the last two
+/// would hide the distinction an operator most needs: whether their own
+/// gate or someone else's service is what stopped the agent.
+fn record_mcp_tool_decision(
+    ctx: &RequestContext,
+    tool_name: &str,
+    server: &str,
+    result_label: &str,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let outcome = match result_label {
+        "ok" => DecisionOutcome::Allow,
+        "policy_denied" | "tool_not_found" => DecisionOutcome::Deny,
+        _ => DecisionOutcome::Error,
+    };
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::McpTool,
+        DecisionEngine::BuiltIn,
+        outcome,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::McpTool,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::McpTool,
+        DecisionEngine::BuiltIn,
+        outcome,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &format!("mcp tool {tool_name} on {server} dispatched: {result_label}"),
+        sbproxy_observe::decision::DecisionDetails::mcp_tool(tool_name, server, result_label),
+    );
+}
+
 fn emit_mcp_tool_attribution(
     ctx: &RequestContext,
     mcp: &sbproxy_modules::action::McpAction,
@@ -4449,9 +4513,16 @@ fn emit_mcp_tool_attribution(
         result_label,
         duration.as_secs_f64(),
     );
+    // WOR-2446: the same dispatch on the shared decision family and,
+    // when the operator asked for it, the audit feed. This function is
+    // already the one place every MCP tool dispatch is accounted for,
+    // which is why the emitter belongs here rather than at the call
+    // sites: a second dispatch path would have to route through this to
+    // get its metric, so it cannot miss the audit record either.
 
     let cost = mcp.tool_cost(tool_name);
     let server = server.unwrap_or("unknown");
+    record_mcp_tool_decision(ctx, tool_name, server, result_label);
     if let Some(cost_usd) = cost {
         sbproxy_observe::metrics::record_mcp_tool_cost(tool_name, server, cost_usd);
     }

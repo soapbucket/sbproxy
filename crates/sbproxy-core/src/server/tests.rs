@@ -4480,6 +4480,55 @@ fn auth_test_pipeline(name: &str) -> std::sync::Arc<crate::pipeline::CompiledPip
     )
 }
 
+/// A superseded label must not be reported as publishing nothing.
+///
+/// `waf` decisions already reach the bus as `policy` records. Telling an
+/// operator who enabled `waf` that nothing publishes it, while their WAF
+/// denials are on the bus, sends them to wait for an emitter instead of
+/// writing the `policy_id` query that works today (WOR-2446).
+#[test]
+fn a_superseded_event_is_reported_separately_from_an_unwired_one() {
+    use sbproxy_observe::decision::{DecisionEvent, EventCoverage};
+
+    let yaml = r#"proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          waf: true
+          mcp.tool: true
+          payment.lifecycle: true
+origins:
+  "audit.test":
+    action:
+      type: static
+      body: ok
+"#;
+    let compiled = sbproxy_config::compile_config(yaml).expect("fixture config");
+    let named = super::lifecycle::unwired_decision_audit_events(&compiled);
+
+    // `mcp.tool` is wired by this change, so it is in neither bucket.
+    assert!(
+        !named.contains(&"mcp.tool"),
+        "mcp.tool publishes now and must not be named at all: {named:?}"
+    );
+    // `payment.lifecycle` genuinely publishes nothing.
+    assert!(
+        named.contains(&"payment.lifecycle"),
+        "an event with no emitter must still be named: {named:?}"
+    );
+    // `waf` is named, but the warning classifies it as superseded, and
+    // that classification is what picks the message the operator reads.
+    assert!(named.contains(&"waf"), "{named:?}");
+    assert_eq!(
+        DecisionEvent::from_label("waf").map(DecisionEvent::coverage),
+        Some(EventCoverage::SupersededByPolicy),
+        "waf must be classified as superseded so it gets the message pointing at policy_id, \
+         not the one telling the operator to wait for an emitter"
+    );
+}
+
 /// The unwired warning has to be right about `policy` (WOR-2448).
 ///
 /// `policy` is the one event whose wiring is a config question rather
