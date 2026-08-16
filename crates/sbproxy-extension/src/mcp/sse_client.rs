@@ -23,7 +23,7 @@
 //! request, so it reaches the upstream over this transport and over
 //! stdio in exactly the same form.
 
-use super::streamable::{read_body_capped, read_sse_response_capped};
+use super::streamable::{read_body_capped, read_sse_response_capped, McpUpstreamHttpStatus};
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 
 // --- SSE Client ---
@@ -54,7 +54,12 @@ pub async fn send_via_sse(
 
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("SSE MCP server returned HTTP {}", status);
+        let www_authenticate_present = resp.headers().contains_key(reqwest::header::WWW_AUTHENTICATE);
+        return Err(McpUpstreamHttpStatus {
+            status: status.as_u16(),
+            www_authenticate_present,
+        }
+        .into());
     }
 
     let content_type = resp

@@ -3072,12 +3072,32 @@ pub(super) async fn handle_mcp_action(
             // those validators ship in the enterprise tier.
             let params = request.params.take().unwrap_or(serde_json::Value::Null);
             let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+            // WOR-2384 fix round 1, item 4: same trust decision,
+            // resolved by URI ownership rather than by tool name --
+            // resolved before dispatch so a downgraded peer is never
+            // contacted for its resource read either.
+            let downgrade_refusal = if uri.is_empty() {
+                None
+            } else {
+                mcp.federation
+                    .resolve_resource(uri)
+                    .and_then(|resource: sbproxy_extension::mcp::federation::FederatedResource| {
+                        mcp_peer_downgrade_refusal_for_non_tool_call(
+                            mcp,
+                            ctx,
+                            session,
+                            &resource.server_name,
+                        )
+                    })
+            };
             if uri.is_empty() {
                 JsonRpcResponse::error(
                     request.id.clone(),
                     INVALID_PARAMS,
                     "resources/read requires `uri` param",
                 )
+            } else if let Some(message) = downgrade_refusal {
+                JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
             } else {
                 match mcp.federation.read_resource(uri).await {
                     Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
@@ -3180,6 +3200,15 @@ pub(super) async fn handle_mcp_action(
                     INVALID_PARAMS,
                     &format!("unknown prompt: {name}"),
                 )
+            } else if let Some(message) = owner.and_then(|p| {
+                // WOR-2384 fix round 1, item 4: same trust decision as
+                // `tools/call` and `resources/read` -- consulted only
+                // once RBAC reachability already passed, so the
+                // ordering matches `tools/call`'s RBAC-then-downgrade
+                // sequence.
+                mcp_peer_downgrade_refusal_for_non_tool_call(mcp, ctx, session, &p.server_name)
+            }) {
+                JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
             } else {
                 let arguments = params.get("arguments").cloned();
                 match mcp
@@ -3607,7 +3636,7 @@ pub(super) async fn handle_mcp_action(
                                     mcp_session_id.as_deref(),
                                     is_modern,
                                     None,
-                                    Some("rbac_denied"),
+                                    McpGovernanceVerdict::Deny("rbac_denied"),
                                     None,
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
@@ -3645,7 +3674,7 @@ pub(super) async fn handle_mcp_action(
                                     mcp_session_id.as_deref(),
                                     is_modern,
                                     None,
-                                    Some("quota_exceeded"),
+                                    McpGovernanceVerdict::Deny("quota_exceeded"),
                                     None,
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
@@ -3665,63 +3694,126 @@ pub(super) async fn handle_mcp_action(
                                         &format!("tool quota exceeded for {}", err.tool_name),
                                     )
                                 }
-                            } else if let Some((reason_code, message)) =
-                                mcp_peer_downgrade_check(mcp, ctx, governed_server)
-                            {
-                                // WOR-2384: a pinned protocol mismatch,
-                                // or an `auto` peer whose contact looked
-                                // weaker than its recorded profile under
-                                // `downgrade: block`. Refused before the
-                                // upstream is ever dispatched, same as
-                                // the RBAC/quota denials above.
-                                tracing::warn!(
-                                    target: "sbproxy::mcp::peer_profile",
-                                    tool = %name,
-                                    server = %governed_server,
-                                    tenant = %ctx.tenant_id,
-                                    reason = reason_code,
-                                    "MCP tools/call refused: federated peer downgrade",
-                                );
-                                sbproxy_observe::metrics::record_policy(
-                                    ctx.hostname.as_str(),
-                                    "mcp_peer_downgrade",
-                                    "deny",
-                                );
-                                sbproxy_observe::SecurityAuditEntry::policy_violation(
-                                    "mcp_peer_downgrade",
-                                    message.clone(),
-                                    200,
-                                    Some(ctx.hostname.to_string()),
-                                    ctx.client_ip,
-                                    Some(ctx.request_id.to_string()),
-                                    Some(session.req_header().method.as_str().to_string()),
-                                )
-                                .with_tenant_id(ctx.tenant_id.to_string())
-                                .emit();
-                                let response = if emit_mcp_governance_evidence(
-                                    ctx,
-                                    &name,
-                                    governed_server,
-                                    mcp_session_id.as_deref(),
-                                    is_modern,
-                                    None,
-                                    Some(reason_code),
-                                    Some(sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID),
-                                ) {
-                                    mcp_evidence_unavailable_response(request.id.clone())
-                                } else {
-                                    JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
-                                };
-                                return write_mcp_application_response(
-                                    session,
-                                    &response,
-                                    &request_id,
-                                    &rpc_method,
-                                    modern_server.as_ref(),
-                                    None,
-                                )
-                                .await;
                             } else {
+                                // WOR-2384 fix round 1: the peer-downgrade
+                                // check runs first inside this branch
+                                // (RBAC and quota already passed). A
+                                // pin mismatch or a block-mode downgrade
+                                // returns early, exactly like the RBAC
+                                // and quota denials above. A warn-mode
+                                // downgrade still emits a governance
+                                // evidence event (verdict "warn") and,
+                                // ONLY if fail-closed delivery of that
+                                // event itself fails, also returns
+                                // early -- the call was going to be
+                                // allowed, but not un-evidenced.
+                                // `Allowed` (including "no federated
+                                // server," "never probed," and
+                                // "matched or exceeded the profile")
+                                // falls through to the dispatch below
+                                // unchanged.
+                                match mcp_peer_downgrade_check(mcp, ctx, governed_server) {
+                                    McpPeerDowngradeDecision::Allowed => {}
+                                    McpPeerDowngradeDecision::Warned {
+                                        rule_id,
+                                        reason_code,
+                                    } => {
+                                        tracing::warn!(
+                                            target: "sbproxy::mcp::peer_profile",
+                                            tool = %name,
+                                            server = %governed_server,
+                                            tenant = %ctx.tenant_id,
+                                            reason = reason_code,
+                                            "MCP federated peer contact looked weaker than its recorded profile (warn mode: allowed)",
+                                        );
+                                        sbproxy_observe::metrics::record_policy(
+                                            ctx.hostname.as_str(),
+                                            "mcp_peer_downgrade",
+                                            "warn",
+                                        );
+                                        if emit_mcp_governance_evidence(
+                                            ctx,
+                                            &name,
+                                            governed_server,
+                                            mcp_session_id.as_deref(),
+                                            is_modern,
+                                            None,
+                                            McpGovernanceVerdict::Warn(reason_code),
+                                            Some(rule_id),
+                                        ) {
+                                            let response = mcp_evidence_unavailable_response(
+                                                request.id.clone(),
+                                            );
+                                            return write_mcp_application_response(
+                                                session,
+                                                &response,
+                                                &request_id,
+                                                &rpc_method,
+                                                modern_server.as_ref(),
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    McpPeerDowngradeDecision::Refused {
+                                        rule_id,
+                                        reason_code,
+                                        message,
+                                    } => {
+                                        tracing::warn!(
+                                            target: "sbproxy::mcp::peer_profile",
+                                            tool = %name,
+                                            server = %governed_server,
+                                            tenant = %ctx.tenant_id,
+                                            reason = reason_code,
+                                            "MCP tools/call refused: federated peer downgrade",
+                                        );
+                                        sbproxy_observe::metrics::record_policy(
+                                            ctx.hostname.as_str(),
+                                            "mcp_peer_downgrade",
+                                            "deny",
+                                        );
+                                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                            "mcp_peer_downgrade",
+                                            message.clone(),
+                                            200,
+                                            Some(ctx.hostname.to_string()),
+                                            ctx.client_ip,
+                                            Some(ctx.request_id.to_string()),
+                                            Some(session.req_header().method.as_str().to_string()),
+                                        )
+                                        .with_tenant_id(ctx.tenant_id.to_string())
+                                        .emit();
+                                        let response = if emit_mcp_governance_evidence(
+                                            ctx,
+                                            &name,
+                                            governed_server,
+                                            mcp_session_id.as_deref(),
+                                            is_modern,
+                                            None,
+                                            McpGovernanceVerdict::Deny(reason_code),
+                                            Some(rule_id),
+                                        ) {
+                                            mcp_evidence_unavailable_response(request.id.clone())
+                                        } else {
+                                            JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                INVALID_PARAMS,
+                                                &message,
+                                            )
+                                        };
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
                                 // Per-server timeout. The
                                 // dispatcher inside `call_tool` shares one
                                 // reqwest::Client across upstreams; the
@@ -4779,6 +4871,14 @@ fn emit_mcp_tool_attribution(
     // feeds `events:` (semconv-shaped, gated on `events.types`), because
     // an operator who wired a SIEM webhook through `events:` should not
     // also have to turn on the decision-audit feed to get MCP coverage.
+    //
+    // This funnel only ever sees allow-or-deny (a dispatched call
+    // either completed or it did not): the "warn" verdict belongs to
+    // the pre-dispatch peer-downgrade check, which never reaches here.
+    let verdict = match governance_denial_reason {
+        Some(reason) => McpGovernanceVerdict::Deny(reason),
+        None => McpGovernanceVerdict::Allow,
+    };
     let evidence_refused = emit_mcp_governance_evidence(
         ctx,
         tool_name,
@@ -4786,7 +4886,7 @@ fn emit_mcp_tool_attribution(
         mcp_session_id,
         is_modern,
         tool_arguments_hash,
-        governance_denial_reason,
+        verdict,
         None,
     );
 
@@ -4879,6 +4979,26 @@ fn mcp_evidence_unavailable_response(
     )
 }
 
+/// WOR-2384 fix round 1, item 3: the three verdicts a
+/// `mcp_governance_decision` event can carry. `Allow` and `Deny` are
+/// what every pre-round-1 caller already produced (implicitly, via
+/// `Option<&str>`); `Warn` is new -- a peer-downgrade check that ran
+/// under `downgrade: warn` still emits evidence, because a SIEM that
+/// only ever sees "allow" or "deny" for a tool that is quietly talking
+/// to a downgraded peer has no way to know the warning ever fired.
+#[derive(Debug, Clone, Copy)]
+enum McpGovernanceVerdict<'a> {
+    /// No policy objection; no reason to redact or report.
+    Allow,
+    /// The call proceeded despite a policy observation worth
+    /// recording. Carries the same kind of short, argument-free reason
+    /// code `Deny` does, redacted the same way, but does not stamp
+    /// `error.type` (the call was not refused).
+    Warn(&'a str),
+    /// The call was refused. Stamps `error.type: "policy_denied"`.
+    Deny(&'a str),
+}
+
 /// WOR-2384: whether `events.fail_closed` names `event_type` in the
 /// config pinned to this request's own pipeline generation.
 ///
@@ -4915,9 +5035,10 @@ fn mcp_governance_fail_closed(
 /// `tool_arguments_hash` is `None` at every pre-dispatch site: no call
 /// ever reached the point where `mcp_audit_capture` (or anything else)
 /// captured arguments to hash. `rule_id` is `None` except at the
-/// peer-downgrade site, which passes
-/// [`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`].
-#[allow(clippy::too_many_arguments)] // one shape reused at four call sites, mirroring emit_mcp_tool_attribution's own field-per-argument style
+/// peer-downgrade sites, which pass
+/// [`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`] or
+/// [`sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID`].
+#[allow(clippy::too_many_arguments)] // one shape reused at five call sites, mirroring emit_mcp_tool_attribution's own field-per-argument style
 fn emit_mcp_governance_evidence(
     ctx: &RequestContext,
     tool_name: &str,
@@ -4925,7 +5046,7 @@ fn emit_mcp_governance_evidence(
     mcp_session_id: Option<&str>,
     is_modern: bool,
     tool_arguments_hash: Option<&str>,
-    governance_denial_reason: Option<&str>,
+    verdict: McpGovernanceVerdict<'_>,
     rule_id: Option<&str>,
 ) -> bool {
     use sbproxy_observe::events::{EventType, ProxyEvent};
@@ -4971,7 +5092,7 @@ fn emit_mcp_governance_evidence(
         protocol_version,
         ctx.tenant_id.as_str(),
         ctx.hostname.as_str(),
-        governance_denial_reason,
+        verdict,
         Some(sbproxy_observe::logging::operator_redact_state().as_ref()),
         tool_arguments_hash,
         seq,
@@ -4998,64 +5119,107 @@ fn emit_mcp_governance_evidence(
     }
 }
 
+/// WOR-2384 fix round 1: the peer-downgrade check's decision. Pure --
+/// no logging, no metrics, no I/O beyond the peer-profile registry
+/// mutation [`sbproxy_extension::mcp::peer_profile::observe_and_record`]
+/// itself performs. Every caller applies the same logging/metrics/audit
+/// treatment around whichever variant comes back, so that treatment
+/// lives at the call sites, not duplicated here.
+#[derive(Debug, Clone)]
+enum McpPeerDowngradeDecision {
+    /// No federated server resolved, the federation has never
+    /// successfully probed it, or the contact matched or exceeded the
+    /// recorded profile: proceed unchanged.
+    Allowed,
+    /// The contact looked weaker than the recorded profile, but
+    /// `downgrade: warn` is configured: the call still proceeds. The
+    /// caller is expected to emit a `mcp_governance_decision` event
+    /// with verdict `warn` (item 3) and, only if that delivery itself
+    /// fails under fail-closed, refuse anyway.
+    Warned {
+        rule_id: &'static str,
+        reason_code: &'static str,
+    },
+    /// The call must be refused: a pinned `protocol:` disagreed with
+    /// what the peer last answered (`rule_id`:
+    /// [`sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID`]),
+    /// or an `auto`-negotiated peer's last-known contact looked weaker
+    /// than its recorded profile under `downgrade: block` (`rule_id`:
+    /// [`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`]).
+    /// These two carry different `rule_id`s (fix round 1, item 2) even
+    /// though both refuse for the same underlying reason -- a pin
+    /// mismatch never consults the recorded profile at all, so it is
+    /// not itself a "downgrade" against one.
+    Refused {
+        rule_id: &'static str,
+        reason_code: &'static str,
+        message: String,
+    },
+}
+
 /// WOR-2384: consult the peer-profile downgrade check for one federated
-/// `tools/call` dispatch, before the upstream is contacted.
+/// contact (`tools/call` dispatch, or a `resources/read` /
+/// `prompts/get` reaching the same peer), before the upstream is
+/// contacted. Both `last_negotiated_protocol` and `last_auth_required`
+/// (below) are populated by
+/// [`sbproxy_extension::mcp::McpFederation::refresh_server_capabilities`]'s
+/// periodic `initialize` probe, not by this request itself, so this
+/// check is always comparing against the *last* classified contact,
+/// not necessarily "just now."
 ///
-/// Returns `Some((reason_code, message))` when the call must be
-/// refused: a pinned `protocol:` disagreed with what the peer last
-/// answered, or an `auto`-negotiated peer's last-known contact looked
-/// weaker than its recorded profile under `downgrade: block`. The
-/// caller (the `tools/call` dispatch site) owns building and emitting
-/// the actual JSON-RPC response and the `mcp_governance_decision`
-/// event, mirroring the RBAC/quota denial sites' shape.
-///
-/// `None` covers every case that does not need a refusal: no federated
-/// server resolved for this tool, the federation has never successfully
-/// probed it (nothing to compare against yet), the contact matched or
-/// exceeded the recorded profile, or the contact looked weaker but
-/// `downgrade: warn` is configured (which still logs and counts the
-/// warning here before returning `None`, matching the RBAC/quota
-/// pattern of logging at the point of decision).
-///
-/// Scope note: the auth-posture axis
+/// Scope note (fix round 1, item 5): the auth-posture axis
 /// ([`sbproxy_extension::mcp::peer_profile::PeerDowngradeKind::AuthPosture`])
-/// is fully implemented and unit-tested in `peer_profile` itself, but
-/// this call site has no trustworthy behavioral signal yet for "did the
-/// peer actually require auth on this contact" -- the background
-/// capability probe (`McpFederation::refresh_server_capabilities`) is
-/// always unauthenticated, and which credentials a per-call dispatch
-/// attaches reflects gateway *config*, not observed peer *behavior*.
-/// Passing `false` for `observed_auth_required` here means the
-/// auth-posture downgrade path cannot fire from production traffic
-/// today; a follow-up needs a real unauthenticated-probe signal (e.g.
-/// distinguishing a 401 from other `initialize` failures) before it
-/// can.
+/// now reads a real observation,
+/// [`sbproxy_extension::mcp::McpFederation::last_auth_required`],
+/// classified from the upstream's actual last contact (a clean
+/// unauthenticated `initialize` success records `false`; a classified
+/// 401/407 records `true`; anything else is not trustworthy evidence
+/// either way). When this cycle has no fresh classification for this
+/// server, this falls back to
+/// [`sbproxy_extension::mcp::peer_profile::peek`]'s currently recorded
+/// value rather than guessing: passing the profile's own current value
+/// straight back in can never look weaker than itself, so a missing
+/// observation can never manufacture a downgrade. A server with no
+/// profile yet and no fresh classification falls back to `false`
+/// (nothing has ever proven it requires auth).
 fn mcp_peer_downgrade_check(
     mcp: &sbproxy_modules::action::McpAction,
     ctx: &RequestContext,
     server_name: &str,
-) -> Option<(&'static str, String)> {
-    let prefix = mcp.prefix_for(server_name)?;
-    let observed_protocol = mcp.federation.last_negotiated_protocol(&prefix.name)?;
+) -> McpPeerDowngradeDecision {
+    let Some(prefix) = mcp.prefix_for(server_name) else {
+        return McpPeerDowngradeDecision::Allowed;
+    };
+    let Some(observed_protocol) = mcp.federation.last_negotiated_protocol(&prefix.name) else {
+        return McpPeerDowngradeDecision::Allowed;
+    };
 
     if let Err(mismatch) =
         sbproxy_extension::mcp::peer_profile::check_pin(prefix.protocol_pin(), &observed_protocol)
     {
-        return Some((
-            "mcp_protocol_pin_mismatch",
-            format!(
+        return McpPeerDowngradeDecision::Refused {
+            rule_id: sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID,
+            reason_code: sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID,
+            message: format!(
                 "federated server '{server_name}' answered protocol '{}', which does not match the pinned '{}'",
                 mismatch.observed, mismatch.expected,
             ),
-        ));
+        };
     }
     if prefix.protocol_pin().is_some() {
         // Pinned and matching: negotiation, and therefore the
         // peer-profile registry, is not consulted at all.
-        return None;
+        return McpPeerDowngradeDecision::Allowed;
     }
 
-    let observed_auth_required = false; // see the scope note above
+    let observed_auth_required =
+        mcp.federation
+            .last_auth_required(&prefix.name)
+            .unwrap_or_else(|| {
+                sbproxy_extension::mcp::peer_profile::peek(ctx.tenant_id.as_str(), &prefix.peer_key)
+                    .map(|profile| profile.auth_required)
+                    .unwrap_or(false)
+            });
 
     use sbproxy_extension::mcp::peer_profile::ObservationVerdict;
     match sbproxy_extension::mcp::peer_profile::observe_and_record(
@@ -5065,13 +5229,50 @@ fn mcp_peer_downgrade_check(
         observed_auth_required,
         prefix.downgrade.into(),
     ) {
-        ObservationVerdict::Allowed => None,
-        ObservationVerdict::Warned(kind) => {
+        ObservationVerdict::Allowed => McpPeerDowngradeDecision::Allowed,
+        ObservationVerdict::Warned(kind) => McpPeerDowngradeDecision::Warned {
+            rule_id: sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID,
+            reason_code: kind.reason_code(),
+        },
+        ObservationVerdict::Refused(kind) => McpPeerDowngradeDecision::Refused {
+            rule_id: sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID,
+            reason_code: kind.reason_code(),
+            message: format!(
+                "federated server '{server_name}' contact looked weaker than its recorded profile ({})",
+                kind.reason_code(),
+            ),
+        },
+    }
+}
+
+/// WOR-2384 fix round 1, item 4: apply the peer-downgrade check to an
+/// MCP method other than `tools/call` that still reaches a federated
+/// peer (`resources/read`, `prompts/get`). Same trust decision, same
+/// peer contact -- but lighter than the `tools/call` treatment: logs,
+/// bumps the `mcp_peer_downgrade` policy metric, and (on a refusal)
+/// emits the same `SecurityAuditEntry`, but does not touch the
+/// `mcp_governance_decision` events bus. That surface stays scoped to
+/// `tools/call` dispatch, the same scoping RBAC and per-tool quota
+/// already keep for these two methods (`mcp_governance_event_data`'s
+/// own doc: "for one dispatched ... MCP tool call"); extending it to
+/// non-tool methods is a larger schema question this round does not
+/// answer.
+///
+/// Returns `Some(message)` when the caller must refuse.
+fn mcp_peer_downgrade_refusal_for_non_tool_call(
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+    session: &Session,
+    server_name: &str,
+) -> Option<String> {
+    match mcp_peer_downgrade_check(mcp, ctx, server_name) {
+        McpPeerDowngradeDecision::Allowed => None,
+        McpPeerDowngradeDecision::Warned { reason_code, .. } => {
             tracing::warn!(
                 target: "sbproxy::mcp::peer_profile",
                 server = %server_name,
                 tenant = %ctx.tenant_id,
-                reason = kind.reason_code(),
+                reason = reason_code,
                 "MCP federated peer contact looked weaker than its recorded profile (warn mode: allowed)",
             );
             sbproxy_observe::metrics::record_policy(
@@ -5081,13 +5282,36 @@ fn mcp_peer_downgrade_check(
             );
             None
         }
-        ObservationVerdict::Refused(kind) => Some((
-            kind.reason_code(),
-            format!(
-                "federated server '{server_name}' contact looked weaker than its recorded profile ({})",
-                kind.reason_code(),
-            ),
-        )),
+        McpPeerDowngradeDecision::Refused {
+            reason_code,
+            message,
+            ..
+        } => {
+            tracing::warn!(
+                target: "sbproxy::mcp::peer_profile",
+                server = %server_name,
+                tenant = %ctx.tenant_id,
+                reason = reason_code,
+                "MCP request refused: federated peer downgrade",
+            );
+            sbproxy_observe::metrics::record_policy(
+                ctx.hostname.as_str(),
+                "mcp_peer_downgrade",
+                "deny",
+            );
+            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                "mcp_peer_downgrade",
+                message.clone(),
+                200,
+                Some(ctx.hostname.to_string()),
+                ctx.client_ip,
+                Some(ctx.request_id.to_string()),
+                Some(session.req_header().method.as_str().to_string()),
+            )
+            .with_tenant_id(ctx.tenant_id.to_string())
+            .emit();
+            Some(message)
+        }
     }
 }
 
@@ -5107,17 +5331,19 @@ fn mcp_peer_downgrade_check(
 ///   `sbproxy.decision.rule_id` is part of that namespace; most callers
 ///   still pass `None` (nothing upstream of them names a rule id for
 ///   their denial), but the WOR-2384 peer-downgrade refusal sites do
-///   pass one (`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`),
-///   since that is exactly the kind of stable, SIEM-rule-friendly label
-///   the field exists for.
-/// - `raw_denial_reason` is redacted through
-///   [`sbproxy_observe::decision::RedactedReason`], the same scrub the
-///   decision-audit bus applies to every OCSF `reason` field, before it
-///   ever reaches `sbproxy.decision.reason`. Every caller of this
-///   function today passes a fixed, argument-free string (a quarantine
-///   reason code, the schema-validation failure message, or a short
-///   `rbac_denied` / `quota_exceeded` reason code from a pre-dispatch
-///   denial), so nothing live currently depends on the scrub; it runs
+///   pass one (`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`
+///   or `PROTOCOL_PIN_MISMATCH_RULE_ID`), since those are exactly the
+///   kind of stable, SIEM-rule-friendly labels the field exists for.
+/// - `verdict` (fix round 1, item 3) is `"allow"`, `"warn"`, or
+///   `"deny"`; only `"deny"` stamps `error.type: "policy_denied"`, but
+///   both `"warn"` and `"deny"` carry a reason. The reason is redacted
+///   through [`sbproxy_observe::decision::RedactedReason`], the same
+///   scrub the decision-audit bus applies to every OCSF `reason` field,
+///   before it ever reaches `sbproxy.decision.reason`. Every caller of
+///   this function today passes a fixed, argument-free string (a
+///   quarantine reason code, the schema-validation failure message, or
+///   a short `rbac_denied` / `quota_exceeded` / peer-downgrade reason
+///   code), so nothing live currently depends on the scrub; it runs
 ///   anyway so a future caller cannot turn this event into a leak
 ///   channel just by handing it richer text.
 #[allow(clippy::too_many_arguments)] // pure builder; kept free of RequestContext so the semconv shape is unit-testable on its own
@@ -5129,16 +5355,16 @@ fn mcp_governance_event_data(
     protocol_version: &str,
     tenant_id: &str,
     route: &str,
-    raw_denial_reason: Option<&str>,
+    verdict: McpGovernanceVerdict<'_>,
     redact_state: Option<&sbproxy_observe::logging::OpRedactState>,
     arguments_hash: Option<&str>,
     seq: u64,
     rule_id: Option<&str>,
 ) -> serde_json::Value {
-    let verdict = if raw_denial_reason.is_some() {
-        "deny"
-    } else {
-        "allow"
+    let (verdict_label, raw_denial_reason, is_policy_denied) = match verdict {
+        McpGovernanceVerdict::Allow => ("allow", None, false),
+        McpGovernanceVerdict::Warn(reason) => ("warn", Some(reason), false),
+        McpGovernanceVerdict::Deny(reason) => ("deny", Some(reason), true),
     };
     let redacted_reason = raw_denial_reason.map(|raw| {
         sbproxy_observe::decision::RedactedReason::redact(
@@ -5158,10 +5384,10 @@ fn mcp_governance_event_data(
         fields.insert("mcp.session.id".to_string(), session_id.into());
     }
     fields.insert("mcp.protocol.version".to_string(), protocol_version.into());
-    if verdict == "deny" {
+    if is_policy_denied {
         fields.insert("error.type".to_string(), "policy_denied".into());
     }
-    fields.insert("sbproxy.decision.verdict".to_string(), verdict.into());
+    fields.insert("sbproxy.decision.verdict".to_string(), verdict_label.into());
     if let Some(reason) = &redacted_reason {
         fields.insert(
             "sbproxy.decision.reason".to_string(),
@@ -6131,7 +6357,7 @@ mod mcp_governance_evidence_tests {
             "2026-07-28",
             "acme",
             "api.example.com",
-            None,
+            McpGovernanceVerdict::Allow,
             None,
             Some("deadbeefcafef00d"),
             7,
@@ -6215,7 +6441,7 @@ mod mcp_governance_evidence_tests {
             "2025-06-18",
             "acme",
             "api.example.com",
-            Some("tool output quarantined (dual_llm)"),
+            McpGovernanceVerdict::Deny("tool output quarantined (dual_llm)"),
             None,
             None,
             1,
@@ -6248,7 +6474,7 @@ mod mcp_governance_evidence_tests {
             "2025-06-18",
             "acme",
             "api.example.com",
-            Some(planted),
+            McpGovernanceVerdict::Deny(planted),
             None,
             None,
             1,
@@ -6271,8 +6497,10 @@ mod mcp_governance_evidence_tests {
 
     /// WOR-2384: `sbproxy.decision.rule_id` is reserved on every other
     /// caller's `None` but populated at the peer-downgrade refusal
-    /// site. Proves the key appears, with the exact value passed,
-    /// exactly when `rule_id` is `Some`.
+    /// sites. Proves the key appears, with the exact value passed,
+    /// exactly when `rule_id` is `Some`, and (fix round 1, item 2)
+    /// that the pin-mismatch and downgrade rule ids are distinct
+    /// values, not the same constant reused for both.
     #[test]
     fn rule_id_appears_only_when_the_caller_supplies_one() {
         let without = mcp_governance_event_data(
@@ -6283,7 +6511,7 @@ mod mcp_governance_evidence_tests {
             "2025-06-18",
             "acme",
             "api.example.com",
-            Some("rbac_denied"),
+            McpGovernanceVerdict::Deny("rbac_denied"),
             None,
             None,
             1,
@@ -6291,7 +6519,7 @@ mod mcp_governance_evidence_tests {
         );
         assert!(without.get("sbproxy.decision.rule_id").is_none());
 
-        let with = mcp_governance_event_data(
+        let downgrade = mcp_governance_event_data(
             "search",
             "acme-server",
             "req-123",
@@ -6299,13 +6527,64 @@ mod mcp_governance_evidence_tests {
             "2025-06-18",
             "acme",
             "api.example.com",
-            Some("peer_protocol_downgrade"),
+            McpGovernanceVerdict::Deny("peer_protocol_downgrade"),
             None,
             None,
             1,
             Some(sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID),
         );
-        assert_eq!(with["sbproxy.decision.rule_id"], "peer_downgrade");
+        assert_eq!(downgrade["sbproxy.decision.rule_id"], "peer_downgrade");
+
+        let pin_mismatch = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            McpGovernanceVerdict::Deny("protocol_pin_mismatch"),
+            None,
+            None,
+            1,
+            Some(sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID),
+        );
+        assert_eq!(
+            pin_mismatch["sbproxy.decision.rule_id"],
+            "protocol_pin_mismatch"
+        );
+        assert_ne!(
+            downgrade["sbproxy.decision.rule_id"],
+            pin_mismatch["sbproxy.decision.rule_id"]
+        );
+    }
+
+    /// WOR-2384 fix round 1, item 3: a warn verdict carries a reason
+    /// and the `"warn"` label, but -- unlike deny -- never stamps
+    /// `error.type`, since the call was not refused.
+    #[test]
+    fn warn_verdict_carries_a_reason_but_no_error_type() {
+        let data = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            McpGovernanceVerdict::Warn("peer_protocol_downgrade"),
+            None,
+            None,
+            1,
+            Some(sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID),
+        );
+        assert_eq!(data["sbproxy.decision.verdict"], "warn");
+        assert_eq!(data["sbproxy.decision.reason"], "peer_protocol_downgrade");
+        assert_eq!(data["sbproxy.decision.rule_id"], "peer_downgrade");
+        assert!(
+            data.get("error.type").is_none(),
+            "a warn is not a refusal and must not carry error.type: {data:?}"
+        );
     }
 }
 
@@ -7553,6 +7832,37 @@ mod mcp_catalog_snapshot_tests {
         .expect("MCP JSON response")
     }
 
+    /// Poll `events_path` (an NDJSON file an `EventEgress::File` sink
+    /// writes to) until a line satisfies `predicate`, or 5s pass. The
+    /// event reaches the file through a bounded queue drained by a
+    /// background worker thread, so this reads repeatedly rather than
+    /// once. WOR-2384 fix round 1: factored out of the original
+    /// RBAC-only governance-evidence test so every scenario sharing the
+    /// one process-wide `EventEgress` can reuse the same polling logic.
+    async fn poll_for_governance_event(
+        events_path: &std::path::Path,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found: Option<serde_json::Value> = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(events_path) {
+                for line in contents.lines() {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        if predicate(&event) {
+                            found = Some(event);
+                        }
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        found
+    }
+
     #[test]
     fn task_5b_synthesized_rollout_visibility_authorizes_the_resolved_call_target() {
         let cases = [
@@ -7655,19 +7965,17 @@ mod mcp_catalog_snapshot_tests {
     }
 
     #[tokio::test]
-    async fn wor_2384_rbac_denied_tools_call_emits_a_deny_governance_event() {
-        // WOR-2384 red-first: before this fix, an RBAC (or per-tool
-        // quota) denial returned straight out of the RBAC branch,
-        // before ever reaching `emit_mcp_tool_attribution`, so it
-        // produced neither a decision-audit record nor an
-        // `mcp_governance_decision` event. A SIEM consuming that
-        // stream would see every allowed tool call and none of the
-        // denials, which is exactly backwards for a security evidence
-        // feed. This drives a real RBAC-denied `tools/call` through
-        // `handle_mcp_action` with an event sink installed and reads
-        // the emitted NDJSON line back.
-        const TOOL_NAME: &str = "wor2384-governance-evidence-rbac-fixture";
-
+    async fn wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios() {
+        // WOR-2384 red-first, extended in fix round 1 (renamed from
+        // `wor_2384_rbac_denied_tools_call_emits_a_deny_governance_event`,
+        // whose original scenario is scenario 1 below, unchanged).
+        // `install_event_egress` is a process-wide, set-once slot (see
+        // `sbproxy_observe::event_sink`'s module docs), so every
+        // scenario that needs a real `mcp_governance_decision` event
+        // observed through the dispatch path has to share the ONE
+        // egress this test installs -- this is still the only test in
+        // this crate that installs one -- rather than each getting its
+        // own test function.
         let dir = tempfile::tempdir().expect("temp dir");
         let events_path = dir.path().join("governance-events.ndjson");
         let egress = sbproxy_observe::event_sink::EventEgress::start(
@@ -7680,86 +7988,541 @@ mod mcp_catalog_snapshot_tests {
             64,
         )
         .expect("file egress starts");
-        // `install_event_egress` is a process-wide, set-once slot (see
-        // `sbproxy_observe::event_sink`'s module docs). This is the
-        // only test in this crate that installs one, so this either
-        // succeeds exactly once here or fails loudly if that stops
-        // being true.
         sbproxy_observe::install_event_egress(egress)
             .expect("event egress installs exactly once per test binary");
+
+        // --- Scenario 1 (original): an RBAC denial never reaches
+        // `emit_mcp_tool_attribution`, so without WOR-2384's dedicated
+        // call it would produce no evidence at all. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-rbac-fixture";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "governance-evidence-fixture", "version": "1.0.0"},
+                "rbac_policies": {
+                    "reader": {
+                        "default_allow": false,
+                        "tool_access": [{"principals": [], "allowed": []}]
+                    }
+                },
+                "federated_servers": [{
+                    "origin": "https://gov.example.com/mcp",
+                    "prefix": "gov-server",
+                    "rbac": "reader"
+                }]
+            }))
+            .expect("rbac-denied governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, "gov-server"))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains("RBAC"),
+                "expected an RBAC denial, got: {message}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the RBAC-denied call \
+                 was not observed within 5s",
+            );
+
+            assert_eq!(event["event_type"], "mcp_governance_decision");
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+            assert_eq!(event["data"]["error.type"], "policy_denied");
+            assert_eq!(event["data"]["sbproxy.decision.reason"], "rbac_denied");
+            assert_eq!(event["data"]["sbproxy.tool.server"], "gov-server");
+            assert!(
+                event["data"].get("sbproxy.tool.arguments_hash").is_none(),
+                "an RBAC denial never dispatched, so no arguments were ever captured to hash: {event:?}"
+            );
+        }
+
+        // --- Scenario 2 (fix round 1, item 2): a pinned protocol
+        // mismatch carries `rule_id: protocol_pin_mismatch`, never
+        // `peer_downgrade` -- it is refused unconditionally and never
+        // consults the recorded profile at all. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-pin-mismatch-fixture";
+            const SERVER: &str = "pin-mismatch-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "pin-mismatch-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "protocol": "2025-06-18"
+                }]
+            }))
+            .expect("pin-mismatch governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+            // The upstream answers a different era than the pin,
+            // synthesized here rather than through a real probe:
+            // `federation.rs`'s own tests already prove the real
+            // `initialize` -> `last_negotiated_protocol` wiring end to
+            // end (`last_negotiated_protocol_reads_back_what_a_refresh_recorded`),
+            // so this test's job is the dispatch-site wiring, not the
+            // probe itself.
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::new(),
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("pinned"),
+                "expected a pin-mismatch refusal, got: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+            })
+            .await
+            .expect("a pin-mismatch mcp_governance_decision event was not observed within 5s");
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "protocol_pin_mismatch",
+                "a pin mismatch must not carry the peer_downgrade rule_id: {event:?}"
+            );
+        }
+
+        // --- Scenario 3 (fix round 1, item 2): a block-mode protocol
+        // downgrade carries `rule_id: peer_downgrade`, distinct from
+        // scenario 2's `protocol_pin_mismatch`. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-block-downgrade-fixture";
+            const SERVER: &str = "block-downgrade-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "block-downgrade-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "downgrade": "block"
+                }]
+            }))
+            .expect("block-downgrade governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            // First contact: modern. `Allowed` never emits a
+            // peer-downgrade event of its own, so nothing to poll for
+            // yet.
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::new(),
+            );
+            let _ = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+
+            // Second contact: legacy. A downgrade against the recorded
+            // modern high-water mark, refused under `downgrade: block`.
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::new(),
+            );
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("weaker"),
+                "expected a downgrade refusal, got: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "deny"
+            })
+            .await
+            .expect("a block-mode downgrade mcp_governance_decision event was not observed within 5s");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "peer_downgrade",
+                "{event:?}"
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"],
+                "peer_protocol_downgrade"
+            );
+        }
+
+        // --- Scenario 4 (fix round 1, item 3): a warn-mode downgrade
+        // still emits an `mcp_governance_decision` event, with verdict
+        // "warn" -- and the call proceeds (this fixture's upstream does
+        // not exist, so "proceeds" here means "reaches, and fails at,
+        // the real dispatch," not "succeeds"; that failure produces its
+        // own separate `emit_mcp_tool_attribution` event, which is why
+        // this polls for `verdict == "warn"` specifically rather than
+        // just the tool name). ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-warn-downgrade-fixture";
+            const SERVER: &str = "warn-downgrade-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "warn-downgrade-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "downgrade": "warn"
+                }]
+            }))
+            .expect("warn-downgrade governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::new(),
+            );
+            let _ = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::new(),
+            );
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            // Warn mode allows the call: whatever it returns is the
+            // (nonexistent) upstream's own failure, never the
+            // "weaker" downgrade-refusal wording scenario 3 asserted.
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .map(|m| !m.contains("weaker"))
+                    .unwrap_or(true),
+                "warn mode must not refuse the call: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "warn"
+            })
+            .await
+            .expect("a warn-mode downgrade mcp_governance_decision event was not observed within 5s");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "peer_downgrade"
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"],
+                "peer_protocol_downgrade"
+            );
+            assert!(
+                event["data"].get("error.type").is_none(),
+                "a warn verdict is not a refusal and must not carry error.type: {event:?}"
+            );
+        }
+
+        // --- Scenario 5 (fix round 1, item 5): the auth-posture axis
+        // now reads a real observation
+        // (`McpFederation::last_auth_required`) instead of a hardcoded
+        // `false`. A later observation of "no auth needed" after an
+        // earlier "auth required" is an AuthPosture downgrade. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-auth-downgrade-fixture";
+            const SERVER: &str = "auth-downgrade-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "auth-downgrade-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "downgrade": "block"
+                }]
+            }))
+            .expect("auth-downgrade governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            // First contact: the upstream required auth (a classified
+            // 401/407 -- `federation.rs`'s own
+            // `a_dual_era_stub_answering_401_with_www_authenticate_records_auth_required`
+            // proves the real classification; this seeds the same
+            // outcome directly). Protocol stays legacy throughout, so
+            // only the auth axis moves.
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::from([(SERVER.to_string(), true)]),
+            );
+            let _ = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+
+            // Second contact: a clean unauthenticated success. The
+            // peer no longer requires auth -- the dangerous direction.
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::from([(SERVER.to_string(), false)]),
+            );
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("weaker"),
+                "expected an auth-posture downgrade refusal, got: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "deny"
+            })
+            .await
+            .expect("an auth-posture downgrade mcp_governance_decision event was not observed within 5s");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "peer_downgrade"
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"],
+                "peer_auth_posture_downgrade",
+                "{event:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wor_2384_block_mode_downgrade_refuses_resources_read_and_prompts_get() {
+        // WOR-2384 fix round 1, item 4: the peer-downgrade check
+        // applies to `resources/read` and `prompts/get` too -- same
+        // trust decision, same peer contact -- not just `tools/call`.
+        // No event-egress installation needed: that surface stays
+        // scoped to `tools/call`
+        // (`mcp_peer_downgrade_refusal_for_non_tool_call`'s own doc
+        // comment explains why).
+        const SERVER: &str = "non-tool-downgrade-server";
+        const RESOURCE_URI: &str = "res://non-tool-downgrade-fixture/doc";
+        const PROMPT_NAME: &str = "wor2384-non-tool-downgrade-prompt";
 
         let action = McpAction::from_config(json!({
             "type": "mcp",
             "mode": "gateway",
-            "server_info": {"name": "governance-evidence-fixture", "version": "1.0.0"},
-            "rbac_policies": {
-                "reader": {
-                    "default_allow": false,
-                    "tool_access": [{"principals": [], "allowed": []}]
-                }
-            },
+            "server_info": {"name": "non-tool-downgrade-fixture", "version": "1.0.0"},
             "federated_servers": [{
-                "origin": "https://gov.example.com/mcp",
-                "prefix": "gov-server",
-                "rbac": "reader"
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": SERVER,
+                "downgrade": "block"
             }]
         }))
-        .expect("rbac-denied governance-evidence fixture compiles");
-        action.federation.seed_tools_for_test(
-            HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, "gov-server"))]),
-            None,
-        );
+        .expect("non-tool downgrade fixture compiles");
+        action.federation.seed_resources_for_test(HashMap::from([(
+            RESOURCE_URI.to_string(),
+            sbproxy_extension::mcp::federation::FederatedResource {
+                uri: RESOURCE_URI.to_string(),
+                name: "doc".to_string(),
+                description: None,
+                mime_type: None,
+                server_name: SERVER.to_string(),
+                upstream_uri: RESOURCE_URI.to_string(),
+            },
+        )]));
+        action.federation.seed_prompts_for_test(HashMap::from([(
+            PROMPT_NAME.to_string(),
+            sbproxy_extension::mcp::FederatedPrompt {
+                name: PROMPT_NAME.to_string(),
+                upstream_name: PROMPT_NAME.to_string(),
+                title: None,
+                description: None,
+                arguments: None,
+                server_name: SERVER.to_string(),
+                meta: None,
+            },
+        )]));
 
-        let call = mcp_handler_exchange(
+        // First contact: modern, via `resources/read` itself (the same
+        // shared check every federated-peer-facing method now runs).
+        // The upstream does not exist, so the read itself fails, but
+        // not because of a downgrade refusal.
+        action.federation.seed_server_observations_for_test(
+            HashMap::from([(
+                SERVER.to_string(),
+                sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+            )]),
+            HashMap::new(),
+        );
+        let first = mcp_handler_exchange(
             &action,
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "tools/call",
-                "params": {"name": TOOL_NAME, "arguments": {}}
+                "method": "resources/read",
+                "params": {"uri": RESOURCE_URI}
             }),
         )
         .await;
-        let message = call["error"]["message"]
-            .as_str()
-            .expect("tools/call denial message");
         assert!(
-            message.contains("RBAC"),
-            "expected an RBAC denial, got: {message}"
+            first["error"]["message"]
+                .as_str()
+                .map(|m| !m.contains("weaker"))
+                .unwrap_or(true),
+            "the first (modern) contact must not be refused as a downgrade: {first:?}"
         );
 
-        // The event reaches the file through a bounded queue drained by
-        // a background worker thread, so poll rather than reading once.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut found: Option<serde_json::Value> = None;
-        while std::time::Instant::now() < deadline {
-            if let Ok(contents) = std::fs::read_to_string(&events_path) {
-                for line in contents.lines() {
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-                        if event["data"]["gen_ai.tool.name"] == TOOL_NAME {
-                            found = Some(event);
-                        }
-                    }
-                }
-            }
-            if found.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let event = found.expect(
-            "an mcp_governance_decision event for the RBAC-denied call \
-             was not observed within 5s",
+        // Second contact: legacy. A downgrade against the now-recorded
+        // modern high-water mark, refused under `downgrade: block`
+        // before the (nonexistent) upstream is ever dispatched --
+        // proven separately for `resources/read` and `prompts/get`,
+        // since each resolves the target server_name through a
+        // different path (`resolve_resource` vs `resolve_prompt`) and
+        // both need to reach the same check correctly.
+        action.federation.seed_server_observations_for_test(
+            HashMap::from([(
+                SERVER.to_string(),
+                sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string(),
+            )]),
+            HashMap::new(),
         );
 
-        assert_eq!(event["event_type"], "mcp_governance_decision");
-        assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
-        assert_eq!(event["data"]["error.type"], "policy_denied");
-        assert_eq!(event["data"]["sbproxy.decision.reason"], "rbac_denied");
-        assert_eq!(event["data"]["sbproxy.tool.server"], "gov-server");
+        let resource_read = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": RESOURCE_URI}
+            }),
+        )
+        .await;
         assert!(
-            event["data"].get("sbproxy.tool.arguments_hash").is_none(),
-            "an RBAC denial never dispatched, so no arguments were ever captured to hash: {event:?}"
+            resource_read["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("weaker"),
+            "resources/read must be refused by the downgraded profile: {resource_read:?}"
+        );
+
+        let prompt_get = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "prompts/get",
+                "params": {"name": PROMPT_NAME}
+            }),
+        )
+        .await;
+        assert!(
+            prompt_get["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("weaker"),
+            "prompts/get must be refused by the same downgraded profile: {prompt_get:?}"
         );
     }
 }

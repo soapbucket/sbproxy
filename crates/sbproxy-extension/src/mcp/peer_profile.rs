@@ -66,7 +66,19 @@ use parking_lot::Mutex;
 /// it accompanies, regardless of which axis (protocol or auth posture)
 /// triggered it. A SIEM rule keys on this one string; [`PeerDowngradeKind::reason_code`]
 /// carries the finer-grained detail for a human reading the record.
+///
+/// Distinct from [`PROTOCOL_PIN_MISMATCH_RULE_ID`]: a pin mismatch is
+/// not a downgrade against a recorded profile (it never consults one,
+/// see [`check_pin`]), so it carries its own rule id rather than this
+/// one (WOR-2384 fix round 1, item 2).
 pub const PEER_DOWNGRADE_RULE_ID: &str = "peer_downgrade";
+
+/// Stable rule id a pinned `protocol:` mismatch carries. Unconditional
+/// and history-free (see [`check_pin`]), so it is never
+/// [`PEER_DOWNGRADE_RULE_ID`] even though both refuse a `tools/call`
+/// for the same underlying reason (a federated peer's contact cannot be
+/// trusted at the pinned/recorded posture).
+pub const PROTOCOL_PIN_MISMATCH_RULE_ID: &str = "protocol_pin_mismatch";
 
 /// Ceiling on the number of `(tenant, server)` pairs this process tracks
 /// a dedicated peer profile for. Mirrors
@@ -320,6 +332,27 @@ pub fn observe_and_record(
         SystemTime::now(),
         MAX_TRACKED_PEERS,
     )
+}
+
+/// Read the currently recorded profile for `(tenant_id, peer_key)`
+/// without observing a new contact: no mutation, no cap-overflow
+/// routing, no effect on any other call. `None` when nothing has been
+/// recorded yet.
+///
+/// Exists for a caller that has an observation on one axis but not the
+/// other this cycle (WOR-2384 fix round 1, item 5: the auth-posture
+/// signal is only ever `Some` on a clean unauthenticated success or a
+/// classified 401/407; every other outcome has "no observation" for
+/// that axis). Such a caller reads the prior recorded value here and
+/// passes it straight through to [`observe_and_record`] as this
+/// cycle's "observed" value on that axis, which is a no-op against the
+/// stored high-water mark: it can never look weaker than itself, so it
+/// never manufactures a downgrade out of missing data.
+pub fn peek(tenant_id: &str, peer_key: &str) -> Option<McpPeerProfile> {
+    registry()
+        .lock()
+        .get(&(tenant_id.to_string(), peer_key.to_string()))
+        .cloned()
 }
 
 /// The actual lookup-or-insert-or-overflow-and-observe logic,
@@ -858,5 +891,96 @@ mod tests {
             "peer_auth_posture_downgrade"
         );
         assert_eq!(PEER_DOWNGRADE_RULE_ID, "peer_downgrade");
+    }
+
+    #[test]
+    fn protocol_pin_mismatch_rule_id_is_distinct_from_peer_downgrade() {
+        // WOR-2384 fix round 1, item 2: the two must never collide,
+        // since a SIEM rule keyed on one must not also match the other.
+        assert_ne!(PROTOCOL_PIN_MISMATCH_RULE_ID, PEER_DOWNGRADE_RULE_ID);
+        assert_eq!(PROTOCOL_PIN_MISMATCH_RULE_ID, "protocol_pin_mismatch");
+    }
+
+    #[test]
+    fn an_upgrade_back_to_the_high_water_mark_after_a_warned_downgrade_is_allowed_again() {
+        // WOR-2384 fix round 1, item 6 (the named-in-brief
+        // warn-upgrade-after-warn case): a warn-mode downgrade never
+        // lowers the stored profile (see
+        // `warn_mode_keeps_warning_on_every_subsequent_legacy_contact`
+        // above), so a later contact that returns to -- or exceeds --
+        // that still-modern high-water mark is a plain `Allowed`, not
+        // something the warn history leaves permanently flagged.
+        let t0 = SystemTime::now();
+        let prior = McpPeerProfile {
+            negotiated_protocol: MODERN.to_string(),
+            auth_required: false,
+            first_seen: t0,
+            last_seen: t0,
+        };
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let (warned_profile, verdict1) =
+            observe(Some(&prior), LEGACY, false, PeerDowngradePolicy::Warn, t1);
+        assert_eq!(
+            verdict1,
+            ObservationVerdict::Warned(PeerDowngradeKind::Protocol)
+        );
+
+        let t2 = t1 + std::time::Duration::from_secs(1);
+        let (profile2, verdict2) = observe(
+            Some(&warned_profile),
+            MODERN,
+            false,
+            PeerDowngradePolicy::Warn,
+            t2,
+        );
+        assert_eq!(
+            verdict2,
+            ObservationVerdict::Allowed,
+            "a contact back at the high-water mark is not a downgrade, warned or not"
+        );
+        assert_eq!(profile2.negotiated_protocol, MODERN);
+        assert_eq!(profile2.last_seen, t2);
+    }
+
+    #[test]
+    fn peek_reads_the_recorded_profile_without_mutating_or_observing() {
+        let tenant = unique_tenant("peek");
+        let key = peer_key("srv-peek", "https://peek.example.com", "auto", "warn");
+
+        assert_eq!(
+            peek(&tenant, &key),
+            None,
+            "nothing recorded yet for this pair"
+        );
+
+        assert_eq!(
+            observe_and_record(&tenant, &key, MODERN, true, PeerDowngradePolicy::Block),
+            ObservationVerdict::Allowed
+        );
+        let peeked = peek(&tenant, &key).expect("now recorded");
+        assert_eq!(peeked.negotiated_protocol, MODERN);
+        assert!(peeked.auth_required);
+
+        // A second peek is unaffected by the first: reading is not
+        // itself an observation.
+        assert_eq!(peek(&tenant, &key), Some(peeked));
+    }
+
+    #[test]
+    fn peek_is_tenant_scoped_like_observe_and_record() {
+        let tenant_a = unique_tenant("peek-a");
+        let tenant_b = unique_tenant("peek-b");
+        let key = peer_key("srv-peek-scope", "https://peek.example.com", "auto", "warn");
+
+        assert_eq!(
+            observe_and_record(&tenant_a, &key, MODERN, false, PeerDowngradePolicy::Block),
+            ObservationVerdict::Allowed
+        );
+        assert!(peek(&tenant_a, &key).is_some());
+        assert_eq!(
+            peek(&tenant_b, &key),
+            None,
+            "tenant b's profile for the identical peer_key is untouched"
+        );
     }
 }

@@ -19,6 +19,36 @@ use super::types::{JsonRpcRequest, JsonRpcResponse};
 /// failure without a typed error enum crossing the module boundary.
 pub(crate) const RESPONSE_CAP_MARKER: &str = "response byte cap exceeded";
 
+/// A non-success HTTP response from an MCP upstream, carrying just
+/// enough of the transport-level detail (WOR-2384) that a caller who
+/// cares -- the peer-profile auth-posture observation -- can classify
+/// it without every other caller's error handling changing shape.
+///
+/// `send_request` and `send_via_sse` both return this (via
+/// `anyhow::Error::from`) instead of an opaque `anyhow!(...)` string on
+/// a non-2xx response, so a caller with only `anyhow::Result<...>` in
+/// hand sees the exact same `Display` text as before
+/// (`"MCP server returned HTTP {status}"` / `"SSE MCP server returned
+/// HTTP {status}"`), while a caller that needs the structured fields
+/// can `err.downcast_ref::<McpUpstreamHttpStatus>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpUpstreamHttpStatus {
+    /// The HTTP status code the upstream answered with.
+    pub status: u16,
+    /// Whether the response carried a `WWW-Authenticate` header.
+    /// Corroborating evidence for a 401/407 classification, not
+    /// required for it: some servers omit the header on a bare 401.
+    pub www_authenticate_present: bool,
+}
+
+impl std::fmt::Display for McpUpstreamHttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MCP server returned HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for McpUpstreamHttpStatus {}
+
 /// Read a response body incrementally, bailing once it exceeds
 /// `max_bytes`. Never buffers more than the cap.
 pub(crate) async fn read_body_capped(
@@ -96,7 +126,12 @@ pub async fn send_request(
 
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("MCP server returned HTTP {}", status);
+        let www_authenticate_present = resp.headers().contains_key(reqwest::header::WWW_AUTHENTICATE);
+        return Err(McpUpstreamHttpStatus {
+            status: status.as_u16(),
+            www_authenticate_present,
+        }
+        .into());
     }
 
     let content_type = resp
@@ -374,6 +409,26 @@ mod tests {
             err.to_string().contains(RESPONSE_CAP_MARKER),
             "oversized SSE stream must hit the cap, got: {err}"
         );
+    }
+
+    #[test]
+    fn mcp_upstream_http_status_preserves_display_text_and_downcasts() {
+        // WOR-2384: `send_request`/`send_via_sse` return this struct
+        // via `anyhow::Error::from` instead of `anyhow!(...)` so a
+        // caller that only cares about the message sees the same text
+        // as before, while a caller that needs the structured fields
+        // (the auth-posture observation) can downcast to get them.
+        let status = McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: true,
+        };
+        let err: anyhow::Error = status.into();
+        assert_eq!(err.to_string(), "MCP server returned HTTP 401");
+        let recovered = err
+            .downcast_ref::<McpUpstreamHttpStatus>()
+            .expect("downcasts back to the structured error");
+        assert_eq!(recovered.status, 401);
+        assert!(recovered.www_authenticate_present);
     }
 
     #[test]

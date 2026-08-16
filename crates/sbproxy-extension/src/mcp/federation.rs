@@ -1176,6 +1176,20 @@ pub struct McpFederation {
     /// happens in `sbproxy_extension::mcp::peer_profile`, which a caller
     /// consults using the value this map reports (WOR-2384).
     server_protocol_versions: ArcSwap<HashMap<String, String>>,
+    /// server_name -> whether the upstream's last classifiable contact
+    /// required authentication, refreshed by
+    /// `refresh_server_capabilities` in the same pass, and rebuilt from
+    /// scratch every cycle exactly like `server_capabilities` and
+    /// `server_protocol_versions` are: a server this cycle could not
+    /// classify (a network error, a 5xx, a malformed response) is
+    /// simply absent from the new map, the same "an upstream missing
+    /// from the snapshot simply declares nothing" contract those two
+    /// siblings already document, rather than carrying a stale value
+    /// forward. A successful unauthenticated probe (this cycle's
+    /// `initialize` call, which always dispatches with no credentials)
+    /// records `false`; a 401 or 407 records `true` -- see
+    /// `classify_auth_required_from_error`. WOR-2384.
+    server_auth_required: ArcSwap<HashMap<String, bool>>,
     /// WOR-818: mcpApps capability values mirrored from any
     /// upstream that advertised one. Empty when no upstream
     /// supports SEP-1865. The first non-empty value is what the
@@ -1329,6 +1343,7 @@ impl McpFederation {
             prompt_catalog_owner: Arc::new(()),
             server_capabilities: ArcSwap::from_pointee(HashMap::new()),
             server_protocol_versions: ArcSwap::from_pointee(HashMap::new()),
+            server_auth_required: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
             openapi_client,
@@ -1806,6 +1821,7 @@ impl McpFederation {
     pub async fn refresh_server_capabilities(&self) -> usize {
         let mut snapshot: HashMap<String, serde_json::Value> = HashMap::new();
         let mut protocol_versions: HashMap<String, String> = HashMap::new();
+        let mut auth_required: HashMap<String, bool> = HashMap::new();
         for server in &self.servers {
             if server.openapi.is_some() {
                 continue;
@@ -1814,8 +1830,16 @@ impl McpFederation {
                 Ok((caps, protocol_version)) => {
                     snapshot.insert(server.name.clone(), caps);
                     protocol_versions.insert(server.name.clone(), protocol_version);
+                    // WOR-2384: this probe always dispatches with `&[]`
+                    // extra_headers (see `fetch_server_capabilities`),
+                    // so a success is unambiguous proof the upstream
+                    // did not require auth for this contact.
+                    auth_required.insert(server.name.clone(), false);
                 }
                 Err(e) => {
+                    if let Some(required) = classify_auth_required_from_error(&e) {
+                        auth_required.insert(server.name.clone(), required);
+                    }
                     warn!(
                         server = %server.name,
                         error = %e,
@@ -1828,6 +1852,7 @@ impl McpFederation {
         self.server_capabilities.store(Arc::new(snapshot));
         self.server_protocol_versions
             .store(Arc::new(protocol_versions));
+        self.server_auth_required.store(Arc::new(auth_required));
         count
     }
 
@@ -1853,6 +1878,16 @@ impl McpFederation {
             .load()
             .get(server_name)
             .cloned()
+    }
+
+    /// Whether `server_name` required authentication on its last
+    /// classifiable contact, or `None` when the last cycle could not
+    /// classify it (never probed yet, an OpenAPI-backed upstream, or a
+    /// probe failure that was not a 401/407). Feeds the peer-profile
+    /// auth-posture downgrade check (WOR-2384); call after at least one
+    /// [`Self::refresh_server_capabilities`].
+    pub fn last_auth_required(&self, server_name: &str) -> Option<bool> {
+        self.server_auth_required.load().get(server_name).copied()
     }
 
     /// Initialize the upstream and return the `capabilities` object it
@@ -2969,6 +3004,43 @@ impl McpFederation {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Test-only: publish `server_protocol_versions` and
+    /// `server_auth_required` directly, the same way
+    /// [`Self::seed_tools_for_test`] does for the tool registry. Lets a
+    /// caller in another crate (WOR-2384's peer-downgrade dispatch
+    /// tests in `sbproxy-core`) drive
+    /// [`Self::last_negotiated_protocol`] / [`Self::last_auth_required`]
+    /// without a real upstream round trip, since both fields are
+    /// private and only [`Self::refresh_server_capabilities`] would
+    /// otherwise populate them.
+    #[doc(hidden)]
+    pub fn seed_server_observations_for_test(
+        &self,
+        protocol_versions: HashMap<String, String>,
+        auth_required: HashMap<String, bool>,
+    ) {
+        self.server_protocol_versions
+            .store(Arc::new(protocol_versions));
+        self.server_auth_required.store(Arc::new(auth_required));
+    }
+
+    /// Test-only: publish the resource registry directly, the same way
+    /// [`Self::seed_tools_for_test`] does for tools. Lets a caller in
+    /// another crate exercise `resources/read` (WOR-2384's peer-downgrade
+    /// check applies there too) without a real upstream `resources/list`.
+    #[doc(hidden)]
+    pub fn seed_resources_for_test(&self, resources: HashMap<String, FederatedResource>) {
+        self.resources.store(Arc::new(resources));
+    }
+
+    /// Test-only: publish the prompt registry directly. See
+    /// [`Self::seed_resources_for_test`]; same reasoning, for
+    /// `prompts/get`.
+    #[doc(hidden)]
+    pub fn seed_prompts_for_test(&self, prompts: HashMap<String, FederatedPrompt>) {
+        self.prompts.store(Arc::new(prompts));
+    }
+
     /// Publish every state component of a completed refresh without
     /// awaiting. Keeping this seam synchronous means cancellation can
     /// only occur before publication, leaving the previous coherent
@@ -3693,6 +3765,21 @@ fn classify_io_failure(e: &anyhow::Error) -> &'static str {
         return "response_cap";
     }
     "other"
+}
+
+/// Classify an upstream contact failure for the peer-profile
+/// auth-posture observation (WOR-2384). `Some(true)` only for a
+/// classified 401 or 407 (`www_authenticate_present` is corroborating,
+/// not required, since some servers omit the header on a bare 401).
+/// Every other failure -- a network error, a 5xx, a malformed response,
+/// a JSON-RPC-level error object -- is not trustworthy evidence either
+/// way and yields `None`, so [`McpFederation::refresh_server_capabilities`]
+/// leaves that server absent from this cycle's auth map rather than
+/// guessing.
+fn classify_auth_required_from_error(e: &anyhow::Error) -> Option<bool> {
+    e.downcast_ref::<super::streamable::McpUpstreamHttpStatus>()
+        .filter(|status| status.status == 401 || status.status == 407)
+        .map(|_| true)
 }
 
 /// Render CodeMode from exactly one loaded catalogue state. The lazy
@@ -5572,6 +5659,188 @@ mod tests {
             None,
             "a server this refresh never recorded declares nothing"
         );
+    }
+
+    #[test]
+    fn last_auth_required_reads_back_what_a_refresh_recorded() {
+        // Same seed-the-ArcSwap-directly pattern as
+        // `last_negotiated_protocol_reads_back_what_a_refresh_recorded`.
+        let fed = McpFederation::new(vec![
+            mock_server("gh", "http://gh.test"),
+            mock_server("docs", "http://docs.test"),
+        ]);
+        assert_eq!(
+            fed.last_auth_required("gh"),
+            None,
+            "nothing has been classified yet"
+        );
+
+        let mut required = HashMap::new();
+        required.insert("gh".to_string(), true);
+        fed.server_auth_required.store(Arc::new(required));
+
+        assert_eq!(fed.last_auth_required("gh"), Some(true));
+        assert_eq!(
+            fed.last_auth_required("docs"),
+            None,
+            "a server this refresh never classified declares nothing"
+        );
+    }
+
+    #[test]
+    fn classify_auth_required_from_error_reads_401_and_407_as_true_and_everything_else_as_none() {
+        use super::super::streamable::McpUpstreamHttpStatus;
+
+        let unauthorized: anyhow::Error = McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: true,
+        }
+        .into();
+        assert_eq!(classify_auth_required_from_error(&unauthorized), Some(true));
+
+        // A bare 401 with no WWW-Authenticate header still classifies:
+        // the header is corroborating, not required.
+        let bare_unauthorized: anyhow::Error = McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(
+            classify_auth_required_from_error(&bare_unauthorized),
+            Some(true)
+        );
+
+        let proxy_auth_required: anyhow::Error = McpUpstreamHttpStatus {
+            status: 407,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(
+            classify_auth_required_from_error(&proxy_auth_required),
+            Some(true)
+        );
+
+        // A 2xx never reaches this function (it is not an error at
+        // all), but any other non-2xx status is not trustworthy
+        // evidence of "auth required" either way.
+        let not_found: anyhow::Error = McpUpstreamHttpStatus {
+            status: 404,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(classify_auth_required_from_error(&not_found), None);
+
+        let server_error: anyhow::Error = McpUpstreamHttpStatus {
+            status: 500,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(classify_auth_required_from_error(&server_error), None);
+
+        let unrelated = anyhow::anyhow!("connection refused");
+        assert_eq!(classify_auth_required_from_error(&unrelated), None);
+    }
+
+    /// A one-shot upstream that answers exactly one HTTP request with a
+    /// fixed raw response (status line, headers, body), then closes.
+    /// Reused for the auth-posture stub-upstream test below: a real
+    /// `refresh_server_capabilities` round trip against a peer that
+    /// answers 401 with `WWW-Authenticate`, proving the classification
+    /// is wired end to end and not just unit-tested against a
+    /// synthetic error.
+    fn one_shot_http_server(status_line: &str, extra_headers: &str) -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("one-shot fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("one-shot fixture address")
+            .port();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let response =
+                format!("{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes());
+        });
+        mock_server("stub-auth", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    #[tokio::test]
+    async fn a_dual_era_stub_answering_401_with_www_authenticate_records_auth_required() {
+        // WOR-2384 fix round 1, item 5: proves the real signal is wired
+        // end to end, not just the pure classifier.
+        let server = one_shot_http_server(
+            "HTTP/1.1 401 Unauthorized",
+            "WWW-Authenticate: Bearer realm=\"mcp\"\r\n",
+        );
+        let fed = McpFederation::new(vec![server]);
+        let answered = fed.refresh_server_capabilities().await;
+        assert_eq!(answered, 0, "a 401 initialize probe answers nothing");
+        assert_eq!(
+            fed.last_auth_required("stub-auth"),
+            Some(true),
+            "a classified 401 must record auth_required = true"
+        );
+        assert_eq!(
+            fed.last_negotiated_protocol("stub-auth"),
+            None,
+            "a failed probe never learns a protocol version either"
+        );
+    }
+
+    /// A one-shot upstream that answers exactly one HTTP request with a
+    /// real JSON-RPC `initialize` success body, so `fetch_server_capabilities`
+    /// gets all the way through parsing rather than failing on an empty
+    /// body.
+    fn one_shot_initialize_success_server() -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("one-shot fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("one-shot fixture address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": super::super::types::LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                },
+                "id": 1,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        mock_server("stub-auth", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    #[tokio::test]
+    async fn a_successful_unauthenticated_initialize_records_auth_required_false() {
+        // This probe always dispatches with no credentials (`&[]`
+        // extra_headers), so a clean success is unambiguous proof the
+        // peer did not require auth for this contact.
+        let server = one_shot_initialize_success_server();
+        let fed = McpFederation::new(vec![server]);
+        let answered = fed.refresh_server_capabilities().await;
+        assert_eq!(answered, 1);
+        assert_eq!(fed.last_auth_required("stub-auth"), Some(false));
     }
 
     #[tokio::test]

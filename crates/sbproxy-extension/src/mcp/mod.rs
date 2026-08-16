@@ -74,7 +74,7 @@ pub use federation::{
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use peer_profile::{
     McpPeerProfile, ObservationVerdict, PeerDowngradeKind, PeerDowngradePolicy, PinMismatch,
-    PEER_DOWNGRADE_RULE_ID,
+    PEER_DOWNGRADE_RULE_ID, PROTOCOL_PIN_MISMATCH_RULE_ID,
 };
 pub use protocol::{
     classify_http_era, decode_header_value, decode_http_request, decode_http_request_with_scan,
