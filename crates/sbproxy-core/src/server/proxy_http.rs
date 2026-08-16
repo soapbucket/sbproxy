@@ -4726,6 +4726,7 @@ impl ProxyHttp for SbProxy {
                         workspace_id,
                         origin: pipeline.config.origins[origin_idx].origin_id.to_string(),
                         tenant: ctx.tenant_id.to_string(),
+                        record_format: pipeline.config.decision_audit.policy_record_format(),
                     };
                     if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
                         &pipeline.enforcers[origin_idx],
