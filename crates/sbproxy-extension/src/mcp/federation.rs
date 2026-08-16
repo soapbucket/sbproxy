@@ -5764,8 +5764,9 @@ mod tests {
             };
             let mut request = [0_u8; 8192];
             let _ = stream.read(&mut request);
-            let response =
-                format!("{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+            let response = format!(
+                "{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             let _ = stream.write_all(response.as_bytes());
         });
         mock_server("stub-auth", &format!("http://127.0.0.1:{port}/mcp"))

@@ -126,7 +126,9 @@ pub async fn send_request(
 
     let status = resp.status();
     if !status.is_success() {
-        let www_authenticate_present = resp.headers().contains_key(reqwest::header::WWW_AUTHENTICATE);
+        let www_authenticate_present = resp
+            .headers()
+            .contains_key(reqwest::header::WWW_AUTHENTICATE);
         return Err(McpUpstreamHttpStatus {
             status: status.as_u16(),
             www_authenticate_present,

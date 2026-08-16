@@ -3079,16 +3079,16 @@ pub(super) async fn handle_mcp_action(
             let downgrade_refusal = if uri.is_empty() {
                 None
             } else {
-                mcp.federation
-                    .resolve_resource(uri)
-                    .and_then(|resource: sbproxy_extension::mcp::federation::FederatedResource| {
+                mcp.federation.resolve_resource(uri).and_then(
+                    |resource: sbproxy_extension::mcp::federation::FederatedResource| {
                         mcp_peer_downgrade_refusal_for_non_tool_call(
                             mcp,
                             ctx,
                             session,
                             &resource.server_name,
                         )
-                    })
+                    },
+                )
             };
             if uri.is_empty() {
                 JsonRpcResponse::error(
@@ -5212,14 +5212,14 @@ fn mcp_peer_downgrade_check(
         return McpPeerDowngradeDecision::Allowed;
     }
 
-    let observed_auth_required =
-        mcp.federation
-            .last_auth_required(&prefix.name)
-            .unwrap_or_else(|| {
-                sbproxy_extension::mcp::peer_profile::peek(ctx.tenant_id.as_str(), &prefix.peer_key)
-                    .map(|profile| profile.auth_required)
-                    .unwrap_or(false)
-            });
+    let observed_auth_required = mcp
+        .federation
+        .last_auth_required(&prefix.name)
+        .unwrap_or_else(|| {
+            sbproxy_extension::mcp::peer_profile::peek(ctx.tenant_id.as_str(), &prefix.peer_key)
+                .map(|profile| profile.auth_required)
+                .unwrap_or(false)
+        });
 
     use sbproxy_extension::mcp::peer_profile::ObservationVerdict;
     match sbproxy_extension::mcp::peer_profile::observe_and_record(
@@ -8118,8 +8118,7 @@ mod mcp_catalog_snapshot_tests {
             .expect("a pin-mismatch mcp_governance_decision event was not observed within 5s");
             assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
             assert_eq!(
-                event["data"]["sbproxy.decision.rule_id"],
-                "protocol_pin_mismatch",
+                event["data"]["sbproxy.decision.rule_id"], "protocol_pin_mismatch",
                 "a pin mismatch must not carry the peer_downgrade rule_id: {event:?}"
             );
         }
@@ -8199,10 +8198,11 @@ mod mcp_catalog_snapshot_tests {
                     && event["data"]["sbproxy.decision.verdict"] == "deny"
             })
             .await
-            .expect("a block-mode downgrade mcp_governance_decision event was not observed within 5s");
+            .expect(
+                "a block-mode downgrade mcp_governance_decision event was not observed within 5s",
+            );
             assert_eq!(
-                event["data"]["sbproxy.decision.rule_id"],
-                "peer_downgrade",
+                event["data"]["sbproxy.decision.rule_id"], "peer_downgrade",
                 "{event:?}"
             );
             assert_eq!(
@@ -8289,11 +8289,10 @@ mod mcp_catalog_snapshot_tests {
                     && event["data"]["sbproxy.decision.verdict"] == "warn"
             })
             .await
-            .expect("a warn-mode downgrade mcp_governance_decision event was not observed within 5s");
-            assert_eq!(
-                event["data"]["sbproxy.decision.rule_id"],
-                "peer_downgrade"
+            .expect(
+                "a warn-mode downgrade mcp_governance_decision event was not observed within 5s",
             );
+            assert_eq!(event["data"]["sbproxy.decision.rule_id"], "peer_downgrade");
             assert_eq!(
                 event["data"]["sbproxy.decision.reason"],
                 "peer_protocol_downgrade"
@@ -8385,13 +8384,9 @@ mod mcp_catalog_snapshot_tests {
             })
             .await
             .expect("an auth-posture downgrade mcp_governance_decision event was not observed within 5s");
+            assert_eq!(event["data"]["sbproxy.decision.rule_id"], "peer_downgrade");
             assert_eq!(
-                event["data"]["sbproxy.decision.rule_id"],
-                "peer_downgrade"
-            );
-            assert_eq!(
-                event["data"]["sbproxy.decision.reason"],
-                "peer_auth_posture_downgrade",
+                event["data"]["sbproxy.decision.reason"], "peer_auth_posture_downgrade",
                 "{event:?}"
             );
         }
