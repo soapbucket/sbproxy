@@ -1907,12 +1907,37 @@ mod tests {
         // `sbproxy_config::compiler::compile_egress_gates` would install
         // from a `egress.usage_sinks.mode: deny_by_default` block, and
         // the resulting sink refuses to dispatch to a host outside it.
+        //
+        // Deliberately exercises the `Webhook` variant, not a simpler
+        // one: `WebhookSink::record` authorizes under its own,
+        // pre-existing `EgressPurpose::Webhook`, a different purpose
+        // from the `EgressPurpose::UsageSink` key this registry slot is
+        // installed under. `compile_egress_gates` compiles one
+        // authorizer keyed under *both* purposes for exactly this
+        // reason (see its call site's comment in
+        // `sbproxy-config/src/compiler.rs`); this test's authorizer is
+        // built the same dual-keyed way so it matches what production
+        // actually installs, and the sighting this dispatch stamps
+        // carries `EgressPurpose::Webhook`'s label, not `UsageSink`'s,
+        // because that is the purpose `WebhookSink::record` itself
+        // stamps under.
+        let dual_purpose_authorizer = {
+            use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+            use std::collections::{HashMap, HashSet};
+            let allow = PurposeAllowlist {
+                hosts: HashSet::from(["collector.example.com".to_string()]),
+                schemes: HashSet::from(["https".to_string(), "http".to_string()]),
+                ports: HashSet::from([443, 80]),
+                allow_private: false,
+            };
+            let mut purposes = HashMap::new();
+            purposes.insert(EgressPurpose::UsageSink, allow.clone());
+            purposes.insert(EgressPurpose::Webhook, allow);
+            EgressAuthorizer::new(EgressConfig { purposes })
+        };
         sbproxy_security::egress::install_configured_gate(
             EgressPurpose::UsageSink,
-            Some(enforce_purpose(
-                EgressPurpose::UsageSink,
-                &["collector.example.com"],
-            )),
+            Some(dual_purpose_authorizer),
         );
 
         let sink = UsageSinkConfig::Webhook {
@@ -1925,7 +1950,7 @@ mod tests {
 
         let denied = sbproxy_security::egress::egress_inventory_snapshot()
             .into_iter()
-            .find(|s| s.purpose == EgressPurpose::UsageSink.as_label() && s.host == "evil.example")
+            .find(|s| s.purpose == EgressPurpose::Webhook.as_label() && s.host == "evil.example")
             .expect("the denied dispatch must be stamped in the inventory");
         assert_eq!(denied.status, "denied");
 

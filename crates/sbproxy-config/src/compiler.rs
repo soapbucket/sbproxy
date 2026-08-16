@@ -2426,32 +2426,58 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> CompiledEgressGat
         return CompiledEgressGates::default();
     };
     CompiledEgressGates {
-        ai_providers: compile_egress_purpose(EgressPurpose::AiProvider, cfg.ai_providers.as_ref()),
-        usage_sinks: compile_egress_purpose(EgressPurpose::UsageSink, cfg.usage_sinks.as_ref()),
+        ai_providers: compile_egress_purpose(
+            &[EgressPurpose::AiProvider],
+            cfg.ai_providers.as_ref(),
+        ),
+        // WOR-2476 fix: `usage_sinks:` has to arm the Webhook sink too,
+        // not just the three sinks that already share
+        // `EgressPurpose::UsageSink` internally (Langfuse, Datadog,
+        // ObjectStore).
+        // `WebhookSink::record` authorizes under its own, separate,
+        // pre-existing `EgressPurpose::Webhook` (see
+        // `crates/sbproxy-ai/src/usage_sink.rs`); an authorizer whose
+        // internal purpose map only has a `UsageSink` entry denies every
+        // Webhook dispatch with `UnlistedPurpose` regardless of `hosts`,
+        // because `EgressAuthorizer::authorize` looks the purpose up by
+        // exact key. Compiling one authorizer keyed under both purposes,
+        // sharing the same allowlist, is what actually arms every
+        // consumer `UsageSinkConfig::build` attaches this to.
+        usage_sinks: compile_egress_purpose(
+            &[EgressPurpose::UsageSink, EgressPurpose::Webhook],
+            cfg.usage_sinks.as_ref(),
+        ),
         model_artifacts: compile_egress_purpose(
-            EgressPurpose::ModelArtifact,
+            &[EgressPurpose::ModelArtifact],
             cfg.model_artifacts.as_ref(),
         ),
         token_exchange: compile_egress_purpose(
-            EgressPurpose::TokenExchange,
+            &[EgressPurpose::TokenExchange],
             cfg.token_exchange.as_ref(),
         ),
-        telemetry: compile_egress_purpose(EgressPurpose::Telemetry, cfg.telemetry.as_ref()),
+        telemetry: compile_egress_purpose(&[EgressPurpose::Telemetry], cfg.telemetry.as_ref()),
     }
 }
 
-/// Compile one purpose's sub-block into a real authorizer.
+/// Compile one sub-block into a real authorizer keyed under every purpose
+/// in `purposes`, all sharing the same allowlist.
 ///
 /// `None` when the sub-block is omitted, or when its `mode` is the inert
-/// `allow_by_default` default: either way the purpose stays legacy
-/// ungated, exactly the contract every consumer already honors for an
-/// absent authorizer. `deny_by_default` builds a real allowlist scoped to
-/// `hosts` (exact match, case-insensitive). Scheme and port are not
-/// exposed at this config layer: every purpose dials over `http`/`https`
-/// on `80`/`443`, which every production consumer this section arms
-/// already does.
+/// `allow_by_default` default: either way every named purpose stays
+/// legacy ungated, exactly the contract every consumer already honors
+/// for an absent authorizer. `deny_by_default` builds a real allowlist
+/// scoped to `hosts` (exact match, case-insensitive). Scheme and port
+/// are not exposed at this config layer: every purpose dials over
+/// `http`/`https` on `80`/`443`, which every production consumer this
+/// section arms already does.
+///
+/// Most sub-blocks arm exactly one [`EgressPurpose`]; `usage_sinks` arms
+/// two (`UsageSink` and `Webhook`, see the call site's comment) because
+/// the sink implementations underneath it authorize under two different,
+/// pre-existing purposes. `purposes` must be non-empty; every call site
+/// in this file passes a literal slice.
 fn compile_egress_purpose(
-    purpose: EgressPurpose,
+    purposes: &[EgressPurpose],
     cfg: Option<&EgressPurposeConfig>,
 ) -> Option<EgressAuthorizer> {
     let cfg = cfg?;
@@ -2471,9 +2497,13 @@ fn compile_egress_purpose(
     allow.schemes.insert("http".to_string());
     allow.ports.insert(443);
     allow.ports.insert(80);
-    let mut purposes = std::collections::HashMap::new();
-    purposes.insert(purpose, allow);
-    Some(EgressAuthorizer::new(EgressConfig { purposes }))
+    let mut purposes_map = std::collections::HashMap::new();
+    for purpose in purposes {
+        purposes_map.insert(*purpose, allow.clone());
+    }
+    Some(EgressAuthorizer::new(EgressConfig {
+        purposes: purposes_map,
+    }))
 }
 
 /// Validate the top-level `events:` block (WOR-2318).
@@ -5309,6 +5339,72 @@ origins:
                 .unwrap_err(),
             EgressDenied::UnlistedHost,
             "a host outside the configured allowlist must be denied"
+        );
+    }
+
+    #[test]
+    fn egress_usage_sinks_authorizer_also_arms_the_webhook_purpose() {
+        // Regression test (WOR-2476): `WebhookSink::record` authorizes
+        // under `EgressPurpose::Webhook`, a separate, pre-existing
+        // purpose from `EgressPurpose::UsageSink` that Langfuse/Datadog/
+        // ObjectStore share. An authorizer compiled from `usage_sinks:`
+        // that only covered `UsageSink` denied every Webhook dispatch
+        // with `UnlistedPurpose` regardless of `hosts`, because
+        // `EgressAuthorizer::authorize` looks the purpose up by exact
+        // key. Proves the compiled authorizer covers both: an allowed
+        // host authorizes under either purpose, and an unlisted host is
+        // denied by host, not by purpose, under either.
+        // `allow_private` + a loopback IP literal so the positive case
+        // below resolves with no real DNS lookup (an IP literal needs
+        // none) and stays hermetic.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    allow_private: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .usage_sinks
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+
+        // Not `UnlistedPurpose`: the Webhook purpose key exists. An
+        // unlisted host is denied by host, which only happens after the
+        // purpose lookup already succeeded.
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Webhook,
+                    "https://attacker.test/ingest",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedHost,
+            "an unlisted host must be denied by host, not by a missing Webhook purpose entry"
+        );
+
+        // The allowlisted host authorizes under the Webhook purpose too,
+        // not just UsageSink.
+        assert!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Webhook,
+                    "https://127.0.0.1/ingest",
+                    &SystemHostResolver,
+                )
+                .is_ok(),
+            "the configured host must authorize under EgressPurpose::Webhook, not just UsageSink"
         );
     }
 

@@ -465,8 +465,11 @@ pub struct EgressTopLevelConfig {
     /// dispatch the AI gateway's client makes.
     #[serde(default)]
     pub ai_providers: Option<EgressPurposeConfig>,
-    /// Arms `EgressPurpose::UsageSink`: webhook, Langfuse, Datadog, and
-    /// object-store usage-sink deliveries.
+    /// Arms Langfuse, Datadog, and object-store usage-sink deliveries
+    /// under `EgressPurpose::UsageSink`, and webhook deliveries under
+    /// `EgressPurpose::Webhook` (a separate, pre-existing purpose the
+    /// webhook sink authorizes under internally): one config knob, two
+    /// purposes armed from the same allowlist.
     #[serde(default)]
     pub usage_sinks: Option<EgressPurposeConfig>,
     /// Arms `EgressPurpose::ModelArtifact`: the model-host artifact
