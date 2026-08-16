@@ -90,6 +90,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [outbound-dpop.md](outbound-dpop.md) - RFC 9449 sender-constrained OAuth credentials and per-request proof minting for upstream calls.
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
 - [prompt-injection-v2.md](prompt-injection-v2.md) - the v2 guardrail: swappable detector returning score + label, with score-to-action mapping and a delegation-depth-aware action at the agent boundary.
+- [classifier-sidecar.md](classifier-sidecar.md) - running the ONNX classifier as a sidecar instead of in-process, and when that trade is worth it.
 
 ## Connect clients
 
@@ -114,6 +115,9 @@ Point a framework you already run at the gateway: chat completions through the O
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
+- [security.md](security.md) - the security map: what the gateway enforces, what stays with your services, and which gaps are real.
+- [api-security.md](api-security.md) - API threat classes and the policy configuration for each, from object-level authorization to bot traffic.
+- [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
 - [events.md](events.md) - the eleven typed events, the `events:` file and webhook sinks, and the in-process bus.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [policy.md](policy.md) - the policy engine, the `semantic_constraint` policy, and the `request_validator`, `concurrent_limit`, `rate_limit_budget`, `http_framing`, and `a2a` policy reference.

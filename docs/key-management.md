@@ -1129,7 +1129,7 @@ still generated and still billed by the provider, so its tokens are folded
 into the same settlement as the served reply. Without that, a caller who
 can drive a cascade could hold a governed budget flat while spending
 freely. The discarded portion is separately visible as
-`sbproxy_ai_wasted_tokens{kind="failover_loser"}`, which is a breakdown of
+`sbproxy_ai_wasted_tokens_total{kind="failover_loser"}`, which is a breakdown of
 the billed total rather than a second charge.
 
 `missing_rate` (default `zero_cost`) governs a key that carries a
