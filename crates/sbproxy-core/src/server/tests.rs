@@ -4480,6 +4480,49 @@ fn auth_test_pipeline(name: &str) -> std::sync::Arc<crate::pipeline::CompiledPip
     )
 }
 
+/// The unwired warning has to be right about `policy` (WOR-2448).
+///
+/// `policy` is the one event whose wiring is a config question rather
+/// than a constant: it always reaches the audit bus, but only lands on
+/// the decision-audit feed in the converged shape. Asking
+/// `has_emitter()` alone tells an operator who deliberately turned that
+/// shape on that nothing publishes `policy`, while the records they
+/// asked for are landing on the feed they are reading.
+#[test]
+fn the_unwired_warning_follows_the_policy_record_format() {
+    fn unwired_for(format: &str) -> Vec<&'static str> {
+        let yaml = format!(
+            r#"proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        policy_record_format: {format}
+        events:
+          policy: true
+origins:
+  "audit.test":
+    action:
+      type: static
+      body: ok
+"#
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("fixture config");
+        super::lifecycle::unwired_decision_audit_events(&compiled)
+    }
+
+    assert!(
+        unwired_for("legacy").contains(&"policy"),
+        "under the legacy shape a policy record never reaches this feed, so naming it is the \
+         honest answer"
+    );
+    assert!(
+        !unwired_for("decision").contains(&"policy"),
+        "under the converged shape policy publishes on exactly this feed; warning that nothing \
+         publishes it is wrong about the one event the operator turned on"
+    );
+}
+
 /// Every auth decision goes through the one seam (WOR-2446).
 ///
 /// Greps the source rather than trusting review, because the failure it
