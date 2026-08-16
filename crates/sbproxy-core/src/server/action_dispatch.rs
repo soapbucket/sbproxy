@@ -2089,11 +2089,13 @@ pub(super) async fn handle_mcp_action(
             uri_authority.as_deref(),
             &request_headers,
         ) {
-            let status = mcp_modern_rejection_status(
+            let status = record_mcp_modern_refusal(
                 rejection,
                 &mcp.server_name,
                 connection_scheme,
                 uri_authority.as_deref(),
+                ctx,
+                session,
             );
             return write_mcp_wire_response(
                 session,
@@ -2460,11 +2462,13 @@ pub(super) async fn handle_mcp_action(
             uri_authority.as_deref(),
             &request_headers,
         ) {
-            let status = mcp_modern_rejection_status(
+            let status = record_mcp_modern_refusal(
                 rejection,
                 &mcp.server_name,
                 connection_scheme,
                 uri_authority.as_deref(),
+                ctx,
+                session,
             );
             return write_mcp_wire_response(
                 session,
@@ -4568,18 +4572,6 @@ fn mcp_catalogue_name_for_snapshot(
     )
 }
 
-/// Return every concrete modern catalogue name owned by a rollout-managed
-/// base tool. Modern PR1 deliberately exposes neither these per-server targets
-/// nor synthesized aliases because the rollout transforms do not yet carry an
-/// independently compiled caller-facing modern contract.
-/// Map a modern transport-trust rejection to its HTTP status, and record why.
-///
-/// The refusal body is deliberately empty so a disallowed Origin learns
-/// nothing about the endpoint, which leaves this log as the only place an
-/// operator can see why modern traffic is being refused. Everything recorded
-/// here is safe to log: the rejection class is a closed enum, the scheme is
-/// server-derived, and the authority is a parsed header value, which cannot
-/// carry control characters. No credential is in scope at this point.
 /// Authority of the request target, including the absolute form.
 ///
 /// Pingora builds the request URI with `Uri::builder().path_and_query(target)`,
@@ -4609,11 +4601,26 @@ pub(super) fn mcp_request_target_authority(uri: &http::Uri) -> Option<String> {
     (!authority.is_empty()).then(|| authority.to_string())
 }
 
-pub(super) fn mcp_modern_rejection_status(
+/// Map a modern transport-trust rejection to its HTTP status, and record it.
+///
+/// The refusal body is deliberately empty so a disallowed Origin learns
+/// nothing about the endpoint, which means the caller is told nothing and the
+/// record written here is all an operator ever gets. So it is a record, not
+/// just a log line: the [`sbproxy_observe::SecurityAuditEntry`] is the durable
+/// half and reaches the SIEM stream alongside every other denial, and it is
+/// what both refusal sites share. The `warn!` beside it is for the operator
+/// reading logs directly.
+///
+/// Everything recorded is safe to emit: the rejection class is a closed enum,
+/// the scheme is server-derived, and the authority is a parsed header value,
+/// which cannot carry control characters. No credential is in scope this early.
+pub(super) fn record_mcp_modern_refusal(
     rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
     server_name: &str,
     connection_scheme: &str,
     authority: Option<&str>,
+    ctx: &RequestContext,
+    session: &Session,
 ) -> http::StatusCode {
     use sbproxy_modules::action::mcp::McpModernHttpRejection;
     let status = match rejection {
@@ -4630,9 +4637,37 @@ pub(super) fn mcp_modern_rejection_status(
         status = status.as_u16(),
         "refused MCP 2026-07-28 request at the transport trust boundary"
     );
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "mcp_transport_denied",
+        mcp_modern_rejection_reason(rejection),
+        status.as_u16(),
+        Some(server_name.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(session.req_header().method.as_str().to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .emit();
     status
 }
 
+/// Closed reason label for a modern transport-trust refusal, so a SIEM rule
+/// can route on the failure mode rather than parse a sentence.
+pub(super) fn mcp_modern_rejection_reason(
+    rejection: sbproxy_modules::action::mcp::McpModernHttpRejection,
+) -> &'static str {
+    use sbproxy_modules::action::mcp::McpModernHttpRejection;
+    match rejection {
+        McpModernHttpRejection::MissingTrustAnchor => "mcp_modern_missing_trust_anchor",
+        McpModernHttpRejection::Authority => "mcp_modern_authority",
+        McpModernHttpRejection::Origin => "mcp_modern_origin",
+    }
+}
+
+/// Return every concrete modern catalogue name owned by a rollout-managed
+/// base tool. Modern PR1 deliberately exposes neither these per-server targets
+/// nor synthesized aliases because the rollout transforms do not yet carry an
+/// independently compiled caller-facing modern contract.
 fn mcp_modern_rollout_hidden_names(
     mcp: &sbproxy_modules::action::McpAction,
     catalog: &sbproxy_extension::mcp::federation::ToolCatalogSnapshot,

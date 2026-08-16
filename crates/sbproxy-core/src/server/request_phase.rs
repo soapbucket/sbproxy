@@ -3045,15 +3045,29 @@ pub(super) async fn request_filter(
     // dispatch runs much later, so this is the only place that gets ahead of
     // both.
     //
-    // Classification is header-only, and that is complete for any conforming
-    // caller: the era makes `MCP-Protocol-Version` and `Mcp-Method` mandatory
-    // on every request precisely so an intermediary can classify without
-    // reading a body. A marker-free legacy request and every non-MCP origin
-    // skip this in one enum match. `handle_mcp_action` keeps the same check
-    // for an MCP action reached through a forward rule, which this
-    // origin-indexed lookup cannot see.
-    let mcp_modern_rejection = match pipeline.actions.get(origin_idx) {
-        Some(Action::Mcp(mcp)) => {
+    // Classification is header-only, which is complete for any caller that
+    // follows the era: `MCP-Protocol-Version` and `Mcp-Method` are mandatory
+    // on the wire precisely so an intermediary can classify without reading a
+    // body. It is not complete for a caller that does not, and the gap is the
+    // request shape this gate most wants to stop. A cross-origin `fetch()`
+    // cannot set either header without a preflight, but a simple request can
+    // carry any body under `text/plain`, so a hostile page can put the modern
+    // marker in `_meta` and be classified legacy here. That request is still
+    // refused, in `handle_mcp_action`, once there is a body to read; what it
+    // gets to do first is run authentication, which for a forward-auth origin
+    // means an outbound call per request. The catalogue and the OAuth
+    // challenge both sit behind the body-aware check, so this is amplification
+    // rather than disclosure. Reading the body here to close it would mean
+    // buffering every request to every MCP origin ahead of routing, which
+    // costs more than the amplification does.
+    //
+    // The route is resolved the way every other pre-route consumer in this
+    // file resolves it, because an origin whose base action is MCP can still
+    // send this path elsewhere through a forward rule, and judging that
+    // request against the MCP action's trust anchor would refuse it before the
+    // rule it would actually have taken is ever evaluated.
+    let mcp_modern_rejection = match request_effective_action(session, &pipeline, origin_idx) {
+        EffectiveAction::Resolved(Some(Action::Mcp(mcp))) => {
             let request = session.req_header();
             if sbproxy_extension::mcp::classify_http_era(None, &request.headers)
                 == sbproxy_extension::mcp::McpProtocolEra::Modern2026_07_28
@@ -3070,11 +3084,18 @@ pub(super) async fn request_filter(
         _ => None,
     };
     if let Some((rejection, scheme, authority, server_name)) = mcp_modern_rejection {
-        let status = super::action_dispatch::mcp_modern_rejection_status(
+        ctx.record_policy_decision("mcp_modern_transport", "deny");
+        ctx.deny_reason = Some(format!(
+            "mcp_modern_transport: {}",
+            super::action_dispatch::mcp_modern_rejection_reason(rejection)
+        ));
+        let status = super::action_dispatch::record_mcp_modern_refusal(
             rejection,
             &server_name,
             scheme,
             authority.as_deref(),
+            ctx,
+            session,
         );
         super::action_dispatch::write_mcp_wire_response(
             session,
