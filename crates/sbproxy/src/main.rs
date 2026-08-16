@@ -2300,6 +2300,17 @@ fn runtime_telemetry_config_for_cli(cli: &Cli) -> Option<sbproxy_observe::Teleme
         .observability
         .as_ref()
         .and_then(|observability| observability.telemetry.as_ref())?;
+    // WOR-2481: install the compiled `egress.telemetry:` authorizer into
+    // the process-wide configured-gate registry before `init_tracing`
+    // (called just after this returns) builds any OTLP exporter, so the
+    // trace and metrics exporters' boot-time egress check has something
+    // to read. Runs once, here, at boot only: the OTLP exporters are
+    // never rebuilt on reload, so there is no reload-path counterpart
+    // (WOR-2481 tracks adding real reload re-verification).
+    sbproxy_security::egress::install_configured_gate(
+        sbproxy_security::egress::EgressPurpose::Telemetry,
+        compiled.egress.telemetry.clone(),
+    );
     // WOR-1869: telemetry headers may hold provider-URI secret
     // references (vault://, secret://, ...), which need the backend
     // manager. Install the process resolver now; the call is

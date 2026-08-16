@@ -92,6 +92,12 @@ impl OtlpLogSink {
         let endpoint = options.endpoint.clone();
         let timeout = options.timeout;
 
+        // WOR-2481: authorize against `egress.telemetry:` before building
+        // anything. A denied endpoint refuses boot loudly (see
+        // `crate::telemetry::authorize_telemetry_endpoint_or_refuse_boot`);
+        // omitted/allowed stamps the sighting and continues.
+        crate::telemetry::authorize_telemetry_endpoint_or_refuse_boot(&endpoint, "logs");
+
         // Build the OTLP exporter per the operator's transport choice.
         // The 0.27 OTLP-logs builder API mirrors the trace + metric
         // builders already wired in `telemetry.rs`.

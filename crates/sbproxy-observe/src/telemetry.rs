@@ -883,10 +883,102 @@ fn otlp_resource(config: &TelemetryConfig) -> Resource {
     Resource::new(resource_kv)
 }
 
+/// Authorize an OTLP exporter endpoint against the top-level
+/// `egress.telemetry:` allowlist (WOR-2481), and stamp the egress
+/// sightings inventory either way.
+///
+/// A denied endpoint refuses boot immediately and loudly, naming the
+/// endpoint: unlike an exporter that merely fails to *build* (logged,
+/// then boot continues without OTLP -- see `logging::init_inner`), a
+/// denied destination means the operator's own allowlist is doing
+/// exactly what it was configured to do, and silently continuing would
+/// either export telemetry somewhere never approved or leave the
+/// exporter sending nowhere with no visible reason why. Mirrors the
+/// audit-chain's boot-time fail-loud contract (WOR-2478).
+///
+/// `None` (an omitted `egress.telemetry:` sub-block, or an authorizer
+/// that permits `endpoint`) stamps the sighting and returns normally, so
+/// boot continues. Called once, at exporter construction, by each of the
+/// three OTLP exporters (traces, metrics, logs); a config reload does
+/// not re-verify an exporter already built at boot (WOR-2481 tracks
+/// closing that gap).
+///
+/// Split from [`check_telemetry_egress`] so the authorization decision
+/// (stamps the inventory, returns an outcome) is unit-testable on its
+/// own; `std::process::exit` cannot be exercised from within the test
+/// process that calls it.
+pub(crate) fn authorize_telemetry_endpoint_or_refuse_boot(endpoint: &str, signal: &str) {
+    if let TelemetryEgressOutcome::Denied(denied) = check_telemetry_egress(endpoint, signal) {
+        eprintln!(
+            "Fatal: telemetry {signal} exporter endpoint '{endpoint}' is not on the \
+             egress.telemetry allowlist ({denied:?}). Add it to egress.telemetry.hosts, or \
+             remove the egress.telemetry block to leave telemetry ungated."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Decision [`authorize_telemetry_endpoint_or_refuse_boot`] acts on.
+#[derive(Debug, PartialEq, Eq)]
+enum TelemetryEgressOutcome {
+    /// No authorizer configured for `EgressPurpose::Telemetry` (an
+    /// omitted `egress.telemetry:` sub-block), or the configured
+    /// authorizer allowed the destination.
+    Proceed,
+    /// The configured allowlist denied the destination.
+    Denied(sbproxy_security::egress::EgressDenied),
+}
+
+/// Authorize `endpoint` against `egress.telemetry:` and stamp the egress
+/// sightings inventory, without acting on the result. See
+/// [`authorize_telemetry_endpoint_or_refuse_boot`] for the production
+/// entry point, which is this function plus the fail-loud side effect on
+/// [`TelemetryEgressOutcome::Denied`].
+fn check_telemetry_egress(endpoint: &str, signal: &str) -> TelemetryEgressOutcome {
+    use sbproxy_security::egress::{
+        configured_gate, record_egress_seen, EgressPurpose, EgressSightingStatus,
+        SystemHostResolver,
+    };
+    let origin = format!("telemetry.{signal}");
+    let Some(authorizer) = configured_gate(EgressPurpose::Telemetry) else {
+        record_egress_seen(
+            EgressPurpose::Telemetry,
+            endpoint,
+            &origin,
+            EgressSightingStatus::Ungated,
+            None,
+        );
+        return TelemetryEgressOutcome::Proceed;
+    };
+    match authorizer.authorize(EgressPurpose::Telemetry, endpoint, &SystemHostResolver) {
+        Ok(_) => {
+            record_egress_seen(
+                EgressPurpose::Telemetry,
+                endpoint,
+                &origin,
+                EgressSightingStatus::Allowed,
+                None,
+            );
+            TelemetryEgressOutcome::Proceed
+        }
+        Err(denied) => {
+            record_egress_seen(
+                EgressPurpose::Telemetry,
+                endpoint,
+                &origin,
+                EgressSightingStatus::Denied,
+                Some(denied),
+            );
+            TelemetryEgressOutcome::Denied(denied)
+        }
+    }
+}
+
 fn build_span_exporter(
     config: &TelemetryConfig,
     endpoint: &str,
 ) -> Result<opentelemetry_otlp::SpanExporter> {
+    authorize_telemetry_endpoint_or_refuse_boot(endpoint, "traces");
     match config.transport {
         OtlpTransport::Http => {
             let mut builder = opentelemetry_otlp::SpanExporter::builder()
@@ -973,6 +1065,7 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
         .filter(|e| !e.is_empty())
         .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string());
     let endpoint = endpoint_owned.as_str();
+    authorize_telemetry_endpoint_or_refuse_boot(endpoint, "metrics");
 
     // Same resource construction as the trace pipeline (detection +
     // service identity + operator attrs), so the two signals stay
@@ -2635,5 +2728,108 @@ mod tests {
                  root: {traceparent}"
             );
         });
+    }
+
+    // WOR-2481: `egress.telemetry:` boot-time authorization.
+    //
+    // `authorize_telemetry_endpoint_or_refuse_boot` calls
+    // `std::process::exit(1)` on denial, which cannot run inside this
+    // test process, so these tests exercise `check_telemetry_egress`,
+    // the pure decision-plus-stamp half it wraps.
+
+    fn enforce_telemetry(
+        hosts: &[&str],
+        allow_private: bool,
+    ) -> sbproxy_security::egress::EgressAuthorizer {
+        use sbproxy_security::egress::{
+            EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist,
+        };
+        use std::collections::{HashMap, HashSet};
+        let allow = PurposeAllowlist {
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            schemes: HashSet::from(["https".to_string(), "http".to_string()]),
+            ports: HashSet::from([443, 80]),
+            allow_private,
+        };
+        EgressAuthorizer::new(EgressConfig {
+            purposes: HashMap::from([(EgressPurpose::Telemetry, allow)]),
+        })
+    }
+
+    #[test]
+    fn denied_telemetry_endpoint_is_stamped_and_would_refuse_boot() {
+        use sbproxy_security::egress::{
+            egress_inventory_snapshot, install_configured_gate, EgressDenied, EgressPurpose,
+        };
+
+        install_configured_gate(
+            EgressPurpose::Telemetry,
+            Some(enforce_telemetry(&["otel-collector.example.com"], false)),
+        );
+
+        let outcome = check_telemetry_egress(
+            "http://attacker-collector.invalid:4317",
+            "traces-wor2481-denied",
+        );
+        assert_eq!(outcome, TelemetryEgressOutcome::Denied(EgressDenied::UnlistedHost));
+
+        let sighting = egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.host == "attacker-collector.invalid")
+            .expect("the denied endpoint must be stamped in the inventory");
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.origin, "telemetry.traces-wor2481-denied");
+
+        install_configured_gate(EgressPurpose::Telemetry, None);
+    }
+
+    #[test]
+    fn omitted_egress_telemetry_stamps_ungated_and_proceeds() {
+        use sbproxy_security::egress::{
+            egress_inventory_snapshot, install_configured_gate, EgressPurpose,
+        };
+
+        // No `egress.telemetry:` sub-block configured: nothing installed.
+        install_configured_gate(EgressPurpose::Telemetry, None);
+
+        let outcome = check_telemetry_egress(
+            "http://collector.internal:4317",
+            "traces-wor2481-omitted",
+        );
+        assert_eq!(outcome, TelemetryEgressOutcome::Proceed);
+
+        let sighting = egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.host == "collector.internal")
+            .expect("an ungated endpoint must still be stamped in the inventory");
+        assert_eq!(sighting.status, "ungated");
+    }
+
+    #[test]
+    fn allowed_telemetry_endpoint_proceeds_and_is_stamped_allowed() {
+        use sbproxy_security::egress::{
+            egress_inventory_snapshot, install_configured_gate, EgressPurpose,
+        };
+
+        // 127.0.0.1 resolves with no network I/O (an IP literal needs no
+        // DNS lookup), so this stays hermetic. A collector reachable only
+        // on loopback is also the realistic shape for a sidecar OTLP
+        // agent, which is why `allow_private` exists at all.
+        install_configured_gate(
+            EgressPurpose::Telemetry,
+            Some(enforce_telemetry(&["127.0.0.1"], true)),
+        );
+
+        let outcome =
+            check_telemetry_egress("https://127.0.0.1", "metrics-wor2481-allowed");
+        assert_eq!(outcome, TelemetryEgressOutcome::Proceed);
+
+        let sighting = egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.host == "127.0.0.1" && s.origin == "telemetry.metrics-wor2481-allowed")
+            .expect("the allowed endpoint must be stamped in the inventory");
+        assert_eq!(sighting.status, "allowed");
+
+        install_configured_gate(EgressPurpose::Telemetry, None);
     }
 }
