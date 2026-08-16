@@ -3072,15 +3072,28 @@ pub(super) async fn handle_mcp_action(
             // those validators ship in the enterprise tier.
             let params = request.params.take().unwrap_or(serde_json::Value::Null);
             let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-            // WOR-2384 fix round 1, item 4: same trust decision,
-            // resolved by URI ownership rather than by tool name --
-            // resolved before dispatch so a downgraded peer is never
-            // contacted for its resource read either.
-            let downgrade_refusal = if uri.is_empty() {
-                None
+            if uri.is_empty() {
+                JsonRpcResponse::error(
+                    request.id.clone(),
+                    INVALID_PARAMS,
+                    "resources/read requires `uri` param",
+                )
             } else {
-                mcp.federation.resolve_resource(uri).and_then(
-                    |resource: sbproxy_extension::mcp::federation::FederatedResource| {
+                // WOR-2384 fix round 1, item 4 (corrected in the
+                // fix-round-2 follow-up): resolve the URI to its
+                // owning server and run the peer-downgrade check on
+                // that resolution IMMEDIATELY -- before any further
+                // resolution or upstream contact. The ordering is
+                // itself the security property: a downgraded peer
+                // must never be dispatched to, regardless of the
+                // resolved resource's validity. A URI that fails to
+                // resolve at all is a separate, unrelated "unknown
+                // resource" outcome below (there is no owning server
+                // to check against), never a way to skip this check
+                // for a URI that does resolve.
+                let resolved = mcp.federation.resolve_resource(uri);
+                let downgrade_refusal = resolved.as_ref().and_then(
+                    |resource: &sbproxy_extension::mcp::federation::FederatedResource| {
                         mcp_peer_downgrade_refusal_for_non_tool_call(
                             mcp,
                             ctx,
@@ -3088,32 +3101,26 @@ pub(super) async fn handle_mcp_action(
                             &resource.server_name,
                         )
                     },
-                )
-            };
-            if uri.is_empty() {
-                JsonRpcResponse::error(
-                    request.id.clone(),
-                    INVALID_PARAMS,
-                    "resources/read requires `uri` param",
-                )
-            } else if let Some(message) = downgrade_refusal {
-                JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
-            } else {
-                match mcp.federation.read_resource(uri).await {
-                    Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
-                    Err(e) => {
-                        if is_modern {
-                            warn!(failure_class = "upstream", "modern resources/read failed");
-                        } else {
-                            warn!(error = %e, uri = %uri, "resources/read failed");
+                );
+                if let Some(message) = downgrade_refusal {
+                    JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
+                } else {
+                    match mcp.federation.read_resource(uri).await {
+                        Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
+                        Err(e) => {
+                            if is_modern {
+                                warn!(failure_class = "upstream", "modern resources/read failed");
+                            } else {
+                                warn!(error = %e, uri = %uri, "resources/read failed");
+                            }
+                            mcp_upstream_failure_response(
+                                request.id.clone(),
+                                is_modern,
+                                "upstream resource read failed",
+                                "resources/read failed",
+                                &e,
+                            )
                         }
-                        mcp_upstream_failure_response(
-                            request.id.clone(),
-                            is_modern,
-                            "upstream resource read failed",
-                            "resources/read failed",
-                            &e,
-                        )
                     }
                 }
             }
@@ -3201,11 +3208,16 @@ pub(super) async fn handle_mcp_action(
                     &format!("unknown prompt: {name}"),
                 )
             } else if let Some(message) = owner.and_then(|p| {
-                // WOR-2384 fix round 1, item 4: same trust decision as
-                // `tools/call` and `resources/read` -- consulted only
-                // once RBAC reachability already passed, so the
-                // ordering matches `tools/call`'s RBAC-then-downgrade
-                // sequence.
+                // WOR-2384 fix round 1, item 4 (ordering confirmed
+                // explicit in the fix-round-2 follow-up): `owner` was
+                // already resolved above, before the RBAC reachability
+                // check; this consults it immediately once RBAC
+                // reachability has passed, and strictly before the
+                // `get_prompt_from_snapshot` dispatch in the `else`
+                // branch below -- the same "resolve, check, only then
+                // dispatch" ordering `resources/read` now makes
+                // explicit too. A downgraded peer is never contacted
+                // for its prompt either.
                 mcp_peer_downgrade_refusal_for_non_tool_call(mcp, ctx, session, &p.server_name)
             }) {
                 JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
@@ -8416,6 +8428,25 @@ mod mcp_catalog_snapshot_tests {
             }]
         }))
         .expect("non-tool downgrade fixture compiles");
+        // WOR-2384 fix round 2: `handle_mcp_action` always calls
+        // `federation.ensure_ready(...)` before dispatching any
+        // method, and on this freshly constructed federation that is
+        // a real cold prime -- every registry's own periodic refresh
+        // (see `McpFederation`'s doc comments) runs for real against
+        // the (nonexistent) upstream, and each unconditionally
+        // overwrites its map with whatever that failed cycle produced
+        // (empty). Left unguarded, the very first `mcp_handler_exchange`
+        // call below would silently wipe every `seed_..._for_test`
+        // call that ran before it, which is exactly what happened in
+        // fix round 1: resource resolution came back empty and the
+        // observed failure ("unknown resource uri") was an artifact
+        // of this wipe, not of the downgrade check. `seed_tools_for_test`
+        // marks the federation primed as a side effect (see its own
+        // doc comment), which makes every later `ensure_ready` call a
+        // no-op fast path, so it has to run first, before any other
+        // seed call whose effect must survive past the first request.
+        // The empty tool map is deliberate: this test needs no tools.
+        action.federation.seed_tools_for_test(HashMap::new(), None);
         action.federation.seed_resources_for_test(HashMap::from([(
             RESOURCE_URI.to_string(),
             sbproxy_extension::mcp::federation::FederatedResource {
