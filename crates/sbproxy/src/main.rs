@@ -6254,8 +6254,8 @@ struct RegoTestCase {
 /// searched for, recursively. A file argument is used as-is regardless
 /// of its name.
 fn discover_rego_test_fixtures(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
     if metadata.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
@@ -6344,8 +6344,11 @@ fn run_rego_tests(
 
     for fixture_path in fixture_paths {
         let fixture_label = fixture_path.display().to_string();
-        let bytes =
-            read_bounded_cli_file(fixture_path, MAX_REGO_TEST_FIXTURE_BYTES, "rego test fixture")?;
+        let bytes = read_bounded_cli_file(
+            fixture_path,
+            MAX_REGO_TEST_FIXTURE_BYTES,
+            "rego test fixture",
+        )?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|error| anyhow::anyhow!("{fixture_label}: not UTF-8: {error}"))?;
         let fixture: RegoTestFixture = serde_yaml::from_str(text)
@@ -13798,10 +13801,8 @@ hooks:
     /// the audit-verify CLI tests' convention (no `tempfile` dependency
     /// in this crate).
     fn rego_test_scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "sb-rego-test-cli-{}-{label}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sb-rego-test-cli-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir

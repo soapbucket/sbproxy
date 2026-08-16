@@ -903,9 +903,15 @@ allow if {
             .expect("fixture has a path comparison line");
         assert_ne!(method_line, path_line);
 
-        let mut both_match =
-            CompiledRego::compile("coverage test", MODULE, "data.sbproxy.allow", 50, None, false)
-                .expect("module compiles");
+        let mut both_match = CompiledRego::compile(
+            "coverage test",
+            MODULE,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
         both_match.set_enable_coverage(true);
         assert!(
             both_match
@@ -922,9 +928,15 @@ allow if {
             report[0]
         );
 
-        let mut short_circuits =
-            CompiledRego::compile("coverage test", MODULE, "data.sbproxy.allow", 50, None, false)
-                .expect("module compiles");
+        let mut short_circuits = CompiledRego::compile(
+            "coverage test",
+            MODULE,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
         short_circuits.set_enable_coverage(true);
         assert!(
             !short_circuits
