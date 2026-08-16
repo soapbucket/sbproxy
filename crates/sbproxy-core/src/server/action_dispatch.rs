@@ -5204,14 +5204,24 @@ enum McpPeerDowngradeDecision {
 ///   axis is unknown *this contact*. It bails only when there is
 ///   truly nothing to compare against on *either* axis, fresh or
 ///   historical (no persisted protocol, no fresh auth classification,
-///   and no existing peer profile). When some signal exists but the
-///   protocol specifically is still unknown (the very first contact
-///   with a peer was itself a 401), the protocol axis defaults to the
-///   weakest rank rather than skipping the comparison -- the same
-///   "positive evidence required for the stronger claim" rule this
-///   codebase already applies to protocol-era classification
-///   elsewhere, applied here to "unknown" rather than to "legacy
-///   marker present."
+///   and no existing peer profile).
+///
+/// Fix round 3 (re-review of fix round 2): when some signal exists but
+/// the protocol specifically has no *fresh* observation this cycle
+/// (this contact never got as far as a JSON-RPC response -- a 401, a
+/// timeout, a 5xx, anything), the fallback must be symmetric with the
+/// auth axis below it: consult
+/// [`sbproxy_extension::mcp::peer_profile::peek`]'s existing recorded
+/// protocol first, and only fall all the way back to the weakest rank
+/// when there is no profile at all yet (the very first contact with
+/// this peer produced no usable answer). The round 2 version defaulted
+/// straight to the weakest rank unconditionally, which meant a config
+/// reload that rebuilds a fresh, empty `McpFederation` -- whose single
+/// cold probe then times out, 5xxs, or hits a transient 401 -- would
+/// compare that silence against an existing MODERN high-water mark and
+/// manufacture a downgrade nobody actually observed. Silence about the
+/// protocol is not the same claim "legacy" is; only a peer with no
+/// history at all defaults to the weakest rank.
 ///
 /// The auth axis itself: a clean unauthenticated `initialize` success
 /// records `false`; a classified 401/407 records `true`; anything
@@ -5262,8 +5272,24 @@ fn mcp_peer_downgrade_check(
         // axis, ever.
         return McpPeerDowngradeDecision::Allowed;
     }
-    let observed_protocol = observed_protocol_fresh
-        .unwrap_or_else(|| sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string());
+    // WOR-2384 fix round 3 (re-review of fix round 2): this fallback
+    // must be symmetric with the auth axis's below it. A fresh probe
+    // failure (config reload builds a new McpFederation with an empty
+    // protocol map; the one cold probe times out, 5xxs, or hits a
+    // transient 401) is not evidence of anything about the peer's
+    // protocol era -- it is silence. Defaulting straight to the
+    // weakest rank here, ignoring an existing recorded profile, would
+    // compare that silence against a real prior high-water mark (say
+    // MODERN) and manufacture a downgrade nobody observed. The prior
+    // profile's own recorded protocol is consulted first; only a peer
+    // with no profile at all (genuinely never contacted before this
+    // cycle) falls all the way back to the weakest rank.
+    let observed_protocol = observed_protocol_fresh.unwrap_or_else(|| {
+        prior_profile
+            .as_ref()
+            .map(|profile| profile.negotiated_protocol.clone())
+            .unwrap_or_else(|| sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string())
+    });
     let observed_auth_required = observed_auth_fresh.unwrap_or_else(|| {
         prior_profile
             .as_ref()
@@ -7583,8 +7609,9 @@ mod mcp_request_target_authority_tests {
 mod mcp_catalog_snapshot_tests {
     use super::{
         handle_mcp_action, mcp_catalogue_name_for_snapshot, mcp_modern_rollout_hidden_names,
-        mcp_synthesized_rollout_tool_is_visible,
+        mcp_peer_downgrade_check, mcp_synthesized_rollout_tool_is_visible,
         mcp_synthesized_rollout_tool_is_visible_to_principal, mcp_unblocked_catalog_tools,
+        McpPeerDowngradeDecision,
     };
     use crate::context::RequestContext;
     use pingora_core::protocols::l4::stream::Stream;
@@ -8786,12 +8813,234 @@ mod mcp_catalog_snapshot_tests {
             }),
         )
         .await;
+        // WOR-2384 fix round 3 test hardening: `.contains("weaker")`
+        // alone cannot distinguish which axis fired -- both
+        // `peer_protocol_downgrade` and `peer_auth_posture_downgrade`
+        // produce a message containing that word. This test's whole
+        // point is the auth axis specifically, so pin the exact reason
+        // code the refusal message embeds
+        // (`mcp_peer_downgrade_check`'s `Refused` branch formats it in
+        // directly): a regression that fired a *protocol* downgrade
+        // instead (for example if the round 3 symmetric fallback ever
+        // regressed back to comparing a defaulted protocol against the
+        // wrong baseline) would still contain "weaker" and pass the
+        // old assertion, but must fail this one.
+        let call2_message = call2["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            call2["error"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("weaker"),
+            call2_message.contains("weaker"),
             "the auth-posture downgrade must refuse the second contact: {call2:?}"
         );
+        assert!(
+            call2_message.contains("peer_auth_posture_downgrade"),
+            "the refusal must be the AuthPosture axis specifically, not a protocol downgrade: {call2:?}"
+        );
+        assert!(
+            !call2_message.contains("peer_protocol_downgrade"),
+            "the protocol axis must not also be flagged here (both cycles answered the same era): {call2:?}"
+        );
+    }
+
+    #[test]
+    fn a_prior_modern_profile_is_not_spuriously_downgraded_when_a_fresh_probe_fails() {
+        // WOR-2384 fix round 3 red-first regression (re-review of fix
+        // round 2): the protocol axis's fallback used to hardcode
+        // LEGACY_PROTOCOL_VERSION whenever this cycle had no fresh
+        // protocol observation, regardless of what an existing peer
+        // profile already recorded -- asymmetric with the auth axis's
+        // fallback, which correctly consulted the profile. Failure
+        // path: a config reload constructs a fresh `McpFederation`
+        // (empty protocol map); `ensure_ready`'s one cold probe fails
+        // with anything that is not a classified 401/407 (a timeout, a
+        // 5xx, a connection error); the peer's process-global
+        // `McpPeerProfile` still holds a MODERN high-water mark from
+        // before the reload; the three-way bail does not fire (the
+        // profile exists); the old code compared a defaulted LEGACY
+        // (rank 0) against the recorded MODERN (rank 1) and reported a
+        // downgrade nobody observed -- a spurious refusal under
+        // `block`, spurious evidence under `warn`.
+        const SERVER: &str = "fix-round-3-protocol-fallback-server";
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "fix-round-3-protocol-fallback-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": SERVER,
+                "downgrade": "block"
+            }]
+        }))
+        .expect("fix-round-3 protocol-fallback fixture compiles");
+        let peer_key = action
+            .prefix_for(SERVER)
+            .expect("compiled prefix")
+            .peer_key
+            .clone();
+
+        // Pre-establish a MODERN high-water mark directly against the
+        // process-global registry, simulating an earlier federation
+        // instance (before the simulated reload) having recorded it.
+        let baseline = sbproxy_extension::mcp::peer_profile::observe_and_record(
+            "__default__",
+            &peer_key,
+            sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION,
+            false,
+            sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block,
+        );
+        assert_eq!(
+            baseline,
+            sbproxy_extension::mcp::peer_profile::ObservationVerdict::Allowed,
+            "the baseline seed itself must be an unrefused first contact"
+        );
+
+        // The fresh `action` above never had `seed_server_observations_for_test`
+        // called on it: `last_negotiated_protocol` and `last_auth_required`
+        // are both `None` for this server, matching "the one cold probe
+        // failed and produced nothing classifiable" (a timeout or a 5xx,
+        // not a 401/407).
+        let ctx = RequestContext::new();
+        let decision = mcp_peer_downgrade_check(&action, &ctx, SERVER);
+        assert!(
+            matches!(decision, McpPeerDowngradeDecision::Allowed),
+            "a fresh federation's failed first probe must not spuriously downgrade an \
+             existing MODERN profile just because this cycle observed nothing: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn the_three_way_bail_requires_all_three_signals_absent() {
+        // WOR-2384 fix round 3 test hardening: pins the exact bail
+        // condition (`observed_protocol_fresh.is_none() &&
+        // observed_auth_fresh.is_none() && prior_profile.is_none()`)
+        // directly. Nothing else in this test suite isolates it: every
+        // existing scenario either seeds a concrete protocol (never
+        // bails) or is the very-first-contact case where all three
+        // genuinely are absent together, which does not distinguish
+        // "all three empty" from "any one of them being present is
+        // enough." Four independent servers, one per case, so each
+        // starts with its own empty peer profile.
+        fn bail_test_action(server: &str) -> McpAction {
+            McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "fix-round-3-bail-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": server,
+                    "downgrade": "block"
+                }]
+            }))
+            .expect("fix-round-3 bail fixture compiles")
+        }
+        let ctx = RequestContext::new();
+
+        // Case 1: nothing known on any axis -> Allowed, and no
+        // observation recorded at all (the bail returns before
+        // `observe_and_record` ever runs).
+        {
+            const SERVER: &str = "fix-round-3-bail-none-known";
+            let action = bail_test_action(SERVER);
+            let peer_key = action
+                .prefix_for(SERVER)
+                .expect("compiled prefix")
+                .peer_key
+                .clone();
+            assert!(
+                sbproxy_extension::mcp::peer_profile::peek("__default__", &peer_key).is_none(),
+                "no profile should exist before the first check"
+            );
+            let decision = mcp_peer_downgrade_check(&action, &ctx, SERVER);
+            assert!(
+                matches!(decision, McpPeerDowngradeDecision::Allowed),
+                "nothing known on any axis must be Allowed: {decision:?}"
+            );
+            assert!(
+                sbproxy_extension::mcp::peer_profile::peek("__default__", &peer_key).is_none(),
+                "the three-way bail must return before observe_and_record ever runs"
+            );
+        }
+
+        // Case 2: only a fresh protocol observation -> proceeds
+        // (records a baseline).
+        {
+            const SERVER: &str = "fix-round-3-bail-protocol-known";
+            let action = bail_test_action(SERVER);
+            let peer_key = action
+                .prefix_for(SERVER)
+                .expect("compiled prefix")
+                .peer_key
+                .clone();
+            action.federation.seed_server_observations_for_test(
+                HashMap::from([(
+                    SERVER.to_string(),
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+                )]),
+                HashMap::new(),
+            );
+            let decision = mcp_peer_downgrade_check(&action, &ctx, SERVER);
+            assert!(
+                matches!(decision, McpPeerDowngradeDecision::Allowed),
+                "a fresh protocol observation alone must proceed and allow first contact: {decision:?}"
+            );
+            assert!(
+                sbproxy_extension::mcp::peer_profile::peek("__default__", &peer_key).is_some(),
+                "a fresh protocol observation alone must let the check proceed and record a baseline"
+            );
+        }
+
+        // Case 3: only a fresh auth observation -> proceeds.
+        {
+            const SERVER: &str = "fix-round-3-bail-auth-known";
+            let action = bail_test_action(SERVER);
+            let peer_key = action
+                .prefix_for(SERVER)
+                .expect("compiled prefix")
+                .peer_key
+                .clone();
+            action.federation.seed_server_observations_for_test(
+                HashMap::new(),
+                HashMap::from([(SERVER.to_string(), true)]),
+            );
+            let decision = mcp_peer_downgrade_check(&action, &ctx, SERVER);
+            assert!(
+                matches!(decision, McpPeerDowngradeDecision::Allowed),
+                "a fresh auth observation alone must proceed and allow first contact: {decision:?}"
+            );
+            assert!(
+                sbproxy_extension::mcp::peer_profile::peek("__default__", &peer_key).is_some(),
+                "a fresh auth observation alone must let the check proceed and record a baseline"
+            );
+        }
+
+        // Case 4: only a pre-existing peer profile, no fresh
+        // observation on either axis this cycle -> proceeds.
+        {
+            const SERVER: &str = "fix-round-3-bail-profile-known";
+            let action = bail_test_action(SERVER);
+            let peer_key = action
+                .prefix_for(SERVER)
+                .expect("compiled prefix")
+                .peer_key
+                .clone();
+            let seeded = sbproxy_extension::mcp::peer_profile::observe_and_record(
+                "__default__",
+                &peer_key,
+                sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION,
+                false,
+                sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block,
+            );
+            assert_eq!(
+                seeded,
+                sbproxy_extension::mcp::peer_profile::ObservationVerdict::Allowed
+            );
+            // Deliberately no `seed_server_observations_for_test` call:
+            // both federation-level maps are empty for this server.
+            let decision = mcp_peer_downgrade_check(&action, &ctx, SERVER);
+            assert!(
+                matches!(decision, McpPeerDowngradeDecision::Allowed),
+                "an existing profile whose recorded signals match this (unobserved) cycle \
+                 must not itself be flagged: {decision:?}"
+            );
+        }
     }
 }
