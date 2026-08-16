@@ -1813,6 +1813,7 @@ spec:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
         let map = render_indices(&cfg, Path::new("."));
         assert!(map.contains_key(&CompactString::new("with.example.com")));

@@ -7797,6 +7797,7 @@ origins:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);

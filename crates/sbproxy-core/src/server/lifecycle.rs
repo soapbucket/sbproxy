@@ -5535,6 +5535,7 @@ origins:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
 
         install_op_redact_state(&compiled);
