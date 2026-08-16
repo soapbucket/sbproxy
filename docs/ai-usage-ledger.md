@@ -160,6 +160,46 @@ side of midnight UTC) or provider usage data that has not caught up yet
 (both OpenAI and Anthropic can lag by minutes), not evidence of
 anything wrong.
 
+### Example run
+
+The fixture this repository ships for its own tests,
+`crates/sbproxy-ai/tests/fixtures/openai-usage-export.json`, is a real
+OpenAI organization Usage API shape (with invented numbers) covering two
+days and three (day, model) rows. Running `reconcile` against a freshly
+created, empty ledger shows the report at its most stark: every
+provider-side row has nothing on the ledger side to match.
+
+```bash
+sbproxy ai ledger reconcile /var/lib/sbproxy/usage-ledger.ndjson \
+  --provider-export crates/sbproxy-ai/tests/fixtures/openai-usage-export.json \
+  --format openai-usage
+```
+
+```text
+usage ledger reconcile: /var/lib/sbproxy/usage-ledger.ndjson vs crates/sbproxy-ai/tests/fixtures/openai-usage-export.json (openai-usage)
+chain: verified (chain only, no signing seed given)
+rows compared: 3
+
+bypass evidence (provider export shows usage the ledger never recorded):
+  2026-06-24 gpt-4o                   47 request(s) unseen by the ledger (125500 token(s))
+  2026-06-24 gpt-4o-mini              210 request(s) unseen by the ledger (60500 token(s))
+  2026-06-25 gpt-4o-mini              63 request(s) unseen by the ledger (19300 token(s))
+  total: 320 request(s) unseen by the ledger
+
+ledger-only: none.
+
+This only proves bypass for usage visible to the provider org and API key that produced this export: a different org, project, or key would not appear here at all. Clock-window edges (the export's bucket boundary vs. the ledger's recorded_at) and key/org attribution differences can also put a row on one side only; treat a ledger-only row as a lead, not proof.
+```
+
+An empty ledger is the degenerate case: every provider row reads as
+bypass evidence because there is nothing on the ledger side to match it
+against. A ledger that has actually been recording usage would show
+real matches wherever the gateway saw the traffic, and bypass evidence
+only on the rows it didn't. Add `--strict` to make that distinction
+actionable: the command exits 1 the moment `bypass evidence` is
+non-empty, which is what a scheduled reconciliation job wants, rather
+than a first, exploratory run.
+
 ## Try it
 
 The runnable example is in

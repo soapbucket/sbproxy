@@ -16,7 +16,7 @@ provider and a proxy cannot own it.
 | LLM01 | Prompt Injection | Built-in and external input guardrails with streaming verdict parity; two-pass RAG screening; multipart requests are refused on JSON surfaces so a Content-Type cannot relabel past body inspection. The default detector is a substring heuristic; no injection model ships. | partial |
 | LLM02 | Sensitive Information Disclosure | Secret-regex plus field-key redaction on structured logs, access log lines, and request-event sinks; audit events carry digests of prompt-linked content, never the content; PII redaction policies on request/response bodies. DLP scans URI and headers only and never masks. | partial |
 | LLM03 | Excessive Agency | Tool scoping, entitlements, and per-credential model blocks are enforced at the MCP seam (see the MCP gateway docs); the model-call seam contributes credential containment and per-agent budgets. | partial |
-| LLM04 | Supply Chain | Upstream provider endpoints pass a default-deny, DNS-pinned egress authorizer, and every endpoint reached is inventoried with its authorization status. Weights: none ship; the model runtime pins artifacts by SHA-256 and verifies signatures. | partial |
+| LLM04 | Supply Chain | Every outbound destination the gateway reaches, across every wired egress purpose (AI providers, the dual-LLM quarantine judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks, and model and engine artifact downloads), passes a default-deny, DNS-pinned egress authorizer and is inventoried with its authorization status. Weights: none ship; the model runtime pins artifacts by SHA-256 and verifies signatures. | partial |
 | LLM05 | Model & Data Poisoning | Out of scope for hosted providers: a proxy cannot attest what a vendor trained on. | out of scope |
 | LLM06 | Misinformation | Out of scope as a correctness property. Shadow evaluation and judge-model routing exist but are not misinformation controls and are not claimed as such. | out of scope |
 | LLM07 | Unbounded Consumption | Budgets across seven scopes with block, log, or downgrade; per-agent token consumption charged on buffered and streamed responses; tenant-keyed request budgets on the serving path. Per-instance counters multiply the cap by replica count unless a shared store is configured, and a store outage degrades to per-instance enforcement (visible on `sbproxy_budget_share_fail_open_total`). GET and multipart surfaces do not debit token budgets. | partial |
@@ -51,19 +51,19 @@ it.
 6. **Telemetry does not leak the traffic it audits.** Prompt-linked
    audit carries digests and lengths; sinks run secret and field-key
    redaction; verbatim content is an explicit opt-in.
-7. **Provider-endpoint egress is inventoried.** Every AI provider
-   endpoint the gateway reaches is recorded with its authorization
-   status (allowed, denied, or ungated) and last-seen time, and is
-   readable from the admin API. Other egress purposes (token exchange,
-   MCP auth, artifacts, webhooks) pass the same authorizer but are not
-   yet inventoried. Traffic that never crosses the gateway is invisible
-   to it; the deployment recipe for making the gateway the only path is
-   part of the control, not an afterthought.
-8. **Change control is tamper-evident.** Security refusals and config
-   changes append to hash-chained, signed files that verify offline;
-   a chain that cannot open fails the boot; an append failure is a
-   non-ok outcome on the emit metric, so a quiet alert means an intact
-   trail rather than a broken sensor.
+7. **Egress is inventoried.** Every outbound destination the gateway
+   reaches, across every wired egress purpose, is recorded with its
+   authorization status (allowed, denied, or ungated) and last-seen
+   time, and is readable from the admin API. Traffic that never
+   crosses the gateway is invisible to it; the deployment recipe for
+   making the gateway the only path is part of the control, not an
+   afterthought.
+8. **Change control is tamper-evident.** Security, config, key, and
+   admin-action records each append, when the operator opts that
+   channel in, to their own hash-chained, signed file that verifies
+   offline; a chain that cannot open fails the boot; an append failure
+   is a non-ok outcome on the emit metric, so a quiet alert means an
+   intact trail rather than a broken sensor.
 
 ## Signals
 
@@ -74,4 +74,4 @@ it.
 | Tenant throttle | decision events | `sbproxy_rate_limit_total{workspace}`, `sbproxy_rate_limit_decisions_total{policy}` |
 | Policy panic | `security_audit` ERROR | `sbproxy_policy_panic_total{policy}` |
 | Egress sightings | `sbproxy::egress` WARN on refusal | `sbproxy_egress_refused_total`, inventory at `GET /api/egress` |
-| Audit chain health | `security_audit` / `config_audit` | `sbproxy_audit_emit_duration_seconds{outcome!="ok"}` |
+| Audit chain health | `security_audit` / `config_audit` / `key_audit` / `sbproxy::admin::audit` | `sbproxy_audit_emit_duration_seconds{channel, outcome!="ok"}` |

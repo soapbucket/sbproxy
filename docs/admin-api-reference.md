@@ -993,10 +993,11 @@ may call the route.
 
 The inventory is process-lifetime and in-memory: it clears on restart and
 is capped at 1,024 tracked destinations, after which a new destination
-stops being tracked while every already-tracked one keeps updating. Today
-the AI-provider egress gate is the only writer; other egress purposes
-(token exchange, MCP auth, artifacts, webhooks) pass the same authorizer
-but are not yet inventoried here.
+stops being tracked while every already-tracked one keeps updating. Every
+wired egress purpose writes here: AI providers, the dual-LLM quarantine
+judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
+and model and engine artifact downloads. `mcp_upstream` is a reserved
+purpose label with no production call site yet, so it never appears.
 
 | Status | When |
 |---|---|

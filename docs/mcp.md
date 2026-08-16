@@ -365,7 +365,7 @@ success.
 | `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
 | `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
 | `token_compaction` | object | unset | Opt-in compaction for large MCP text result blocks. |
-| `dual_llm_quarantine` | object | unset | Opt-in dual-LLM judge quarantine for untrusted MCP text result blocks (`enabled`, `endpoint`, optional `model` / `timeout`). Fail closed; reason-code only. |
+| `dual_llm_quarantine` | object | unset | Opt-in dual-LLM judge quarantine for untrusted MCP text result blocks (`enabled`, `endpoint`, optional `model` / `timeout` / `egress`). Fail closed; reason-code only. `egress` is an allowlist scoped to the judge endpoint alone (same shape as `federated_servers[].egress`); omitted, the judge call is ungated but still recorded in the egress inventory. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
 | `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogs. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
 | `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
 | `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |

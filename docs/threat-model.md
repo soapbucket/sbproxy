@@ -1,6 +1,6 @@
 # SBproxy threat model
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-16*
 
 This is the threat-model companion to [`operator-runbook.md`](operator-runbook.md).
 It records the operator-facing assumptions that should be revisited at the end
@@ -110,6 +110,35 @@ of each implementation wave.
   operator-facing `proxy.egress` configuration exists and someone is
   actually running these gates in enforce mode; today no production
   configuration attaches an authorizer to any of the four.
+- **Egress bypass detection:** the gateway enforces nothing on traffic
+  that does not reach it. A caller with direct network access to an AI
+  provider that skips the proxy entirely is invisible to every egress
+  control above: the authorizer, the DNS pinning, the per-purpose
+  inventory. None of it sees a request it was never handed. Closing
+  that gap is a deployment decision, not something SBproxy configures
+  for you, and three things help. A network egress policy (a
+  Kubernetes NetworkPolicy, a cloud security group, a host firewall
+  rule) that permits outbound HTTPS to AI provider hosts only from the
+  gateway's own network identity, and refuses it from the workloads
+  that are supposed to call the gateway instead, forces that traffic
+  across a boundary the gateway can see. An outer forward proxy in
+  front of the gateway, or any other independent egress choke point,
+  adds a second control that does not share the gateway's own blind
+  spots. Provider-side key restrictions, most AI providers let an API
+  key be scoped to an origin IP or a project, mean a leaked credential
+  or a bypassed network policy still cannot reach the provider from
+  anywhere but the gateway's own address.
+
+  What SBproxy adds is detection after the fact. `sbproxy ai ledger
+  reconcile` compares the gateway's own usage ledger against a usage
+  export downloaded directly from the provider, per day and model, and
+  flags provider-billed usage the ledger never recorded, exactly the
+  shape a bypass leaves behind. It proves nothing about traffic under a
+  different provider organization, project, or key, and a ledger-only
+  row is a lead rather than proof: clock-window edges between the
+  export's bucket boundary and the ledger's own timestamp produce the
+  same shape. See
+  [ai-usage-ledger.md](ai-usage-ledger.md#reconciling-against-a-provider-export).
 - **Agent Skills v0.2.0:** every artifact `GET` re-hashes the served
   body and compares to the manifest digest. A mismatch returns 503 with a
   generic "service unavailable" body and emits an `agent_skill.digest_mismatch`
