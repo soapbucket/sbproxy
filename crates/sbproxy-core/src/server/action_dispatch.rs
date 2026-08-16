@@ -3575,8 +3575,10 @@ pub(super) async fn handle_mcp_action(
                             // governance evidence event naming the
                             // resolved server before returning their
                             // refusal.
-                            let governed_server =
-                                federated.as_ref().map(|t| t.server_name.as_str()).unwrap_or("unknown");
+                            let governed_server = federated
+                                .as_ref()
+                                .map(|t| t.server_name.as_str())
+                                .unwrap_or("unknown");
                             if denied_by_rbac {
                                 tracing::warn!(
                                     target: "sbproxy::mcp::rbac",
@@ -4039,9 +4041,9 @@ pub(super) async fn handle_mcp_action(
                                 // independently redacting and hashing
                                 // the same tool-argument bytes under the
                                 // same salt.
-                                let tool_arguments_hash = mcp_audit_capture
-                                    .as_ref()
-                                    .map(|cap| sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json)));
+                                let tool_arguments_hash = mcp_audit_capture.as_ref().map(|cap| {
+                                    sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json))
+                                });
 
                                 // WOR-1644: attribute the call into the
                                 // usage plane. Metrics always fire;

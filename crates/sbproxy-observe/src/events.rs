@@ -476,7 +476,10 @@ mod tests {
             (EventType::BudgetExceeded, "\"budget_exceeded\""),
             (EventType::GuardrailTriggered, "\"guardrail_triggered\""),
             (EventType::ConfigReloaded, "\"config_reloaded\""),
-            (EventType::McpGovernanceDecision, "\"mcp_governance_decision\""),
+            (
+                EventType::McpGovernanceDecision,
+                "\"mcp_governance_decision\"",
+            ),
         ];
 
         for (variant, expected) in variants {
