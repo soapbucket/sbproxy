@@ -259,6 +259,10 @@ impl DecisionEvent {
             // ai.guardrail.*: ai_dispatch.rs, the input and output
             // guardrail funnels.
             // mcp.tool: action_dispatch.rs `emit_mcp_tool_attribution`.
+            // ai.tool_call: ai_dispatch.rs `handle_verdicts`, one record
+            // per judged streamed tool call. Bounded by tool calls
+            // rather than chunks, which is what separates it from
+            // ai.stream.event.
             // Each is a funnel rather than a scattering of call sites,
             // which is what makes these arms honest: wiring some sites
             // and not others would silence the startup warning while
@@ -272,8 +276,8 @@ impl DecisionEvent {
             | Self::McpTool => EventCoverage::Emitted,
             // Published as `policy` records already; see the doc above.
             Self::Waf | Self::RateLimit => EventCoverage::SupersededByPolicy,
+            Self::AiToolCall => EventCoverage::Emitted,
             Self::Policy
-            | Self::AiToolCall
             | Self::AiStreamEvent
             | Self::AiClose
             | Self::AiFailure
@@ -968,6 +972,21 @@ impl DecisionDetails {
         }
     }
 
+    /// Detail for one judged streamed tool call.
+    ///
+    /// `verdict` is the guard's own word (`clean`, `blocked`,
+    /// `flagged`) rather than the record outcome, because flag mode
+    /// leaves the stream untouched while still recording a judgement an
+    /// analyst wants to count. Collapsing it into the outcome would
+    /// make "the guard disagreed but we shipped it anyway" unreadable.
+    pub fn ai_tool_call(tool: &str, verdict: &str) -> Self {
+        Self {
+            tool: (!tool.is_empty()).then(|| tool.to_owned()),
+            verdict: (!verdict.is_empty()).then(|| verdict.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Detail for an AI guardrail decision.
     ///
     /// `guardrail` names the one that blocked, and is absent on an
@@ -1386,6 +1405,7 @@ mod tests {
                 "route.decide",
                 "ai.guardrail.input",
                 "ai.guardrail.output",
+                "ai.tool_call",
                 "mcp.tool"
             ],
             "the wired set changed; update has_emitter and the docs that state coverage"
