@@ -49,7 +49,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
 | `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
-| `policies[] type: rego`, fields `module` + `query` (+ optional `data`) | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message`; `data` is a JSON object the rule reads as `data.<key>` |
+| `policies[] type: rego`, fields `module` or `module_path` + `query` (+ optional `data`, `rego_v0`) | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message`; `data` is a JSON object the rule reads as `data.<key>` |
 | `forward_rules[].rules[].when` | CEL | Boolean predicate over the arriving request; an evaluation error means the rule does not match |
 | `observability.log.custom_fields[]` with `engine: lua` or `engine: js` | Lua or JavaScript | Returns the value of one operator-defined access-log field |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
@@ -586,6 +586,41 @@ Everything fails closed, at the earliest point it can be detected:
 ### One OPA divergence worth knowing
 
 Builtin errors are strict here. Upstream OPA treats a builtin error as `undefined` and moves on; Regorus propagates it, and this surface turns it into a denial. A policy that leans on that forgiveness upstream, for example calling `net.cidr_contains` on a header that is sometimes not a CIDR, works on OPA and denies here. Guard the input first, or accept the deny.
+
+### `module_path`: a `.rego` file instead of an inline string
+
+`module` and `module_path` are mutually exclusive; exactly one must be set. `module_path` is a filesystem path to a `.rego` file, read once when the config compiles (and again on every reload, since a reload recompiles the whole config), resolved relative to the proxy's working directory. It exists for the same reason `transforms[] type: wasm`'s `module_path` does: real policy lives in source control as its own file, not pasted into a YAML block scalar.
+
+```yaml
+policies:
+  - type: rego
+    module_path: /etc/sbproxy/policies/authz.rego
+    query: data.sbproxy.allow
+```
+
+The loaded text feeds the same compile path an inline `module` does, so everything above (base data, failure posture, the OPA divergence) applies identically either way.
+
+### `rego_v0`: pre-OPA-1.0 syntax
+
+Regorus, like current OPA, defaults to Rego v1: rule bodies require `if`, and multi-value rules require `contains`. A module written before OPA 1.0 (November 2024) uses the older syntax, `allow { ... }` with no `if`, and fails to parse under the default. `rego_v0: true` (default `false`) calls Regorus's own v0 compatibility switch before parsing, so that module compiles unchanged:
+
+```yaml
+policies:
+  - type: rego
+    rego_v0: true
+    module: |
+      package sbproxy
+
+      allow {
+        input.request.method == "GET"
+      }
+```
+
+Reach for it to run a policy pasted from an older OPA install rather than rewriting it; a module authored fresh should use `if`/`contains` and leave the flag at its default.
+
+### `print()` capture
+
+A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior for every `policy: rego` and every `ai_routing_policy` `engine: rego`.
 
 ---
 
