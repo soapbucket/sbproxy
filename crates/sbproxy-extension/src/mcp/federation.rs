@@ -17,7 +17,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
+use super::concealed_text::{concealment_classes, ConcealmentClass};
 use super::egress::{EgressPolicy, SystemHostResolver};
+use super::poisoned_text::{poison_indicators, PoisonIndicator};
 use super::protocol::{
     compile_modern_tool_contract, CompiledMcpToolContract, McpContractError, McpSchemaLimits,
     McpToolContract,
@@ -529,11 +531,6 @@ fn modern_incompatibility_change(
     })
 }
 
-/// Diff incompatible entries by stable catalog identity, not aggregate count.
-/// The result is sorted and capped so a hostile catalog cannot amplify logs.
-use super::concealed_text::{concealment_classes, ConcealmentClass};
-use super::poisoned_text::{poison_indicators, PoisonIndicator};
-
 /// Map a stored indicator label back to the `&'static str` the metric takes.
 fn poison_indicator_label(label: &str) -> &'static str {
     match label {
@@ -632,7 +629,7 @@ fn poison_indicator_findings(tool: &FederatedTool) -> Vec<(&'static str, Vec<Poi
 fn poison_indicator_changes(
     previous: &HashMap<String, FederatedTool>,
     next: &HashMap<String, FederatedTool>,
-) -> Vec<ConcealedTextChange> {
+) -> AdvertisedTextChanges {
     advertised_text_changes(previous, next, |tool| {
         poison_indicator_findings(tool)
             .into_iter()
@@ -652,7 +649,7 @@ fn poison_indicator_changes(
 fn concealed_text_changes(
     previous: &HashMap<String, FederatedTool>,
     next: &HashMap<String, FederatedTool>,
-) -> Vec<ConcealedTextChange> {
+) -> AdvertisedTextChanges {
     advertised_text_changes(previous, next, |tool| {
         concealed_text_findings(tool)
             .into_iter()
@@ -662,6 +659,47 @@ fn concealed_text_changes(
             })
             .collect()
     })
+}
+
+/// Cap on advertised-text change records carried out of one refresh.
+///
+/// Every record becomes a log line, and how many tools a federated catalog
+/// holds is upstream's choice rather than ours: a response that fits inside
+/// `max_response_bytes` still has room for tens of thousands of minimal
+/// tools, and each of those can contribute a record per field. An upstream
+/// that alternates a concealing character to keep the digest moving would
+/// otherwise write that many lines on every refresh interval, forever.
+///
+/// Past this many records the refresh reports how many it dropped instead of
+/// writing them out, which also means the metric stops counting there. That
+/// is the trade the bound buys, and it is the right way round: what an
+/// operator alerts on is that concealed text showed up at all, and a
+/// truncated report still says so.
+const MAX_ADVERTISED_TEXT_CHANGE_EVENTS: usize = 64;
+
+/// Advertised-text change records for one refresh, bounded for logging.
+#[derive(Default)]
+struct AdvertisedTextChanges {
+    /// Records to report, at most [`MAX_ADVERTISED_TEXT_CHANGE_EVENTS`].
+    records: Vec<ConcealedTextChange>,
+    /// Records the cap dropped, reported as a count so a truncated report
+    /// cannot read as a complete one.
+    suppressed: usize,
+}
+
+impl AdvertisedTextChanges {
+    fn push(&mut self, change: ConcealedTextChange) {
+        if self.records.len() < MAX_ADVERTISED_TEXT_CHANGE_EVENTS {
+            self.records.push(change);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.suppressed == 0
+    }
 }
 
 /// Diff per-field findings for every tool across two publications.
@@ -674,12 +712,12 @@ fn advertised_text_changes(
     previous: &HashMap<String, FederatedTool>,
     next: &HashMap<String, FederatedTool>,
     describe: impl Fn(&FederatedTool) -> Vec<(&'static str, String)>,
-) -> Vec<ConcealedTextChange> {
+) -> AdvertisedTextChanges {
     let mut identities: Vec<&String> = previous.keys().chain(next.keys()).collect();
     identities.sort_unstable();
     identities.dedup();
 
-    let mut changes = Vec::new();
+    let mut changes = AdvertisedTextChanges::default();
     for identity in identities {
         let before = previous.get(identity).map(&describe).unwrap_or_default();
         let after = next.get(identity).map(&describe).unwrap_or_default();
@@ -722,6 +760,8 @@ fn advertised_text_changes(
     changes
 }
 
+/// Diff incompatible entries by stable catalog identity, not aggregate count.
+/// The result is sorted and capped so a hostile catalog cannot amplify logs.
 fn modern_incompatibility_changes(
     previous: &HashMap<String, FederatedTool>,
     next: &HashMap<String, FederatedTool>,
@@ -1389,7 +1429,7 @@ impl McpFederation {
             // rather than refused: reporting changes no bytes on the wire, so
             // it is safe to run for every deployment, and what to do about a
             // finding is the operator's call.
-            for change in &concealed_changes {
+            for change in &concealed_changes.records {
                 for class in change.classes.split(',').filter(|c| !c.is_empty()) {
                     sbproxy_observe::metrics::record_mcp_concealed_text_finding(
                         change.field,
@@ -1407,10 +1447,18 @@ impl McpFederation {
                     "MCP advertised tool text conceals content from a reader"
                 );
             }
+            if concealed_changes.suppressed > 0 {
+                warn!(
+                    target: "sbproxy::mcp::catalog",
+                    emitted = concealed_changes.records.len(),
+                    suppressed = concealed_changes.suppressed,
+                    "MCP concealed-text report truncated for this refresh"
+                );
+            }
             // Static indicators, reported and never enforced. See
             // `poisoned_text` for why detection is a signal here rather than
             // a boundary.
-            for change in &poison_changes {
+            for change in &poison_changes.records {
                 for indicator in change.classes.split(',').filter(|c| !c.is_empty()) {
                     sbproxy_observe::metrics::record_mcp_poison_indicator(
                         change.field,
@@ -1426,6 +1474,14 @@ impl McpFederation {
                     tool = %change.tool,
                     server = %change.server,
                     "MCP advertised tool text carries a poisoning indicator"
+                );
+            }
+            if poison_changes.suppressed > 0 {
+                warn!(
+                    target: "sbproxy::mcp::catalog",
+                    emitted = poison_changes.records.len(),
+                    suppressed = poison_changes.suppressed,
+                    "MCP poisoning-indicator report truncated for this refresh"
                 );
             }
             if let Some(classes) = incompatibility_summary {
@@ -4260,6 +4316,7 @@ mod tests {
 
         let appearing = concealed_text_changes(&clean_registry, &poisoned_registry);
         let mut seen: Vec<(&str, &str, &str)> = appearing
+            .records
             .iter()
             .map(|change| (change.kind, change.field, change.classes.as_str()))
             .collect();
@@ -4278,8 +4335,11 @@ mod tests {
 
         // And it says so when the upstream cleans up.
         let cleared = concealed_text_changes(&poisoned_registry, &clean_registry);
-        assert!(cleared.iter().all(|change| change.kind == "cleared"));
-        assert_eq!(cleared.len(), 2);
+        assert!(cleared
+            .records
+            .iter()
+            .all(|change| change.kind == "cleared"));
+        assert_eq!(cleared.records.len(), 2);
     }
 
     #[test]
@@ -4298,17 +4358,50 @@ mod tests {
         poisoned_registry.insert("search".to_string(), poisoned);
 
         let appearing = poison_indicator_changes(&clean_registry, &poisoned_registry);
-        assert_eq!(appearing.len(), 1);
-        assert_eq!(appearing[0].kind, "added");
-        assert_eq!(appearing[0].field, "description");
-        assert_eq!(appearing[0].classes, "credential_path,model_directive");
+        assert_eq!(appearing.records.len(), 1);
+        assert_eq!(appearing.records[0].kind, "added");
+        assert_eq!(appearing.records[0].field, "description");
+        assert_eq!(
+            appearing.records[0].classes,
+            "credential_path,model_directive"
+        );
 
         // Unchanged on the next refresh, so nothing new to say.
         assert!(poison_indicator_changes(&poisoned_registry, &poisoned_registry).is_empty());
 
         let cleared = poison_indicator_changes(&poisoned_registry, &clean_registry);
-        assert_eq!(cleared.len(), 1);
-        assert_eq!(cleared[0].kind, "cleared");
+        assert_eq!(cleared.records.len(), 1);
+        assert_eq!(cleared.records[0].kind, "cleared");
+    }
+
+    #[test]
+    fn a_hostile_catalog_cannot_amplify_the_concealed_text_report() {
+        // How many tools an upstream advertises is the upstream's choice, so
+        // the report has to hold whatever it is handed. Each of these hides a
+        // character in its description, which is one record apiece, and the
+        // refresh must still write a bounded number of lines.
+        let hidden = "\u{e0041}";
+        let mut clean_registry = HashMap::new();
+        let mut poisoned_registry = HashMap::new();
+        for index in 0..(MAX_ADVERTISED_TEXT_CHANGE_EVENTS * 4) {
+            let name = format!("search_{index}");
+            clean_registry.insert(
+                name.clone(),
+                prepared_tool(full_tool_document(&name), "alpha", &name),
+            );
+            let mut document = full_tool_document(&name);
+            document["description"] = json!(format!("Search repositories{hidden}"));
+            poisoned_registry.insert(name.clone(), prepared_tool(document, "alpha", &name));
+        }
+
+        let appearing = concealed_text_changes(&clean_registry, &poisoned_registry);
+        assert_eq!(appearing.records.len(), MAX_ADVERTISED_TEXT_CHANGE_EVENTS);
+        // The count of what was dropped is the part that keeps a truncated
+        // report from reading like a complete one.
+        assert_eq!(
+            appearing.suppressed,
+            MAX_ADVERTISED_TEXT_CHANGE_EVENTS * 4 - MAX_ADVERTISED_TEXT_CHANGE_EVENTS
+        );
     }
 
     #[test]
