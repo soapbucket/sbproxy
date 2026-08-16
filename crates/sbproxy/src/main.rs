@@ -6207,10 +6207,15 @@ struct RegoTestFixture {
     /// Inline Rego source. Mutually exclusive with `module_path`.
     #[serde(default)]
     module: Option<String>,
-    /// A `.rego` file to load. Resolved the same way `policies[] type:
-    /// rego`'s own `module_path` is: relative to the process's current
-    /// working directory, read fresh on every run. Mutually exclusive
-    /// with `module`.
+    /// A `.rego` file to load. A relative path resolves against the
+    /// directory containing THIS fixture file, not the process's
+    /// current working directory (unlike `policies[] type: rego`'s own
+    /// `module_path`, which is CLI/process relative), so a fixture
+    /// swept from a directory tree can colocate its module beside it
+    /// (`policies/authz/policy_test.yaml` naming `module_path:
+    /// policy.rego`) instead of depending on where `sbproxy rego test`
+    /// happened to be invoked from. An absolute path is used as-is.
+    /// Read fresh on every run. Mutually exclusive with `module`.
     #[serde(default)]
     module_path: Option<String>,
     /// The rule reference evaluated for every case in this file.
@@ -6288,6 +6293,22 @@ fn discover_rego_test_fixtures(path: &std::path::Path) -> anyhow::Result<Vec<Pat
     Ok(fixtures)
 }
 
+/// Resolve a fixture's `module_path` against the directory containing
+/// the fixture file that named it, not the process's current working
+/// directory, so a fixture found by a recursive directory sweep can
+/// colocate its module beside it regardless of where `sbproxy rego
+/// test` was invoked from.
+///
+/// An absolute `relative` passes through unchanged: `Path::join`
+/// already discards the base when the joined path is absolute, so this
+/// only documents that behavior rather than special-casing it.
+fn resolve_fixture_relative_path(fixture_path: &std::path::Path, relative: &str) -> PathBuf {
+    match fixture_path.parent() {
+        Some(parent) => parent.join(relative),
+        None => PathBuf::from(relative),
+    }
+}
+
 #[derive(serde::Serialize, Debug)]
 struct RegoTestCaseOutput {
     fixture: String,
@@ -6306,6 +6327,18 @@ struct RegoTestCoverageOutput {
     percent: f64,
 }
 
+/// A fixture that never produced case or coverage results at all: an
+/// unreadable path, malformed YAML, a `module`/`module_path` conflict
+/// or omission, no `cases`, a non-positive `budget_ms`, or a module
+/// that failed to compile. Kept distinct from a case whose `expect`
+/// disagreed with the actual result, which is a verdict the fixture
+/// DID produce; see [`run_one_fixture`].
+#[derive(serde::Serialize, Debug)]
+struct RegoTestFixtureError {
+    fixture: String,
+    error: String,
+}
+
 #[derive(serde::Serialize, Debug)]
 struct RegoTestOutput {
     schema_version: u32,
@@ -6318,117 +6351,199 @@ struct RegoTestOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     min_coverage: Option<f64>,
     coverage_ok: bool,
+    errors: Vec<RegoTestFixtureError>,
 }
 
-/// Run every case in `fixture_paths` and gather coverage, without
-/// printing anything or deciding an exit code.
+impl RegoTestOutput {
+    /// The process exit code this result implies. Fixture errors take
+    /// precedence over case/coverage verdicts: a batch with one broken
+    /// fixture and nine failing cases is still `2`, since a fixture
+    /// that never ran cannot also be counted as a case failure.
+    ///
+    /// * `2` - at least one fixture itself was unusable (a config/IO
+    ///   class fault; see [`RegoTestFixtureError`]).
+    /// * `1` - every fixture ran, but a case disagreed with `expect`
+    ///   or `--min-coverage` was not met.
+    /// * `0` - every fixture ran, every case passed, and coverage (if
+    ///   checked) cleared the threshold.
+    fn exit_code(&self) -> i32 {
+        if !self.errors.is_empty() {
+            2
+        } else if self.failed != 0 || !self.coverage_ok {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// One fixture's case and coverage results, before they are folded
+/// into the batch-wide [`RegoTestOutput`]. Not serialized on its own;
+/// exists only so [`run_rego_tests`] can isolate a per-fixture fault
+/// (see [`run_one_fixture`]) without discarding what already ran.
+struct RegoTestFixtureRun {
+    cases: Vec<RegoTestCaseOutput>,
+    coverage: Vec<RegoTestCoverageOutput>,
+    failed: usize,
+}
+
+/// Run every case in one fixture file.
 ///
-/// Split out from [`handle_rego_test`] so the pass/fail/coverage
-/// verdict is a plain value a test can assert on directly, rather than
-/// something only observable by capturing this process's stdout.
+/// Isolated from [`run_rego_tests`] so a fault specific to this
+/// fixture - an unreadable path, malformed YAML, a `module`/
+/// `module_path` conflict or omission, no `cases`, a non-positive
+/// `budget_ms`, or a module that fails to compile - is a single `Err`
+/// the caller records against this fixture and moves past, rather than
+/// a `?` that would discard every other fixture's results too.
 ///
 /// # Errors
 ///
-/// Returns an error for a usage or fixture-authoring fault: an
-/// unreadable path, a fixture that does not parse, or a module that
-/// does not compile. A fixture whose cases run cleanly but disagree
-/// with `expect` is not an error; it is reflected in the returned
-/// `failed` count and each case's `status`.
+/// Returns an error naming what about the fixture itself is broken.
+/// Never returns an error for a case that ran but disagreed with
+/// `expect`; that is reflected in the returned `failed` count and each
+/// case's `status` instead.
+fn run_one_fixture(
+    fixture_path: &std::path::Path,
+    fixture_label: &str,
+) -> anyhow::Result<RegoTestFixtureRun> {
+    let bytes =
+        read_bounded_cli_file(fixture_path, MAX_REGO_TEST_FIXTURE_BYTES, "rego test fixture")?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|error| anyhow::anyhow!("not UTF-8: {error}"))?;
+    let fixture: RegoTestFixture =
+        serde_yaml::from_str(text).map_err(|error| anyhow::anyhow!("{error}"))?;
+    anyhow::ensure!(!fixture.cases.is_empty(), "has no `cases`; nothing to run");
+    // Mirrors `RegoPolicy::new`'s own refusal
+    // (`crates/sbproxy-modules/src/policy/rego.rs`): without this, a
+    // zero budget reaches `CompiledRego::compile`'s load-time trial
+    // evaluation and dies there with a "semantic fault" message that
+    // has nothing to do with the module's actual logic.
+    anyhow::ensure!(
+        fixture.budget_ms > 0,
+        "budget_ms must be greater than zero; a zero budget would refuse every case \
+         before it ran"
+    );
+
+    let (module, site) = match (&fixture.module, &fixture.module_path) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "set either `module` (inline Rego source) or `module_path` (a path to a .rego \
+             file), not both"
+        ),
+        (None, None) => anyhow::bail!(
+            "needs `module` (inline Rego source) or `module_path` (a path to a .rego file)"
+        ),
+        (Some(module), None) => (module.clone(), fixture_label.to_owned()),
+        (None, Some(path)) => {
+            let resolved = resolve_fixture_relative_path(fixture_path, path);
+            let module = std::fs::read_to_string(&resolved).map_err(|error| {
+                anyhow::anyhow!("loading module from {}: {error}", resolved.display())
+            })?;
+            (module, path.trim_end_matches(".rego").to_owned())
+        }
+    };
+
+    let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
+        site,
+        &module,
+        fixture.query.clone(),
+        fixture.budget_ms,
+        fixture.data.clone(),
+        fixture.rego_v0,
+    )?;
+    compiled.set_enable_coverage(true);
+
+    let mut cases = Vec::new();
+    let mut failed = 0usize;
+    for case in &fixture.cases {
+        match compiled.eval_value(case.input.clone(), "") {
+            Ok(actual) if actual == case.expect => {
+                cases.push(RegoTestCaseOutput {
+                    fixture: fixture_label.to_owned(),
+                    case: case.name.clone(),
+                    status: "pass",
+                    detail: None,
+                });
+            }
+            Ok(actual) => {
+                failed += 1;
+                cases.push(RegoTestCaseOutput {
+                    fixture: fixture_label.to_owned(),
+                    case: case.name.clone(),
+                    status: "fail",
+                    detail: Some(format!("expected {}, got {actual}", case.expect)),
+                });
+            }
+            Err(error) => {
+                failed += 1;
+                cases.push(RegoTestCaseOutput {
+                    fixture: fixture_label.to_owned(),
+                    case: case.name.clone(),
+                    status: "fail",
+                    detail: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    let report = compiled.coverage_report()?;
+    let coverage = report
+        .into_iter()
+        .map(|file| RegoTestCoverageOutput {
+            fixture: fixture_label.to_owned(),
+            path: file.path,
+            covered_lines: file.covered.len(),
+            not_covered_lines: file.not_covered,
+            percent: file.percent(),
+        })
+        .collect();
+
+    Ok(RegoTestFixtureRun {
+        cases,
+        coverage,
+        failed,
+    })
+}
+
+/// Run every fixture in `fixture_paths` and gather coverage, without
+/// printing anything or deciding an exit code.
+///
+/// Split out from [`handle_rego_test`] so the pass/fail/coverage/error
+/// verdict is a plain value a test can assert on directly, rather than
+/// something only observable by capturing this process's stdout. Each
+/// fixture runs through [`run_one_fixture`] independently: one broken
+/// fixture is recorded in the returned value's `errors` and the sweep
+/// continues, rather than aborting every other fixture's results.
+///
+/// # Errors
+///
+/// Returns an error only for a fault in the sweep itself, which cannot
+/// happen today - a per-fixture fault is caught by [`run_one_fixture`]
+/// and never propagates past this function. Kept `Result` because
+/// every other handler in this file returns one and a caller should
+/// not have to special-case this one if that ever changes.
 fn run_rego_tests(
     fixture_paths: &[PathBuf],
     min_coverage: Option<f64>,
 ) -> anyhow::Result<RegoTestOutput> {
     let mut cases = Vec::new();
     let mut coverage = Vec::new();
+    let mut errors = Vec::new();
     let mut failed = 0usize;
 
     for fixture_path in fixture_paths {
         let fixture_label = fixture_path.display().to_string();
-        let bytes = read_bounded_cli_file(
-            fixture_path,
-            MAX_REGO_TEST_FIXTURE_BYTES,
-            "rego test fixture",
-        )?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| anyhow::anyhow!("{fixture_label}: not UTF-8: {error}"))?;
-        let fixture: RegoTestFixture = serde_yaml::from_str(text)
-            .map_err(|error| anyhow::anyhow!("{fixture_label}: {error}"))?;
-        anyhow::ensure!(
-            !fixture.cases.is_empty(),
-            "{fixture_label}: has no `cases`; nothing to run"
-        );
-
-        let (module, site) = match (&fixture.module, &fixture.module_path) {
-            (Some(_), Some(_)) => anyhow::bail!(
-                "{fixture_label}: set either `module` (inline Rego source) or `module_path` \
-                 (a path to a .rego file), not both"
-            ),
-            (None, None) => anyhow::bail!(
-                "{fixture_label}: needs `module` (inline Rego source) or `module_path` (a path \
-                 to a .rego file)"
-            ),
-            (Some(module), None) => (module.clone(), fixture_label.clone()),
-            (None, Some(path)) => {
-                let module = std::fs::read_to_string(path).map_err(|error| {
-                    anyhow::anyhow!("{fixture_label}: loading module from {path}: {error}")
-                })?;
-                (module, path.trim_end_matches(".rego").to_owned())
+        match run_one_fixture(fixture_path, &fixture_label) {
+            Ok(run) => {
+                failed += run.failed;
+                cases.extend(run.cases);
+                coverage.extend(run.coverage);
             }
-        };
-
-        let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
-            site,
-            &module,
-            fixture.query.clone(),
-            fixture.budget_ms,
-            fixture.data.clone(),
-            fixture.rego_v0,
-        )
-        .map_err(|error| anyhow::anyhow!("{fixture_label}: {error}"))?;
-        compiled.set_enable_coverage(true);
-
-        for case in &fixture.cases {
-            match compiled.eval_value(case.input.clone(), "") {
-                Ok(actual) if actual == case.expect => {
-                    cases.push(RegoTestCaseOutput {
-                        fixture: fixture_label.clone(),
-                        case: case.name.clone(),
-                        status: "pass",
-                        detail: None,
-                    });
-                }
-                Ok(actual) => {
-                    failed += 1;
-                    cases.push(RegoTestCaseOutput {
-                        fixture: fixture_label.clone(),
-                        case: case.name.clone(),
-                        status: "fail",
-                        detail: Some(format!("expected {}, got {actual}", case.expect)),
-                    });
-                }
-                Err(error) => {
-                    failed += 1;
-                    cases.push(RegoTestCaseOutput {
-                        fixture: fixture_label.clone(),
-                        case: case.name.clone(),
-                        status: "fail",
-                        detail: Some(error.to_string()),
-                    });
-                }
+            Err(error) => {
+                errors.push(RegoTestFixtureError {
+                    fixture: fixture_label,
+                    error: error.to_string(),
+                });
             }
-        }
-
-        let report = compiled
-            .coverage_report()
-            .map_err(|error| anyhow::anyhow!("{fixture_label}: coverage report: {error}"))?;
-        for file in report {
-            coverage.push(RegoTestCoverageOutput {
-                fixture: fixture_label.clone(),
-                path: file.path.clone(),
-                covered_lines: file.covered.len(),
-                not_covered_lines: file.not_covered.clone(),
-                percent: file.percent(),
-            });
         }
     }
 
@@ -6456,6 +6571,7 @@ fn run_rego_tests(
         coverage_percent,
         min_coverage,
         coverage_ok,
+        errors,
     })
 }
 
@@ -6472,12 +6588,15 @@ fn run_rego_tests(
 ///
 /// # Errors
 ///
-/// Returns an error for a usage or fixture-authoring fault: an
-/// unreadable path, a fixture that does not parse, or a module that
-/// does not compile. A fixture whose cases run cleanly but disagree
-/// with `expect`, or whose coverage misses `--min-coverage`, is not an
-/// error; it is `Ok(1)`, the same "the check ran and reported a
-/// verdict" shape `audit verify` uses.
+/// Returns an error only when nothing could be discovered or run at
+/// all: an unreadable `path`, or a directory with no `*_test.yaml` /
+/// `*_test.yml` fixtures in it. A fault specific to one discovered
+/// fixture (unreadable, malformed, a bad `module`/`module_path`
+/// pairing, no cases, a non-positive `budget_ms`, or a module that
+/// fails to compile) does not propagate as an `Err`: it is recorded
+/// against that fixture and the sweep continues, which is why the
+/// exit code carries three states rather than two - see
+/// `RegoTestOutput::exit_code`.
 fn handle_rego_test(args: &RegoTestArgs) -> anyhow::Result<i32> {
     let fixture_paths = discover_rego_test_fixtures(&args.path)?;
     if fixture_paths.is_empty() {
@@ -6501,6 +6620,9 @@ fn handle_rego_test(args: &RegoTestArgs) -> anyhow::Result<i32> {
                     None => println!("PASS {} :: {}", case.fixture, case.case),
                 }
             }
+            for error in &output.errors {
+                println!("ERROR {}: {}", error.fixture, error.error);
+            }
             for row in &output.coverage {
                 let missed = if row.not_covered_lines.is_empty() {
                     String::new()
@@ -6521,17 +6643,16 @@ fn handle_rego_test(args: &RegoTestArgs) -> anyhow::Result<i32> {
                 None => String::new(),
             };
             println!(
-                "{} passed, {} failed, {:.1}% total coverage{threshold}",
-                output.passed, output.failed, output.coverage_percent
+                "{} passed, {} failed, {} errored, {:.1}% total coverage{threshold}",
+                output.passed,
+                output.failed,
+                output.errors.len(),
+                output.coverage_percent
             );
         }
     }
 
-    Ok(if output.failed == 0 && output.coverage_ok {
-        0
-    } else {
-        1
-    })
+    Ok(output.exit_code())
 }
 
 // --- `--locked` serve-time lockfile enforcement (WOR-1864) ---
@@ -14008,6 +14129,245 @@ cases:
             vec![fixture_path],
             "only the *_test.yaml file must be discovered, found recursively"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- fix round 1 (review findings) ---
+
+    const COLOCATED_MODULE_SOURCE: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    input.request.method == "GET"
+}
+"#;
+
+    const COLOCATED_MODULE_PATH_FIXTURE: &str = r#"
+module_path: policy.rego
+cases:
+  - name: get is allowed
+    input:
+      request:
+        method: GET
+    expect: true
+  - name: post is denied
+    input:
+      request:
+        method: POST
+    expect: false
+"#;
+
+    #[test]
+    fn rego_test_module_path_resolves_against_the_fixture_directory_not_the_cwd() {
+        // Finding 1: a bare `module_path: policy.rego` in a fixture
+        // discovered by a directory sweep must resolve against the
+        // fixture's OWN directory. The process's real cwd (wherever
+        // `cargo test` runs from) has no `policy.rego` at all, so if
+        // resolution fell back to it, this would fail to read the
+        // module and land in `output.errors` instead of passing.
+        let dir = rego_test_scratch_dir("colocated-module");
+        let nested = dir.join("policies").join("authz");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(nested.join("policy.rego"), COLOCATED_MODULE_SOURCE)
+            .expect("write colocated module");
+        std::fs::write(
+            nested.join("policy_test.yaml"),
+            COLOCATED_MODULE_PATH_FIXTURE,
+        )
+        .expect("write fixture");
+
+        let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
+        assert_eq!(found, vec![nested.join("policy_test.yaml")], "{found:?}");
+
+        let output = run_rego_tests(&found, None).expect("the sweep itself does not fail");
+        assert!(
+            output.errors.is_empty(),
+            "a bare module_path must resolve against the fixture's own directory: {output:?}"
+        );
+        assert_eq!(output.failed, 0, "{output:?}");
+        assert_eq!(output.passed, 2, "{output:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const BROKEN_FIXTURE: &str = r#"
+module: |
+  not rego at all
+cases:
+  - name: whatever
+    expect: true
+"#;
+
+    #[test]
+    fn rego_test_one_broken_fixture_does_not_discard_the_others_results() {
+        // Finding 2: a directory sweep with one good fixture and one
+        // broken one must still report the good fixture's results, and
+        // name the broken one and its error, rather than aborting the
+        // whole batch.
+        let dir = rego_test_scratch_dir("mixed-batch");
+        std::fs::write(dir.join("good_test.yaml"), PASSING_FIXTURE).expect("write good fixture");
+        std::fs::write(dir.join("broken_test.yaml"), BROKEN_FIXTURE)
+            .expect("write broken fixture");
+
+        let found = discover_rego_test_fixtures(&dir).expect("directory is readable");
+        assert_eq!(found.len(), 2, "{found:?}");
+
+        let output = run_rego_tests(&found, None).expect("the sweep itself does not fail");
+        assert_eq!(
+            output.errors.len(),
+            1,
+            "exactly the broken fixture must be recorded as errored: {output:?}"
+        );
+        assert!(
+            output.errors[0].fixture.ends_with("broken_test.yaml"),
+            "the error must name the broken fixture: {output:?}"
+        );
+        assert_eq!(
+            output.passed, 2,
+            "the good fixture's cases must still run and pass: {output:?}"
+        );
+        assert_eq!(output.failed, 0, "{output:?}");
+        assert_eq!(
+            output.exit_code(),
+            2,
+            "a fixture error must exit 2, beating any case/coverage verdict: {output:?}"
+        );
+
+        let exit = handle_rego_test(&RegoTestArgs {
+            path: dir.clone(),
+            min_coverage: None,
+            format: OutputFormat::Text,
+        })
+        .expect("the handler runs end to end");
+        assert_eq!(exit, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const ZERO_BUDGET_FIXTURE: &str = r#"
+module: |
+  package sbproxy
+
+  default allow := false
+
+  allow if {
+      input.request.method == "GET"
+  }
+budget_ms: 0
+cases:
+  - name: get is allowed
+    input:
+      request:
+        method: GET
+    expect: true
+"#;
+
+    #[test]
+    fn rego_test_fixture_zero_budget_ms_is_refused_with_a_clear_message() {
+        // Finding 3: `budget_ms: 0` must be caught at the fixture layer
+        // with the same message shape `RegoPolicy::new` uses in
+        // production, rather than reaching `CompiledRego::compile`'s
+        // load-time trial and surfacing a misleading "semantic fault".
+        let dir = rego_test_scratch_dir("zero-budget");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, ZERO_BUDGET_FIXTURE).expect("write fixture");
+
+        let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("the sweep itself does not fail");
+        assert_eq!(output.errors.len(), 1, "{output:?}");
+        assert!(
+            output.errors[0]
+                .error
+                .contains("budget_ms must be greater than zero"),
+            "must name the same invariant production's RegoPolicy::new refuses on: {output:?}"
+        );
+        assert!(
+            !output.errors[0].error.contains("semantic fault"),
+            "must not surface the misleading load-time-trial message: {output:?}"
+        );
+        assert_eq!(output.exit_code(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const BOTH_MODULE_FIELDS_FIXTURE: &str = r#"
+module: |
+  package sbproxy
+
+  default allow := false
+module_path: policy.rego
+cases:
+  - name: whatever
+    expect: false
+"#;
+
+    #[test]
+    fn rego_test_fixture_with_both_module_and_module_path_is_refused() {
+        // Finding 4.
+        let dir = rego_test_scratch_dir("both-module-fields");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, BOTH_MODULE_FIELDS_FIXTURE).expect("write fixture");
+
+        let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("the sweep itself does not fail");
+        assert_eq!(output.errors.len(), 1, "{output:?}");
+        assert!(output.errors[0].error.contains("not both"), "{output:?}");
+        assert_eq!(output.exit_code(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const NEITHER_MODULE_FIELD_FIXTURE: &str = r#"
+cases:
+  - name: whatever
+    expect: false
+"#;
+
+    #[test]
+    fn rego_test_fixture_with_neither_module_nor_module_path_is_refused() {
+        // Finding 4.
+        let dir = rego_test_scratch_dir("neither-module-field");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, NEITHER_MODULE_FIELD_FIXTURE).expect("write fixture");
+
+        let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("the sweep itself does not fail");
+        assert_eq!(output.errors.len(), 1, "{output:?}");
+        assert!(
+            output.errors[0].error.contains("module_path"),
+            "{output:?}"
+        );
+        assert_eq!(output.exit_code(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const EMPTY_CASES_FIXTURE: &str = r#"
+module: |
+  package sbproxy
+
+  default allow := false
+cases: []
+"#;
+
+    #[test]
+    fn rego_test_fixture_with_no_cases_is_refused() {
+        // Finding 4.
+        let dir = rego_test_scratch_dir("empty-cases");
+        let fixture_path = dir.join("authz_test.yaml");
+        std::fs::write(&fixture_path, EMPTY_CASES_FIXTURE).expect("write fixture");
+
+        let output = run_rego_tests(std::slice::from_ref(&fixture_path), None)
+            .expect("the sweep itself does not fail");
+        assert_eq!(output.errors.len(), 1, "{output:?}");
+        assert!(
+            output.errors[0].error.contains("no `cases`"),
+            "{output:?}"
+        );
+        assert_eq!(output.exit_code(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
