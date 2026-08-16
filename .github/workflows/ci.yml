@@ -217,6 +217,7 @@ jobs:
           bash scripts/check-config-readers.sh
           bash scripts/check-model-host-capabilities.sh
           bash scripts/check-metrics-stability.sh
+          bash scripts/check-decision-contract.sh
 
       # dead_code cannot see a `pub` item inside a `pub mod` of a library
       # crate, so write-only code lands with a green build. This ratchet

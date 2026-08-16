@@ -793,6 +793,8 @@ The block also composes across scopes, and it composes **per event label** rathe
 
 Two mistakes are refused at config load rather than ignored, both because a misconfigured audit feed is silent and silence is indistinguishable from a feed with nothing to say. An `events:` key naming no decision this proxy makes fails the load, and the error lists every accepted label. `ai.stream.event: true` fails too, because that event fires once per streamed chunk; enable `ai.close` instead, which carries the stream's summary once the response finishes. Writing `ai.stream.event: false` stays legal, since saying out loud that a feed is off is a reasonable thing to want in a config.
 
+The per-event field contract, and what may change without warning, is [decision-records.md](decision-records.md). That page is generated from the code and gated in CI, so it cannot drift from what the proxy actually emits.
+
 **What is wired today.** Eight events publish: `auth`, `cache.admit`, `cache.key`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, and `mcp.tool`, plus `policy` when `policy_record_format: decision` is set.
 
 They do not all publish on the same terms, and the difference matters when you are reading a quiet feed:

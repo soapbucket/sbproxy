@@ -581,6 +581,7 @@ step "generated docs are current"
 run_generated_artifact_checks \
   "$ROOT" \
   check-metrics-stability.sh \
+  check-decision-contract.sh \
   check-model-host-capabilities.sh
 
 # CI: ci.yml payments lane (WOR-2222). Last in this phase because it is the

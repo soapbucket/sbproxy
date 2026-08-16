@@ -156,6 +156,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
+- [decision-records.md](decision-records.md) - what a SIEM consumer may rely on from the decision-audit feed.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 

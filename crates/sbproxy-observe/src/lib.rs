@@ -21,6 +21,7 @@ pub mod clock_skew;
 /// OCSF-shaped audit record they all share instead of hand-rolling
 /// their own (WOR-2365, WOR-2370).
 pub mod decision;
+pub mod decision_contract;
 /// Egress for the typed proxy events: the `events:` block's bounded
 /// queue, background worker, and file / webhook sinks. Delivery never
 /// runs on the publisher's thread, which is the difference between this

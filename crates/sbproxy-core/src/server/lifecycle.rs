@@ -4074,6 +4074,7 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
     };
     let superseded = with_coverage(EventCoverage::SupersededByPolicy);
     let durable_elsewhere = with_coverage(EventCoverage::DurableElsewhere);
+    let wrong_format = with_coverage(EventCoverage::ConfigDependent);
     let unwired = with_coverage(EventCoverage::Unwired);
 
     // Two messages, because they are two different problems and one
@@ -4089,6 +4090,19 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
             "decision_audit enables events whose decisions already publish as `policy` records: \
              these run in the policy chain, so enable `policy` and select on the `policy_id` \
              field instead. They will never emit under their own label"
+        );
+    }
+    if !wrong_format.is_empty() {
+        // Reached only under the legacy format: the converged one makes
+        // `publishes_decision_audit` true, so the event never enters the
+        // enabled-but-not-publishing set at all. Naming it as unwired
+        // would be false in both formats, and saying nothing would leave
+        // an operator who enabled it waiting on a feed one setting away.
+        tracing::warn!(
+            events = %wrong_format.join(", "),
+            "decision_audit enables events that publish in a different record shape: they \
+             reach the audit bus today as policy_verdict_event rather than on this feed. Set \
+             policy_record_format: decision to receive them here"
         );
     }
     if !durable_elsewhere.is_empty() {

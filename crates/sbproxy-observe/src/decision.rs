@@ -160,6 +160,24 @@ pub enum EventCoverage {
     /// offer a second, weaker answer to a question that already has an
     /// authoritative one.
     DurableElsewhere,
+    /// Publishes on this feed only under a specific configuration.
+    ///
+    /// `policy` is the only one. It has always reached the audit bus,
+    /// but arrives as a `PolicyVerdictEvent` on its own prefix until
+    /// `policy_record_format: decision` moves it onto this feed. Calling
+    /// that "unwired" tells an operator nothing publishes it, which is
+    /// false in both formats; calling it "emitted" tells them it is on
+    /// this feed, which is false in one.
+    ConfigDependent,
+    /// Cannot publish, whatever the operator configures.
+    ///
+    /// `ai.stream.event` fires once per streamed chunk, so a per-event
+    /// audit record is an ingest bill rather than a control. It is
+    /// refused ahead of both the per-event map and the master switch,
+    /// which makes an emitter for it unreachable. Reporting it as "not
+    /// yet" would promise a feed that is never coming; `ai.close`
+    /// carries the same stream's summary once.
+    NeverPublishes,
     /// No emitter yet. Enabling it publishes nothing.
     Unwired,
 }
@@ -297,9 +315,9 @@ impl DecisionEvent {
             // here. See `EventCoverage::DurableElsewhere`.
             Self::PaymentLifecycle => EventCoverage::DurableElsewhere,
             Self::AiToolCall => EventCoverage::Emitted,
-            Self::Policy
-            | Self::AiStreamEvent
-            | Self::AiClose
+            Self::Policy => EventCoverage::ConfigDependent,
+            Self::AiStreamEvent => EventCoverage::NeverPublishes,
+            Self::AiClose
             | Self::AiFailure
             | Self::Transform
             | Self::Action
