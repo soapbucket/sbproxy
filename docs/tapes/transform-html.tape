@@ -20,11 +20,11 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -s https://test.sbproxy.dev/html | head -20`
+Type `curl -s https://test.sbproxy.dev/html`
 Enter
 Sleep 1.6s
 
-Type `curl -s -H 'Host: html.local' http://127.0.0.1:8080/html | head -20`
+Type `curl -s -H 'Host: html.local' http://127.0.0.1:8080/html`
 Enter
 Sleep 1.6s
 

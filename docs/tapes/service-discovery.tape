@@ -20,7 +20,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `for i in 1 2 3 4; do curl -s -o /dev/null -H 'Host: localhost' http://127.0.0.1:8080/ip; done`
+Type `for i in 1 2 3 4; do curl -s -o /dev/null -H 'Host: localhost' http://127.0.0.1:8080/get; done`
 Enter
 Sleep 1.6s
 

@@ -20,11 +20,11 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -i -H 'Host: cap.localhost' http://127.0.0.1:8080/blog/article`
+Type `curl -i -H 'Host: cap.localhost' http://127.0.0.1:8080/anything/blog/article`
 Enter
 Sleep 1.6s
 
-Type `curl -i -H 'Host: cap.localhost' -H "CAP-Token: $(cat /tmp/cap.jwt)" http://127.0.0.1:8080/blog/article`
+Type `curl -i -H 'Host: cap.localhost' -H "CAP-Token: $(cat /tmp/cap.jwt)" http://127.0.0.1:8080/anything/blog/article`
 Enter
 Sleep 1.6s
 

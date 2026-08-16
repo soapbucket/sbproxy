@@ -20,7 +20,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"gpt-4o-mini","messages":[ {"role":"user","content":"Summarise the public release notes."} ]}'`
+Type `curl http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"gpt-4o-mini","messages":[ {"role":"user","content":"Summarize the public release notes."} ]}'`
 Enter
 Sleep 3.5s
 
