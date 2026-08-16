@@ -1,0 +1,63 @@
+{
+  "object": "page",
+  "data": [
+    {
+      "object": "bucket",
+      "start_time": 1782259200,
+      "end_time": 1782345600,
+      "results": [
+        {
+          "object": "organization.usage.completions.result",
+          "input_tokens": 48000,
+          "output_tokens": 12500,
+          "num_model_requests": 210,
+          "project_id": null,
+          "user_id": null,
+          "api_key_id": "key_gw_prod_7f3a",
+          "model": "gpt-4o-mini",
+          "batch": false,
+          "input_cached_tokens": 6000,
+          "input_audio_tokens": 0,
+          "output_audio_tokens": 0
+        },
+        {
+          "object": "organization.usage.completions.result",
+          "input_tokens": 91000,
+          "output_tokens": 34500,
+          "num_model_requests": 47,
+          "project_id": null,
+          "user_id": null,
+          "api_key_id": "key_gw_prod_7f3a",
+          "model": "gpt-4o",
+          "batch": false,
+          "input_cached_tokens": 0,
+          "input_audio_tokens": 0,
+          "output_audio_tokens": 0
+        }
+      ]
+    },
+    {
+      "object": "bucket",
+      "start_time": 1782345600,
+      "end_time": 1782432000,
+      "results": [
+        {
+          "object": "organization.usage.completions.result",
+          "input_tokens": 15200,
+          "output_tokens": 4100,
+          "num_model_requests": 63,
+          "project_id": null,
+          "user_id": null,
+          "api_key_id": "key_gw_prod_7f3a",
+          "model": "gpt-4o-mini",
+          "batch": false,
+          "input_cached_tokens": 1200,
+          "input_audio_tokens": 0,
+          "output_audio_tokens": 0
+        }
+      ]
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}

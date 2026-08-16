@@ -947,6 +947,8 @@ beyond local development. See [admin.md](admin.md#authentication-and-roles).
 ```bash
 sbproxy ai ledger verify /var/lib/sbproxy/usage-ledger.jsonl
 sbproxy ai ledger report /var/lib/sbproxy/value-ledger.redb --format json
+sbproxy ai ledger reconcile /var/lib/sbproxy/usage-ledger.jsonl \
+  --provider-export openai-usage-export.json --strict
 ```
 
 `ledger verify` re-derives the verifiable usage ledger's hash chain (and,
@@ -956,7 +958,11 @@ verifies, `1` otherwise. `ledger report` aggregates a value ledger (the
 redb file the AI handler keeps at `<cache_dir>/value-ledger.redb`) into
 the same per-model savings report the admin `GET /admin/model-host/value`
 route serves, with no server running; a missing file reports an empty
-ledger rather than an error.
+ledger rather than an error. `ledger reconcile` compares the usage
+ledger against a downloaded provider usage export, per day and model, to
+surface spend the ledger never saw: see
+[ai-usage-ledger.md](ai-usage-ledger.md#reconciling-against-a-provider-export)
+for the export format and what the result does and does not prove.
 
 ```bash
 sbproxy ai prompt optimize \

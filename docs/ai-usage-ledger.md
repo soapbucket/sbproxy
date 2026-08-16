@@ -1,5 +1,5 @@
 # Verifiable usage ledger
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 The usage ledger turns the stream of completed LLM calls into a
 tamper-evident, optionally signed record. Where a plain usage sink ships
@@ -99,6 +99,66 @@ On success it prints the entry count and exits 0. On a broken chain or a
 bad signature it names the first failing sequence number and exits 1, so
 it slots into a cron check or CI gate. `--format json` emits a structured
 object for tooling.
+
+## Reconciling against a provider export
+
+Verification proves the ledger has not been tampered with. It cannot
+prove the ledger is *complete*: a call that never went through this
+gateway never produces a ledger entry to check. `ledger reconcile`
+closes part of that gap by comparing the ledger against a usage export
+you download from the provider directly, per day and model:
+
+```bash
+sbproxy ai ledger reconcile /var/lib/sbproxy/usage-ledger.jsonl \
+  --provider-export openai-usage-export.json \
+  --format openai-usage --strict
+```
+
+`--provider-export` is a file you fetch yourself, ahead of time, with an
+Admin API key:
+`GET /v1/organization/usage/completions?bucket_width=1d&group_by[]=model`
+against
+[OpenAI's organization Usage API](https://platform.openai.com/docs/api-reference/usage/completions)
+(worked example:
+[the OpenAI cookbook](https://developers.openai.com/cookbook/examples/completions_usage_api)).
+`openai-usage` is the only supported `--format` today; it was picked
+over
+[Anthropic's Admin usage/cost API](https://platform.claude.com/docs/en/manage-claude/usage-cost-api)
+because Anthropic's usage rows split input tokens across
+`uncached_input_tokens`, `cache_read_input_tokens`, and a nested
+`cache_creation` object, which needs a policy decision about which of
+those count toward "what the ledger should have seen" before they are
+comparable; OpenAI's flat `input_tokens` / `output_tokens` pair does
+not.
+
+The command always re-derives the ledger's hash chain first (the same
+check `ledger verify` runs) and refuses to reconcile an unverified one.
+It then reports two things:
+
+- **Bypass evidence**: a (day, model) row the export shows requests for
+  that the ledger has no matching request for at all. This is the
+  strongest signal: spend the provider counted that the gateway's own
+  metering path never recorded.
+- **Ledger-only rows**: a (day, model) row the ledger recorded that the
+  export does not show. Not bypass evidence by itself; see the caveats
+  below.
+
+Without `--strict` the command always exits 0, so a first run can be
+read before it is wired into anything. With `--strict` it exits 1 when
+bypass evidence is found, so it slots into a scheduled reconciliation
+job the way `ledger verify` slots into a CI gate.
+
+**What this does and does not prove.** A clean reconcile run proves
+only that, for the org and API key that produced this export, every
+request the provider billed also has a matching entry in this gateway's
+ledger. It does not prove nothing else was spent: a call made under a
+different key, project, or provider organization produces no row at
+all, on either side, so it is invisible to this check. A ledger-only
+row is usually a clock-window edge (the export's daily bucket boundary
+and the ledger's `recorded_at` are not guaranteed to land on the same
+side of midnight UTC) or provider usage data that has not caught up yet
+(both OpenAI and Anthropic can lag by minutes), not evidence of
+anything wrong.
 
 ## Try it
 

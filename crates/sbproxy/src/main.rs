@@ -827,6 +827,14 @@ enum LedgerSub {
     /// redb file directly with no server running. A missing file is
     /// reported as no value recorded yet, not an error. Exit 0.
     Report(LedgerReportArgs),
+    /// Compare the local usage ledger against a provider's own usage
+    /// export, per (day, model): usage the export shows that the ledger
+    /// never recorded is evidence a call reached the provider without
+    /// going through this gateway. Always verifies the ledger's hash
+    /// chain first and refuses to reconcile an unverified one. Exit 0
+    /// unless `--strict` is given and the export shows usage the ledger
+    /// never saw, in which case exit 1.
+    Reconcile(LedgerReconcileArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -852,6 +860,48 @@ struct LedgerReportArgs {
     /// `json` emits the same object `GET /admin/model-host/value` serves.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+}
+
+/// Provider usage export format for `sbproxy ai ledger reconcile`. A
+/// closed set (clap rejects unknown values at parse time) with exactly
+/// one member today: see `parse_openai_usage_export` in
+/// `sbproxy_ai::usage_ledger` for why OpenAI's organization Usage API
+/// export was picked as the format to support first, and what an
+/// Anthropic Admin usage/cost format would need to add.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProviderExportFormatArg {
+    /// OpenAI organization Usage API completions export
+    /// (`GET /v1/organization/usage/completions`, `bucket_width=1d`,
+    /// ideally `group_by[]=model`).
+    #[default]
+    OpenaiUsage,
+}
+
+#[derive(clap::Args, Debug)]
+struct LedgerReconcileArgs {
+    /// Path to the local usage ledger file (the JSONL write-ahead log).
+    path: PathBuf,
+    /// Path to a downloaded provider usage export file.
+    #[arg(long = "provider-export")]
+    provider_export: PathBuf,
+    /// Provider export format.
+    #[arg(long = "format", value_enum, default_value_t = ProviderExportFormatArg::OpenaiUsage)]
+    format: ProviderExportFormatArg,
+    /// Optional 32-byte Ed25519 signing seed as hex, forwarded to the
+    /// chain-integrity check that runs before reconciling.
+    #[arg(long = "signing-seed-hex")]
+    signing_seed_hex: Option<String>,
+    /// Exit 1 when the export shows provider-side usage the ledger never
+    /// recorded (the bypass evidence). Without this flag the command
+    /// always exits 0 after printing the report, so a first run can be
+    /// inspected before it is wired into a gate.
+    #[arg(long)]
+    strict: bool,
+    /// Output format. `text` (default) prints the reconciled rows and
+    /// the honesty caveats; `json` emits a structured object for
+    /// tooling.
+    #[arg(long = "output", value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
 }
 
 #[derive(clap::Args, Debug)]
@@ -9463,6 +9513,7 @@ fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
         AiSub::Ledger(ledger) => match &ledger.sub {
             LedgerSub::Verify(args) => handle_ledger_verify(args),
             LedgerSub::Report(args) => handle_ledger_report(args),
+            LedgerSub::Reconcile(args) => handle_ledger_reconcile(args),
         },
         AiSub::Prompt(prompt) => match &prompt.sub {
             PromptSub::Optimize(args) => handle_prompt_optimize(args),
@@ -9704,6 +9755,160 @@ fn handle_ledger_report_to(
     }
 
     Ok(0)
+}
+
+/// `sbproxy ai ledger reconcile`: compare the local usage ledger against
+/// a provider's own usage export, per (day, model), to surface spend the
+/// gateway's own metering path never saw (WOR-2476).
+fn handle_ledger_reconcile(args: &LedgerReconcileArgs) -> anyhow::Result<i32> {
+    handle_ledger_reconcile_to(args, &mut std::io::stdout())
+}
+
+/// The testable core of `handle_ledger_reconcile`: writes the report to
+/// `out` instead of stdout, so tests can assert on it without capturing
+/// the process's real stdout.
+fn handle_ledger_reconcile_to(
+    args: &LedgerReconcileArgs,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    const MAX_PROVIDER_EXPORT_BYTES: usize = 32 * 1024 * 1024;
+    const CAVEAT: &str = "This only proves bypass for usage visible to the provider org and \
+API key that produced this export: a different org, project, or key would not appear here at \
+all. Clock-window edges (the export's bucket boundary vs. the ledger's recorded_at) and \
+key/org attribution differences can also put a row on one side only; treat a ledger-only row \
+as a lead, not proof.";
+
+    let verifying_key = match args.signing_seed_hex.as_deref() {
+        Some(seed) => Some(sbproxy_ai::usage_ledger::verifying_key_from_seed_hex(seed)?),
+        None => None,
+    };
+
+    // Reconciling an unverified chain would let a tampered ledger explain
+    // away real bypass evidence (or manufacture fake evidence), so this
+    // refuses to proceed on a broken chain rather than comparing against
+    // content nothing has confirmed is intact.
+    let verify_result =
+        sbproxy_ai::usage_ledger::verify_ledger(&args.path, verifying_key.as_ref())?;
+    if !verify_result.ok {
+        anyhow::bail!(
+            "usage ledger {} does not verify at seq {}: {} (run `sbproxy ai ledger verify` for details; refusing to reconcile against an unverified chain)",
+            args.path.display(),
+            verify_result
+                .broken_seq
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            verify_result.reason.as_deref().unwrap_or("unknown"),
+        );
+    }
+
+    let ledger_entries = sbproxy_ai::usage_ledger::read_ledger_entries(&args.path)?;
+    let export_bytes = read_bounded_cli_file(
+        &args.provider_export,
+        MAX_PROVIDER_EXPORT_BYTES,
+        "provider usage export",
+    )?;
+    let (format_label, provider_rows) = match args.format {
+        ProviderExportFormatArg::OpenaiUsage => (
+            "openai-usage",
+            sbproxy_ai::usage_ledger::parse_openai_usage_export(&export_bytes)?,
+        ),
+    };
+
+    let report = sbproxy_ai::usage_ledger::reconcile_usage(&ledger_entries, &provider_rows);
+    let bypass_requests_total = report.total_unseen_by_ledger();
+    let bypass_rows: Vec<_> = report.bypass_rows().collect();
+    let ledger_only_rows: Vec<_> = report
+        .rows
+        .iter()
+        .filter(|r| r.unseen_by_provider() > 0)
+        .collect();
+    let signature_checked = verifying_key.is_some();
+
+    match args.output {
+        OutputFormat::Json => {
+            let obj = serde_json::json!({
+                "path": args.path.to_string_lossy(),
+                "provider_export": args.provider_export.to_string_lossy(),
+                "format": format_label,
+                "chain_signature_checked": signature_checked,
+                "rows_compared": report.rows.len(),
+                "bypass_requests_total": bypass_requests_total,
+                "bypass_rows": bypass_rows,
+                "ledger_only_rows": ledger_only_rows,
+                "strict": args.strict,
+                "caveat": CAVEAT,
+            });
+            writeln!(out, "{}", serde_json::to_string(&obj)?)?;
+        }
+        OutputFormat::Text => {
+            writeln!(
+                out,
+                "usage ledger reconcile: {} vs {} ({format_label})",
+                args.path.display(),
+                args.provider_export.display(),
+            )?;
+            writeln!(
+                out,
+                "chain: verified ({})",
+                if signature_checked {
+                    "chain + signatures"
+                } else {
+                    "chain only, no signing seed given"
+                },
+            )?;
+            writeln!(out, "rows compared: {}", report.rows.len())?;
+            writeln!(out)?;
+            if bypass_rows.is_empty() {
+                writeln!(out, "bypass evidence: none found for the rows compared.")?;
+            } else {
+                writeln!(
+                    out,
+                    "bypass evidence (provider export shows usage the ledger never recorded):"
+                )?;
+                for row in &bypass_rows {
+                    writeln!(
+                        out,
+                        "  {:<10} {:<24} {} request(s) unseen by the ledger ({} token(s))",
+                        row.day,
+                        row.model,
+                        row.unseen_by_ledger(),
+                        row.provider_total_tokens,
+                    )?;
+                }
+                writeln!(
+                    out,
+                    "  total: {bypass_requests_total} request(s) unseen by the ledger"
+                )?;
+            }
+            writeln!(out)?;
+            if ledger_only_rows.is_empty() {
+                writeln!(out, "ledger-only: none.")?;
+            } else {
+                writeln!(
+                    out,
+                    "ledger-only (the ledger recorded usage this export does not show):"
+                )?;
+                for row in &ledger_only_rows {
+                    writeln!(
+                        out,
+                        "  {:<10} {:<24} {} request(s) unseen by the export",
+                        row.day,
+                        row.model,
+                        row.unseen_by_provider(),
+                    )?;
+                }
+            }
+            writeln!(out)?;
+            writeln!(out, "{CAVEAT}")?;
+        }
+    }
+
+    let exit = if args.strict && bypass_requests_total > 0 {
+        1
+    } else {
+        0
+    };
+    Ok(exit)
 }
 
 /// Format micro-USD as a decimal dollar string with at least two and at
@@ -10580,6 +10785,126 @@ mod tests {
         assert_eq!(code, 0);
         assert!(text.contains("no value recorded yet"), "text: {text}");
         let _ = std::fs::remove_file(&empty);
+    }
+
+    /// A unique scratch path for the usage-ledger reconcile tests.
+    /// Mirrors `temp_value_ledger_path`'s pid-plus-counter convention.
+    fn temp_jsonl_ledger_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sbproxy-ledger-reconcile-{tag}-{}-{n}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn ai_ledger_reconcile_cli_surface_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "ai",
+            "ledger",
+            "reconcile",
+            "usage-ledger.jsonl",
+            "--provider-export",
+            "openai-usage-export.json",
+            "--format",
+            "openai-usage",
+            "--strict",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        let Some(Cmd::Ai(AiCmd {
+            sub:
+                AiSub::Ledger(LedgerCmd {
+                    sub: LedgerSub::Reconcile(args),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("ai ledger reconcile parsed to the wrong command");
+        };
+        assert_eq!(args.path, PathBuf::from("usage-ledger.jsonl"));
+        assert_eq!(
+            args.provider_export,
+            PathBuf::from("openai-usage-export.json")
+        );
+        assert!(matches!(args.format, ProviderExportFormatArg::OpenaiUsage));
+        assert!(args.strict);
+        assert!(matches!(args.output, OutputFormat::Json));
+    }
+
+    /// Red-first proof for WOR-2476: an empty local ledger (nothing the
+    /// gateway ever metered) reconciled against the checked-in OpenAI
+    /// usage export fixture (`crates/sbproxy-ai/tests/fixtures/openai-usage-export.json`)
+    /// must flag every row in that fixture as bypass evidence, because an
+    /// empty ledger has no matching request for any of them, and
+    /// `--strict` must turn that into a nonzero exit.
+    #[test]
+    fn ai_ledger_reconcile_flags_an_injected_provider_only_row_and_strict_exits_nonzero() {
+        let ledger_path = temp_jsonl_ledger_path("bypass");
+        let _ = std::fs::remove_file(&ledger_path);
+        // A real, chain-valid ledger with zero entries: nothing the
+        // gateway ever metered.
+        drop(
+            sbproxy_ai::usage_ledger::LedgerSink::try_build(
+                ledger_path.to_str().expect("utf-8 temp path"),
+                None,
+            )
+            .expect("open empty ledger"),
+        );
+
+        let export_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("sbproxy-ai")
+            .join("tests")
+            .join("fixtures")
+            .join("openai-usage-export.json");
+        assert!(
+            export_path.exists(),
+            "fixture must exist at {}",
+            export_path.display()
+        );
+
+        let args = LedgerReconcileArgs {
+            path: ledger_path.clone(),
+            provider_export: export_path,
+            format: ProviderExportFormatArg::OpenaiUsage,
+            signing_seed_hex: None,
+            strict: false,
+            output: OutputFormat::Json,
+        };
+        let mut out = Vec::new();
+        let code = handle_ledger_reconcile_to(&args, &mut out).expect("reconcile runs");
+        assert_eq!(
+            code, 0,
+            "without --strict the command reports but does not fail the run"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&out).expect("reconcile json output");
+        let bypass_total = report["bypass_requests_total"]
+            .as_u64()
+            .expect("bypass_requests_total is a number");
+        assert_eq!(
+            bypass_total, 320,
+            "every request in the fixture (210 + 47 + 63) is unseen by an empty ledger: {report}"
+        );
+        assert_eq!(report["rows_compared"], 3);
+
+        let strict_args = LedgerReconcileArgs {
+            strict: true,
+            ..args
+        };
+        let mut strict_out = Vec::new();
+        let strict_code =
+            handle_ledger_reconcile_to(&strict_args, &mut strict_out).expect("reconcile runs");
+        assert_eq!(
+            strict_code, 1,
+            "an injected provider-side-only row must fail a --strict run"
+        );
+
+        let _ = std::fs::remove_file(&ledger_path);
     }
 
     #[test]
