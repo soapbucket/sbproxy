@@ -10,7 +10,49 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.12.0] - 2026-08-17
+
 ### Added
+
+- **The full MCP surface is governed: content filters, tenant-bound
+  sessions, and registry approval status.** `content_filters` runs the
+  shared secret and PII detector catalog over tool-call arguments and
+  results, and over `resources/read` and `prompts/get` results, with
+  `off | warn | redact | block` per category; MCP responses are written
+  outside the HTTP `response_filter` phase, so this is the first time
+  those detectors see MCP traffic at all. Sessions are tenant-bound: a
+  session id presented by a different tenant is refused with the same
+  generic error a stranger gets, and session establishment is capped
+  (256 per tenant, 4096 globally, sixteen tenants at full sub-cap) with
+  a fail-closed refusal of `initialize` at saturation rather than an
+  untracked session. `federated_servers[].status` gates the registry:
+  `draft` servers are invisible on every listing surface and refused at
+  dispatch, `deprecated` serves but warns on every call. The peer
+  registry behind downgrade detection carries the same caps; under
+  `downgrade: block`, a peer it cannot track is refused rather than
+  enforced against no baseline. `result_policies[]` runs the same
+  CEL/Rego engine over the tool-call result document after dispatch.
+  [mcp-security.md](docs/mcp-security.md) is the narrative;
+  [mcp-security-coverage.md](docs/mcp-security-coverage.md) maps
+  MCP01:2025 through MCP10:2025 row by row, each claim naming the test
+  or example that proves it.
+
+- **Every security decision reaches the SIEM.** A twelfth typed event,
+  `egress_refused`, carries every purpose-scoped outbound-dial refusal
+  (AI providers, MCP upstreams, token exchange, webhooks, artifact
+  fetches) with the same bounded labels its Prometheus series already
+  had. All six config-reload paths emit `config_audit` records for
+  accepts and rejections, with rejection reasons bounded and scrubbed
+  of the config path. mTLS handshake rejections write a
+  `security_audit` record with the certificate CN control-stripped and
+  bounded on every surface it reaches. Circuit-breaker state
+  transitions emit one structured record alongside the existing
+  counter. `budget_exceeded`, `guardrail_triggered`,
+  `provider_selected`, `ai.failure`, and `ai.close` are wired at their
+  decision points, and boot warns when `events.types:` names a type
+  nothing publishes. [events.md](docs/events.md) is rewritten as the
+  SIEM integration map: which channel carries what, the gapless
+  sequence contract, and what deliberately stays off the lossy feed.
 
 - **MCP tool calls emit a governance evidence event, with an optional
   fail-closed guarantee.** The `events:` type list grows to thirteen
@@ -267,6 +309,16 @@ the next version cut.
   compiles in a Linux builder stage.
 
 ### Fixed
+
+- **A prefix-namespaced MCP tool call now reaches its upstream.**
+  Since the dual-revision release, the federation advertised namespaced
+  tool names (`reports.hello`) but also forwarded that advertised name
+  on `tools/call`, so an upstream serving the bare name refused every
+  dispatch with "Unknown tool". Tools now keep the name the upstream
+  advertised, the way prompts and resources always did, and dispatch
+  forwards it; the governance-pack e2e's mock upstream now refuses
+  prefixed names the way real upstreams do, so this cannot regress
+  silently.
 
 - **NOTICE names the 27 Apache-2.0-only crates it previously omitted.**
   Most of them are the swc TypeScript and JavaScript toolchain reached
