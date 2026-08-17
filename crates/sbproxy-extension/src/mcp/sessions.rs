@@ -19,20 +19,28 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Ceiling on the number of concurrently-live sessions one
-/// [`SessionStore`] tracks with independently-mutable state (WOR-2384,
-/// I3 fix round). Mirrors `crate::mcp::peer_profile::MAX_TRACKED_PEERS`'s
-/// order of magnitude and reasoning: a session id is minted by this
-/// server, not caller-supplied, but minting itself is driven by
-/// inbound `initialize` requests, so an unbounded map is still a
+/// [`SessionStore`] tracks (WOR-2384, I3 fix round; fail-closed per the
+/// I3 fix round 2 ruling). Mirrors
+/// `crate::mcp::peer_profile::MAX_TRACKED_PEERS`'s order of magnitude
+/// and reasoning: a session id is minted by this server, not
+/// caller-supplied, but minting itself is driven by inbound
+/// `initialize` requests, so an unbounded map is still a
 /// memory-exhaustion knob for a caller who can afford enough
-/// concurrent connections to keep flooding it.
+/// concurrent connections to keep flooding it. Acts as a backstop
+/// behind [`MAX_TRACKED_SESSIONS_PER_TENANT`]: a single tenant can
+/// never reach this ceiling on its own (it would hit its own sub-cap
+/// first), so this bounds the number of *distinct tenants* with live
+/// sessions at once, not a single tenant's flood.
 pub const MAX_TRACKED_SESSIONS: usize = 4096;
 
-/// The single session every mint past [`MAX_TRACKED_SESSIONS`] shares
-/// (WOR-2384, I3 fix round). A NUL-prefixed sentinel keeps it out of
-/// the UUID-v4 id space [`SessionStore::create`] otherwise returns, so
-/// it can never collide with a real minted id.
-const OVERFLOW_SESSION_ID: &str = "\u{0}sbproxy-mcp-session-overflow";
+/// Ceiling on the number of concurrently-live sessions one tenant may
+/// hold in one [`SessionStore`] (WOR-2384, I3 fix round 2). A tenant at
+/// its own sub-cap is refused a new session while every other tenant,
+/// and every one of this tenant's own already-live sessions, is
+/// unaffected -- one tenant flooding `initialize` cannot exhaust the
+/// registry for anyone else, the gap the fix round 1 shared-overflow
+/// design (removed; see git history) failed to close.
+pub const MAX_TRACKED_SESSIONS_PER_TENANT: usize = 256;
 
 /// Session-level risk signals used by guardrails that need memory
 /// across multiple MCP requests.
@@ -169,6 +177,25 @@ struct SessionEntry {
     tenant_id: String,
 }
 
+/// Outcome of [`SessionStore::create`] (WOR-2384, I3 fix round 2).
+///
+/// A session id is minted by this server, never caller-supplied, so
+/// there is no tenant-mismatch case here the way [`SessionValidation`]
+/// has one -- the only failure mode is the registry being too full to
+/// hand out a new, independently-tracked session at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMint {
+    /// A new session was minted and is live under `tenant_id`.
+    Minted(String),
+    /// The store is saturated -- either the global
+    /// [`MAX_TRACKED_SESSIONS`] cap or the presenting tenant's own
+    /// [`MAX_TRACKED_SESSIONS_PER_TENANT`] sub-cap -- and refused to
+    /// mint a new session. Every existing session, for this tenant and
+    /// every other, is unaffected: no session was ended, no label was
+    /// reset, and no entry was shared with anyone.
+    Saturated,
+}
+
 /// Outcome of [`SessionStore::validate`] (WOR-2384, MCP10).
 ///
 /// A three-way result rather than a plain bool so the caller can tell
@@ -203,20 +230,34 @@ impl SessionValidation {
     }
 }
 
+impl SessionMint {
+    /// The minted id, when this call succeeded; `None` for
+    /// [`Self::Saturated`]. Convenience for a caller that only needs
+    /// the `Option<String>` shape.
+    pub fn minted(self) -> Option<String> {
+        match self {
+            Self::Minted(id) => Some(id),
+            Self::Saturated => None,
+        }
+    }
+}
+
 /// In-memory session table with a sliding idle TTL, bounded at
-/// [`MAX_TRACKED_SESSIONS`] (WOR-2384, I3 fix round).
+/// [`MAX_TRACKED_SESSIONS`] globally and [`MAX_TRACKED_SESSIONS_PER_TENANT`]
+/// per tenant (WOR-2384, I3 fix round; fail-closed per the I3 fix round
+/// 2 ruling -- a mint past either cap is refused outright, never
+/// shared with another caller).
 pub struct SessionStore {
     ttl: Duration,
     inner: Mutex<HashMap<String, SessionEntry>>,
-    /// Latches true the first time this store routes a mint to the
-    /// shared overflow session, so the saturation warning logs once
-    /// per store rather than once per flooding call. Per-instance
-    /// (not a process-wide `static`, unlike
-    /// `crate::mcp::peer_profile`'s registry): a hot reload compiles a
-    /// fresh `SessionStore`, and an operator running several `mcp`
-    /// origins has one store per origin, so a process-wide latch would
-    /// silence the warning for every store after the first one to
-    /// saturate.
+    /// Latches true the first time this store refuses a mint for
+    /// saturation, so the warning logs once per store rather than once
+    /// per flooding call. Per-instance (not a process-wide `static`,
+    /// unlike `crate::mcp::peer_profile`'s registry): a hot reload
+    /// compiles a fresh `SessionStore`, and an operator running
+    /// several `mcp` origins has one store per origin, so a
+    /// process-wide latch would silence the warning for every store
+    /// after the first one to saturate.
     saturated: AtomicBool,
 }
 
@@ -232,112 +273,126 @@ impl SessionStore {
 
     /// Create a new session bound to `tenant_id` and return its id
     /// (UUID v4, which satisfies the spec's visible-ASCII requirement
-    /// and is not guessable) -- or, once the store holds
-    /// [`MAX_TRACKED_SESSIONS`] entries, the shared overflow session id
-    /// every mint past the cap returns instead. See
-    /// [`Self::create_capped`] for the overflow behavior.
+    /// and is not guessable) as [`SessionMint::Minted`] -- or
+    /// [`SessionMint::Saturated`] when the store cannot mint one
+    /// (WOR-2384, I3 fix round 2). See [`Self::create_capped`] for the
+    /// exact caps.
     ///
     /// WOR-2384 (MCP10): `tenant_id` is stamped once at mint time and
     /// checked by every later [`Self::validate`] call for this id. It
     /// must come from the request's route-derived tenant, the same
     /// source every other per-tenant gate in this codebase uses, never
     /// from a caller-mutable header or body field.
-    pub fn create(&self, tenant_id: &str) -> String {
-        self.create_capped(tenant_id, MAX_TRACKED_SESSIONS)
+    pub fn create(&self, tenant_id: &str) -> SessionMint {
+        self.create_capped(
+            tenant_id,
+            MAX_TRACKED_SESSIONS,
+            MAX_TRACKED_SESSIONS_PER_TENANT,
+        )
     }
 
-    /// The actual mint-or-overflow logic, parameterized on the cap
-    /// rather than reaching for [`MAX_TRACKED_SESSIONS`] directly.
+    /// The actual mint-or-refuse logic, parameterized on both caps
+    /// rather than reaching for [`MAX_TRACKED_SESSIONS`] /
+    /// [`MAX_TRACKED_SESSIONS_PER_TENANT`] directly.
     ///
     /// Split out for the same reason
     /// `crate::mcp::peer_profile::observe_and_record_capped` is:
-    /// exercising the overflow branch against the real
-    /// [`MAX_TRACKED_SESSIONS`] (4096) would take thousands of real
-    /// mints to reach inside a test.
+    /// exercising either cap against the real constants (4096 / 256)
+    /// would take that many real mints to reach inside a test.
     ///
-    /// Below the cap, mints a normal, independently-tracked session
-    /// with the usual trusted/untouched defaults. At the cap, every
-    /// further mint (regardless of tenant) shares one
-    /// [`OVERFLOW_SESSION_ID`] session instead of growing the map
-    /// further. Unlike `peer_profile`'s shared overflow profile (an
-    /// aggregate downgrade-detection signal, safe to merge across
-    /// unrelated callers by construction), an MCP session legitimately
-    /// carries per-client state, so sharing one here is a deliberate
-    /// degradation, not a free one:
-    ///
-    /// - The shared session's flow labels start at their
-    ///   most-restrictive values (`SessionIntegrity::Tainted` +
-    ///   `sensitive_touched: true`) instead of the normal
-    ///   trusted/untouched defaults -- fail closed on the Rule-of-Two
-    ///   guardrail for a session this store can no longer track with
-    ///   dedicated state.
-    /// - Only the tenant that first claims the shared slot can ever
-    ///   [`Self::validate`] it again: every other tenant's mint gets
-    ///   back the *same* session id, but `tenant_id` was already
-    ///   stamped by whichever mint claimed the slot first, so every
-    ///   later tenant's very next request fails the tenant check --
-    ///   the fail-closed direction, since a caller flooding
-    ///   `initialize` to exhaust the registry gets a session that
-    ///   locks it out rather than one that silently under-enforces the
-    ///   flow guardrail or leaks state to an unrelated tenant.
-    fn create_capped(&self, tenant_id: &str, cap: usize) -> String {
+    /// Below both caps, mints a normal, independently-tracked session
+    /// with the usual trusted/untouched defaults. At either cap, the
+    /// mint is refused outright (WOR-2384, I3 fix round 2 -- this
+    /// replaces fix round 1's shared-overflow-session design, which a
+    /// review found let a saturated store silently issue a 200 with no
+    /// `Mcp-Session-Id` header, since the shared id's leading NUL byte
+    /// is rejected by the HTTP header encoder, and let
+    /// `set_tool_requirements` write onto that shared entry across
+    /// tenants because it took no tenant parameter -- both real bugs
+    /// a shared mutable session can produce that an outright refusal
+    /// cannot). No entry is inserted, no existing session (this
+    /// tenant's or any other's) is touched, and the caller is
+    /// responsible for surfacing the refusal to the client -- this
+    /// method only decides whether to mint, it never talks to the
+    /// wire itself.
+    fn create_capped(&self, tenant_id: &str, cap: usize, tenant_cap: usize) -> SessionMint {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         Self::prune(&mut map);
 
-        if map.len() < cap {
-            let id = uuid::Uuid::new_v4().to_string();
-            map.insert(
-                id.clone(),
-                SessionEntry {
-                    expires_at: Instant::now() + self.ttl,
-                    risk: SessionRisk::default(),
-                    flow: FlowLabels::default(),
-                    tool_requirements: None,
-                    tenant_id: tenant_id.to_string(),
-                },
-            );
-            return id;
+        if map.len() >= cap {
+            self.report_saturation(cap, "global");
+            return SessionMint::Saturated;
+        }
+        let tenant_live = map.values().filter(|e| e.tenant_id == tenant_id).count();
+        if tenant_live >= tenant_cap {
+            self.report_saturation(tenant_cap, "tenant");
+            return SessionMint::Saturated;
         }
 
-        let first_time_this_episode = !map.contains_key(OVERFLOW_SESSION_ID);
-        if first_time_this_episode && !self.saturated.swap(true, Ordering::Relaxed) {
+        let id = uuid::Uuid::new_v4().to_string();
+        map.insert(
+            id.clone(),
+            SessionEntry {
+                expires_at: Instant::now() + self.ttl,
+                risk: SessionRisk::default(),
+                flow: FlowLabels::default(),
+                tool_requirements: None,
+                tenant_id: tenant_id.to_string(),
+            },
+        );
+        SessionMint::Minted(id)
+    }
+
+    /// Log (once per store) and record the saturation metric for a
+    /// refused mint. `scope` is `"global"` or `"tenant"`, naming which
+    /// cap refused it, for the one log line only -- the metric and the
+    /// wire-visible refusal both stay a single closed reason
+    /// (`session_registry_saturated`) regardless of which cap tripped,
+    /// since the caller-visible behavior (refused, try again later) is
+    /// identical either way.
+    fn report_saturation(&self, cap: usize, scope: &'static str) {
+        if !self.saturated.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 target: "sbproxy::mcp::sessions",
-                max_sessions = cap,
-                "mcp session registry is full; new sessions share a fallback session"
+                scope,
+                cap,
+                "mcp session registry is full; refusing to mint a new session"
             );
         }
         sbproxy_observe::metrics::record_mcp_session_registry_saturated();
-        let entry = map
-            .entry(OVERFLOW_SESSION_ID.to_string())
-            .or_insert_with(|| SessionEntry {
-                expires_at: Instant::now() + self.ttl,
-                risk: SessionRisk::default(),
-                flow: FlowLabels {
-                    integrity: SessionIntegrity::Tainted,
-                    sensitive_touched: true,
-                },
-                tool_requirements: None,
-                tenant_id: tenant_id.to_string(),
-            });
-        entry.expires_at = Instant::now() + self.ttl;
-        OVERFLOW_SESSION_ID.to_string()
     }
 
     /// Attach the rollout plane's per-session version requirements
-    /// (`{tool: semver range}`) to a live session. True on success;
-    /// false when the session is unknown or expired. Renews the
-    /// sliding TTL like every other successful access.
-    pub fn set_tool_requirements(&self, id: &str, reqs: HashMap<String, String>) -> bool {
+    /// (`{tool: semver range}`) to a live session bound to `tenant_id`.
+    /// True on success; false when the session is unknown, expired, or
+    /// minted for a different tenant (WOR-2384, I3 fix round 2: tenant
+    /// checked here too, matching every other per-session write, even
+    /// though the one production call site only ever presents the
+    /// tenant's own just-minted id). Renews the sliding TTL like every
+    /// other successful access; a tenant mismatch renews nothing,
+    /// matching [`Self::validate`]'s no-side-effect-on-mismatch rule.
+    pub fn set_tool_requirements(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        reqs: HashMap<String, String>,
+    ) -> bool {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         match map.get_mut(id) {
             Some(entry) if entry.expires_at > Instant::now() => {
+                if entry.tenant_id != tenant_id {
+                    // No side effect on a mismatch, matching
+                    // `validate()`: the entry is not removed and its
+                    // TTL is not renewed, it just is not this caller's
+                    // to write.
+                    return false;
+                }
                 entry.expires_at = Instant::now() + self.ttl;
                 entry.tool_requirements = Some(std::sync::Arc::new(reqs));
                 true
@@ -573,7 +628,7 @@ mod tests {
     #[test]
     fn create_then_validate_then_end() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         assert!(store.validate(&id, "acme").is_valid());
         assert!(store.end(&id, "acme").is_valid());
         assert!(
@@ -593,7 +648,7 @@ mod tests {
     #[test]
     fn expired_session_is_invalid_and_pruned() {
         let store = SessionStore::new(Duration::from_millis(10));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         std::thread::sleep(Duration::from_millis(30));
         assert!(!store.validate(&id, "acme").is_valid());
         assert!(store.is_empty(), "expired entries must be pruned");
@@ -602,7 +657,7 @@ mod tests {
     #[test]
     fn validate_renews_the_sliding_ttl() {
         let store = SessionStore::new(Duration::from_millis(80));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         for _ in 0..4 {
             std::thread::sleep(Duration::from_millis(40));
             assert!(
@@ -615,8 +670,8 @@ mod tests {
     #[test]
     fn ids_are_unique_and_ascii() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let a = store.create("acme");
-        let b = store.create("acme");
+        let a = store.create("acme").minted().expect("mint below the cap");
+        let b = store.create("acme").minted().expect("mint below the cap");
         assert_ne!(a, b);
         assert!(a.is_ascii());
         assert_eq!(store.len(), 2);
@@ -625,7 +680,7 @@ mod tests {
     #[test]
     fn risk_accumulates_within_one_live_session() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         let first = store
             .record_risk(
                 &id,
@@ -654,10 +709,10 @@ mod tests {
     #[test]
     fn tool_requirements_roundtrip() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         assert!(store.tool_requirements(&id).is_none());
         let reqs = std::collections::HashMap::from([("search".to_string(), "^1".to_string())]);
-        assert!(store.set_tool_requirements(&id, reqs.clone()));
+        assert!(store.set_tool_requirements(&id, "acme", reqs.clone()));
         let got = store.tool_requirements(&id).expect("live session");
         assert_eq!(got.as_ref(), &reqs);
     }
@@ -667,6 +722,7 @@ mod tests {
         let store = SessionStore::new(Duration::from_secs(60));
         assert!(!store.set_tool_requirements(
             "nope",
+            "acme",
             std::collections::HashMap::from([("a".to_string(), "^1".to_string())])
         ));
         assert!(store.tool_requirements("nope").is_none());
@@ -678,7 +734,7 @@ mod tests {
     #[test]
     fn flow_labels_default_to_trusted_and_not_sensitive_touched() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         let labels = store.flow_labels(&id).expect("live session");
         assert_eq!(labels.integrity, SessionIntegrity::Trusted);
         assert!(!labels.sensitive_touched);
@@ -687,7 +743,7 @@ mod tests {
     #[test]
     fn taint_flips_integrity_and_reports_the_transition() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
 
         let first = store.taint(&id).expect("live session");
         assert_eq!(first.labels.integrity, SessionIntegrity::Tainted);
@@ -707,7 +763,7 @@ mod tests {
     #[test]
     fn mark_sensitive_touched_flips_the_label_and_reports_the_transition() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
 
         let first = store.mark_sensitive_touched(&id).expect("live session");
         assert!(first.labels.sensitive_touched);
@@ -730,7 +786,7 @@ mod tests {
     #[test]
     fn taint_is_sticky_across_later_reads() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         store.taint(&id).expect("live session");
 
         // Reading the labels several more times must never observe a
@@ -745,7 +801,7 @@ mod tests {
     #[test]
     fn sensitive_touched_is_sticky_across_later_reads() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         store.mark_sensitive_touched(&id).expect("live session");
 
         for _ in 0..3 {
@@ -761,7 +817,7 @@ mod tests {
         // tainted, ends up with both flipped, not just the last one
         // applied.
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("acme");
+        let id = store.create("acme").minted().expect("mint below the cap");
         store.mark_sensitive_touched(&id).expect("live session");
         store.taint(&id).expect("live session");
 
@@ -776,7 +832,7 @@ mod tests {
         assert!(store.taint("nope").is_none());
 
         let short = SessionStore::new(Duration::from_millis(10));
-        let id = short.create("acme");
+        let id = short.create("acme").minted().expect("mint below the cap");
         std::thread::sleep(Duration::from_millis(30));
         assert!(short.taint(&id).is_none());
     }
@@ -787,7 +843,7 @@ mod tests {
         assert!(store.mark_sensitive_touched("nope").is_none());
 
         let short = SessionStore::new(Duration::from_millis(10));
-        let id = short.create("acme");
+        let id = short.create("acme").minted().expect("mint below the cap");
         std::thread::sleep(Duration::from_millis(30));
         assert!(short.mark_sensitive_touched(&id).is_none());
     }
@@ -801,8 +857,8 @@ mod tests {
         // covered separately by the `validate` tenant-binding tests
         // below.
         let store = SessionStore::new(Duration::from_secs(60));
-        let tenant_a_session = store.create("acme");
-        let tenant_b_session = store.create("acme");
+        let tenant_a_session = store.create("acme").minted().expect("mint below the cap");
+        let tenant_b_session = store.create("acme").minted().expect("mint below the cap");
 
         store.taint(&tenant_a_session).expect("live session");
         store
@@ -830,7 +886,10 @@ mod tests {
     #[test]
     fn a_session_validates_only_for_the_tenant_it_was_minted_for() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         assert_eq!(store.validate(&id, "tenant-a"), SessionValidation::Valid);
     }
 
@@ -839,7 +898,10 @@ mod tests {
         // This is the adversarial case the mint-time binding exists to
         // close: tenant B guesses or replays tenant A's session id.
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         assert_eq!(
             store.validate(&id, "tenant-b"),
             SessionValidation::TenantMismatch,
@@ -855,7 +917,10 @@ mod tests {
         // wants the pass/fail bit (the generic 404 both cases map to
         // at the HTTP boundary).
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         assert!(!store.validate(&id, "tenant-b").is_valid());
         assert!(!store.validate("does-not-exist", "tenant-b").is_valid());
     }
@@ -868,7 +933,10 @@ mod tests {
         // nor deletes it (which would let an attacker end another
         // tenant's session by guessing its id).
         let store = SessionStore::new(Duration::from_millis(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(
             store.validate(&id, "tenant-b"),
@@ -893,8 +961,14 @@ mod tests {
     #[test]
     fn two_tenants_each_validate_only_their_own_session() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let a = store.create("tenant-a");
-        let b = store.create("tenant-b");
+        let a = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
+        let b = store
+            .create("tenant-b")
+            .minted()
+            .expect("mint below the cap");
         assert_eq!(store.validate(&a, "tenant-a"), SessionValidation::Valid);
         assert_eq!(
             store.validate(&a, "tenant-b"),
@@ -917,7 +991,10 @@ mod tests {
         // entry -- the rightful tenant must still be able to validate
         // it afterward.
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         assert_eq!(
             store.end(&id, "tenant-b"),
             SessionValidation::TenantMismatch
@@ -932,7 +1009,10 @@ mod tests {
         // non-owning tenant must not be able to trigger by guessing an
         // id and calling DELETE.
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         store.taint(&id).expect("live session");
         store.mark_sensitive_touched(&id).expect("live session");
 
@@ -953,7 +1033,10 @@ mod tests {
         // same `is_valid() == false` a caller checking only the bool
         // shape would see.
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         assert!(!store.end(&id, "tenant-b").is_valid());
         assert!(!store.end("does-not-exist", "tenant-b").is_valid());
     }
@@ -961,7 +1044,10 @@ mod tests {
     #[test]
     fn the_rightful_tenant_can_still_end_their_own_session() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         assert_eq!(store.end(&id, "tenant-a"), SessionValidation::Valid);
         assert_eq!(
             store.validate(&id, "tenant-a"),
@@ -970,91 +1056,130 @@ mod tests {
         );
     }
 
-    // --- Bounded session registry (WOR-2384, I3 fix round) ---
+    // --- Bounded session registry (WOR-2384, I3 fix round 2: fail
+    // closed, no shared overflow session) ---
 
     #[test]
-    fn mints_past_the_cap_share_the_overflow_session_instead_of_growing_unbounded() {
-        // Mirrors `peer_profile`'s and `evidence_seq`'s own overflow
+    fn mints_below_both_caps_succeed_independently() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let (cap, tenant_cap) = (8, 8);
+        let a = store
+            .create_capped("tenant-a", cap, tenant_cap)
+            .minted()
+            .expect("below both caps");
+        let b = store
+            .create_capped("tenant-a", cap, tenant_cap)
+            .minted()
+            .expect("below both caps");
+        assert_ne!(a, b);
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn a_mint_past_the_global_cap_is_refused_and_mints_nothing() {
+        // Mirrors `peer_profile`'s and `evidence_seq`'s own capped
         // tests: exercises `create_capped` directly against a small
         // throwaway cap rather than filling the real 4096-entry store.
         let store = SessionStore::new(Duration::from_secs(60));
-        let cap = 2;
+        let (cap, tenant_cap) = (2, 100);
+        store.create_capped("tenant-a", cap, tenant_cap);
+        store.create_capped("tenant-b", cap, tenant_cap);
 
-        let a = store.create_capped("tenant-a", cap);
-        let b = store.create_capped("tenant-a", cap);
-        assert_ne!(a, b, "both mints below the cap must get independent ids");
-
-        // The store is now at the cap. A third mint shares the
-        // overflow session rather than getting a third independent id.
-        let c = store.create_capped("tenant-a", cap);
-        assert_eq!(c, "\u{0}sbproxy-mcp-session-overflow");
-        assert_ne!(c, a);
-        assert_ne!(c, b);
-
-        // A fourth mint, even for the same tenant, shares the exact
-        // same overflow session -- the map must not keep growing.
-        let d = store.create_capped("tenant-a", cap);
-        assert_eq!(d, c);
+        assert_eq!(
+            store.create_capped("tenant-c", cap, tenant_cap),
+            SessionMint::Saturated,
+            "a third tenant must be refused once the global cap is hit"
+        );
+        assert_eq!(
+            store.len(),
+            2,
+            "a refused mint must not insert anything, shared or otherwise"
+        );
     }
 
     #[test]
-    fn the_overflow_session_starts_at_the_flow_guardrails_most_restrictive_labels() {
+    fn a_mint_past_the_tenant_sub_cap_is_refused_while_other_tenants_are_unaffected() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let cap = 1;
-        store.create_capped("tenant-a", cap); // fills the one real slot
-        let overflow_id = store.create_capped("tenant-a", cap);
+        let (cap, tenant_cap) = (100, 2);
+        store.create_capped("tenant-a", cap, tenant_cap);
+        store.create_capped("tenant-a", cap, tenant_cap);
 
-        let labels = store
-            .flow_labels(&overflow_id)
-            .expect("overflow session is itself a live session");
         assert_eq!(
-            labels.integrity,
-            SessionIntegrity::Tainted,
-            "an overflow session must fail closed on the integrity leg"
+            store.create_capped("tenant-a", cap, tenant_cap),
+            SessionMint::Saturated,
+            "tenant-a is at its own sub-cap"
         );
         assert!(
-            labels.sensitive_touched,
-            "an overflow session must fail closed on the sensitivity leg"
+            matches!(
+                store.create_capped("tenant-b", cap, tenant_cap),
+                SessionMint::Minted(_)
+            ),
+            "a different tenant, unaffected by tenant-a's sub-cap, must still mint"
         );
     }
 
     #[test]
-    fn only_the_first_tenant_to_claim_the_overflow_session_can_validate_it_again() {
-        // Fail-closed direction: cardinality pressure must not let a
-        // second tenant validate a session id it was handed but that
-        // was actually claimed by whichever tenant minted it first.
+    fn existing_sessions_keep_working_when_the_store_is_saturated() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let cap = 1;
-        store.create_capped("tenant-a", cap); // fills the one real slot
-        let overflow_id = store.create_capped("tenant-a", cap);
-        // A different tenant's mint returns the same id (nothing else
-        // to hand out), but does not reassign the entry's tenant.
-        let same_overflow_id = store.create_capped("tenant-b", cap);
-        assert_eq!(overflow_id, same_overflow_id);
+        let (cap, tenant_cap) = (1, 100);
+        let pre_existing = store
+            .create_capped("tenant-a", cap, tenant_cap)
+            .minted()
+            .expect("fills the one global slot");
 
         assert_eq!(
-            store.validate(&overflow_id, "tenant-a"),
-            SessionValidation::Valid,
-            "the tenant that first claimed the overflow slot must still be able to use it"
+            store.create_capped("tenant-b", cap, tenant_cap),
+            SessionMint::Saturated
         );
+
+        // The pre-existing session is untouched: still validates, still
+        // renews its TTL, still carries its own flow labels -- nothing
+        // about refusing a *new* mint reaches back into what already
+        // exists.
         assert_eq!(
-            store.validate(&overflow_id, "tenant-b"),
-            SessionValidation::TenantMismatch,
-            "a later tenant sharing the overflow slot must not be able to validate it"
+            store.validate(&pre_existing, "tenant-a"),
+            SessionValidation::Valid
         );
+        let transition = store.taint(&pre_existing).expect("still live");
+        assert!(transition.transitioned);
     }
 
     #[test]
-    fn a_flood_of_mints_never_grows_the_map_past_the_cap_plus_the_overflow_slot() {
+    fn a_flood_of_mints_never_grows_the_map_past_the_cap() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let cap = 8;
+        let (cap, tenant_cap) = (8, 100);
         for i in 0..cap * 10 {
-            store.create_capped(&format!("tenant-{i}"), cap);
+            store.create_capped(&format!("tenant-{i}"), cap, tenant_cap);
         }
         assert_eq!(
             store.len(),
-            cap + 1,
-            "cap real sessions plus exactly one shared overflow session, regardless of flood size"
+            cap,
+            "exactly the cap's worth of sessions survive a flood of distinct-tenant mints, \
+             none shared, none silently dropped past the cap"
         );
+    }
+
+    #[test]
+    fn set_tool_requirements_is_tenant_checked() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
+        assert!(!store.set_tool_requirements(
+            &id,
+            "tenant-b",
+            HashMap::from([("search".to_string(), "^1".to_string())])
+        ));
+        assert!(
+            store.tool_requirements(&id).is_none(),
+            "a cross-tenant write must not land"
+        );
+        assert!(store.set_tool_requirements(
+            &id,
+            "tenant-a",
+            HashMap::from([("search".to_string(), "^1".to_string())])
+        ));
+        assert!(store.tool_requirements(&id).is_some());
     }
 }

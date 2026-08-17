@@ -4357,15 +4357,22 @@ pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static st
         .inc();
 }
 
-/// Record one MCP session mint that overflowed the per-store
-/// `MAX_TRACKED_SESSIONS` cap and shared the fallback overflow session
-/// instead of getting a dedicated one
-/// (`sbproxy_mcp_session_registry_saturated_total`, WOR-2384, I3 fix
-/// round). No labels: the tenant that caused it is exactly the
+/// Record one `initialize` refused because the session registry was
+/// full, either globally (`MAX_TRACKED_SESSIONS`) or for the caller's
+/// tenant (`MAX_TRACKED_SESSIONS_PER_TENANT`)
+/// (`sbproxy_mcp_session_registry_saturated_total`, WOR-2384; meaning
+/// changed by the F1/F2 fix round from "shared the fallback overflow
+/// session" to this fail-closed refusal once that fallback session
+/// was removed). No labels: the tenant that caused it is exactly the
 /// caller-controlled string the cap exists to bound, so it cannot
 /// appear as a label value without recreating the unbounded
 /// cardinality the cap is closing off -- same reasoning
-/// `record_evidence_seq_tenant_cap` documents for its own cap.
+/// `record_evidence_seq_tenant_cap` documents for its own cap. Which
+/// of the two caps tripped is on the `sbproxy::mcp::sessions`
+/// `tracing::warn!` line only; the caller-visible refusal, the
+/// `security_audit` entry, and this counter all stay one closed
+/// reason (`mcp_session_registry_saturated`) regardless, since the
+/// caller-visible behavior is identical either way.
 pub fn record_mcp_session_registry_saturated() {
     use prometheus::{register_int_counter, IntCounter};
     use std::sync::OnceLock;
@@ -4373,7 +4380,7 @@ pub fn record_mcp_session_registry_saturated() {
     let counter = C.get_or_init(|| {
         register_int_counter!(
             "sbproxy_mcp_session_registry_saturated_total",
-            "MCP session mints that overflowed the per-store session cap and shared the fallback session",
+            "MCP session mints refused because the session registry was at capacity, globally or for the caller's tenant",
         )
         .expect("mcp session registry saturated counter registers")
     });

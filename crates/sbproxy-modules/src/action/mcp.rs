@@ -6188,7 +6188,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let outcome =
             action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv");
         assert!(outcome.newly_tainted);
@@ -6213,7 +6215,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let outcome = action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -6241,7 +6245,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let outcome = action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -6266,7 +6272,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -6298,7 +6306,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -6335,7 +6345,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let outcome =
             action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv");
         assert!(outcome.newly_tainted);
@@ -6357,7 +6369,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         // No sensitivity setup at all in `pair_rule_flow_cfg` -- taint
         // alone must still trip under the explicit `taint_and_outbound`
         // rule.
@@ -6380,7 +6394,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let verdict =
             action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
         assert_eq!(verdict, McpFlowVerdict::Allow);
@@ -6393,7 +6409,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let outcome = action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "trusted-srv");
         assert!(!outcome.newly_tainted);
         assert!(!outcome.newly_sensitive);
@@ -6413,7 +6431,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         assert!(
             action
                 .flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv")
@@ -6445,7 +6465,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         assert!(
             action
                 .flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv")
@@ -6466,7 +6488,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         assert!(
             action
                 .flow_record_entry(
@@ -6503,7 +6527,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         // Served by a *trusted* server (no taint), but the tool itself
         // is declared sensitive.
         let outcome =
@@ -6530,7 +6556,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         // `tool_name: None` (a `resources/read`): even though
         // `untrusted-srv` taints, `sensitive_tools` has nothing to
         // match against without a tool name, and `untrusted-srv` is not
@@ -6547,7 +6575,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         let outcome = action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -6567,7 +6597,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
         action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -6640,8 +6672,14 @@ allow := false if {
         // isolation).
         let action = flow_action(pair_rule_flow_cfg(), true);
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let tenant_a_session = store.create("tenant-a");
-        let tenant_b_session = store.create("tenant-b");
+        let tenant_a_session = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
+        let tenant_b_session = store
+            .create("tenant-b")
+            .minted()
+            .expect("mint below the cap");
 
         action.flow_record_entry(Some(&tenant_a_session), Some("fetch_doc"), "untrusted-srv");
 
@@ -6691,7 +6729,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
 
         let allow = action.evaluate_argument_policies(
             &principal_for("acme"),
@@ -6769,7 +6809,9 @@ allow := false if {
             .sessions
             .as_ref()
             .expect("sessions enabled")
-            .create("acme");
+            .create("acme")
+            .minted()
+            .expect("mint below the cap");
 
         let allow = action.evaluate_argument_policies(
             &principal_for("acme"),

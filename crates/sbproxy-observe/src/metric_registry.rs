@@ -2226,7 +2226,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &[],
-        description: "MCP session mints that overflowed the per-store session cap and shared the fallback session.",
+        description: "MCP session mints refused because the session registry was at capacity, globally or for the caller's tenant.",
         dead_reason: None,
     },
     MetricCapability {

@@ -211,8 +211,9 @@ origins:
 
       # The seam response_filter never reaches: MCP writes its own
       # response outside the generic HTTP body-filter phase. Runs
-      # against tool-call arguments on the way out and tool-call
-      # results on the way back, before either reaches the upstream
+      # against tool-call arguments on the way out, tool-call
+      # results on the way back, and resources/read and prompts/get
+      # results too, before any of them reaches the upstream server
       # or the caller.
       content_filters:
         secrets: redact

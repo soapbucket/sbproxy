@@ -18,7 +18,7 @@ It is also opinionated on purpose. `mode: block` where the docs default to `warn
 - `federated_servers[].protocol` / `.downgrade` - pin a server to a known protocol era, or let the gateway remember the strongest era and auth posture an upstream has shown and flag or refuse a later contact that looks weaker.
 - `argument_policies` - a CEL or Rego expression evaluated against the parsed tool-call arguments, after RBAC and JSON-Schema validation, before dispatch. `false` is a violation.
 - `flow` - Meta's Rule of Two. A session that has touched an untrusted, sensitive source and then tries an outbound call is refused, even though every individual call along the way was itself allowed.
-- `content_filters` - the secret and PII detector catalog, run against tool-call arguments on the way out and tool-call results on the way back. `response_filter` never sees this traffic; MCP writes its own response outside that phase.
+- `content_filters` - the secret and PII detector catalog, run against tool-call arguments on the way out, tool-call results on the way back, and `resources/read` and `prompts/get` results too. `response_filter` never sees any of this traffic; MCP writes its own response outside that phase.
 - `mcp_audit.capture_arguments` - opt-in, redacted, size-bounded verbatim arguments on every governance record, refused or dispatched. See the privacy note near the bottom before you turn this on for real.
 - `events.fail_closed: [mcp_governance_decision]` - if the evidence record for a governed decision cannot be queued, the call it describes is refused rather than served with no evidence behind it.
 
@@ -225,7 +225,7 @@ One line per decision, RBAC deny, argument-policy deny, flow deny, draft deny, c
 
 ## Privacy note on `mcp_audit.capture_arguments`
 
-This example turns it on. Every tool-invocation record in `mcp-governance-events.ndjson`, not just the refused ones, carries `gen_ai.tool.call.arguments`: the call's arguments, redacted through the same secret-pattern scrub `content_filters` uses and capped at 8 KiB. That redaction pass recognizes credential shapes. It does not recognize your customers' names, case numbers, or anything else that is sensitive only because of what your business does with it, which is exactly what shows up in `crm.echo`'s `message` argument in the scenarios above.
+This example turns it on. Every tool-invocation record in `mcp-governance-events.ndjson`, not just the refused ones, carries `gen_ai.tool.call.arguments`: the call's arguments, redacted through the same `content_filters` pass this config runs and capped at 8 KiB. A category only mutates the match out of the captured text when its mode is `redact`, not `warn`. This config sets `secrets: redact` but `pii: warn`, so the credential shape from the earlier scenario is scrubbed from this record too, while your customers' names, case numbers, or anything else that is sensitive only because of what your business does with it, is not, which is exactly what shows up in `crm.echo`'s `message` argument in the scenarios above. Set `content_filters.pii: redact` if you want that caught here as well.
 
 Turning this on is a real decision, not a default you should inherit from an example. Look at what your own tools actually receive before you flip it in production, and remember that with a webhook sink instead of the file sink used here, those bytes leave your network.
 

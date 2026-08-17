@@ -661,6 +661,24 @@ does not confirm the id belongs to someone) and audited as
 practice -- session ids were opaque per-deployment UUIDs before -- so turning
 it on cannot change behavior for an existing legitimate config.
 
+Session establishment is capacity-bounded too, per tenant and globally: a
+live entry costs registry memory for as long as its TTL, so an unbounded
+mint is a denial-of-service surface in its own right, and one tenant
+minting sessions without bound should not be able to crowd out another's.
+`initialize` refuses to mint a session once the caller's tenant already
+holds 256 live sessions, or the registry holds 4096 across every tenant,
+with an explicit JSON-RPC error rather than a `200` carrying no
+`Mcp-Session-Id` header, so a caller cannot mistake refusal for silent
+statelessness. The refusal is audited as `mcp_session_registry_saturated`
+via `security_audit` rather than a `mcp_governance_decision` event --
+`initialize` is never itself a `tools/call`, the boundary that event stays
+scoped to throughout this page -- and counted on
+`sbproxy_mcp_session_registry_saturated_total`. Neither cap touches an
+existing session: one already minted keeps working and renewing its TTL on
+every request exactly as before, and every other tenant's headroom is
+unaffected; only the establishment of a *new* session, for a tenant or a
+registry that is already full, is refused.
+
 And a tool-call *result* can carry another tenant's data through an upstream
 that itself mixes tenants; `content_filters` (see "Credentials reaching a tool
 that should not see them" above) and `result_policies[]` (see "A permitted tool

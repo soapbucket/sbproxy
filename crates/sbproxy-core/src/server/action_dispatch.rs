@@ -2792,25 +2792,87 @@ pub(super) async fn handle_mcp_action(
             // enabled. The id rides back on the Mcp-Session-Id
             // response header, per the streamable HTTP transport.
             if let Some(store) = mcp.sessions.as_deref() {
-                issued_session = Some(store.create(ctx.tenant_id.as_str()));
-                // Rollout plane, session rung: requirements declared
-                // once at initialize apply to every later request on
-                // this session.
-                if mcp.rollout_plan.is_some() {
-                    let declared = request
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("_meta"))
-                        .and_then(|m| m.get(sbproxy_extension::mcp::rollout::META_REQUIREMENTS_KEY))
-                        .and_then(|v| v.as_object());
-                    if let (Some(reqs), Some(sid)) = (declared, issued_session.as_deref()) {
-                        let map: std::collections::HashMap<String, String> = reqs
-                            .iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect();
-                        if !map.is_empty() {
-                            store.set_tool_requirements(sid, map);
+                match store.create(ctx.tenant_id.as_str()) {
+                    sbproxy_extension::mcp::sessions::SessionMint::Minted(id) => {
+                        issued_session = Some(id);
+                        // Rollout plane, session rung: requirements
+                        // declared once at initialize apply to every
+                        // later request on this session.
+                        if mcp.rollout_plan.is_some() {
+                            let declared = request
+                                .params
+                                .as_ref()
+                                .and_then(|p| p.get("_meta"))
+                                .and_then(|m| {
+                                    m.get(sbproxy_extension::mcp::rollout::META_REQUIREMENTS_KEY)
+                                })
+                                .and_then(|v| v.as_object());
+                            if let (Some(reqs), Some(sid)) = (declared, issued_session.as_deref()) {
+                                let map: std::collections::HashMap<String, String> = reqs
+                                    .iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect();
+                                if !map.is_empty() {
+                                    store.set_tool_requirements(sid, ctx.tenant_id.as_str(), map);
+                                }
+                            }
                         }
+                    }
+                    // WOR-2384 (I3 fix round 2): fail closed rather
+                    // than fix round 1's shared-overflow-session
+                    // design, which a review found two real bugs in --
+                    // the shared id's leading NUL byte was silently
+                    // rejected by the header encoder, so a saturated
+                    // registry returned 200 with no Mcp-Session-Id
+                    // header at all, and `set_tool_requirements` had
+                    // no tenant check, so a different tenant sharing
+                    // the overflow slot could write onto it. A
+                    // saturated registry now refuses to establish a
+                    // session at all: an explicit JSON-RPC error the
+                    // client can act on, never a silent, malformed
+                    // success. Every other tenant, and this tenant's
+                    // own already-live sessions, are unaffected --
+                    // `SessionStore::create` mutated nothing on this
+                    // path.
+                    sbproxy_extension::mcp::sessions::SessionMint::Saturated => {
+                        tracing::warn!(
+                            target: "sbproxy::mcp::sessions",
+                            tenant = %ctx.tenant_id,
+                            "MCP initialize refused: session registry is saturated",
+                        );
+                        sbproxy_observe::metrics::record_policy(
+                            ctx.hostname.as_str(),
+                            "mcp_session_registry",
+                            "deny",
+                        );
+                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                            "mcp_session_registry_saturated",
+                            "mcp session registry is at capacity; refusing to establish a new session",
+                            200,
+                            Some(ctx.hostname.to_string()),
+                            ctx.client_ip,
+                            Some(ctx.request_id.to_string()),
+                            Some(session.req_header().method.as_str().to_string()),
+                        )
+                        .with_tenant_id(ctx.tenant_id.to_string())
+                        .emit();
+                        let response = JsonRpcResponse::error(
+                            request.id.clone(),
+                            INTERNAL_ERROR,
+                            "mcp session registry is at capacity; refusing to establish a new \
+                             session (session_registry_saturated)",
+                        );
+                        return write_mcp_application_response(
+                            session,
+                            &response,
+                            &request_id,
+                            &rpc_method,
+                            modern_server.as_ref(),
+                            None,
+                        )
+                        .await;
                     }
                 }
             }
@@ -4940,6 +5002,30 @@ pub(super) async fn handle_mcp_action(
                                 // independently redacting and hashing
                                 // the same tool-argument bytes under the
                                 // same salt.
+                                //
+                                // WOR-2384 (I4 fix round, F3): the input
+                                // here is `bound_mcp_audit_field`'s
+                                // output only -- `redact_secrets` plus
+                                // the size cap, never `content_filters`
+                                // -- deliberately, so this hash stays
+                                // one stable cross-record correlation
+                                // key between this line and the
+                                // governance event's
+                                // `sbproxy.tool.arguments_hash`
+                                // regardless of `content_filters`
+                                // configuration. Hashing after
+                                // `content_filters` too would make the
+                                // same call's hash differ depending on
+                                // whether that block is configured,
+                                // breaking the one property this shared
+                                // computation exists for. The
+                                // governance event's *separate* verbatim
+                                // `gen_ai.tool.call.arguments` field
+                                // (opt-in via `mcp_audit.capture_arguments`,
+                                // built by `governance_tool_arguments_field`)
+                                // is the one that also runs
+                                // `content_filters` -- see that
+                                // function's doc comment.
                                 let tool_arguments_hash = mcp_audit_capture.as_ref().map(|cap| {
                                     sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json))
                                 });
@@ -5786,12 +5872,20 @@ struct McpAuditCapture {
 /// something this event carries today.
 ///
 /// `precomputed_tool_arguments_hash`: WOR-2384's governance evidence
-/// event hashes these exact same redacted argument bytes under the
-/// same salt (see `sha256_hex_prefix`'s doc comment). The call site
-/// computes that digest once and passes it here so this line and that
-/// event agree on one value rather than each hashing independently;
-/// `None` falls back to hashing locally, which keeps this function
-/// correct on its own for any caller that has not done that work.
+/// event carries this same digest as `sbproxy.tool.arguments_hash`,
+/// computed from `bound_mcp_audit_field`'s output -- `redact_secrets`
+/// plus the size cap, never `content_filters` -- under the same salt
+/// (see `sha256_hex_prefix`'s doc comment). The call site computes
+/// that digest once and passes it here so this line and that event
+/// agree on one value rather than each hashing independently; `None`
+/// falls back to hashing locally, which keeps this function correct
+/// on its own for any caller that has not done that work. The hash
+/// input is deliberately narrower than the governance event's
+/// separate, opt-in verbatim `gen_ai.tool.call.arguments` field
+/// (`governance_tool_arguments_field`), which additionally runs
+/// `content_filters` -- keeping the hash off that pipeline means it
+/// stays a stable correlation key between this line and that event
+/// regardless of whether `content_filters` is configured.
 fn emit_mcp_prompt_audit(
     ctx: &RequestContext,
     tool_name: &str,
@@ -9670,6 +9764,132 @@ mod mcp_catalog_snapshot_tests {
         .expect("MCP JSON response")
     }
 
+    /// WOR-2384 (F1/F2 fix round 2): crosses the wire boundary that
+    /// `sbproxy_extension::mcp::sessions`'s own store-level tests only
+    /// reach as far as `SessionStore::create_capped` returning
+    /// `SessionMint::Saturated`. Drives a real `initialize` through
+    /// `handle_mcp_action` once the registry is at its global cap and
+    /// checks the two properties fix round 1's shared-overflow-session
+    /// design got wrong: an explicit JSON-RPC `error`, never a
+    /// `result`, and no `Mcp-Session-Id` response header at all
+    /// (fix round 1 minted a NUL-prefixed shared id the header encoder
+    /// silently dropped, so a saturated registry answered `200` with a
+    /// normal-looking `InitializeResult` body and no header a client
+    /// could act on).
+    #[tokio::test]
+    async fn initialize_is_refused_with_an_explicit_error_when_the_registry_is_globally_saturated()
+    {
+        async fn raw_initialize_exchange(action: &McpAction, request: serde_json::Value) -> String {
+            let body = serde_json::to_vec(&request).expect("MCP request JSON");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind MCP downstream fixture");
+            let address = listener.local_addr().expect("MCP downstream address");
+            let client = tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connect MCP downstream fixture");
+                let headers = format!(
+                    "POST / HTTP/1.1\r\nHost: mcp.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("write MCP request headers");
+                stream
+                    .write_all(&body)
+                    .await
+                    .expect("write MCP request body");
+                let _ = stream.shutdown().await;
+                let mut response = Vec::new();
+                stream
+                    .read_to_end(&mut response)
+                    .await
+                    .expect("read MCP response");
+                response
+            });
+            let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+            let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+            session
+                .as_downstream_mut()
+                .read_request()
+                .await
+                .expect("parse MCP downstream request");
+            let mut context = RequestContext::new();
+
+            handle_mcp_action(&mut session, action, &mut context, false)
+                .await
+                .expect("MCP handler response");
+            drop(session);
+
+            let response = tokio::time::timeout(Duration::from_secs(2), client)
+                .await
+                .expect("MCP response timeout")
+                .expect("MCP downstream task");
+            String::from_utf8(response).expect("MCP HTTP response UTF-8")
+        }
+
+        let action = session_delete_fixture();
+        let store = action.sessions.as_ref().expect("sessions enabled");
+
+        // Fill the GLOBAL cap across many distinct tenants, none of
+        // which individually reaches its own per-tenant sub-cap --
+        // this proves the global backstop itself refuses a session
+        // for a tenant ("__default__", the context these raw
+        // exchanges use) that has never minted one before, the exact
+        // case fix round 1's shared-overflow-session design mishandled.
+        let tenants_needed = sbproxy_extension::mcp::sessions::MAX_TRACKED_SESSIONS
+            / sbproxy_extension::mcp::sessions::MAX_TRACKED_SESSIONS_PER_TENANT;
+        for tenant_index in 0..tenants_needed {
+            let tenant = format!("wire-saturation-tenant-{tenant_index}");
+            for _ in 0..sbproxy_extension::mcp::sessions::MAX_TRACKED_SESSIONS_PER_TENANT {
+                assert!(
+                    matches!(
+                        store.create(&tenant),
+                        sbproxy_extension::mcp::sessions::SessionMint::Minted(_)
+                    ),
+                    "priming the registry to its global cap must not itself refuse a mint"
+                );
+            }
+        }
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "wire-boundary-test", "version": "1.0.0"}
+            }
+        });
+        let raw = raw_initialize_exchange(&action, request).await;
+        let (head, body) = raw
+            .split_once("\r\n\r\n")
+            .expect("MCP HTTP response head/body split");
+        assert!(
+            !head.to_ascii_lowercase().contains("mcp-session-id"),
+            "a saturated registry must not carry an Mcp-Session-Id header, head was: {head}"
+        );
+        let response: serde_json::Value = serde_json::from_str(body).expect("MCP JSON response");
+        assert!(
+            response.get("result").is_none(),
+            "a saturated registry must not return a successful initialize result: {response}"
+        );
+        let error = response
+            .get("error")
+            .expect("a saturated registry must return a JSON-RPC error");
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .expect("error message");
+        assert!(
+            message.contains("session_registry_saturated"),
+            "error message should name the closed reason, got: {message}"
+        );
+    }
+
     /// A one-shot upstream that answers exactly one JSON-RPC request
     /// with a fixed `result` value, then closes. Mirrors
     /// `sbproxy_extension::mcp::federation`'s own
@@ -9760,7 +9980,10 @@ mod mcp_catalog_snapshot_tests {
         // request never reaches this test's actual subject (the
         // `flow_record_entry` wiring) at all.
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let session_id = store.create("__default__");
+        let session_id = store
+            .create("__default__")
+            .minted()
+            .expect("mint below the cap");
         assert_eq!(
             store
                 .flow_labels(&session_id)
@@ -11995,7 +12218,10 @@ mod mcp_catalog_snapshot_tests {
     async fn a_cross_tenant_delete_leaves_the_session_alive() {
         let action = session_delete_fixture();
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
 
         let mut foreign_ctx = RequestContext::new();
         foreign_ctx.tenant_id = "tenant-b".into();
@@ -12019,7 +12245,10 @@ mod mcp_catalog_snapshot_tests {
     async fn a_cross_tenant_delete_does_not_reset_flow_labels() {
         let action = session_delete_fixture();
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
         store.taint(&id).expect("live session");
         store.mark_sensitive_touched(&id).expect("live session");
 
@@ -12042,7 +12271,10 @@ mod mcp_catalog_snapshot_tests {
     async fn a_cross_tenant_delete_is_audited() {
         let action = session_delete_fixture();
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
 
         let mut foreign_ctx = RequestContext::new();
         foreign_ctx.tenant_id = "audit-probe-tenant-b".into();
@@ -12068,7 +12300,10 @@ mod mcp_catalog_snapshot_tests {
     async fn the_rightful_tenants_delete_still_ends_the_session() {
         let action = session_delete_fixture();
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let id = store.create("tenant-a");
+        let id = store
+            .create("tenant-a")
+            .minted()
+            .expect("mint below the cap");
 
         let mut ctx = RequestContext::new();
         ctx.tenant_id = "tenant-a".into();
