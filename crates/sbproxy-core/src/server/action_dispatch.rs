@@ -3178,7 +3178,22 @@ pub(super) async fn handle_mcp_action(
             // declare no prompts capability contributed nothing at
             // refresh time, so there is nothing here to skip for them.
             let prompt_catalog = mcp.federation.prompt_catalog_snapshot();
-            let prompts = prompt_catalog.list_prompts();
+            // WOR-2384 (MCP09) fix round 4: a `draft` server's prompts
+            // are neither advertised nor gettable, the same treatment
+            // `resources/list` already gives a `draft` server's
+            // resources. `deprecated` and absent status are left
+            // alone here, same as `resources/list`: only `Draft` is
+            // excluded from the listing.
+            let prompts: Vec<_> = prompt_catalog
+                .list_prompts()
+                .into_iter()
+                .filter(|p| {
+                    !matches!(
+                        mcp.server_status(&p.server_name),
+                        sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+                    )
+                })
+                .collect();
             let prompts = match held_modern_tool_catalog.as_ref() {
                 Some(tool_catalog) => {
                     mcp_prompts_view_in_snapshot(mcp, &ctx.principal, &prompts, tool_catalog)
@@ -9219,13 +9234,17 @@ mod mcp_catalog_snapshot_tests {
         );
     }
 
-    /// WOR-2384 (MCP09) fix round 3, item 2a: red-first proof that a
-    /// `draft` server's resources and prompts are gated the same way
-    /// its tools already are, mirroring
+    /// WOR-2384 (MCP09) fix round 3, item 2a (extended in fix round 4
+    /// with the `prompts/list` assertion at the end): red-first proof
+    /// that a `draft` server's resources and prompts are gated the
+    /// same way its tools already are, mirroring
     /// `wor_2384_block_mode_downgrade_refuses_resources_read_and_prompts_get`
     /// above but for approval status instead of peer downgrade. Needs
     /// no protocol-negotiation seeding (unlike that test): `draft` is a
-    /// plain config fact, not an observed peer behavior.
+    /// plain config fact, not an observed peer behavior. Covers all
+    /// four remaining MCP surfaces the review named:
+    /// `resources/list` (hidden), `resources/read` (refused),
+    /// `prompts/get` (refused), `prompts/list` (hidden).
     #[tokio::test]
     async fn wor_2384_draft_server_hides_resources_list_and_refuses_resources_read_and_prompts_get(
     ) {
@@ -9321,6 +9340,23 @@ mod mcp_catalog_snapshot_tests {
         assert!(
             prompt_message.contains("draft") && prompt_message.contains("not yet approved"),
             "prompts/get must be refused, naming the draft status: {prompt_get:?}"
+        );
+
+        // WOR-2384 (MCP09) fix round 4: `prompts/list` gets the same
+        // "hidden from the listing surface" treatment `resources/list`
+        // already has, above.
+        let prompts_list = mcp_handler_exchange(
+            &action,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/list", "params": {}}),
+        )
+        .await;
+        assert!(
+            prompts_list["result"]["prompts"]
+                .as_array()
+                .expect("prompts/list result")
+                .iter()
+                .all(|p| p["name"] != PROMPT_NAME),
+            "a draft server's prompts must be hidden from prompts/list: {prompts_list:?}"
         );
     }
 
