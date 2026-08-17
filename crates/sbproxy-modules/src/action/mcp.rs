@@ -2114,7 +2114,12 @@ fn compile_mcp_argument_policy(
             // `McpArgumentPolicyConfig` today: base-data tables and a
             // non-default query are `policy: rego` features this
             // surface has not needed yet, not a deliberate omission.
-            let compiled = CompiledRego::compile(site, &source, "data.sbproxy.allow", 50, None)?;
+            // `rego_v0: false`: argument/result policies are authored fresh on
+            // this config surface, so they take the v1 dialect Regorus and
+            // OPA 1.0 default to; the legacy-module escape hatch stays a
+            // `policy rego` concern until someone asks for it here.
+            let compiled =
+                CompiledRego::compile(site, &source, "data.sbproxy.allow", 50, None, false)?;
             Box::new(RegoArgumentExpr(Mutex::new(compiled)))
         }
     };
@@ -2365,7 +2370,12 @@ fn compile_mcp_result_policy(
             &source,
         )?),
         McpArgumentPolicyEngineConfig::Rego => {
-            let compiled = CompiledRego::compile(site, &source, "data.sbproxy.allow", 50, None)?;
+            // `rego_v0: false`: argument/result policies are authored fresh on
+            // this config surface, so they take the v1 dialect Regorus and
+            // OPA 1.0 default to; the legacy-module escape hatch stays a
+            // `policy rego` concern until someone asks for it here.
+            let compiled =
+                CompiledRego::compile(site, &source, "data.sbproxy.allow", 50, None, false)?;
             Box::new(RegoArgumentExpr(Mutex::new(compiled)))
         }
     };
@@ -6918,6 +6928,7 @@ allow := false if {
                 panicked: false,
             }
         );
+    }
 
     // --- AiJudge egress gate (WOR-2476) ---
 
