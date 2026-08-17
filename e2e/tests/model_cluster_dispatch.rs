@@ -1030,8 +1030,24 @@ fn managed_cold_fallback_advances_a_non_fallback_router() -> Result<()> {
     Ok(())
 }
 
+/// Cold managed fallback must not launder a multipart body to the external
+/// provider.
+///
+/// This test used to assert the opposite: that a multipart POST to
+/// `/v1/chat/completions` cold-fell-back to the external provider and
+/// succeeded. WOR-2472 removed that behaviour deliberately. A multipart
+/// Content-Type on a classified JSON surface is a caller relabelling their
+/// way around body inspection, so `ai_dispatch` refuses it with 403 before
+/// any budget, guardrail, or upstream work runs.
+///
+/// The managed deployment in this fixture serves a chat model, so chat
+/// completions is the only surface it answers and multipart is never
+/// legitimate on it; there is no "multipart managed fallback" left to
+/// assert. What is worth pinning is that the refusal happens *before*
+/// provider advancement: a cold managed deployment must not be the excuse
+/// that walks an uninspectable body out to a third-party provider.
 #[test]
-fn multipart_managed_cold_fallback_advances_provider() -> Result<()> {
+fn multipart_managed_cold_fallback_is_refused_before_provider_advance() -> Result<()> {
     let upstream = MockUpstream::start(external_chat_reply()).context("fallback upstream")?;
     let cluster =
         ThreeNodeCluster::start_with_policy("fallback", "fallback_chain", Some(upstream), false)?;
@@ -1056,17 +1072,22 @@ fn multipart_managed_cold_fallback_advances_provider() -> Result<()> {
         .send()
         .context("multipart cold fallback")?;
     anyhow::ensure!(
-        response.status().is_success(),
-        "multipart fallback status {}",
+        response.status().as_u16() == 403,
+        "multipart on a JSON surface must be refused, got {}",
         response.status()
+    );
+    let body = response.text().context("refusal body")?;
+    anyhow::ensure!(
+        body.contains("multipart/form-data is not accepted on this AI surface"),
+        "unexpected refusal body: {body}"
     );
     let upstream = cluster
         .fallback_upstream
         .as_ref()
         .context("fallback upstream retained")?;
     anyhow::ensure!(
-        !upstream.captured().is_empty(),
-        "multipart managed fallback did not advance to the external provider"
+        upstream.captured().is_empty(),
+        "a refused multipart request must not advance to the external provider"
     );
     Ok(())
 }
