@@ -211,17 +211,21 @@ see [cache-reserve.md](cache-reserve.md) and [degradation.md](degradation.md).
 ## 9. Logging and the typed event bus
 
 Metrics emission, the structured access log, and event publication close
-out the pipeline. `ProxyEvent` has eleven variants, but the shipped OSS
-binary emits only five from the request path -
-`request_completed`, `request_error`, `auth_denied`, `policy_denied`,
-and `config_reloaded` (the last from the admin plane, not this stage).
-The other six (`request_started`, `cache_hit`, `cache_miss`,
-`provider_selected`, `budget_exceeded`, `guardrail_triggered`) are enum
-variants an embedder can publish; wiring a sink to one of those in the
-OSS build gets you a sink that never fires. Cache and AI accounting
-instead report through `sbproxy_cache_*`/`sbproxy_ai_*` metrics and the
-[usage ledger](ai-usage-ledger.md). See [events.md](events.md) and
-[observability.md](observability.md).
+out the pipeline. `ProxyEvent` has twelve variants; ten of them ship a
+production emitter in the OSS binary today: `request_started`,
+`request_completed`, `request_error` (the `request_events:` lane),
+`auth_denied`, `policy_denied`, `config_reloaded`, `egress_refused`
+(the `events:` lane, bridged from the security, config, and egress
+audit records), and `provider_selected`, `budget_exceeded`,
+`guardrail_triggered` (verdict-level: a provider fallback, a budget
+cap denial, or a guardrail block, never a per-request or per-chunk
+line). `cache_hit` and `cache_miss` are the two enum variants left
+unwired on purpose: firing on every cacheable request would put an
+NDJSON line on every configured `events:` sink per cache lookup. Cache
+admission already reports through `DecisionEvent::CacheAdmit`/`CacheKey`
+and the access log's `cache_status` column; naming either in
+`events.types:` gets a boot warning rather than a silent no-op. See
+[events.md](events.md) and [observability.md](observability.md).
 
 ## Where to attach custom logic: a summary
 
