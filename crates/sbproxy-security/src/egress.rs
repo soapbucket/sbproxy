@@ -1042,6 +1042,23 @@ mod tests {
         );
     }
 
+    /// A deployment that never called `install_egress_refused_hook` at
+    /// all (the OSS default, or any process that boots before
+    /// `sbproxy-core`'s registration line runs) must not panic on a
+    /// refusal. This is the sibling of the test above and deliberately
+    /// does not install a hook itself; nextest gives it its own
+    /// process, so `EGRESS_REFUSED_HOOK` starts unset here regardless
+    /// of what any other test in this file does.
+    #[test]
+    fn record_egress_refused_is_a_no_op_with_no_hook_installed() {
+        record_egress_refused(
+            EgressPurpose::AiProvider,
+            EgressDenied::PrivateAddress,
+            "acme",
+            "openai",
+        );
+    }
+
     #[test]
     fn deny_by_default_rejects_unlisted_purpose_host() {
         let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
