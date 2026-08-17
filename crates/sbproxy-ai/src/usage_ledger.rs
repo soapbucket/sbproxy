@@ -289,7 +289,12 @@ pub fn parse_openai_usage_export(bytes: &[u8]) -> anyhow::Result<Vec<ProviderUsa
                     .clone()
                     .unwrap_or_else(|| "ungrouped".to_string()),
                 requests: result.num_model_requests,
-                total_tokens: result.input_tokens + result.output_tokens,
+                // WOR-2478 review, M9: these two fields come straight off
+                // the provider's own JSON response, not a value this
+                // process ever bounded, so a plain `+` is a panic (debug)
+                // or a silent wrap (release) waiting on whatever number
+                // the provider happens to send.
+                total_tokens: result.input_tokens.saturating_add(result.output_tokens),
             });
         }
     }
@@ -409,14 +414,20 @@ pub fn reconcile_usage(
             entry.event.model.clone(),
         );
         let a = acc.entry(key).or_default();
-        a.ledger_requests += 1;
-        a.ledger_total_tokens += entry.event.total_tokens;
+        // WOR-2478 review, M9: accumulators here fold an unbounded number
+        // of rows, and `row.requests` / `row.total_tokens` come from the
+        // provider's own export; saturating keeps a pathological or
+        // adversarial export from panicking or wrapping the reconcile
+        // report instead of just reporting a very large, correct-enough
+        // number.
+        a.ledger_requests = a.ledger_requests.saturating_add(1);
+        a.ledger_total_tokens = a.ledger_total_tokens.saturating_add(entry.event.total_tokens);
     }
     for row in provider_rows {
         let key = (row.day.clone(), row.model.clone());
         let a = acc.entry(key).or_default();
-        a.provider_requests += row.requests;
-        a.provider_total_tokens += row.total_tokens;
+        a.provider_requests = a.provider_requests.saturating_add(row.requests);
+        a.provider_total_tokens = a.provider_total_tokens.saturating_add(row.total_tokens);
     }
     let rows = acc
         .into_iter()
