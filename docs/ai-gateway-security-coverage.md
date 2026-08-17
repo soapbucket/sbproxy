@@ -34,7 +34,10 @@ does travel is a policy-bucket id, not the key.
 Config: `key_management:` (`pepper`, `crypto.master_key`) plus a
 `credentials:` block (`type: ai_provider`). Signal:
 `sbproxy_inbound_key_requests_total{provider,key_mode,tenant_id,api_key_id}`,
-where `api_key_id` is the secret-free bucket id.
+where `api_key_id` is the secret-free bucket id. Proof:
+`crates/sbproxy-keystore/src/crypto.rs::verify_rejects_wrong_pepper`,
+`::envelope_rejects_wrong_master_and_wrong_record`,
+`::key_crypto_handle_combines_hash_and_envelope`.
 [key-management.md](key-management.md).
 [`examples/ai-dynamic-keys/`](../examples/ai-dynamic-keys/).
 
@@ -43,7 +46,7 @@ where `api_key_id` is the secret-free bucket id.
 Cache keys bind tenant and credential scope through domain-separated
 digests, so a tenant or credential change produces a different namespace
 rather than a collision. Request budgets key by tenant. A panicking tenant
-policy now denies that one request with a 500 instead of taking the process
+policy denies that one request with a 500 instead of taking the process
 down with it.
 
 Config: `tenants:` scope resolution as described in multi-tenant.md. Signal:
@@ -74,14 +77,26 @@ Config: `proxy.observability.log.decision_audit.events.route.decide: true`
 [observability.md](observability.md#one-family-for-every-decision-event),
 [decision-records.md](decision-records.md).
 
-Named limit: eight of the eighteen possible decision events actually
-publish today (`auth`, `cache.admit`, `cache.key`, `route.decide`,
-`ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`,
-plus `policy` under the newer record format). The rest are enum variants
-with no emitter yet. Naming one of those under `events:` fails config load
-rather than accepting it and silently publishing nothing, because the
-alternative, a feed that looks configured and never fires, is the more
-dangerous mistake.
+Named limit: eight of the eighteen possible decision events publish under
+their own label today (`auth`, `cache.admit`, `cache.key`, `route.decide`,
+`ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`),
+plus `policy` under the newer record format. The other ten are not one
+undifferentiated leftover; the code names four deliberate states for them.
+`waf` and `rate_limit` are superseded by policy: both already run in the
+policy chain and publish as a `policy` record naming which one fired, so a
+second emitter would double-record one decision rather than add coverage.
+`payment.lifecycle` is recorded durably elsewhere: money lands on the
+durable settlement store, and this feed drops records under load, which is
+the wrong trade for a receipt. `ai.stream.event` never publishes: it fires
+once per streamed chunk, so config load refuses `ai.stream.event: true`
+outright rather than accept an ingest bill (`ai.close` carries the
+stream's summary once instead). The remaining five, `ai.close`,
+`ai.failure`, `transform`, `action`, `log.custom_field`, are genuinely
+unwired, no emitter yet. An `events:` key naming a label this proxy does
+not recognize fails config load; a known but unwired label loads and
+warns at boot instead, because refusing every label a later release might
+wire would block pre-configuring it today. Proof:
+`crates/sbproxy-config/src/compiler.rs::decision_audit_refuses_an_unknown_event_label`.
 
 ### 4. Denial of wallet is enforcement, not observation
 
@@ -142,7 +157,10 @@ readable from the admin API.
 
 Config: the top-level `egress:` block, `mode: deny_by_default` per purpose.
 Signal: `GET /api/egress`,
-`sbproxy_egress_refused_total{purpose,reason,tenant,origin}`.
+`sbproxy_egress_refused_total{purpose,reason,tenant,origin}`. Proof:
+`crates/sbproxy-security/src/egress.rs::egress_seen_records_a_single_sighting_with_counts`,
+`::serialized_sighting_never_carries_userinfo_or_query` (the inventory
+itself never carries a credential embedded in a dialed URL).
 [configuration.md](configuration.md#egress-allowlists),
 [admin-api-reference.md](admin-api-reference.md#get-apiegress).
 
@@ -189,25 +207,29 @@ trim.
 
 ## OWASP LLM Top 10 (2026) mapping
 
-The public taxonomy, current as of the 2026-08-03 edition. Each row below
-links to a section with the risk in one line, what the gateway enforces
-with the config keys that turn it on, where to turn it on, the named proof,
-and the honest limits.
+The public taxonomy, current as of the 2026-08-03 edition. Each row links
+to a section carrying its coverage word (enforced, enforced with named
+limits, or out of gateway scope), the risk in one line, what the gateway
+enforces with the config keys that turn it on, where to turn it on, the
+named proof, and the honest limits. The third column here is what's
+enforced in one clause, not a repeated grade.
 
-| # | Risk | Coverage |
+| # | Risk | What sbproxy enforces |
 |---|---|---|
-| [LLM01](#llm01-prompt-injection) | Prompt Injection | Enforced, with named limits |
-| [LLM02](#llm02-sensitive-information-disclosure) | Sensitive Information Disclosure | Enforced, with named limits |
-| [LLM03](#llm03-excessive-agency) | Excessive Agency | Enforced, with named limits |
-| [LLM04](#llm04-supply-chain) | Supply Chain | Enforced, with named limits |
-| [LLM05](#llm05-model--data-poisoning) | Model & Data Poisoning | Out of gateway scope |
-| [LLM06](#llm06-misinformation) | Misinformation | Out of gateway scope |
-| [LLM07](#llm07-unbounded-consumption) | Unbounded Consumption | Enforced, with named limits |
-| [LLM08](#llm08-hidden-context-exposure) | Hidden Context Exposure | Enforced, with named limits |
-| [LLM09](#llm09-vector--embedding-weaknesses) | Vector & Embedding Weaknesses | Enforced |
-| [LLM10](#llm10-improper-output-handling) | Improper Output Handling | Enforced, with named limits |
+| [LLM01](#llm01-prompt-injection) | Prompt Injection | Input/output injection guardrail, double-pass RAG screening, multipart refusal on JSON-only surfaces |
+| [LLM02](#llm02-sensitive-information-disclosure) | Sensitive Information Disclosure | `pii:` body redaction, plus secret-regex and field-key redaction on every log emitter |
+| [LLM03](#llm03-excessive-agency) | Excessive Agency | Per-tool RBAC with default-deny, resolved-model gates, per-agent budgets on verified identity |
+| [LLM04](#llm04-supply-chain) | Supply Chain | Default-deny, DNS-pinned egress authorizer across ten purposes, with per-hop redirect re-authorization |
+| [LLM05](#llm05-model--data-poisoning) | Model & Data Poisoning | Out of gateway scope: risk lives with the model provider's training pipeline |
+| [LLM06](#llm06-misinformation) | Misinformation | Out of gateway scope: risk lives in the model's own generation |
+| [LLM07](#llm07-unbounded-consumption) | Unbounded Consumption | Budgets deny at the cap across seven scopes; per-instance until a shared store is present |
+| [LLM08](#llm08-hidden-context-exposure) | Hidden Context Exposure | Domain-separated cache-key digests, digest-only prompt-linked audit |
+| [LLM09](#llm09-vector--embedding-weaknesses) | Vector & Embedding Weaknesses | Pre- and post-retrieval guardrail passes, tenant-scoped vector search |
+| [LLM10](#llm10-improper-output-handling) | Improper Output Handling | Output guardrails with streaming/buffered verdict parity; blocked responses never cache |
 
 ### LLM01: Prompt Injection
+
+*Enforced, with named limits.*
 
 **Risk.** Attacker-controlled text in a prompt, or in retrieved context,
 tries to override the model's instructions or exfiltrate what it was told
@@ -250,6 +272,8 @@ we picked for them.
 
 ### LLM02: Sensitive Information Disclosure
 
+*Enforced, with named limits.*
+
 **Risk.** A prompt or a completion carries a secret, PII, or other
 sensitive data that leaks into a log, a cache, or a downstream sink.
 
@@ -271,15 +295,17 @@ whether or not `pii:` is configured. [ai-gateway.md](ai-gateway.md),
 **Limits.** The `dlp` policy scans request URI and headers only, never
 bodies, and only tags or blocks; it never masks. That is a different
 control from `pii:`, and the docs say so explicitly so the two are not
-mistaken for each other. Rationale: `dlp` runs on every request type ahead
-of body parsing, because most traffic through this gateway is not AI
-traffic and does not carry a JSON body worth parsing for that pass; `pii:`
-is AI-surface-specific and needs the parsed body already in hand. Folding
-them into one pass would mean either parsing every request's body to catch
-the rare case, or losing the metadata-only pass's speed on the traffic that
-never needs more than that.
+mistaken for each other. Rationale: `crates/sbproxy-modules/src/policy/dlp.rs`
+states body scanning is intentionally out of scope for this cut, not a
+speed tradeoff; the `pii:` block already handles request-body redaction
+with the same regex catalogue today, and a stated follow-up extends `dlp`
+to consume the buffered body `RequestValidator` already produces. Until
+that lands, `pii:` is the masking control and `dlp` is the metadata-only
+one, and the two stay separate rather than one doing both jobs partway.
 
 ### LLM03: Excessive Agency
+
+*Enforced, with named limits.*
 
 **Risk.** An agent or a tool call reaches further than the caller should be
 allowed to: a tool nobody granted, a model outside its allow list, or spend
@@ -319,6 +345,8 @@ first place rather than to expect a proxy to unsee one already there.
 
 ### LLM04: Supply Chain
 
+*Enforced, with named limits.*
+
 **Risk.** The gateway or something it calls on your behalf reaches an
 outbound destination it should not: a compromised registry, a redirected
 webhook, a rebound DNS answer.
@@ -356,11 +384,13 @@ connection pool on every dial, a latency regression on every AI request to
 close a window the resolver cache already narrows to its TTL. It
 compensates in two ways: the allowlist, scheme, and port checks still
 hold, so exploiting the gap requires already being on the operator's
-allowlist, and the fix (a per-destination client cache) is a scoped,
-stated future change rather than an unstated one.
+allowlist, and the per-destination client cache that would close it is
+scoped and stated rather than left implicit.
 [threat-model.md](threat-model.md#current-wave-notes).
 
 ### LLM05: Model & Data Poisoning
+
+*Out of gateway scope.*
 
 **Risk lives** with the model provider's training pipeline for hosted
 models, or with whatever fine-tunes or indexes a corpus for a self-hosted
@@ -380,6 +410,8 @@ indexed.
 
 ### LLM06: Misinformation
 
+*Out of gateway scope.*
+
 **Risk lives** in the model's own generation. Whether an answer is correct
 is a property of the model and the prompt, not of the network path a
 request took to reach it.
@@ -393,6 +425,8 @@ would be exactly the kind of claim this page exists to avoid making.
 [ai-gateway.md](ai-gateway.md#shadow-eval).
 
 ### LLM07: Unbounded Consumption
+
+*Enforced, with named limits.*
 
 **Risk.** A caller, or a compromised credential, runs up spend or resource
 consumption with no ceiling, whether that is deliberate denial-of-wallet or
@@ -428,6 +462,8 @@ preflight check, still holds while the gap is visible.
 
 ### LLM08: Hidden Context Exposure
 
+*Enforced, with named limits.*
+
 **Risk.** A system prompt, injected RAG context, or other server-side
 detail leaks to a caller who should not see it, through an error message,
 a cache key, or a log line.
@@ -461,6 +497,8 @@ than the content, and add a pattern for anything else.
 
 ### LLM09: Vector & Embedding Weaknesses
 
+*Enforced.*
+
 **Risk.** A retrieval-augmented pipeline embeds or indexes something an
 attacker controls, or serves a tenant's vectors to a caller who should not
 reach them.
@@ -482,6 +520,8 @@ set. [rag.md](rag.md). Example:
 `::rag_injects_tenant_scoped_context_before_provider_dispatch`.
 
 ### LLM10: Improper Output Handling
+
+*Enforced, with named limits.*
 
 **Risk.** Model output reaches a client, or gets admitted to cache, without
 validation: an unvalidated payload, broken JSON hitting a downstream
@@ -517,7 +557,7 @@ from every request to protect the rare one that gets blocked.
 
 | Control | Log target | Metric |
 |---|---|---|
-| Multipart surface refusal | `security_audit` (`multipart_disallowed_surface`, policy_denied via events sink) | none dedicated; covered by the audit-chain metric below |
+| Multipart surface refusal | `security_audit` (`multipart_disallowed_surface`, policy_denied via events sink) | `sbproxy_audit_emit_duration_seconds{channel="security"}` (no dedicated counter; the security-channel audit-emission metric below) |
 | Multipart inspection skip (allowed surfaces) | none | `sbproxy_ai_multipart_inspection_skipped_total{check,surface}`, legitimate multipart traffic that skipped body inspection, not a refusal |
 | Budget fail-open | `sbproxy::budget` WARN on transition | `sbproxy_budget_share_fail_open_total{op}`, `sbproxy_budget_share_unavailable` |
 | Tenant throttle | decision events | `sbproxy_rate_limit_total{workspace}`, `sbproxy_rate_limit_decisions_total{policy}` |
