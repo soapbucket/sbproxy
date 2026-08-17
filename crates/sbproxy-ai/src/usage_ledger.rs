@@ -421,7 +421,9 @@ pub fn reconcile_usage(
         // report instead of just reporting a very large, correct-enough
         // number.
         a.ledger_requests = a.ledger_requests.saturating_add(1);
-        a.ledger_total_tokens = a.ledger_total_tokens.saturating_add(entry.event.total_tokens);
+        a.ledger_total_tokens = a
+            .ledger_total_tokens
+            .saturating_add(entry.event.total_tokens);
     }
     for row in provider_rows {
         let key = (row.day.clone(), row.model.clone());
