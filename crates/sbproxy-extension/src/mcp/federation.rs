@@ -3668,7 +3668,7 @@ impl McpFederation {
             // contract in the lockfile the grade is structural;
             // digest-only baselines can still prove "changed", which
             // is at least a patch.
-            let verdict = match lock.contract.as_ref() {
+            let mut verdict = match lock.contract.as_ref() {
                 Some(old_contract) => {
                     let inputs = super::compat::OracleInputs {
                         tool: name,
@@ -3712,13 +3712,29 @@ impl McpFederation {
                 None => super::compat::CompatibilityVerdict {
                     tool: name.clone(),
                     from_digest: lock.contract_digest.clone(),
-                    to_digest: live_digest,
+                    to_digest: live_digest.clone(),
                     grade: super::compat::SemverGrade::Patch,
                     findings: Vec::new(),
                     behavioral_evaluated: false,
                     needs_confirmation: false,
                 },
             };
+            // Post-merge fix (main's #1091/#1092 reshaped this flow):
+            // the oracle's own `from_digest`/`to_digest` are always
+            // legacy-scheme (`compat::oracle::evaluate_compatibility`
+            // has no notion of which scheme a lockfile baseline was
+            // written under, unlike `digest_matching_scheme` above,
+            // which this function already used to compute both
+            // `live_contract` and `live_digest` under the baseline's
+            // own scheme). Overwrite with those already scheme-correct
+            // values so the governance event's digest fields keep
+            // correlating with what the lockfile actually pinned --
+            // `mcp-contract-v2-sha256:...` included -- regardless of
+            // which arm above produced the verdict, rather than
+            // silently downgrading a v2 baseline's reported digest to
+            // the legacy scheme.
+            verdict.from_digest = lock.contract_digest.clone();
+            verdict.to_digest = live_digest.clone();
             let declared = gate.declared_versions.get(name).unwrap_or(&lock.semver);
             let grade_label = match verdict.grade {
                 super::compat::SemverGrade::None => "none",

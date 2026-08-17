@@ -381,6 +381,7 @@ proxy:
             - principals: []
               allowed:
                 - "reports.hello"
+                - "crm.hello"
                 - "crm.echo"
                 - "crm.notes"
                 - "legacy.echo"
@@ -622,6 +623,12 @@ fn ungranted_tool_is_refused_by_rbac() {
 /// `crm.hello` is a real, live tool the mock upstream serves, but it
 /// has no entry in the lockfile. `block_unlocked: true` blocks it
 /// outright -- the escape hatch closing rather than merely reporting.
+/// `analyst`'s `allowed` list grants it deliberately: RBAC runs before
+/// the version gate, so an ungranted tool would be refused by RBAC
+/// first and this test would prove nothing about `block_unlocked`. The
+/// grant isolates the version gate as the one deciding refusal here;
+/// `ungranted_tool_is_refused_by_rbac` above already covers the RBAC
+/// denial this test deliberately routes around.
 #[test]
 fn unlocked_tool_is_blocked_by_the_version_gate() {
     let upstream = MockMcpUpstream::start();
