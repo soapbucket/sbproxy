@@ -2073,7 +2073,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         // WOR-2476/WOR-2481: compile the top-level `egress:` block into
         // one authorizer per configured purpose. Absent, this is
         // `CompiledEgressGates::default()`, which arms nothing.
-        egress: compile_egress_gates(config_file.egress.as_ref()),
+        egress: compile_egress_gates(config_file.egress.as_ref())?,
     })
 }
 
@@ -2421,15 +2421,19 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
 /// [`sbproxy_security::egress::EgressAuthorizer`] per configured purpose
 /// (WOR-2476, WOR-2481). `cfg` absent yields a default
 /// [`CompiledEgressGates`] (every field `None`), which arms nothing.
-fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> CompiledEgressGates {
+///
+/// `Err` when any sub-block's `ports:` is present but empty, or names
+/// port `0`; see [`compile_egress_purpose`].
+fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEgressGates> {
     let Some(cfg) = cfg else {
-        return CompiledEgressGates::default();
+        return Ok(CompiledEgressGates::default());
     };
-    CompiledEgressGates {
+    Ok(CompiledEgressGates {
         ai_providers: compile_egress_purpose(
             &[EgressPurpose::AiProvider],
             cfg.ai_providers.as_ref(),
-        ),
+            "ai_providers",
+        )?,
         // WOR-2476 fix: `usage_sinks:` has to arm the Webhook sink too,
         // not just the three sinks that already share
         // `EgressPurpose::UsageSink` internally (Langfuse, Datadog,
@@ -2446,30 +2450,44 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> CompiledEgressGat
         usage_sinks: compile_egress_purpose(
             &[EgressPurpose::UsageSink, EgressPurpose::Webhook],
             cfg.usage_sinks.as_ref(),
-        ),
+            "usage_sinks",
+        )?,
         model_artifacts: compile_egress_purpose(
             &[EgressPurpose::ModelArtifact],
             cfg.model_artifacts.as_ref(),
-        ),
+            "model_artifacts",
+        )?,
         token_exchange: compile_egress_purpose(
             &[EgressPurpose::TokenExchange],
             cfg.token_exchange.as_ref(),
-        ),
-        telemetry: compile_egress_purpose(&[EgressPurpose::Telemetry], cfg.telemetry.as_ref()),
-    }
+            "token_exchange",
+        )?,
+        telemetry: compile_egress_purpose(
+            &[EgressPurpose::Telemetry],
+            cfg.telemetry.as_ref(),
+            "telemetry",
+        )?,
+    })
 }
 
 /// Compile one sub-block into a real authorizer keyed under every purpose
-/// in `purposes`, all sharing the same allowlist.
+/// in `purposes`, all sharing the same allowlist. `section_key` names the
+/// sub-block for the two refusal messages (e.g. `"telemetry"`).
 ///
-/// `None` when the sub-block is omitted, or when its `mode` is the inert
-/// `allow_by_default` default: either way every named purpose stays
-/// legacy ungated, exactly the contract every consumer already honors
-/// for an absent authorizer. `deny_by_default` builds a real allowlist
-/// scoped to `hosts` (exact match, case-insensitive). Scheme and port
-/// are not exposed at this config layer: every purpose dials over
-/// `http`/`https` on `80`/`443`, which every production consumer this
-/// section arms already does.
+/// `Ok(None)` when the sub-block is omitted, or when its `mode` is the
+/// inert `allow_by_default` default: either way every named purpose
+/// stays legacy ungated, exactly the contract every consumer already
+/// honors for an absent authorizer. `deny_by_default` builds a real
+/// allowlist scoped to `hosts` (exact match, case-insensitive) and
+/// `ports` (default `[80, 443]`; see `EgressPurposeConfig`'s own field
+/// doc for why a purpose that dials a non-standard port, like
+/// `telemetry`'s OTLP endpoint, must override it).
+///
+/// `Err` when `ports` is present but empty, or names port `0`. Checked
+/// unconditionally, even under `allow_by_default`, because an operator
+/// who wrote either explicitly almost certainly meant something else,
+/// and `allow_by_default` being inert today does not mean a later `mode`
+/// flip should be the first thing to notice.
 ///
 /// Most sub-blocks arm exactly one [`EgressPurpose`]; `usage_sinks` arms
 /// two (`UsageSink` and `Webhook`, see the call site's comment) because
@@ -2479,10 +2497,26 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> CompiledEgressGat
 fn compile_egress_purpose(
     purposes: &[EgressPurpose],
     cfg: Option<&EgressPurposeConfig>,
-) -> Option<EgressAuthorizer> {
-    let cfg = cfg?;
+    section_key: &str,
+) -> Result<Option<EgressAuthorizer>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    if cfg.ports.is_empty() {
+        anyhow::bail!(
+            "egress.{section_key}.ports is empty, which would refuse every destination this \
+             purpose reaches with no host list fix able to recover it. Omit `ports:` to use \
+             the default [80, 443], or name at least one port."
+        );
+    }
+    if cfg.ports.contains(&0) {
+        anyhow::bail!(
+            "egress.{section_key}.ports names port 0, which is never a valid destination \
+             port. Remove it."
+        );
+    }
     if !cfg.mode.is_enforce() {
-        return None;
+        return Ok(None);
     }
     let mut allow = PurposeAllowlist {
         hosts: cfg
@@ -2495,15 +2529,16 @@ fn compile_egress_purpose(
     };
     allow.schemes.insert("https".to_string());
     allow.schemes.insert("http".to_string());
-    allow.ports.insert(443);
-    allow.ports.insert(80);
+    for port in &cfg.ports {
+        allow.ports.insert(*port);
+    }
     let mut purposes_map = std::collections::HashMap::new();
     for purpose in purposes {
         purposes_map.insert(*purpose, allow.clone());
     }
-    Some(EgressAuthorizer::new(EgressConfig {
+    Ok(Some(EgressAuthorizer::new(EgressConfig {
         purposes: purposes_map,
-    }))
+    })))
 }
 
 /// Validate the top-level `events:` block (WOR-2318).
@@ -5441,6 +5476,128 @@ origins:
                 )
                 .unwrap_err(),
             EgressDenied::UnlistedHost,
+        );
+    }
+
+    #[test]
+    fn egress_telemetry_with_an_explicit_port_authorizes_the_default_otlp_endpoint() {
+        // C1 regression: `compile_egress_purpose` used to hardcode
+        // `{80, 443}` regardless of the sub-block's own `ports:`, which
+        // meant `egress.telemetry:` could never be armed at all --
+        // `DEFAULT_OTLP_ENDPOINT` is `http://localhost:4327`, and every
+        // other OTLP default (4317 gRPC, 4318 HTTP) is non-standard too.
+        // An operator following the docs' advice to add the host to
+        // `hosts:` would still get `DisallowedPort` on every dial, with
+        // no config fix available.
+        let yaml = r#"
+proxy: {}
+egress:
+  telemetry:
+    mode: deny_by_default
+    hosts: ["localhost"]
+    ports: [4327]
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .telemetry
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Telemetry,
+                    "http://localhost:4327",
+                    &SystemHostResolver,
+                )
+                .is_ok(),
+            "an explicit ports: override must authorize the default OTLP endpoint"
+        );
+
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Telemetry,
+                    "http://localhost:8080",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::DisallowedPort,
+            "a port outside the explicit override must still be refused"
+        );
+    }
+
+    #[test]
+    fn egress_telemetry_without_ports_refuses_the_default_otlp_endpoint() {
+        // The other half of the C1 regression: the default port set
+        // ([80, 443]) does not cover OTLP, so an operator who arms
+        // `egress.telemetry:` without an explicit `ports:` override
+        // gets `DisallowedPort` on the default endpoint, not a working
+        // gate. This is the exact boot failure C1 described: "boot
+        // fails with advice that cannot work" until `ports:` is added.
+        let yaml = r#"
+proxy: {}
+egress:
+  telemetry:
+    mode: deny_by_default
+    hosts: ["localhost"]
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .telemetry
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Telemetry,
+                    "http://localhost:4327",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::DisallowedPort,
+            "the default port set [80, 443] does not cover OTLP's default port"
+        );
+    }
+
+    #[test]
+    fn egress_section_refuses_an_empty_ports_list() {
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+    ports: []
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("an empty ports: list must fail compile");
+        assert!(
+            format!("{err:#}").contains("egress.ai_providers.ports"),
+            "error must name the offending key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn egress_section_refuses_port_zero() {
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+    ports: [443, 0]
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("port 0 must fail compile");
+        assert!(
+            format!("{err:#}").contains("egress.ai_providers.ports"),
+            "error must name the offending key: {err:#}"
         );
     }
 

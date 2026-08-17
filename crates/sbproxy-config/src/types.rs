@@ -494,10 +494,10 @@ pub struct EgressTopLevelConfig {
 ///
 /// Shares its vocabulary with the per-tool MCP/OpenAPI `egress:` block;
 /// see `sbproxy_extension::mcp::egress::EgressPolicy` for the enforcement
-/// semantics this compiles to. Only `hosts` (exact match) and
+/// semantics this compiles to. `hosts` (exact match), `ports`, and
 /// `allow_private` are supported here; the per-tool block's `suffixes`
 /// has no equivalent in this section.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EgressPurposeConfig {
     /// Default behavior for hosts that do not match `hosts`.
@@ -515,6 +515,33 @@ pub struct EgressPurposeConfig {
     /// hosts on this allowlist (operator opt-in).
     #[serde(default)]
     pub allow_private: bool,
+    /// Permitted destination ports. Defaults to `[80, 443]`, the
+    /// scheme-standard HTTP/HTTPS ports most sub-blocks dial. An
+    /// override is required for a purpose that does not: `telemetry`'s
+    /// OTLP endpoint is commonly `4317` (gRPC) or `4318` (HTTP), never
+    /// `80`/`443`, so the default here would refuse every destination
+    /// that sub-block reaches with `DisallowedPort` and there would be
+    /// no `hosts:` fix an operator could make to recover. Refused if
+    /// present but empty, or if it names port `0`: either would
+    /// silently refuse every destination this purpose reaches with no
+    /// indication why.
+    #[serde(default = "default_egress_ports")]
+    pub ports: Vec<u16>,
+}
+
+impl Default for EgressPurposeConfig {
+    fn default() -> Self {
+        Self {
+            mode: EgressPurposeMode::default(),
+            hosts: Vec::new(),
+            allow_private: false,
+            ports: default_egress_ports(),
+        }
+    }
+}
+
+fn default_egress_ports() -> Vec<u16> {
+    vec![80, 443]
 }
 
 /// Egress behavior when a destination host does not match `hosts`
