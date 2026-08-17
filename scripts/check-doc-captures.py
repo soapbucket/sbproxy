@@ -75,6 +75,24 @@ MANIFEST: dict[str, dict] = {
         # so every block reads the state the block above it left.
         "sections": [{"stack": "settlement", "fresh_each": False}],
     },
+    "examples/usage-bridge-queue/README.md": {
+        # The same worker as docs/payment-settlement.md's usage_bridge
+        # section, reached by its own dedicated walkthrough. Both of this
+        # page's captures are `sqlite3` reads against the queue that
+        # section's config also drives, so they get the same stack,
+        # match list, and settle wait rather than a second definition of
+        # the same shape: a row written `queued` needs the recovery
+        # worker's next sweep, 1000 ms in this example's config, before
+        # it reads `terminal`.
+        "sections": [
+            {
+                "match": ["usage-bridge", "usage_bridge"],
+                "stack": "usage_bridge",
+                "fresh_each": False,
+                "settle_ms": 4000,
+            },
+        ],
+    },
     "docs/payment-settlement.md": {
         # This page is two halves with opposite needs, which is why
         # freshness is per section rather than per document.
