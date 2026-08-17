@@ -584,6 +584,13 @@ impl Router {
                     to = to.as_str(),
                     "ai provider circuit breaker closed"
                 );
+                sbproxy_observe::metrics::record_circuit_breaker_transition(
+                    provider_name,
+                    from.as_str(),
+                    to.as_str(),
+                    "success_threshold_met",
+                    "",
+                );
             }
         }
         if let Some(d) = &self.outlier {
@@ -602,6 +609,17 @@ impl Router {
                     from = from.as_str(),
                     to = to.as_str(),
                     "ai provider circuit breaker opened"
+                );
+                let reason = match from {
+                    CircuitState::HalfOpen => "probe_failed",
+                    _ => "failure_threshold_exceeded",
+                };
+                sbproxy_observe::metrics::record_circuit_breaker_transition(
+                    provider_name,
+                    from.as_str(),
+                    to.as_str(),
+                    reason,
+                    "",
                 );
             }
         }
@@ -2800,6 +2818,38 @@ mod tests {
             router.breakers()[0].state(),
             sbproxy_platform::circuitbreaker::CircuitState::Closed,
             "one half-open success meets success_threshold 1 and closes it"
+        );
+
+        // WOR-2486: both transitions above must land on
+        // `sbproxy_circuit_breaker_transitions_total`. Before this
+        // wiring the AI-provider breaker only logged; the metric never
+        // fired for this call site, which made the provider-health
+        // dashboard blind to exactly the axis this test exists for.
+        // The counter lives on `ProxyMetrics`'s own registry rather than
+        // `prometheus::default_registry()`, so `render()` (which gathers
+        // both) is the only way to see it from this crate. Scanned by
+        // line, checking every label is present rather than a fixed
+        // substring, so the assertion does not depend on the encoder's
+        // label ordering.
+        let rendered = sbproxy_observe::metrics::metrics().render();
+        let transition_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("sbproxy_circuit_breaker_transitions_total{")
+                    && line.contains("origin=\"recovering\"")
+            })
+            .collect();
+        assert!(
+            transition_lines
+                .iter()
+                .any(|l| l.contains("from_state=\"closed\"") && l.contains("to_state=\"open\"")),
+            "the failure must record closed->open: {transition_lines:?}"
+        );
+        assert!(
+            transition_lines.iter().any(|l| l
+                .contains("from_state=\"half_open\"")
+                && l.contains("to_state=\"closed\"")),
+            "the recovery must record half_open->closed: {transition_lines:?}"
         );
     }
 

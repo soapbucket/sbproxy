@@ -2799,6 +2799,44 @@ pub fn record_circuit_breaker(origin: &str, from_state: &str, to_state: &str) {
         .inc();
 }
 
+/// Record a circuit breaker state transition on both the metric and a
+/// structured, SIEM-observable log line (WOR-2486).
+///
+/// Call only on an actual transition, never per request: the three
+/// production call sites (the load-balancer target breaker, the AI
+/// provider breaker, the crawl-ledger HTTP breaker) all guard this
+/// behind `if let Some((from, to)) = breaker.record_success()/
+/// record_failure()`, which is `None` on the overwhelming majority of
+/// calls. `record_circuit_breaker` alone (the metric-only sibling this
+/// wraps) predates this function and stays as a direct call where a
+/// caller has already decided a metric is enough.
+///
+/// `tenant` is `""` when the breaker has no tenant scope, which is the
+/// common case: a circuit breaker in this codebase is keyed by origin
+/// or provider, not by caller, so most transitions have nothing to
+/// attribute to a tenant. Pass one when the call site actually knows
+/// it.
+pub fn record_circuit_breaker_transition(
+    origin: &str,
+    from_state: &str,
+    to_state: &str,
+    reason: &str,
+    tenant: &str,
+) {
+    record_circuit_breaker(origin, from_state, to_state);
+    let sanitized_origin = sanitize_label("origin", origin);
+    tracing::warn!(
+        target: "sbproxy::circuit_breaker",
+        event = "circuit_breaker_transition",
+        origin = %sanitized_origin,
+        from = from_state,
+        to = to_state,
+        reason = reason,
+        tenant = tenant,
+        "circuit breaker state transition"
+    );
+}
+
 /// Increment `sbproxy_upstream_status_retries_total{origin, status}`.
 ///
 /// Called once per status-triggered upstream retry, at the moment the
@@ -5784,6 +5822,88 @@ mod tests {
         assert!(output.contains("sbproxy_policy_triggers_total"));
         assert!(output.contains("sbproxy_cache_results_total"));
         assert!(output.contains("sbproxy_circuit_breaker_transitions_total"));
+    }
+
+    /// WOR-2486: red first. Before `record_circuit_breaker_transition`
+    /// existed, a circuit-breaker state change bumped a Prometheus
+    /// counter (or nothing, on the AI-provider call site, which logged
+    /// with `tracing::info!/warn!` under its own field names) and
+    /// nothing else; there was no single structured record a SIEM
+    /// query could select `event = "circuit_breaker_transition"` on.
+    #[test]
+    fn record_circuit_breaker_transition_logs_a_structured_line() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+        struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+            type Writer = SharedLogGuard;
+            fn make_writer(&'a self) -> Self::Writer {
+                SharedLogGuard(Arc::clone(&self.0))
+            }
+        }
+        impl std::io::Write for SharedLogGuard {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log capture").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_circuit_breaker_transition(
+                "breaker-transition.example.com",
+                "closed",
+                "open",
+                "failure_threshold_exceeded",
+                "acme",
+            );
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("utf8 log");
+        assert!(output.contains("\"event\":\"circuit_breaker_transition\""));
+        assert!(output.contains("\"from\":\"closed\""));
+        assert!(output.contains("\"to\":\"open\""));
+        assert!(output.contains("\"reason\":\"failure_threshold_exceeded\""));
+        assert!(output.contains("\"tenant\":\"acme\""));
+        // And the metric still fires: this wraps `record_circuit_breaker`
+        // rather than replacing it.
+        assert!(output_or_metric_has_transition("breaker-transition.example.com"));
+    }
+
+    fn output_or_metric_has_transition(origin: &str) -> bool {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_circuit_breaker_transitions_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: std::collections::HashMap<&str, &str> = metric
+                    .get_label()
+                    .iter()
+                    .map(|l| (l.name(), l.value()))
+                    .collect();
+                if labels.get("origin").copied() == Some(origin)
+                    && labels.get("from_state").copied() == Some("closed")
+                    && labels.get("to_state").copied() == Some("open")
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     #[test]
