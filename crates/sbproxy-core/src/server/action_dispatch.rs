@@ -2963,7 +2963,13 @@ pub(super) async fn handle_mcp_action(
                 let needs_filter = mcp.tool_allowlist.is_some()
                     || mcp.has_principal_scoped_tools
                     || !version_blocked.is_empty()
-                    || rollout_patch.is_some();
+                    || rollout_patch.is_some()
+                    // WOR-2384 (MCP09): a `draft` server's tools must
+                    // never reach the unfiltered fast path below -- the
+                    // draft-status check only runs inside the per-entry
+                    // filter loop this flag gates, same bug class as
+                    // `has_principal_scoped_tools` above.
+                    || mcp.has_draft_servers;
                 let tools_json: std::borrow::Cow<'_, str> = if !needs_filter {
                     std::borrow::Cow::Borrowed(snapshot.full_array.as_str())
                 } else {

@@ -989,6 +989,13 @@ pub struct McpAction {
     /// `tools/list` responses depend on the inbound principal and the
     /// unfiltered fast path must not be used (WOR-1640).
     pub has_principal_scoped_tools: bool,
+    /// True when any federated server's `status` is `draft` (WOR-2384,
+    /// MCP09), i.e. `tools/list` must not take the unfiltered fast path
+    /// (same reasoning, and the same class of bug, as
+    /// `has_principal_scoped_tools`: the legacy `tools/list` handler
+    /// only runs its per-entry filter loop, which is where the
+    /// draft-status check lives, when `needs_filter` is true).
+    pub has_draft_servers: bool,
     /// Session store when `sessions.enabled` (WOR-1642); `None`
     /// keeps the gateway stateless. Like the quota store, sessions
     /// live for the lifetime of the compiled origin chain and a hot
@@ -1493,6 +1500,10 @@ impl McpAction {
         let lethal_trifecta = collapse_lethal_trifecta(&cfg.guardrails);
 
         let has_principal_scoped_tools = prefixes.values().any(|p| p.rbac.is_some());
+        // WOR-2384 (MCP09): mirrors `has_principal_scoped_tools` above.
+        let has_draft_servers = prefixes
+            .values()
+            .any(|p| matches!(p.status, McpServerApprovalStatus::Draft));
 
         let dual_llm_quarantine = cfg.dual_llm_quarantine.filter(|c| c.enabled);
         let tool_output_judge = match dual_llm_quarantine.as_ref() {
@@ -1544,6 +1555,7 @@ impl McpAction {
             quota_store: Arc::new(ToolQuotaStore::new()),
             refresh_interval: cfg.refresh_interval.unwrap_or(Duration::from_secs(60)),
             has_principal_scoped_tools,
+            has_draft_servers,
             sessions: cfg.sessions.as_ref().filter(|s| s.enabled).map(|s| {
                 Arc::new(SessionStore::new(
                     s.ttl.unwrap_or(Duration::from_secs(30 * 60)),
