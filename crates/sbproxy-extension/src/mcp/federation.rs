@@ -3143,14 +3143,28 @@ impl McpFederation {
     /// `DnsPinMismatch` reason before any connect. An unpinned
     /// destination keeps the shared, re-resolving `self.client`.
     ///
-    /// Unlike `openapi_dial_client`, this does not disable redirects:
-    /// the base MCP transports (`send_request` / `send_via_sse`) have
-    /// no per-hop re-authorization loop the way the OpenAPI REST path
-    /// does, so disabling redirects here would be a behavior change
-    /// beyond closing the DNS-rebind window, not a defense this change
-    /// adds. A redirect to a *different* host is therefore still
-    /// unauthorized on that hop exactly as before this change; only the
-    /// pinned-host rebind window is closed here.
+    /// Fix round 3: also disables redirects, like `openapi_dial_client`
+    /// does. Re-review found the earlier "leave redirects on" choice
+    /// was a full bypass, not a residual gap: `reqwest`'s default
+    /// policy follows up to 10 redirects *inside* `send()`, the
+    /// `resolve_to_addrs` pin only scopes to the dial's original
+    /// hostname, and `send_request` / `send_via_sse` only look at the
+    /// final response's status, after any redirect already happened --
+    /// so one authorized upstream answering `Location:
+    /// http://anything` would have silently dialled a host this gate
+    /// never authorized at all, egress mode notwithstanding. With
+    /// redirects off, a 3xx from an MCP upstream instead comes back as
+    /// a non-success status `send_request` (`streamable.rs`) /
+    /// `send_via_sse` (`sse_client.rs`) already turn into a refused
+    /// `McpUpstreamHttpStatus` error -- fail closed. Unlike the
+    /// OpenAPI REST path (`call_openapi_tool_with_resolver`'s
+    /// redirect loop a few hundred lines above, which re-authorizes
+    /// and re-pins each hop before following it), the base MCP
+    /// transports get no equivalent per-hop follow-and-reauthorize
+    /// loop here: a redirecting MCP upstream is refused outright
+    /// rather than chased. That parity gap is deliberate and out of
+    /// scope for this fix -- closing the rebind/bypass window, not
+    /// adding redirect support the base MCP path never had.
     fn mcp_upstream_dial_client(
         &self,
         server: &McpServerConfig,
@@ -3174,6 +3188,7 @@ impl McpFederation {
         reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
             .timeout(self.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(host, &addrs)
             .build()
             .map_err(|e| anyhow::anyhow!("pinned MCP upstream client construction failed: {e}"))
@@ -7861,6 +7876,73 @@ mod tests {
         assert!(
             !rebound_hit.load(Ordering::SeqCst),
             "the rebound address must never be contacted"
+        );
+    }
+
+    /// WOR-2384 (MCP09) fix round 3: re-review found the earlier "leave
+    /// redirects on" choice for the pinned MCP-upstream client was a
+    /// full bypass, not a residual gap -- `reqwest`'s default policy
+    /// follows a redirect *inside* `send()`, before `send_request`'s
+    /// own status check ever runs, and the DNS pin only scopes to the
+    /// original hostname, so a redirect target was never
+    /// re-authorized at all. A stub upstream answers `301` with a
+    /// `Location` pointing at a second, distinct listener; the second
+    /// listener must never be contacted, and the call must surface the
+    /// refused status as an error.
+    #[tokio::test]
+    async fn mcp_upstream_dial_client_never_follows_a_redirect_to_a_second_listener() {
+        let Some((second_addr, second_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let redirect = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:{}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            second_addr.port()
+        );
+        let Some((first_addr, first_hit)) = dial_fixture(redirect) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![("mcp-redirect.invalid", vec![vec![first_addr]])]);
+        let server = McpServerConfig {
+            name: "redirect-mcp".to_string(),
+            url: format!("http://mcp-redirect.invalid:{}/mcp", first_addr.port()),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["mcp-redirect.invalid".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:redirect-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![]);
+
+        let client = fed
+            .authorize_mcp_upstream_dial_with_resolver(&server, &resolver)
+            .expect("pinned client must build for a verified destination");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/list".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let err = send_request(&client, &server.url, &req, 1 << 20, &[])
+            .await
+            .expect_err("a redirect from an MCP upstream must not be followed");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("301"),
+            "expected the refused status to surface, got: {rendered}"
+        );
+        assert!(
+            first_hit.load(Ordering::SeqCst),
+            "the first (authorized) listener must have been contacted"
+        );
+        assert!(
+            !second_hit.load(Ordering::SeqCst),
+            "the second listener must never be contacted -- no redirect must be followed"
         );
     }
 

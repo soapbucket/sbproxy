@@ -7865,7 +7865,7 @@ mod mcp_request_target_authority_tests {
 mod mcp_catalog_snapshot_tests {
     use super::{
         handle_mcp_action, mcp_catalogue_name_for_snapshot, mcp_modern_rollout_hidden_names,
-        mcp_peer_downgrade_check, mcp_synthesized_rollout_tool_is_visible,
+        mcp_peer_downgrade_check, mcp_progressive_search, mcp_synthesized_rollout_tool_is_visible,
         mcp_synthesized_rollout_tool_is_visible_to_principal, mcp_unblocked_catalog_tools,
         McpPeerDowngradeDecision,
     };
@@ -8458,6 +8458,46 @@ mod mcp_catalog_snapshot_tests {
         );
     }
 
+    /// WOR-2384 (MCP09) fix round 3, item 2c: progressive discovery's
+    /// `search` meta-tool must hide a `draft` server's tools too (the
+    /// `mcp_progressive_search` filter added in fix round 1). Calls
+    /// the free function directly, the same lower-risk shape as
+    /// `wor_2384_modern_catalog_snapshot_hides_a_draft_servers_tool`
+    /// above, rather than driving a full `tools/call` `search`
+    /// round trip through `handle_mcp_action`.
+    #[test]
+    fn wor_2384_progressive_search_hides_a_draft_servers_tool() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "progressive-draft-fixture", "version": "1.0.0"},
+            "progressive_discovery": true,
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": "progressive-draft-server",
+                "status": "draft"
+            }]
+        }))
+        .expect("progressive-discovery draft-status fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(
+                "progressive-draft-tool".to_string(),
+                tool("progressive-draft-tool", "progressive-draft-server"),
+            )]),
+            None,
+        );
+
+        let ctx = RequestContext::new();
+        let results = mcp_progressive_search(&action, &ctx, "", 10);
+        assert!(
+            results
+                .iter()
+                .all(|t| t["name"] != "progressive-draft-tool"),
+            "progressive discovery's search meta-tool must hide a draft \
+             server's tools, same as tools/list: {results:?}"
+        );
+    }
+
     #[tokio::test]
     async fn wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios() {
         // WOR-2384 red-first, extended in fix round 1 (renamed from
@@ -8967,6 +9007,68 @@ mod mcp_catalog_snapshot_tests {
                 "a warn verdict must not stamp error.type: {event:?}"
             );
         }
+
+        // --- Scenario 7 (WOR-2384, MCP09 fix round 3, item 2b): a
+        // `draft` federated server's `tools/call` refusal must reach
+        // the governance evidence feed too -- verdict "deny", reason
+        // "server_draft", rule_id "mcp_server_approval" -- the same
+        // evidence-completeness bar RBAC/quota (scenario 1) and
+        // peer-downgrade (scenarios 2-5) already meet. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-draft-fixture";
+            const SERVER: &str = "draft-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "draft-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "status": "draft"
+                }]
+            }))
+            .expect("draft-server governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not yet approved"),
+                "a draft server's tools/call must be refused, got: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "deny"
+            })
+            .await
+            .expect(
+                "a draft-server mcp_governance_decision deny event was not observed within 5s",
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "mcp_server_approval"
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"], "server_draft",
+                "{event:?}"
+            );
+            assert_eq!(event["data"]["error.type"], "policy_denied");
+        }
     }
 
     #[tokio::test]
@@ -9114,6 +9216,111 @@ mod mcp_catalog_snapshot_tests {
                 .unwrap_or_default()
                 .contains("weaker"),
             "prompts/get must be refused by the same downgraded profile: {prompt_get:?}"
+        );
+    }
+
+    /// WOR-2384 (MCP09) fix round 3, item 2a: red-first proof that a
+    /// `draft` server's resources and prompts are gated the same way
+    /// its tools already are, mirroring
+    /// `wor_2384_block_mode_downgrade_refuses_resources_read_and_prompts_get`
+    /// above but for approval status instead of peer downgrade. Needs
+    /// no protocol-negotiation seeding (unlike that test): `draft` is a
+    /// plain config fact, not an observed peer behavior.
+    #[tokio::test]
+    async fn wor_2384_draft_server_hides_resources_list_and_refuses_resources_read_and_prompts_get(
+    ) {
+        const SERVER: &str = "draft-non-tool-server";
+        const RESOURCE_URI: &str = "res://draft-non-tool-fixture/doc";
+        const PROMPT_NAME: &str = "wor2384-draft-non-tool-prompt";
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "draft-non-tool-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": SERVER,
+                "status": "draft"
+            }]
+        }))
+        .expect("draft non-tool fixture compiles");
+        // WOR-2384 fix round 2's lesson applies here too:
+        // `seed_tools_for_test` must run first so it marks the
+        // federation primed before any other seed's effect is read,
+        // or the first `mcp_handler_exchange` call's real
+        // `ensure_ready` cold prime silently wipes the resource/prompt
+        // seeds below.
+        action.federation.seed_tools_for_test(HashMap::new(), None);
+        action.federation.seed_resources_for_test(HashMap::from([(
+            RESOURCE_URI.to_string(),
+            sbproxy_extension::mcp::federation::FederatedResource {
+                uri: RESOURCE_URI.to_string(),
+                name: "doc".to_string(),
+                description: None,
+                mime_type: None,
+                server_name: SERVER.to_string(),
+                upstream_uri: RESOURCE_URI.to_string(),
+            },
+        )]));
+        action.federation.seed_prompts_for_test(HashMap::from([(
+            PROMPT_NAME.to_string(),
+            sbproxy_extension::mcp::FederatedPrompt {
+                name: PROMPT_NAME.to_string(),
+                upstream_name: PROMPT_NAME.to_string(),
+                title: None,
+                description: None,
+                arguments: None,
+                server_name: SERVER.to_string(),
+                meta: None,
+            },
+        )]));
+
+        let list = mcp_handler_exchange(
+            &action,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {}}),
+        )
+        .await;
+        assert!(
+            list["result"]["resources"]
+                .as_array()
+                .expect("resources/list result")
+                .iter()
+                .all(|r| r["uri"] != RESOURCE_URI),
+            "a draft server's resources must be hidden from resources/list: {list:?}"
+        );
+
+        let resource_read = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": RESOURCE_URI}
+            }),
+        )
+        .await;
+        let resource_message = resource_read["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            resource_message.contains("draft") && resource_message.contains("not yet approved"),
+            "resources/read must be refused, naming the draft status: {resource_read:?}"
+        );
+
+        let prompt_get = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "prompts/get",
+                "params": {"name": PROMPT_NAME}
+            }),
+        )
+        .await;
+        let prompt_message = prompt_get["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            prompt_message.contains("draft") && prompt_message.contains("not yet approved"),
+            "prompts/get must be refused, naming the draft status: {prompt_get:?}"
         );
     }
 
