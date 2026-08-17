@@ -80,7 +80,13 @@ impl AuditRingEvent {
     }
 }
 
-fn bound_detail(detail: &str) -> String {
+/// Cap `detail` at `MAX_DETAIL_BYTES` on a UTF-8 char boundary.
+///
+/// `pub(crate)` (WOR-2478 I5) so `crate::audit::AdminActionAuditEntry::new`
+/// can cap its own `detail` field with the exact same helper the ring
+/// caps `AuditRingEvent::detail` with, rather than duplicating the
+/// boundary-safe truncation logic and risking the two drifting apart.
+pub(crate) fn bound_detail(detail: &str) -> String {
     if detail.len() <= MAX_DETAIL_BYTES {
         return detail.to_string();
     }

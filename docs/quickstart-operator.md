@@ -4,6 +4,12 @@
 
 This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
+[`examples/k8s-gateway/`](../examples/k8s-gateway/) pairs primarily with
+[kubernetes.md](kubernetes.md), but it is a runnable config with the same
+data-plane shape the operator manages here (trusted proxies, service
+discovery, host override), so it is worth a look while working through this
+quickstart too.
+
 Before you begin, make sure you have:
 
 - A reachable Kubernetes cluster.

@@ -1,6 +1,6 @@
 # Run a local model
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-16*
 
 `sbproxy run` is the first local-model command to try. It chooses a cataloged artifact, verifies it, starts a managed local deployment, and prints an OpenAI-compatible endpoint. It is meant for one model on one machine. The completion command below uses `curl` and `jq`.
 
@@ -55,4 +55,4 @@ sbproxy models show qwen2.5-0.5b-instruct --format json
 sbproxy doctor --format json
 ```
 
-Use a managed `proxy.model_host` configuration when you need fixed ports, an explicit cache location, several origins, or a deployment that survives the convenience command. [model-host.md](model-host.md) describes that shape. [self-hosting.md](self-hosting.md) covers local models with gateway policy and hosted fallback.
+Use a managed `proxy.model_host` configuration when you need fixed ports, an explicit cache location, several origins, or a deployment that survives the convenience command. [model-host.md](model-host.md) describes that shape, and [`examples/ai-local-serving/`](../examples/ai-local-serving/) is a complete working config of it. [self-hosting.md](self-hosting.md) covers local models with gateway policy and hosted fallback, the pattern behind [`examples/local-models/`](../examples/local-models/).

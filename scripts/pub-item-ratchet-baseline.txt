@@ -367,6 +367,30 @@
 # used, not less), so the drift it causes is a ratchet that was too loose
 # getting tighter.
 
+# 2026-08-16 (WOR-2476): 290 -> 291. `AiClient::authorize_provider_url`
+# (`crates/sbproxy-ai/src/client.rs`) newly counts as tests-only because
+# `crates/sbproxy-core/src/server/lifecycle.rs`'s
+# `arm_egress_gates_from_config_is_the_seam_run_calls_at_boot` now calls
+# it. It was already unreferenced from outside its own file before this
+# (that bucket is not what this ratchet tracks), so the item did not get
+# less used; a cross-crate test started using the same `pub` seam a
+# production caller would.
+#
+# That test is a regression guard for a real bug a code review caught:
+# boot (`lifecycle::run`) never called the function that arms the
+# egress-purpose registry and rebuilds the process-wide `AiClient`, only
+# the reload path did, so a fresh process start served every AI-provider
+# dispatch ungated until its first reload. The test drives the shared
+# arming seam directly and then calls `authorize_provider_url` on the
+# live, process-wide client `ai_client()` returns, the same method
+# production dispatch resolves to internally, to prove the armed
+# registry actually reached that client and not just its own slot.
+#
+# Not narrowable: `authorize_provider_url` needs to stay `pub` for this
+# cross-crate test to reach it at all, and the alternative (asserting only
+# on the registry, not on the client the registry is supposed to arm)
+# would stop proving the property the bug was about.
+
 # 2026-08-16 (WOR-2384 fix round 1): 290 -> 293. Three new
 # `McpFederation` test seams in sbproxy-extension/src/mcp/federation.rs:
 # `seed_resources_for_test`, `seed_prompts_for_test`, and
@@ -380,3 +404,7 @@
 # peer-downgrade dispatch tests) needs a seam to seed them directly. Not
 # narrowable: the whole point is a public entry point a different crate's
 # `#[test]`/`#[tokio::test]` functions call.
+
+# 2026-08-17 (WOR-2384 main-sync): 293/291 -> 294. The two entries above
+# landed on separate branches from the same 290 base; the union after the
+# merge is 294 (three federation `_for_test` seams + `authorize_provider_url`).

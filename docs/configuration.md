@@ -207,6 +207,7 @@ agent_classes:
 access_log: { ... }
 rate_limits: { ... }
 audit: { ... }
+egress: { ... }
 session_ledger: { ... }
 request_events: { ... }
 events: { ... }
@@ -245,6 +246,7 @@ origins:
 | `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
 | `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
 | `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; audit rows remain in memory and tracing. |
+| `egress` | object | unset | Per-purpose outbound allowlists (AI providers, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
 | `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
@@ -278,6 +280,53 @@ agent_classes:
 | `resolver.rdns_enabled` | bool | `true` | Run forward-confirmed reverse DNS as resolver step 2. |
 | `resolver.bot_auth_keyid_enabled` | bool | `true` | Let a verified Web Bot Auth `keyid` match `expected_keyids` as resolver step 1. |
 | `resolver.cache_size` | int | `10000` | Per-process reverse-DNS verdict cache capacity. |
+
+### Egress allowlists
+
+The optional top-level `egress` block arms per-purpose outbound
+allowlists. Each sub-block is independently
+optional; a purpose whose sub-block is omitted, or whose `mode` is left
+at the default `allow_by_default`, stays legacy ungated exactly as if
+`egress:` were absent entirely. Set `mode: deny_by_default` to actually
+arm a purpose: only the hosts listed may be reached, and every
+destination that purpose touches lands in the egress inventory (`GET
+/api/egress`, see [admin-api-reference.md](admin-api-reference.md)) as
+`allowed` or `denied` instead of `ungated`.
+
+```yaml
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com", "api.anthropic.com"]
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["cloud.langfuse.com"]
+  model_artifacts: { ... }
+  token_exchange: { ... }
+  telemetry:
+    mode: deny_by_default
+    hosts: ["otel-collector.internal"]
+    ports: [4317]
+    allow_private: true
+```
+
+| Sub-block | Purpose(s) armed | Gates |
+|---|---|---|
+| `ai_providers` | `ai_provider` | Every upstream AI provider dispatch the AI gateway client makes. |
+| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
+| `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
+| `token_exchange` | `token_exchange` | The non-MCP outbound-credential resolver's OAuth token-endpoint calls. The MCP token-exchange path has its own per-server `egress:` block (see [mcp-security.md](mcp-security.md)) and is unaffected by this section. |
+| `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload does not re-verify an exporter already running. |
+
+Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
+default `allow_by_default`), `hosts` (exact hostnames, case-insensitive),
+`ports` (default `[80, 443]`; **`telemetry` almost always needs an
+explicit override**, since the OTLP default endpoint is `4327` and the
+common alternates are `4317`/`4318`, none of them `80` or `443`; an
+empty list or port `0` fails config compile), and `allow_private`
+(permit resolved private/link-local addresses for listed hosts; default
+`false`). Unlike the per-tool MCP/OpenAPI `egress:` block, this section
+has no `suffixes` key.
 
 ---
 

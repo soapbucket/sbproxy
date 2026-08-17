@@ -26,8 +26,8 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use dashmap::DashMap;
 use sbproxy_security::egress::{
-    record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied, EgressPurpose,
-    HostResolver,
+    record_egress_refused, record_egress_seen, CachedSystemResolver, EgressAuthorizer,
+    EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
 };
 use serde::Deserialize;
 
@@ -621,10 +621,43 @@ fn gate_token_endpoint(
     url: &str,
     origin_id: &str,
 ) -> Result<()> {
-    authorize_token_endpoint(egress, url, &CachedSystemResolver).map_err(|denied| {
-        record_egress_refused(EgressPurpose::TokenExchange, denied, "unset", origin_id);
-        anyhow::anyhow!("egress denied: {denied:?}")
-    })
+    // WOR-2476: every token endpoint lands in the egress inventory,
+    // whether an authorizer is configured or not. `authorize_token_endpoint`
+    // collapses "no authorizer" to `Ok(())`, so the stamp inspects `egress`
+    // directly rather than trusting that result.
+    if egress.is_none() {
+        record_egress_seen(
+            EgressPurpose::TokenExchange,
+            url,
+            origin_id,
+            EgressSightingStatus::Ungated,
+            None,
+        );
+        return Ok(());
+    }
+    match authorize_token_endpoint(egress, url, &CachedSystemResolver) {
+        Ok(()) => {
+            record_egress_seen(
+                EgressPurpose::TokenExchange,
+                url,
+                origin_id,
+                EgressSightingStatus::Allowed,
+                None,
+            );
+            Ok(())
+        }
+        Err(denied) => {
+            record_egress_seen(
+                EgressPurpose::TokenExchange,
+                url,
+                origin_id,
+                EgressSightingStatus::Denied,
+                Some(denied),
+            );
+            record_egress_refused(EgressPurpose::TokenExchange, denied, "unset", origin_id);
+            Err(anyhow::anyhow!("egress denied: {denied:?}"))
+        }
+    }
 }
 
 /// Resolve the outbound credential for `cfg`.
@@ -825,12 +858,17 @@ fn cred_cache() -> &'static DashMap<String, CachedCred> {
 ///
 /// Prefer [`resolve_cached_isolated`] for run-as-user paths so tokens
 /// for user A are never served to user B when subject tokens collide.
+///
+/// `egress` gates token-endpoint HTTP for `EgressPurpose::TokenExchange`
+/// (WOR-2476). `None` preserves legacy ungated token exchange.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_cached(
     origin_id: &str,
     cfg: &OutboundCredentialConfig,
     http: &reqwest::Client,
     subject_token: Option<&str>,
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+    egress: Option<&EgressAuthorizer>,
     trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Result<MintedCredential> {
     resolve_cached_isolated(
@@ -840,7 +878,7 @@ pub async fn resolve_cached(
         http,
         subject_token,
         secret_lookup,
-        None,
+        egress,
         trace_ctx,
     )
     .await

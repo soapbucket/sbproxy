@@ -1,6 +1,6 @@
 # Getting started: Content estate (HTML-to-markdown / content transformation for agents)
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-16*
 
 ## What you will build
 
@@ -28,7 +28,7 @@ sbproxy serve -f sb.yml
 
 ## Minimal config
 
-Save this as `sb.yml`. It fronts the HTML page at `test.sbproxy.dev/html`, converts the body to Markdown with ATX-style headings (`#`, `##`, ...), and stamps the Markdown MIME type on the way out. Every key here exists in the config schema and matches the `transform-html-to-markdown` example.
+Save this as `sb.yml`. It fronts the HTML page at `test.sbproxy.dev/html`, converts the body to Markdown with ATX-style headings (`#`, `##`, ...), and stamps the Markdown MIME type on the way out. Every key here exists in the config schema and matches the [`transform-html-to-markdown`](../examples/transform-html-to-markdown/) example.
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json

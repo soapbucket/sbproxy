@@ -67,6 +67,14 @@ origins:
 `default_allow: false` is the setting that matters. A caller matching no rule is
 refused, so adding a tool upstream does not silently widen access.
 
+See [`examples/mcp-rbac-quotas/`](../examples/mcp-rbac-quotas/) for a
+complete working config of RBAC and per-tool quotas together.
+
+**Still yours.** The gateway cannot see a credential the agent already holds and
+chooses to type into a tool argument. If your agent has a long-lived secret in
+its context, no proxy can unsee that. Scope credentials down and keep them out
+of the model's reach in the first place.
+
 An MCP origin's responses are written directly, outside the generic HTTP
 `response_filter` phase the `pii:`/`dlp:` policy blocks are wired to, so those
 controls never see a tool-call argument or result on their own. `content_filters`
@@ -133,6 +141,10 @@ upstream. A tool outside the allowlist is not advertised and not callable.
 
 **Still yours.** Deciding what the right scope is. The gateway enforces the
 list you write; it has no opinion about whether `gh.delete_repo` belongs on it.
+
+A related way to keep the surface small is not advertising the whole
+federated catalogue to the model in the first place; see
+[`examples/mcp-progressive-discovery/`](../examples/mcp-progressive-discovery/).
 
 ## A permitted tool called with an argument that should not be
 
@@ -255,6 +267,11 @@ against it and exits nonzero on drift, documented in
 shipped example matches what the gate computes. Wiring `verify-lock` into
 your own CI, so drift actually blocks a merge, is still yours to do.
 
+See [`examples/mcp-tool-versioning/`](../examples/mcp-tool-versioning/) for
+the lockfile and compatibility oracle above, and
+[`examples/mcp-tool-rollout/`](../examples/mcp-tool-rollout/) for pinning a
+tool to a specific upstream version during a rollout.
+
 ## Text in a tool definition that a reviewer cannot see
 
 **What goes wrong.** A description contains characters that render as nothing
@@ -318,13 +335,25 @@ timeout, a malformed response, or an egress denial all quarantine.
         endpoint: https://judge.example/v1/chat/completions
         model: judge-model
         timeout: 10s
+        egress:
+          mode: deny_by_default
+          hosts: [judge.example]
 ```
+
+`egress` allowlists the judge endpoint itself; omitted, the judge call
+is ungated but still recorded in the egress inventory. See
+[mcp-gateway-guardrails.md](mcp-gateway-guardrails.md#dual-llm-quarantine).
 
 **Still yours.** Neither is a solved-problem control. The trifecta guardrail
 constrains the damage rather than detecting the injection, which is the honest
 framing: it assumes the model will be steered and removes the combination that
 makes steering costly. The quarantine judge is another model, with everything
 that implies.
+
+See [`examples/mcp-sessions/`](../examples/mcp-sessions/) for the session
+lifecycle the trifecta guardrail's risk accumulation depends on, and
+[`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/)
+for an out-of-process classifier that can scan tool output directly.
 
 ## A session that reads something untrusted, then tries to leave
 
@@ -480,6 +509,9 @@ dial as `ungated` rather than staying silent about it. SBproxy also does not
 implement per-upstream certificate pinning. TLS validation is standard chain
 validation. If you need to pin a specific key for an upstream, that is not
 available here today.
+
+See [`examples/mcp-federation/`](../examples/mcp-federation/) for a complete
+working config of multiple federated upstreams behind one gateway.
 
 ## Weak authentication on the MCP endpoint itself
 

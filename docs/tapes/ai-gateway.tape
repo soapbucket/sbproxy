@@ -26,7 +26,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `# sbproxy speaks the OpenAI API. Same request shape, pick the vendor by host.`
+Type `# SBproxy speaks the OpenAI API. Same request shape, pick the vendor by host.`
 Sleep 1.4s
 Enter
 Sleep 500ms

@@ -22,6 +22,9 @@ pub mod clock_skew;
 /// their own (WOR-2365, WOR-2370).
 pub mod decision;
 pub mod decision_contract;
+/// Bridge from `sbproxy_security::egress::record_egress_refused` to the
+/// typed `EgressRefused` proxy event (WOR-2486).
+pub mod egress_bridge;
 /// Egress for the typed proxy events: the `events:` block's bounded
 /// queue, background worker, and file / webhook sinks. Delivery never
 /// runs on the publisher's thread, which is the difference between this
@@ -87,7 +90,7 @@ pub mod usage_rollup;
 pub use access_log::AccessLogEntry;
 pub use agent_labels::AgentLabels;
 pub use alerting::{Alert, AlertChannelConfig, AlertDispatcher};
-pub use audit::{ConfigAuditEntry, KeyAuditEntry, SecurityAuditEntry};
+pub use audit::{AdminActionAuditEntry, ConfigAuditEntry, KeyAuditEntry, SecurityAuditEntry};
 pub use capture::{
     capture_parent_session_id, capture_properties, capture_session_id, capture_user_id,
     AutoGenerate, BudgetConfig, PropertiesConfig, PropertyDropCounts, RedactConfig,

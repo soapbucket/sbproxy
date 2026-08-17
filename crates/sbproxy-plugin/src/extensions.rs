@@ -282,6 +282,8 @@ pub enum ExtensionRuntime {
     Wasm,
     /// HTTP filter using the Proxy-Wasm ABI.
     ProxyWasm,
+    /// Rego evaluated directly on the Regorus interpreter (WOR-2482).
+    Rego,
 }
 
 /// Kind of hook exported by an extension bundle.

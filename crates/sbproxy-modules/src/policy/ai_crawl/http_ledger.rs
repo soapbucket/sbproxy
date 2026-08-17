@@ -313,10 +313,12 @@ impl HttpLedger {
             ) {
                 Ok(result) => {
                     if let Some((from, to)) = self.breaker.record_success() {
-                        sbproxy_observe::metrics::record_circuit_breaker(
+                        sbproxy_observe::metrics::record_circuit_breaker_transition(
                             &self.config.endpoint,
                             from.as_str(),
                             to.as_str(),
+                            "success_threshold_met",
+                            "",
                         );
                     }
                     return Ok(result);
@@ -324,10 +326,16 @@ impl HttpLedger {
                 Err(err) => {
                     if err.retryable {
                         if let Some((from, to)) = self.breaker.record_failure() {
-                            sbproxy_observe::metrics::record_circuit_breaker(
+                            let reason = match from {
+                                sbproxy_platform::CircuitState::HalfOpen => "probe_failed",
+                                _ => "failure_threshold_exceeded",
+                            };
+                            sbproxy_observe::metrics::record_circuit_breaker_transition(
                                 &self.config.endpoint,
                                 from.as_str(),
                                 to.as_str(),
+                                reason,
+                                "",
                             );
                         }
                         last_err = Some(err);

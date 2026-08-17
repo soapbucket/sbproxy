@@ -10,6 +10,11 @@ sbproxy-capability.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-observe.workspace = true
+# WOR-2476: the top-level `egress:` section compiles straight to the GF
+# egress authorizer, the same runtime type `l2_store` already builds a
+# concrete `Arc<dyn KVStore>` for above. sbproxy-security is a leaf (no
+# sbproxy-* dependencies of its own), so this adds no cycle.
+sbproxy-security.workspace = true
 
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -515,7 +515,11 @@ impl SourcePoller {
             }
         };
 
-        let outcome = crate::server::try_reload_from_config_yaml(&self.config_path, &effective);
+        let outcome = crate::server::try_reload_from_config_yaml(
+            &self.config_path,
+            &effective,
+            "config_refresh_poller",
+        );
         let cycle = match outcome {
             Ok(TryReloadOutcome::Applied(outcome)) => {
                 let commit = resolved.head_commit().unwrap_or("unknown");

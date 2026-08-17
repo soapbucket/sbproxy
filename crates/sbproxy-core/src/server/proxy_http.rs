@@ -1941,6 +1941,11 @@ impl ProxyHttp for SbProxy {
         let mut req_to_append: Vec<(String, String)> = Vec::new();
         let mut lua_scripts: Vec<String> = Vec::new();
         let mut js_scripts: Vec<String> = Vec::new();
+        // WOR-2482: (module, rego_v0, budget_ms) triples, mirroring
+        // lua_scripts / js_scripts. rego_v0 and budget_ms travel with
+        // the module because they are per-modifier knobs (parse
+        // dialect, eval budget), not a global engine setting.
+        let mut rego_scripts: Vec<(String, bool, u64)> = Vec::new();
         let mut advanced_modifiers: Vec<sbproxy_config::RequestModifierConfig> = Vec::new();
         let mut upstream_url_path: Option<String> = None;
         let mut upstream_host_header: Option<String> = None;
@@ -2203,6 +2208,13 @@ impl ProxyHttp for SbProxy {
                         if let Some(script) = &modifier.js_script {
                             js_scripts.push(script.clone());
                         }
+                        if let Some(module) = &modifier.rego_module {
+                            rego_scripts.push((
+                                module.clone(),
+                                modifier.rego_v0,
+                                modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS),
+                            ));
+                        }
                     }
                 }
 
@@ -2234,6 +2246,13 @@ impl ProxyHttp for SbProxy {
                                 }
                                 if let Some(script) = &modifier.js_script {
                                     js_scripts.push(script.clone());
+                                }
+                                if let Some(module) = &modifier.rego_module {
+                                    rego_scripts.push((
+                                        module.clone(),
+                                        modifier.rego_v0,
+                                        modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS),
+                                    ));
                                 }
                             }
                         }
@@ -2567,12 +2586,19 @@ impl ProxyHttp for SbProxy {
             // closed, so the token exchange has no ambient span to read
             // and the request's context is handed over explicitly.
             let cred_trace_ctx = ctx.trace_ctx.clone();
+            // WOR-2476: wires the `EgressPurpose::TokenExchange` gate
+            // from the top-level `egress.token_exchange:` section, when
+            // configured.
+            let token_exchange_egress = sbproxy_security::egress::configured_gate(
+                sbproxy_security::egress::EgressPurpose::TokenExchange,
+            );
             match sbproxy_modules::auth::outbound_credential::resolve_cached(
                 &ctx.hostname,
                 cred_cfg,
                 forward_auth_client(),
                 inbound_bearer.as_deref(),
                 &lookup,
+                token_exchange_egress.as_ref(),
                 cred_trace_ctx.as_ref(),
             )
             .await
@@ -2678,6 +2704,29 @@ impl ProxyHttp for SbProxy {
                 }
                 Err(e) => {
                     warn!(error = %e, "JavaScript request modifier script error");
+                }
+            }
+        }
+
+        // Apply Rego request modifiers, after Lua and JavaScript so a
+        // modifier setting more than one engine resolves the same way
+        // the other two already do: the later engine's headers win on a
+        // shared header (WOR-2482).
+        for (module, rego_v0, rego_budget_ms) in &rego_scripts {
+            match rego_request_modifier(
+                module,
+                *rego_v0,
+                *rego_budget_ms,
+                session.req_header(),
+                ctx,
+            ) {
+                Ok(headers_to_set) => {
+                    for (key, value) in headers_to_set {
+                        let _ = upstream_request.insert_header(key, &value);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Rego request modifier script error");
                 }
             }
         }
@@ -3587,6 +3636,33 @@ impl ProxyHttp for SbProxy {
                             }
                             Err(e) => {
                                 warn!(error = %e, "JavaScript response modifier script error");
+                            }
+                        }
+                    }
+                    // WOR-2482: after Lua and JavaScript, so a modifier
+                    // setting more than one engine resolves the same way
+                    // the request side already does: the later engine's
+                    // headers win on a shared header.
+                    if let Some(module) = &modifier.rego_module {
+                        let status = upstream_response.status.as_u16();
+                        let rego_budget_ms =
+                            modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS);
+                        match rego_response_modifier(
+                            module,
+                            modifier.rego_v0,
+                            rego_budget_ms,
+                            status,
+                            &response_headers,
+                            ctx,
+                        ) {
+                            Ok(headers) => {
+                                for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
+                                    to_set.push((key, value));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Rego response modifier script error");
                             }
                         }
                     }

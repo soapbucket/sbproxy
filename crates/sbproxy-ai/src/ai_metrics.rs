@@ -763,8 +763,42 @@ impl Drop for AiSurfaceLatencyGuard {
 }
 
 /// Record a failover event.
-pub fn record_failover(from: &str, to: &str, reason: &str) {
+///
+/// The provider-advance seam (WOR-2486): every call site is a fallback
+/// or an advance to the next configured provider, never a per-request
+/// selection, so this is also where `EventType::ProviderSelected`
+/// publishes. `tenant` is the requesting tenant, or `""` in a
+/// single-tenant deployment; [`sbproxy_observe::ProxyEvent::new`]
+/// carries an empty string the same way every other bridge in this
+/// codebase does.
+pub fn record_failover(from: &str, to: &str, reason: &str, tenant: &str) {
     AI_FAILOVERS.with_label_values(&[from, to, reason]).inc();
+    sbproxy_observe::publish_proxy_event(sbproxy_observe::EventType::ProviderSelected, || {
+        provider_selected_event(from, to, reason, tenant)
+    });
+}
+
+/// Build the `provider_selected` [`sbproxy_observe::ProxyEvent`] for one
+/// failover.
+///
+/// Split out for the same reason `sbproxy_observe::egress_bridge`'s
+/// builder is: testable without a running event egress.
+fn provider_selected_event(
+    from: &str,
+    to: &str,
+    reason: &str,
+    tenant: &str,
+) -> sbproxy_observe::ProxyEvent {
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::ProviderSelected,
+        to.to_owned(),
+        tenant.to_owned(),
+        serde_json::json!({
+            "from_provider": from,
+            "to_provider": to,
+            "reason": reason,
+        }),
+    )
 }
 
 /// Record one closed reasoning-policy outcome for a provider attempt.
@@ -2417,9 +2451,9 @@ mod tests {
         // fallback). Pin the label names and that vocabulary so a
         // rename breaks this test instead of silently orphaning
         // dashboards and the provider-health admin view.
-        record_failover("primary", "backup", "http_503");
-        record_failover("primary", "backup", "transport");
-        record_failover("primary", "backup", "content_policy");
+        record_failover("primary", "backup", "http_503", "acme");
+        record_failover("primary", "backup", "transport", "acme");
+        record_failover("primary", "backup", "content_policy", "acme");
         let families = prometheus::gather();
         let failovers = families
             .iter()
@@ -2446,6 +2480,24 @@ mod tests {
                 "missing failover reason {expected}"
             );
         }
+    }
+
+    /// WOR-2486: `provider_selected` fires only on the fallback/advance
+    /// transition this function already is, never per request. Red
+    /// first: before this wiring `EventType::ProviderSelected` had no
+    /// production call site anywhere in the workspace.
+    #[test]
+    fn provider_selected_event_carries_the_transition() {
+        let event = super::provider_selected_event("primary", "backup", "http_503", "acme");
+        assert_eq!(
+            event.event_type,
+            sbproxy_observe::EventType::ProviderSelected
+        );
+        assert_eq!(event.hostname, "backup");
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.data["from_provider"], "primary");
+        assert_eq!(event.data["to_provider"], "backup");
+        assert_eq!(event.data["reason"], "http_503");
     }
 
     #[test]

@@ -88,8 +88,10 @@ impl AiRoutingOnError {
 /// - `expression`: a CEL expression (the original form, unchanged).
 /// - `engine` + `source`: an inline document engine, `lua`, `js`, or
 ///   `rego`. Rego additionally accepts `query` (default
-///   `data.sbproxy.route`), `data` (a base-data document, WOR-2420), and
-///   `budget_ms`.
+///   `data.sbproxy.route`), `data` (a base-data document, WOR-2420),
+///   `budget_ms`, `module_path` (a file alternative to `source`,
+///   mutually exclusive with it), and `rego_v0` (parse pre-OPA-1.0
+///   syntax).
 /// - `engine: wasm` + `type`: a compiled bundle hook of kind
 ///   `ai_routing`, resolved from the loaded extension bundles when the
 ///   config compiles, with `vars` as its optional per-policy
@@ -123,6 +125,19 @@ pub struct AiRoutingPolicyConfig {
     /// same bound the `rego` policy module uses.
     #[serde(default)]
     pub budget_ms: Option<u64>,
+    /// Rego only: a filesystem path to a `.rego` file, read once at
+    /// config load (and again on every reload) in place of an inline
+    /// `source`. Mutually exclusive with `source`; the Rego form needs
+    /// exactly one of the two, the same rule `policy: rego`'s `module` /
+    /// `module_path` holds.
+    #[serde(default)]
+    pub module_path: Option<String>,
+    /// Rego only: parse the module as pre-OPA-1.0 Rego v0 (no
+    /// `if`/`contains` required) instead of the v1 default. A
+    /// compatibility escape hatch for a module pasted from an older OPA
+    /// install.
+    #[serde(default)]
+    pub rego_v0: bool,
     /// Wasm only: the bundle hook's `type:` name. Names an `ai_routing`
     /// hook in a loaded extension bundle; the hook is resolved when the
     /// config compiles, so a typo refuses at load rather than at the
@@ -389,17 +404,22 @@ impl CompiledAiRoutingPolicy {
                 if engine.trim() == "wasm" {
                     return Self::compile_wasm_program(cfg, wasm);
                 }
-                let source = cfg.source.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("ai_routing_policy `engine: {engine}` needs an inline `source`")
-                })?;
-                let rego_only_knobs =
-                    cfg.query.is_some() || cfg.data.is_some() || cfg.budget_ms.is_some();
+                let rego_only_knobs = cfg.query.is_some()
+                    || cfg.data.is_some()
+                    || cfg.budget_ms.is_some()
+                    || cfg.module_path.is_some()
+                    || cfg.rego_v0;
                 match engine.trim() {
                     "lua" | "js" if rego_only_knobs => anyhow::bail!(
-                        "ai_routing_policy `query`/`data`/`budget_ms` are Rego knobs; \
-                         `engine: {engine}` takes only `source`"
+                        "ai_routing_policy `query`/`data`/`budget_ms`/`module_path`/`rego_v0` \
+                         are Rego knobs; `engine: {engine}` takes only `source`"
                     ),
                     "lua" => {
+                        let source = cfg.source.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "ai_routing_policy `engine: {engine}` needs an inline `source`"
+                            )
+                        })?;
                         // Syntax errors refuse at load. Runtime faults (a nil
                         // index, a bad return shape) still follow `on_error`.
                         sbproxy_extension::lua::LuaEngine::check_syntax(source).map_err(
@@ -416,9 +436,16 @@ impl CompiledAiRoutingPolicy {
                     // JS has no compile-only seam in the embedded engine, so
                     // a syntax error surfaces at first evaluation under
                     // `on_error` rather than at load; the docs say so.
-                    "js" => Ok(RoutingProgram::Js {
-                        source: source.to_owned(),
-                    }),
+                    "js" => {
+                        let source = cfg.source.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "ai_routing_policy `engine: {engine}` needs an inline `source`"
+                            )
+                        })?;
+                        Ok(RoutingProgram::Js {
+                            source: source.to_owned(),
+                        })
+                    }
                     "rego" => {
                         // Same invariant the `rego` policy module holds: a zero
                         // budget reads as "no budget" but is an instantly
@@ -432,13 +459,35 @@ impl CompiledAiRoutingPolicy {
                                  zero budget would abort every evaluation before the rule ran"
                             );
                         }
+                        // Exactly one of `source` (inline) or `module_path` (a
+                        // `.rego` file), the same split `policy: rego`'s
+                        // `module` / `module_path` holds.
+                        let module = match (&cfg.source, &cfg.module_path) {
+                            (Some(_), Some(_)) => anyhow::bail!(
+                                "ai_routing_policy rego form takes either `source` (inline) or \
+                                 `module_path` (a path to a .rego file), not both"
+                            ),
+                            (None, None) => anyhow::bail!(
+                                "ai_routing_policy `engine: rego` needs `source` (inline) or \
+                                 `module_path` (a path to a .rego file)"
+                            ),
+                            (Some(source), None) => source.clone(),
+                            (None, Some(path)) => {
+                                std::fs::read_to_string(path).map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "ai_routing_policy: loading module from {path}: {error}"
+                                    )
+                                })?
+                            }
+                        };
                         Ok(RoutingProgram::Rego(Box::new(std::sync::Mutex::new(
                             sbproxy_extension::rego::CompiledRego::compile(
                                 "ai_routing_policy",
-                                source,
+                                &module,
                                 cfg.query.as_deref().unwrap_or(DEFAULT_REGO_QUERY),
                                 cfg.budget_ms.unwrap_or(DEFAULT_REGO_BUDGET_MS),
                                 cfg.data.clone(),
+                                cfg.rego_v0,
                             )?,
                         ))))
                     }
@@ -629,7 +678,7 @@ impl CompiledAiRoutingPolicy {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard
-                    .eval_value(serde_json::json!({ "ai": view.to_json() }))
+                    .eval_value(serde_json::json!({ "ai": view.to_json() }), &view.tenant)
                     .map_err(|error| format!("rego evaluation failed: {error:#}"))
             }
             // A Null document declines through the shared decode tail,
@@ -731,6 +780,8 @@ mod tests {
             query: None,
             data: None,
             budget_ms: None,
+            module_path: None,
+            rego_v0: false,
             hook_type: None,
             vars: None,
             on_error: default_on_error(),
@@ -747,6 +798,8 @@ mod tests {
             query: None,
             data: None,
             budget_ms: None,
+            module_path: None,
+            rego_v0: false,
             hook_type: None,
             vars: None,
             on_error: default_on_error(),
@@ -763,6 +816,8 @@ mod tests {
             query: None,
             data: None,
             budget_ms: None,
+            module_path: None,
+            rego_v0: false,
             hook_type: hook_type.map(str::to_owned),
             vars: None,
             on_error: default_on_error(),
@@ -893,6 +948,81 @@ mod tests {
                 .await,
             AiRoutingOutcome::Decline
         );
+    }
+
+    const ROUTE_ON_BUDGET: &str = r#"
+package sbproxy
+route := {"candidates": [{"provider_id": "openai", "model": "gpt-4o-mini"}],
+          "reason": "over budget"} if {
+    input.ai.budget.fraction > 0.8
+}
+"#;
+
+    #[tokio::test]
+    async fn a_rego_module_path_plans_the_same_as_the_inline_source() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("route.rego");
+        std::fs::write(&path, ROUTE_ON_BUDGET).expect("write fixture module");
+
+        let mut cfg = engine_config("rego", "");
+        cfg.source = None;
+        cfg.module_path = Some(path.display().to_string());
+        let policy = CompiledAiRoutingPolicy::compile(&cfg)
+            .expect("a module read from module_path compiles");
+
+        let pressed = AiDecisionView {
+            budget_fraction: 0.9,
+            ..Default::default()
+        };
+        let (cascade, reason, _) = expect_plan(policy.evaluate(&pressed, &providers()).await);
+        assert_eq!(cascade.tiers[0].provider_id, "openai");
+        assert_eq!(reason, "over budget");
+    }
+
+    #[test]
+    fn rego_source_and_module_path_together_or_neither_is_refused() {
+        let mut both = engine_config("rego", ROUTE_ON_BUDGET);
+        both.module_path = Some("/etc/sbproxy/policies/route.rego".to_owned());
+        let error = CompiledAiRoutingPolicy::compile(&both).expect_err("both must refuse");
+        assert!(error.to_string().contains("not both"), "{error}");
+
+        let mut neither = engine_config("rego", "");
+        neither.source = None;
+        let error = CompiledAiRoutingPolicy::compile(&neither).expect_err("neither must refuse");
+        assert!(error.to_string().contains("module_path"), "{error}");
+    }
+
+    #[test]
+    fn module_path_on_a_non_rego_engine_is_refused_as_a_rego_knob() {
+        let mut lua = engine_config("lua", "return nil");
+        lua.module_path = Some("/etc/sbproxy/policies/route.rego".to_owned());
+        let error = CompiledAiRoutingPolicy::compile(&lua).expect_err("module_path on lua refused");
+        assert!(error.to_string().contains("Rego knobs"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rego_v0_is_wired_from_config_through_to_the_engine() {
+        // The exact shape Regorus's own `set_rego_v0` doctest uses: a
+        // rule body with no `if`, which the v1 default refuses to parse.
+        const V0_STYLE: &str = r#"
+package sbproxy
+route := {"candidates": [{"provider_id": "openai", "model": "m"}], "reason": "r"} {
+    input.ai.budget.fraction > 0.8
+}
+"#;
+        CompiledAiRoutingPolicy::compile(&engine_config("rego", V0_STYLE))
+            .expect_err("v0 syntax must not compile without rego_v0: true");
+
+        let mut cfg = engine_config("rego", V0_STYLE);
+        cfg.rego_v0 = true;
+        let policy =
+            CompiledAiRoutingPolicy::compile(&cfg).expect("rego_v0: true compiles the same module");
+        let pressed = AiDecisionView {
+            budget_fraction: 0.9,
+            ..Default::default()
+        };
+        let (cascade, ..) = expect_plan(policy.evaluate(&pressed, &providers()).await);
+        assert_eq!(cascade.tiers[0].provider_id, "openai");
     }
 
     #[test]

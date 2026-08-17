@@ -181,6 +181,8 @@ sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
                            [--cache-dir <path>] [--dry-run]
 sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>|
                 lock|verify-lock|prune]
+sbproxy mcp {lock|verify-lock} [--out <path> | --lockfile <path>] [--format text|json]
+sbproxy rego test <path> [--min-coverage <pct>] [--format text|json]
 sbproxy cluster {init|token create|enroll|status}
 sbproxy update [--self] [--engines] [--models] [--check] [--yes]
                         [--cache-dir <path>] [--format text|json]
@@ -216,6 +218,8 @@ The full subcommand set, one line each:
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, drain and stop one, write or check a lockfile (`lock`, `verify-lock`), or reclaim unreferenced cache blobs (`prune`). |
+| `mcp` | Federated MCP tool-catalogue lockfile: `lock` discovers the configured servers and pins every advertised tool at its current contract digest; `verify-lock` re-discovers and diffs against the committed baseline without starting a listener, exiting 2 on drift, for CI. |
+| `rego` | `rego test <path>` is the offline `opa test` analogue: runs one or more YAML fixture files against the Rego module(s) they name and prints a per-module line-coverage summary, without touching `sb.yml` or a running proxy. See [scripting.md §3a](scripting.md#3a-rego-policies). |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
 | `ai` | AI gateway tools: `ai ledger` verifies or reports on the usage ledger, `ai prompt optimize` compiles a shorter static system prompt against a customer-owned evaluation set. |
@@ -947,6 +951,8 @@ beyond local development. See [admin.md](admin.md#authentication-and-roles).
 ```bash
 sbproxy ai ledger verify /var/lib/sbproxy/usage-ledger.jsonl
 sbproxy ai ledger report /var/lib/sbproxy/value-ledger.redb --format json
+sbproxy ai ledger reconcile /var/lib/sbproxy/usage-ledger.jsonl \
+  --provider-export openai-usage-export.json --strict
 ```
 
 `ledger verify` re-derives the verifiable usage ledger's hash chain (and,
@@ -956,7 +962,11 @@ verifies, `1` otherwise. `ledger report` aggregates a value ledger (the
 redb file the AI handler keeps at `<cache_dir>/value-ledger.redb`) into
 the same per-model savings report the admin `GET /admin/model-host/value`
 route serves, with no server running; a missing file reports an empty
-ledger rather than an error.
+ledger rather than an error. `ledger reconcile` compares the usage
+ledger against a downloaded provider usage export, per day and model, to
+surface spend the ledger never saw: see
+[ai-usage-ledger.md](ai-usage-ledger.md#reconciling-against-a-provider-export)
+for the export format and what the result does and does not prove.
 
 ```bash
 sbproxy ai prompt optimize \

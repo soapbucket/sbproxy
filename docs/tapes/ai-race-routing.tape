@@ -35,7 +35,7 @@ Type `curl -s localhost:8080/v1/chat/completions -H 'Host: ai.local' -d '{"model
 Enter
 Sleep 4s
 
-Type `# The slow racer was cancelled; the winner answered. Lower tail latency,`
+Type `# The slow racer was canceled; the winner answered. Lower tail latency,`
 Enter
 Type `# at the cost of a duplicate upstream call.`
 Sleep 2s

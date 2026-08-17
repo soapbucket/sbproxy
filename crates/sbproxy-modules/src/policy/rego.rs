@@ -120,10 +120,17 @@ impl std::fmt::Debug for RegoPolicy {
 impl RegoPolicy {
     /// Build from the `policies[]` entry.
     ///
+    /// Exactly one of `module` (inline Rego source) or `module_path` (a
+    /// filesystem path to a `.rego` file, resolved relative to the
+    /// proxy's working directory) must be set; see [`Self::new`] for how
+    /// the two are reconciled.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the module does not parse. A malformed
-    /// policy is a config error, so boot and reload both refuse it.
+    /// Returns an error when neither or both of `module` /
+    /// `module_path` are set, when `module_path` cannot be read, or
+    /// when the resulting module does not parse. A malformed policy is
+    /// a config error, so boot and reload both refuse it.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -134,7 +141,16 @@ impl RegoPolicy {
             /// dropped, which for `data` would apply an empty table.
             #[serde(rename = "type")]
             _policy_type: Option<String>,
-            module: String,
+            /// Inline Rego source. Mutually exclusive with
+            /// `module_path`.
+            #[serde(default)]
+            module: Option<String>,
+            /// Filesystem path to a `.rego` file, read once at config
+            /// load (and again on every reload, the same as
+            /// `transforms[] type: wasm`'s `module_path`). Mutually
+            /// exclusive with `module`.
+            #[serde(default)]
+            module_path: Option<String>,
             #[serde(default = "default_query")]
             query: String,
             #[serde(default = "default_deny_status", alias = "status_code")]
@@ -149,9 +165,29 @@ impl RegoPolicy {
             /// touching the policy logic.
             #[serde(default)]
             data: Option<serde_json::Value>,
+            /// Parse the module as pre-OPA-1.0 Rego v0 (no `if`/`contains`
+            /// required) instead of the v1 default. A compatibility
+            /// escape hatch for a module pasted from an older OPA
+            /// install; a module authored fresh should not need it.
+            #[serde(default)]
+            rego_v0: bool,
         }
 
         let cfg: Config = serde_json::from_value(value)?;
+        let module = match (cfg.module, cfg.module_path) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "policy `rego`: set either `module` (inline Rego source) or `module_path` (a \
+                 path to a .rego file), not both"
+            ),
+            (None, None) => anyhow::bail!(
+                "policy `rego`: needs `module` (inline Rego source) or `module_path` (a path \
+                 to a .rego file)"
+            ),
+            (Some(module), None) => module,
+            (None, Some(path)) => std::fs::read_to_string(&path).map_err(|error| {
+                anyhow::anyhow!("policy `rego`: loading module from {path}: {error}")
+            })?,
+        };
         // Base data must be a JSON object: `data` is a namespace the
         // rule indexes into (`data.roles`, `data.allowed_cidrs`), and a
         // scalar or array top level has nowhere for a named lookup to
@@ -171,16 +207,21 @@ impl RegoPolicy {
             );
         }
         Self::new(
-            cfg.module,
+            module,
             cfg.query,
             cfg.deny_status,
             cfg.deny_message,
             cfg.budget_ms,
             cfg.data,
+            cfg.rego_v0,
         )
     }
 
     /// Build from parts, parsing the module once.
+    ///
+    /// `rego_v0` selects the Rego dialect: `false` (the default)
+    /// requires current v1 syntax; `true` accepts a pre-OPA-1.0 module.
+    /// See [`sbproxy_extension::rego::CompiledRego::compile`].
     ///
     /// # Errors
     ///
@@ -193,13 +234,15 @@ impl RegoPolicy {
         deny_message: String,
         budget_ms: u64,
         data: Option<serde_json::Value>,
+        rego_v0: bool,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             budget_ms > 0,
             "policy `rego`: budget_ms must be greater than zero; a zero budget would refuse \
              every request before the rule ran"
         );
-        let compiled = CompiledRego::compile("policy `rego`", &module, query, budget_ms, data)?;
+        let compiled =
+            CompiledRego::compile("policy `rego`", &module, query, budget_ms, data, rego_v0)?;
         Ok(Self {
             deny_status,
             deny_message,
@@ -395,6 +438,87 @@ allow if {
         assert!(
             policy.evaluate(&ctx),
             "a binding a CEL expression can read must be readable here too"
+        );
+    }
+
+    // --- module_path ---
+
+    #[test]
+    fn module_and_module_path_together_is_refused() {
+        let error = RegoPolicy::from_config(serde_json::json!({
+            "module": MODULE,
+            "module_path": "/etc/sbproxy/policies/authz.rego",
+        }))
+        .expect_err("both an inline module and a path must refuse");
+        assert!(
+            error.to_string().contains("not both"),
+            "the refusal names the conflict: {error}"
+        );
+    }
+
+    #[test]
+    fn neither_module_nor_module_path_is_refused() {
+        let error = RegoPolicy::from_config(serde_json::json!({ "query": "data.sbproxy.allow" }))
+            .expect_err("a policy naming neither must refuse");
+        assert!(
+            error.to_string().contains("module_path"),
+            "the refusal names what is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn module_path_loads_and_compiles_the_same_as_the_inline_module() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("authz.rego");
+        std::fs::write(&path, MODULE).expect("write fixture module");
+
+        let policy = RegoPolicy::from_config(serde_json::json!({
+            "module_path": path.display().to_string(),
+        }))
+        .expect("a module read from module_path compiles");
+        assert!(policy.evaluate(&context("GET")));
+        assert!(!policy.evaluate(&context("POST")));
+    }
+
+    #[test]
+    fn an_unreadable_module_path_names_the_path() {
+        let error = RegoPolicy::from_config(serde_json::json!({
+            "module_path": "/nonexistent/definitely-not-here.rego",
+        }))
+        .expect_err("a missing file must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("/nonexistent/definitely-not-here.rego"),
+            "the refusal names the unreadable path: {error}"
+        );
+    }
+
+    // --- rego_v0 ---
+
+    #[test]
+    fn rego_v0_is_wired_from_config_through_to_the_engine() {
+        // The exact shape Regorus's own `set_rego_v0` doctest uses: a
+        // rule body with no `if`, which the v1 default (this surface's
+        // default posture) refuses to parse.
+        const V0_STYLE: &str = r#"
+package sbproxy
+
+allow {
+    input.request.method == "GET"
+}
+"#;
+        RegoPolicy::from_config(serde_json::json!({ "module": V0_STYLE }))
+            .expect_err("v0 syntax must not compile without rego_v0: true");
+
+        let policy = RegoPolicy::from_config(serde_json::json!({
+            "module": V0_STYLE,
+            "rego_v0": true,
+        }))
+        .expect("rego_v0: true compiles the same module");
+        assert!(
+            policy.evaluate(&context("GET")),
+            "the v0 rule still decides once it parses"
         );
     }
 }

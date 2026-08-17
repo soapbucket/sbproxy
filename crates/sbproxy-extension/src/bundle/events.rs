@@ -43,6 +43,13 @@ impl EnvelopeEventProgram {
                 "event",
                 "Proxy-Wasm event hooks use the streaming HTTP callback adapter",
             )),
+            // WOR-2482: a Rego bundle hook is `kind: policy` only
+            // (refused earlier at manifest validation), so this arm is
+            // a defensive backstop rather than a reachable path.
+            BundleRuntime::Rego => Err(BundleLoadError::new(
+                "event",
+                "runtime rego does not support envelope event hooks",
+            )),
         }
     }
 

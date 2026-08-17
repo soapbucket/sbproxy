@@ -1,6 +1,8 @@
 # prompt_injection_v2
 *Last modified: 2026-08-16*
 
+![Two requests carrying injection-style instructions: one tagged, one blocked](assets/prompt-injection-v2.gif)
+
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
 returns a numeric score plus a categorical label, and the policy maps

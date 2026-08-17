@@ -303,6 +303,15 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
         // discriminator; anything else collapses to `other`.
         let label = classify_mtls_outcome(&outcome);
         sbproxy_observe::metrics::record_mtls_handshake(label);
+        // WOR-2486: a chain-validation rejection is metric-only before
+        // this line. The handshake fails closed either way (the
+        // connection never reaches a request), so the miss was forensic
+        // completeness rather than a live control gap; this closes it
+        // with the same `security_audit` shape every other credential
+        // rejection uses.
+        if label != "ok" {
+            record_mtls_rejection_audit(label, &cn);
+        }
         // WOR-1155: even when CA-chain validation passes, enforce the CN
         // allowlist. A cert signed by the configured CA whose CN matches
         // none of the operator's patterns is rejected at the handshake.
@@ -310,12 +319,17 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
             && !self.cn_patterns.is_empty()
             && !self.cn_patterns.iter().any(|re| re.is_match(&cn))
         {
+            // The CN is attacker-chosen; the log line and the handshake
+            // error string get the same bounded, control-stripped form the
+            // `security_audit` record uses, never the raw value.
+            let safe_cn = sanitize_rejected_cn(&cn);
             tracing::warn!(
-                cn = %cn,
+                cn = %safe_cn,
                 "mTLS client cert CN does not match allowed_cn_patterns; rejecting handshake"
             );
+            record_mtls_rejection_audit("cn_mismatch", &cn);
             return Err(rustls::Error::General(format!(
-                "client certificate CN '{cn}' does not match any allowed_cn_patterns"
+                "client certificate CN '{safe_cn}' does not match any allowed_cn_patterns"
             )));
         }
         outcome
@@ -375,6 +389,104 @@ fn classify_mtls_outcome(
         Err(InvalidCertificate(CertificateError::Revoked)) => "revoked",
         Err(_) => "other",
     }
+}
+
+/// Emit a `security_audit` record for one rejected mTLS handshake
+/// (WOR-2486).
+///
+/// `reason` is [`classify_mtls_outcome`]'s label for a chain-validation
+/// rejection, or `"cn_mismatch"` for the separate allowlist check just
+/// below it; both are closed, bounded vocabularies. `cn` is the
+/// certificate's own claimed Common Name, attacker-controlled on an
+/// untrusted cert, so it goes in the free-form `auth_type` slot
+/// alongside the reason rather than a structured field a SIEM rule
+/// would key on.
+///
+/// This callback runs below `RequestContext`: no tenant, hostname, or
+/// request id has been resolved yet, so this record correlates on
+/// nothing but its own timestamp. That is a real gap, not an oversight;
+/// closing it needs plumbing a per-connection identity down into
+/// `rustls::server::danger::ClientCertVerifier`, which is out of scope
+/// for wiring the rejection itself.
+fn record_mtls_rejection_audit(reason: &str, cn: &str) {
+    sbproxy_observe::SecurityAuditEntry::auth_failure(
+        "auth_mtls_rejected",
+        mtls_rejection_auth_type(reason, cn),
+        // 495 is nginx's de facto "SSL Certificate Error" convention.
+        // There is no real HTTP status here: the handshake fails before
+        // any request exists, so nothing this status describes was ever
+        // sent. It is the closest bounded label to "the connection
+        // never reached HTTP" that the field's u16 type accepts.
+        495,
+        None,
+        None,
+        None,
+        None,
+    )
+    .emit();
+}
+
+/// The `auth_type` string [`record_mtls_rejection_audit`] carries.
+///
+/// Split out so the format is testable without a tracing subscriber:
+/// `reason` and `cn` land in one field because `SecurityAuditEntry`
+/// only gives an mTLS rejection the same two-field shape every other
+/// `auth_failure` gets (`event_type` plus `reason`), and there is no
+/// third slot to give the certificate's own claimed identity.
+///
+/// `cn` is sanitized and bounded before it enters this string (WOR-2486
+/// fix round 1, C2). It is the *rejected* certificate's own claimed
+/// Common Name: attacker-controlled, reachable pre-authentication (no
+/// trust decision has been made yet), and otherwise unbounded.
+/// `SecurityAuditEntry::reason` is free text, and with `audit.sink:
+/// chain` it is appended verbatim to a non-rotating, append-only file,
+/// so an oversized CN costs unbounded disk on that file for every
+/// rejected handshake an attacker cares to send.
+fn mtls_rejection_auth_type(reason: &str, cn: &str) -> String {
+    format!("mtls:{reason} cn={}", sanitize_rejected_cn(cn))
+}
+
+/// Upper bound on the sanitized CN, in bytes.
+///
+/// Common Names are conventionally well under this (RFC 5280 caps the
+/// underlying `DirectoryString` at 64 characters for most profiles,
+/// though nothing on the wire enforces that on an untrusted,
+/// not-yet-validated cert), so this only ever trims a CN that is
+/// already abusing the field.
+const MAX_REJECTED_CN_BYTES: usize = 128;
+
+/// Strip control characters and bound an untrusted certificate's CN
+/// before it reaches an audit record (WOR-2486 fix round 1, C2).
+///
+/// Two passes, in this order:
+///
+/// 1. Drop every Unicode control character (`char::is_control`, which
+///    covers the full C0 set including `\n`, `\r`, and `\t`, plus C1).
+///    This is not a record-splitting defense against the on-disk chain:
+///    `sbproxy_meter::ledger` writes one `serde_json::to_string`-encoded
+///    line per `writeln!` call, and JSON string encoding already escapes
+///    a raw newline as `\n` (two ASCII bytes) rather than emitting one,
+///    so a literal control byte can never split an NDJSON line here.
+///    Verified, not assumed: see
+///    `security_audit_entry_reason_cannot_split_the_chained_ndjson_line`
+///    in `sbproxy_observe::audit`, which exercises the same
+///    `serde_json::to_string` path `sbproxy_meter::ledger` writes
+///    through.
+///    Stripped anyway, because a control character survives that escaping
+///    as visual noise (`cn=evil.example\ncn=trusted.example` reads as two
+///    fields to a human or a naive downstream parser even though it is
+///    one JSON string), and because the field is meant to hold a
+///    hostname-shaped value, not arbitrary bytes.
+/// 2. Bound to [`MAX_REJECTED_CN_BYTES`], last, on a UTF-8 character
+///    boundary. Last because bounding first could cut inside a
+///    multi-byte control sequence and leave a partial one behind.
+fn sanitize_rejected_cn(cn: &str) -> String {
+    let stripped: String = cn.chars().filter(|c| !c.is_control()).collect();
+    let mut end = stripped.len().min(MAX_REJECTED_CN_BYTES);
+    while end > 0 && !stripped.is_char_boundary(end) {
+        end -= 1;
+    }
+    stripped[..end].to_string()
 }
 
 /// Parse an end-entity DER into `ClientCertInfo`. Returns `None` when
@@ -568,6 +680,98 @@ mod tests {
         let got = cache.get(&digest).expect("hit");
         assert_eq!(got.common_name, info.common_name);
         assert_eq!(got.subject_alt_names, info.subject_alt_names);
+    }
+
+    // --- WOR-2486: mTLS rejection reaches security_audit ---
+
+    /// Red-first: before this wiring, a rejected mTLS handshake produced
+    /// only `sbproxy_mtls_handshake_total{result}` and a `tracing::warn!`
+    /// line, neither of which is a structured, SIEM-consumable record.
+    /// Pins the field the record's `reason` carries.
+    #[test]
+    fn mtls_rejection_auth_type_names_the_reason_and_cn() {
+        assert_eq!(
+            mtls_rejection_auth_type("untrusted_issuer", "attacker.example"),
+            "mtls:untrusted_issuer cn=attacker.example"
+        );
+        assert_eq!(
+            mtls_rejection_auth_type("cn_mismatch", "wrong-cn.example"),
+            "mtls:cn_mismatch cn=wrong-cn.example"
+        );
+    }
+
+    /// WOR-2486 fix round 1, C2. Red first: before this fix, the
+    /// rejected certificate's raw, attacker-chosen CN went straight into
+    /// `SecurityAuditEntry::reason` with no bound and no stripping.
+    #[test]
+    fn sanitize_rejected_cn_bounds_an_oversized_cn() {
+        let oversized = "a".repeat(1000);
+        let sanitized = sanitize_rejected_cn(&oversized);
+        assert_eq!(sanitized.len(), MAX_REJECTED_CN_BYTES);
+        assert!(oversized.len() > MAX_REJECTED_CN_BYTES);
+    }
+
+    /// A multi-byte character sitting on the truncation boundary must
+    /// not be cut mid-codepoint.
+    #[test]
+    fn sanitize_rejected_cn_truncates_on_a_char_boundary() {
+        // Three-byte UTF-8 characters repeated past the byte cap; a naive
+        // byte-index truncation at exactly MAX_REJECTED_CN_BYTES would
+        // split the codepoint straddling that boundary.
+        let oversized = "\u{2603}".repeat(100); // snowman, 3 bytes each
+        let sanitized = sanitize_rejected_cn(&oversized);
+        assert!(sanitized.len() <= MAX_REJECTED_CN_BYTES);
+        assert!(
+            sanitized.chars().all(|c| c == '\u{2603}'),
+            "truncation must not leave a partial codepoint: {sanitized:?}"
+        );
+    }
+
+    /// The CN this test embeds is exactly the shape an attacker would
+    /// send: a raw newline attempting to look like a second audit
+    /// record, plus a CR and a tab for good measure.
+    #[test]
+    fn sanitize_rejected_cn_strips_control_characters() {
+        let hostile = "evil.example\ncn=trusted.example\r\n\tafter-tab";
+        let sanitized = sanitize_rejected_cn(hostile);
+        assert!(!sanitized.contains('\n'), "{sanitized:?}");
+        assert!(!sanitized.contains('\r'), "{sanitized:?}");
+        assert!(!sanitized.contains('\t'), "{sanitized:?}");
+        assert_eq!(sanitized, "evil.examplecn=trusted.exampleafter-tab");
+    }
+
+    /// The composed `auth_type` string a real rejection builds must
+    /// carry neither an oversized nor a control-character-bearing CN,
+    /// end to end through `mtls_rejection_auth_type`, not just through
+    /// the sanitizer in isolation.
+    #[test]
+    fn mtls_rejection_auth_type_sanitizes_and_bounds_the_cn() {
+        let hostile = format!("legit.example\nX-Injected: true{}", "z".repeat(500));
+        let auth_type = mtls_rejection_auth_type("untrusted_issuer", &hostile);
+        assert!(!auth_type.contains('\n'), "{auth_type:?}");
+        assert!(
+            auth_type.len() <= "mtls:untrusted_issuer cn=".len() + MAX_REJECTED_CN_BYTES,
+            "the composed string must stay bounded: {} bytes",
+            auth_type.len()
+        );
+    }
+
+    /// Every [`classify_mtls_outcome`] rejection label, plus the CN
+    /// mismatch this module raises separately, must format without
+    /// panicking: a malformed reason string reaching a real
+    /// `SecurityAuditEntry::auth_failure` call would fail the handshake
+    /// path itself, not just the audit trail.
+    #[test]
+    fn record_mtls_rejection_audit_does_not_panic_for_any_reason() {
+        for reason in [
+            "untrusted_issuer",
+            "expired",
+            "revoked",
+            "other",
+            "cn_mismatch",
+        ] {
+            record_mtls_rejection_audit(reason, "test.example.com");
+        }
     }
 
     #[test]

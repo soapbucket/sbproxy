@@ -227,6 +227,35 @@ pub struct CompiledOrigin {
     pub observability: Option<crate::types::OriginObservabilityConfig>,
 }
 
+/// Per-purpose egress authorizers compiled once from the top-level
+/// `egress:` config section (WOR-2476, WOR-2481 for `telemetry`).
+///
+/// Each field is `None` when its sub-block was omitted from `egress:`
+/// (or `egress:` itself was omitted), or when the sub-block's `mode` is
+/// the default `allow_by_default`. Consumers treat `None` as the purpose's
+/// legacy ungated contract: `AiClient`'s documented `None`, the usage
+/// sinks' and model-artifact fetcher's `with_egress` builders left
+/// unset, the outbound-credential resolver's unauthenticated token
+/// exchange, and the OTLP exporters dialing without a boot-time check.
+/// `sbproxy_core::server::lifecycle` installs each `Some` value into
+/// `sbproxy_security::egress`'s process-wide configured-gate registry so
+/// consumers reached well past config compile (a lazily-built usage
+/// sink, an artifact fetcher, a per-request token exchange) read the
+/// same authorizer with no parameter threaded through the layers between.
+#[derive(Clone, Default)]
+pub struct CompiledEgressGates {
+    /// Arms `EgressPurpose::AiProvider`.
+    pub ai_providers: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::UsageSink`.
+    pub usage_sinks: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::ModelArtifact`.
+    pub model_artifacts: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::TokenExchange` for the non-MCP resolver.
+    pub token_exchange: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::Telemetry` (WOR-2481).
+    pub telemetry: Option<sbproxy_security::egress::EgressAuthorizer>,
+}
+
 /// The complete compiled config: all origins plus host-based routing.
 #[derive(Clone, Default)]
 pub struct CompiledConfig {
@@ -301,6 +330,11 @@ pub struct CompiledConfig {
     /// The binary atomically replaces the live CEL store from this
     /// complete snapshot at boot and after every successful reload.
     pub flags: Vec<crate::types::FeatureFlagConfig>,
+    /// Per-purpose egress authorizers compiled from the top-level
+    /// `egress:` block (WOR-2476, WOR-2481). Default (every field `None`)
+    /// when `egress:` is absent, which arms nothing and preserves every
+    /// purpose's legacy ungated contract. See [`CompiledEgressGates`].
+    pub egress: CompiledEgressGates,
 }
 
 impl CompiledConfig {
@@ -361,5 +395,11 @@ mod tests {
         // the whole of it: no per-event map to consult and no master
         // switch to inherit.
         assert!(cfg.decision_audit.is_empty());
+        // WOR-2476/WOR-2481: an absent `egress:` block arms nothing.
+        assert!(cfg.egress.ai_providers.is_none());
+        assert!(cfg.egress.usage_sinks.is_none());
+        assert!(cfg.egress.model_artifacts.is_none());
+        assert!(cfg.egress.token_exchange.is_none());
+        assert!(cfg.egress.telemetry.is_none());
     }
 }

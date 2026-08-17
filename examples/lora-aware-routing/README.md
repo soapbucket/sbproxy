@@ -2,6 +2,8 @@
 
 *Last modified: 2026-07-26*
 
+![LoRA-aware routing](../../docs/assets/lora-aware-routing.gif)
+
 Wires the production `lora-aware` `RoutingStrategy` onto a three-target load balancer pool. The strategy reads each target's `metadata.loaded_adapters` array and prefers an eligible target that already has the requested adapter warm. If none does, it returns `None` and `algorithm: least_connections` picks the target. The adapter comes from `X-LoRA-Adapter` or `?adapter=`; empty values and values over 256 bytes are ignored.
 
 `strategy: lora-aware` compiles and runs the registered strategy on the production request path. `lb_method: plugin` is the compatibility marker used by this example, and `algorithm` remains the explicit fallback. Missing or malformed `loaded_adapters` metadata is treated as an empty inventory so one target cannot poison the pool.

@@ -1,0 +1,82 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI access control via a Rego policy.
+#
+# The Rego twin of examples/ai-cel-tenant-gate/: same gate, same
+# request-time behavior, expressed as `policy: rego` instead of
+# `policy: expression`. SBproxy evaluates the Rego module in process on
+# the Regorus interpreter; there is no OPA server to run alongside the
+# proxy. See docs/opa-rego-policies.md.
+#
+# Two Rego policies layer here:
+#
+#   1. Require a non-empty `X-Tenant` header. Anything without one
+#      gets a 403 before the AI handler even reads the body.
+#
+#   2. Require the tenant value to appear in an allow-list, kept in
+#      `data` rather than hardcoded into the rule, so an operator edits
+#      the allow-list without reading a line of Rego. Unknown tenants
+#      are rejected with a different message so the operator can spot
+#      misconfigured clients vs. unprovisioned ones.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/ai-rego-tenant-gate/sb.yml
+#
+# Test (no tenant -> 403):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# Test (unknown tenant -> 403):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'X-Tenant: stranger' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# Test (allowed tenant -> 200):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'X-Tenant: acme' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+
+    policies:
+      - type: rego
+        module: |
+          package sbproxy
+
+          default allow := false
+
+          allow if {
+            input.request.headers["x-tenant"] != ""
+          }
+        deny_status: 403
+        deny_message: "X-Tenant header required for AI access"
+
+      - type: rego
+        module: |
+          package sbproxy
+
+          default allow := false
+
+          allow if {
+            input.request.headers["x-tenant"] == data.allowed_tenants[_]
+          }
+        data:
+          allowed_tenants: ["acme", "globex", "initech"]
+        deny_status: 403
+        deny_message: "tenant not provisioned for AI access"

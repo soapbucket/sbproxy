@@ -17,8 +17,8 @@ use std::time::Instant;
 use base64::Engine as _;
 use sbproxy_config::OutboundDestination;
 use sbproxy_security::egress::{
-    CachedSystemResolver, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
-    PurposeAllowlist,
+    record_egress_seen, CachedSystemResolver, EgressAuthorizer, EgressConfig, EgressDenied,
+    EgressPurpose, EgressSightingStatus, PurposeAllowlist,
 };
 
 /// Count and log one refusal on the shared egress family, then return
@@ -252,6 +252,12 @@ impl BundleOutbound {
         let authorizer = self.authorizer.clone();
         let resolver = self.resolver;
         let url = url.to_owned();
+        // WOR-2476: kept alongside the moved copy below so the egress
+        // inventory stamp can name the destination after the blocking
+        // authorize/verify pair resolves; this purpose has no
+        // "authorizer omitted" branch, so every stamp here is `Allowed`
+        // or `Denied`, never `Ungated`.
+        let url_for_seen = url.clone();
         let bundle = self.bundle.clone();
         runtime.block_on(async move {
             let overall = tokio::time::Instant::now() + remaining;
@@ -267,7 +273,23 @@ impl BundleOutbound {
             .await
             .map_err(|_| "budget_exhausted".to_owned())?
             .map_err(|_| "request_failed".to_owned())?
-            .map_err(|denied| refuse_for(&bundle, denied))?;
+            .map_err(|denied| {
+                record_egress_seen(
+                    EgressPurpose::BundleHook,
+                    &url_for_seen,
+                    &bundle,
+                    EgressSightingStatus::Denied,
+                    Some(denied),
+                );
+                refuse_for(&bundle, denied)
+            })?;
+            record_egress_seen(
+                EgressPurpose::BundleHook,
+                &url_for_seen,
+                &bundle,
+                EgressSightingStatus::Allowed,
+                None,
+            );
             let host = destination
                 .url
                 .host_str()

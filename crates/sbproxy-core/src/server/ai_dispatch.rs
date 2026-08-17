@@ -1154,6 +1154,7 @@ async fn ai_surface_budget_gate(
         Some(hostname),
         tag.as_deref(),
         agent.identity(),
+        ctx.tenant_id.as_str(),
     )
     .await;
     gate
@@ -2935,6 +2936,29 @@ fn record_guardrail_decision(
         origin_for_family,
         &ctx.tenant_id,
     );
+
+    // WOR-2486: `guardrail_triggered` on the typed event feed. Verdict
+    // level, never per-chunk: this function is the input/output funnel
+    // both guardrail stages already run through once per evaluation,
+    // and only a block ("triggered") publishes, not an allow with a
+    // near-miss flag count.
+    if outcome == sbproxy_observe::decision::DecisionOutcome::Deny {
+        sbproxy_observe::publish_proxy_event(
+            sbproxy_observe::EventType::GuardrailTriggered,
+            || {
+                sbproxy_observe::ProxyEvent::new(
+                    sbproxy_observe::EventType::GuardrailTriggered,
+                    origin_for_family.to_owned(),
+                    ctx.tenant_id.to_string(),
+                    serde_json::json!({
+                        "stage": stage,
+                        "guardrail": guardrail,
+                        "flagged_count": flagged_count,
+                    }),
+                )
+            },
+        );
+    }
 
     let Some(origin_id) = origin_id else {
         return;
@@ -4851,6 +4875,7 @@ pub(super) async fn handle_ai_proxy(
             provider.name.as_str(),
             status,
             Some(response_body.as_ref()),
+            Some(&*ctx),
         );
         let response_body =
             bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
@@ -5269,6 +5294,7 @@ pub(super) async fn handle_ai_proxy(
             Some(hostname),
             tag_header.as_deref(),
             billing_agent.identity(),
+            ctx.tenant_id.as_str(),
         )
         .await;
         match gate {
@@ -7756,6 +7782,7 @@ pub(super) async fn handle_ai_proxy(
                         &o.provider_name,
                         o.status,
                         Some(o.body.as_ref()),
+                        Some(&*ctx),
                     );
                     let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
                         o.status,
@@ -8441,6 +8468,7 @@ pub(super) async fn handle_ai_proxy(
                         &provider.name,
                         &to_provider,
                         &format!("http_{status}"),
+                        ctx.tenant_id.as_str(),
                     );
                     warn!(
                         provider = %provider.name,
@@ -8517,6 +8545,7 @@ pub(super) async fn handle_ai_proxy(
                             &provider.name,
                             &to_provider,
                             "content_policy",
+                            ctx.tenant_id.as_str(),
                         );
                         warn!(
                             provider = %provider.name,
@@ -8530,6 +8559,7 @@ pub(super) async fn handle_ai_proxy(
                         provider.name.as_str(),
                         status,
                         Some(body_bytes.as_ref()),
+                        Some(&*ctx),
                     );
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                     try_spawn_governed_shadow_after_primary(
@@ -8640,6 +8670,7 @@ pub(super) async fn handle_ai_proxy(
                         &provider.name,
                         &to_provider,
                         "managed_cold_fallback",
+                        ctx.tenant_id.as_str(),
                     );
                     continue;
                 }
@@ -8651,7 +8682,12 @@ pub(super) async fn handle_ai_proxy(
                     .get(attempt + 1)
                     .map(|&i| config.providers[i].name.clone())
                     .unwrap_or_default();
-                sbproxy_ai::ai_metrics::record_failover(&provider.name, &to_provider, "transport");
+                sbproxy_ai::ai_metrics::record_failover(
+                    &provider.name,
+                    &to_provider,
+                    "transport",
+                    ctx.tenant_id.as_str(),
+                );
                 continue;
             }
         }
@@ -8980,11 +9016,16 @@ fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
     }
 }
 
+// `ctx` is the WOR-2486 addition: `ai.failure` needs an origin and a
+// tenant to attribute a decision-audit record to, and `relay_ai_response`
+// (one of the seven callers) has no `RequestContext` in scope at all, so
+// the parameter is `Option` rather than required.
 pub(super) fn record_ai_provider_response_failure(
     span: &tracing::Span,
     provider: &str,
     status: u16,
     body: Option<&[u8]>,
+    ctx: Option<&RequestContext>,
 ) {
     let Some(kind) = ai_provider_response_error_type(status, body) else {
         return;
@@ -9007,6 +9048,142 @@ pub(super) fn record_ai_provider_response_failure(
             ai_metric_error_kind_for_span_error_type(kind),
         );
     }
+    record_ai_failure_decision(ctx, provider, status, kind, &diagnostic);
+}
+
+/// Record `ai.failure` on the decision family and, when enabled, the
+/// audit feed (WOR-2486).
+///
+/// Mirrors [`record_guardrail_decision`]'s shape exactly: the metric
+/// family always records (when `ctx` resolves an origin), the audit
+/// record only when the origin's `decision_audit` config selects
+/// `ai.failure` for this tenant/origin.
+fn record_ai_failure_decision(
+    ctx: Option<&RequestContext>,
+    provider: &str,
+    status: u16,
+    kind: &str,
+    diagnostic: &AiProviderErrorDiagnostic,
+) {
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
+
+    let Some(ctx) = ctx else {
+        return;
+    };
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::AiFailure,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Error,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::AiFailure,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    let mut reason = format!("provider {provider} returned {kind} (status {status})");
+    if let Some(code) = diagnostic.code {
+        reason.push_str(&format!("; upstream_error_code={code}"));
+    }
+    if let Some(diag_status) = diagnostic.status {
+        reason.push_str(&format!("; upstream_error_status={diag_status}"));
+    }
+    if let Some(diag_reason) = diagnostic.reason {
+        reason.push_str(&format!("; upstream_error_reason={diag_reason}"));
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::AiFailure,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Error,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &reason,
+        DecisionDetails::ai_failure(provider, kind),
+    );
+}
+
+/// Record `ai.close` on the decision family and, when enabled, the
+/// audit feed (WOR-2486).
+///
+/// Same shape as [`record_ai_failure_decision`] and
+/// [`record_guardrail_decision`]. `ctx` is `None` when the relay has no
+/// request context in scope; a stream summary with no origin to
+/// attribute to publishes nothing.
+///
+/// Coverage is narrower than the other funnels this shape wires: it
+/// fires only when the caller's [`crate::ai_extensions::AiRequestExtensions`]
+/// is `Some`, which requires a non-empty AI extension chain for this
+/// generation. A deployment with no AI extension bundles configured
+/// never constructs one, so `ai.close` publishes nothing there even
+/// with `decision_audit` enabled. See `DecisionEvent::coverage`'s doc
+/// on the `AiClose` arm and `docs/events.md`.
+fn record_ai_close_decision(
+    ctx: Option<&RequestContext>,
+    summary: &crate::ai_extensions::AiCloseSummary,
+) {
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
+
+    let Some(ctx) = ctx else {
+        return;
+    };
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::AiClose,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Allow,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::AiClose,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    let reason = match summary.finish_reason.as_deref() {
+        Some(reason) => format!("stream closed (finish_reason={reason})"),
+        None => "stream closed (no finish_reason reported)".to_owned(),
+    };
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::AiClose,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Allow,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &reason,
+        DecisionDetails::ai_close(summary.finish_reason.as_deref()),
+    );
 }
 
 #[derive(Default)]
@@ -9318,7 +9495,10 @@ pub(super) async fn relay_ai_response(
 
     let translated =
         sbproxy_ai::translators::translate_success_response_bytes(format, status, &resp_body);
-    record_ai_provider_response_failure(ai_span, provider_name, status, Some(&translated));
+    // No `RequestContext` in scope on this relay path (see the doc on
+    // `record_ai_provider_response_failure`); the failure is still
+    // logged and metriced, just not decision-audited.
+    record_ai_provider_response_failure(ai_span, provider_name, status, Some(&translated), None);
     let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
         status,
         inbound_format,
@@ -9691,6 +9871,7 @@ pub(super) async fn relay_ai_response_with_cache(
         router_sink.provider_name,
         status,
         Some(resp_body.as_ref()),
+        ctx.as_deref(),
     );
 
     // WOR-1044: snapshot the reversible redaction pairs before any
@@ -11688,7 +11869,13 @@ pub(super) async fn relay_ai_stream(
     mut ai_extensions: Option<crate::ai_extensions::AiRequestExtensions>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
-    record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
+    record_ai_provider_response_failure(
+        &ai_span,
+        router_sink.provider_name,
+        status,
+        None,
+        ctx.as_deref(),
+    );
 
     // WOR-1811: a served (local) engine stamps its internal model id
     // (historically the weights file path or the internal deployment
@@ -12379,6 +12566,7 @@ pub(super) async fn relay_ai_stream(
                     break;
                 }
                 if let Some(extensions) = ai_extensions.as_mut() {
+                    let already_closed = extensions.is_closed();
                     let decision = dispatch_ai_hub_events(
                         extensions,
                         &tail_events,
@@ -12387,6 +12575,13 @@ pub(super) async fn relay_ai_stream(
                     )
                     .await
                     .and(extensions.close().await);
+                    // WOR-2486: `close()` is idempotent across the two
+                    // exit paths this function has, but the decision
+                    // record is not one of the things it idempotently
+                    // guards, so this call site owns not double-firing.
+                    if decision.is_ok() && !already_closed {
+                        record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
+                    }
                     if let Err(block) = decision {
                         warn!(
                             extension_code = %block.code,
@@ -12582,7 +12777,12 @@ pub(super) async fn relay_ai_stream(
     }
 
     if let Some(extensions) = ai_extensions.as_mut() {
-        if let Err(block) = extensions.close().await {
+        let already_closed = extensions.is_closed();
+        let close_result = extensions.close().await;
+        if close_result.is_ok() && !already_closed {
+            record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
+        }
+        if let Err(block) = close_result {
             warn!(
                 extension_code = %block.code,
                 "AI proxy: extension hook blocked stream close"
@@ -17654,8 +17854,8 @@ mod compression_selection_tests {
 mod ai_error_classification_tests {
     use super::{
         ai_metric_error_kind_for_span_error_type, ai_provider_response_error_type,
-        ai_response_body_indicates_content_filter, record_ai_provider_response_failure,
-        safe_provider_error_label,
+        ai_response_body_indicates_content_filter, record_ai_close_decision,
+        record_ai_provider_response_failure, safe_provider_error_label,
     };
     use std::sync::{Arc, Mutex};
 
@@ -17759,7 +17959,13 @@ mod ai_error_classification_tests {
         }"#;
 
         tracing::subscriber::with_default(subscriber, || {
-            record_ai_provider_response_failure(&tracing::Span::none(), "gemini", 400, Some(body));
+            record_ai_provider_response_failure(
+                &tracing::Span::none(),
+                "gemini",
+                400,
+                Some(body),
+                None,
+            );
         });
 
         let output =
@@ -17834,6 +18040,249 @@ mod ai_error_classification_tests {
             ),
             "timeout"
         );
+    }
+
+    /// WOR-2486: red first. Before this wiring, `ai.failure` was on
+    /// `DecisionEvent::ALL` marked `Unwired`, and no call site anywhere
+    /// in the workspace ever constructed a `DecisionAudit` for it.
+    /// Driven through the real bus, mirroring
+    /// `the_audit_record_names_the_same_engine_the_metric_does` in
+    /// `server/tests.rs`, so this fails if the funnel stops threading
+    /// the fields it was handed rather than just checking a struct this
+    /// test built by hand.
+    #[test]
+    fn ai_provider_response_failure_publishes_ai_failure_when_enabled() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.failure: true
+origins:
+  "ai-failure.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.failure fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.failure fixture pipeline");
+
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.tenant_id = "acme".into();
+        ctx.request_id = "req-ai-failure".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        crate::policy_bus::init_global_bus(bus);
+
+        record_ai_provider_response_failure(
+            &tracing::Span::none(),
+            "openai",
+            503,
+            None,
+            Some(&ctx),
+        );
+
+        let mut ours = None;
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-ai-failure" {
+                    ours = Some(audit);
+                    break;
+                }
+            }
+        }
+        let audit = ours.expect(
+            "ai.failure must reach the bus; a silent miss here would make this test pass \
+             without checking anything",
+        );
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiFailure
+        );
+        assert_eq!(audit.tenant, "acme");
+        assert_eq!(audit.origin, "ai-failure.test");
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Error
+        );
+        assert_eq!(audit.details.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            audit.details.verdict.as_deref(),
+            Some(sbproxy_ai::tracing_spans::error_type::UPSTREAM_5XX)
+        );
+    }
+
+    /// The negative half of the pair above: a 2xx response is not a
+    /// failure, so `ai.failure` must not publish even with the feed
+    /// enabled.
+    #[test]
+    fn ai_provider_response_failure_is_silent_on_success() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.failure: true
+origins:
+  "ai-failure-ok.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.failure success fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.failure success fixture pipeline");
+
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.request_id = "req-ai-failure-ok".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        crate::policy_bus::init_global_bus(bus);
+
+        record_ai_provider_response_failure(
+            &tracing::Span::none(),
+            "openai",
+            200,
+            None,
+            Some(&ctx),
+        );
+
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert_ne!(
+                    audit.request_id, "req-ai-failure-ok",
+                    "a 2xx response must never publish ai.failure"
+                );
+            }
+        }
+    }
+
+    /// WOR-2486: red first. Before this wiring, `ai.close` was
+    /// `Unwired` and no call site anywhere published a `DecisionAudit`
+    /// for it.
+    #[test]
+    fn ai_close_publishes_when_enabled() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.close: true
+origins:
+  "ai-close.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.close fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.close fixture pipeline");
+
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.tenant_id = "acme".into();
+        ctx.request_id = "req-ai-close".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        crate::policy_bus::init_global_bus(bus);
+
+        record_ai_close_decision(
+            Some(&ctx),
+            &crate::ai_extensions::AiCloseSummary {
+                finish_reason: Some("tool_calls".to_string()),
+            },
+        );
+
+        let mut ours = None;
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-ai-close" {
+                    ours = Some(audit);
+                    break;
+                }
+            }
+        }
+        let audit = ours.expect(
+            "ai.close must reach the bus; a silent miss here would make this test pass \
+             without checking anything",
+        );
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiClose
+        );
+        assert_eq!(audit.tenant, "acme");
+        assert_eq!(audit.origin, "ai-close.test");
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Allow
+        );
+        assert_eq!(audit.details.verdict.as_deref(), Some("tool_calls"));
+    }
+
+    /// The negative half: `ai.close` must stay silent when
+    /// `decision_audit` does not select it, even with a real context.
+    #[test]
+    fn ai_close_is_silent_when_not_configured() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+origins:
+  "ai-close-off.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.close off fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.close off fixture pipeline");
+
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.request_id = "req-ai-close-off".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        crate::policy_bus::init_global_bus(bus);
+
+        record_ai_close_decision(
+            Some(&ctx),
+            &crate::ai_extensions::AiCloseSummary {
+                finish_reason: Some("stop".to_string()),
+            },
+        );
+
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert_ne!(
+                    audit.request_id, "req-ai-close-off",
+                    "decision_audit is absent, so ai.close must not publish"
+                );
+            }
+        }
     }
 }
 
@@ -19271,7 +19720,14 @@ mod effective_key_budget_tests {
         let keys = scope_keys(&merged, &policy.key_id, "budget-block-origin");
         BUDGET_TRACKER.record_usage(&keys[0].1, 100, 0.0);
         assert!(matches!(
-            budget_preflight(&merged, &keys, &[], &std::collections::HashMap::new()),
+            budget_preflight(
+                &merged,
+                &keys,
+                &[],
+                &std::collections::HashMap::new(),
+                "tenant-a",
+                "budget-block-origin",
+            ),
             BudgetGate::Block { status: 402, .. }
         ));
     }
@@ -19288,11 +19744,25 @@ mod effective_key_budget_tests {
 
         BUDGET_TRACKER.record_usage(&keys_a[0].1, 50, 0.0);
         assert!(matches!(
-            budget_preflight(&merged, &keys_a, &[], &std::collections::HashMap::new()),
+            budget_preflight(
+                &merged,
+                &keys_a,
+                &[],
+                &std::collections::HashMap::new(),
+                "tenant-a",
+                "budget-independent-origin",
+            ),
             BudgetGate::Block { .. }
         ));
         assert!(matches!(
-            budget_preflight(&merged, &keys_b, &[], &std::collections::HashMap::new()),
+            budget_preflight(
+                &merged,
+                &keys_b,
+                &[],
+                &std::collections::HashMap::new(),
+                "tenant-a",
+                "budget-independent-origin",
+            ),
             BudgetGate::Allow
         ));
     }

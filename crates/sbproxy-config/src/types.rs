@@ -69,6 +69,13 @@ pub struct ConfigFile {
     /// `security_audit` event to a hash-chained, signed file.
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+    /// Operator-authored egress allowlists that arm the AiProvider,
+    /// UsageSink, ModelArtifact, TokenExchange, and Telemetry purposes
+    /// (WOR-2476, WOR-2481). Absent, or a sub-block omitted within it,
+    /// keeps the corresponding purpose exactly as ungated as it was
+    /// before this section existed. See [`EgressTopLevelConfig`].
+    #[serde(default)]
+    pub egress: Option<EgressTopLevelConfig>,
     /// WOR-1186: emit the canonical session ledger (per-tool-call run
     /// records) from the live MCP `tools/call` path. Off unless this
     /// block is present and `enabled: true`.
@@ -80,7 +87,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub request_events: Option<RequestEventsConfig>,
     /// Where typed proxy events go. Absent, or present with the default
-    /// `sink: none`, means the twelve event types stay in-process and
+    /// `sink: none`, means the thirteen event types stay in-process and
     /// nothing leaves the proxy.
     #[serde(default)]
     pub events: Option<EventsConfig>,
@@ -375,12 +382,26 @@ pub struct AuditConfig {
     /// Optional path where `config_audit` events are chained. Opt-in; when
     /// absent, `config_audit` remains a tracing stream and is not durably
     /// recorded, preserving exactly the old behavior. Requires `sink: chain`.
-    /// Must differ from `path` because the two audit event types (config and
-    /// security) have different payload formats and verify independently.
-    /// `key_audit` is deliberately not chainable yet, since its before/after
-    /// diff contents require a separate contents-based ruling first.
+    /// Must differ from `path`, `key_path`, and `admin_path`: every audit
+    /// channel has a different payload format and verifies independently.
     #[serde(default)]
     pub config_path: Option<String>,
+    /// Optional path where `key_audit` mutations are chained (WOR-2478).
+    /// Opt-in, same terms as `config_path`. The chained record is metadata
+    /// plus a keyed-HMAC fingerprint of each before/after field, never the
+    /// raw diff `key_audit`'s tracing target carries; see
+    /// `sbproxy_observe::audit`'s module docs. Requires `sink: chain`.
+    /// Must differ from `path`, `config_path`, and `admin_path`.
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Optional path where authenticated admin-console actions are
+    /// chained (WOR-2478): mutating admin API calls, logins, and content
+    /// inspection, the same events the `sbproxy::admin::audit` tracing
+    /// target and the admin ring's `admin` channel already carry. Opt-in,
+    /// same terms as `config_path`. Requires `sink: chain`. Must differ
+    /// from `path`, `config_path`, and `key_path`.
+    #[serde(default)]
+    pub admin_path: Option<String>,
 }
 
 /// Accepted audit sink names.
@@ -411,10 +432,148 @@ pub enum AuditSinkKind {
     /// Append every `security_audit` event to a SHA-256 hash-chained,
     /// Ed25519-signed file at `path`, signed by the identity `sign_with`
     /// names. Editing or removing a record breaks the chain, and
-    /// `sbproxy audit verify` re-derives it from genesis. When `config_path`
-    /// is set, `config_audit` events chain to that file; `key_audit` is not
-    /// chained yet.
+    /// `sbproxy audit verify` re-derives it from genesis. `config_path`,
+    /// `key_path`, and `admin_path` opt the `config_audit`, `key_audit`,
+    /// and admin-console channels into their own chain files under the
+    /// same signing identity (WOR-2478).
     Chain,
+}
+
+/// Top-level `egress:` section: operator-authored allowlists that arm the
+/// per-purpose egress gates (WOR-2476), plus the OTLP exporter gate
+/// (WOR-2481).
+///
+/// Reuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI
+/// `egress:` block already ships
+/// (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot
+/// depend on `sbproxy-extension` (that dependency runs the other way), so
+/// the shape is redeclared here rather than shared by type.
+///
+/// Every sub-block is independently optional. A purpose whose sub-block is
+/// omitted stays legacy ungated: `AiClient`'s documented `None` contract,
+/// the usage sinks' unauthenticated dispatch, the model-artifact fetcher's
+/// unauthenticated download, the non-MCP token-exchange resolver, and the
+/// OTLP exporters all keep behaving exactly as they did before this
+/// section existed. `compile_config` compiles each configured sub-block
+/// into a [`sbproxy_security::egress::EgressAuthorizer`] once, on
+/// [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses
+/// this raw struct directly.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EgressTopLevelConfig {
+    /// Arms `EgressPurpose::AiProvider`: every upstream AI provider
+    /// dispatch the AI gateway's client makes.
+    #[serde(default)]
+    pub ai_providers: Option<EgressPurposeConfig>,
+    /// Arms Langfuse, Datadog, and object-store usage-sink deliveries
+    /// under `EgressPurpose::UsageSink`, and webhook deliveries under
+    /// `EgressPurpose::Webhook` (a separate, pre-existing purpose the
+    /// webhook sink authorizes under internally): one config knob, two
+    /// purposes armed from the same allowlist.
+    #[serde(default)]
+    pub usage_sinks: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::ModelArtifact`: the model-host artifact
+    /// fetcher's HTTP downloads.
+    #[serde(default)]
+    pub model_artifacts: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::TokenExchange` for the non-MCP outbound
+    /// credential resolver's OAuth token-endpoint calls. The MCP token
+    /// exchange path (`sbproxy_extension::mcp::auth`) has its own
+    /// `egress:` block and is unaffected by this section.
+    #[serde(default)]
+    pub token_exchange: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric,
+    /// and log exporter endpoints. Authorized once at boot, where each
+    /// exporter is constructed; a config reload does not re-verify an
+    /// already-running exporter (WOR-2481 tracks closing that gap).
+    #[serde(default)]
+    pub telemetry: Option<EgressPurposeConfig>,
+}
+
+/// One purpose's allowlist under the top-level `egress:` section.
+///
+/// Shares its vocabulary with the per-tool MCP/OpenAPI `egress:` block;
+/// see `sbproxy_extension::mcp::egress::EgressPolicy` for the enforcement
+/// semantics this compiles to. `hosts` (exact match), `ports`, and
+/// `allow_private` are supported here; the per-tool block's `suffixes`
+/// has no equivalent in this section.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EgressPurposeConfig {
+    /// Default behavior for hosts that do not match `hosts`.
+    /// `allow_by_default` (the default) is inert: the purpose stays
+    /// legacy ungated even though `hosts` is present, mirroring the
+    /// per-tool block's `EgressMode::AllowByDefault` short-circuit. Set
+    /// `deny_by_default` to actually arm the gate.
+    #[serde(default)]
+    pub mode: EgressPurposeMode,
+    /// Exact hostnames, compared case-insensitively. Ignored under
+    /// `allow_by_default`.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// When true, resolved private/link-local addresses are permitted for
+    /// hosts on this allowlist (operator opt-in).
+    #[serde(default)]
+    pub allow_private: bool,
+    /// Permitted destination ports. Defaults to `[80, 443]`, the
+    /// scheme-standard HTTP/HTTPS ports most sub-blocks dial. An
+    /// override is required for a purpose that does not: `telemetry`'s
+    /// OTLP endpoint is commonly `4317` (gRPC) or `4318` (HTTP), never
+    /// `80`/`443`, so the default here would refuse every destination
+    /// that sub-block reaches with `DisallowedPort` and there would be
+    /// no `hosts:` fix an operator could make to recover. Refused if
+    /// present but empty, or if it names port `0`: either would
+    /// silently refuse every destination this purpose reaches with no
+    /// indication why.
+    #[serde(default = "default_egress_ports")]
+    pub ports: Vec<u16>,
+}
+
+impl Default for EgressPurposeConfig {
+    fn default() -> Self {
+        Self {
+            mode: EgressPurposeMode::default(),
+            hosts: Vec::new(),
+            allow_private: false,
+            ports: default_egress_ports(),
+        }
+    }
+}
+
+fn default_egress_ports() -> Vec<u16> {
+    vec![80, 443]
+}
+
+/// Egress behavior when a destination host does not match `hosts`
+/// (mirrors `sbproxy_extension::mcp::egress::EgressMode`, minus its
+/// `enforce` alias).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPurposeMode {
+    /// Only explicitly listed `hosts` may be contacted; compiles to a
+    /// real `EgressAuthorizer` that fails closed.
+    DenyByDefault,
+    /// All hosts may be contacted. Legacy default: an omitted `mode:`, or
+    /// an omitted sub-block entirely, compiles to no authorizer at all.
+    #[default]
+    AllowByDefault,
+}
+
+impl EgressPurposeMode {
+    /// True when this mode arms a real authorizer (fails closed).
+    pub fn is_enforce(self) -> bool {
+        matches!(self, Self::DenyByDefault)
+    }
 }
 
 /// WOR-1186: session-ledger emission configuration.
@@ -537,7 +696,7 @@ pub struct EventsConfig {
     /// any host that can reach the endpoint can forge.
     #[serde(default)]
     pub signing_secret: Option<String>,
-    /// Which of the twelve event types to deliver. Empty or absent means
+    /// Which of the thirteen event types to deliver. Empty or absent means
     /// all of them.
     ///
     /// Names are the snake_case wire names (`policy_denied`,
@@ -8174,8 +8333,9 @@ pub struct ForwardRuleOrigin {
 /// Request modifier entry.
 ///
 /// Each modifier entry can contain one or more of: `headers`, `url`, `query`,
-/// `method`, `body`, or `lua_script`. Multiple modifier entries in the list
-/// are applied in order.
+/// `method`, `body`, `lua_script`, `js_script`, or `rego_module` /
+/// `rego_module_path`. Multiple modifier entries in the list are applied in
+/// order.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestModifierConfig {
@@ -8200,6 +8360,32 @@ pub struct RequestModifierConfig {
     /// Optional JavaScript script for dynamic request modification.
     #[serde(default)]
     pub js_script: Option<String>,
+    /// Optional inline Rego module for dynamic request modification
+    /// (WOR-2482). The module's `data.sbproxy.modify_request` rule
+    /// evaluates against the same document `lua_script` / `js_script`
+    /// receive as `req` and `ctx`, merged into one `input`, and returns
+    /// `{"set_headers": {...}}`, the same shape those scripts return.
+    /// Mutually exclusive with `rego_module_path`. See
+    /// `docs/scripting.md`.
+    #[serde(default)]
+    pub rego_module: Option<String>,
+    /// Filesystem path to a `.rego` file, read once when the config
+    /// compiles (and again on every reload), in place of an inline
+    /// `rego_module`. Mutually exclusive with `rego_module`.
+    #[serde(default)]
+    pub rego_module_path: Option<String>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound `policy: rego` and `ai_routing_policy`'s Rego form
+    /// use. Must be greater than zero; a zero budget is refused at
+    /// config compile.
+    #[serde(default)]
+    pub rego_budget_ms: Option<u64>,
+    /// Parse `rego_module` (or the file at `rego_module_path`) as
+    /// pre-OPA-1.0 Rego v0 (no `if`/`contains` required) instead of the
+    /// v1 default. A compatibility escape hatch for a module pasted from
+    /// an older OPA install.
+    #[serde(default)]
+    pub rego_v0: bool,
 }
 
 /// URL path rewrite configuration.
@@ -8259,8 +8445,10 @@ pub struct BodyModifier {
 
 /// Response modifier entry.
 ///
-/// Each modifier entry can contain one or more of: `headers`, `status`, `body`,
-/// or `lua_script`. Multiple modifier entries in the list are applied in order.
+/// Each modifier entry can contain one or more of: `headers`, `status`,
+/// `body`, `lua_script`, `js_script`, or `rego_module` /
+/// `rego_module_path`. Multiple modifier entries in the list are applied in
+/// order.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseModifierConfig {
@@ -8280,6 +8468,32 @@ pub struct ResponseModifierConfig {
     /// Optional JavaScript script for dynamic response modification.
     #[serde(default)]
     pub js_script: Option<String>,
+    /// Optional inline Rego module for dynamic response modification
+    /// (WOR-2482). The module's `data.sbproxy.modify_response` rule
+    /// evaluates against the same document `lua_script` / `js_script`
+    /// receive as `resp` and `ctx`, merged into one `input`, and returns
+    /// `{"set_headers": {...}}`, the same shape those scripts return.
+    /// Mutually exclusive with `rego_module_path`. See
+    /// `docs/scripting.md`.
+    #[serde(default)]
+    pub rego_module: Option<String>,
+    /// Filesystem path to a `.rego` file, read once when the config
+    /// compiles (and again on every reload), in place of an inline
+    /// `rego_module`. Mutually exclusive with `rego_module`.
+    #[serde(default)]
+    pub rego_module_path: Option<String>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound `policy: rego` and `ai_routing_policy`'s Rego form
+    /// use. Must be greater than zero; a zero budget is refused at
+    /// config compile.
+    #[serde(default)]
+    pub rego_budget_ms: Option<u64>,
+    /// Parse `rego_module` (or the file at `rego_module_path`) as
+    /// pre-OPA-1.0 Rego v0 (no `if`/`contains` required) instead of the
+    /// v1 default. A compatibility escape hatch for a module pasted from
+    /// an older OPA install.
+    #[serde(default)]
+    pub rego_v0: bool,
 }
 
 /// Status code override for response modifiers.

@@ -462,6 +462,7 @@ mod tests {
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         }
     }
 

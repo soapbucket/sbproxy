@@ -20,8 +20,8 @@ What a consumer may rely on from the decision-audit feed. Retrofitting a field i
 | `ai.guardrail.output` | yes |  |
 | `ai.tool_call` | yes |  |
 | `ai.stream.event` | never | Fires once per streamed chunk, so it is refused ahead of both the per-event map and the master switch. `ai.close` carries the stream's summary once instead. |
-| `ai.close` | not yet | No emitter. Enabling it publishes nothing. |
-| `ai.failure` | not yet | No emitter. Enabling it publishes nothing. |
+| `ai.close` | yes |  |
+| `ai.failure` | yes |  |
 | `transform` | not yet | No emitter. Enabling it publishes nothing. |
 | `action` | not yet | No emitter. Enabling it publishes nothing. |
 | `log.custom_field` | not yet | No emitter. Enabling it publishes nothing. |
@@ -100,6 +100,19 @@ One record per judged streamed tool call, not per chunk. `verdict` is the guard'
 - `unmapped.verdict`
 
 `verdict` is the dispatch label rather than the outcome, because only it separates the gateway refusing a call (`policy_denied`, `tool_not_found`) from the upstream failing one the gateway allowed (`tool_error`).
+
+### `ai.failure`
+
+- `unmapped.selected_provider`
+- `unmapped.verdict`
+
+`selected_provider` names which provider's response failed. `verdict` carries the classified failure kind (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`), a closed vocabulary rather than the raw upstream status text, which can carry a prompt fragment. The record's own `outcome` is always `error`: this is an upstream fact, not a proxy policy decision.
+
+### `ai.close`
+
+- `unmapped.verdict`
+
+`verdict` carries the terminal `finish_reason` (`stop`, `length`, `tool_calls`, `content_filter`, ...). Token counts and cost are not duplicated here: they already have an authoritative home in the access log and the usage ledger, and this record's job is marking that the stream reached its end, not re-billing it.
 
 ## Envelope
 

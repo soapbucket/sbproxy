@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
 Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, provider-neutral event hooks, and AI routing decisions without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -99,8 +99,8 @@ permissions: []
 
 - `apiVersion` is `sbproxy.dev/v1alpha1` and `kind` is `Bundle`.
 - `name` is a stable lowercase bundle ID. Each hook `type` is the name used in `sb.yml`.
-- `runtime` is `javascript`, `wasm`, or `proxy_wasm`.
-- `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`.
+- `runtime` is `javascript`, `wasm`, `proxy_wasm`, or `rego`.
+- `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`; `rego` accepts `.rego`.
 - `sha256` pins a digest and `digest_scope` says what that digest is a digest of. The example above omits `digest_scope`, so it means `entry`, the narrower of the two scopes. See [What the digest covers](#what-the-digest-covers).
 - `hooks` declares at least one typed hook. A JavaScript hook names its ES module export. WASM hooks omit `export`.
 - `config_schema` is an optional Draft 7 JSON Schema for one attachment. Defaults are applied before the hook starts, and invalid attachment config refuses the candidate.
@@ -128,7 +128,7 @@ Writing nothing on the attachment is not the same as writing `open` there. A bun
 
 `digest_scope: entry` is the default and covers the exact bytes of the single file named by `entry`. Nothing else: not `bundle.yaml`, not the WAT or TypeScript source used to build the entry, not any other file in the directory. Every manifest written before `digest_scope` existed means this, which is why it stays the default.
 
-Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, and `permissions` live, and the permission lines are what decide which destinations guest code may ask for. Pinning the code while leaving the file that declares its capabilities unpinned is the verification the wrong way round.
+Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, `permissions`, and a `runtime: rego` hook's `query` all live, and the permission lines are what decide which destinations guest code may ask for. Pinning the code while leaving the file that declares its capabilities unpinned is the verification the wrong way round. An unpinned `query` is a narrower version of the same problem: a `bundle.yaml` edit can point evaluation at a different rule without touching the pinned module's bytes at all, but only among whatever rules that already-pinned module happens to define, not arbitrary new logic.
 
 `digest_scope: bundle_v1` covers `bundle.yaml` and every other file the bundle ships:
 
@@ -253,6 +253,41 @@ entry: action.wasm
 The artifact is a WASI preview 1 command module with an exported `_start`. On each invocation, sbproxy creates a fresh Wasmtime store, writes the same versioned JSON hook envelope to stdin, runs `_start`, and parses one strict JSON result from stdout. The module receives no filesystem, network, environment, or host-clock access. The compiled module is shared, but guest state is not.
 
 The worked example keeps `action.wat` beside the committed `action.wasm` and rebuilds it with `wat2wasm`. A production build can use any language that emits a compatible WASI preview 1 command module.
+
+## Rego
+
+A Rego bundle manifest uses:
+
+```yaml
+runtime: rego
+entry: policy.rego
+hooks:
+  - kind: policy
+    type: acme_authz
+    execution:
+      body_mode: none
+```
+
+A `runtime: rego` bundle rides the same signing, digest verification, and candidate load-or-refuse flow as every other bundle asset; see [Candidate load and reload](#candidate-load-and-reload). What differs is evaluation: sbproxy compiles the `.rego` module once, at candidate load, on the same [Regorus](https://github.com/microsoft/regorus) interpreter `policy: rego` uses (see [scripting.md](scripting.md)), and proves the pinned query evaluable before the candidate can activate, the same load-time guarantee `entry.js`'s declared exports and `action.wasm`'s module contract already get. A `.rego` module performs no I/O during evaluation, so `runtime: rego` accepts only `kind: policy` hooks, must omit `abi` and `export`, and must declare `execution.body_mode: none`.
+
+Bundled Rego is v1 only: the manifest has no `rego_v0` flag, so a pre-OPA-1.0 module fails at candidate load with a parse error. This is narrower than the config-inline surfaces: `policy: rego` and the `rego_module`/`rego_module_path` modifier fields both accept `rego_v0: true` for a pasted-in legacy module.
+
+`type:` is the same `sb.yml` attachment name any other policy hook uses. The `query` field pins the rule reference evaluated per request (`data.<package>.<rule>`), defaulting to `data.sbproxy.allow` when omitted, matching `policy: rego`'s own default:
+
+```yaml
+hooks:
+  - kind: policy
+    type: acme_authz
+    query: data.sbproxy.allow
+    execution:
+      body_mode: none
+```
+
+The rule reads the same JSON envelope a JavaScript or WASM policy hook reads: `input.request.method`, `input.request.uri`, `input.request.headers`, and `input.config` (the attachment's resolved `vars`, after `config_schema` defaults and `secret_vars` resolution). This is the wire-level request, not the internally resolved `CelContext` `policy: rego` reads from `sb.yml`; a bundle hook never sees trust tier or principal the way a built-in enforcer can. The query must evaluate to a Rego boolean: `true` allows and `false` denies, both with the fixed status and message `policy: rego` itself defaults to. A budget-exceeded, non-boolean-result, or other internal evaluation fault is not a decision, so it does not deny by itself: it reaches the same `failure_posture` handling every other bundle policy hook's fault reaches (`open` admits, `closed` refuses), rather than always denying the way `policy: rego`'s own unconditional fail-closed posture does.
+
+A denial is always a fixed `403` with body `forbidden by policy`. `policy: rego`'s `deny_status`/`deny_message` knobs do not apply inside a bundle.
+
+`sbproxy rego test` (see [scripting.md](scripting.md#3a-rego-policies)) is engine-agnostic: it evaluates a fixture's `input` document exactly as authored, so it works as an offline pre-flight for a `.rego` file destined for a bundle just as well as for `policy: rego`. Write the fixture's `input` in the bundle envelope shape above (`input.request.method`, `input.request.uri`, `input.config`), not the `CelContext` shape `policy: rego` fixtures use.
 
 ## Proxy-Wasm HTTP and AI stream hooks
 

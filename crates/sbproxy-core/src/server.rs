@@ -45,8 +45,27 @@ static AI_CLIENT: std::sync::LazyLock<arc_swap::ArcSwap<AiClient>> =
 /// edits providers picks up the new catalog without a process
 /// restart. In-flight requests are unaffected; the next request after
 /// the swap sees the new client.
+///
+/// WOR-2476: reads the `EgressPurpose::AiProvider` authorizer from
+/// `sbproxy_security::egress`'s process-wide configured-gate registry and
+/// attaches it via `with_egress` when one is installed. The registry is
+/// populated by `lifecycle::arm_egress_gates_from_config`, which calls
+/// this function itself (not a separate caller) immediately after
+/// installing the registry, so this always reads the authorizer the
+/// current config compiled (or `None`, preserving `AiClient`'s legacy
+/// ungated contract, when `egress:` omits `ai_providers` or was never
+/// configured at all). `arm_egress_gates_from_config` is the one seam
+/// both `lifecycle::run` (boot) and the reload path call, specifically
+/// so this function runs at boot and not only from the second config a
+/// process ever loads.
 pub fn reload_ai_client() {
-    AI_CLIENT.store(std::sync::Arc::new(AiClient::new()));
+    use sbproxy_security::egress::{configured_gate, EgressPurpose};
+
+    let mut client = AiClient::new();
+    if let Some(authorizer) = configured_gate(EgressPurpose::AiProvider) {
+        client = client.with_egress(authorizer);
+    }
+    AI_CLIENT.store(std::sync::Arc::new(client));
 }
 
 /// The current AI client, for surfaces outside the request pipeline
@@ -4926,6 +4945,193 @@ fn js_request_modifier(
         }
     }
     Ok(headers_to_set)
+}
+
+// --- Rego modifier helpers ---
+//
+// WOR-2482: engine-surface parity. `rego_module` / `rego_module_path`
+// on a request or response modifier evaluate the same way `lua_script`
+// / `js_script` do: a fresh `CompiledRego` is built from the module
+// text on every invocation, no config-load compile and no cached
+// engine, matching how `js_request_modifier` above builds a fresh
+// `JsEngine` per call rather than caching a parsed script. The failure
+// posture mirrors the Lua/JS row of `docs/scripting.md`'s modifier
+// error table, not `policy: rego`'s fail-closed-and-deny posture: an
+// error (a module that does not name the queried rule at all, a
+// budget overrun) is logged by the caller and the modifier's headers
+// are simply not applied; the request proceeds. A rule that is defined
+// but simply does not fire for a given input is `undefined`, which
+// Rego treats as "no opinion" rather than a fault
+// (`CompiledRego::eval_value`), so it also produces no headers without
+// logging anything.
+//
+// The evaluated rule name is a fixed convention,
+// `data.sbproxy.modify_request` / `data.sbproxy.modify_response`,
+// mirroring how Lua and JavaScript modifiers also call a fixed
+// function name (`modify_request` / `modify_response`) with no config
+// knob to rename it: the capability is identical, only the spelling
+// differs per language.
+
+/// Default evaluation budget for a Rego request/response modifier when
+/// `rego_budget_ms` is not set, matching `policy: rego`'s default
+/// (`docs/scripting.md` §3a). Operator-overridable per modifier via
+/// `rego_budget_ms`, unlike Lua's/JS's sandbox budgets, which are
+/// process-wide (`proxy.scripting.{lua,javascript}.sandbox`); Rego's is
+/// per-policy already on the other two Rego surfaces, so the modifier
+/// form matches them rather than introducing a third shape.
+const REGO_MODIFIER_BUDGET_MS: u64 = 50;
+
+/// The rule a Rego request modifier's `rego_module` evaluates.
+const REGO_MODIFIER_REQUEST_QUERY: &str = "data.sbproxy.modify_request";
+
+/// The rule a Rego response modifier's `rego_module` evaluates.
+const REGO_MODIFIER_RESPONSE_QUERY: &str = "data.sbproxy.modify_response";
+
+/// Build the Rego `input` document a request modifier's `rego_module`
+/// evaluates against.
+///
+/// Lua and JavaScript request modifiers receive two arguments, `req`
+/// (`method`/`path`/`headers`/`host`/`tls`) and `ctx`
+/// (`aipref`/`tls`/`principal`, [`script_modifier_context`]). Rego
+/// takes one `input` document, so this merges the two: `ctx`'s
+/// `request` object already carries `aipref` and `tls`; `req`'s fields
+/// join it under the same key. `input.principal` is `ctx`'s `principal`
+/// unchanged. The result is exactly the union of what the two engines
+/// see, addressed as `input.request.*` / `input.principal.*` instead of
+/// two arguments.
+fn rego_request_modifier_input(
+    req_header: &RequestHeader,
+    ctx: &RequestContext,
+) -> serde_json::Value {
+    let mut headers_map = std::collections::HashMap::new();
+    for (name, value) in req_header.headers.iter() {
+        if let Ok(v) = value.to_str() {
+            headers_map.insert(name.as_str().to_string(), v.to_string());
+        }
+    }
+    let mut input = script_modifier_context(ctx);
+    if let Some(request) = input
+        .get_mut("request")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        request.insert(
+            "method".to_string(),
+            serde_json::Value::String(req_header.method.as_str().to_string()),
+        );
+        request.insert(
+            "path".to_string(),
+            serde_json::Value::String(req_header.uri.path().to_string()),
+        );
+        request.insert(
+            "host".to_string(),
+            serde_json::Value::String(ctx.hostname.as_str().to_string()),
+        );
+        request.insert("headers".to_string(), serde_json::json!(headers_map));
+    }
+    input
+}
+
+/// Build the Rego `input` document a response modifier's `rego_module`
+/// evaluates against.
+///
+/// Mirrors [`rego_request_modifier_input`]: `ctx`'s `request` /
+/// `principal` objects carry what Lua/JS's `ctx` argument carries, and
+/// `resp` (`status_code`/`headers`) joins as a new `response` key, the
+/// same fields Lua/JS's `resp` argument carries.
+fn rego_response_modifier_input(
+    status: u16,
+    response_headers: &serde_json::Map<String, serde_json::Value>,
+    ctx: &RequestContext,
+) -> serde_json::Value {
+    let mut input = script_modifier_context(ctx);
+    if let Some(map) = input.as_object_mut() {
+        map.insert(
+            "response".to_string(),
+            serde_json::json!({
+                "status_code": status,
+                "headers": response_headers,
+            }),
+        );
+    }
+    input
+}
+
+/// Execute a Rego request modifier module.
+///
+/// Extracts `set_headers` from the evaluated `data.sbproxy.modify_request`
+/// document, the same field Lua's and JS's `modify_request` return.
+/// `budget_ms` is the modifier's resolved `rego_budget_ms` (the caller
+/// applies the [`REGO_MODIFIER_BUDGET_MS`] default when the config left
+/// it unset; config compile already refused a `Some(0)`).
+///
+/// # Errors
+///
+/// Returns an error when the module does not parse or evaluate, or
+/// evaluation exceeds its budget. The caller logs this and skips the
+/// modifier's headers, matching the Lua/JS request modifier row of
+/// `docs/scripting.md`'s error table.
+fn rego_request_modifier(
+    module: &str,
+    rego_v0: bool,
+    budget_ms: u64,
+    req_header: &RequestHeader,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let input = rego_request_modifier_input(req_header, ctx);
+    let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
+        "rego request modifier",
+        module,
+        REGO_MODIFIER_REQUEST_QUERY,
+        budget_ms,
+        None,
+        rego_v0,
+    )?;
+    let result = compiled.eval_value(input, ctx.principal.tenant_id.as_str())?;
+
+    let mut headers_to_set = Vec::new();
+    if let Some(set_headers) = result.get("set_headers").and_then(|h| h.as_object()) {
+        for (key, value) in set_headers {
+            if let Some(v) = value.as_str() {
+                headers_to_set.push((key.clone(), v.to_string()));
+            }
+        }
+    }
+    Ok(headers_to_set)
+}
+
+/// Execute a Rego response modifier module.
+///
+/// Extracts headers the same way [`response_modifier_headers`] does for
+/// Lua and JavaScript response modifiers, so a module returning
+/// `{"set_headers": {...}}` behaves identically across all three
+/// engines. `budget_ms` is the modifier's resolved `rego_budget_ms`,
+/// the same as [`rego_request_modifier`]'s parameter of the same name.
+///
+/// # Errors
+///
+/// Returns an error when the module does not parse or evaluate, or
+/// evaluation exceeds its budget. The caller logs this and skips the
+/// modifier's headers, matching the Lua/JS response modifier row of
+/// `docs/scripting.md`'s error table.
+fn rego_response_modifier(
+    module: &str,
+    rego_v0: bool,
+    budget_ms: u64,
+    status: u16,
+    response_headers: &serde_json::Map<String, serde_json::Value>,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let input = rego_response_modifier_input(status, response_headers, ctx);
+    let mut compiled = sbproxy_extension::rego::CompiledRego::compile(
+        "rego response modifier",
+        module,
+        REGO_MODIFIER_RESPONSE_QUERY,
+        budget_ms,
+        None,
+        rego_v0,
+    )?;
+    let result = compiled.eval_value(input, ctx.principal.tenant_id.as_str())?;
+    Ok(response_modifier_headers(&result, response_headers))
 }
 
 // --- Session cookie builder ---

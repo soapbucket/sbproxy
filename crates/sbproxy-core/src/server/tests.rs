@@ -465,6 +465,272 @@ fn js_request_modifier_reads_the_same_table_lua_does() {
     assert!(out.contains(&("x-path".to_string(), "/v1/things".to_string())));
 }
 
+// --- WOR-2482: Rego request/response modifiers ---
+
+#[test]
+fn rego_request_modifier_sets_a_header() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/v1/things", None).unwrap();
+    let module = r#"
+package sbproxy
+
+modify_request := {"set_headers": {"x-rego-modified": "true"}}
+"#;
+
+    let out = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect("rego request modifier runs");
+
+    assert_eq!(
+        out,
+        vec![("x-rego-modified".to_string(), "true".to_string())]
+    );
+}
+
+/// The Rego twin of [`js_request_modifier_reads_the_same_table_lua_does`]:
+/// the same document, addressed as `input.request.*` / `input.principal.*`
+/// in one `input` instead of two arguments, must expose the same fields.
+#[test]
+fn rego_request_modifier_reads_the_same_document_lua_and_js_do() {
+    let ctx = ctx_with_principal_and_tls();
+    let mut req_header = pingora_http::RequestHeader::build("GET", b"/v1/things", None).unwrap();
+    req_header.insert_header("x-probe", "1").unwrap();
+    let module = r#"
+package sbproxy
+
+modify_request := {"set_headers": {
+    "x-tls-ja4": input.request.tls.ja4,
+    "x-team": input.principal.attrs.team,
+    "x-method": input.request.method,
+    "x-path": input.request.path,
+}}
+"#;
+
+    let out = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect("rego request modifier runs");
+
+    assert!(out.contains(&(
+        "x-tls-ja4".to_string(),
+        "t13d1516h2_8daaf6152771".to_string()
+    )));
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&("x-method".to_string(), "GET".to_string())));
+    assert!(out.contains(&("x-path".to_string(), "/v1/things".to_string())));
+}
+
+#[test]
+fn rego_response_modifier_edits_a_response_header() {
+    let ctx = RequestContext::new();
+    let headers = serde_json::Map::new();
+    let module = r#"
+package sbproxy
+
+modify_response := {"set_headers": {"x-rego-stage": "response"}}
+"#;
+
+    let out = rego_response_modifier(module, false, REGO_MODIFIER_BUDGET_MS, 200, &headers, &ctx)
+        .expect("rego response modifier runs");
+
+    assert_eq!(
+        out,
+        vec![("x-rego-stage".to_string(), "response".to_string())]
+    );
+}
+
+#[test]
+fn rego_response_modifier_reads_principal_and_status_from_input() {
+    let ctx = ctx_with_principal_and_tls();
+    let headers = serde_json::Map::new();
+    let module = r#"
+package sbproxy
+
+modify_response := {"set_headers": {"x-team": input.principal.attrs.team, "x-is-5xx": is_5xx}}
+
+is_5xx := "true" if input.response.status_code >= 500
+is_5xx := "false" if input.response.status_code < 500
+"#;
+
+    let out = rego_response_modifier(module, false, REGO_MODIFIER_BUDGET_MS, 503, &headers, &ctx)
+        .expect("rego response modifier runs");
+
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&("x-is-5xx".to_string(), "true".to_string())));
+}
+
+/// The documented modifier failure posture (`docs/scripting.md` §11):
+/// a module fault is an error the caller logs and skips, not a denial.
+/// This asserts the function-level half of that contract: the module
+/// does not parse, so the function itself must return `Err`.
+#[test]
+fn rego_request_modifier_a_module_that_does_not_parse_is_an_error() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    let module = "package sbproxy\n\nmodify_request := {\n";
+
+    let error = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect_err("a module that does not parse must error, not silently omit headers");
+    assert!(!error.to_string().is_empty());
+}
+
+/// A rule that is defined but simply does not fire for this input is
+/// `undefined`, which Rego treats as "no opinion", not a fault
+/// (`sbproxy_extension::rego::CompiledRego::eval_value`). Confirms the
+/// modifier form inherits that reading rather than treating it as an
+/// error: no headers, no `Err`.
+#[test]
+fn rego_request_modifier_a_rule_not_satisfied_for_this_input_is_not_an_error() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    let module = r#"
+package sbproxy
+
+modify_request := {"set_headers": {"x-crawler": "true"}} if {
+    input.request.headers["user-agent"] == "bot"
+}
+"#;
+
+    let out = rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect("an unsatisfied rule is undefined, not an error");
+    assert!(out.is_empty());
+}
+
+/// `rego_v0` is offered on the modifier form the same way it is on
+/// `policy: rego` and `ai_routing_policy` (Task 1): a pre-OPA-1.0
+/// module (a rule body with no `if`) fails the v1 default and compiles
+/// once `rego_v0: true` is threaded through.
+#[test]
+fn rego_v0_is_wired_from_the_modifier_config_through_to_the_engine() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    // The exact shape Regorus's own `set_rego_v0` doctest uses: a rule
+    // body with no `if`, which the v1 default refuses to parse.
+    let module = r#"
+package sbproxy
+modify_request := {"set_headers": {"x-legacy": "true"}} {
+    input.request.method == "GET"
+}
+"#;
+
+    rego_request_modifier(module, false, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect_err("v0 syntax must not compile without rego_v0: true");
+
+    let out = rego_request_modifier(module, true, REGO_MODIFIER_BUDGET_MS, &req_header, &ctx)
+        .expect("rego_v0: true compiles the same module");
+    assert_eq!(out, vec![("x-legacy".to_string(), "true".to_string())]);
+}
+
+/// Multi-engine "both set" on one modifier is not refused today for
+/// `lua_script` + `js_script` (`sbproxy_core::server::proxy_http` runs
+/// Lua then JavaScript; the later engine's `insert_header` wins on a
+/// shared key, by design). `rego_module` mirrors that rather than
+/// refusing: this reproduces the header-application half of the real
+/// call site (Lua's result applied via `insert_header`, then Rego's,
+/// the same order and the same API the request-modifier call site
+/// uses) to prove Rego, as the later engine, wins the shared header.
+#[test]
+fn rego_and_lua_request_modifiers_on_one_entry_both_apply_rego_wins_shared_header() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    let lua_script = r#"
+        function modify_request(req, ctx)
+          return { set_headers = { ["x-engine"] = "lua" } }
+        end
+    "#;
+    let rego_module = r#"
+package sbproxy
+
+modify_request := {"set_headers": {"x-engine": "rego"}}
+"#;
+
+    let mut upstream_request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    for (key, value) in lua_request_modifier(lua_script, &req_header, &ctx).unwrap() {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+    for (key, value) in rego_request_modifier(
+        rego_module,
+        false,
+        REGO_MODIFIER_BUDGET_MS,
+        &req_header,
+        &ctx,
+    )
+    .unwrap()
+    {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+
+    assert_eq!(
+        upstream_request.headers.get("x-engine").unwrap(),
+        "rego",
+        "rego runs after lua at the real call site, so it wins on a shared header"
+    );
+}
+
+/// The full three-engine precedence claim, pinned so a future refactor
+/// cannot silently flip it: `lua_script`, `js_script`, and `rego_module`
+/// on ONE modifier entry all run, in that fixed order (matching the
+/// real call site in `proxy_http.rs`), the later engine wins on a
+/// shared header, and each engine's own non-shared header survives
+/// untouched.
+#[test]
+fn lua_js_and_rego_request_modifiers_on_one_entry_apply_in_documented_order() {
+    let ctx = RequestContext::new();
+    let req_header = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    let lua_script = r#"
+        function modify_request(req, ctx)
+          return { set_headers = { ["x-shared"] = "lua", ["x-lua-only"] = "from-lua" } }
+        end
+    "#;
+    let js_script = r#"
+        function modify_request(req, ctx) {
+          return { set_headers: { "x-shared": "js", "x-js-only": "from-js" } };
+        }
+    "#;
+    let rego_module = r#"
+package sbproxy
+
+modify_request := {"set_headers": {"x-shared": "rego", "x-rego-only": "from-rego"}}
+"#;
+
+    let mut upstream_request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    // Same order the real call site applies them: lua, then js, then rego.
+    for (key, value) in lua_request_modifier(lua_script, &req_header, &ctx).unwrap() {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+    for (key, value) in js_request_modifier(js_script, &req_header, &ctx).unwrap() {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+    for (key, value) in rego_request_modifier(
+        rego_module,
+        false,
+        REGO_MODIFIER_BUDGET_MS,
+        &req_header,
+        &ctx,
+    )
+    .unwrap()
+    {
+        upstream_request.insert_header(key, &value).unwrap();
+    }
+
+    assert_eq!(
+        upstream_request.headers.get("x-shared").unwrap(),
+        "rego",
+        "the last engine to run, rego, wins the shared header"
+    );
+    assert_eq!(
+        upstream_request.headers.get("x-lua-only").unwrap(),
+        "from-lua",
+        "lua's own non-shared header must survive js and rego running after it"
+    );
+    assert_eq!(
+        upstream_request.headers.get("x-js-only").unwrap(),
+        "from-js",
+        "js's own non-shared header must survive rego running after it"
+    );
+    assert_eq!(
+        upstream_request.headers.get("x-rego-only").unwrap(),
+        "from-rego"
+    );
+}
+
 // --- resolve_override parsing ---
 
 #[test]
@@ -3282,6 +3548,80 @@ fn reload_from_config_path_propagates_compile_errors() {
     let _ = format!("{err}");
 }
 
+/// WOR-2486: a file-watcher-path rejection now reaches `config_audit`.
+/// Before this wiring, `ConfigAuditEntry` had exactly one production
+/// call site (the admin API's success arm); a compile failure on the
+/// file-watcher/SIGHUP path was invisible to the one channel built to
+/// answer "what changed and who changed it" (it was never in `config_audit`
+/// at all, accepted or rejected).
+#[test]
+fn a_file_watcher_rejection_reaches_config_audit() {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    tmp.write_all(b"proxy: !! no\n  origins ....\n").unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    let before =
+        sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None).len();
+    let _ = reload_from_config_path(&path).expect_err("broken YAML must fail");
+    let events = sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
+    assert!(
+        events.len() > before,
+        "the rejection must reach the audit ring, not just the metric"
+    );
+    let ours = events
+        .iter()
+        .find(|e| e.kind == "file_watcher")
+        .expect("a file_watcher-sourced config_audit entry must exist");
+    assert!(
+        ours.detail
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("rejected:"),
+        "must read as a rejection, not an accepted no-op reload: {:?}",
+        ours.detail
+    );
+}
+
+/// The accepted half of the pair above: a successful file-watcher-path
+/// reload also reaches `config_audit`, which it never did before this
+/// wiring either (only the admin API's success arm did).
+#[test]
+fn a_file_watcher_success_reaches_config_audit() {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "file-watcher-audit.test":
+    action:
+      type: static
+      body: ok
+"#;
+    tmp.write_all(yaml.as_bytes()).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    reload_from_config_path(&path).expect("valid config reloads");
+    let events = sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
+    let ours = events
+        .iter()
+        .find(|e| {
+            e.kind == "file_watcher"
+                && e.detail
+                    .as_deref()
+                    .is_some_and(|d| !d.starts_with("rejected:"))
+        })
+        .expect("an accepted file_watcher-sourced config_audit entry must exist");
+    assert!(!ours
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("rejected:"));
+}
+
 // --- WOR-2162: a reload carrying invalid CEL is rejected whole ---
 
 #[test]
@@ -4569,6 +4909,74 @@ origins:
         !unwired_for("decision").contains(&"policy"),
         "under the converged shape policy publishes on exactly this feed; warning that nothing \
          publishes it is wrong about the one event the operator turned on"
+    );
+}
+
+/// The `events.types` boot warning has to name a dead type and stay
+/// silent about a wired one (WOR-2486, mirroring
+/// `a_superseded_event_is_reported_separately_from_an_unwired_one` for
+/// the typed proxy event feed).
+#[test]
+fn unwired_proxy_events_names_cache_hit_but_not_policy_denied() {
+    let yaml = r#"events:
+  sink: file
+  path: /tmp/sbproxy-events-test.ndjson
+  types:
+    - cache_hit
+    - policy_denied
+origins:
+  "events.test":
+    action:
+      type: static
+      body: ok
+"#;
+    let compiled = sbproxy_config::compile_config(yaml).expect("fixture config");
+    let events_cfg = compiled
+        .events
+        .as_ref()
+        .expect("events block compiles from the fixture");
+    let unwired = super::lifecycle::unwired_proxy_events(events_cfg);
+
+    assert!(
+        unwired.contains(&"cache_hit"),
+        "cache_hit has no emitter by design and must be named: {unwired:?}"
+    );
+    assert!(
+        !unwired.contains(&"policy_denied"),
+        "policy_denied publishes through the SecurityAuditEntry bridge and must not be named: \
+         {unwired:?}"
+    );
+}
+
+/// An empty `types:` means "every type", the same reading
+/// `build_event_egress` gives it, so the warning still has to catch a
+/// dead type nobody explicitly named.
+#[test]
+fn unwired_proxy_events_covers_the_implicit_all_selection() {
+    let yaml = r#"events:
+  sink: file
+  path: /tmp/sbproxy-events-test-all.ndjson
+origins:
+  "events-all.test":
+    action:
+      type: static
+      body: ok
+"#;
+    let compiled = sbproxy_config::compile_config(yaml).expect("fixture config");
+    let events_cfg = compiled
+        .events
+        .as_ref()
+        .expect("events block compiles from the fixture");
+    let unwired = super::lifecycle::unwired_proxy_events(events_cfg);
+
+    assert!(
+        unwired.contains(&"cache_hit") && unwired.contains(&"cache_miss"),
+        "an implicit all-types selection must still catch the dead types: {unwired:?}"
+    );
+    assert_eq!(
+        unwired.len(),
+        2,
+        "only cache_hit and cache_miss have no emitter: {unwired:?}"
     );
 }
 

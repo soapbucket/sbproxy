@@ -1223,6 +1223,8 @@ impl InternalSummarizer for RuntimeInternalSummarizer {
                 &keys,
                 std::slice::from_ref(&self.provider),
                 &shared,
+                request.tenant_id,
+                &self.origin,
             ) {
                 crate::server::ai_support::BudgetGate::Allow => keys,
                 crate::server::ai_support::BudgetGate::Block { .. }
@@ -3030,6 +3032,8 @@ origins:
                 &keys,
                 &handler.providers,
                 &HashMap::new(),
+                "tenant-a",
+                "ai.example.com",
             ),
             crate::server::ai_support::BudgetGate::Block { .. }
         ));

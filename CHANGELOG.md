@@ -162,6 +162,41 @@ the next version cut.
   `enforcement_mode: observe` now refuses at config load, since an
   observe hook's decisions are discarded.
 
+- **`policy: rego` and the AI gateway's Rego routing engine can load a
+  module from a file, and accept pre-OPA-1.0 syntax.** `module_path`
+  reads a `.rego` file at config-compile time, the same convention
+  `transforms[] type: wasm` already uses, and `rego_v0: true` runs
+  Regorus's own compatibility switch so a module written before OPA
+  1.0's `if`/`contains` requirement parses unchanged. A policy's
+  `print()` calls are gathered per evaluation and logged through
+  `tracing` at INFO under the `rego_print` target instead of reaching
+  the process's stderr.
+
+- **`sbproxy rego test` runs Rego fixtures offline, with line
+  coverage.** Point the new subcommand at a fixture YAML file or a
+  directory of `*_test.yaml` files and it compiles each module through
+  the same engine construction a live policy uses, runs every named
+  case, and reports per-module line coverage. `--min-coverage` gates
+  the exit code on it, and `--format json` emits a structured result
+  for a CI step to parse.
+
+- **Request and response modifiers gained a Rego form.**
+  `request_modifiers[]` and `response_modifiers[]` now accept
+  `rego_module` / `rego_module_path` beside the existing `lua_script`
+  and `js_script`, evaluating `data.sbproxy.modify_request` /
+  `modify_response` against the same context document those two
+  engines already receive and returning the same `set_headers` shape.
+  `rego_budget_ms` bounds the evaluation, matching the `budget_ms`
+  knob on `policy: rego`.
+
+- **Signed extension bundles can ship a `.rego` policy module.**
+  `runtime: rego` bundle hooks compile at candidate load on the same
+  Regorus interpreter `policy: rego` uses, register into the same
+  policy registry a config-inline module would, and evaluate the same
+  wire-level envelope a JavaScript or WASM policy hook reads. A
+  tampered or malformed `.rego` module fails verification like any
+  other bundle asset, and the previous bundle keeps serving.
+
 ### Changed, and worth checking before you upgrade
 
 - **`proxy.messenger_settings` refuse names the deleted bus defects.** The

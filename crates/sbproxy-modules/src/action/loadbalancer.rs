@@ -670,10 +670,12 @@ impl LoadBalancerAction {
             if let Some(b) = brs.get(idx) {
                 if let Some((from, to)) = b.record_success() {
                     if let Some(target) = self.targets.get(idx) {
-                        sbproxy_observe::metrics::record_circuit_breaker(
+                        sbproxy_observe::metrics::record_circuit_breaker_transition(
                             &target.url,
                             from.as_str(),
                             to.as_str(),
+                            "success_threshold_met",
+                            "",
                         );
                     }
                 }
@@ -690,10 +692,16 @@ impl LoadBalancerAction {
             if let Some(b) = brs.get(idx) {
                 if let Some((from, to)) = b.record_failure() {
                     if let Some(target) = self.targets.get(idx) {
-                        sbproxy_observe::metrics::record_circuit_breaker(
+                        let reason = match from {
+                            sbproxy_platform::CircuitState::HalfOpen => "probe_failed",
+                            _ => "failure_threshold_exceeded",
+                        };
+                        sbproxy_observe::metrics::record_circuit_breaker_transition(
                             &target.url,
                             from.as_str(),
                             to.as_str(),
+                            reason,
+                            "",
                         );
                     }
                 }

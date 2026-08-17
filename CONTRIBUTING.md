@@ -3,7 +3,7 @@
 
 ## Prerequisites
 
-- Rust 1.82+ (workspace MSRV, pinned in `Cargo.toml`)
+- Rust 1.95+ (workspace MSRV, pinned in `Cargo.toml`)
 - Cargo (comes with Rust)
 - Node.js 18+ (for e2e test backends)
 - cmake (for Pingora's BoringSSL dependency)

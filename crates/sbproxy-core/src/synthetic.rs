@@ -258,6 +258,7 @@ mod tests {
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
         let pipeline = crate::pipeline::CompiledPipeline::from_config(compiled)
             .expect("static origin pipeline compiles");

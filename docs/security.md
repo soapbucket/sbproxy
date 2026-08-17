@@ -37,6 +37,28 @@ Separately from all four: reporting a vulnerability in SBproxy, verifying a
 release signature, and checking build provenance live in
 [`SECURITY.md`](../SECURITY.md) at the repository root.
 
+## Identity and credential controls
+
+These sit underneath more than one of the four surfaces above, so they get
+their own list rather than a slot in any single one.
+
+**Authenticating the caller.** [auth-oidc.md](auth-oidc.md) covers the
+`oidc` provider: a full authorization-code-plus-PKCE login with a sealed
+session cookie, for callers that are people. [web-bot-auth.md](web-bot-auth.md)
+covers the `bot_auth` provider: RFC 9421 signature verification against a
+published key directory, for callers that claim to be a known crawler and can
+prove it rather than just assert it.
+
+**Managing the credentials themselves.** [key-management.md](key-management.md)
+covers minting, revoking, and rotating inbound virtual keys at runtime through
+the admin API, hashed at rest. [secrets.md](secrets.md) covers the one
+reference grammar every secret-bearing config value resolves through,
+regardless of which field it sits in.
+
+**Constraining outbound credentials.** [outbound-dpop.md](outbound-dpop.md)
+covers RFC 9449 sender-constrained tokens on the credentials SBproxy presents
+to an upstream, so a stolen bearer token by itself is not enough to replay.
+
 ## What the gateway is actually good at
 
 Being unavoidable. Every control on the pages above is enforcement at a choke
@@ -93,9 +115,10 @@ store is configured, and when that store fails, enforcement degrades to
 per-instance tracking with a metric and a warning rather than silence.
 [ai-gateway.md](ai-gateway.md#budgets).
 
-Every provider endpoint the gateway reaches is recorded with its authorization
-status, allowed, denied, or ungated, and is readable at `GET /api/egress`.
-Outbound dials pass a default-deny, DNS-pinned egress authorizer.
+Every outbound destination the gateway reaches, across every wired egress
+purpose and not just AI providers, is recorded with its authorization status,
+allowed, denied, or ungated, and is readable at `GET /api/egress`. Outbound
+dials pass a default-deny, DNS-pinned egress authorizer.
 
 Serving-path request budgets key by tenant, and a panicking tenant policy now
 denies that one request instead of crashing the process. Neither changes the
@@ -103,9 +126,9 @@ recommendation in [multi-tenant.md](multi-tenant.md): mutually untrusting
 tenants get one process per trust boundary.
 
 Prompt-linked audit records carry salted digests and lengths, never content.
-Security refusals and, when opted in, config changes append to hash-chained,
-signed files that `sbproxy audit verify --channel` checks offline.
-[audit-log.md](audit-log.md).
+Security, config, key-mutation, and admin-action records each append, when
+opted in per channel, to their own hash-chained, signed file that `sbproxy
+audit verify --channel` checks offline. [audit-log.md](audit-log.md).
 
 ## Defaults worth knowing
 
@@ -158,9 +181,11 @@ If you are securing a deployment for the first time:
 2. [api-security.md](api-security.md), [mcp-security.md](mcp-security.md), or
    [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md),
    depending on what you are putting behind it.
-3. [audit-log.md](audit-log.md), because the controls are worth much less
+3. [policy.md](policy.md), once you know which threat class you are answering
+   and need the actual policy, its fields, and a config example.
+4. [audit-log.md](audit-log.md), because the controls are worth much less
    without somewhere to send what they record.
-4. [`SECURITY.md`](../SECURITY.md), for release verification and how to report
+5. [`SECURITY.md`](../SECURITY.md), for release verification and how to report
    something.
 
 If you are responding to a security review, the topic pages are written to

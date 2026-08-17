@@ -162,6 +162,11 @@ pub mod meter_runtime;
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
+/// Strip the configured config path out of an error string before it
+/// reaches an HTTP response or an audit record (WOR-2486 fix round 1,
+/// I5). Shared between the admin reload/validate handlers and the
+/// non-admin reload paths so both scrub the same way.
+pub(crate) mod path_redact;
 /// Fail-open delivery for terminal payment extension events.
 #[cfg(feature = "payments")]
 pub mod payment_extensions;

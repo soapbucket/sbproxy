@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use sbproxy_config::extract_type;
 use sbproxy_extension::bundle::{
     build_javascript_action, build_javascript_auth, build_javascript_policy,
-    build_javascript_transform, build_wasm_action, build_wasm_policy, build_wasm_transform,
-    BundleRegistry, LoadedBundleHook,
+    build_javascript_transform, build_rego_policy, build_wasm_action, build_wasm_policy,
+    build_wasm_transform, BundleRegistry, LoadedBundleHook,
 };
 
 use crate::action::{
@@ -240,6 +240,11 @@ fn compile_bundle_auth(hook: &LoadedBundleHook, config: serde_json::Value) -> Re
         }
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide auth hooks")
+        }
+        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
+        // at manifest validation; this arm is the defensive backstop.
+        sbproxy_config::BundleRuntime::Rego => {
+            anyhow::bail!("rego bundles cannot provide auth hooks")
         }
     };
     Ok(Auth::Plugin(handler))
@@ -524,6 +529,10 @@ fn compile_bundle_policy(hook: &LoadedBundleHook, config: serde_json::Value) -> 
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide policy hooks")
         }
+        // WOR-2482: a signed extension bundle's Rego module rides the
+        // same verify-then-activate flow as every other bundle asset;
+        // see `sbproxy_extension::bundle::rego`.
+        sbproxy_config::BundleRuntime::Rego => Box::new(build_rego_policy(hook, config)?),
     };
     Ok(Policy::Plugin(crate::PluginPolicy::dynamic(
         handler,
@@ -543,6 +552,11 @@ fn compile_bundle_transform(
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide transform hooks")
         }
+        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
+        // at manifest validation; this arm is the defensive backstop.
+        sbproxy_config::BundleRuntime::Rego => {
+            anyhow::bail!("rego bundles cannot provide transform hooks")
+        }
     };
     Ok(Transform::Plugin(crate::PluginTransform::dynamic(
         handler,
@@ -558,6 +572,11 @@ fn compile_bundle_action(hook: &LoadedBundleHook, config: serde_json::Value) -> 
         sbproxy_config::BundleRuntime::Wasm => Box::new(build_wasm_action(hook, config)?),
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide action hooks")
+        }
+        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
+        // at manifest validation; this arm is the defensive backstop.
+        sbproxy_config::BundleRuntime::Rego => {
+            anyhow::bail!("rego bundles cannot provide action hooks")
         }
     };
     Ok(Action::Plugin(crate::PluginAction::dynamic(

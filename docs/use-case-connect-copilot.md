@@ -22,7 +22,7 @@ OpenAI chat-completions (`POST /v1/chat/completions`). SBproxy's `ai_proxy` acti
 
 ## A governed gateway, not just a proxy
 
-The `sb.yml` below is the same shape as [use-case-own-openrouter.md](use-case-own-openrouter.md): one data-plane port, dynamic key management, and a budget plus a usage ledger. Save it and start the gateway before registering the provider in Copilot.
+The `sb.yml` below is the same shape as [use-case-own-openrouter.md](use-case-own-openrouter.md) and its runnable [`examples/use-case-own-openrouter/`](../examples/use-case-own-openrouter/): one data-plane port, dynamic key management, and a budget plus a usage ledger. Save it and start the gateway before registering the provider in Copilot.
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json

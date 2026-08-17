@@ -52,7 +52,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ## See also
 
+- [examples/ai-rego-tenant-gate/](../ai-rego-tenant-gate/) - the Rego twin of this example
 - [docs/ai-gateway.md](../../docs/ai-gateway.md)
 - [docs/scripting.md](../../docs/scripting.md)
+- [docs/opa-rego-policies.md](../../docs/opa-rego-policies.md)
 - [docs/features.md](../../docs/features.md)
 - [docs/configuration.md](../../docs/configuration.md)

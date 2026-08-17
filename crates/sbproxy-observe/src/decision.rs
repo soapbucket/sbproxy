@@ -72,8 +72,7 @@ pub const DEFAULT_TENANT: &str = "__default__";
 /// dashboards and SIEM rules both.
 ///
 /// `#[non_exhaustive]` because the set grows: routing and cache are the
-/// events with no competitor equivalent, and the AI failure event is
-/// still landing.
+/// events with no competitor equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
@@ -298,16 +297,31 @@ impl DecisionEvent {
             // per judged streamed tool call. Bounded by tool calls
             // rather than chunks, which is what separates it from
             // ai.stream.event.
-            // Each is a funnel rather than a scattering of call sites,
-            // which is what makes these arms honest: wiring some sites
-            // and not others would silence the startup warning while
-            // the feed still missed decisions (WOR-2446).
+            // ai.failure: `record_ai_provider_response_failure` in
+            // ai_dispatch.rs, the one funnel every provider-response
+            // failure classification already ran through (WOR-2486).
+            // ai.close: `AiRequestExtensions::close()` in
+            // ai_extensions.rs, called once per stream regardless of
+            // whether any bundle hook subscribed to `ai.close` itself
+            // (WOR-2486). Scoped to a request whose AI extension chain
+            // is non-empty: a deployment with zero configured AI
+            // extension bundles builds no `AiRequestExtensions` at all,
+            // so `close()` never runs for it. That is narrower than
+            // "every streamed AI response" and is a real, documented
+            // gap (see `docs/events.md`), not the funnel-per-event
+            // shape the other `Emitted` arms guarantee.
+            // Each of the others is a funnel rather than a scattering of
+            // call sites, which is what makes those arms honest: wiring
+            // some sites and not others would silence the startup
+            // warning while the feed still missed decisions (WOR-2446).
             Self::CacheAdmit
             | Self::CacheKey
             | Self::RouteDecide
             | Self::Auth
             | Self::AiGuardrailInput
             | Self::AiGuardrailOutput
+            | Self::AiFailure
+            | Self::AiClose
             | Self::McpTool => EventCoverage::Emitted,
             // Published as `policy` records already; see the doc above.
             Self::Waf | Self::RateLimit => EventCoverage::SupersededByPolicy,
@@ -317,11 +331,7 @@ impl DecisionEvent {
             Self::AiToolCall => EventCoverage::Emitted,
             Self::Policy => EventCoverage::ConfigDependent,
             Self::AiStreamEvent => EventCoverage::NeverPublishes,
-            Self::AiClose
-            | Self::AiFailure
-            | Self::Transform
-            | Self::Action
-            | Self::LogCustomField => EventCoverage::Unwired,
+            Self::Transform | Self::Action | Self::LogCustomField => EventCoverage::Unwired,
         }
     }
 
@@ -1111,19 +1121,95 @@ impl DecisionDetails {
         }
     }
 
+    /// Detail for an upstream AI provider failure (WOR-2486).
+    ///
+    /// Reuses the routing and policy fields rather than adding a new
+    /// pair: `selected_provider` names the provider whose response
+    /// failed, and `verdict` carries the classified failure kind
+    /// (`rate_limited`, `content_filter`, `upstream_5xx`,
+    /// `provider_error`), a closed vocabulary rather than the raw
+    /// upstream status text, which can carry a prompt fragment back.
+    pub fn ai_failure(provider: &str, kind: &str) -> Self {
+        Self {
+            selected_provider: (!provider.is_empty()).then(|| provider.to_owned()),
+            verdict: (!kind.is_empty()).then(|| kind.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for a streamed response's close (WOR-2486).
+    ///
+    /// `verdict` carries the terminal `finish_reason` (`stop`,
+    /// `length`, `tool_calls`, `content_filter`, ...). Token counts and
+    /// cost are not duplicated here: they already have an authoritative
+    /// home in the access log and the usage ledger, and this record's
+    /// job is marking that the stream reached its end, not re-billing
+    /// it.
+    pub fn ai_close(finish_reason: Option<&str>) -> Self {
+        Self {
+            verdict: finish_reason
+                .filter(|reason| !reason.is_empty())
+                .map(ToOwned::to_owned),
+            ..Self::default()
+        }
+    }
+
     /// Whether every field is absent, so the OCSF render can leave the
     /// object out rather than emit an empty one.
+    ///
+    /// Destructures without `..` on purpose (WOR-2486): the nine
+    /// fields added after the first ten (`tool`, `tool_server`,
+    /// `guardrail`, `flagged_count`, `auth_type`, `policy_id`,
+    /// `policy_surface`, `verdict`, `decision_latency_ms`) were never
+    /// added here, so a `guardrail()`, `mcp_tool()`, `auth()`, or
+    /// `policy()` detail reported empty and `to_ocsf` never emitted
+    /// `unmapped` for it: every `AiGuardrailInput`/`AiGuardrailOutput`,
+    /// `McpTool`, `Auth`, and `policy_record_format: decision` `Policy`
+    /// record shipped with its structured detail silently dropped. A
+    /// destructure with no `..` fails to compile the moment a field is
+    /// added and not listed here, which is what an exhaustive
+    /// enumeration is for.
     pub fn is_empty(&self) -> bool {
-        self.requested_model.is_none()
-            && self.selected_model.is_none()
-            && self.selected_provider.is_none()
-            && self.tier_count.is_none()
-            && self.dropped.is_none()
-            && self.stored.is_none()
-            && self.ttl_secs.is_none()
-            && self.swr_secs.is_none()
-            && self.skip_lookup.is_none()
-            && self.vary_count.is_none()
+        let Self {
+            requested_model,
+            selected_model,
+            selected_provider,
+            tier_count,
+            dropped,
+            stored,
+            ttl_secs,
+            swr_secs,
+            skip_lookup,
+            vary_count,
+            tool,
+            tool_server,
+            guardrail,
+            flagged_count,
+            auth_type,
+            policy_id,
+            policy_surface,
+            verdict,
+            decision_latency_ms,
+        } = self;
+        requested_model.is_none()
+            && selected_model.is_none()
+            && selected_provider.is_none()
+            && tier_count.is_none()
+            && dropped.is_none()
+            && stored.is_none()
+            && ttl_secs.is_none()
+            && swr_secs.is_none()
+            && skip_lookup.is_none()
+            && vary_count.is_none()
+            && tool.is_none()
+            && tool_server.is_none()
+            && guardrail.is_none()
+            && flagged_count.is_none()
+            && auth_type.is_none()
+            && policy_id.is_none()
+            && policy_surface.is_none()
+            && verdict.is_none()
+            && decision_latency_ms.is_none()
     }
 
     /// Whether the decision moved the request off what it asked for, or
@@ -1355,6 +1441,91 @@ mod tests {
         assert!(audit.to_ocsf().get("unmapped").is_none());
     }
 
+    /// WOR-2486 regression: `is_empty()` used to check only the first
+    /// ten fields, so a `guardrail()` detail (which sets only
+    /// `guardrail` and `flagged_count`, both added later) reported
+    /// empty and `to_ocsf` never attached `unmapped` at all. Every
+    /// `AiGuardrailInput`/`AiGuardrailOutput` record shipped with its
+    /// structured detail silently dropped until this test's fix. Picks
+    /// `guardrail()` specifically because it is the constructor whose
+    /// only two fields both post-date the original ten-field check.
+    #[test]
+    fn a_guardrail_detail_reaches_the_ocsf_record() {
+        let audit = DecisionAudit::new(
+            uuid::Uuid::new_v4(),
+            "req-guardrail",
+            DecisionEvent::AiGuardrailOutput,
+            DecisionEngine::BuiltIn,
+            DecisionOutcome::Deny,
+            "api.example.test",
+            "acme-corp",
+            chrono::Utc::now(),
+            "jailbreak guardrail blocked the request",
+            None,
+            None,
+        )
+        .with_details(DecisionDetails::guardrail(Some("jailbreak"), 0));
+        assert!(
+            !audit.details.is_empty(),
+            "a guardrail name is real detail, not absence"
+        );
+        let ocsf = audit.to_ocsf();
+        let unmapped = ocsf
+            .get("unmapped")
+            .expect("guardrail detail has to reach the record, not just the struct");
+        assert_eq!(unmapped["guardrail"], "jailbreak");
+    }
+
+    /// Same regression, for `ai_failure()` and `ai_close()` specifically,
+    /// since both are new in this change and both use only
+    /// post-original-ten fields (`selected_provider`/`verdict` and
+    /// `verdict` respectively).
+    #[test]
+    fn ai_failure_and_ai_close_details_reach_the_ocsf_record() {
+        let failure = DecisionAudit::new(
+            uuid::Uuid::new_v4(),
+            "req-ai-failure",
+            DecisionEvent::AiFailure,
+            DecisionEngine::BuiltIn,
+            DecisionOutcome::Error,
+            "api.example.test",
+            "acme-corp",
+            chrono::Utc::now(),
+            "provider openai returned upstream_5xx (status 503)",
+            None,
+            None,
+        )
+        .with_details(DecisionDetails::ai_failure("openai", "upstream_5xx"));
+        let unmapped = failure
+            .to_ocsf()
+            .get("unmapped")
+            .cloned()
+            .expect("ai.failure detail must reach the record");
+        assert_eq!(unmapped["selected_provider"], "openai");
+        assert_eq!(unmapped["verdict"], "upstream_5xx");
+
+        let close = DecisionAudit::new(
+            uuid::Uuid::new_v4(),
+            "req-ai-close",
+            DecisionEvent::AiClose,
+            DecisionEngine::BuiltIn,
+            DecisionOutcome::Allow,
+            "api.example.test",
+            "acme-corp",
+            chrono::Utc::now(),
+            "stream closed",
+            None,
+            None,
+        )
+        .with_details(DecisionDetails::ai_close(Some("tool_calls")));
+        let unmapped = close
+            .to_ocsf()
+            .get("unmapped")
+            .cloned()
+            .expect("ai.close detail must reach the record");
+        assert_eq!(unmapped["verdict"], "tool_calls");
+    }
+
     #[test]
     fn changed_route_reads_the_same_question_a_siem_rule_would() {
         // Kept in the codebase so the definition has one home, even
@@ -1417,6 +1588,36 @@ mod tests {
     }
 
     #[test]
+    fn ai_failure_detail_carries_provider_and_kind() {
+        let detail = DecisionDetails::ai_failure("openai", "upstream_5xx");
+        let rendered = serde_json::to_string(&detail).expect("serializes");
+        assert!(
+            rendered.contains("\"selected_provider\":\"openai\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"verdict\":\"upstream_5xx\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn ai_close_detail_carries_the_finish_reason() {
+        let detail = DecisionDetails::ai_close(Some("tool_calls"));
+        let rendered = serde_json::to_string(&detail).expect("serializes");
+        assert!(
+            rendered.contains("\"verdict\":\"tool_calls\""),
+            "{rendered}"
+        );
+
+        // No finish reason (a stream that never delivered one) omits
+        // the field entirely rather than emitting an empty string,
+        // matching every other Option field on this struct.
+        let empty = DecisionDetails::ai_close(None);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn every_wired_event_is_listed_here() {
         // Pins the emitters that exist. A removed call site whose arm
         // was not flipped shows up here; an *added* one still needs a
@@ -1443,6 +1644,8 @@ mod tests {
                 "ai.guardrail.input",
                 "ai.guardrail.output",
                 "ai.tool_call",
+                "ai.close",
+                "ai.failure",
                 "mcp.tool"
             ],
             "the wired set changed; update has_emitter and the docs that state coverage"

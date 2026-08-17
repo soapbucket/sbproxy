@@ -11,7 +11,8 @@ use bytes::Bytes;
 use futures::Stream;
 #[cfg(feature = "weights")]
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, CachedSystemResolver, RedirectRule,
+    evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
+    EgressSightingStatus, RedirectRule,
 };
 use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use zeroize::Zeroize;
@@ -150,6 +151,18 @@ pub fn authorize_artifact_url(
 /// an operator configures egress.
 #[cfg(feature = "weights")]
 pub(crate) fn authorize_engine_download(url: &str) -> Result<(), String> {
+    // WOR-2476: the authorizer here is always `None` (no per-engine config
+    // exists yet to attach one), so every engine-artifact download is
+    // honestly `Ungated` until a real authorizer is threaded through.
+    // Stamping still proves the endpoint is reached, and this one choke
+    // point covers all three engine-release callers.
+    record_egress_seen(
+        EgressPurpose::EngineArtifact,
+        url,
+        "engine_artifact",
+        EgressSightingStatus::Ungated,
+        None,
+    );
     authorize_artifact_url(
         None,
         EgressPurpose::EngineArtifact,
@@ -164,7 +177,13 @@ pub(crate) fn authorize_engine_download(url: &str) -> Result<(), String> {
 #[derive(Debug, Clone)]
 pub struct HttpArtifactTransport {
     client: reqwest::Client,
-    egress: Option<EgressAuthorizer>,
+    /// Test-only fixed override, set via [`Self::with_egress`]. `None`
+    /// (the state `new()` and `with_configured_egress()` both leave it
+    /// in) means every dial calls [`Self::effective_egress`] instead,
+    /// which reads the process-wide `ModelArtifact` registry slot live.
+    /// See [`Self::effective_egress`] for why this is not a
+    /// construction-time snapshot.
+    egress_override: Option<EgressAuthorizer>,
 }
 
 #[cfg(feature = "weights")]
@@ -178,6 +197,12 @@ impl HttpArtifactTransport {
     /// followed rather than refused, but
     /// each one is re-authorized first and the source credential is
     /// dropped before the request leaves the origin it was minted for.
+    ///
+    /// No egress override is attached; every dial reads the
+    /// process-wide `ModelArtifact` registry slot live (see
+    /// `effective_egress`). This is the production entry point;
+    /// prefer [`Self::with_configured_egress`] only for the doc
+    /// signature, since it is now equivalent to this constructor.
     pub fn new() -> Result<Self, ArtifactError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -185,18 +210,67 @@ impl HttpArtifactTransport {
             .map_err(|error| ArtifactError::Transport(format!("build HTTP client: {error}")))?;
         Ok(Self {
             client,
-            egress: None,
+            egress_override: None,
         })
     }
 
-    /// Attach a fail-closed egress authorizer (`EgressPurpose::ModelArtifact`).
+    /// Attach a fixed egress authorizer, bypassing the live registry
+    /// read `effective_egress` would otherwise do for every
+    /// dial. Test-only: production construction should read the
+    /// registry lazily via `new()` (or `with_configured_egress()`,
+    /// identical to it) rather than pin a snapshot here, so a reload
+    /// that arms or tightens `egress.model_artifacts:` takes effect
+    /// without needing this transport rebuilt.
     pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
-        self.egress = Some(authorizer);
+        self.egress_override = Some(authorizer);
         self
     }
 
+    /// Construct a transport for the model-artifact fetcher (WOR-2476).
+    ///
+    /// Identical to [`Self::new`]: neither snapshots the
+    /// `ModelArtifact` registry slot at construction. Kept as a
+    /// separate, clearly-named entry point for server-construction call
+    /// sites (`sbproxy-core/src/server/model_host.rs`,
+    /// `sbproxy-model-host/src/weights.rs`) so the intent at each call
+    /// site (arm from the top-level `egress:` section) reads clearly
+    /// even though the constructor no longer does anything `new()`
+    /// does not.
+    ///
+    /// Earlier versions of this constructor read the registry once,
+    /// here, and stored the result on the transport. That snapshot went
+    /// stale the moment a reload armed or tightened
+    /// `egress.model_artifacts:` without also changing whatever
+    /// triggers a transport rebuild (`RuntimeFoundation`, which
+    /// `cache_root`/`catalog_revision` changes, not `egress:`, drive) --
+    /// the transport kept dialing under the authorizer, or lack of one,
+    /// that was live when it happened to be built. `effective_egress`
+    /// fixes that by reading the registry at dial time instead, which
+    /// is safe here because artifact downloads are rare (a per-dial
+    /// registry read costs nothing next to an HTTP transfer).
+    pub fn with_configured_egress() -> Result<Self, ArtifactError> {
+        Self::new()
+    }
+
+    /// The authorizer to use for the current dial: the fixed test
+    /// override from [`Self::with_egress`] if one was attached,
+    /// otherwise a fresh read of the process-wide `ModelArtifact`
+    /// registry slot (WOR-2476). Called once per `get()` call (not
+    /// once at construction), and the same value is threaded into
+    /// [`Self::follow_governed`] for every redirect hop within that one
+    /// call, so one logical download authorizes its whole hop chain
+    /// under a single, consistent snapshot even though the registry
+    /// itself can change between separate downloads.
+    fn effective_egress(&self) -> Option<EgressAuthorizer> {
+        self.egress_override
+            .clone()
+            .or_else(|| sbproxy_security::egress::configured_gate(EgressPurpose::ModelArtifact))
+    }
+
     /// Follow the redirect chain for one artifact `GET`, re-authorizing
-    /// each hop (WOR-2165).
+    /// each hop (WOR-2165) against `egress`, the same authorizer
+    /// [`Self::get`] resolved via [`Self::effective_egress`] for this
+    /// download's initial dial.
     ///
     /// A registry handing a download to object storage is the normal
     /// case, so a cross-origin hop is followed rather than refused. The
@@ -207,6 +281,7 @@ impl HttpArtifactTransport {
         &self,
         mut request: reqwest::Request,
         origin_label: &str,
+        egress: Option<&EgressAuthorizer>,
     ) -> Result<reqwest::Response, String> {
         let mut hop = 0usize;
         loop {
@@ -230,13 +305,14 @@ impl HttpArtifactTransport {
             };
             hop += 1;
             let next = evaluate_hop(
-                self.egress.as_ref(),
+                egress,
                 EgressPurpose::ModelArtifact,
                 &from,
                 &location,
                 hop,
                 RedirectRule::CrossOriginAllowed,
                 &CachedSystemResolver,
+                origin_label,
             )
             .map_err(|denied| {
                 record_egress_refused(EgressPurpose::ModelArtifact, denied, "unset", origin_label);
@@ -265,21 +341,60 @@ impl ArtifactTransport for HttpArtifactTransport {
             .ok()
             .and_then(|url| url.host_str().map(str::to_string))
             .unwrap_or_else(|| "unset".to_string());
-        authorize_artifact_url(
-            self.egress.as_ref(),
-            EgressPurpose::ModelArtifact,
-            &request.url,
-            &CachedSystemResolver,
-        )
-        .map_err(|denied| {
-            record_egress_refused(
+        // WOR-2476: resolved once per call (not once per transport), so
+        // a reload that armed or tightened `egress.model_artifacts:`
+        // since the last download is honored on this one. See
+        // `effective_egress`'s doc for why a construction-time snapshot
+        // was wrong here.
+        let egress = self.effective_egress();
+        // Every artifact URL lands in the egress inventory, whether an
+        // authorizer is configured or not. `authorize_artifact_url`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `egress` directly rather than trusting that result.
+        if egress.is_none() {
+            record_egress_seen(
                 EgressPurpose::ModelArtifact,
-                denied,
-                "unset",
+                &request.url,
                 &artifact_host,
+                EgressSightingStatus::Ungated,
+                None,
             );
-            ArtifactError::Transport(format!("egress denied: {denied:?}"))
-        })?;
+        } else {
+            match authorize_artifact_url(
+                egress.as_ref(),
+                EgressPurpose::ModelArtifact,
+                &request.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::ModelArtifact,
+                        &request.url,
+                        &artifact_host,
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::ModelArtifact,
+                        &request.url,
+                        &artifact_host,
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(
+                        EgressPurpose::ModelArtifact,
+                        denied,
+                        "unset",
+                        &artifact_host,
+                    );
+                    return Err(ArtifactError::Transport(format!(
+                        "egress denied: {denied:?}"
+                    )));
+                }
+            }
+        }
 
         let mut builder = self.client.get(&request.url);
         if request.offset > 0 {
@@ -306,7 +421,7 @@ impl ArtifactTransport for HttpArtifactTransport {
             ArtifactError::Transport(format!("request {}: {error}", request.url))
         })?;
         let response = self
-            .follow_governed(built, &artifact_host)
+            .follow_governed(built, &artifact_host, egress.as_ref())
             .await
             .map_err(|error| {
                 ArtifactError::Transport(format!("request {}: {error}", request.url))
@@ -554,6 +669,110 @@ mod tests {
             &MapResolver::new(vec![]),
         )
         .expect("omitted egress must not deny, and must not even resolve");
+    }
+
+    #[cfg(feature = "weights")]
+    #[tokio::test]
+    async fn a_transport_built_before_the_registry_was_armed_still_honors_it() {
+        // WOR-2476 review finding: `HttpArtifactTransport` used to read
+        // `configured_gate(ModelArtifact)` once, at construction, and
+        // store the result. `build_production_manager` only rebuilds
+        // this transport when `RuntimeFoundation` changes
+        // (`cache_root`/`catalog_revision`), not on every config reload,
+        // so a reload that armed or tightened `egress.model_artifacts:`
+        // without touching either of those would have kept the
+        // already-built transport dialing under whatever authorizer (or
+        // lack of one) was live when it happened to be constructed.
+        //
+        // Reproduces exactly that ordering: build the transport FIRST,
+        // with nothing installed, then install a `deny_by_default`
+        // authorizer afterward (the "a reload armed the gate" step),
+        // and confirm a download this same transport instance issues
+        // afterward is denied by it. `effective_egress` reading the
+        // registry live at dial time, not at construction, is what
+        // makes this pass.
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::ModelArtifact, None);
+        let transport = HttpArtifactTransport::new().expect("transport builds");
+
+        sbproxy_security::egress::install_configured_gate(
+            EgressPurpose::ModelArtifact,
+            Some(enforce_model_artifact(&["huggingface.co"])),
+        );
+
+        // `TransportResponse` (the `Ok` side) carries a
+        // `Pin<Box<dyn Stream<..> + Send>>` and does not implement
+        // `Debug`, so this matches on the whole `Result` rather than
+        // `.expect_err(..)` (which requires `T: Debug` to format the
+        // `Ok` case it panics on).
+        match transport
+            .get(TransportRequest {
+                url: "https://evil.example/model.bin".to_string(),
+                offset: 0,
+                if_range: None,
+                credential: None,
+            })
+            .await
+        {
+            Ok(_) => {
+                panic!("a host outside the allowlist armed after construction must be denied")
+            }
+            Err(ArtifactError::Transport(msg)) => {
+                assert!(
+                    msg.contains("egress denied"),
+                    "must be an egress refusal, got: {msg}"
+                );
+            }
+            Err(other) => panic!("must be an egress refusal, got: {other:?}"),
+        }
+
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::ModelArtifact, None);
+    }
+
+    #[cfg(feature = "weights")]
+    #[tokio::test]
+    async fn with_egress_override_wins_over_the_configured_gate_registry() {
+        // Complements the staleness test above from the other direction:
+        // `with_egress` is the test-only escape hatch from
+        // `effective_egress`'s live registry read, for a caller that
+        // wants a deterministic authorizer no concurrent registry
+        // mutation in the same test process can perturb. Proves the
+        // precedence `effective_egress`'s doc claims: the fixed override
+        // wins even when the registry holds something that would decide
+        // differently (here, a registry entry that would *allow* the
+        // request the override denies).
+        sbproxy_security::egress::install_configured_gate(
+            EgressPurpose::ModelArtifact,
+            Some(enforce_model_artifact(&["evil.example"])),
+        );
+        let transport = HttpArtifactTransport::new()
+            .expect("transport builds")
+            .with_egress(enforce_model_artifact(&["huggingface.co"]));
+
+        // See the staleness test above for why this matches on the
+        // whole `Result` rather than `.expect_err(..)`: `TransportResponse`
+        // does not implement `Debug`.
+        match transport
+            .get(TransportRequest {
+                url: "https://evil.example/model.bin".to_string(),
+                offset: 0,
+                if_range: None,
+                credential: None,
+            })
+            .await
+        {
+            Ok(_) => {
+                panic!("the fixed override, not the more permissive registry entry, must decide")
+            }
+            Err(ArtifactError::Transport(msg)) => {
+                assert!(
+                    msg.contains("egress denied"),
+                    "must be an egress refusal, got: {msg}"
+                );
+            }
+            Err(other) => panic!("must be an egress refusal, got: {other:?}"),
+        }
+
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::ModelArtifact, None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Config change + security audit logging.
 //!
-//! Two channels:
+//! Four channels:
 //!
 //! * `config_audit` (via [`ConfigAuditEntry::emit`]) - configuration
 //!   change events: hot reloads, mesh broadcasts, API-driven origin
@@ -11,8 +11,12 @@
 //!   forwarding to a SIEM. Designed so each channel can be routed
 //!   to a dedicated sink (security log into the SOC's alert
 //!   pipeline; config audit into the change-management log).
+//! * `key_audit` (via [`KeyAuditEntry::emit`]) - key/credential
+//!   lifecycle mutations.
+//! * `sbproxy::admin::audit` (via [`AdminActionAuditEntry::emit`]) -
+//!   authenticated admin-console actions.
 //!
-//! All three channels also push a normalized copy onto
+//! All four channels also push a normalized copy onto
 //! [`crate::audit_ring`], which is a bounded in-memory sample and is
 //! explicitly not durable.
 //!
@@ -28,14 +32,18 @@
 //! `sbproxy audit verify` re-derive from genesis. Editing one record
 //! there breaks its own digest and every link after it.
 //!
-//! `config_audit` and `key_audit` do not have that yet. Both are equally
-//! worth chaining and both are deliberately out of scope of the first
-//! pass, because the honest version of each needs its own decision about
-//! what a record may carry: `KeyAuditEntry` ships a before/after diff of
-//! a credential record, which is exactly the field that has to be proven
-//! secret-free before it is written somewhere designed to be permanent.
+//! `config_audit` has the same durable form, opt-in on `audit.config_path`.
+//! `key_audit` and the admin-console's `sbproxy::admin::audit` target join
+//! it too (WOR-2478), opt-in on `audit.key_path` / `audit.admin_path`.
+//! `key_audit`'s chained record is not [`KeyAuditEntry`] itself: that type
+//! ships a before/after diff of a credential record, and a diff is exactly
+//! the field that must never enter a file designed to be impossible to
+//! quietly amend. [`KeyAuditChainEntry`] carries the metadata instead, plus
+//! a keyed-HMAC-SHA256 fingerprint of each before/after field in place of
+//! its value; see that type's docs and [`crate::audit_chain`] for the key.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 /// A structured record of a single configuration change event.
@@ -71,6 +79,13 @@ pub struct ConfigAuditEntry {
     /// Config revision after the change, when known (WOR-2094).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_revision: Option<String>,
+    /// Why the reload was refused, when this entry records a rejection
+    /// rather than an applied change (WOR-2486). `None` on an accepted
+    /// reload. The actual contract this field keeps, and does not, is
+    /// on [`Self::with_rejection_reason`]; read it before pointing a
+    /// sink at this field that assumes more than that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 impl ConfigAuditEntry {
@@ -100,6 +115,24 @@ impl ConfigAuditEntry {
         };
         // WOR-2094: normalized copy for the admin console's runtime
         // sample; the collector remains the durable consumer.
+        //
+        // WOR-2486: a rejection's detail leads with the reason rather
+        // than the same "revision X -> Y" shape an accepted reload
+        // gets. Without this, a rejected reload with no revision change
+        // and no origin delta rendered as "revision rev-5 -> ?; +0 -0
+        // ~0 origins" in the ring, which reads exactly like an
+        // accepted no-op reload rather than a refusal.
+        let detail = match self.rejection_reason.as_deref() {
+            Some(reason) => format!("rejected: {reason}"),
+            None => format!(
+                "revision {} -> {}; +{} -{} ~{} origins",
+                self.prior_revision.as_deref().unwrap_or("?"),
+                self.next_revision.as_deref().unwrap_or("?"),
+                self.origins_added.len(),
+                self.origins_removed.len(),
+                self.origins_modified.len(),
+            ),
+        };
         crate::audit_ring::push_audit_event(crate::audit_ring::AuditRingEvent::new(
             "config",
             self.source.clone(),
@@ -107,14 +140,7 @@ impl ConfigAuditEntry {
             self.tenant_id.clone(),
             None,
             None,
-            Some(format!(
-                "revision {} -> {}; +{} -{} ~{} origins",
-                self.prior_revision.as_deref().unwrap_or("?"),
-                self.next_revision.as_deref().unwrap_or("?"),
-                self.origins_added.len(),
-                self.origins_removed.len(),
-                self.origins_modified.len(),
-            )),
+            Some(detail),
         ));
         // WOR-2470: the durable, tamper-evident half, on the same terms
         // as the security channel: ordered after the ring and the
@@ -418,7 +444,7 @@ impl SecurityAuditEntry {
     /// `events:` egress.
     ///
     /// `event_type` here is an open string; the egress filter is a closed
-    /// enum of twelve. The split follows what a SIEM rule would route on:
+    /// enum of thirteen. The split follows what a SIEM rule would route on:
     /// the four values [`Self::auth_failure`] documents are the
     /// credential ones, and everything else that reaches this channel
     /// (framing violations plus every policy label
@@ -485,6 +511,7 @@ impl ConfigAuditEntry {
             actor: None,
             prior_revision: None,
             next_revision: None,
+            rejection_reason: None,
         }
     }
 
@@ -510,6 +537,37 @@ impl ConfigAuditEntry {
     ) -> Self {
         self.prior_revision = prior.map(Into::into);
         self.next_revision = next.map(Into::into);
+        self
+    }
+
+    /// Attach the reason a reload was refused (WOR-2486).
+    ///
+    /// The honest contract, not the aspirational one: `reason` is
+    /// **bounded** to 512 bytes here, the same ceiling `RedactedReason`
+    /// uses on the decision-audit side, and this record ships to the
+    /// same third-party sinks `events:` does. It is **not** scrubbed
+    /// of config content in general. A compile or validation error
+    /// routinely echoes a fragment of the document it is complaining
+    /// about, an invalid CEL expression, an unrecognized key, an
+    /// origin hostname, because naming the offending fragment is how a
+    /// validation error explains itself; nothing here tells that fragment
+    /// apart from ordinary error prose.
+    ///
+    /// The one thing callers are expected to scrub before this is
+    /// called is the config **path**: `crate::path_redact` (in
+    /// `sbproxy-core`) strips the filesystem path a reload was told to
+    /// read out of the error text first, because that path is this
+    /// node's local layout and every call site knows it in advance. A
+    /// resolved secret should not appear either, by the convention
+    /// every secret-reference resolver in this codebase already
+    /// follows (report the unresolved reference, never the value), but
+    /// that convention lives in the resolvers, not enforced here: this
+    /// function performs no content inspection of its own. If your
+    /// threat model needs a stronger guarantee than "bounded, path-
+    /// scrubbed, and secrets-by-convention", read the reason before
+    /// wiring a sink you do not already trust with your config's shape.
+    pub fn with_rejection_reason(mut self, reason: impl AsRef<str>) -> Self {
+        self.rejection_reason = Some(sbproxy_util::truncate_utf8(reason.as_ref(), 512).to_owned());
         self
     }
 }
@@ -547,6 +605,164 @@ pub struct KeyAuditEntry {
     /// Redacted snapshot of the record after the mutation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<serde_json::Value>,
+}
+
+/// The durable half of a key/credential mutation (WOR-2478).
+///
+/// Carries every metadata field [`KeyAuditEntry`] does - `timestamp`,
+/// `op`, `resource`, `id`, `actor`, `tenant_id` - and nothing that field
+/// list did not already promise was secret-free. In place of `before` /
+/// `after` it carries a keyed-HMAC-SHA256 fingerprint of each field the
+/// snapshot named, so a chain reader can tell that two mutations set the
+/// same field to the same value without the chain file ever holding that
+/// value; see `crate::audit_chain::fingerprint_key_audit_snapshot` for
+/// how a fingerprint is computed and the key it runs under.
+///
+/// `Deserialize` and `Clone` exist so this is a
+/// [`sbproxy_meter::ledger::LedgerPayload`]; see [`crate::audit_chain`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyAuditChainEntry {
+    /// RFC 3339 timestamp of the mutation.
+    pub timestamp: String,
+    /// The operation: `create`, `update`, `delete`, `revoke`, `block`,
+    /// `unblock`, or `rotate`.
+    pub op: String,
+    /// The resource kind: `key` or `credential`.
+    pub resource: String,
+    /// The public record id (key_id or credential id). Never a secret.
+    pub id: String,
+    /// The principal that performed the mutation, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Tenant the record belongs to, when scoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// A short, non-secret tag identifying which fingerprint key produced
+    /// this record's fingerprints: `hex(HMAC(derived_key, b"epoch"))[..8]`
+    /// (WOR-2478 I4). An ephemeral master key (no
+    /// `key_management.crypto.master_key` configured) re-derives a fresh
+    /// fingerprint key on every boot, and a rotated one re-derives on the
+    /// next; either silently re-bases every fingerprint that follows.
+    /// Two records with different `key_epoch` values were fingerprinted
+    /// under different keys, and their fingerprints must never be
+    /// compared for equality. Empty before a fingerprint key has been
+    /// installed, in step with `before_fingerprint` / `after_fingerprint`
+    /// also being empty under the same condition.
+    pub key_epoch: String,
+    /// Before-mutation field fingerprints, keyed by the field's own name
+    /// when that name is on the closed key-audit field-name allowlist, or
+    /// by the field name's own keyed fingerprint (prefixed `f:`)
+    /// otherwise (WOR-2478 I3/M6) - a caller-supplied field name never
+    /// lands verbatim in this map unless it was reviewed onto the
+    /// allowlist first. Each value is a keyed-HMAC-SHA256 fingerprint,
+    /// hex, that also binds the field's own name, so two different
+    /// fields set to the same value fingerprint differently. Empty when
+    /// the mutation carried no `before` snapshot, or no fingerprint key
+    /// has been installed yet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub before_fingerprint: BTreeMap<String, String>,
+    /// The same, for the value after the mutation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub after_fingerprint: BTreeMap<String, String>,
+}
+
+// --- Admin-action audit channel (WOR-2478) ---
+
+/// A structured record of one authenticated admin-console action.
+///
+/// Not what performs the `sbproxy::admin::audit` tracing emission itself:
+/// each of the four call sites in `crates/sbproxy-core/src/admin.rs`
+/// independently logs to that tracing target immediately before building
+/// one of these (WOR-2094's original ring-push shape), and this type
+/// carries the same fact onward rather than duplicating the log line.
+/// [`Self::emit`] pushes a normalized copy onto the shared audit ring
+/// and, if a chain is installed, appends it to the durable admin chain
+/// (WOR-2478). Every field here is what the audit ring's
+/// `AuditRingEvent` already carries for the `admin` channel: the
+/// operator, the tenant, the public key id (never the secret), a request
+/// correlation id, and a bounded free-text `detail` (an HTTP method and
+/// path, or a role label; never a header value or a credential). Chained
+/// verbatim, the same as [`SecurityAuditEntry`] and [`ConfigAuditEntry`]:
+/// nothing here needs the fingerprinting [`KeyAuditChainEntry`] does.
+///
+/// `Deserialize` and `Clone` exist so this is a
+/// [`sbproxy_meter::ledger::LedgerPayload`]; see [`crate::audit_chain`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminActionAuditEntry {
+    /// RFC 3339 timestamp.
+    pub timestamp: String,
+    /// The admin action: `admin_action`, `login`, `login_failed`, or
+    /// `inspect_request_content`.
+    pub action: String,
+    /// The operator username, when the request resolved one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Tenant scope, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Public key id the action is attributed to, when one resolved.
+    /// Never the secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_id: Option<String>,
+    /// Request correlation id, when the action is request-scoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Bounded, machine-readable detail: an HTTP method and path, or a
+    /// role label. Capped in [`Self::new`] by the same
+    /// `crate::audit_ring::bound_detail` helper the ring itself caps
+    /// `AuditRingEvent::detail` with (WOR-2478 I5), so the ring's copy
+    /// and the chain's copy of one action are never capped at two
+    /// different lengths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl AdminActionAuditEntry {
+    /// Build an entry for `action`, stamped now. `detail` is bounded the
+    /// same way `AuditRingEvent::new` bounds it (WOR-2478 I5): both the
+    /// ring and the chain carry the same capped value for one action
+    /// rather than the ring silently disagreeing with what got chained.
+    pub fn new(
+        action: impl Into<String>,
+        actor: Option<String>,
+        tenant_id: Option<String>,
+        api_key_id: Option<String>,
+        request_id: Option<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            timestamp: now_rfc3339(),
+            action: action.into(),
+            actor,
+            tenant_id,
+            api_key_id,
+            request_id,
+            detail: detail.map(|d| crate::audit_ring::bound_detail(&d)),
+        }
+    }
+
+    /// Push a normalized copy onto the shared audit ring (WOR-2094,
+    /// unchanged shape) and append the same record to the admin audit
+    /// chain, if one is installed (WOR-2478).
+    pub fn emit(&self) {
+        let started = std::time::Instant::now();
+        crate::audit_ring::push_audit_event(crate::audit_ring::AuditRingEvent::new(
+            "admin",
+            self.action.clone(),
+            self.actor.clone(),
+            self.tenant_id.clone(),
+            self.api_key_id.clone(),
+            self.request_id.clone(),
+            self.detail.clone(),
+        ));
+        let chain_ok = crate::audit_chain::append_admin_audit(self);
+        let outcome = if chain_ok { "ok" } else { "chain_error" };
+        crate::metrics::record_audit_emit_duration(
+            "admin",
+            outcome,
+            started.elapsed().as_secs_f64(),
+        );
+    }
 }
 
 impl KeyAuditEntry {
@@ -591,7 +807,26 @@ impl KeyAuditEntry {
     ///
     /// Also pushes a normalized copy onto the in-memory audit ring so
     /// the admin console can show the mutation without collector
-    /// wiring (WOR-2094).
+    /// wiring (WOR-2094), and appends the durable half to the key audit
+    /// chain, if one is installed (WOR-2478). The tracing line and the
+    /// ring keep the raw `before`/`after` diff exactly as before; the
+    /// chain never sees it. See [`KeyAuditChainEntry`].
+    ///
+    /// The `outcome` label folds in the chain append result the same way
+    /// [`ConfigAuditEntry::emit`] and [`SecurityAuditEntry::emit`] do:
+    /// `ok` on success, `serialize_error` when the tracing JSON encode
+    /// fails, `chain_error` when a configured key chain rejected the
+    /// append.
+    ///
+    /// WOR-2478 M8: the [`KeyAuditChainEntry`] itself - the fingerprint
+    /// maps and the epoch tag - is only built when a key chain is
+    /// actually installed. `append_key_audit` already treats an
+    /// uninstalled chain as a no-op, but computing an HMAC per
+    /// before/after field on every mutation to build an entry that would
+    /// only be discarded is not free; a deployment that never set
+    /// `audit.key_path` pays one relaxed load of a `OnceLock` here and
+    /// nothing more, the same posture the other three channels already
+    /// have with no chain configured.
     pub fn emit(&self) {
         let started = std::time::Instant::now();
         let outcome = match serde_json::to_string(self) {
@@ -615,6 +850,30 @@ impl KeyAuditEntry {
                 _ => self.resource.clone(),
             }),
         ));
+        // WOR-2478: the durable half. Metadata only, plus a keyed-HMAC
+        // fingerprint of each before/after field; the raw diff never
+        // reaches the chain. Built only when a chain is installed (M8).
+        let chain_ok = if crate::audit_chain::key_audit_chain_installed() {
+            let chain_entry = KeyAuditChainEntry {
+                timestamp: self.timestamp.clone(),
+                op: self.op.clone(),
+                resource: self.resource.clone(),
+                id: self.id.clone(),
+                actor: self.actor.clone(),
+                tenant_id: self.tenant_id.clone(),
+                key_epoch: crate::audit_chain::key_audit_fingerprint_epoch(),
+                before_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
+                    self.before.as_ref(),
+                ),
+                after_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
+                    self.after.as_ref(),
+                ),
+            };
+            crate::audit_chain::append_key_audit(&chain_entry)
+        } else {
+            true
+        };
+        let outcome = if !chain_ok { "chain_error" } else { outcome };
         crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
     }
 }
@@ -634,6 +893,7 @@ mod tests {
             actor: None,
             prior_revision: None,
             next_revision: None,
+            rejection_reason: None,
         }
     }
 
@@ -704,6 +964,34 @@ mod tests {
         assert!(
             detail.contains("r-prior-cfg-test") && detail.contains("r-next-cfg-test"),
             "the revision pair is on the event: {detail}"
+        );
+    }
+
+    /// WOR-2486: a rejected reload's ring entry has to say so. Before
+    /// this fix a rejection with no revision change and no origin delta
+    /// rendered identically to an accepted no-op reload
+    /// (`"revision X -> ?; +0 -0 ~0 origins"`), which is indistinguishable
+    /// from a real accepted reload that happened to touch nothing.
+    #[test]
+    fn a_rejected_reload_names_itself_on_the_ring() {
+        ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
+            .with_actor("operator-cfg-reject")
+            .with_rejection_reason("origin \"ring-reject.example\": invalid regex")
+            .emit();
+        let events =
+            crate::audit_ring::recent_audit_events(10, Some("config"), Some("file_watcher"), None);
+        let event = events
+            .iter()
+            .find(|e| e.actor.as_deref() == Some("operator-cfg-reject"))
+            .expect("rejected reload reaches the audit ring");
+        let detail = event.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.starts_with("rejected:"),
+            "a rejection must not read like an accepted no-op reload: {detail}"
+        );
+        assert!(
+            detail.contains("ring-reject.example"),
+            "the reason must be on the event: {detail}"
         );
     }
 
@@ -819,6 +1107,7 @@ mod tests {
             actor: None,
             prior_revision: None,
             next_revision: None,
+            rejection_reason: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -854,6 +1143,57 @@ mod tests {
         assert!(v_anon.get("tenant_id").is_none());
     }
 
+    /// WOR-2486: an accepted reload carries no `rejection_reason`; a
+    /// rejected one does, bounded and never the raw unbounded string.
+    #[test]
+    fn config_audit_entry_rejection_reason_round_trips_and_is_bounded() {
+        let accepted = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![]);
+        let json = serde_json::to_string(&accepted).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("rejection_reason").is_none(),
+            "an accepted reload must not carry a rejection_reason field"
+        );
+
+        let rejected = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
+            .with_rejection_reason(
+                "origin \"api.example.com\": model_rate_limits[0]: invalid regex",
+            );
+        let json = serde_json::to_string(&rejected).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["rejection_reason"],
+            "origin \"api.example.com\": model_rate_limits[0]: invalid regex"
+        );
+
+        let long_reason = "x".repeat(1000);
+        let bounded = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
+            .with_rejection_reason(&long_reason);
+        assert!(
+            bounded.rejection_reason.as_ref().expect("set").len() <= 512,
+            "the reason must be bounded before it reaches a record shipped to a third-party sink"
+        );
+    }
+
+    /// A record serialized before `rejection_reason` existed must still
+    /// deserialize: `#[serde(default)]` is what makes that true, and the
+    /// sibling `Option` fields on this struct (`tenant_id`, `actor`,
+    /// `prior_revision`, `next_revision`) lack it, so a JSON payload
+    /// missing any of those fails to parse. This pins the new field to
+    /// the safer contract rather than repeating that gap.
+    #[test]
+    fn config_audit_entry_without_rejection_reason_field_still_deserializes() {
+        let json = r#"{
+            "timestamp": "2026-01-01T00:00:00Z",
+            "source": "file_watcher",
+            "origins_added": [],
+            "origins_removed": [],
+            "origins_modified": []
+        }"#;
+        let entry: ConfigAuditEntry = serde_json::from_str(json).expect("old-shape record parses");
+        assert!(entry.rejection_reason.is_none());
+    }
+
     /// WOR-1067: security audit entry carries tenant_id when set; the
     /// field is omitted when None to keep existing SIEM ingest pipelines
     /// unchanged for proxy-wide events.
@@ -878,6 +1218,45 @@ mod tests {
         let json_anon = serde_json::to_string(&entry_anon).unwrap();
         let v_anon: serde_json::Value = serde_json::from_str(&json_anon).unwrap();
         assert!(v_anon.get("tenant_id").is_none());
+    }
+
+    /// WOR-2486 fix round 1, C2: verifies the claim `sbproxy_tls::mtls`'s
+    /// CN sanitizer's doc comment relies on, rather than assuming it.
+    ///
+    /// `sbproxy_meter::ledger::UsageLedger::append_checked` writes one
+    /// `serde_json::to_string(&entry)` result per `writeln!` call to the
+    /// hash-chained file: exactly this crate's own serialization, not a
+    /// hand-rolled format. A `reason` (or any other free-text field)
+    /// carrying a raw newline must not be able to start a second NDJSON
+    /// record inside a value meant to hold one field, because every
+    /// downstream chain reader (`sbproxy audit verify`, a SIEM's NDJSON
+    /// parser) treats one physical line as one record.
+    #[test]
+    fn security_audit_entry_reason_cannot_split_the_chained_ndjson_line() {
+        let entry = SecurityAuditEntry::auth_failure(
+            "auth_mtls_rejected",
+            "mtls:untrusted_issuer cn=evil.example\ncn=trusted.example",
+            495,
+            None,
+            None,
+            None,
+            None,
+        );
+        // The exact call `UsageLedger::append_checked` makes before its
+        // own `writeln!`.
+        let line = serde_json::to_string(&entry).expect("entry serializes");
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "a raw newline in a field must not produce a second physical line: {line:?}"
+        );
+        // And the value round-trips: JSON escaping, not data loss, is
+        // what prevents the split.
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("line parses");
+        assert_eq!(
+            parsed["reason"],
+            "mtls:untrusted_issuer cn=evil.example\ncn=trusted.example"
+        );
     }
 
     // --- WOR-2318: the `events:` egress bridge ---
@@ -1046,4 +1425,148 @@ mod tests {
     // already proves `append` returns `false` on a failing chain via a
     // serialize-refusing payload; the one-line fold above is verified by
     // inspection rather than by a second injected failure.
+
+    // --- WOR-2478: key audit entries become chainable, metadata only ---
+
+    /// End to end through the public emitter, the same shape as
+    /// `config_audit_emit_lands_on_an_installed_chain_with_an_ok_outcome`
+    /// above, over the key channel. Unlike the config/security twins, the
+    /// chained bytes are never expected to equal the emitted tracing
+    /// line (the chain carries fingerprints, not the diff), so this
+    /// asserts on the metadata and the fingerprint fields instead of a
+    /// substring match.
+    #[test]
+    fn key_audit_emit_lands_on_an_installed_chain_with_an_ok_outcome() {
+        let path =
+            std::env::temp_dir().join(format!("sb-audit-key-emit-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let seed = "12".repeat(32);
+        let chain = crate::audit_chain::KeyAuditChain::open(&path, &seed, "audit-emit-test")
+            .expect("chain opens");
+        if crate::audit_chain::install_key_audit_chain(chain).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        // Any process that already claimed `KEY_CHAIN` above has also had
+        // a chance to install a fingerprint key; install one here too so
+        // this test's assertions on non-empty fingerprints hold even when
+        // this is the very first WOR-2478 test in the process.
+        crate::audit_chain::install_key_audit_fingerprint_key(b"test-master-for-key-emit");
+
+        KeyAuditEntry::new("rotate", "key", "sbp_chain_emit_key")
+            .with_actor("operator-chain-test")
+            .with_tenant_id("tenant-chain-test")
+            .with_diff(
+                Some(serde_json::json!({ "status": "active" })),
+                Some(serde_json::json!({ "status": "rotated" })),
+            )
+            .emit();
+
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        assert!(
+            content.contains("sbp_chain_emit_key"),
+            "the metadata reached the chain: {content}"
+        );
+        assert!(
+            content.contains("before_fingerprint") && content.contains("after_fingerprint"),
+            "the fingerprints reached the chain: {content}"
+        );
+
+        let ok_exemplar = crate::exemplars::last_recorded_for_test(
+            "sbproxy_audit_emit_duration_seconds",
+            &[("channel", "key"), ("outcome", "ok")],
+        );
+        assert!(
+            ok_exemplar.is_some(),
+            "a successful chain append must keep the outcome label at ok"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The non-negotiable proof behind the whole ticket: a key mutation
+    /// whose before/after diff carries something that looks exactly like
+    /// a real upstream credential must never write that value to the
+    /// chain file, in either its plaintext or fingerprinted form's
+    /// namesake bytes - and (WOR-2478 I3/M6(c)) the same holds for a
+    /// diff field's own NAME, not just its value: a caller that starts
+    /// diffing a field nobody reviewed must not get to name that field
+    /// in the chain either. Greps the raw file contents, not a parsed
+    /// structure, so there is nowhere for either canary to hide.
+    #[test]
+    fn a_key_mutation_with_a_secret_before_after_value_never_writes_the_secret_to_the_chain() {
+        let path =
+            std::env::temp_dir().join(format!("sb-audit-key-secret-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let seed = "34".repeat(32);
+        let chain = crate::audit_chain::KeyAuditChain::open(&path, &seed, "audit-secret-test")
+            .expect("chain opens");
+        if crate::audit_chain::install_key_audit_chain(chain).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        crate::audit_chain::install_key_audit_fingerprint_key(b"test-master-for-secret-test");
+
+        let planted_secret = "sk-planted-canary-do-not-leak-4f8a91";
+        let rotated_secret = "sk-rotated-canary-do-not-leak-9b21c7";
+        // A second canary planted as the diff's own FIELD NAME, not its
+        // value: `upstream_secret` is not on the key-audit field-name
+        // allowlist either, but naming the canary distinctly here means
+        // a regression that started copying non-allowlisted names
+        // verbatim would be caught by this assertion specifically,
+        // rather than only by the (also-not-allowlisted) `upstream_secret`
+        // name coincidentally being absent too.
+        let planted_field_name = "sk-planted-field-name-canary-77aa21";
+
+        let mut before = serde_json::Map::new();
+        before.insert(
+            "upstream_secret".to_string(),
+            serde_json::Value::String(planted_secret.to_string()),
+        );
+        before.insert(
+            planted_field_name.to_string(),
+            serde_json::Value::String("before".to_string()),
+        );
+        let mut after = serde_json::Map::new();
+        after.insert(
+            "upstream_secret".to_string(),
+            serde_json::Value::String(rotated_secret.to_string()),
+        );
+        after.insert(
+            planted_field_name.to_string(),
+            serde_json::Value::String("after".to_string()),
+        );
+
+        KeyAuditEntry::new("update", "credential", "cred-secret-test")
+            .with_actor("operator-secret-test")
+            .with_diff(
+                Some(serde_json::Value::Object(before)),
+                Some(serde_json::Value::Object(after)),
+            )
+            .emit();
+
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        assert!(
+            content.contains("cred-secret-test"),
+            "the metadata reached the chain: {content}"
+        );
+        assert!(
+            !content.contains(planted_secret),
+            "the planted secret VALUE must never reach the chain file: {content}"
+        );
+        assert!(
+            !content.contains(rotated_secret),
+            "the rotated secret VALUE must never reach the chain file either: {content}"
+        );
+        assert!(
+            !content.contains(planted_field_name),
+            "a caller-supplied field NAME must never reach the chain file verbatim: {content}"
+        );
+        assert!(
+            content.contains("before_fingerprint") && content.contains("after_fingerprint"),
+            "fingerprints stand in for the diff: {content}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

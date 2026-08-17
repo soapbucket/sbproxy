@@ -11,8 +11,9 @@
 //! a failure: a broken sink cannot fail the request it is logging.
 
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied,
-    EgressPurpose, HostResolver, RedirectRule,
+    configured_gate, evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
+    EgressAuthorizer, EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
+    RedirectRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -329,6 +330,7 @@ async fn send_sink_post(
             hop,
             RedirectRule::SameOriginOnly,
             &CachedSystemResolver,
+            sink_name,
         ) {
             Ok(next) => next,
             Err(denied) => {
@@ -375,14 +377,47 @@ impl WebhookSink {
 impl UsageSink for WebhookSink {
     fn record(&self, event: &LlmUsageEvent) {
         let tenant = event.tenant_id.clone().unwrap_or_default();
-        if let Err(denied) = authorize_usage_http(
-            self.egress.as_ref(),
-            EgressPurpose::Webhook,
-            &self.url,
-            &CachedSystemResolver,
-        ) {
-            record_egress_refused(EgressPurpose::Webhook, denied, &tenant, "webhook");
-            return;
+        // WOR-2476: every webhook URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_usage_http`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::Webhook,
+                    &self.url,
+                    "webhook",
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::Webhook,
+                &self.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::Webhook,
+                        &self.url,
+                        "webhook",
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::Webhook,
+                        &self.url,
+                        "webhook",
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::Webhook, denied, &tenant, "webhook");
+                    return;
+                }
+            },
         }
         let body = match serde_json::to_vec(event) {
             Ok(b) => b,
@@ -586,14 +621,47 @@ impl LangfuseSink {
 impl UsageSink for LangfuseSink {
     fn record(&self, event: &LlmUsageEvent) {
         let tenant = event.tenant_id.clone().unwrap_or_default();
-        if let Err(denied) = authorize_usage_http(
-            self.egress.as_ref(),
-            EgressPurpose::UsageSink,
-            &self.url,
-            &CachedSystemResolver,
-        ) {
-            record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "langfuse");
-            return;
+        // WOR-2476: every usage-sink URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_usage_http`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::UsageSink,
+                    &self.url,
+                    "langfuse",
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::UsageSink,
+                &self.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "langfuse",
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "langfuse",
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "langfuse");
+                    return;
+                }
+            },
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
         let id = event
@@ -671,14 +739,47 @@ impl DatadogSink {
 impl UsageSink for DatadogSink {
     fn record(&self, event: &LlmUsageEvent) {
         let tenant = event.tenant_id.clone().unwrap_or_default();
-        if let Err(denied) = authorize_usage_http(
-            self.egress.as_ref(),
-            EgressPurpose::UsageSink,
-            &self.url,
-            &CachedSystemResolver,
-        ) {
-            record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "datadog");
-            return;
+        // WOR-2476: every usage-sink URL lands in the egress inventory,
+        // whether an authorizer is configured or not. `authorize_usage_http`
+        // collapses "no authorizer" to `Ok(())`, so the stamp inspects
+        // `self.egress` directly rather than trusting that result.
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::UsageSink,
+                    &self.url,
+                    "datadog",
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::UsageSink,
+                &self.url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "datadog",
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        &self.url,
+                        "datadog",
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "datadog");
+                    return;
+                }
+            },
         }
         let body = datadog_log_body(event, &self.service);
         let url = self.url.clone();
@@ -820,30 +921,59 @@ enum ObjectStoreKind {
 /// `GOOGLE_APPLICATION_CREDENTIALS`, etc.) on each put. An empty bucket,
 /// missing credentials, or a put failure logs and returns, never panics
 /// or propagates to the request hot path.
+///
+/// `auth_url` (WOR-2476) is resolved once, at construction, via
+/// `object_store_authorization_url`, and reused for every `record()`
+/// call rather than recomputed. A sink is built once per config
+/// compile (see [`UsageSinkConfig::build`]) and lives for the process
+/// lifetime, so this assumes an operator's S3 endpoint override
+/// (`AWS_ENDPOINT_URL` / `AWS_ENDPOINT`) does not change mid-process;
+/// it is read from the environment once, the same way every other
+/// piece of process-lifetime config here is. Without this,
+/// `AmazonS3Builder::from_env()`'s full `std::env::vars_os()` scan ran
+/// synchronously on the request-logging hot path for every completed
+/// AI call, duplicating the scan `object_store_put`'s builders
+/// already do inside the spawned task.
 #[derive(Debug)]
 pub struct ObjectStoreSink {
     kind: ObjectStoreKind,
     bucket: String,
     prefix: String,
+    egress: Option<EgressAuthorizer>,
+    auth_url: String,
 }
 
 impl ObjectStoreSink {
     /// Create an S3 usage sink for `bucket` under `prefix`.
     pub fn s3(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        let bucket = bucket.into();
+        let auth_url = object_store_authorization_url(ObjectStoreKind::S3, &bucket);
         Self {
             kind: ObjectStoreKind::S3,
-            bucket: bucket.into(),
+            bucket,
             prefix: prefix.into(),
+            egress: None,
+            auth_url,
         }
     }
 
     /// Create a GCS usage sink for `bucket` under `prefix`.
     pub fn gcs(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        let bucket = bucket.into();
+        let auth_url = object_store_authorization_url(ObjectStoreKind::Gcs, &bucket);
         Self {
             kind: ObjectStoreKind::Gcs,
-            bucket: bucket.into(),
+            bucket,
             prefix: prefix.into(),
+            egress: None,
+            auth_url,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::UsageSink`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
@@ -855,6 +985,64 @@ impl UsageSink for ObjectStoreSink {
                 "usage sink: object store bucket missing"
             );
             return;
+        }
+        let tenant = event.tenant_id.clone().unwrap_or_default();
+        // WOR-2476: gate the object-store destination before any I/O,
+        // through the same `EgressPurpose::UsageSink` authorizer surface
+        // as the other usage sinks. `authorize_usage_http` collapses "no
+        // authorizer" to `Ok(())`, so the stamp inspects `self.egress`
+        // directly rather than trusting that result. There is no literal
+        // request URL here: `object_store`'s builders resolve the real
+        // dial target from the environment (`AWS_*` /
+        // `GOOGLE_APPLICATION_CREDENTIALS`, a possible custom endpoint
+        // override, etc.), not from a field on this struct. `self.auth_url`
+        // is that same environment read back, resolved once at
+        // construction (see the struct doc comment) rather than here on
+        // every `record()`: this method runs on the request-logging hot
+        // path, and `AmazonS3Builder::from_env()` is a full
+        // `std::env::vars_os()` scan that would otherwise run per logged
+        // request in addition to the identical scan
+        // [`object_store_put`]'s builders already do inside the spawned
+        // task. See `object_store_authorization_url` for the S3-vs-GCS
+        // derivation and the inventory-granularity note.
+        let auth_url = &self.auth_url;
+        match self.egress.as_ref() {
+            None => {
+                record_egress_seen(
+                    EgressPurpose::UsageSink,
+                    auth_url,
+                    self.name(),
+                    EgressSightingStatus::Ungated,
+                    None,
+                );
+            }
+            Some(_) => match authorize_usage_http(
+                self.egress.as_ref(),
+                EgressPurpose::UsageSink,
+                auth_url,
+                &CachedSystemResolver,
+            ) {
+                Ok(()) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        auth_url,
+                        self.name(),
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                }
+                Err(denied) => {
+                    record_egress_seen(
+                        EgressPurpose::UsageSink,
+                        auth_url,
+                        self.name(),
+                        EgressSightingStatus::Denied,
+                        Some(denied),
+                    );
+                    record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, self.name());
+                    return;
+                }
+            },
         }
         let body = match serde_json::to_vec(event) {
             Ok(b) => b,
@@ -888,6 +1076,66 @@ impl UsageSink for ObjectStoreSink {
             ObjectStoreKind::S3 => "s3",
             ObjectStoreKind::Gcs => "gcs",
         }
+    }
+}
+
+/// URL representing an object-store backend's destination, for egress
+/// authorization only (WOR-2476).
+///
+/// `ObjectStoreSink` carries no endpoint field of its own: the real
+/// dial target is resolved by [`object_store_put`]'s builders from the
+/// process environment. For **S3**, `AmazonS3Builder::from_env()`
+/// already parses `AWS_ENDPOINT_URL` / `AWS_ENDPOINT` into a builder
+/// field, and reading it back via `get_config_value` is a synchronous
+/// struct-field read (no I/O, no `.build()`), so an operator-configured
+/// endpoint override (MinIO, R2, a self-hosted gateway, etc.) is used
+/// directly instead of being silently assumed away; only an unset
+/// override falls back to the well-known default AWS endpoint. **GCS**
+/// has no equivalent accessor in `object_store` 0.11, so it stays on
+/// its well-known default endpoint unconditionally. This also means the
+/// two backends land in the inventory at different granularity: the S3
+/// default is virtual-hosted style with the bucket in the host
+/// (`<bucket>.s3.amazonaws.com`), so each bucket is its own row, while
+/// the GCS default is path-style (`storage.googleapis.com/<bucket>`),
+/// so every GCS bucket collapses onto the same host and the same row.
+/// Never stored or logged with the raw bucket path; only host/port/
+/// scheme reach the sightings inventory.
+fn object_store_authorization_url(kind: ObjectStoreKind, bucket: &str) -> String {
+    match kind {
+        ObjectStoreKind::S3 => {
+            s3_authorization_url(bucket, &object_store::aws::AmazonS3Builder::from_env())
+        }
+        ObjectStoreKind::Gcs => format!("https://storage.googleapis.com/{bucket}/"),
+    }
+}
+
+/// S3 authorization URL for `bucket`, given an already-configured
+/// `builder` (WOR-2476).
+///
+/// Split out from [`object_store_authorization_url`] so a test can
+/// construct `builder` explicitly via `AmazonS3Builder::with_config`
+/// instead of mutating real process environment variables: the
+/// env-mutation guard (`scripts/check-env-mutation.sh`) restricts
+/// direct `set_var`/`remove_var` to a documented per-crate
+/// `EnvVarGuard` (`src/test_env.rs`), and `sbproxy-ai` has no such
+/// guard today.
+fn s3_authorization_url(bucket: &str, builder: &object_store::aws::AmazonS3Builder) -> String {
+    use object_store::aws::AmazonS3ConfigKey;
+    match builder.get_config_value(&AmazonS3ConfigKey::Endpoint) {
+        Some(endpoint) if !endpoint.is_empty() => normalize_endpoint_url(&endpoint),
+        _ => format!("https://{bucket}.s3.amazonaws.com/"),
+    }
+}
+
+/// Ensure an operator-supplied `AWS_ENDPOINT_URL`-style value parses as
+/// an absolute URL for the egress authorizer, which only inspects
+/// host/port/scheme. A bare `host[:port]` with no scheme defaults to
+/// `https://`.
+fn normalize_endpoint_url(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
     }
 }
 
@@ -1028,10 +1276,24 @@ pub enum UsageSinkConfig {
 impl UsageSinkConfig {
     /// Build the runtime sink for this config entry. Returned as an `Arc` so a
     /// single instance is shared across every request for the origin.
+    ///
+    /// WOR-2476: every network-reaching sink variant (`Webhook`,
+    /// `Langfuse`, `Datadog`, `S3`, `Gcs`) attaches the process-wide
+    /// `EgressPurpose::UsageSink` authorizer via `with_egress` when the
+    /// top-level `egress.usage_sinks:` section configured one.
+    /// `JsonlFile`, `Ledger`, and `Otel` never reach the network, so
+    /// there is nothing here for an authorizer to gate.
     pub fn build(&self) -> std::sync::Arc<dyn UsageSink> {
+        let egress = configured_gate(EgressPurpose::UsageSink);
         match self {
             UsageSinkConfig::JsonlFile { path } => std::sync::Arc::new(JsonlFileSink::new(path)),
-            UsageSinkConfig::Webhook { url } => std::sync::Arc::new(WebhookSink::new(url)),
+            UsageSinkConfig::Webhook { url } => {
+                let mut sink = WebhookSink::new(url);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
+            }
             UsageSinkConfig::Ledger {
                 path,
                 signing_seed_hex,
@@ -1040,22 +1302,42 @@ impl UsageSinkConfig {
                 host,
                 public_key,
                 secret_key,
-            } => std::sync::Arc::new(LangfuseSink::new(host, public_key, secret_key)),
+            } => {
+                let mut sink = LangfuseSink::new(host, public_key, secret_key);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
+            }
             UsageSinkConfig::Datadog {
                 api_key,
                 site,
                 service,
-            } => std::sync::Arc::new(DatadogSink::new(
-                site,
-                api_key,
-                service.clone().unwrap_or_else(|| "sbproxy".to_string()),
-            )),
+            } => {
+                let mut sink = DatadogSink::new(
+                    site,
+                    api_key,
+                    service.clone().unwrap_or_else(|| "sbproxy".to_string()),
+                );
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
+            }
             UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
             UsageSinkConfig::S3 { bucket, prefix } => {
-                std::sync::Arc::new(ObjectStoreSink::s3(bucket, prefix))
+                let mut sink = ObjectStoreSink::s3(bucket, prefix);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
             }
             UsageSinkConfig::Gcs { bucket, prefix } => {
-                std::sync::Arc::new(ObjectStoreSink::gcs(bucket, prefix))
+                let mut sink = ObjectStoreSink::gcs(bucket, prefix);
+                if let Some(authorizer) = &egress {
+                    sink = sink.with_egress(authorizer.clone());
+                }
+                std::sync::Arc::new(sink)
             }
         }
     }
@@ -1617,6 +1899,86 @@ mod tests {
         sink.record(&sample_event());
     }
 
+    #[test]
+    fn config_build_arms_a_usage_sink_from_the_top_level_egress_registry() {
+        // WOR-2476: proves the whole seam, not just the `with_egress`
+        // builder in isolation. `UsageSinkConfig::build()` (what a
+        // compiled `AiHandlerConfig` actually calls) reads the
+        // process-wide `EgressPurpose::UsageSink` gate that
+        // `sbproxy_config::compiler::compile_egress_gates` would install
+        // from a `egress.usage_sinks.mode: deny_by_default` block, and
+        // the resulting sink refuses to dispatch to a host outside it.
+        //
+        // Deliberately exercises the `Webhook` variant, not a simpler
+        // one: `WebhookSink::record` authorizes under its own,
+        // pre-existing `EgressPurpose::Webhook`, a different purpose
+        // from the `EgressPurpose::UsageSink` key this registry slot is
+        // installed under. `compile_egress_gates` compiles one
+        // authorizer keyed under *both* purposes for exactly this
+        // reason (see its call site's comment in
+        // `sbproxy-config/src/compiler.rs`); this test's authorizer is
+        // built the same dual-keyed way so it matches what production
+        // actually installs, and the sighting this dispatch stamps
+        // carries `EgressPurpose::Webhook`'s label, not `UsageSink`'s,
+        // because that is the purpose `WebhookSink::record` itself
+        // stamps under.
+        let dual_purpose_authorizer = {
+            use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+            use std::collections::{HashMap, HashSet};
+            let allow = PurposeAllowlist {
+                hosts: HashSet::from(["collector.example.com".to_string()]),
+                schemes: HashSet::from(["https".to_string(), "http".to_string()]),
+                ports: HashSet::from([443, 80]),
+                allow_private: false,
+            };
+            let mut purposes = HashMap::new();
+            purposes.insert(EgressPurpose::UsageSink, allow.clone());
+            purposes.insert(EgressPurpose::Webhook, allow);
+            EgressAuthorizer::new(EgressConfig { purposes })
+        };
+        sbproxy_security::egress::install_configured_gate(
+            EgressPurpose::UsageSink,
+            Some(dual_purpose_authorizer),
+        );
+
+        let sink = UsageSinkConfig::Webhook {
+            url: "https://evil.example/ingest".to_string(),
+        }
+        .build();
+        // Must not panic: a WebhookSink that dispatched would
+        // `tokio::spawn` with no ambient runtime in this plain #[test].
+        sink.record(&sample_event());
+
+        let denied = sbproxy_security::egress::egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.purpose == EgressPurpose::Webhook.as_label() && s.host == "evil.example")
+            .expect("the denied dispatch must be stamped in the inventory");
+        assert_eq!(denied.status, "denied");
+
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::UsageSink, None);
+    }
+
+    #[test]
+    fn config_build_leaves_a_usage_sink_ungated_when_the_registry_is_unset() {
+        // WOR-2476: an omitted `egress.usage_sinks:` sub-block (nothing
+        // installed in the registry) must preserve the exact legacy
+        // ungated contract: `build()` returns a sink with no authorizer
+        // attached, so `record()` proceeds. Guards the entry point tests
+        // above depend on staying `None` by default.
+        sbproxy_security::egress::install_configured_gate(EgressPurpose::UsageSink, None);
+
+        let sink = UsageSinkConfig::Webhook {
+            url: "https://evil.example/ingest".to_string(),
+        }
+        .build();
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_none(),
+            "test precondition: the registry must be unset"
+        );
+        // Building must not fail or panic; the sink is legacy ungated.
+        let _ = sink;
+    }
+
     /// One-shot loopback fixture serving `response` verbatim, reporting
     /// whether anything connected.
     fn dial_fixture(
@@ -1693,6 +2055,170 @@ mod tests {
         assert!(
             !sink_hit.load(Ordering::SeqCst),
             "the redirect target must never be contacted"
+        );
+    }
+
+    /// Red-first: before this change, `ObjectStoreSink::record` called
+    /// `object_store_put` with no `authorize_usage_http` call at all, so a
+    /// bucket outside a configured allowlist was still dialed. The
+    /// authorizer here only allows a different host, so the S3 put must
+    /// be refused before `object_store_put` (and its `tokio::spawn`, which
+    /// would panic in this non-`tokio::test` fn if reached) ever runs, and
+    /// the refusal must land in the sightings inventory as `Denied`.
+    #[test]
+    fn enforce_object_store_sink_skips_put_when_denied() {
+        let bucket = "wor-2476-denied-bucket";
+        let sink = ObjectStoreSink::s3(bucket, "prefix").with_egress(enforce_purpose(
+            EgressPurpose::UsageSink,
+            &["allowed-bucket.s3.amazonaws.com"],
+        ));
+
+        // No panic: `object_store_put`'s `tokio::spawn` is never reached
+        // outside a Tokio runtime, so reaching it here would abort the
+        // test rather than merely fail an assertion.
+        sink.record(&sample_event());
+
+        let expected_host = format!("{bucket}.s3.amazonaws.com");
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == expected_host)
+            .expect("denied object-store destination must be stamped in the inventory");
+        assert_eq!(entry.status, "denied");
+        assert_eq!(
+            entry.last_reason,
+            Some(EgressDenied::UnlistedHost.as_label())
+        );
+    }
+
+    /// An operator-configured S3 endpoint override must be authorized
+    /// (and stamped) at its own real host, not the synthetic
+    /// `<bucket>.s3.amazonaws.com` default (WOR-2476 follow-up).
+    ///
+    /// Builds the `AmazonS3Builder` explicitly via `with_config` rather
+    /// than `AmazonS3Builder::from_env`: `sbproxy-ai` has no
+    /// `EnvVarGuard` test helper, and `scripts/check-env-mutation.sh`
+    /// restricts direct `set_var`/`remove_var` to the documented
+    /// per-crate guards, so a real environment mutation is not an
+    /// option here.
+    #[test]
+    fn s3_authorization_url_and_sighting_use_the_resolved_endpoint_override() {
+        use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+
+        let bucket = "wor-2476-override-bucket";
+        let override_host = "minio.internal.test";
+        let builder = AmazonS3Builder::new().with_config(
+            AmazonS3ConfigKey::Endpoint,
+            format!("https://{override_host}"),
+        );
+
+        let url = s3_authorization_url(bucket, &builder);
+        assert_eq!(
+            url,
+            format!("https://{override_host}"),
+            "an endpoint override must be used as-is, not collapsed into \
+             the synthetic <bucket>.s3.amazonaws.com default"
+        );
+
+        // The authorization decision itself must move with the URL: an
+        // allowlist scoped to the synthetic default must not authorize
+        // the real override host, and one scoped to the override host
+        // must.
+        let resolver = MapResolver::new(vec![(override_host, vec![public_addr(443)])]);
+        let synthetic_host = format!("{bucket}.s3.amazonaws.com");
+        let synthetic_only = enforce_purpose(EgressPurpose::UsageSink, &[synthetic_host.as_str()]);
+        let err = authorize_usage_http(
+            Some(&synthetic_only),
+            EgressPurpose::UsageSink,
+            &url,
+            &resolver,
+        )
+        .expect_err("an allowlist scoped to the synthetic default must deny the real override");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+
+        let override_allowed = enforce_purpose(EgressPurpose::UsageSink, &[override_host]);
+        authorize_usage_http(
+            Some(&override_allowed),
+            EgressPurpose::UsageSink,
+            &url,
+            &resolver,
+        )
+        .expect("an allowlist scoped to the override host must authorize it");
+
+        // And the sighting recorded for this destination must be keyed
+        // by the override host, not the synthetic default.
+        record_egress_seen(
+            EgressPurpose::UsageSink,
+            &url,
+            "s3",
+            EgressSightingStatus::Allowed,
+            None,
+        );
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        assert!(
+            snapshot.iter().any(
+                |e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == override_host
+            ),
+            "the override host must be stamped in the inventory"
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
+                    && e.host == synthetic_host),
+            "the synthetic default host must never be stamped once a real override resolves"
+        );
+    }
+
+    /// `record()` must gate against the `auth_url` memoized at
+    /// construction, never recompute it (WOR-2476 perf follow-up: a
+    /// fresh `AmazonS3Builder::from_env()` per `record()` call is a
+    /// full `std::env::vars_os()` scan on the request-logging hot path).
+    ///
+    /// Constructed via the struct literal rather than `ObjectStoreSink::s3`:
+    /// `mod tests` is a child module of this file, so `ObjectStoreSink`'s
+    /// private fields (including `auth_url`) are visible here, and that
+    /// is the only way to plant an `auth_url` a fresh resolution could
+    /// never produce. This test environment sets no `AWS_ENDPOINT_URL`,
+    /// so `object_store_authorization_url` would resolve the synthetic
+    /// `<bucket>.s3.amazonaws.com` default for this bucket if `record()`
+    /// recomputed it; the sighting below is keyed by a different host
+    /// entirely, so its presence is proof `record()` read the memoized
+    /// field instead.
+    #[test]
+    fn record_gates_against_the_auth_url_memoized_at_construction() {
+        let bucket = "wor-2476-memoized-bucket";
+        let memoized_host = "already-resolved.internal.test";
+        let sink = ObjectStoreSink {
+            kind: ObjectStoreKind::S3,
+            bucket: bucket.to_string(),
+            prefix: "prefix".to_string(),
+            egress: Some(enforce_purpose(
+                EgressPurpose::UsageSink,
+                &["allowed-elsewhere.example.com"],
+            )),
+            auth_url: format!("https://{memoized_host}"),
+        };
+
+        // No panic: the memoized host is denied by the authorizer above,
+        // so `record()` returns before `object_store_put`'s
+        // `tokio::spawn`, which would panic outside a Tokio runtime.
+        sink.record(&sample_event());
+
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.purpose == EgressPurpose::UsageSink.as_label() && e.host == memoized_host)
+            .expect("record() must gate against the memoized auth_url, not a fresh resolution");
+        assert_eq!(entry.status, "denied");
+
+        let synthetic_host = format!("{bucket}.s3.amazonaws.com");
+        assert!(
+            !snapshot
+                .iter()
+                .any(|e| e.purpose == EgressPurpose::UsageSink.as_label()
+                    && e.host == synthetic_host),
+            "record() must not recompute the synthetic default from a fresh environment scan"
         );
     }
 }

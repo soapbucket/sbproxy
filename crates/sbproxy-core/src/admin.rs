@@ -26,6 +26,13 @@ use sbproxy_config::config_merge::{BaseOrigin, MergeMode, Provenance};
 use sbproxy_config::types::AdminRole;
 use serde::Serialize;
 
+// Shared with the non-admin reload paths (WOR-2486 fix round 1, I5) so
+// a config_audit rejection reason is scrubbed the same way an HTTP
+// response body already is. See `crate::path_redact` for the scrub
+// itself; this file's own reload/validate handlers are its original
+// and largest set of call sites.
+use crate::path_redact::sanitise_path_in_error;
+
 pub mod prompt_persistence;
 pub use prompt_persistence::{prompt_key_ring, PromptPersistence, PromptSealer};
 
@@ -1162,23 +1169,6 @@ pub(crate) fn render_quote_keys_jwks() -> (u16, &'static str, String) {
 
 // --- Reload route ---
 
-/// Sanitise an error message so it never leaks the absolute config
-/// path. The file watcher and the reload route both operate on a
-/// path the operator picked, so a parse failure that includes the
-/// path tells an attacker exactly where the file lives. We strip
-/// the directory component and keep only the file name.
-fn sanitise_path_in_error(msg: &str, full_path: &std::path::Path) -> String {
-    let full = full_path.to_string_lossy();
-    if full.is_empty() {
-        return msg.to_string();
-    }
-    let file_name = full_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<config>".to_string());
-    msg.replace(full.as_ref(), &file_name)
-}
-
 /// Outcome of a `POST /admin/reload` invocation. The
 /// `(status, content_type, body)` triple matches the rest of the
 /// admin route shape so the dispatcher can hand it back unchanged.
@@ -1244,6 +1234,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Err(e) => {
             tracing::error!(error = %e, "admin reload: failed to read config file");
             let msg = sanitise_path_in_error(&e.to_string(), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 500,
                 "application/json",
@@ -1265,6 +1256,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: config source resolution failed");
             let msg = sanitise_path_in_error(&format!("{e:#}"), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 400,
                 "application/json",
@@ -1280,6 +1272,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: YAML parse failed");
             let msg = sanitise_path_in_error(&e.to_string(), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 400,
                 "application/json",
@@ -1303,6 +1296,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     {
         tracing::warn!(error = ?error, "admin reload: pipeline compile failed");
         let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
+        audit_admin_reload_rejection(&prior_revision, &msg);
         return (
             400,
             "application/json",
@@ -1327,6 +1321,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
             // operator saw a path they could read and nothing to act on.
             tracing::error!(error = ?error, "admin reload: shared reload transaction failed");
             let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 500,
                 "application/json",
@@ -2729,17 +2724,17 @@ pub fn handle_admin_request(
             action = "inspect_request_content",
             "admin content inspection"
         );
-        sbproxy_observe::audit_ring::push_audit_event(
-            sbproxy_observe::audit_ring::AuditRingEvent::new(
-                "admin",
-                "inspect_request_content",
-                Some(operator),
-                Some(sample.tenant_id.clone()),
-                sample.api_key_id.clone(),
-                Some(request_id.to_string()),
-                None,
-            ),
-        );
+        // WOR-2478: tees into the durable admin chain, if one is
+        // installed, alongside the existing ring push.
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "inspect_request_content",
+            Some(operator),
+            Some(sample.tenant_id.clone()),
+            sample.api_key_id.clone(),
+            Some(request_id.to_string()),
+            None,
+        )
+        .emit();
         return match serde_json::to_string(&sample) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
@@ -3384,6 +3379,27 @@ pub(crate) fn current_admin_role() -> Option<AdminRole> {
     CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().as_ref().map(|(_, role)| *role))
 }
 
+/// Emit a `config_audit` record for a `POST /admin/reload` rejection
+/// (WOR-2486).
+///
+/// The success arm has audited since `ConfigAuditEntry`'s original
+/// production call site; every rejection arm on this path (source
+/// resolution, YAML parse, pipeline compile, and the shared runtime
+/// transaction) had none. `reason` is expected already path-scrubbed by
+/// [`sanitise_path_in_error`], the same text the HTTP response carries,
+/// so the record never says more than the caller who triggered it
+/// already saw.
+fn audit_admin_reload_rejection(prior_revision: &str, reason: &str) {
+    let mut entry =
+        sbproxy_observe::ConfigAuditEntry::new("api", Vec::new(), Vec::new(), Vec::new())
+            .with_revisions(Some(prior_revision), None::<&str>)
+            .with_rejection_reason(reason);
+    if let Some(actor) = current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    entry.emit();
+}
+
 /// Clears the actor slot when the dispatch scope ends.
 struct AdminActorGuard;
 
@@ -3858,18 +3874,17 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 path = %path,
                 "admin action"
             );
-            // WOR-2094: same event on the console's audit sample.
-            sbproxy_observe::audit_ring::push_audit_event(
-                sbproxy_observe::audit_ring::AuditRingEvent::new(
-                    "admin",
-                    "admin_action",
-                    Some(p.username.clone()),
-                    None,
-                    None,
-                    None,
-                    Some(format!("{method} {path}")),
-                ),
-            );
+            // WOR-2094: same event on the console's audit sample. WOR-2478:
+            // and, if installed, into the durable admin chain.
+            sbproxy_observe::AdminActionAuditEntry::new(
+                "admin_action",
+                Some(p.username.clone()),
+                None,
+                None,
+                None,
+                Some(format!("{method} {path}")),
+            )
+            .emit();
         }
     }
     // A session-authenticated request synthesizes a Basic header so
@@ -4481,18 +4496,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
         None => {
             tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
             // WOR-2094: failed sign-ins are first-class security
-            // events on the console's audit sample.
-            sbproxy_observe::audit_ring::push_audit_event(
-                sbproxy_observe::audit_ring::AuditRingEvent::new(
-                    "admin",
-                    "login_failed",
-                    Some(user.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            );
+            // events on the console's audit sample. WOR-2478: and, if
+            // installed, on the durable admin chain.
+            sbproxy_observe::AdminActionAuditEntry::new(
+                "login_failed",
+                Some(user.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .emit();
             let _ = write_admin_response_headed(
                 sock,
                 401,
@@ -4507,17 +4521,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     let ttl_secs = 8 * 3600;
     let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
     tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
-    sbproxy_observe::audit_ring::push_audit_event(
-        sbproxy_observe::audit_ring::AuditRingEvent::new(
-            "admin",
-            "login",
-            Some(user.clone()),
-            None,
-            None,
-            None,
-            Some(format!("role: {}", role_label(role))),
-        ),
-    );
+    // WOR-2478: tees into the durable admin chain, if one is installed,
+    // alongside the existing ring push.
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "login",
+        Some(user.clone()),
+        None,
+        None,
+        None,
+        Some(format!("role: {}", role_label(role))),
+    )
+    .emit();
     let secure_attr = if secure { "; Secure" } else { "" };
     let cookie = format!(
         "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
@@ -4715,6 +4729,47 @@ mod tests {
         assert!(
             body.contains("this_action_type_does_not_exist"),
             "the error names the payload's fault, not the pointer's: {body}"
+        );
+    }
+
+    /// WOR-2486 fix round 1, I4: the reload handler's file-read failure
+    /// branch (a config path that does not exist, or is not readable)
+    /// never called `audit_admin_reload_rejection`, even though the
+    /// only other four rejection branches on this same handler already
+    /// did. `prior_revision` was in scope the whole time; the call was
+    /// simply missing.
+    #[test]
+    fn a_missing_config_file_is_refused_and_reaches_config_audit() {
+        let mut state = make_state();
+        state.config_path = Some(std::path::PathBuf::from(
+            "/nonexistent/wor-2486-i4-missing-config.yml",
+        ));
+
+        let before =
+            sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), Some("api"), None)
+                .len();
+        let (status, _content_type, body) = handle_reload(&state);
+        assert_eq!(status, 500, "a missing config file is a 500: {body}");
+        assert!(
+            body.contains("failed to read config file"),
+            "the response must name the failure: {body}"
+        );
+
+        let events =
+            sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), Some("api"), None);
+        assert!(
+            events.len() > before,
+            "the file-read rejection must reach config_audit like every other rejection \
+             branch on this handler does"
+        );
+        assert!(
+            events[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("rejected:"),
+            "{:?}",
+            events[0].detail
         );
     }
 
@@ -5809,6 +5864,18 @@ mod tests {
             sbproxy_security::egress::EgressSightingStatus::Ungated,
             None,
         );
+        // WOR-2476: a second, distinct non-AI purpose. Before every gate
+        // site stamped a sighting, `ai_provider` was the only purpose the
+        // inventory could ever report; this proves the snapshot carries
+        // more than one purpose, and that a `denied` sighting round-trips
+        // its reason without leaking the URL that produced it.
+        sbproxy_security::egress::record_egress_seen(
+            sbproxy_security::egress::EgressPurpose::TokenExchange,
+            "https://seeded-admin-test-2.invalid:8443/token?secret=y",
+            "admin-test",
+            sbproxy_security::egress::EgressSightingStatus::Denied,
+            Some(sbproxy_security::egress::EgressDenied::UnlistedHost),
+        );
 
         let (status, content_type, body) =
             handle_admin_request("GET", "/api/egress", &state, Some(&auth), None);
@@ -5825,6 +5892,7 @@ mod tests {
             .iter()
             .find(|e| e["host"] == "seeded-admin-test.invalid")
             .expect("seeded sighting must appear in the inventory");
+        assert_eq!(entry["purpose"], "webhook");
         assert!(entry.get("host").is_some());
         assert!(entry.get("status").is_some());
         assert!(entry.get("last_seen_unix_ms").is_some());
@@ -5832,7 +5900,21 @@ mod tests {
             entry.get("url").is_none(),
             "no raw url in an egress entry: {entry}"
         );
+
+        let token_entry = endpoints
+            .iter()
+            .find(|e| e["host"] == "seeded-admin-test-2.invalid")
+            .expect("seeded token_exchange sighting must appear in the inventory");
+        assert_eq!(token_entry["purpose"], "token_exchange");
+        assert_eq!(token_entry["status"], "denied");
+        assert_eq!(token_entry["last_reason"], "unlisted_host");
+        assert!(
+            token_entry.get("url").is_none(),
+            "no raw url in an egress entry: {token_entry}"
+        );
+
         assert!(!body.contains("secret=x"), "no query string: {body}");
+        assert!(!body.contains("secret=y"), "no query string: {body}");
     }
 
     #[tokio::test]
@@ -7772,6 +7854,7 @@ origins:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);

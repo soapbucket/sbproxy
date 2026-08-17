@@ -367,6 +367,10 @@ mod tests {
                 body: None,
                 lua_script: None,
                 js_script: None,
+                rego_module: None,
+                rego_module_path: None,
+                rego_budget_ms: None,
+                rego_v0: false,
             },
             RequestModifierConfig {
                 headers: None,
@@ -376,6 +380,10 @@ mod tests {
                 body: None,
                 lua_script: None,
                 js_script: None,
+                rego_module: None,
+                rego_module_path: None,
+                rego_budget_ms: None,
+                rego_v0: false,
             },
             RequestModifierConfig {
                 headers: Some(modifiers_with_set(vec![("x-second", "also")])),
@@ -385,6 +393,10 @@ mod tests {
                 body: None,
                 lua_script: None,
                 js_script: None,
+                rego_module: None,
+                rego_module_path: None,
+                rego_budget_ms: None,
+                rego_v0: false,
             },
         ];
 
@@ -403,6 +415,10 @@ mod tests {
             body: None,
             lua_script: None,
             js_script: None,
+            rego_module: None,
+            rego_module_path: None,
+            rego_budget_ms: None,
+            rego_v0: false,
         }];
 
         let mut headers = HeaderMap::new();

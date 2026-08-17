@@ -993,12 +993,33 @@ may call the route.
 
 The inventory is process-lifetime and in-memory: it clears on restart and
 is capped at 1,024 tracked destinations, after which a new destination
-stops being tracked while every already-tracked one keeps updating. The
-AI-provider egress gate and the MCP-upstream egress gate (WOR-2384: the
-base MCP connect for a plain `type: mcp` federated server, and the
-`type: openapi` REST-call gate's denials) both write to it today; other
-egress purposes (token exchange, MCP auth, artifacts, webhooks) pass the
-same authorizer but are not yet inventoried here.
+stops being tracked while every already-tracked one keeps updating. Every
+wired egress purpose writes here: AI providers, the dual-LLM quarantine
+judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
+model and engine artifact downloads, extension bundle hooks, and the
+OTLP telemetry exporters. `mcp_upstream` covers the base MCP connect
+for a plain `type: mcp` federated server, gated and DNS-pinned at the
+dial.
+
+The top-level `egress:` section (see
+[Egress allowlists](configuration.md#egress-allowlists)) arms six of
+the purposes above through five sub-blocks: `ai_providers` (AI
+providers), `usage_sinks` (usage sinks and webhooks, one allowlist for
+both), `model_artifacts`, `token_exchange` (the non-MCP token-exchange
+resolver only), and `telemetry`. Until a sub-block sets
+`mode: deny_by_default`, its purpose stays `ungated`: reached, but
+nothing was ever denied because nothing was armed.
+
+Four more purposes arm outside that section, per-tool or per-action:
+MCP upstream connects, OpenAPI-backed MCP tools, and the MCP
+token-exchange path each take a per-server `egress:` block (see [mcp-security.md](mcp-security.md));
+the dual-LLM quarantine judge takes a per-action `egress:` block.
+Extension bundle hooks are armed automatically from the bundle's own
+outbound grant and never appear as `ungated`.
+
+One purpose cannot be armed by any config today: engine-artifact
+downloads pass no authorizer, so they stay `ungated` regardless of
+configuration.
 
 | Status | When |
 |---|---|

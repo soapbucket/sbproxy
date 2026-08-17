@@ -31,10 +31,20 @@
 //! trail without handing over every denial the proxy ever issued.
 //!
 //! Each is opt-in on its own key. `audit.path` turns on the security
-//! chain, `audit.config_path` turns on the config chain, and a deployment
-//! that sets neither pays a relaxed load per event and nothing else.
-//! `key_audit` is still deliberately not chainable: see [`crate::audit`]
-//! for why its before/after diff has to be proven secret-free first.
+//! chain, `audit.config_path` turns on the config chain, `audit.key_path`
+//! turns on the key/credential-mutation chain, `audit.admin_path` turns on
+//! the admin-action chain, and a deployment that sets none of them pays a
+//! relaxed load per event and nothing else (WOR-2478).
+//!
+//! The key channel is the one exception to "every byte the tracing target
+//! ships, chained verbatim": [`crate::audit::KeyAuditEntry`] carries a
+//! before/after diff of a credential record, and that diff must never
+//! reach a file designed to be impossible to quietly amend. What chains
+//! instead is [`crate::audit::KeyAuditChainEntry`] - every metadata field
+//! the tracing entry carries, plus a keyed-HMAC-SHA256 fingerprint of each
+//! before/after field in place of its value. See that type's docs and
+//! [`install_key_audit_fingerprint_key`] for the key the fingerprint is
+//! computed under.
 //!
 //! What the chain gives, in its own words and reproduced here so an
 //! operator does not have to read the meter to know what they have:
@@ -104,16 +114,25 @@
 //! chaining the record of a reload is safe and chaining what it loaded
 //! would not be.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+
+use hmac::{Hmac, KeyInit as _, Mac as _};
+use sha2::Sha256;
 
 use sbproxy_meter::ledger::{LedgerPayload, UsageLedger};
 
 pub use ed25519_dalek::VerifyingKey;
 pub use sbproxy_meter::ledger::{verifying_key_from_seed_hex, LedgerVerifyResult};
 
-use crate::audit::{ConfigAuditEntry, SecurityAuditEntry};
+use crate::audit::{
+    AdminActionAuditEntry, ConfigAuditEntry, KeyAuditChainEntry, SecurityAuditEntry,
+};
+
+/// HMAC-SHA256, keyed by the derived key-audit fingerprint key.
+type HmacSha256 = Hmac<Sha256>;
 
 /// A security audit entry is chained one-for-one with the event it
 /// records.
@@ -159,6 +178,36 @@ impl LedgerPayload for ConfigAuditEntry {
     }
 }
 
+/// A key-audit chain entry is chained one-for-one with the mutation it
+/// records, for the same reason a denial and a config change are: two
+/// mutations of the same key in the same second are two events, not one
+/// retried.
+///
+/// `meter_observed` is `false`: see the module docs.
+impl LedgerPayload for KeyAuditChainEntry {
+    fn dedup_key(&self) -> Option<&str> {
+        None
+    }
+
+    fn meter_observed() -> bool {
+        false
+    }
+}
+
+/// An admin-action chain entry is chained one-for-one with the action it
+/// records, on the same terms as the other three channels.
+///
+/// `meter_observed` is `false`: see the module docs.
+impl LedgerPayload for AdminActionAuditEntry {
+    fn dedup_key(&self) -> Option<&str> {
+        None
+    }
+
+    fn meter_observed() -> bool {
+        false
+    }
+}
+
 /// Which audited channel a chain is the durable half of.
 ///
 /// Carried as a field rather than a type parameter because every one of
@@ -173,6 +222,12 @@ enum AuditChannel {
     Security,
     /// `config_audit`: reloads, mesh broadcasts, API origin updates.
     Config,
+    /// `key_audit`: key/credential mutations, metadata and fingerprints
+    /// only (WOR-2478).
+    Key,
+    /// `sbproxy::admin::audit`: authenticated admin-console actions
+    /// (WOR-2478).
+    Admin,
 }
 
 impl AuditChannel {
@@ -181,6 +236,8 @@ impl AuditChannel {
         match self {
             Self::Security => "security_audit",
             Self::Config => "config_audit",
+            Self::Key => "key_audit",
+            Self::Admin => "sbproxy::admin::audit",
         }
     }
 
@@ -189,6 +246,8 @@ impl AuditChannel {
         match self {
             Self::Security => "security",
             Self::Config => "config",
+            Self::Key => "key",
+            Self::Admin => "admin",
         }
     }
 
@@ -198,6 +257,8 @@ impl AuditChannel {
         match self {
             Self::Security => "audit.path",
             Self::Config => "audit.config_path",
+            Self::Key => "audit.key_path",
+            Self::Admin => "audit.admin_path",
         }
     }
 
@@ -206,6 +267,8 @@ impl AuditChannel {
         match self {
             Self::Security => "SecurityAuditChain",
             Self::Config => "ConfigAuditChain",
+            Self::Key => "KeyAuditChain",
+            Self::Admin => "AdminActionAuditChain",
         }
     }
 }
@@ -213,10 +276,11 @@ impl AuditChannel {
 /// A hash-chained, signed audit trail: one file, one payload type, one
 /// channel.
 ///
-/// Private, and reached only through [`SecurityAuditChain`] and
-/// [`ConfigAuditChain`]. The wrappers exist so the two chains cannot be
-/// mixed up by a caller holding the wrong one, and so each keeps the
-/// concrete `open` signature boot already calls.
+/// Private, and reached only through [`SecurityAuditChain`],
+/// [`ConfigAuditChain`], [`KeyAuditChain`], and [`AdminActionAuditChain`].
+/// The wrappers exist so the four chains cannot be mixed up by a caller
+/// holding the wrong one, and so each keeps the concrete `open` signature
+/// boot already calls.
 struct AuditChain<P> {
     /// The chain itself. Owns the file handle, the sequence counter, and
     /// the signing key.
@@ -360,6 +424,18 @@ impl<P: LedgerPayload> AuditChain<P> {
                 kid = %self.key_id,
                 "{message}"
             ),
+            AuditChannel::Key => tracing::info!(
+                target: "key_audit",
+                path = %self.path.display(),
+                kid = %self.key_id,
+                "{message}"
+            ),
+            AuditChannel::Admin => tracing::info!(
+                target: "sbproxy::admin::audit",
+                path = %self.path.display(),
+                kid = %self.key_id,
+                "{message}"
+            ),
         }
     }
 
@@ -381,6 +457,20 @@ impl<P: LedgerPayload> AuditChain<P> {
             ),
             AuditChannel::Config => tracing::error!(
                 target: "config_audit",
+                %error,
+                path = %self.path.display(),
+                kid = %self.key_id,
+                "{message}"
+            ),
+            AuditChannel::Key => tracing::error!(
+                target: "key_audit",
+                %error,
+                path = %self.path.display(),
+                kid = %self.key_id,
+                "{message}"
+            ),
+            AuditChannel::Admin => tracing::error!(
+                target: "sbproxy::admin::audit",
                 %error,
                 path = %self.path.display(),
                 kid = %self.key_id,
@@ -476,6 +566,78 @@ impl ConfigAuditChain {
     }
 }
 
+/// The hash-chained, signed key/credential-mutation audit trail for this
+/// process (WOR-2478).
+///
+/// A third file, same shape as [`SecurityAuditChain`] and
+/// [`ConfigAuditChain`]: its own payload type verifies on its own. What it
+/// chains is [`KeyAuditChainEntry`], not [`crate::audit::KeyAuditEntry`]
+/// itself - see that type's docs for why the diff never makes it here.
+pub struct KeyAuditChain(AuditChain<KeyAuditChainEntry>);
+
+impl std::fmt::Debug for KeyAuditChain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, formatter)
+    }
+}
+
+impl KeyAuditChain {
+    /// Open (or create) the key chain at `path`, signing every entry with
+    /// the 32-byte Ed25519 seed `seed_hex` under the key id `key_id`. Same
+    /// failure posture as [`SecurityAuditChain::open`]: the error names
+    /// `audit.key_path`.
+    pub fn open(path: &Path, seed_hex: &str, key_id: &str) -> anyhow::Result<Self> {
+        AuditChain::open(path, seed_hex, key_id, AuditChannel::Key).map(Self)
+    }
+
+    /// The `kid` this chain signs under.
+    pub fn key_id(&self) -> &str {
+        self.0.key_id()
+    }
+
+    /// Append one key/credential mutation record, reporting whether it
+    /// reached the file.
+    fn append(&self, entry: &KeyAuditChainEntry) -> bool {
+        self.0.append(entry)
+    }
+}
+
+/// The hash-chained, signed admin-action audit trail for this process
+/// (WOR-2478).
+///
+/// The durable half of the admin ring's `admin` channel
+/// ([`crate::audit_ring`]): the ring stays the fast, bounded read model
+/// behind the admin console, and this is where the same records survive a
+/// restart and resist a quiet edit.
+pub struct AdminActionAuditChain(AuditChain<AdminActionAuditEntry>);
+
+impl std::fmt::Debug for AdminActionAuditChain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, formatter)
+    }
+}
+
+impl AdminActionAuditChain {
+    /// Open (or create) the admin chain at `path`, signing every entry
+    /// with the 32-byte Ed25519 seed `seed_hex` under the key id `key_id`.
+    /// Same failure posture as [`SecurityAuditChain::open`]: the error
+    /// names `audit.admin_path`.
+    pub fn open(path: &Path, seed_hex: &str, key_id: &str) -> anyhow::Result<Self> {
+        AuditChain::open(path, seed_hex, key_id, AuditChannel::Admin).map(Self)
+    }
+
+    /// The `kid` this chain signs under.
+    pub fn key_id(&self) -> &str {
+        self.0.key_id()
+    }
+
+    /// Append one admin-action record, reporting whether it reached the
+    /// file.
+    fn append(&self, entry: &AdminActionAuditEntry) -> bool {
+        self.0.append(entry)
+    }
+}
+
 /// The process-wide security chain, or nothing when `audit.sink` does not
 /// ask for one.
 ///
@@ -488,6 +650,14 @@ static CHAIN: OnceLock<SecurityAuditChain> = OnceLock::new();
 /// The process-wide config chain, or nothing when `audit.config_path` is
 /// absent. Its own slot, on the same terms as `CHAIN` above.
 static CONFIG_CHAIN: OnceLock<ConfigAuditChain> = OnceLock::new();
+
+/// The process-wide key chain, or nothing when `audit.key_path` is absent.
+/// Its own slot, on the same terms as `CHAIN` above (WOR-2478).
+static KEY_CHAIN: OnceLock<KeyAuditChain> = OnceLock::new();
+
+/// The process-wide admin chain, or nothing when `audit.admin_path` is
+/// absent. Its own slot, on the same terms as `CHAIN` above (WOR-2478).
+static ADMIN_CHAIN: OnceLock<AdminActionAuditChain> = OnceLock::new();
 
 /// Register the process-wide security audit chain. Returns `Err` if one
 /// was already registered. Call once at startup.
@@ -503,6 +673,22 @@ pub fn install_config_audit_chain(chain: ConfigAuditChain) -> Result<(), &'stati
     CONFIG_CHAIN
         .set(chain)
         .map_err(|_| "config audit chain already registered")
+}
+
+/// Register the process-wide key audit chain. Returns `Err` if one was
+/// already registered. Call once at startup (WOR-2478).
+pub fn install_key_audit_chain(chain: KeyAuditChain) -> Result<(), &'static str> {
+    KEY_CHAIN
+        .set(chain)
+        .map_err(|_| "key audit chain already registered")
+}
+
+/// Register the process-wide admin audit chain. Returns `Err` if one was
+/// already registered. Call once at startup (WOR-2478).
+pub fn install_admin_audit_chain(chain: AdminActionAuditChain) -> Result<(), &'static str> {
+    ADMIN_CHAIN
+        .set(chain)
+        .map_err(|_| "admin audit chain already registered")
 }
 
 /// Append one entry to the security chain, if one is installed, and report
@@ -531,6 +717,29 @@ pub(crate) fn append_security_audit(entry: &SecurityAuditEntry) -> bool {
 /// as [`append_security_audit`].
 pub(crate) fn append_config_audit(entry: &ConfigAuditEntry) -> bool {
     match CONFIG_CHAIN.get() {
+        Some(chain) => chain.append(entry),
+        None => true,
+    }
+}
+
+/// Append one entry to the key chain, if one is installed, and report
+/// whether the entry is now on a file. Same absent-is-not-a-failure rule
+/// as [`append_security_audit`]. Called from
+/// [`crate::audit::KeyAuditEntry::emit`] with the metadata-and-fingerprint
+/// [`KeyAuditChainEntry`], never the entry that carries the raw diff.
+pub(crate) fn append_key_audit(entry: &KeyAuditChainEntry) -> bool {
+    match KEY_CHAIN.get() {
+        Some(chain) => chain.append(entry),
+        None => true,
+    }
+}
+
+/// Append one entry to the admin chain, if one is installed, and report
+/// whether the entry is now on a file. Same absent-is-not-a-failure rule
+/// as [`append_security_audit`]. Called from
+/// [`crate::audit::AdminActionAuditEntry::emit`].
+pub(crate) fn append_admin_audit(entry: &AdminActionAuditEntry) -> bool {
+    match ADMIN_CHAIN.get() {
         Some(chain) => chain.append(entry),
         None => true,
     }
@@ -572,6 +781,275 @@ pub fn verify_config_audit_chain(
     verifying_key: Option<&VerifyingKey>,
 ) -> anyhow::Result<LedgerVerifyResult> {
     sbproxy_meter::ledger::verify_ledger::<ConfigAuditEntry>(path, verifying_key)
+}
+
+/// Re-derive a key audit chain from genesis and report the first broken
+/// link. The same walk as [`verify_security_audit_chain`], over
+/// [`KeyAuditChainEntry`] (WOR-2478).
+pub fn verify_key_audit_chain(
+    path: impl AsRef<Path>,
+    verifying_key: Option<&VerifyingKey>,
+) -> anyhow::Result<LedgerVerifyResult> {
+    sbproxy_meter::ledger::verify_ledger::<KeyAuditChainEntry>(path, verifying_key)
+}
+
+/// Re-derive an admin audit chain from genesis and report the first broken
+/// link. The same walk as [`verify_security_audit_chain`], over
+/// [`AdminActionAuditEntry`] (WOR-2478).
+pub fn verify_admin_audit_chain(
+    path: impl AsRef<Path>,
+    verifying_key: Option<&VerifyingKey>,
+) -> anyhow::Result<LedgerVerifyResult> {
+    sbproxy_meter::ledger::verify_ledger::<AdminActionAuditEntry>(path, verifying_key)
+}
+
+// --- WOR-2478: the key-audit fingerprint key ---
+//
+// A key/credential mutation's before/after values must never reach the
+// chain (see `KeyAuditChainEntry`'s docs), so the chain carries a
+// keyed-HMAC-SHA256 fingerprint of each field instead. The key that HMAC
+// runs under is derived once per process from the operator's
+// `key_management.crypto.master_key`, under a dedicated
+// [`sbproxy_security::HkdfPurpose::KeyAuditFingerprint`], the same shape
+// `sbproxy-keystore::crypto::derive_wrap_key` uses for the envelope
+// DEK-wrapping key: the master key as HKDF input keying material, an
+// empty salt, purpose alone for domain separation. Neither the master key
+// nor this derived key is ever serialized, logged, or written to the
+// chain; the derived key exists only in process memory as the input to an
+// HMAC computation.
+
+/// The process-wide key-audit fingerprint key, or nothing before
+/// [`install_key_audit_fingerprint_key`] has run.
+static KEY_AUDIT_FINGERPRINT_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Derive and install the process-wide key-audit fingerprint key from the
+/// operator's key-management master key (WOR-2478).
+///
+/// Takes the master key by reference and immediately consumes it into an
+/// HKDF derivation; this function never retains, logs, or returns the
+/// master key itself, and the derived key it stores is likewise never
+/// exposed outside this module. Call from wherever the master key is
+/// resolved (`sbproxy-core`'s key plane), not from boot's
+/// `install_audit_chain`: the key-management master key and the
+/// `proxy.web_bot_auth` signing identity resolve from different config
+/// blocks at different points in startup, and this function's job is
+/// independent of whether the key chain file itself is even open.
+///
+/// First-write-wins, on the same terms as the chain installers above: a
+/// hot reload that resolves a different master key does not re-derive
+/// this key, for the same reason a reload does not reopen a chain file
+/// (see the module docs). A deployment that rotates
+/// `key_management.crypto.master_key` needs a restart for the fingerprint
+/// key to follow, exactly as it already needs one for previously sealed
+/// credential envelopes to stay openable under the old key today. See
+/// [`KeyAuditChainEntry::key_epoch`] for how a reader tells that a
+/// rotation happened at all.
+pub fn install_key_audit_fingerprint_key(master_key: &[u8]) {
+    let derived = sbproxy_security::hkdf_derive_purpose(
+        master_key,
+        b"",
+        sbproxy_security::HkdfPurpose::KeyAuditFingerprint,
+        32,
+    );
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&derived);
+    let _ = KEY_AUDIT_FINGERPRINT_KEY.set(key);
+}
+
+/// Whether a key-audit chain file is installed for this process.
+///
+/// Exposed so [`crate::audit::KeyAuditEntry::emit`] can skip building a
+/// [`KeyAuditChainEntry`] entirely on a deployment that never turned the
+/// key chain on (WOR-2478 M8): [`append_key_audit`] already treats an
+/// uninstalled chain as a no-op, but constructing the entry that would
+/// have been thrown away is not free - every before/after field gets an
+/// HMAC computed for it - so the check moves in front of that work
+/// instead of after it.
+pub(crate) fn key_audit_chain_installed() -> bool {
+    KEY_CHAIN.get().is_some()
+}
+
+/// Key-audit diff field names the one production caller
+/// (`sbproxy-core`'s `admin_keys::audit_mutation_scoped`) emits today.
+/// Names on this list are copied into the chain verbatim - readable to
+/// an auditor without needing the fingerprint key at all, the same trade
+/// Vault's audit log makes for its own closed field-name vocabulary -
+/// because they are a closed, reviewed set rather than a caller-supplied
+/// string. A field name that is not on this list does not get to land in
+/// a file designed to be impossible to quietly amend either: see
+/// [`fingerprinted_field_name`] (WOR-2478 I3/M6). Grow this list in the
+/// same commit that adds a new field to a `KeyAuditEntry::with_diff`
+/// call site, not before.
+const KNOWN_KEY_AUDIT_FIELD_NAMES: &[&str] = &["status"];
+
+/// Prefix on a fingerprinted (non-allowlisted) field name in the chained
+/// map, so a reader can tell the two shapes apart at a glance: `status`
+/// reads as a name, `f:3f9c...` reads as a fingerprint.
+const FIELD_NAME_FINGERPRINT_PREFIX: &str = "f:";
+
+/// Hex characters kept from a field name/value fingerprint's full
+/// HMAC-SHA256 digest: 32 hex characters, 16 bytes, 128 bits.
+const FIELD_FINGERPRINT_HEX_LEN: usize = 32;
+
+/// Hex characters kept from the key-epoch tag's full HMAC-SHA256 digest.
+/// Deliberately much shorter than a field fingerprint: the epoch is not
+/// trying to resist brute force (there is nothing to invert - it is not
+/// a digest of any secret value, only of the fixed string `b"epoch"`
+/// under the derived key), only to give two records a short, glanceable
+/// "same key or not" tag. See [`KeyAuditChainEntry::key_epoch`].
+const KEY_EPOCH_HEX_LEN: usize = 8;
+
+/// HMAC-SHA256 `data` under `key`, hex encoded and truncated to the
+/// first `hex_len` hex characters, the shared primitive under every
+/// fingerprint and the epoch tag below. 128 bits (the field-fingerprint
+/// length) is not brute-forceable back to the input by anyone without
+/// the derived key, which is the property a field fingerprint needs;
+/// none of these calls is a general-purpose hash.
+///
+/// `Option`-returning rather than infallible: `Hmac::new_from_slice`
+/// only ever errs on a key length HMAC-SHA256 does not accept, which a
+/// fixed 32-byte `key` never hits in practice, but that is a fact about
+/// this call site rather than something the type system can promise, so
+/// the caller decides what "no fingerprint" means (omit the field)
+/// rather than this function taking down the process on an input it
+/// cannot actually receive.
+///
+/// A free function, not a method, so it is testable without touching the
+/// process-wide `KEY_AUDIT_FINGERPRINT_KEY` slot: determinism,
+/// key-separation, and (for values) name-binding are properties of the
+/// functions built on top of this one, not of any installed state.
+fn hmac_hex(key: &[u8; 32], data: &[u8], hex_len: usize) -> Option<String> {
+    let mut mac = HmacSha256::new_from_slice(key).ok()?;
+    mac.update(data);
+    let digest = mac.finalize().into_bytes();
+    let full = hex::encode(digest);
+    Some(full[..hex_len.min(full.len())].to_string())
+}
+
+/// HMAC-SHA256 a field's name-bound value: `b"value\0" || name || 0x00 ||
+/// canonical(value)`. Binding the name into the value's own MAC
+/// (WOR-2478 I3/M6) means two mutations that set different fields to the
+/// same value no longer fingerprint identically: `{"status":"blocked"}`
+/// and some future `{"role":"blocked"}` disagree, where the bare value
+/// digest alone would not have.
+///
+/// The leading `b"value\0"` domain-separates this input from
+/// [`hmac_name`]'s (WOR-2478 review, M8): without it, a field literally
+/// named `name` whose canonical value bytes equal some other field's raw
+/// name would make `hmac_value(key, "name", that_value)` and
+/// `hmac_name(key, that_other_field)` hash the identical byte string
+/// (`hmac_name`'s `b"name\0" || name` looks exactly like `hmac_value`'s
+/// old `name || 0x00 || canonical(value)` in that one case), so the two
+/// keyspaces the doc comment on `hmac_name` claims are kept apart were
+/// not, for that input. Prefixing both functions with their own literal
+/// tag closes it: the two inputs now differ in their first six bytes no
+/// matter what `name` or `value` a caller passes.
+fn hmac_value(key: &[u8; 32], name: &str, value: &serde_json::Value) -> Option<String> {
+    let canonical = serde_json::to_vec(value).ok()?;
+    let mut data = Vec::with_capacity(6 + name.len() + 1 + canonical.len());
+    data.extend_from_slice(b"value\0");
+    data.extend_from_slice(name.as_bytes());
+    data.push(0);
+    data.extend_from_slice(&canonical);
+    hmac_hex(key, &data, FIELD_FINGERPRINT_HEX_LEN)
+}
+
+/// HMAC-SHA256 a field NAME, domain-separated from [`hmac_value`] by the
+/// `b"name\0"` prefix so the two keyspaces cannot be confused. Used only
+/// for a name that fails [`is_known_key_audit_field_name`]; see
+/// [`fingerprinted_field_name`].
+fn hmac_name(key: &[u8; 32], name: &str) -> Option<String> {
+    let mut data = Vec::with_capacity(5 + name.len());
+    data.extend_from_slice(b"name\0");
+    data.extend_from_slice(name.as_bytes());
+    hmac_hex(key, &data, FIELD_FINGERPRINT_HEX_LEN)
+}
+
+/// Whether `name` is on the closed, reviewed key-audit diff field-name
+/// vocabulary. See [`KNOWN_KEY_AUDIT_FIELD_NAMES`].
+fn is_known_key_audit_field_name(name: &str) -> bool {
+    KNOWN_KEY_AUDIT_FIELD_NAMES.contains(&name)
+}
+
+/// The map key one field lands under in the chained snapshot: `name`
+/// verbatim when it is on the closed allowlist, or its own keyed,
+/// domain-separated fingerprint (prefixed so it reads as one) when it is
+/// not (WOR-2478 I3/M6). An arbitrary caller-supplied field name can
+/// therefore never land verbatim in the chain file, only an allowlisted
+/// one can. Returns `None` exactly when [`hmac_name`] does, for a name
+/// that fails the allowlist (see that function's docs for when that is).
+fn fingerprinted_field_name(key: &[u8; 32], name: &str) -> Option<String> {
+    if is_known_key_audit_field_name(name) {
+        Some(name.to_string())
+    } else {
+        hmac_name(key, name).map(|hash| format!("{FIELD_NAME_FINGERPRINT_PREFIX}{hash}"))
+    }
+}
+
+/// Fingerprint one named field under the installed key-audit fingerprint
+/// key: the map key ([`fingerprinted_field_name`]) paired with the
+/// name-bound value fingerprint ([`hmac_value`]). `None` when no key has
+/// been installed yet: a fingerprint computed under no key would not be
+/// a fingerprint of anything, so the field is omitted rather than
+/// derived under an all-zero placeholder.
+fn fingerprint_named_field(name: &str, value: &serde_json::Value) -> Option<(String, String)> {
+    let key = KEY_AUDIT_FINGERPRINT_KEY.get()?;
+    let value_fingerprint = hmac_value(key, name, value)?;
+    let map_key = fingerprinted_field_name(key, name)?;
+    Some((map_key, value_fingerprint))
+}
+
+/// Fingerprint every top-level field of a key/credential before/after
+/// snapshot (WOR-2478).
+///
+/// A JSON object fingerprints one entry per key. Anything else a caller
+/// might pass as a snapshot (a scalar, an array, or simply absent)
+/// fingerprints as a single field named `"value"`, so a diff shaped
+/// either way still produces something. Called from
+/// [`crate::audit::KeyAuditEntry::emit`]; never the raw name or value,
+/// only their digests under a key only the operator's master secret can
+/// derive, and only when a fingerprint key has actually been installed
+/// (this omits the entry rather than fingerprinting with a placeholder).
+pub(crate) fn fingerprint_key_audit_snapshot(
+    value: Option<&serde_json::Value>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(value) = value else {
+        return out;
+    };
+    match value.as_object() {
+        Some(map) => {
+            for (field, field_value) in map {
+                if let Some((map_key, fingerprint)) = fingerprint_named_field(field, field_value) {
+                    out.insert(map_key, fingerprint);
+                }
+            }
+        }
+        None => {
+            if let Some((map_key, fingerprint)) = fingerprint_named_field("value", value) {
+                out.insert(map_key, fingerprint);
+            }
+        }
+    }
+    out
+}
+
+/// The current key-audit fingerprint key's epoch tag, or an empty string
+/// before a fingerprint key has been installed (WOR-2478 I4). See
+/// [`KeyAuditChainEntry::key_epoch`] for what this is for; kept as a
+/// standalone free function ([`epoch_tag`]) underneath so the property
+/// "same key -> same tag, different key -> different tag" is testable
+/// without touching the process-wide slot.
+pub(crate) fn key_audit_fingerprint_epoch() -> String {
+    KEY_AUDIT_FINGERPRINT_KEY
+        .get()
+        .and_then(epoch_tag)
+        .unwrap_or_default()
+}
+
+/// `hex(HMAC(key, b"epoch"))[..8]`. See [`key_audit_fingerprint_epoch`].
+fn epoch_tag(key: &[u8; 32]) -> Option<String> {
+    hmac_hex(key, b"epoch", KEY_EPOCH_HEX_LEN)
 }
 
 #[cfg(test)]
@@ -1066,5 +1544,350 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- WOR-2478: the key and admin channels ---
+
+    /// The same, for the key channel.
+    fn open_key_chain(path: &Path, seed_hex: &str) -> KeyAuditChain {
+        KeyAuditChain::open(path, seed_hex, "audit-kid").expect("chain opens")
+    }
+
+    /// The same, for the admin channel.
+    fn open_admin_chain(path: &Path, seed_hex: &str) -> AdminActionAuditChain {
+        AdminActionAuditChain::open(path, seed_hex, "audit-kid").expect("chain opens")
+    }
+
+    /// A key-audit chain entry with every optional field populated, so the
+    /// tamper test below is editing a record shaped like a real mutation
+    /// rather than a minimal one.
+    fn key_mutation(id: &str) -> KeyAuditChainEntry {
+        let mut before_fingerprint = BTreeMap::new();
+        before_fingerprint.insert(
+            "status".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        let mut after_fingerprint = BTreeMap::new();
+        after_fingerprint.insert(
+            "status".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+        KeyAuditChainEntry {
+            timestamp: "2026-08-16T00:00:00Z".to_string(),
+            op: "rotate".to_string(),
+            resource: "key".to_string(),
+            id: id.to_string(),
+            actor: Some("operator-jo".to_string()),
+            tenant_id: Some("acme".to_string()),
+            key_epoch: "test-epoch".to_string(),
+            before_fingerprint,
+            after_fingerprint,
+        }
+    }
+
+    /// An admin-action chain entry with every optional field populated.
+    fn admin_action(action: &str) -> AdminActionAuditEntry {
+        AdminActionAuditEntry::new(
+            action,
+            Some("operator-jo".to_string()),
+            Some("acme".to_string()),
+            Some("sbp_admin_test_key".to_string()),
+            Some("req-admin-test".to_string()),
+            Some("PATCH /api/keys/abc".to_string()),
+        )
+    }
+
+    #[test]
+    fn a_mutated_key_record_fails_verification_at_the_record_that_moved() {
+        // The security/config tamper proof, run again over the
+        // metadata-and-fingerprint payload: proof the key channel is
+        // genuinely bound to the shared chain machinery.
+        let path = temp_path("key-mutated");
+        let _ = std::fs::remove_file(&path);
+        let seed = seed(0xa1);
+        {
+            let chain = open_key_chain(&path, &seed);
+            assert!(chain.append(&key_mutation("key-first")), "the append lands");
+            assert!(
+                chain.append(&key_mutation("key-second")),
+                "the append lands"
+            );
+            assert!(chain.append(&key_mutation("key-third")), "the append lands");
+        }
+
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 3, "three entries were written");
+        lines[1] = lines[1].replace("\"id\":\"key-second\"", "\"id\":\"key-tampered\"");
+        assert!(lines[1].contains("key-tampered"), "the edit landed");
+        std::fs::write(&path, lines.join("\n") + "\n").expect("chain is writable");
+
+        let unsigned = verify_key_audit_chain(&path, None).expect("file is readable");
+        assert!(!unsigned.ok, "a mutated record must not verify");
+        assert_eq!(unsigned.broken_seq, Some(1));
+        let reason = unsigned.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("tampered"),
+            "the verdict says what happened: {reason}"
+        );
+
+        let key = verifying_key_from_seed_hex(&seed).expect("seed derives a public key");
+        let signed = verify_key_audit_chain(&path, Some(&key)).expect("file is readable");
+        assert!(!signed.ok, "a mutated record must not verify under the key");
+        assert_eq!(signed.broken_seq, Some(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_mutated_admin_record_fails_verification_at_the_record_that_moved() {
+        let path = temp_path("admin-mutated");
+        let _ = std::fs::remove_file(&path);
+        let seed = seed(0xa2);
+        {
+            let chain = open_admin_chain(&path, &seed);
+            assert!(chain.append(&admin_action("first")), "the append lands");
+            assert!(chain.append(&admin_action("second")), "the append lands");
+            assert!(chain.append(&admin_action("third")), "the append lands");
+        }
+
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 3, "three entries were written");
+        lines[1] = lines[1].replace("\"action\":\"second\"", "\"action\":\"tampered\"");
+        assert!(lines[1].contains("tampered"), "the edit landed");
+        std::fs::write(&path, lines.join("\n") + "\n").expect("chain is writable");
+
+        let unsigned = verify_admin_audit_chain(&path, None).expect("file is readable");
+        assert!(!unsigned.ok, "a mutated record must not verify");
+        assert_eq!(unsigned.broken_seq, Some(1));
+        let reason = unsigned.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("tampered"),
+            "the verdict says what happened: {reason}"
+        );
+
+        let key = verifying_key_from_seed_hex(&seed).expect("seed derives a public key");
+        let signed = verify_admin_audit_chain(&path, Some(&key)).expect("file is readable");
+        assert!(!signed.ok, "a mutated record must not verify under the key");
+        assert_eq!(signed.broken_seq, Some(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_chain_does_not_verify_as_a_config_chain() {
+        // Why the key channel gets its own file, mirroring the
+        // security/config pairing: a verifier pointed at the wrong file
+        // stops at the first record instead of walking it clean.
+        let path = temp_path("key-wrong-payload");
+        let _ = std::fs::remove_file(&path);
+        {
+            let chain = open_key_chain(&path, &seed(0xa3));
+            assert!(
+                chain.append(&key_mutation("mislabeled")),
+                "the append lands"
+            );
+        }
+
+        let result = verify_config_audit_chain(&path, None).expect("file is readable");
+        assert!(
+            !result.ok,
+            "a key mutation is not a config record: {result:?}"
+        );
+        assert_eq!(result.broken_seq, Some(0), "it stops at the first record");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_installed_key_chain_takes_what_append_key_audit_is_given() {
+        let path = temp_path("key-installed");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_key_chain(&path, &seed(0xa4));
+        assert_eq!(chain.key_id(), "audit-kid");
+
+        if KEY_CHAIN.get().is_none() {
+            assert!(
+                append_key_audit(&key_mutation("no-chain-installed")),
+                "with no key chain configured there is nothing that could have failed"
+            );
+        }
+
+        if install_key_audit_chain(chain).is_err() {
+            // Another test in this process claimed the slot first (the
+            // `cargo test` fallback path; nextest gives every test its own
+            // process, which is what the gate actually runs).
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        assert!(
+            append_key_audit(&key_mutation("installed-key-marker")),
+            "an installed chain takes the entry"
+        );
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        assert!(
+            content.contains("installed-key-marker"),
+            "the entry reached the file: {content}"
+        );
+    }
+
+    #[test]
+    fn an_installed_admin_chain_takes_what_append_admin_audit_is_given() {
+        let path = temp_path("admin-installed");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_admin_chain(&path, &seed(0xa5));
+        assert_eq!(chain.key_id(), "audit-kid");
+
+        if ADMIN_CHAIN.get().is_none() {
+            assert!(
+                append_admin_audit(&admin_action("no-chain-installed")),
+                "with no admin chain configured there is nothing that could have failed"
+            );
+        }
+
+        if install_admin_audit_chain(chain).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        assert!(
+            append_admin_audit(&admin_action("installed-admin-marker")),
+            "an installed chain takes the entry"
+        );
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        assert!(
+            content.contains("installed-admin-marker"),
+            "the entry reached the file: {content}"
+        );
+    }
+
+    #[test]
+    fn key_audit_value_fingerprint_is_deterministic_key_dependent_and_name_bound() {
+        // A pure-function test, independent of the process-wide
+        // fingerprint-key slot: same name + same value + same key must
+        // always agree, and any one of the three changing must break
+        // that agreement.
+        let key_a = [0x11u8; 32];
+        let key_b = [0x22u8; 32];
+        let value = serde_json::json!({ "status": "active" });
+
+        let fp1 = hmac_value(&key_a, "status", &value).expect("value fingerprints");
+        let fp2 = hmac_value(&key_a, "status", &value).expect("value fingerprints");
+        assert_eq!(fp1, fp2, "same name + value + key -> same fingerprint");
+        assert_eq!(
+            fp1.len(),
+            FIELD_FINGERPRINT_HEX_LEN,
+            "truncated to 32 hex chars for log ergonomics"
+        );
+
+        let fp3 = hmac_value(&key_b, "status", &value).expect("value fingerprints");
+        assert_ne!(fp1, fp3, "a different derived key must not agree");
+
+        let other_value = serde_json::json!({ "status": "blocked" });
+        let fp4 = hmac_value(&key_a, "status", &other_value).expect("value fingerprints");
+        assert_ne!(
+            fp1, fp4,
+            "a different value under the same name and key must not agree"
+        );
+
+        // WOR-2478 I3/M6(b): the value MAC binds the field name, so two
+        // fields set to the identical value must not fingerprint
+        // identically either.
+        let fp5 = hmac_value(&key_a, "role", &value).expect("value fingerprints");
+        assert_ne!(
+            fp1, fp5,
+            "the same value under a different field name must not agree"
+        );
+    }
+
+    #[test]
+    fn key_audit_value_fingerprint_is_stable_across_json_object_key_insertion_order() {
+        // WOR-2478 M7: guards the assumption that `serde_json::Value`'s
+        // map canonicalizes independent of insertion order (true today
+        // because this workspace does not enable serde_json's
+        // `preserve_order` feature; a BTreeMap-backed map always
+        // serializes in sorted key order regardless of how it was
+        // built). If that assumption ever breaks, this is the test that
+        // catches it rather than a silent fingerprint mismatch in
+        // production.
+        let key = [0x33u8; 32];
+
+        let mut forward = serde_json::Map::new();
+        forward.insert("x".to_string(), serde_json::json!(1));
+        forward.insert("y".to_string(), serde_json::json!(2));
+        let value_forward = serde_json::Value::Object(forward);
+
+        let mut reverse = serde_json::Map::new();
+        reverse.insert("y".to_string(), serde_json::json!(2));
+        reverse.insert("x".to_string(), serde_json::json!(1));
+        let value_reverse = serde_json::Value::Object(reverse);
+
+        let fp_forward = hmac_value(&key, "field", &value_forward).expect("value fingerprints");
+        let fp_reverse = hmac_value(&key, "field", &value_reverse).expect("value fingerprints");
+        assert_eq!(
+            fp_forward, fp_reverse,
+            "canonical serialization must not depend on object key insertion order"
+        );
+    }
+
+    #[test]
+    fn key_audit_epoch_is_stable_per_key_and_differs_across_keys() {
+        // WOR-2478 I4: same key -> same epoch every time; different key
+        // -> different epoch. Drives `epoch_tag` directly for the same
+        // reason the value-fingerprint tests above drive `hmac_value`
+        // directly: independent of the process-wide slot.
+        let key_a = [0x44u8; 32];
+        let key_b = [0x55u8; 32];
+
+        let epoch_a1 = epoch_tag(&key_a).expect("epoch tags");
+        let epoch_a2 = epoch_tag(&key_a).expect("epoch tags");
+        assert_eq!(epoch_a1, epoch_a2, "the same key must yield a stable epoch");
+        assert_eq!(
+            epoch_a1.len(),
+            KEY_EPOCH_HEX_LEN,
+            "the epoch tag is 8 hex characters"
+        );
+
+        let epoch_b = epoch_tag(&key_b).expect("epoch tags");
+        assert_ne!(
+            epoch_a1, epoch_b,
+            "a different key must yield a different epoch"
+        );
+    }
+
+    #[test]
+    fn fingerprint_key_audit_snapshot_keeps_allowlisted_names_verbatim_and_fingerprints_others() {
+        // WOR-2478 I3/M6(a): `status` is the one field name the
+        // production caller emits today, so it is on the closed
+        // allowlist and lands in the chain readable. `note` is not, so
+        // it must not land in the chain under its own name at all -
+        // only under its own keyed, prefixed fingerprint.
+        install_key_audit_fingerprint_key(b"test-master-for-snapshot-fields");
+        let snapshot = fingerprint_key_audit_snapshot(Some(&serde_json::json!({
+            "status": "active",
+            "note": "rotated",
+        })));
+        assert_eq!(snapshot.len(), 2, "one entry per field: {snapshot:?}");
+        assert!(
+            snapshot.contains_key("status"),
+            "an allowlisted name is copied verbatim: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key("note"),
+            "a non-allowlisted name must never land verbatim: {snapshot:?}"
+        );
+        let fingerprinted_key = snapshot
+            .keys()
+            .find(|k| k.starts_with(FIELD_NAME_FINGERPRINT_PREFIX))
+            .expect("the non-allowlisted field lands under its fingerprinted name");
+        assert!(
+            !fingerprinted_key.contains("note"),
+            "the fingerprinted name must not embed the raw name either: {fingerprinted_key}"
+        );
+
+        let empty = fingerprint_key_audit_snapshot(None);
+        assert!(empty.is_empty(), "no snapshot, no fingerprints");
     }
 }

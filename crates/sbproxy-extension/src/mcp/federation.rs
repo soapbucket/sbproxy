@@ -2814,27 +2814,45 @@ impl McpFederation {
         let url = Url::parse(&format!("{base}{path}"))
             .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
         // Deny unlisted hosts before any I/O (WOR-1791 / G2).
+        //
+        // WOR-2476: every OpenAPI tool URL lands in the egress inventory.
+        // Unlike the `Option<&EgressAuthorizer>` gates elsewhere, "no
+        // authorizer" here is `EgressMode::AllowByDefault`
+        // (`!mode.is_enforce()`), which `authorize()` itself
+        // short-circuits to a synthetic, always-`Ok` destination
+        // (`legacy_passthrough`) rather than surfacing as `None`.
+        let is_gated = backing.egress_policy.mode.is_enforce();
         let mut dest = match backing.egress_policy.authorize(
             EgressPurpose::OpenApiTool,
             url.as_str(),
             resolver,
         ) {
-            Ok(dest) => dest,
-            Err(e) => {
-                // WOR-2384 (MCP09): this denial used to be silent --
-                // the sighting inventory never heard about an
-                // OpenAPI-tool egress decision at all, allowed or
-                // denied. Record it here so `GET /api/egress` reflects
-                // a refused destination the same way every purpose
-                // that already gates production traffic does.
+            Ok(dest) => {
                 record_egress_seen(
                     EgressPurpose::OpenApiTool,
                     url.as_str(),
-                    &server.name,
+                    federated_name,
+                    if is_gated {
+                        EgressSightingStatus::Allowed
+                    } else {
+                        EgressSightingStatus::Ungated
+                    },
+                    None,
+                );
+                dest
+            }
+            Err(e) => {
+                record_egress_seen(
+                    EgressPurpose::OpenApiTool,
+                    url.as_str(),
+                    federated_name,
                     EgressSightingStatus::Denied,
                     Some(e),
                 );
-                record_egress_refused(EgressPurpose::OpenApiTool, e, "", &server.name);
+                // WOR-2384 (MCP09) + WOR-2486: the refusal also reaches
+                // the typed `egress_refused` event, labeled with the
+                // same federated name the sighting row carries.
+                record_egress_refused(EgressPurpose::OpenApiTool, e, "", federated_name);
                 return Err(anyhow::anyhow!("egress denied: {e:?}"));
             }
         };
