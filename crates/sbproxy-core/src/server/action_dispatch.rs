@@ -9752,8 +9752,15 @@ mod mcp_catalog_snapshot_tests {
             },
         )]));
 
+        // WOR-2384 (C2 fix round) reverify: `mcp_handler_exchange_with_session`
+        // builds its `RequestContext` via `RequestContext::new()`, whose
+        // `tenant_id` defaults to `"__default__"` (see `context.rs`) --
+        // the session must be minted under that same tenant, or the
+        // C2 tenant-bound `validate()` sees a `TenantMismatch` and the
+        // request never reaches this test's actual subject (the
+        // `flow_record_entry` wiring) at all.
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let session_id = store.create("acme");
+        let session_id = store.create("__default__");
         assert_eq!(
             store
                 .flow_labels(&session_id)
