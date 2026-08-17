@@ -3222,10 +3222,27 @@ mod tests {
 
         // Installed AFTER parsing, simulating a reload that armed
         // `egress.usage_sinks:` between this action's compile and the
-        // first tool call that would use its sinks. `WebhookSink`
-        // authorizes under `EgressPurpose::Webhook` specifically (see
-        // `sbproxy_config::compiler::compile_egress_purpose`'s doc for
-        // why `usage_sinks:` arms both purposes from one allowlist).
+        // first tool call that would use its sinks. `UsageSinkConfig::
+        // build()` (what the lazily-built sink underneath `usage_sinks()`
+        // actually calls) reads the registry SLOT keyed under
+        // `EgressPurpose::UsageSink`, not `Webhook` -- matching
+        // `arm_egress_gates_from_config`, which installs
+        // `compiled.egress.usage_sinks` only under that one slot. The
+        // authorizer itself must still carry a `Webhook` entry in its
+        // own internal purpose map, because `WebhookSink::record`
+        // authorizes under `EgressPurpose::Webhook` specifically once
+        // attached (see `sbproxy_config::compiler::compile_egress_purpose`'s
+        // doc for why `usage_sinks:` compiles one authorizer keyed under
+        // both purposes from one allowlist). Installing this dual-keyed
+        // authorizer under the `Webhook` slot instead of `UsageSink` -
+        // a slot `UsageSinkConfig::build()` never reads - was the actual
+        // fixture bug here: it left the built `WebhookSink` with no
+        // `egress` attached at all, so `record()` took the `None`
+        // ("ungated") branch and fell through to the real
+        // `tokio::spawn` dispatch, which panics with no ambient runtime
+        // in this plain `#[test]`. Mirrors
+        // `usage_sink::config_build_arms_a_usage_sink_from_the_top_level_
+        // egress_registry`'s already-correct pattern.
         let allow = PurposeAllowlist {
             hosts: HashSet::from(["collector.example.com".to_string()]),
             schemes: HashSet::from(["https".to_string(), "http".to_string()]),
@@ -3233,9 +3250,10 @@ mod tests {
             allow_private: false,
         };
         let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::UsageSink, allow.clone());
         purposes.insert(EgressPurpose::Webhook, allow);
         install_configured_gate(
-            EgressPurpose::Webhook,
+            EgressPurpose::UsageSink,
             Some(EgressAuthorizer::new(EgressConfig { purposes })),
         );
 
