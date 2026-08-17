@@ -104,6 +104,17 @@ struct AiStreamStats {
     completion_tokens: Option<u64>,
 }
 
+/// Snapshot of a finished stream's aggregate, for the `ai.close`
+/// decision-audit record (WOR-2486). Only meaningful after
+/// [`AiRequestExtensions::close`] has run.
+pub(crate) struct AiCloseSummary {
+    /// The stream's terminal `finish_reason` (`stop`, `length`,
+    /// `tool_calls`, `content_filter`, ...), when the upstream sent
+    /// one. `None` for a stream that never delivered a usage/finish
+    /// event before closing.
+    pub(crate) finish_reason: Option<String>,
+}
+
 impl AiRequestExtensions {
     /// Start request-local state when this generation has AI hooks.
     pub(crate) fn start(chain: &AiExtensionChain, request_id: &str, model: &str) -> Option<Self> {
@@ -451,6 +462,35 @@ impl AiRequestExtensions {
             .finish()
             .map_err(|_| AiExtensionBlock::runtime_failure());
         decision.and(finish)
+    }
+
+    /// Whether [`Self::close`] has already run for this request.
+    ///
+    /// `close()` is idempotent and can be called from more than one
+    /// exit path in `relay_ai_stream`; this is how a caller tells the
+    /// first, real close from a later no-op one, which matters for a
+    /// side effect (like the `ai.close` decision-audit record) that
+    /// `close()` itself does not gate. Read before calling `close()`,
+    /// since `close()` flips this to `true` as its own first act.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Snapshot the stream's aggregate for the `ai.close` decision-audit
+    /// record (WOR-2486).
+    ///
+    /// Separate from [`Self::close`] on purpose: that method's dispatch
+    /// is gated on `self.kinds.close` (whether an AI extension bundle
+    /// subscribed to the `ai.close` hook), while decision-audit is a
+    /// different consumer axis entirely (`observability.log.decision_audit`)
+    /// and must not depend on whether any bundle hook exists. Call after
+    /// a successful `close()`; the caller owns the decision to publish
+    /// and the correlation fields (`RequestContext` is not reachable
+    /// from this struct).
+    pub(crate) fn close_summary(&self) -> AiCloseSummary {
+        AiCloseSummary {
+            finish_reason: self.stats.finish_reason.clone(),
+        }
     }
 
     /// Dispatch one event; `Ok(Some(payload))` is the payload after a
