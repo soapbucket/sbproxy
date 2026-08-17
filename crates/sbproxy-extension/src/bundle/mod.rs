@@ -15,6 +15,7 @@ mod outbound;
 mod payments;
 mod proxy_wasm;
 mod registry;
+mod rego;
 mod response_semantics;
 #[cfg(test)]
 mod tests;
@@ -39,6 +40,7 @@ pub use proxy_wasm::{
 pub use registry::{
     BundleConfigValidationError, BundleProvenance, BundleRegistry, LoadedBundleHook,
 };
+pub use rego::{build_rego_policy, RegoPolicyAdapter};
 pub use response_semantics::{
     status_forbids_body, validate_extension_response, ExtensionResponseError,
 };

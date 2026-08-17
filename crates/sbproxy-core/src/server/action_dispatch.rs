@@ -617,6 +617,32 @@ pub(super) async fn handle_action(
                             }
                         }
                     }
+                    // Rego response modifier (WOR-2482), after Lua and
+                    // JavaScript so the later engine wins on a shared
+                    // header, matching every other modifier call site.
+                    if let Some(module) = &modifier.rego_module {
+                        let rego_status = status_override.unwrap_or(s.status);
+                        let rego_budget_ms =
+                            modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS);
+                        match rego_response_modifier(
+                            module,
+                            modifier.rego_v0,
+                            rego_budget_ms,
+                            rego_status,
+                            &response_headers,
+                            ctx,
+                        ) {
+                            Ok(headers) => {
+                                for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
+                                    extra_headers.push((key, value));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Rego response modifier on static action failed");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1377,6 +1403,30 @@ fn apply_plugin_action_response_modifiers(
                 }
                 Err(error) => {
                     warn!(error = %error, "JavaScript response modifier on plugin action failed");
+                }
+            }
+        }
+        // Rego response modifier (WOR-2482), after Lua and JavaScript so
+        // the later engine wins on a shared header, matching every other
+        // modifier call site.
+        if let Some(module) = &modifier.rego_module {
+            let rego_budget_ms = modifier.rego_budget_ms.unwrap_or(REGO_MODIFIER_BUDGET_MS);
+            match rego_response_modifier(
+                module,
+                modifier.rego_v0,
+                rego_budget_ms,
+                status,
+                &response_headers,
+                ctx,
+            ) {
+                Ok(modified) => {
+                    for (name, value) in modified {
+                        set_plugin_action_response_header(&mut headers, &name, &value);
+                        insert_json_header(&mut response_headers, name, value);
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "Rego response modifier on plugin action failed");
                 }
             }
         }

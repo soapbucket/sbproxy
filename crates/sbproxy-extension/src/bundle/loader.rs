@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Take};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cap_std::ambient_authority;
@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use super::javascript::prepare_javascript_artifact;
 use super::proxy_wasm::ProxyWasmRuntime;
 use super::registry::{lookup, BundleProvenance, BundleRegistry, LoadedBundleHook};
+use crate::rego::CompiledRego;
 use crate::wasm::{WasmBundleLimits, WasmRuntime};
 
 /// Largest executable artifact accepted by the bundle loader.
@@ -48,6 +49,54 @@ impl WasmBundleLimits {
                 .map_err(|_| BundleLoadError::new("wasm", "output limit is unsupported"))?,
         })
     }
+}
+
+/// Compile one `runtime: rego` policy hook's module, once, at candidate
+/// load time (WOR-2482).
+///
+/// Mirrors `prepare_javascript_artifact`'s "preflight the exports now"
+/// posture and `WasmRuntime::from_bundle_bytes`'s "validate the module
+/// contract now": a `.rego` module with a parse error, an unsafe
+/// variable, or a `query` naming no rule refuses the whole candidate
+/// here, rather than compiling clean and then denying every request
+/// once the hook is finally attached. Manifest validation already
+/// proved `entry` ends in `.rego` and every hook here is `kind:
+/// policy`, so the only new failure mode is the module's own content.
+///
+/// Unlike the JavaScript source and the WASM/Proxy-Wasm runtimes
+/// (compiled once per manifest, then shared by every hook), this
+/// compiles once per hook: a bundle's Rego hooks may each pin a
+/// different `query` against the same module text.
+///
+/// # Errors
+///
+/// Returns a bounded load error naming the bundle and hook when the
+/// entry is not valid UTF-8 or the module does not compile.
+fn compile_rego_hook(
+    bundle_name: &str,
+    hook: &BundleHook,
+    module: &[u8],
+    budget_ms: u64,
+) -> Result<CompiledRego, BundleLoadError> {
+    let module = std::str::from_utf8(module).map_err(|_| {
+        BundleLoadError::new(
+            "rego",
+            format!(
+                "bundle `{bundle_name}` rego hook `{}` entry is not valid UTF-8",
+                hook.type_name
+            ),
+        )
+    })?;
+    let site = format!(
+        "extension bundle `{bundle_name}` policy `{}`",
+        hook.type_name
+    );
+    let query = hook
+        .query
+        .clone()
+        .unwrap_or_else(|| "data.sbproxy.allow".to_owned());
+    CompiledRego::compile(site, module, query, budget_ms, None, false)
+        .map_err(|error| BundleLoadError::new("rego", error.to_string()))
 }
 
 /// A bounded, sanitized candidate-loading failure.
@@ -544,7 +593,20 @@ impl<'a> Candidate<'a> {
         for hook in &hooks {
             let key = (hook.kind, hook.type_name.clone());
             let validator = compile_schema(&manifest.name, hook)?;
-            prepared.push((key, hook.clone(), validator));
+            // WOR-2482: compiled here, once per hook, rather than
+            // shared across the manifest the way the JS source and
+            // the WASM runtimes are below; see `compile_rego_hook`.
+            let compiled_rego = if manifest.runtime == BundleRuntime::Rego {
+                Some(Arc::new(Mutex::new(compile_rego_hook(
+                    &manifest.name,
+                    hook,
+                    &artifact,
+                    manifest.sandbox.budget_ms,
+                )?)))
+            } else {
+                None
+            };
+            prepared.push((key, hook.clone(), validator, compiled_rego));
         }
         let javascript_source = if manifest.runtime == BundleRuntime::Javascript {
             Some(prepare_javascript_artifact(
@@ -590,7 +652,7 @@ impl<'a> Candidate<'a> {
         };
         let runtime = inventory_runtime(manifest.runtime);
         let mut hook_ids = Vec::with_capacity(prepared.len());
-        for (key, hook, validator) in prepared {
+        for (key, hook, validator, compiled_rego) in prepared {
             let id = format!(
                 "{}:{}:{}",
                 manifest.name,
@@ -605,6 +667,7 @@ impl<'a> Candidate<'a> {
                 javascript_source: javascript_source.clone(),
                 wasm_runtime: wasm_runtime.clone(),
                 proxy_wasm_runtime: proxy_wasm_runtime.clone(),
+                compiled_rego,
                 sha256: digest.clone(),
                 config_validator: validator,
                 provenance: provenance.clone(),
@@ -930,6 +993,7 @@ const fn inventory_runtime(runtime: BundleRuntime) -> ExtensionRuntime {
         BundleRuntime::Javascript => ExtensionRuntime::Javascript,
         BundleRuntime::Wasm => ExtensionRuntime::Wasm,
         BundleRuntime::ProxyWasm => ExtensionRuntime::ProxyWasm,
+        BundleRuntime::Rego => ExtensionRuntime::Rego,
     }
 }
 

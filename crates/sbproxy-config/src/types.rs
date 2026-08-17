@@ -8314,8 +8314,9 @@ pub struct ForwardRuleOrigin {
 /// Request modifier entry.
 ///
 /// Each modifier entry can contain one or more of: `headers`, `url`, `query`,
-/// `method`, `body`, or `lua_script`. Multiple modifier entries in the list
-/// are applied in order.
+/// `method`, `body`, `lua_script`, `js_script`, or `rego_module` /
+/// `rego_module_path`. Multiple modifier entries in the list are applied in
+/// order.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestModifierConfig {
@@ -8340,6 +8341,32 @@ pub struct RequestModifierConfig {
     /// Optional JavaScript script for dynamic request modification.
     #[serde(default)]
     pub js_script: Option<String>,
+    /// Optional inline Rego module for dynamic request modification
+    /// (WOR-2482). The module's `data.sbproxy.modify_request` rule
+    /// evaluates against the same document `lua_script` / `js_script`
+    /// receive as `req` and `ctx`, merged into one `input`, and returns
+    /// `{"set_headers": {...}}`, the same shape those scripts return.
+    /// Mutually exclusive with `rego_module_path`. See
+    /// `docs/scripting.md`.
+    #[serde(default)]
+    pub rego_module: Option<String>,
+    /// Filesystem path to a `.rego` file, read once when the config
+    /// compiles (and again on every reload), in place of an inline
+    /// `rego_module`. Mutually exclusive with `rego_module`.
+    #[serde(default)]
+    pub rego_module_path: Option<String>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound `policy: rego` and `ai_routing_policy`'s Rego form
+    /// use. Must be greater than zero; a zero budget is refused at
+    /// config compile.
+    #[serde(default)]
+    pub rego_budget_ms: Option<u64>,
+    /// Parse `rego_module` (or the file at `rego_module_path`) as
+    /// pre-OPA-1.0 Rego v0 (no `if`/`contains` required) instead of the
+    /// v1 default. A compatibility escape hatch for a module pasted from
+    /// an older OPA install.
+    #[serde(default)]
+    pub rego_v0: bool,
 }
 
 /// URL path rewrite configuration.
@@ -8399,8 +8426,10 @@ pub struct BodyModifier {
 
 /// Response modifier entry.
 ///
-/// Each modifier entry can contain one or more of: `headers`, `status`, `body`,
-/// or `lua_script`. Multiple modifier entries in the list are applied in order.
+/// Each modifier entry can contain one or more of: `headers`, `status`,
+/// `body`, `lua_script`, `js_script`, or `rego_module` /
+/// `rego_module_path`. Multiple modifier entries in the list are applied in
+/// order.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseModifierConfig {
@@ -8420,6 +8449,32 @@ pub struct ResponseModifierConfig {
     /// Optional JavaScript script for dynamic response modification.
     #[serde(default)]
     pub js_script: Option<String>,
+    /// Optional inline Rego module for dynamic response modification
+    /// (WOR-2482). The module's `data.sbproxy.modify_response` rule
+    /// evaluates against the same document `lua_script` / `js_script`
+    /// receive as `resp` and `ctx`, merged into one `input`, and returns
+    /// `{"set_headers": {...}}`, the same shape those scripts return.
+    /// Mutually exclusive with `rego_module_path`. See
+    /// `docs/scripting.md`.
+    #[serde(default)]
+    pub rego_module: Option<String>,
+    /// Filesystem path to a `.rego` file, read once when the config
+    /// compiles (and again on every reload), in place of an inline
+    /// `rego_module`. Mutually exclusive with `rego_module`.
+    #[serde(default)]
+    pub rego_module_path: Option<String>,
+    /// Rego only: evaluation budget in milliseconds. Defaults to 50, the
+    /// same bound `policy: rego` and `ai_routing_policy`'s Rego form
+    /// use. Must be greater than zero; a zero budget is refused at
+    /// config compile.
+    #[serde(default)]
+    pub rego_budget_ms: Option<u64>,
+    /// Parse `rego_module` (or the file at `rego_module_path`) as
+    /// pre-OPA-1.0 Rego v0 (no `if`/`contains` required) instead of the
+    /// v1 default. A compatibility escape hatch for a module pasted from
+    /// an older OPA install.
+    #[serde(default)]
+    pub rego_v0: bool,
 }
 
 /// Status code override for response modifiers.

@@ -300,8 +300,20 @@ pub fn interpolate_config_vars(
         }
         serde_json::Value::Object(map) => {
             for (key, val) in map.iter_mut() {
-                // Skip Lua scripts - they are executed at runtime.
-                if key == "lua_script" {
+                // Skip Lua, JavaScript, and Rego script bodies - they
+                // are executed (Lua/JS) or evaluated (Rego) at runtime,
+                // not templated. WOR-2482: without this, a forward-rule
+                // modifier's script reaches here through the whole-rule
+                // JSON round-trip in `compile_origin`, and a literal
+                // `{{` inside the script (a string or comment) would be
+                // corrupted by var substitution. `js_script` was missing
+                // from this list until a review caught it: a
+                // forward-rule `js_script` containing a literal
+                // `{{vars.X}}` (e.g. building a header value with a
+                // template-looking string) was silently rewritten with
+                // the variable's value instead of reaching the engine
+                // as authored.
+                if key == "lua_script" || key == "js_script" || key == "rego_module" {
                     continue;
                 }
                 interpolate_config_vars(val, variables);
@@ -404,6 +416,61 @@ fn resolve_template_string(
     }
     result.push_str(rest);
     result
+}
+
+/// Resolve a request/response modifier's `rego_module_path` into
+/// `rego_module`, mirroring `policy: rego`'s `module` / `module_path`
+/// split (WOR-2482; Task 1 established the convention on
+/// `transforms[] type: wasm`'s `module_path`): read once here, when the
+/// config compiles, and again on every reload. Downstream code
+/// (`sbproxy-core`, which does the actual Rego evaluation) reads only
+/// `rego_module`; a modifier entry with neither field set has no Rego
+/// form and is left untouched.
+///
+/// Also validates `rego_budget_ms`, the Rego evaluation budget: not
+/// module resolution, but the same per-modifier Rego validation this
+/// function already performs at the same three call sites, so it lives
+/// here rather than as a fourth near-duplicate loop.
+///
+/// # Errors
+///
+/// Returns an error naming the origin and the modifier field when both
+/// `rego_module` and `rego_module_path` are set, when `rego_module_path`
+/// cannot be read, or when `rego_budget_ms` is `Some(0)`.
+fn resolve_rego_modifier_module(
+    hostname: &str,
+    field: &str,
+    module: &mut Option<String>,
+    module_path: &mut Option<String>,
+    budget_ms: Option<u64>,
+) -> Result<()> {
+    if module.is_some() && module_path.is_some() {
+        anyhow::bail!(
+            "origin {hostname}: {field} sets both rego_module and rego_module_path; use \
+             `rego_module` for an inline Rego source or `rego_module_path` for a path to a \
+             .rego file, not both"
+        );
+    }
+    // Same invariant `policy: rego` and `ai_routing_policy` hold: a zero
+    // budget reads as "no budget" but is an instantly expired timer, so
+    // it would abort every evaluation before the rule ran rather than
+    // disabling the limit.
+    if budget_ms == Some(0) {
+        anyhow::bail!(
+            "origin {hostname}: {field} rego_budget_ms must be greater than zero; a zero \
+             budget would abort every evaluation before the rule ran, silently dropping every \
+             header the module would have set"
+        );
+    }
+    if let Some(path) = module_path.take() {
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "origin {hostname}: {field}: loading rego_module_path from {path}: {error}"
+            )
+        })?;
+        *module = Some(contents);
+    }
+    Ok(())
 }
 
 // --- features.* -> proxy.extensions[...] migration ---
@@ -3423,6 +3490,40 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
                     *value = resolve_template_string(value, &config.variables);
                 }
             }
+        }
+    }
+
+    // WOR-2482: resolve a Rego modifier's `rego_module_path` into
+    // `rego_module` once, here, mirroring `policy: rego`'s `module` /
+    // `module_path` split (see Task 1). Downstream code (sbproxy-core,
+    // which does the actual evaluation) reads only `rego_module`.
+    for modifier in &mut config.request_modifiers {
+        resolve_rego_modifier_module(
+            hostname,
+            "request_modifiers[]",
+            &mut modifier.rego_module,
+            &mut modifier.rego_module_path,
+            modifier.rego_budget_ms,
+        )?;
+    }
+    for modifier in &mut config.response_modifiers {
+        resolve_rego_modifier_module(
+            hostname,
+            "response_modifiers[]",
+            &mut modifier.rego_module,
+            &mut modifier.rego_module_path,
+            modifier.rego_budget_ms,
+        )?;
+    }
+    for fwd_rule in &mut config.forward_rules {
+        for modifier in &mut fwd_rule.origin.request_modifiers {
+            resolve_rego_modifier_module(
+                hostname,
+                "forward_rules[].origin.request_modifiers[]",
+                &mut modifier.rego_module,
+                &mut modifier.rego_module_path,
+                modifier.rego_budget_ms,
+            )?;
         }
     }
 
@@ -6996,6 +7097,176 @@ origins:
         assert!(origin.response_modifiers[0].lua_script.is_some());
     }
 
+    // --- WOR-2482: Rego request/response modifiers ---
+
+    #[test]
+    fn compile_config_with_rego_request_modifiers() {
+        let yaml = r#"
+origins:
+  "rego-reqmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module: |
+          package sbproxy
+
+          modify_request := {"set_headers": {"x-rego-modified": "true"}}
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("rego-reqmod.test").unwrap();
+        assert_eq!(origin.request_modifiers.len(), 1);
+        assert!(origin.request_modifiers[0].lua_script.is_none());
+        assert!(origin.request_modifiers[0].rego_module.is_some());
+        let module = origin.request_modifiers[0].rego_module.as_ref().unwrap();
+        assert!(module.contains("modify_request"));
+        assert!(module.contains("x-rego-modified"));
+        assert!(origin.request_modifiers[0].rego_module_path.is_none());
+    }
+
+    #[test]
+    fn compile_config_with_rego_response_modifiers() {
+        let yaml = r#"
+origins:
+  "rego-respmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - rego_module: |
+          package sbproxy
+
+          modify_response := {"set_headers": {"x-rego-stage": "response"}}
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("rego-respmod.test").unwrap();
+        assert_eq!(origin.response_modifiers.len(), 1);
+        assert!(origin.response_modifiers[0].rego_module.is_some());
+        let module = origin.response_modifiers[0].rego_module.as_ref().unwrap();
+        assert!(module.contains("modify_response"));
+    }
+
+    #[test]
+    fn rego_module_path_on_a_modifier_is_loaded_and_the_path_field_is_cleared() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("modify.rego");
+        std::fs::write(
+            &path,
+            "package sbproxy\n\nmodify_request := {\"set_headers\": {}}\n",
+        )
+        .expect("write fixture module");
+
+        let yaml = format!(
+            r#"
+origins:
+  "rego-path.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module_path: "{}"
+"#,
+            path.display()
+        );
+        let compiled = compile_config(&yaml).unwrap();
+        let origin = compiled.resolve_origin("rego-path.test").unwrap();
+        let modifier = &origin.request_modifiers[0];
+        assert!(
+            modifier.rego_module_path.is_none(),
+            "module_path is resolved into module at compile time, mirroring policy: rego"
+        );
+        let module = modifier
+            .rego_module
+            .as_ref()
+            .expect("module loaded from path");
+        assert!(module.contains("modify_request"));
+    }
+
+    #[test]
+    fn rego_module_and_rego_module_path_together_on_one_modifier_is_refused() {
+        let yaml = r#"
+origins:
+  "rego-both.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module: |
+          package sbproxy
+          modify_request := {"set_headers": {}}
+        rego_module_path: /etc/sbproxy/modify.rego
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("setting both rego_module and rego_module_path must be refused");
+        assert!(
+            error.to_string().contains("rego_module")
+                && error.to_string().contains("rego_module_path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `rego_budget_ms: 0` on a modifier, mirroring `policy: rego`'s
+    /// `budget_ms` refusal: a zero budget is an instantly expired timer,
+    /// not "no limit", so it is refused at config compile rather than
+    /// silently aborting every evaluation at request time.
+    #[test]
+    fn rego_budget_ms_of_zero_on_a_modifier_is_refused() {
+        let yaml = r#"
+origins:
+  "rego-zero-budget.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - rego_module: |
+          package sbproxy
+          modify_request := {"set_headers": {}}
+        rego_budget_ms: 0
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("rego_budget_ms: 0 on a modifier must be refused");
+        assert!(
+            error.to_string().contains("rego_budget_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The multi-engine "both set" case is a different question from the
+    /// mutual-exclusion case above: this is `rego_module` alongside
+    /// `lua_script`, two *different* engines on one modifier entry.
+    ///
+    /// `lua_script` and `js_script` set together on one modifier are not
+    /// refused today (`sbproxy_core::server::proxy_http` runs Lua then
+    /// JavaScript, and the later engine's headers win on a shared key,
+    /// by design - see the comment at that call site). `rego_module`
+    /// mirrors that: it is not refused either, so it must survive
+    /// compilation with both fields intact for the runtime to run all
+    /// three.
+    #[test]
+    fn rego_module_alongside_lua_script_on_one_modifier_is_not_refused() {
+        let yaml = r#"
+origins:
+  "rego-and-lua.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - lua_script: |
+          function modify_request(req, ctx)
+            return { set_headers = { ["x-engine"] = "lua" } }
+          end
+        rego_module: |
+          package sbproxy
+          modify_request := {"set_headers": {"x-engine": "rego"}}
+"#;
+        let compiled = compile_config(yaml).expect("both engines on one modifier compiles");
+        let origin = compiled.resolve_origin("rego-and-lua.test").unwrap();
+        assert!(origin.request_modifiers[0].lua_script.is_some());
+        assert!(origin.request_modifiers[0].rego_module.is_some());
+    }
+
     #[test]
     fn compile_config_with_template_variables() {
         let yaml = r#"
@@ -7474,6 +7745,59 @@ origins:
         assert!(fb.get("on_error").unwrap().as_bool().unwrap());
     }
 
+    /// WOR-2482 review finding: a forward-rule modifier's `js_script`
+    /// reaches `interpolate_config_vars` through the whole-rule JSON
+    /// round-trip this function performs on every `forward_rules[]`
+    /// entry. Before the fix, a `{{vars.X}}`-shaped literal inside the
+    /// script body (naming a variable the origin actually defines) was
+    /// silently rewritten with the variable's value rather than
+    /// reaching the JS engine as authored, the same corruption
+    /// `interpolate_skips_lua_script_keys` already pins for
+    /// `lua_script`. End to end through `compile_config`, not the
+    /// lower-level `interpolate_config_vars` unit test
+    /// (`interpolate_skips_js_script_keys`, in the section below), so
+    /// this proves the fix survives the forward-rule round-trip
+    /// specifically.
+    #[test]
+    fn forward_rule_js_script_with_a_vars_pattern_is_not_interpolated() {
+        let yaml = r#"
+origins:
+  "js-braces.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    variables:
+      literal_marker: "SUBSTITUTED"
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          action:
+            type: proxy
+            url: http://127.0.0.1:18888
+          request_modifiers:
+            - js_script: |
+                function modify_request(req, ctx) {
+                  return { set_headers: { "x-literal": "{{vars.literal_marker}}" } };
+                }
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("js-braces.test").unwrap();
+        let script = origin.forward_rules[0]["origin"]["request_modifiers"][0]["js_script"]
+            .as_str()
+            .expect("js_script survives as a string");
+        assert!(
+            script.contains("{{vars.literal_marker}}"),
+            "a js_script's {{{{vars.X}}}} pattern must stay literal, matching lua_script and \
+             rego_module, not be resolved at compile time: {script}"
+        );
+        assert!(
+            !script.contains("SUBSTITUTED"),
+            "the script must not have been silently rewritten with the variable's value: {script}"
+        );
+    }
+
     // --- interpolate_config_vars tests ---
 
     #[test]
@@ -7556,6 +7880,32 @@ origins:
         // lua_script should NOT be interpolated
         assert_eq!(
             val["lua_script"].as_str().unwrap(),
+            "result.set_headers['X-Name'] = '{{vars.name}}'"
+        );
+    }
+
+    /// WOR-2482 review finding: `js_script` was missing from the skip
+    /// list `interpolate_skips_lua_script_keys` above pins for
+    /// `lua_script`, so a forward-rule `js_script` containing a literal
+    /// `{{vars.X}}` (a template-looking string the author meant to reach
+    /// the JS engine verbatim, not a real template reference) was
+    /// silently rewritten with the variable's value.
+    #[test]
+    fn interpolate_skips_js_script_keys() {
+        let vars: HashMap<String, serde_json::Value> =
+            [("name".to_string(), serde_json::json!("test"))]
+                .into_iter()
+                .collect();
+        let mut val = serde_json::json!({
+            "headers": {"X-Name": "{{vars.name}}"},
+            "js_script": "result.set_headers['X-Name'] = '{{vars.name}}'"
+        });
+        interpolate_config_vars(&mut val, &vars);
+        // headers value should be interpolated
+        assert_eq!(val["headers"]["X-Name"].as_str().unwrap(), "test");
+        // js_script should NOT be interpolated
+        assert_eq!(
+            val["js_script"].as_str().unwrap(),
             "result.set_headers['X-Name'] = '{{vars.name}}'"
         );
     }

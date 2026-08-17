@@ -717,3 +717,94 @@ fn header_phase_policy_fault_refuses_under_the_closed_default() {
         upstream.captured()
     );
 }
+
+// --- runtime: rego fault posture (WOR-2482 review finding I1) ---
+//
+// Mirrors the pair above with a `runtime: rego` bundle instead of a
+// throwing JS export. The module returns a document rather than a
+// boolean: that passes candidate load (the load-time trial only
+// proves the rule evaluates, not that its value is boolean) and
+// faults at request time instead, which is what proves the fault
+// reaches the shared `failure_posture` handling rather than being
+// swallowed into a hardcoded deny inside the adapter.
+
+fn rego_fault_manifest(name: &str, policy_type: &str, posture: &str) -> String {
+    format!(
+        r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: {name}
+version: 1.0.0
+runtime: rego
+entry: policy.rego
+hooks:
+  - kind: policy
+    type: {policy_type}
+    execution:
+      body_mode: none
+failure_posture: {posture}
+"#
+    )
+}
+
+const FAULTING_POLICY_REGO: &str = r#"package sbproxy
+
+allow := {"reason": "not a boolean"}
+"#;
+
+#[test]
+fn rego_bundle_policy_fault_admits_under_an_open_posture() {
+    let upstream = MockUpstream::start(serde_json::json!({"ok": true})).expect("start upstream");
+    let manifest = rego_fault_manifest("rego-open-fault", "rego_open_fault_policy", "open");
+    let files = [
+        ("bundles/rego-open-fault/bundle.yaml", manifest.as_str()),
+        ("bundles/rego-open-fault/policy.rego", FAULTING_POLICY_REGO),
+    ];
+    let proxy = ProxyHarness::start_with_workspace(
+        &proxy_policy_config(&upstream, "rego_open_fault_policy"),
+        &files,
+    )
+    .expect("start proxy");
+
+    let response = proxy.get("/", "extension.localhost").expect("request");
+    assert_eq!(
+        response.status,
+        200,
+        "an open posture must admit the request when the rego hook faults: {:?}",
+        response.text().unwrap_or_default()
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "the admitted request must reach the upstream"
+    );
+}
+
+#[test]
+fn rego_bundle_policy_fault_refuses_under_the_closed_default() {
+    let upstream = MockUpstream::start(serde_json::json!({"ok": true})).expect("start upstream");
+    let manifest = rego_fault_manifest("rego-closed-fault", "rego_closed_fault_policy", "closed");
+    let files = [
+        ("bundles/rego-closed-fault/bundle.yaml", manifest.as_str()),
+        (
+            "bundles/rego-closed-fault/policy.rego",
+            FAULTING_POLICY_REGO,
+        ),
+    ];
+    let proxy = ProxyHarness::start_with_workspace(
+        &proxy_policy_config(&upstream, "rego_closed_fault_policy"),
+        &files,
+    )
+    .expect("start proxy");
+
+    let response = proxy.get("/", "extension.localhost").expect("request");
+    assert_eq!(
+        response.status, 500,
+        "a closed posture must refuse the request when the rego hook faults"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        0,
+        "the refused request must not reach the upstream: {:?}",
+        upstream.captured()
+    );
+}

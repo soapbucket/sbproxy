@@ -42,21 +42,23 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `observability.log.custom_fields[]` with `engine: cel` | CEL | Returns the value of one operator-defined access-log field |
 | `request_modifiers[].lua_script` | Lua | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
 | `request_modifiers[].js_script` | JavaScript | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
+| `request_modifiers[].rego_module` (+ `rego_module_path`, `rego_v0`) | Rego | The `data.sbproxy.modify_request` rule returns `{"set_headers": {...}}`, applied to the upstream request |
 | `response_modifiers[].lua_script` | Lua | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `response_modifiers[].js_script` | JavaScript | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
+| `response_modifiers[].rego_module` (+ `rego_module_path`, `rego_v0`) | Rego | The `data.sbproxy.modify_response` rule returns `{"set_headers": {...}}`, applied to the response |
 | `transforms[] type: lua_json`, field `script` | Lua | Defines `modify_json(data, ctx)`; return value replaces the JSON response body |
 | `transforms[] type: javascript`, field `script` | JavaScript | Defines `transform(body, ctx)` over the raw body string |
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
 | `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
-| `policies[] type: rego`, fields `module` + `query` (+ optional `data`) | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message`; `data` is a JSON object the rule reads as `data.<key>` |
+| `policies[] type: rego`, fields `module` or `module_path` + `query` (+ optional `data`, `rego_v0`) | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message`; `data` is a JSON object the rule reads as `data.<key>` |
 | `forward_rules[].rules[].when` | CEL | Boolean predicate over the arriving request; an evaluation error means the rule does not match |
 | `observability.log.custom_fields[]` with `engine: lua` or `engine: js` | Lua or JavaScript | Returns the value of one operator-defined access-log field |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
 | `origins.<host>.response_cache.key_event`, field `source` | Lua or JavaScript | Returns `{vary, skip_lookup, reason}` before the cache lookup; adds dimensions to the cache key |
 | `origins.<host>.response_cache.admit_event`, field `source` | Lua or JavaScript | Returns `{store, ttl_secs, reason}` once the response body is complete; decides whether it is stored |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
-| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, or envelope WASM | Uses a typed, versioned JSON envelope and the hook's `type` name |
+| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` only) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` hook reads `input.request.*` and `input.config` and returns a Rego boolean |
 | `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
 | Extension AI and payment hooks | JavaScript, envelope WASM, or Proxy-Wasm for AI streaming | Receives provider-neutral, credential-free events through versioned contracts |
 
@@ -587,6 +589,133 @@ Everything fails closed, at the earliest point it can be detected:
 
 Builtin errors are strict here. Upstream OPA treats a builtin error as `undefined` and moves on; Regorus propagates it, and this surface turns it into a denial. A policy that leans on that forgiveness upstream, for example calling `net.cidr_contains` on a header that is sometimes not a CIDR, works on OPA and denies here. Guard the input first, or accept the deny.
 
+### `module_path`: a `.rego` file instead of an inline string
+
+`module` and `module_path` are mutually exclusive; exactly one must be set. `module_path` is a filesystem path to a `.rego` file, read once when the config compiles (and again on every reload, since a reload recompiles the whole config), resolved relative to the proxy's working directory. It exists for the same reason `transforms[] type: wasm`'s `module_path` does: real policy lives in source control as its own file, not pasted into a YAML block scalar.
+
+```yaml
+policies:
+  - type: rego
+    module_path: /etc/sbproxy/policies/authz.rego
+    query: data.sbproxy.allow
+```
+
+The loaded text feeds the same compile path an inline `module` does, so everything above (base data, failure posture, the OPA divergence) applies identically either way.
+
+### `rego_v0`: pre-OPA-1.0 syntax
+
+Regorus, like current OPA, defaults to Rego v1: rule bodies require `if`, and multi-value rules require `contains`. A module written before OPA 1.0 (December 2024) uses the older syntax, `allow { ... }` with no `if`, and fails to parse under the default. `rego_v0: true` (default `false`) calls Regorus's own v0 compatibility switch before parsing, so that module compiles unchanged:
+
+```yaml
+policies:
+  - type: rego
+    rego_v0: true
+    module: |
+      package sbproxy
+
+      allow {
+        input.request.method == "GET"
+      }
+```
+
+Reach for it to run a policy pasted from an older OPA install rather than rewriting it; a module authored fresh should use `if`/`contains` and leave the flag at its default.
+
+### `print()` capture
+
+A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior of Rego evaluation itself, not something each call site opts into, so it covers every surface that compiles a Rego module: `policy: rego`, `ai_routing_policy` `engine: rego`, a [request/response modifier's](#rego-modifiers) `rego_module`, and a signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook.
+
+### Rego modifiers
+
+`request_modifiers[]` and `response_modifiers[]` also accept a Rego form, beside `lua_script` and `js_script`: `rego_module` (inline source) or `rego_module_path` (a path to a `.rego` file, mutually exclusive with `rego_module`), `rego_v0` for pre-OPA-1.0 syntax, and `rego_budget_ms` (default 50, must be greater than zero) for the evaluation budget, the same knob `policy: rego` and `ai_routing_policy`'s Rego form expose. This is engine-surface parity, not a different contract: the module evaluates against the same document `req`/`resp` and `ctx` give Lua and JavaScript, merged into one `input` because Rego takes a single document where the other two take two arguments, and it returns the same `{"set_headers": {...}}` shape those scripts return.
+
+```yaml
+request_modifiers:
+  - rego_module: |
+      package sbproxy
+
+      default modify_request := {"set_headers": {"x-caller-kind": "browser"}}
+
+      modify_request := {"set_headers": {"x-caller-kind": "crawler"}} if {
+        contains(input.request.headers["user-agent"], "GPTBot")
+      }
+```
+
+```yaml
+response_modifiers:
+  - rego_module: |
+      package sbproxy
+
+      modify_response := {"set_headers": {"x-status-bucket": "5xx"}} if {
+        input.response.status_code >= 500
+      }
+```
+
+`input` merges what Lua's/JavaScript's two arguments (`req`/`resp` and `ctx`) carry into one document:
+
+| `input` key | Present on | Meaning |
+|---|---|---|
+| `input.request.method`, `.path`, `.host`, `.headers` | request modifiers | same fields Lua's/JavaScript's `req` argument carries |
+| `input.request.aipref.{train,search,ai_input}` (also `input.request.aipref["ai-input"]`) | both | mirrors `ctx.request.aipref` |
+| `input.request.tls.*` | both | TLS fingerprint fields, mirrors `ctx.request.tls` |
+| `input.principal.*` | both | mirrors `ctx.principal`, unchanged |
+| `input.response.status_code`, `.headers` | response modifiers | same fields Lua's/JavaScript's `resp` argument carries |
+
+The queried rule is a fixed name, `data.sbproxy.modify_request` / `data.sbproxy.modify_response`, the same way Lua and JavaScript modifiers call a fixed function name (`modify_request` / `modify_response`) with no config knob to rename it. Unlike `policy: rego`, a module that fails to parse does not refuse the config: the failure posture here matches the Lua/JS modifier row in [§11](#error-behavior), not the `rego` policy row above. There is also no `data` knob here: `policy: rego`'s base-data table (above) has no modifier equivalent, matching Lua's and JavaScript's modifier forms, which have no analogous side-table either. See [§7](#7-modifier-reference) for the full modifier field reference.
+
+### Testing Rego policies offline: `sbproxy rego test`
+
+`sbproxy rego test <path>` is the offline `opa test` analogue: it runs one or more YAML fixture files against the module(s) they name and prints a per-module line-coverage summary, without touching `sb.yml` or a running proxy. `<path>` is either one fixture file or a directory, searched recursively for `*_test.yaml` / `*_test.yml` files (OPA's own `*_test.rego` naming convention, in sbproxy's YAML fixture shape).
+
+Every fixture compiles its module through the same engine construction a live `policy: rego` or `ai_routing_policy` uses, so a fixture that passes here behaves identically pasted into config. A fixture's top-level fields mirror `policies[] type: rego` exactly and take the same defaults, so a block copied from a fixture into `policies:`, or the other way around, is the same policy:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `module` | - | Inline Rego source. Mutually exclusive with `module_path` |
+| `module_path` | - | A `.rego` file. Resolved against the fixture file's own directory, not the CLI's working directory, so a fixture can colocate its module beside it regardless of where `sbproxy rego test` runs from |
+| `query` | `data.sbproxy.allow` | The rule reference every case in the file evaluates |
+| `data` | none | Base data the module reads as `data.<key>` |
+| `budget_ms` | `50` | Evaluation budget; must be greater than zero |
+| `rego_v0` | `false` | Parse as pre-OPA-1.0 syntax |
+| `cases` | required | A list of `{name, input, expect}`. `expect` is compared as JSON against the query's actual result; an undefined rule reads as `null` |
+
+A real fixture, testing the `module_path` policy from [examples/rego-modifier-parity](../examples/rego-modifier-parity/):
+
+```yaml
+# examples/rego-modifier-parity/policy_test.yaml
+module_path: policy.rego
+cases:
+  - name: strong trust tier is allowed
+    input:
+      request: { trust_tier: strong, method: GET, path: /private/status }
+    expect: true
+  - name: public GET is allowed regardless of trust tier
+    input:
+      request: { trust_tier: anonymous, method: GET, path: /public/status }
+    expect: true
+  - name: private path with no strong trust tier is denied
+    input:
+      request: { trust_tier: anonymous, method: GET, path: /private/status }
+    expect: false
+  - name: POST to a public path is denied
+    input:
+      request: { trust_tier: anonymous, method: POST, path: /public/status }
+    expect: false
+```
+
+<!-- CAPTURE: sbproxy rego test examples/rego-modifier-parity/policy_test.yaml -->
+
+```text
+PASS examples/rego-modifier-parity/policy_test.yaml :: strong trust tier is allowed
+PASS examples/rego-modifier-parity/policy_test.yaml :: public GET is allowed regardless of trust tier
+PASS examples/rego-modifier-parity/policy_test.yaml :: private path with no strong trust tier is denied
+PASS examples/rego-modifier-parity/policy_test.yaml :: POST to a public path is denied
+coverage: policy.rego 4/4 lines (100.0%)
+4 passed, 0 failed, 0 errored, 100.0% total coverage
+```
+
+
+Exit code `0`. A failing case exits `1` and names what it expected (`FAIL <fixture> :: <case>: expected <value>, got <value>`); `--min-coverage <PCT>` also exits `1` when aggregate coverage across every fixture in the run falls short. A fixture that is itself broken (unreadable, malformed YAML, a `module`/`module_path` conflict, no `cases`, a non-positive `budget_ms`) is recorded against that fixture and exits `2`, without discarding the results of every other fixture in the same run. `--format json` emits one structured object (`schema_version`, `cases`, `coverage`, `errors`, ...) instead of the text lines above, for a CI step that parses the result rather than scrapes it. Fixture paths are trusted input: unlike a bundle manifest's `entry`, a fixture's `module_path` resolves against the fixture file's own directory with no path-traversal guard, so run `sbproxy rego test` only against fixtures you trust, including in CI.
+
 ---
 
 ## 4. Lua scripting
@@ -1075,6 +1204,10 @@ Request and response modifiers are lists of typed entries. Each entry can combin
 | `body.replace` | string | Replace the request body with this string |
 | `body.replace_json` | any | Replace the request body with this JSON value |
 | `lua_script` | string | Lua `modify_request(req, ctx)`; returned `set_headers` applied |
+| `js_script` | string | JavaScript `modify_request(req, ctx)`; returned `set_headers` applied |
+| `rego_module` / `rego_module_path` | string | Rego `data.sbproxy.modify_request`; returned `{"set_headers": {...}}` applied. Mutually exclusive with each other |
+| `rego_budget_ms` | int | Rego evaluation budget in milliseconds. Defaults to 50. Must be greater than zero |
+| `rego_v0` | bool | Parse the Rego module as pre-OPA-1.0 syntax |
 
 ```yaml
 request_modifiers:
@@ -1107,6 +1240,9 @@ request_modifiers:
 | `body.replace_json` | any | Replace the response body with this JSON value |
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |
 | `js_script` | string | JavaScript `modify_response(resp, ctx)`; returned `set_headers` applied |
+| `rego_module` / `rego_module_path` | string | Rego `data.sbproxy.modify_response`; returned `{"set_headers": {...}}` applied. Mutually exclusive with each other |
+| `rego_budget_ms` | int | Rego evaluation budget in milliseconds. Defaults to 50. Must be greater than zero |
+| `rego_v0` | bool | Parse the Rego module as pre-OPA-1.0 syntax |
 
 ```yaml
 response_modifiers:
@@ -1125,6 +1261,8 @@ response_modifiers:
 ```
 
 For JSON body surgery on responses, prefer the JSON transforms: the typed `json` transform (`set` / `remove` / `rename` fields) for static edits, or `lua_json` / `js_json` for computed edits.
+
+When one modifier entry declares more than one script form together, they all run, in the fixed order `lua_script`, then `js_script`, then `rego_module` / `rego_module_path`, and the later engine wins when more than one sets the same header name.
 
 ---
 
@@ -1148,10 +1286,13 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 
 ### Rego
 
+The four bullets below describe `policies[] type: rego` and `ai_routing_policy` `engine: rego`, the two surfaces §3a documents in full. The [Rego modifiers](#rego-modifiers) and [`runtime: rego` bundle](extension-bundles.md#rego) surfaces share the same Regorus engine and the same budget mechanism, but not this section's compile-time or failure-posture claims; see the fifth bullet.
+
 - One evaluation runs under `budget_ms` (default 50 ms, matching the extension-bundle sandbox default), enforced by the Regorus execution timer, which checks the deadline every thousand work units. `budget_ms: 0` is refused at config load.
 - Deliberately has no memory or stack cap and no fuel: the execution timer bounds total work, and a policy is one bounded evaluation over an already-bounded input document rather than a body-sized stream.
 - Configured per policy (`policies[] type: rego`, field `budget_ms`), not under `proxy.scripting`. Modules are compiled and semantically checked at config load, including one trial evaluation, so authoring mistakes cannot defer to request time.
 - Every fault denies the request; there is no `failure_posture` knob on this surface. See [§3a](#failure-posture).
+- A [request/response modifier's](#rego-modifiers) `rego_module` compiles fresh per invocation instead, under its own `rego_budget_ms` (same 50 ms default), and a fault is logged and the modifier skipped rather than denying, matching the Lua/JS modifier posture. A signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook compiles once at candidate load like `policies[] type: rego`, but a request-time fault propagates to the bundle manifest's `failure_posture` (`open` admits, `closed` refuses) instead of always denying, the same fault path every other bundle policy hook shares.
 
 ### Lua
 
@@ -1182,7 +1323,7 @@ One row per engine; every empty cell is a decision, not an omission, and the not
 | Engine | Wall clock | Memory | Stack | Fuel | Output cap | Limits configured in |
 |---|---|---|---|---|---|---|
 | CEL | none (terminates by construction; regex caps only) | none | none | none | none | nowhere: the regex caps are fixed |
-| Rego | `budget_ms`, default 50 ms | none | none | none | none | per policy (`budget_ms`) |
+| Rego | `budget_ms` (policy/routing) or `rego_budget_ms` (modifiers), default 50 ms either way | none | none | none | none | per policy (`budget_ms`) or per modifier (`rego_budget_ms`) |
 | Lua | 100 ms interrupt | 8 MB allocator | none | none (wall clock covers it) | none | `proxy.scripting.lua.sandbox` |
 | JavaScript (inline) | 100 ms watchdog | 16 MB heap | 1 MB native | none (wall clock covers it) | none | `proxy.scripting.javascript.sandbox` |
 | WASM (`transform: wasm`) | `timeout_ms`, default 1 s, epoch interruption | `max_memory_pages`, default 256 pages (16 MiB) | module-internal | `max_fuel`, default 10^9 | none | the transform's own config block |
@@ -1200,7 +1341,7 @@ CEL evaluates in microseconds per request and fits any routing decision, includi
 
 Lua and JavaScript build a fresh interpreter state per invocation. That is the isolation guarantee, and it means simple scripts complete in well under a millisecond but there is no cross-request state to amortize into.
 
-WASM has a one-time compilation cost at config load; subsequent invocations run at near-native speed inside the Wasmtime sandbox, paying one instantiation per request.
+WASM has a one-time compilation cost at config load; subsequent invocations run at near-native speed inside the Wasmtime sandbox, paying one instantiation per request. `policies[] type: rego`, `ai_routing_policy`, and a bundle's `runtime: rego` policy hook share that one-time cost: each compiles and trial-evaluates its module once, at config load or candidate load. A [request/response modifier's](#rego-modifiers) `rego_module` does not: it compiles fresh (parse plus one trial evaluation) on every invocation, so a broken module stamps a `record_script_compile` failure on every request that reaches it rather than once at load, the trade-off for `rego_module`/`rego_module_path` living in a list evaluated per request rather than a config-load-time slot.
 
 Tips:
 - Prefer `startsWith`, `endsWith`, or `contains` over `regex_match` in CEL hot paths.
@@ -1243,7 +1384,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `rego` policy | A module that fails to parse or a semantic fault (unsafe variable, `query` naming no rule) rejects the config at compile time; a rule error, non-boolean result, or exceeded `budget_ms` denies the request with `deny_status` |
 | forward-rule `when:` | A CEL parse error rejects the config at compile time; an evaluation error means the rule does not match, logged per request |
 | WAF custom rule (Lua / JS) | A rule whose script errors is skipped and counted; if no rule blocked but at least one went unevaluated, the pass reports a WAF failure and the policy's `failure_posture` decides (default closed) |
-| Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
+| Lua / JS / Rego modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds. Unlike `policy: rego`, a Rego modifier module that fails to parse follows this row, not the `rego` policy row above: the module is not compiled at config load |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
@@ -1287,6 +1428,7 @@ To see custom scripting and transforms in action, refer to these runnable exampl
 | [`transform-markdown`](../examples/transform-markdown/) | Markdown to HTML conversion. | Use `type: markdown`. | Renders a Markdown response body as HTML via `pulldown-cmark`. |
 | [`transform-template`](../examples/transform-template/) | Dynamic payload rendering. | Use the `template` transform with minijinja (Jinja-style) syntax. | Renders a structured JSON body into a plain-text (or other) summary. |
 | [`variables-template`](../examples/variables-template/) | Origin variable and env var interpolation. | Reference `{{ variables.<name> }}` / `{{ env.<NAME> }}` in modifier fields. | Injects config-defined values into headers sent upstream, resolved once when the config compiles (not per request). |
+| [`rego-modifier-parity`](../examples/rego-modifier-parity/) | A file-based Rego policy plus a Rego response modifier. | Use `policies[] type: rego` with `module_path`, and `response_modifiers[].rego_module`. | A `strong` trust tier or a public `GET` is allowed; everything else is denied 403. Test the module offline first with `sbproxy rego test`. |
 
 ## See also
 

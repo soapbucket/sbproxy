@@ -104,6 +104,62 @@ origins:
     )
 }
 
+/// Fallback chain restricted by a credential allowlist, on a surface that
+/// legitimately carries `multipart/form-data`.
+///
+/// Two things about this fixture are load bearing.
+///
+/// The providers are named `openai` and `groq` rather than
+/// `primary`/`secondary`. the surface-capability lookup keys the surface
+/// capability matrix on the provider *name*, not on `provider_type`, so a
+/// provider named `primary` is treated as an unknown provider and gets the
+/// most restrictive answer (chat, models, messages, responses). Audio
+/// transcription would then 501 before routing ever runs.
+///
+/// The path is `/v1/audio/transcriptions`, not `/v1/chat/completions`.
+/// Since WOR-2472 a multipart Content-Type on a classified JSON surface is
+/// refused with 403 before any provider work, so a chat-completions fixture
+/// cannot exercise multipart routing at all. Transcription is one of the
+/// surfaces `AiSurface::accepts_multipart` admits.
+fn restricted_multipart_fallback_config(primary_url: &str, secondary_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: "k"
+          base_url: "{primary_url}"
+          allow_private_base_url: true
+          priority: 1
+          models: [whisper-1]
+        - name: groq
+          provider_type: openai
+          api_key: "k"
+          base_url: "{secondary_url}"
+          allow_private_base_url: true
+          priority: 2
+          models: [whisper-1]
+      routing:
+        strategy: fallback_chain
+      require_governed_key: true
+    credentials:
+      - name: openai-only
+        type: ai_provider
+        provider: openai
+        key: "sk-openai-only"
+        policies:
+          - type: rate_limit
+            rpm: 1
+"#
+    )
+}
+
 fn restricted_discovery_config(primary_url: &str, secondary_url: &str) -> String {
     format!(
         r#"
@@ -249,24 +305,37 @@ fn fallback_chain_never_crosses_the_credential_provider_allowlist() {
     );
 }
 
+/// A multipart request on a surface that legitimately carries multipart
+/// must still obey the credential's provider allowlist and its common
+/// request governance.
+///
+/// This drives `/v1/audio/transcriptions`, not `/v1/chat/completions`. The
+/// original form of this test posted multipart at chat completions, which
+/// WOR-2472 now refuses with 403 before any provider is selected, so it was
+/// asserting provider advancement through a door the gate closed. The
+/// property it exists to pin is unchanged and still real: the multipart
+/// byte-forward path in `ai_dispatch` runs its own provider-order loop, and
+/// that loop must not walk past the credential's allowlist. The refusal on
+/// a JSON surface is covered separately by
+/// `ai_policy_pack::multipart_on_chat_completions_is_refused_by_the_release_binary`.
 #[test]
 fn multipart_fallback_never_crosses_the_credential_provider_allowlist() {
     let primary = MockUpstream::start_with_status(chat_reply("primary"), 503).expect("primary");
     let secondary = MockUpstream::start(chat_reply("secondary")).expect("secondary");
-    let proxy = ProxyHarness::start_with_yaml(&restricted_fallback_config(
+    let proxy = ProxyHarness::start_with_yaml(&restricted_multipart_fallback_config(
         &primary.base_url(),
         &secondary.base_url(),
     ))
     .expect("proxy");
     let boundary = "sbproxy-provider-policy";
     let multipart = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o\r\n--{boundary}--\r\n"
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.wav\"\r\nContent-Type: audio/wav\r\n\r\nfixture\r\n--{boundary}--\r\n"
     );
     let client = reqwest::blocking::Client::new();
     let response = client
-        .post(format!("{}/v1/chat/completions", proxy.base_url()))
+        .post(format!("{}/v1/audio/transcriptions", proxy.base_url()))
         .header("host", "ai.localhost")
-        .header("authorization", "Bearer sk-primary-only")
+        .header("authorization", "Bearer sk-openai-only")
         .header(
             reqwest::header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -275,7 +344,10 @@ fn multipart_fallback_never_crosses_the_credential_provider_allowlist() {
         .send()
         .expect("multipart request");
 
-    assert!(!response.status().is_success());
+    assert!(
+        !response.status().is_success(),
+        "the allowed provider's failure must not be hidden by a denied provider"
+    );
     assert!(
         !primary.captured().is_empty(),
         "the allowed provider is tried"
@@ -286,9 +358,9 @@ fn multipart_fallback_never_crosses_the_credential_provider_allowlist() {
     );
 
     let rate_limited = client
-        .post(format!("{}/v1/chat/completions", proxy.base_url()))
+        .post(format!("{}/v1/audio/transcriptions", proxy.base_url()))
         .header("host", "ai.localhost")
-        .header("authorization", "Bearer sk-primary-only")
+        .header("authorization", "Bearer sk-openai-only")
         .header(
             reqwest::header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
