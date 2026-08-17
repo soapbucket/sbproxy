@@ -928,6 +928,8 @@ pub(crate) fn budget_scope_keys_for_agent(
 /// soft-landing behavior. Keeping those concerns outside this helper lets the
 /// regular HTTP and realtime admission paths share hard-limit semantics
 /// without changing their dispatch-specific behavior.
+// `tenant_id` is the only argument added for WOR-2486: every other
+// parameter already existed and moves through unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn scoped_budget_preflight(
     cfg: &sbproxy_ai::BudgetConfig,
@@ -939,11 +941,19 @@ pub(crate) async fn scoped_budget_preflight(
     origin: Option<&str>,
     tag: Option<&str>,
     agent: sbproxy_ai::budget::AgentIdentity<'_>,
+    tenant_id: &str,
 ) -> (Vec<(usize, String)>, BudgetGate) {
     let keys =
         budget_scope_keys_for_agent(cfg, workspace_id, api_key, user, model, origin, tag, agent);
     let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
-    let gate = budget_preflight(cfg, &keys, providers, &shared_spend);
+    let gate = budget_preflight(
+        cfg,
+        &keys,
+        providers,
+        &shared_spend,
+        tenant_id,
+        origin.unwrap_or(workspace_id),
+    );
     (keys, gate)
 }
 
@@ -1017,6 +1027,38 @@ pub(super) fn limit_utilization(
     None
 }
 
+/// Build the `budget_exceeded` [`sbproxy_observe::ProxyEvent`] for one
+/// deny-at-cap decision (WOR-2486).
+///
+/// Split from [`budget_preflight`]'s `Block` arm so the field set is
+/// testable without a running event egress, the same reason
+/// `sbproxy_observe::egress_bridge`'s bridge is tested against its own
+/// pure builder rather than the full publish path.
+///
+/// `scope`, `max_tokens`, and `max_cost_usd` are the cap fields an
+/// analyst needs to tell "which limit" from "how close"; `reason` is
+/// the same machine-readable string the 402 body already carries, so
+/// the event and the client response never disagree about why.
+fn budget_exceeded_event(
+    tenant_id: &str,
+    origin: &str,
+    limit: &sbproxy_ai::budget::BudgetLimit,
+    reason: &str,
+) -> sbproxy_observe::ProxyEvent {
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::BudgetExceeded,
+        origin.to_owned(),
+        tenant_id.to_owned(),
+        serde_json::json!({
+            "scope": scope_label(&limit.scope),
+            "reason": reason,
+            "max_tokens": limit.max_tokens,
+            "max_cost_usd": limit.max_cost_usd,
+            "window_secs": limit.window().map(|d| d.as_secs()),
+        }),
+    )
+}
+
 /// Run the budget pre-flight for a request.
 ///
 /// Each configured limit produces a scope key. The first limit that
@@ -1027,11 +1069,16 @@ pub(super) fn limit_utilization(
 /// across the configured providers' `models` lists is selected from
 /// the embedded price catalog; if no candidates are available the
 /// request blocks instead of silently passing through.
+// `tenant_id` and `origin` are WOR-2486 additions, carried only for the
+// `budget_exceeded` event on the `Block` arm below; every other
+// parameter and the allow/downgrade paths are unchanged.
 pub(crate) fn budget_preflight(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     providers: &[sbproxy_ai::ProviderConfig],
     shared: &std::collections::HashMap<String, sbproxy_ai::UsageRecord>,
+    tenant_id: &str,
+    origin: &str,
 ) -> BudgetGate {
     for (limit_idx, key) in keys {
         let limit = &cfg.limits[*limit_idx];
@@ -1083,6 +1130,14 @@ pub(crate) fn budget_preflight(
                         "scope": scope_label(&limit.scope),
                         "message": result.reason,
                     }
+                });
+                // WOR-2486: the deny-at-cap site. Verdict-level by
+                // construction: this arm runs once per request that
+                // actually crosses a cap, never for a request that
+                // stays under one (the `!result.exceeded` check above
+                // `continue`s before reaching here).
+                sbproxy_observe::publish_proxy_event(sbproxy_observe::EventType::BudgetExceeded, || {
+                    budget_exceeded_event(tenant_id, origin, limit, &result.reason)
                 });
                 return BudgetGate::Block {
                     status: 402,
@@ -1201,6 +1256,8 @@ mod budget_preflight_tests {
             &[(0, key.to_string())],
             &[],
             &exceeded_shared_usage(key),
+            "tenant-a",
+            "budget-preflight-log",
         );
 
         assert!(matches!(gate, BudgetGate::Allow));
@@ -1214,6 +1271,8 @@ mod budget_preflight_tests {
             &[(0, key.to_string())],
             &[],
             &exceeded_shared_usage(key),
+            "tenant-a",
+            "budget-preflight-block",
         );
 
         let BudgetGate::Block { status, body } = gate else {
@@ -1226,6 +1285,35 @@ mod budget_preflight_tests {
         assert_eq!(body["error"]["message"], "token limit exceeded: 100 >= 100");
     }
 
+    /// WOR-2486: the fields a SIEM rule selects on. Red-first: before
+    /// this wiring, `budget_exceeded` had zero production call sites
+    /// anywhere in the workspace (`grep -rn EventType::BudgetExceeded`
+    /// matched only the enum declaration and its own tests).
+    #[test]
+    fn budget_exceeded_event_carries_tenant_scope_and_cap() {
+        let limit = sbproxy_ai::budget::BudgetLimit {
+            scope: sbproxy_ai::budget::BudgetScope::Workspace,
+            max_tokens: Some(100),
+            max_cost_usd: None,
+            period: Some("total".to_string()),
+            downgrade_to: None,
+        };
+        let event = super::budget_exceeded_event(
+            "acme",
+            "budget-preflight-event-origin",
+            &limit,
+            "token limit exceeded: 100 >= 100",
+        );
+
+        assert_eq!(event.event_type, sbproxy_observe::EventType::BudgetExceeded);
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.hostname, "budget-preflight-event-origin");
+        assert_eq!(event.data["scope"], "workspace");
+        assert_eq!(event.data["reason"], "token limit exceeded: 100 >= 100");
+        assert_eq!(event.data["max_tokens"], 100);
+        assert!(event.data["max_cost_usd"].is_null());
+    }
+
     #[test]
     fn budget_preflight_downgrade_returns_the_configured_model() {
         let key = "workspace:budget-preflight-downgrade";
@@ -1234,6 +1322,8 @@ mod budget_preflight_tests {
             &[(0, key.to_string())],
             &[],
             &exceeded_shared_usage(key),
+            "tenant-a",
+            "budget-preflight-downgrade",
         );
 
         assert!(matches!(
@@ -1266,6 +1356,7 @@ mod budget_preflight_tests {
             Some("budget-preflight-scoped"),
             None,
             AgentIdentity::default(),
+            "tenant-a",
         )
         .await;
 
@@ -1308,6 +1399,7 @@ mod budget_preflight_tests {
                 id: Some("planner"),
                 verified: true,
             },
+            "tenant-a",
         )
         .await;
         assert_eq!(
@@ -1328,6 +1420,7 @@ mod budget_preflight_tests {
                 id: Some("planner"),
                 verified: false,
             },
+            "tenant-a",
         )
         .await;
         assert_eq!(
@@ -1348,6 +1441,7 @@ mod budget_preflight_tests {
             Some(host),
             None,
             AgentIdentity::default(),
+            "tenant-a",
         )
         .await;
         assert_eq!(anonymous, claimed);
