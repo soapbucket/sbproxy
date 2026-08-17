@@ -60,6 +60,8 @@ policies:
 
 `model` selects the loaded classifier by the id used on `--model` above (`prompt-injection` in the example). See [local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection) for the full field reference and auto-selection behavior.
 
+See [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) for a complete working config, including both a `tag` and a `block` origin against the same sidecar.
+
 ## 4. Building a Custom Sidecar
 
 Because the proxy uses a standard gRPC contract, you can build a custom sidecar in any language (Python, Go, Node.js) to run your own proprietary ML models.
@@ -73,3 +75,8 @@ When SBproxy encounters an AI request with a sidecar-backed guardrail, it automa
 4. Compares the returned score against `threshold` and either allows the request or applies the policy's `action` (`tag` or `block`).
 
 See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
+
+## See also
+
+- [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) - the `prompt_injection_v2` policy against an out-of-process classifier sidecar, `tag` and `block` variants.
+- [`examples/sidecar/`](../examples/sidecar/) - a different sense of "sidecar": sbproxy itself deployed per-pod as a workload sidecar rather than a classifier process. Relevant if the classifier sidecar above is going to run alongside a proxy deployed this way.

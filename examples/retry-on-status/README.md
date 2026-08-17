@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![Retry on status](../../docs/assets/retry-on-status.gif)
+
 Demonstrates status-code retries across a two-target load balancer. The `retry` block lists `503` in `retry_on`, so a matching upstream response is discarded before any bytes reach the client and target selection runs again. One target points at a deliberately failing local backend, the other at the healthy `test.sbproxy.dev` placeholder; with `algorithm: round_robin` the retry pass advances to the next target, so every request returns 200 even when it first lands on the failing backend.
 
 Status retries are replayed only for safe/idempotent methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) whose bodies still fit in Pingora's retry buffer. A matching status the proxy cannot safely replay passes through unchanged with an `x-sbproxy-retry-skip-reason` header. When `max_attempts` is exhausted, the client sees the real upstream status.

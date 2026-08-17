@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![AI gateway: an operator-authored routing policy](../../docs/assets/ai-routing-policy.gif)
+
 The built-in routing strategies pick from a fixed menu. `ai_routing_policy` hands the routing decision itself to operator code: one sandboxed CEL expression reads the gateway-computed `ai` decision view and returns a plan (an ordered candidate list plus a reason), or `null` to decline to the configured `routing` strategy. Declining is the cheap common path, so a policy with an opinion about a few kinds of request costs nothing for the rest.
 
 This example composes three signals no fixed strategy can weigh together:

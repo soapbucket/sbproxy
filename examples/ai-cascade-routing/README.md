@@ -2,6 +2,8 @@
 
 *Last modified: 2026-05-17*
 
+![AI gateway: cascade routing across two tiers](../../docs/assets/ai-cascade-routing.gif)
+
 The `cascade` strategy walks an ordered list of `(provider, model)` tiers from cheapest to most expensive. Each tier's response is graded against a `quality_threshold`, compared against the response body's top-level `confidence_score` field. When the score falls below the threshold, the response is empty, or the response is refused, the cascade retries on the next tier. The dispatcher stops as soon as a tier's response meets the threshold or the cumulative cost reaches `max_total_cost`.
 
 This is the pattern proven Pareto-optimal in [A Unified Approach to Routing and Cascading for LLMs](https://arxiv.org/abs/2410.10347): try the cheap model first, fall back to the expensive one only when the cheap answer is not good enough.

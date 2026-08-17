@@ -37,6 +37,28 @@ Separately from all four: reporting a vulnerability in SBproxy, verifying a
 release signature, and checking build provenance live in
 [`SECURITY.md`](../SECURITY.md) at the repository root.
 
+## Identity and credential controls
+
+These sit underneath more than one of the four surfaces above, so they get
+their own list rather than a slot in any single one.
+
+**Authenticating the caller.** [auth-oidc.md](auth-oidc.md) covers the
+`oidc` provider: a full authorization-code-plus-PKCE login with a sealed
+session cookie, for callers that are people. [web-bot-auth.md](web-bot-auth.md)
+covers the `bot_auth` provider: RFC 9421 signature verification against a
+published key directory, for callers that claim to be a known crawler and can
+prove it rather than just assert it.
+
+**Managing the credentials themselves.** [key-management.md](key-management.md)
+covers minting, revoking, and rotating inbound virtual keys at runtime through
+the admin API, hashed at rest. [secrets.md](secrets.md) covers the one
+reference grammar every secret-bearing config value resolves through,
+regardless of which field it sits in.
+
+**Constraining outbound credentials.** [outbound-dpop.md](outbound-dpop.md)
+covers RFC 9449 sender-constrained tokens on the credentials SBproxy presents
+to an upstream, so a stolen bearer token by itself is not enough to replay.
+
 ## What the gateway is actually good at
 
 Being unavoidable. Every control on the pages above is enforcement at a choke
@@ -158,9 +180,11 @@ If you are securing a deployment for the first time:
 2. [api-security.md](api-security.md), [mcp-security.md](mcp-security.md), or
    [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md),
    depending on what you are putting behind it.
-3. [audit-log.md](audit-log.md), because the controls are worth much less
+3. [policy.md](policy.md), once you know which threat class you are answering
+   and need the actual policy, its fields, and a config example.
+4. [audit-log.md](audit-log.md), because the controls are worth much less
    without somewhere to send what they record.
-4. [`SECURITY.md`](../SECURITY.md), for release verification and how to report
+5. [`SECURITY.md`](../SECURITY.md), for release verification and how to report
    something.
 
 If you are responding to a security review, the topic pages are written to

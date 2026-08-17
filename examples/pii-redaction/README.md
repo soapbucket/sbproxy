@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![PII redaction at the AI request boundary](../../docs/assets/pii-redaction.gif)
+
 When `pii.enabled: true` is set on an AI proxy origin, the gateway redacts well-known PII shapes from the parsed JSON request body before forwarding to the upstream provider. `defaults: true` enables the built-in rule set: email, US SSN, credit card with Luhn check, phone, IPv4, and common API key shapes (OpenAI, Anthropic, AWS, GitHub). Custom regex rules layer on top of the defaults, so an organisation can also redact internal ticket references, codenames, or any other shape the default catalogue does not catch. `redact_request: true` rewrites every string leaf in the JSON request body before it is forwarded; `redact_response: false` leaves response bodies untouched so the model output is delivered as-is to the client.
 
 ## Run

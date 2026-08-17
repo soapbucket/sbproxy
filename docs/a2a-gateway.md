@@ -1,7 +1,7 @@
 # A2A gateway
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-16*
 
-The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces.
+The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces. See [`examples/a2a-protocol/`](../examples/a2a-protocol/) for a complete working config.
 
 ## What ships and what does not
 
@@ -223,7 +223,9 @@ delegation chain the hop sits.
 
 The full configuration, including why the agent boundary has its own
 action vocabulary and why the default rejects on delegated hops, is in
-[prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
+[prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary). See
+[`examples/a2a-prompt-injection/`](../examples/a2a-prompt-injection/) for a
+complete working config.
 
 ### Cost
 

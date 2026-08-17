@@ -1,6 +1,6 @@
 # sbproxy air-gapped demo: manifest-pinned local weights, offline config
 # checks, and guardrails that block with zero egress. Every command below
-# runs with no network access: no provider keys, no upstream, no
+# makes no outbound calls: no provider keys, no upstream, no
 # downloads.
 #
 # Regenerate with:  scripts/record-tapes.sh use-case-air-gapped
