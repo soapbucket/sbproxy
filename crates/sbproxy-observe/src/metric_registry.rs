@@ -2230,6 +2230,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_peer_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_peer_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_content_filter_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_content_filter"),

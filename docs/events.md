@@ -267,6 +267,8 @@ A `fail_closed` entry does not have to also appear in `types`, but if it does no
 
 `sbproxy.evidence.seq` only advances while something installed would actually receive `mcp_governance_decision`, so the sequence covers the period evidence emission is enabled: turning it off freezes the counter rather than creating a gap, and turning it back on resumes from where it left off.
 
+A gap inside that enabled period does not automatically mean a lost record. The sequence number is allocated before the delivery attempt, not after it succeeds, so a `fail_closed`-refused call still consumes one: the record was never queued, never delivered, and the caller was refused instead of served un-evidenced. That number then reads to a SIEM exactly like a genuinely dropped best-effort record would, a hole with nothing behind it, even though nothing was actually lost, because nothing was ever produced to lose. A SIEM rule alerting on a gap in this stream should therefore treat it as "a governed call may have been refused for lack of evidence, or a record was dropped," not "a record was dropped" alone, and corroborate against `sbproxy_mcp_evidence_fail_closed_total{tenant}` (ticks on exactly the refusal case) before assuming data loss over a fail-closed refusal.
+
 ## Retention
 
 There is no `retention:` key anywhere in the `events:` block, and that is deliberate rather than an omission. The gateway is a producer, not a store: it appends to a file or POSTs to a webhook and moves on, and a per-event-type retention window would mean the proxy owning a decision it has no way to enforce once the bytes have left the process.

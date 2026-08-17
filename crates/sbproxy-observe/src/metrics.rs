@@ -4428,6 +4428,36 @@ pub fn record_mcp_session_registry_saturated() {
     counter.inc();
 }
 
+/// Record one peer-profile observation that could not be tracked
+/// because the peer registry was full, either globally
+/// (`sbproxy_extension::mcp::peer_profile::MAX_TRACKED_PEERS`) or for
+/// the caller's tenant
+/// (`MAX_TRACKED_PEERS_PER_TENANT`)
+/// (`sbproxy_mcp_peer_registry_saturated_total`, WOR-2384 whole-branch
+/// review, item 1: fail-closed per-pair, no shared fallback profile,
+/// mirroring `record_mcp_session_registry_saturated`'s own redesign).
+/// No labels, same reasoning as that counter's: the tenant that caused
+/// it is exactly the caller-controlled string the cap exists to bound.
+/// Ticks on every refused-tracking call regardless of `downgrade:`
+/// policy -- registry capacity is a fact independent of whether the
+/// caller then refuses (`block`) or allows (`warn`) the call; the
+/// once-per-tenant `tracing::warn!` line that accompanies it is a
+/// separate, deliberately noisier-than-this-counter dedup (see
+/// `peer_profile::warned_tenants`'s doc comment).
+pub fn record_mcp_peer_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_peer_registry_saturated_total",
+            "MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant",
+        )
+        .expect("mcp peer registry saturated counter registers")
+    });
+    counter.inc();
+}
+
 /// Record one `content_filters` category outcome that was not a plain
 /// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
 /// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or

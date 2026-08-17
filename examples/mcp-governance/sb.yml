@@ -23,10 +23,10 @@
 #   - legacy: status: draft, never approved. Exists only to show a
 #     draft server's tools refused before dispatch.
 #
-# Run (from inside this directory, so the lockfile and Rego policy
-# paths below resolve):
-#   cd examples/mcp-governance
-#   sbproxy serve -f sb.yml
+# Run (from the repository root, like every other example: the
+# lockfile and Rego policy paths below are written relative to that
+# working directory, not this file's):
+#   sbproxy serve -f examples/mcp-governance/sb.yml
 #
 # See README.md for the full walkthrough.
 

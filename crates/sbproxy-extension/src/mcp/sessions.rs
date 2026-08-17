@@ -30,7 +30,11 @@ use std::time::{Duration, Instant};
 /// behind [`MAX_TRACKED_SESSIONS_PER_TENANT`]: a single tenant can
 /// never reach this ceiling on its own (it would hit its own sub-cap
 /// first), so this bounds the number of *distinct tenants* with live
-/// sessions at once, not a single tenant's flood.
+/// sessions at once, not a single tenant's flood. `4096 /
+/// MAX_TRACKED_SESSIONS_PER_TENANT` (16 tenants at full sub-cap) is a
+/// deployment-sizing fact -- how many tenants this process can hold
+/// sessions for at once -- not a per-tenant isolation guarantee; the
+/// sub-cap is what isolates one tenant's flood from every other's.
 pub const MAX_TRACKED_SESSIONS: usize = 4096;
 
 /// Ceiling on the number of concurrently-live sessions one tenant may
@@ -317,13 +321,25 @@ impl SessionStore {
         };
         Self::prune(&mut map);
 
-        if map.len() >= cap {
-            self.report_saturation(cap, "global");
-            return SessionMint::Saturated;
-        }
+        // Per-tenant sub-cap first (whole-branch review, item 5):
+        // checking the global cap first would let a 17th tenant be
+        // refused outright the moment the registry as a whole is
+        // full, even though that tenant itself holds no sessions yet
+        // -- an honest refusal names the reason the caller actually
+        // hit. "Your own tenant is at its sub-cap" is the more common,
+        // more actionable one to report first; the global cap still
+        // exists to bound how many *distinct* tenants this process
+        // tracks sessions for at all, 16 at a time at full sub-cap
+        // (`MAX_TRACKED_SESSIONS / MAX_TRACKED_SESSIONS_PER_TENANT`),
+        // a deployment-sizing fact, not a per-tenant isolation
+        // guarantee.
         let tenant_live = map.values().filter(|e| e.tenant_id == tenant_id).count();
         if tenant_live >= tenant_cap {
             self.report_saturation(tenant_cap, "tenant");
+            return SessionMint::Saturated;
+        }
+        if map.len() >= cap {
+            self.report_saturation(cap, "global");
             return SessionMint::Saturated;
         }
 
@@ -1110,6 +1126,30 @@ mod tests {
                 SessionMint::Minted(_)
             ),
             "a different tenant, unaffected by tenant-a's sub-cap, must still mint"
+        );
+    }
+
+    #[test]
+    fn the_tenant_sub_cap_is_checked_before_the_global_cap() {
+        // Whole-branch review, item 5: checking the global cap first
+        // would refuse a brand-new tenant that has minted nothing
+        // itself, once the registry as a whole happens to be full --
+        // an honest refusal names the reason the *caller* actually
+        // hit. Set the global cap equal to the tenant cap so both are
+        // simultaneously true, and confirm the sub-cap is what a
+        // caller sees first: the third mint for the same tenant is
+        // refused with the registry still one slot under the global
+        // cap, proving the tenant check ran, and won, before the
+        // global one could.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let (cap, tenant_cap) = (3, 2);
+        store.create_capped("tenant-a", cap, tenant_cap);
+        store.create_capped("tenant-a", cap, tenant_cap);
+        assert_eq!(store.len(), 2, "one slot under the global cap of 3");
+        assert_eq!(
+            store.create_capped("tenant-a", cap, tenant_cap),
+            SessionMint::Saturated,
+            "tenant-a's own sub-cap refuses this before the global cap ever would"
         );
     }
 

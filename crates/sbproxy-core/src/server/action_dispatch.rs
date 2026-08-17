@@ -3263,6 +3263,9 @@ pub(super) async fn handle_mcp_action(
                         mcp_server_approval_refusal_for_non_tool_call(
                             mcp,
                             ctx,
+                            "resources/read",
+                            mcp_session_id.as_deref(),
+                            is_modern,
                             &resource.server_name,
                         )
                         .or_else(|| {
@@ -3270,6 +3273,9 @@ pub(super) async fn handle_mcp_action(
                                 mcp,
                                 ctx,
                                 session,
+                                "resources/read",
+                                mcp_session_id.as_deref(),
+                                is_modern,
                                 &resource.server_name,
                             )
                         })
@@ -3332,6 +3338,8 @@ pub(super) async fn handle_mcp_action(
                                 ctx,
                                 session,
                                 "resources/read",
+                                mcp_session_id.as_deref(),
+                                is_modern,
                                 server_name,
                                 &mut value,
                             ) {
@@ -3473,16 +3481,25 @@ pub(super) async fn handle_mcp_action(
                 // WOR-2384 (MCP09) fix round 1: approval status runs
                 // first, same pre-dispatch position, same `or_else`
                 // short-circuit as `resources/read`.
-                mcp_server_approval_refusal_for_non_tool_call(mcp, ctx, &p.server_name).or_else(
-                    || {
-                        mcp_peer_downgrade_refusal_for_non_tool_call(
-                            mcp,
-                            ctx,
-                            session,
-                            &p.server_name,
-                        )
-                    },
+                mcp_server_approval_refusal_for_non_tool_call(
+                    mcp,
+                    ctx,
+                    "prompts/get",
+                    mcp_session_id.as_deref(),
+                    is_modern,
+                    &p.server_name,
                 )
+                .or_else(|| {
+                    mcp_peer_downgrade_refusal_for_non_tool_call(
+                        mcp,
+                        ctx,
+                        session,
+                        "prompts/get",
+                        mcp_session_id.as_deref(),
+                        is_modern,
+                        &p.server_name,
+                    )
+                })
             }) {
                 JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
             } else {
@@ -3535,6 +3552,8 @@ pub(super) async fn handle_mcp_action(
                             ctx,
                             session,
                             "prompts/get",
+                            mcp_session_id.as_deref(),
+                            is_modern,
                             server_name,
                             &mut value,
                         ) {
@@ -5110,6 +5129,31 @@ pub(super) async fn handle_mcp_action(
                                         newly_sensitive: false,
                                     }
                                 };
+                                // Whole-branch review, item 2: a
+                                // fail-closed evidence-delivery failure
+                                // on EITHER flow-label transition below
+                                // used to `return` immediately, before
+                                // `emit_mcp_tool_attribution` ever ran
+                                // -- so a call that had already
+                                // dispatched, and already cost money,
+                                // could skip its own dispatch metrics,
+                                // decision-audit record, billable-call
+                                // queue push, and usage-sink row. The
+                                // caller-facing `evidence_unavailable`
+                                // refusal is still correct (the gateway
+                                // will not hand back a result it cannot
+                                // also evidence), but attribution and
+                                // billing must fire for an executed
+                                // call regardless of which evidence
+                                // emission failed, or how many did.
+                                // `evidence_refused` therefore
+                                // accumulates across all three
+                                // emissions (taint, sensitive,
+                                // attribution's own) with `|=`, and the
+                                // single refusal response below fires
+                                // exactly once, after attribution has
+                                // already unconditionally run.
+                                let mut evidence_refused = false;
                                 if flow_outcome.newly_tainted {
                                     tracing::warn!(
                                         target: "sbproxy::mcp::flow",
@@ -5131,7 +5175,7 @@ pub(super) async fn handle_mcp_action(
                                     // the transition was itself permitted
                                     // -- this guardrail only ever gates a
                                     // *later* outbound call.
-                                    if emit_mcp_governance_evidence(
+                                    evidence_refused |= emit_mcp_governance_evidence(
                                         ctx,
                                         &name,
                                         governed_server,
@@ -5143,19 +5187,7 @@ pub(super) async fn handle_mcp_action(
                                         ),
                                         Some(sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID),
                                         None,
-                                    ) {
-                                        let response =
-                                            mcp_evidence_unavailable_response(request.id.clone());
-                                        return write_mcp_application_response(
-                                            session,
-                                            &response,
-                                            &request_id,
-                                            &rpc_method,
-                                            modern_server.as_ref(),
-                                            None,
-                                        )
-                                        .await;
-                                    }
+                                    );
                                 }
                                 if flow_outcome.newly_sensitive {
                                     tracing::warn!(
@@ -5170,7 +5202,7 @@ pub(super) async fn handle_mcp_action(
                                         sbproxy_modules::action::mcp::MCP_FLOW_SENSITIVE_RULE_ID,
                                         "warn",
                                     );
-                                    if emit_mcp_governance_evidence(
+                                    evidence_refused |= emit_mcp_governance_evidence(
                                         ctx,
                                         &name,
                                         governed_server,
@@ -5182,19 +5214,7 @@ pub(super) async fn handle_mcp_action(
                                         ),
                                         Some(sbproxy_modules::action::mcp::MCP_FLOW_SENSITIVE_RULE_ID),
                                         None,
-                                    ) {
-                                        let response =
-                                            mcp_evidence_unavailable_response(request.id.clone());
-                                        return write_mcp_application_response(
-                                            session,
-                                            &response,
-                                            &request_id,
-                                            &rpc_method,
-                                            modern_server.as_ref(),
-                                            None,
-                                        )
-                                        .await;
-                                    }
+                                    );
                                 }
 
                                 // WOR-1644: attribute the call into the
@@ -5205,8 +5225,17 @@ pub(super) async fn handle_mcp_action(
                                 // `mcp_governance_decision` evidence
                                 // record and reports whether a
                                 // fail-closed delivery failure must
-                                // refuse this call.
-                                let evidence_refused = emit_mcp_tool_attribution(
+                                // refuse this call. Unconditional on
+                                // dispatch (item 2 above): this call
+                                // sits after both flow-label checks
+                                // now, never gated behind either one's
+                                // own evidence outcome, because
+                                // attribution/billing/usage accounting
+                                // for a call that already ran must not
+                                // depend on whether an unrelated
+                                // evidence record for the same call
+                                // happened to queue successfully.
+                                evidence_refused |= emit_mcp_tool_attribution(
                                     ctx,
                                     mcp,
                                     &name,
@@ -5235,18 +5264,29 @@ pub(super) async fn handle_mcp_action(
 
                                 if evidence_refused {
                                     // WOR-2384: `events.fail_closed` names
-                                    // `mcp_governance_decision` and the
-                                    // evidence record could not be queued.
-                                    // The tool call may already have run
-                                    // (or already failed) upstream, but the
-                                    // gateway will not hand back a result it
+                                    // `mcp_governance_decision` and at
+                                    // least one of this call's evidence
+                                    // records (the taint transition, the
+                                    // sensitive-touched transition, or
+                                    // the tool-call verdict itself, any
+                                    // or all of the three `|=`'d above)
+                                    // could not be queued. The tool call
+                                    // may already have run (or already
+                                    // failed) upstream, but the gateway
+                                    // will not hand back a result it
                                     // cannot also evidence, so this
                                     // overrides every other outcome below,
                                     // including a clean allow.
                                     // `sbproxy_mcp_evidence_fail_closed_total{tenant}`
-                                    // was already ticked inside
-                                    // `emit_mcp_tool_attribution`, at the
-                                    // point the delivery failure was
+                                    // was already ticked once per failed
+                                    // emission inside
+                                    // `emit_mcp_governance_evidence`
+                                    // itself (called directly above for
+                                    // the two flow-label transitions,
+                                    // and again inside
+                                    // `emit_mcp_tool_attribution` for
+                                    // the tool-call verdict), at the
+                                    // point each delivery failure was
                                     // actually observed.
                                     mcp_evidence_unavailable_response(request.id.clone())
                                 } else if modern_output_invalid {
@@ -5704,17 +5744,30 @@ fn mcp_server_draft_denial(
 }
 
 /// WOR-2384 (MCP09) fix round 1: the approval-status equivalent of
-/// [`mcp_peer_downgrade_refusal_for_non_tool_call`], for `resources/list`,
-/// `resources/read`, and `prompts/get` -- MCP surfaces that reach a
-/// federated peer but are not `tools/call`, so (matching the same
-/// carve-out the peer-downgrade check already uses for these methods)
-/// this does not touch the `mcp_governance_decision` evidence bus; that
-/// surface stays scoped to `tools/call` dispatch. `draft` refuses;
-/// `deprecated` logs and counts but still returns `None` (the request
-/// proceeds); `approved` is silent.
+/// [`mcp_peer_downgrade_refusal_for_non_tool_call`], for `resources/read`
+/// and `prompts/get` -- MCP surfaces that reach a federated peer but
+/// are not `tools/call`. `draft` refuses; `deprecated` logs and counts
+/// but still returns `None` (the request proceeds); `approved` is
+/// silent.
+///
+/// Whole-branch review, item 4: both `draft`'s refusal and
+/// `deprecated`'s warning now also reach the `mcp_governance_decision`
+/// evidence bus, mirroring the `tools/call` sibling
+/// (`mcp_server_draft_denial` and the deprecated-server warn site in
+/// [`handle_mcp_action`]) -- `method` names `mcp.method.name`, and
+/// `gen_ai.tool.name` is absent, since neither surface names a tool.
+/// Fire-and-forget: unlike the `tools/call` sibling, this does not
+/// also wire the fail-closed-refuses-differently contract, which would
+/// mean widening every caller's `Option<String>` return shape to carry
+/// that response too. The refusal this function already returns, and
+/// the `SecurityAuditEntry` a caller downstream still emits, both stay
+/// durable even if this specific evidence record fails to deliver.
 fn mcp_server_approval_refusal_for_non_tool_call(
     mcp: &sbproxy_modules::action::McpAction,
     ctx: &RequestContext,
+    method: &str,
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
     server_name: &str,
 ) -> Option<String> {
     match mcp.server_status(server_name) {
@@ -5729,6 +5782,18 @@ fn mcp_server_approval_refusal_for_non_tool_call(
                 ctx.hostname.as_str(),
                 "mcp_server_approval",
                 "deny",
+            );
+            let _ = emit_mcp_governance_evidence_for_method(
+                ctx,
+                method,
+                None,
+                server_name,
+                mcp_session_id,
+                is_modern,
+                None,
+                McpGovernanceVerdict::Deny(sbproxy_modules::action::mcp::MCP_SERVER_DRAFT_REASON),
+                Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
+                None,
             );
             Some(format!(
                 "federated server '{server_name}' has status 'draft' and is not yet approved for calls"
@@ -5745,6 +5810,20 @@ fn mcp_server_approval_refusal_for_non_tool_call(
                 ctx.hostname.as_str(),
                 "mcp_server_approval",
                 "warn",
+            );
+            let _ = emit_mcp_governance_evidence_for_method(
+                ctx,
+                method,
+                None,
+                server_name,
+                mcp_session_id,
+                is_modern,
+                None,
+                McpGovernanceVerdict::Warn(
+                    sbproxy_modules::action::mcp::MCP_SERVER_DEPRECATED_REASON,
+                ),
+                Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
+                None,
             );
             None
         }
@@ -6022,16 +6101,62 @@ fn sha256_hex_prefix(value: &str) -> String {
 /// layer's per-property payload cap.
 const MCP_AUDIT_FIELD_MAX_BYTES: usize = 8 * 1024;
 
+/// Slack kept above [`MCP_AUDIT_FIELD_MAX_BYTES`] when pre-bounding a
+/// field's serialized form before [`sbproxy_observe::redact::redact_secrets`]
+/// runs over it (whole-branch review addendum). Generous relative to
+/// any secret shape `redact_secrets` matches (API keys, tokens, and
+/// similar credential shapes run a few dozen to a few hundred bytes),
+/// so a pattern that starts inside the final emitted window and
+/// extends slightly past it still has its whole match available to
+/// `redact_secrets`, rather than being cut mid-pattern by the
+/// pre-redaction bound and missed.
+const MCP_AUDIT_FIELD_PRE_REDACT_MARGIN_BYTES: usize = 1024;
+
+/// The largest prefix of `value` no longer than `max_bytes` that ends
+/// on a UTF-8 character boundary. Shared by [`bound_mcp_audit_field`]'s
+/// two truncation points (the pre-redaction bound and the final
+/// emitted size) so both use identical boundary-safe logic.
+fn mcp_audit_field_boundary(value: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Secret-redact and size-cap one mcp_audit content field (WOR-2095).
+///
+/// Whole-branch review addendum: `value` is bounded to
+/// [`MCP_AUDIT_FIELD_MAX_BYTES`] plus
+/// [`MCP_AUDIT_FIELD_PRE_REDACT_MARGIN_BYTES`] BEFORE `redact_secrets`
+/// runs, not after. This is correct, not merely faster: nothing past
+/// the final truncation point below is ever emitted in the field this
+/// function returns, so redacting bytes this function is going to
+/// discard anyway buys no coverage -- only cost proportional to a
+/// caller-controlled document's full size, regardless of how small
+/// the field that actually ships is. `redact_secrets`'s own output can
+/// still be longer or shorter than its input (a matched credential is
+/// replaced with a `[REDACTED:...]` marker of a different length), so
+/// the final truncation below still has to run on `redact_secrets`'s
+/// result, not the pre-bounded input -- pre-bounding narrows the input
+/// to that pass, it does not replace the output bound.
+///
+/// Ordering nuance this does not (and structurally cannot) fix:
+/// `governance_tool_arguments_field`'s own `apply_content_filters`
+/// pass, which runs before this function ever sees the value, still
+/// scans the caller's full, unbounded document -- `content_filters`
+/// needs a valid parsed JSON value to match against declared shapes,
+/// and there is no byte-prefix of a JSON document's serialized form
+/// that is still valid JSON to hand it, so that pass cannot be
+/// pre-bounded the same way this string-level one can.
 fn bound_mcp_audit_field(value: &str) -> String {
-    let redacted = sbproxy_observe::redact::redact_secrets(value);
+    let pre_bound = MCP_AUDIT_FIELD_MAX_BYTES + MCP_AUDIT_FIELD_PRE_REDACT_MARGIN_BYTES;
+    let pre_bounded = &value[..mcp_audit_field_boundary(value, pre_bound)];
+    let redacted = sbproxy_observe::redact::redact_secrets(pre_bounded);
     if redacted.len() <= MCP_AUDIT_FIELD_MAX_BYTES {
         return redacted;
     }
-    let mut end = MCP_AUDIT_FIELD_MAX_BYTES;
-    while end > 0 && !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = mcp_audit_field_boundary(&redacted, MCP_AUDIT_FIELD_MAX_BYTES);
     format!("{}...[truncated]", &redacted[..end])
 }
 
@@ -6077,6 +6202,16 @@ fn bound_mcp_audit_field(value: &str) -> String {
 /// `content_filters.secrets` is left `off`; it was never going to
 /// catch a PII shape only `content_filters.pii` recognizes, which is
 /// the gap this fix round closes.
+///
+/// Whole-branch review addendum: `content_filters` and `serde_json::to_string`
+/// below both still run over `arguments` at its full, caller-controlled
+/// size, unavoidably (see [`bound_mcp_audit_field`]'s doc comment for
+/// why the JSON-level pass specifically cannot be pre-bounded the way
+/// the string-level one now is). Bounding happens as early as it
+/// safely can: `bound_mcp_audit_field` pre-bounds the *serialized*
+/// string before its own `redact_secrets` pass, rather than running
+/// that pass over the full string and discarding everything past
+/// [`MCP_AUDIT_FIELD_MAX_BYTES`] only at the very end.
 fn governance_tool_arguments_field(
     mcp: &sbproxy_modules::action::McpAction,
     capture_arguments: bool,
@@ -6509,6 +6644,45 @@ fn emit_mcp_governance_evidence(
     rule_id: Option<&str>,
     tool_arguments_verbatim: Option<&str>,
 ) -> bool {
+    emit_mcp_governance_evidence_for_method(
+        ctx,
+        "tools/call",
+        Some(tool_name),
+        server,
+        mcp_session_id,
+        is_modern,
+        tool_arguments_hash,
+        verdict,
+        rule_id,
+        tool_arguments_verbatim,
+    )
+}
+
+/// Generalized form of [`emit_mcp_governance_evidence`] (whole-branch
+/// review, item 4): closes the gap `docs/mcp-security.md`'s "every
+/// governed decision emits" claim did not actually cover -- a `draft`
+/// status refusal, a peer-downgrade refusal, and a content-filter
+/// block on `resources/read` or `prompts/get` used to emit only a
+/// `SecurityAuditEntry` and a policy metric, never this SIEM-routable
+/// bus, even though their `tools/call` siblings always have. `method`
+/// is the JSON-RPC method name (`"tools/call"`, `"resources/read"`,
+/// `"prompts/get"`); `tool_name` is `None` for the latter two, since
+/// neither names a tool. [`emit_mcp_governance_evidence`] is a thin
+/// wrapper over this that keeps its own signature, and every one of
+/// its existing callers, completely unchanged.
+#[allow(clippy::too_many_arguments)]
+fn emit_mcp_governance_evidence_for_method(
+    ctx: &RequestContext,
+    method: &str,
+    tool_name: Option<&str>,
+    server: &str,
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
+    tool_arguments_hash: Option<&str>,
+    verdict: McpGovernanceVerdict<'_>,
+    rule_id: Option<&str>,
+    tool_arguments_verbatim: Option<&str>,
+) -> bool {
     use sbproxy_observe::events::{EventType, ProxyEvent};
 
     let event_type = EventType::McpGovernanceDecision;
@@ -6544,7 +6718,8 @@ fn emit_mcp_governance_evidence(
     };
     let seq = sbproxy_observe::evidence_seq::next_seq(&ctx.tenant_id);
 
-    let data = mcp_governance_event_data(
+    let data = mcp_governance_event_data_for_method(
+        method,
         tool_name,
         server,
         ctx.request_id.as_str(),
@@ -6747,12 +6922,13 @@ fn mcp_peer_downgrade_check(
     });
 
     use sbproxy_extension::mcp::peer_profile::ObservationVerdict;
+    let policy: sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy = prefix.downgrade.into();
     match sbproxy_extension::mcp::peer_profile::observe_and_record(
         ctx.tenant_id.as_str(),
         &prefix.peer_key,
         &observed_protocol,
         observed_auth_required,
-        prefix.downgrade.into(),
+        policy,
     ) {
         ObservationVerdict::Allowed => McpPeerDowngradeDecision::Allowed,
         ObservationVerdict::Warned(kind) => McpPeerDowngradeDecision::Warned {
@@ -6767,6 +6943,31 @@ fn mcp_peer_downgrade_check(
                 kind.reason_code(),
             ),
         },
+        // WOR-2384 whole-branch review, item 1: the registry could not
+        // track this NEW pair at all -- no baseline exists to compare
+        // against, shared or otherwise. `block` treats "no baseline"
+        // the same way it treats a demonstrated downgrade: refuse,
+        // fail closed, with its own rule id so a SIEM rule keyed on
+        // `PEER_DOWNGRADE_RULE_ID` does not also match this. `warn`
+        // never refuses a downgrade it *can* observe, so it does not
+        // refuse one it cannot observe either; the registry-capacity
+        // metric and the once-per-tenant log line already fired
+        // inside `observe_and_record` regardless of which policy is
+        // configured.
+        ObservationVerdict::Saturated => match policy {
+            sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block => {
+                McpPeerDowngradeDecision::Refused {
+                    rule_id: sbproxy_extension::mcp::peer_profile::PEER_PROFILE_SATURATED_RULE_ID,
+                    reason_code: sbproxy_extension::mcp::peer_profile::PEER_PROFILE_SATURATED_RULE_ID,
+                    message: format!(
+                        "federated server '{server_name}' has no recorded downgrade baseline for this tenant (peer profile registry is at capacity)",
+                    ),
+                }
+            }
+            sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Warn => {
+                McpPeerDowngradeDecision::Allowed
+            }
+        },
     }
 }
 
@@ -6775,24 +6976,39 @@ fn mcp_peer_downgrade_check(
 /// peer (`resources/read`, `prompts/get`). Same trust decision, same
 /// peer contact -- but lighter than the `tools/call` treatment: logs,
 /// bumps the `mcp_peer_downgrade` policy metric, and (on a refusal)
-/// emits the same `SecurityAuditEntry`, but does not touch the
-/// `mcp_governance_decision` events bus. That surface stays scoped to
-/// `tools/call` dispatch, the same scoping RBAC and per-tool quota
-/// already keep for these two methods (`mcp_governance_event_data`'s
-/// own doc: "for one dispatched ... MCP tool call"); extending it to
-/// non-tool methods is a larger schema question this round does not
-/// answer.
+/// emits the same `SecurityAuditEntry`.
+///
+/// Whole-branch review, item 4: a warn or a refusal here now also
+/// reaches the `mcp_governance_decision` evidence bus, closing the gap
+/// between this function's behavior and `docs/mcp-security.md`'s
+/// "every governed decision emits" claim -- `method` names
+/// `mcp.method.name`, `gen_ai.tool.name` is absent (neither surface
+/// names a tool), and `rule_id`/the reason match the `tools/call`
+/// sibling's exactly (`PEER_DOWNGRADE_RULE_ID` or
+/// `PROTOCOL_PIN_MISMATCH_RULE_ID`, from `McpPeerDowngradeDecision`
+/// itself, not re-derived here). Fire-and-forget, for the same reason
+/// [`mcp_server_approval_refusal_for_non_tool_call`] is: retrofitting
+/// the fail-closed-refuses-differently contract onto this function's
+/// `Option<String>` return shape is a larger change this round does
+/// not make; the `SecurityAuditEntry` below stays the durable record
+/// on a delivery failure here.
 ///
 /// Returns `Some(message)` when the caller must refuse.
 fn mcp_peer_downgrade_refusal_for_non_tool_call(
     mcp: &sbproxy_modules::action::McpAction,
     ctx: &RequestContext,
     session: &Session,
+    method: &str,
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
     server_name: &str,
 ) -> Option<String> {
     match mcp_peer_downgrade_check(mcp, ctx, server_name) {
         McpPeerDowngradeDecision::Allowed => None,
-        McpPeerDowngradeDecision::Warned { reason_code, .. } => {
+        McpPeerDowngradeDecision::Warned {
+            rule_id,
+            reason_code,
+        } => {
             tracing::warn!(
                 target: "sbproxy::mcp::peer_profile",
                 server = %server_name,
@@ -6805,12 +7021,24 @@ fn mcp_peer_downgrade_refusal_for_non_tool_call(
                 "mcp_peer_downgrade",
                 "warn",
             );
+            let _ = emit_mcp_governance_evidence_for_method(
+                ctx,
+                method,
+                None,
+                server_name,
+                mcp_session_id,
+                is_modern,
+                None,
+                McpGovernanceVerdict::Warn(reason_code),
+                Some(rule_id),
+                None,
+            );
             None
         }
         McpPeerDowngradeDecision::Refused {
+            rule_id,
             reason_code,
             message,
-            ..
         } => {
             tracing::warn!(
                 target: "sbproxy::mcp::peer_profile",
@@ -6835,6 +7063,18 @@ fn mcp_peer_downgrade_refusal_for_non_tool_call(
             )
             .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
+            let _ = emit_mcp_governance_evidence_for_method(
+                ctx,
+                method,
+                None,
+                server_name,
+                mcp_session_id,
+                is_modern,
+                None,
+                McpGovernanceVerdict::Deny(reason_code),
+                Some(rule_id),
+                None,
+            );
             Some(message)
         }
     }
@@ -6843,22 +7083,29 @@ fn mcp_peer_downgrade_refusal_for_non_tool_call(
 /// WOR-2384 (MCP01/MCP10, I1 fix round): apply `content_filters` to a
 /// `resources/read` or `prompts/get` result. Mutates `value` in place
 /// for a `redact` hit. `method` is `"resources/read"` or
-/// `"prompts/get"`, for the log line and the refusal message only --
-/// this function does not branch on it.
+/// `"prompts/get"`, for the log line, the refusal message, and (below)
+/// `mcp.method.name` on the governance event.
 ///
 /// Mirrors [`mcp_peer_downgrade_refusal_for_non_tool_call`]'s evidence
-/// shape exactly, for the same reason: `tracing::warn!` and a policy
-/// metric on any match, plus `SecurityAuditEntry::policy_violation` on
-/// an actual refusal, but never the `mcp_governance_decision` events
-/// bus, which stays scoped to `tools/call` dispatch.
+/// shape exactly: `tracing::warn!` and a policy metric on any match,
+/// `SecurityAuditEntry::policy_violation` on an actual refusal, and
+/// (whole-branch review, item 4) a `mcp_governance_decision` event on
+/// both a warn/redact match and a block, `rule_id` built the same
+/// `"{category}:{mode}:{detectors}"` way the `tools/call` sibling
+/// builds it, `gen_ai.tool.name` absent since this method names no
+/// tool. Fire-and-forget, for the same reason
+/// [`mcp_peer_downgrade_refusal_for_non_tool_call`] is.
 ///
 /// Returns `Some(message)` when the caller must refuse the whole
 /// result.
+#[allow(clippy::too_many_arguments)]
 fn mcp_content_filter_for_non_tool_call(
     mcp: &sbproxy_modules::action::McpAction,
     ctx: &RequestContext,
     session: &Session,
     method: &str,
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
     server_name: &str,
     value: &mut serde_json::Value,
 ) -> Option<String> {
@@ -6870,6 +7117,12 @@ fn mcp_content_filter_for_non_tool_call(
                     sbproxy_modules::action::mcp::McpFilterModeConfig::Redact => "redact",
                     _ => "warn",
                 };
+                let rule_id = format!(
+                    "{}:{}:{}",
+                    hit.category,
+                    verdict_label,
+                    hit.detectors.join(",")
+                );
                 tracing::warn!(
                     target: "sbproxy::mcp::content_filter",
                     method = %method,
@@ -6883,6 +7136,20 @@ fn mcp_content_filter_for_non_tool_call(
                     ctx.tenant_id.as_str(),
                     hit.category,
                     verdict_label,
+                );
+                let _ = emit_mcp_governance_evidence_for_method(
+                    ctx,
+                    method,
+                    None,
+                    server_name,
+                    mcp_session_id,
+                    is_modern,
+                    None,
+                    McpGovernanceVerdict::Warn(
+                        sbproxy_modules::action::mcp::MCP_CONTENT_FILTER_REASON,
+                    ),
+                    Some(rule_id.as_str()),
+                    None,
                 );
             }
             None
@@ -6920,6 +7187,19 @@ fn mcp_content_filter_for_non_tool_call(
             )
             .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
+            let rule_id = format!("{category}:block:{}", detectors.join(","));
+            let _ = emit_mcp_governance_evidence_for_method(
+                ctx,
+                method,
+                None,
+                server_name,
+                mcp_session_id,
+                is_modern,
+                None,
+                McpGovernanceVerdict::Deny(sbproxy_modules::action::mcp::MCP_CONTENT_FILTER_REASON),
+                Some(rule_id.as_str()),
+                None,
+            );
             Some(message)
         }
     }
@@ -6980,6 +7260,50 @@ fn mcp_governance_event_data(
     rule_id: Option<&str>,
     arguments_verbatim: Option<&str>,
 ) -> serde_json::Value {
+    mcp_governance_event_data_for_method(
+        "tools/call",
+        Some(tool_name),
+        server,
+        request_id,
+        mcp_session_id,
+        protocol_version,
+        tenant_id,
+        route,
+        verdict,
+        redact_state,
+        arguments_hash,
+        seq,
+        rule_id,
+        arguments_verbatim,
+    )
+}
+
+/// Generalized form of [`mcp_governance_event_data`] (whole-branch
+/// review, item 4): `method` replaces the value this function's
+/// original, `tools/call`-only form hardcoded into `mcp.method.name`,
+/// and `tool_name` is `None` for a method that never names a tool
+/// (`resources/read`, `prompts/get`) -- `gen_ai.tool.name` is then
+/// simply absent from the payload rather than carrying an empty
+/// string. [`mcp_governance_event_data`] is a thin wrapper over this
+/// that keeps its own signature, and every one of its existing
+/// callers, completely unchanged.
+#[allow(clippy::too_many_arguments)]
+fn mcp_governance_event_data_for_method(
+    method: &str,
+    tool_name: Option<&str>,
+    server: &str,
+    request_id: &str,
+    mcp_session_id: Option<&str>,
+    protocol_version: &str,
+    tenant_id: &str,
+    route: &str,
+    verdict: McpGovernanceVerdict<'_>,
+    redact_state: Option<&sbproxy_observe::logging::OpRedactState>,
+    arguments_hash: Option<&str>,
+    seq: u64,
+    rule_id: Option<&str>,
+    arguments_verbatim: Option<&str>,
+) -> serde_json::Value {
     let (verdict_label, raw_denial_reason, is_policy_denied) = match verdict {
         McpGovernanceVerdict::Allow => ("allow", None, false),
         McpGovernanceVerdict::Warn(reason) => ("warn", Some(reason), false),
@@ -6996,9 +7320,11 @@ fn mcp_governance_event_data(
 
     let mut fields = serde_json::Map::new();
     fields.insert("gen_ai.operation.name".to_string(), "execute_tool".into());
-    fields.insert("gen_ai.tool.name".to_string(), tool_name.into());
+    if let Some(tool_name) = tool_name {
+        fields.insert("gen_ai.tool.name".to_string(), tool_name.into());
+    }
     fields.insert("gen_ai.tool.call.id".to_string(), request_id.into());
-    fields.insert("mcp.method.name".to_string(), "tools/call".into());
+    fields.insert("mcp.method.name".to_string(), method.into());
     if let Some(session_id) = mcp_session_id {
         fields.insert("mcp.session.id".to_string(), session_id.into());
     }
@@ -9454,8 +9780,10 @@ mod mcp_catalog_snapshot_tests {
         McpPeerDowngradeDecision,
     };
     use crate::context::RequestContext;
+    use crate::pipeline::CompiledPipeline;
     use pingora_core::protocols::l4::stream::Stream;
     use pingora_proxy::Session;
+    use sbproxy_config::types::EventsConfig;
     use sbproxy_extension::mcp::protocol::{
         compile_modern_tool_contract, McpSchemaLimits, McpToolContract,
     };
@@ -10125,6 +10453,110 @@ mod mcp_catalog_snapshot_tests {
         assert!(
             message.contains("content filter"),
             "denial must name the content filter: {message}"
+        );
+    }
+
+    /// Whole-branch review, item 4, red-first: before this fix,
+    /// `mcp_content_filter_for_non_tool_call`'s `Denied` arm never
+    /// reached the `mcp_governance_decision` bus at all -- only a
+    /// `SecurityAuditEntry` and a policy metric -- even though
+    /// `docs/mcp-security.md` claims every governed decision emits.
+    /// This drives the exact same content-filter-block scenario the
+    /// sibling test above proves the wire refusal for, and additionally
+    /// asserts the event itself: `mcp.method.name: "resources/read"`,
+    /// no `gen_ai.tool.name` (this method names no tool), verdict
+    /// `deny`, and a rule id built the same
+    /// `"{category}:block:{detectors}"` way the `tools/call` sibling
+    /// builds it.
+    #[tokio::test]
+    async fn wor_2384_resources_read_content_filter_block_emits_governance_evidence() {
+        const SERVER: &str = "item4-resource-filter-server";
+        const RESOURCE_URI: &str = "res://item4-resource-filter-fixture/doc";
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("item4-resource-filter-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            64,
+        )
+        .expect("dedicated file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let origin = one_shot_mcp_result_server(json!({
+            "contents": [{
+                "uri": RESOURCE_URI,
+                "mimeType": "text/plain",
+                "text": "key: AKIAIOSFODNN7EXAMPLE"
+            }]
+        }));
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "item4-resource-filter-fixture", "version": "1.0.0"},
+            "federated_servers": [{"origin": origin, "prefix": SERVER}],
+            "content_filters": {"secrets": "block"}
+        }))
+        .expect("item4 resource-filter fixture compiles");
+        action.federation.seed_tools_for_test(HashMap::new(), None);
+        action.federation.seed_resources_for_test(HashMap::from([(
+            RESOURCE_URI.to_string(),
+            sbproxy_extension::mcp::federation::FederatedResource {
+                uri: RESOURCE_URI.to_string(),
+                name: "doc".to_string(),
+                description: None,
+                mime_type: None,
+                server_name: SERVER.to_string(),
+                upstream_uri: RESOURCE_URI.to_string(),
+            },
+        )]));
+
+        let response = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": RESOURCE_URI}
+            }),
+        )
+        .await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("content filter"),
+            "denial must name the content filter: {response:?}"
+        );
+
+        let event = poll_for_governance_event(&events_path, |event| {
+            event["data"]["sbproxy.tool.server"] == SERVER
+        })
+        .await
+        .expect(
+            "a resources/read content-filter-block mcp_governance_decision event was not \
+             observed within 5s",
+        );
+        assert_eq!(event["event_type"], "mcp_governance_decision");
+        assert_eq!(event["data"]["mcp.method.name"], "resources/read");
+        assert!(
+            event["data"].get("gen_ai.tool.name").is_none(),
+            "resources/read names no tool: {event:?}"
+        );
+        assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+        assert_eq!(event["data"]["error.type"], "policy_denied");
+        assert_eq!(event["data"]["sbproxy.decision.reason"], "content_filter");
+        let rule_id = event["data"]["sbproxy.decision.rule_id"]
+            .as_str()
+            .expect("rule_id present on a content-filter deny");
+        assert!(
+            rule_id.starts_with("secrets:block:"),
+            "rule_id must name the category and mode the tools/call sibling's format does: {rule_id}"
         );
     }
 
@@ -11498,6 +11930,237 @@ mod mcp_catalog_snapshot_tests {
         }
     }
 
+    /// Every label of a gathered family, as `name=value` pairs joined by
+    /// commas, one entry per series, with the series value appended.
+    /// Mirrors `sbproxy_observe::metrics`'s own private test helper of
+    /// the same name; `prometheus::gather()` reads the one process-wide
+    /// default registry both crates register into.
+    fn gathered_series(family_name: &str) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for family in prometheus::gather() {
+            if family.name() != family_name {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                let value = match family.get_field_type() {
+                    prometheus::proto::MetricType::COUNTER => metric.get_counter().value(),
+                    prometheus::proto::MetricType::GAUGE => metric.get_gauge().value(),
+                    other => unreachable!("{family_name} is a {other:?}, not a counter or a gauge"),
+                };
+                out.push((labels.join(","), value));
+            }
+        }
+        out
+    }
+
+    /// Whole-branch review, items 2 + 3: red-first proof that a
+    /// POST-dispatch fail-closed evidence-delivery failure (here, the
+    /// flow-taint transition's own `mcp_governance_decision` emission
+    /// hitting `QueueFull`) does not skip `emit_mcp_tool_attribution`'s
+    /// dispatch metrics, decision-audit record, and billing/usage-sink
+    /// work for a call that already dispatched. Before the item 2 fix,
+    /// this scenario returned early inside the `newly_tainted` block
+    /// and `emit_mcp_tool_attribution` never ran at all, so
+    /// `sbproxy_mcp_tool_dispatch_total` for this tool would still
+    /// read zero after the call below -- this is the exact caller-
+    /// facing shape a call that already ran (and, in a real
+    /// deployment, already cost money) must not lose attribution for.
+    #[tokio::test]
+    async fn wor_2384_queue_full_post_dispatch_evidence_failure_still_records_attribution() {
+        const TOOL_NAME: &str = "wor-2384-queue-full-attribution-tool";
+        const SERVER: &str = "queue-full-attribution-server";
+
+        // A dedicated, tiny-capacity event egress, distinct from the
+        // shared, capacity-64 one
+        // `wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios`
+        // installs above: nextest runs each test function in its own
+        // process, so a second `install_event_egress` call here is a
+        // fresh process-global slot, not a conflict with that test's.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("queue-full-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            1,
+        )
+        .expect("dedicated file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        // A pipeline whose only job here is to carry
+        // `events.fail_closed`: `mcp_governance_fail_closed` reads
+        // `ctx.pipeline.config.events` directly, independent of the
+        // separate `McpAction` fixture below that `handle_mcp_action`
+        // actually dispatches through.
+        let mut events_pipeline = CompiledPipeline::empty_for_test();
+        events_pipeline.config.events = Some(EventsConfig {
+            fail_closed: vec!["mcp_governance_decision".to_string()],
+            ..Default::default()
+        });
+        let events_pipeline = Arc::new(events_pipeline);
+
+        let origin = scripted_responses_server(vec![scripted_tool_call_response()]);
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "queue-full-attribution-fixture", "version": "1.0.0"},
+            "sessions": {"enabled": true},
+            "federated_servers": [{
+                "origin": origin,
+                "prefix": SERVER
+            }],
+            "flow": {
+                "mode": "block",
+                "trusted_servers": ["nobody"],
+                "outbound_tools": ["nobody.*"]
+            }
+        }))
+        .expect("queue-full attribution fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+            None,
+        );
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("__default__")
+            .minted()
+            .expect("mint below the cap");
+
+        // Keep the dedicated egress's single queue slot continuously
+        // full for as long as the dispatch below is in flight: a
+        // one-shot burst only guarantees `Full` for the microseconds
+        // the burst itself takes, not for a real async round trip,
+        // since the channel drains the instant the file worker (a
+        // real, separate OS thread) gets scheduled and catches up.
+        let stop_flooding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood_stop = Arc::clone(&stop_flooding);
+        let flooder = std::thread::spawn(move || {
+            while !flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sbproxy_observe::event_sink::publish_proxy_event_checked(
+                    sbproxy_observe::events::EventType::McpGovernanceDecision,
+                    || {
+                        sbproxy_observe::events::ProxyEvent::new(
+                            sbproxy_observe::events::EventType::McpGovernanceDecision,
+                            "flood.test".to_string(),
+                            "flood-tenant".to_string(),
+                            json!({}),
+                        )
+                    },
+                );
+            }
+        });
+
+        async fn raw_tools_call_exchange(
+            action: &McpAction,
+            request: serde_json::Value,
+            session_id: &str,
+            pipeline: Arc<CompiledPipeline>,
+        ) -> serde_json::Value {
+            let body = serde_json::to_vec(&request).expect("MCP request JSON");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind MCP downstream fixture");
+            let address = listener.local_addr().expect("MCP downstream address");
+            let session_id = session_id.to_string();
+            let client = tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connect MCP downstream fixture");
+                let headers = format!(
+                    "POST / HTTP/1.1\r\nHost: mcp.test\r\ncontent-type: application/json\r\nmcp-session-id: {session_id}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("write MCP request headers");
+                stream
+                    .write_all(&body)
+                    .await
+                    .expect("write MCP request body");
+                let _ = stream.shutdown().await;
+                let mut response = Vec::new();
+                stream
+                    .read_to_end(&mut response)
+                    .await
+                    .expect("read MCP response");
+                response
+            });
+            let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+            let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+            session
+                .as_downstream_mut()
+                .read_request()
+                .await
+                .expect("parse MCP downstream request");
+            let mut context = RequestContext::new();
+            context.pipeline = pipeline;
+
+            handle_mcp_action(&mut session, action, &mut context, false)
+                .await
+                .expect("MCP handler response");
+            drop(session);
+
+            let response = tokio::time::timeout(Duration::from_secs(2), client)
+                .await
+                .expect("MCP response timeout")
+                .expect("MCP downstream task");
+            let response = String::from_utf8(response).expect("MCP HTTP response UTF-8");
+            serde_json::from_str(
+                response
+                    .split_once("\r\n\r\n")
+                    .expect("MCP HTTP response body")
+                    .1,
+            )
+            .expect("MCP JSON response")
+        }
+
+        let call = raw_tools_call_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": TOOL_NAME, "arguments": {}}
+            }),
+            &session_id,
+            events_pipeline,
+        )
+        .await;
+
+        stop_flooding.store(true, std::sync::atomic::Ordering::Relaxed);
+        flooder.join().expect("flooding thread joins");
+
+        assert_eq!(
+            call["error"]["message"].as_str().unwrap_or_default(),
+            "mcp governance evidence could not be recorded; refusing per events.fail_closed (evidence_unavailable)",
+            "the caller must get the fail-closed refusal shape: {call:?}"
+        );
+
+        let series = gathered_series("sbproxy_mcp_tool_dispatch_total");
+        let needle = format!("tool={TOOL_NAME}");
+        let recorded = series
+            .iter()
+            .any(|(labels, value)| labels.contains(needle.as_str()) && *value >= 1.0);
+        assert!(
+            recorded,
+            "attribution (sbproxy_mcp_tool_dispatch_total) must still be recorded for a call \
+             that already dispatched, even though its post-dispatch evidence emission failed \
+             fail-closed: {series:?}"
+        );
+    }
+
     #[tokio::test]
     async fn wor_2384_block_mode_downgrade_refuses_resources_read_and_prompts_get() {
         // WOR-2384 fix round 1, item 4: the peer-downgrade check
@@ -12184,6 +12847,156 @@ mod mcp_catalog_snapshot_tests {
                  must not itself be flagged: {decision:?}"
             );
         }
+    }
+
+    /// WOR-2384 whole-branch review, item 1: wire-level proof that a
+    /// saturated peer registry refuses fail-closed under
+    /// `downgrade: block`, while an ALREADY-tracked peer for the same
+    /// tenant keeps enforcing its own real downgrade history unchanged
+    /// -- saturation for a *new* pair must never reach back into what
+    /// already exists, the same property the store-level tests in
+    /// `peer_profile.rs` cover directly. Drives two real `tools/call`
+    /// requests through `mcp_handler_exchange`, not just
+    /// `mcp_peer_downgrade_check` in isolation, so the actual
+    /// JSON-RPC error surface is exercised too.
+    #[tokio::test]
+    async fn wor_2384_peer_registry_saturation_refuses_a_new_pair_but_not_an_existing_one() {
+        const TENANT: &str = "__default__"; // `mcp_handler_exchange`'s hardcoded context tenant.
+        const EXISTING_SERVER: &str = "peer-saturation-existing-server";
+        const NEW_SERVER: &str = "peer-saturation-new-server";
+        const EXISTING_TOOL: &str = "peer-saturation-existing-tool";
+        const NEW_TOOL: &str = "peer-saturation-new-tool";
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "peer-saturation-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                {
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": EXISTING_SERVER,
+                    "downgrade": "block"
+                },
+                {
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": NEW_SERVER,
+                    "downgrade": "block"
+                }
+            ]
+        }))
+        .expect("peer-saturation fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([
+                (
+                    EXISTING_TOOL.to_string(),
+                    tool(EXISTING_TOOL, EXISTING_SERVER),
+                ),
+                (NEW_TOOL.to_string(), tool(NEW_TOOL, NEW_SERVER)),
+            ]),
+            None,
+        );
+
+        let existing_peer_key = action
+            .prefix_for(EXISTING_SERVER)
+            .expect("compiled prefix")
+            .peer_key
+            .clone();
+
+        // Establish a real MODERN high-water mark for the EXISTING
+        // pair, then fill the rest of this tenant's sub-cap with junk
+        // peer keys so the (never-seen) NEW pair below has nowhere
+        // left to go. The existing pair's own slot counts toward the
+        // sub-cap exactly like any other tracked pair would.
+        assert_eq!(
+            sbproxy_extension::mcp::peer_profile::observe_and_record(
+                TENANT,
+                &existing_peer_key,
+                sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION,
+                false,
+                sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block,
+            ),
+            sbproxy_extension::mcp::peer_profile::ObservationVerdict::Allowed,
+            "the baseline seed itself must be an unrefused first contact"
+        );
+        for i in 1..sbproxy_extension::mcp::peer_profile::MAX_TRACKED_PEERS_PER_TENANT {
+            assert_eq!(
+                sbproxy_extension::mcp::peer_profile::observe_and_record(
+                    TENANT,
+                    &format!("peer-saturation-junk-key-{i}"),
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION,
+                    false,
+                    sbproxy_extension::mcp::peer_profile::PeerDowngradePolicy::Block,
+                ),
+                sbproxy_extension::mcp::peer_profile::ObservationVerdict::Allowed,
+                "filling the tenant's own sub-cap must not itself be refused"
+            );
+        }
+
+        // Fresh protocol observations for both servers this cycle, so
+        // neither hits the three-way bail: EXISTING_SERVER answers
+        // LEGACY (a real downgrade against its MODERN baseline);
+        // NEW_SERVER answers MODERN, which does not matter -- the
+        // saturation check runs before any comparison against it could
+        // happen at all.
+        action.federation.seed_server_observations_for_test(
+            HashMap::from([
+                (
+                    EXISTING_SERVER.to_string(),
+                    sbproxy_extension::mcp::types::LEGACY_PROTOCOL_VERSION.to_string(),
+                ),
+                (
+                    NEW_SERVER.to_string(),
+                    sbproxy_extension::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+                ),
+            ]),
+            HashMap::new(),
+        );
+
+        // The EXISTING pair still enforces its own real downgrade
+        // history, unaffected by every other slot in the tenant's
+        // registry being full.
+        let existing_call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": EXISTING_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        let existing_message = existing_call["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            existing_message.contains("weaker")
+                && existing_message.contains("peer_protocol_downgrade"),
+            "the already-tracked peer must still refuse its own real downgrade: {existing_call:?}"
+        );
+
+        // The NEW pair, past the tenant's sub-cap, gets no baseline at
+        // all and is refused fail-closed under `downgrade: block` --
+        // not silently allowed, and not compared against anyone else's
+        // history.
+        let new_call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": NEW_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        let new_message = new_call["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !new_message.contains("weaker"),
+            "a saturated registry must not be reported as a demonstrated downgrade: {new_call:?}"
+        );
+        assert!(
+            new_message.contains("peer profile registry is at capacity"),
+            "a saturated new pair must be refused for capacity, not silently allowed: {new_call:?}"
+        );
     }
 
     /// Drive a raw `DELETE / HTTP/1.1` with an `Mcp-Session-Id` header

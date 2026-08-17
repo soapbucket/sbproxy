@@ -43,19 +43,50 @@
 //! # Tenant scoping and the bounded registry
 //!
 //! [`observe_and_record`] stores one profile per `(tenant_id, peer_key)`
-//! pair in a process-global, [`MAX_TRACKED_PEERS`]-bounded map, the same
+//! pair in a process-global map, bounded at [`MAX_TRACKED_PEERS`]
+//! globally and [`MAX_TRACKED_PEERS_PER_TENANT`] per tenant -- the same
 //! cap hygiene `sbproxy_observe::evidence_seq` applies to its per-tenant
-//! sequence counters: `tenant_id` is caller-controlled, so an unbounded
-//! map keyed by it is a memory-exhaustion knob. A pair past the cap
-//! shares one overflow profile with every other overflowing pair rather
-//! than being refused a slot outright -- the same reasoning as
-//! `evidence_seq`'s overflow bucket, except here erring toward *more*
-//! false-positive downgrade warnings under extreme cardinality pressure
-//! is the safe direction for a security control, where erring toward
-//! *silently* skipping the check would not be.
+//! sequence counters, and the same two-cap shape [`super::sessions::SessionStore`]
+//! uses: `tenant_id` is caller-controlled, so an unbounded map keyed by
+//! it is a memory-exhaustion knob a single tenant could pull on its
+//! own without the sub-cap.
+//!
+//! A pair past either cap is refused a dedicated slot outright, fail
+//! closed (WOR-2384 fix round N): there is no shared fallback profile.
+//! An earlier design routed every overflowing pair to one shared
+//! mutable profile, on the theory that erring toward more
+//! false-positive downgrade warnings under cardinality pressure beats
+//! silently skipping the check. A review found that reasoning
+//! backwards for an *enforcement input* like this one: tenant A's
+//! observation of a weak, unauthenticated peer could seed the shared
+//! profile, so tenant B's later MITM'd downgrade against the *same
+//! shared bucket* would compare clean and the control would be
+//! silently off for B -- or, in the other direction, a shared
+//! high-water mark could refuse a tenant's legitimate legacy peer it
+//! had never actually seen degrade. `tenant_id` being caller-controlled
+//! means an attacker can walk the shared bucket into either failure
+//! mode on purpose by supplying junk `(tenant, peer)` pairs, and the
+//! old design ticked no metric when it did, so the drift was invisible
+//! too.
+//!
+//! A pair this process cannot track therefore gets no downgrade
+//! baseline at all, and [`observe_and_record`] reports
+//! [`ObservationVerdict::Saturated`] rather than comparing against
+//! anyone else's history. What that means on the wire depends on the
+//! configured [`PeerDowngradePolicy`], decided by the caller (see
+//! `mcp_peer_downgrade_check` in `sbproxy-core`): `block` refuses the
+//! call fail-closed, with its own rule id
+//! ([`PEER_PROFILE_SATURATED_RULE_ID`]), on the same reasoning an
+//! unprofiled peer under `block` cannot be trusted any more than a
+//! demonstrated downgrade can; `warn` allows it, since `warn` never
+//! refuses a downgrade it *can* observe either. Either way the event is
+//! observable: [`sbproxy_observe::metrics::record_mcp_peer_registry_saturated`]
+//! ticks on every refused-tracking call (label-free and not
+//! tenant-scoped, the same reason `evidence_seq`'s own tenant-cap
+//! counter is), and a `tracing::warn!` line logs once per tenant so a
+//! single flooding tenant cannot spam the log on every subsequent call.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -67,10 +98,12 @@ use parking_lot::Mutex;
 /// triggered it. A SIEM rule keys on this one string; [`PeerDowngradeKind::reason_code`]
 /// carries the finer-grained detail for a human reading the record.
 ///
-/// Distinct from [`PROTOCOL_PIN_MISMATCH_RULE_ID`]: a pin mismatch is
-/// not a downgrade against a recorded profile (it never consults one,
-/// see [`check_pin`]), so it carries its own rule id rather than this
-/// one (WOR-2384 fix round 1, item 2).
+/// Distinct from [`PROTOCOL_PIN_MISMATCH_RULE_ID`] and
+/// [`PEER_PROFILE_SATURATED_RULE_ID`]: neither of those is a downgrade
+/// against a recorded profile (a pin mismatch never consults one, see
+/// [`check_pin`]; a saturated registry has no profile to consult at
+/// all), so each carries its own rule id rather than this one
+/// (WOR-2384 fix round 1, item 2; saturation added fix round N).
 pub const PEER_DOWNGRADE_RULE_ID: &str = "peer_downgrade";
 
 /// Stable rule id a pinned `protocol:` mismatch carries. Unconditional
@@ -80,17 +113,39 @@ pub const PEER_DOWNGRADE_RULE_ID: &str = "peer_downgrade";
 /// trusted at the pinned/recorded posture).
 pub const PROTOCOL_PIN_MISMATCH_RULE_ID: &str = "protocol_pin_mismatch";
 
+/// Stable rule id a `downgrade: block` refusal carries when the peer
+/// registry cannot track this `(tenant, peer_key)` pair at all (WOR-2384
+/// fix round N: past [`MAX_TRACKED_PEERS`] or [`MAX_TRACKED_PEERS_PER_TENANT`]).
+/// Distinct from [`PEER_DOWNGRADE_RULE_ID`] for the same reason
+/// [`PROTOCOL_PIN_MISMATCH_RULE_ID`] is: refusing a peer this process
+/// has no history for is not itself a demonstrated downgrade against a
+/// recorded profile, even though `block` treats both as reasons to
+/// refuse the call.
+pub const PEER_PROFILE_SATURATED_RULE_ID: &str = "peer_profile_saturated";
+
 /// Ceiling on the number of `(tenant, server)` pairs this process tracks
-/// a dedicated peer profile for. Mirrors
+/// a dedicated peer profile for, across every tenant (WOR-2384 fix
+/// round N: fail-closed per-pair, no shared fallback; mirrors
 /// `sbproxy_observe::evidence_seq::MAX_TRACKED_TENANTS`'s order of
-/// magnitude and reasoning.
+/// magnitude and reasoning). Acts as a backstop behind
+/// [`MAX_TRACKED_PEERS_PER_TENANT`]: a single tenant can never reach
+/// this ceiling on its own (it would hit its own sub-cap first), so
+/// this bounds the number of *distinct tenants* with live peer
+/// profiles at once, not a single tenant's flood. `4096 /
+/// MAX_TRACKED_PEERS_PER_TENANT` (16 tenants at full sub-cap) is a
+/// deployment-sizing fact, not a per-tenant isolation guarantee -- see
+/// [`MAX_TRACKED_PEERS_PER_TENANT`]'s own doc.
 pub const MAX_TRACKED_PEERS: usize = 4096;
 
-/// The bucket every `(tenant, peer_key)` pair past [`MAX_TRACKED_PEERS`]
-/// shares. A NUL prefix keeps both halves out of the space of real
-/// tenant ids and peer keys, so neither can collide with it by chance.
-const OVERFLOW_TENANT: &str = "\u{0}sbproxy-mcp-peer-overflow-tenant";
-const OVERFLOW_PEER: &str = "\u{0}sbproxy-mcp-peer-overflow-peer";
+/// Ceiling on the number of `(tenant, server)` pairs one tenant may hold
+/// a dedicated peer profile for in this process (WOR-2384 fix round N).
+/// A tenant at its own sub-cap is refused a new profile while every
+/// other tenant, and every one of this tenant's own already-tracked
+/// peers, is unaffected -- one tenant flooding `tenant_id` (a
+/// caller-controlled value) cannot exhaust the registry for anyone
+/// else, the gap the earlier shared-overflow-profile design (removed;
+/// see git history) failed to close.
+pub const MAX_TRACKED_PEERS_PER_TENANT: usize = 256;
 
 /// One upstream MCP peer's negotiation history for one tenant.
 ///
@@ -165,6 +220,20 @@ pub enum ObservationVerdict {
     /// A downgrade was observed under `block` mode: the call must be
     /// refused. The profile is left completely unchanged.
     Refused(PeerDowngradeKind),
+    /// The registry could not track this NEW `(tenant, peer_key)` pair
+    /// -- past [`MAX_TRACKED_PEERS`] globally or the presenting
+    /// tenant's own [`MAX_TRACKED_PEERS_PER_TENANT`] sub-cap (WOR-2384
+    /// fix round N). No profile was created, and nothing was shared
+    /// with any other caller. There is no baseline to compare this
+    /// contact against, so this is deliberately not folded into
+    /// [`PeerDowngradeKind`]: the caller decides what "no baseline"
+    /// means for the configured [`PeerDowngradePolicy`] (refuse under
+    /// `block`, allow under `warn`, with its own rule id,
+    /// [`PEER_PROFILE_SATURATED_RULE_ID`]), the same way it already
+    /// decides for a [`PinMismatch`] rather than this module deciding
+    /// for it. Every existing profile, for this tenant and every
+    /// other, is unaffected.
+    Saturated,
 }
 
 /// A pinned `protocol:` disagreed with what the peer actually answered.
@@ -303,17 +372,61 @@ fn registry() -> &'static Mutex<HashMap<(String, String), McpPeerProfile>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Latches true the first time the registry routes a new `(tenant,
-/// peer_key)` pair to the overflow bucket, so the saturation warning
-/// logs once per process rather than once per overflowing call.
-fn registry_saturated() -> &'static AtomicBool {
-    static SATURATED: OnceLock<AtomicBool> = OnceLock::new();
-    SATURATED.get_or_init(|| AtomicBool::new(false))
+/// Tenant ids that have already triggered the once-per-tenant
+/// saturation warning log line (WOR-2384 fix round N), so a single
+/// flooding tenant does not spam the log on every refused-tracking
+/// call after the first. Deliberately per-tenant rather than the
+/// once-per-process latch [`super::sessions::SessionStore::report_saturation`]
+/// uses: `tenant_id` is exactly the caller-controlled value driving
+/// the flood this redesign exists to contain, so a process-wide latch
+/// would silence every *other* tenant's first warning the moment one
+/// tenant saturates the registry first.
+///
+/// Capped at [`MAX_TRACKED_PEERS`] for the same reason the profile
+/// registry itself is: an unbounded set keyed by caller-controlled
+/// `tenant_id` would just relocate the memory-exhaustion knob this
+/// whole module exists to close, one indirection over. Past that cap,
+/// a tenant not already in the set is warned on every subsequent
+/// refused-tracking call instead of just its first -- a noisier log,
+/// never a missed [`sbproxy_observe::metrics::record_mcp_peer_registry_saturated`]
+/// increment or a missed fail-closed refusal, since neither of those
+/// reads this set.
+fn warned_tenants() -> &'static Mutex<HashSet<String>> {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record one refused-tracking call for `tenant_id`: always bumps
+/// [`sbproxy_observe::metrics::record_mcp_peer_registry_saturated`]
+/// (registry capacity is a fact regardless of `downgrade:` policy, so
+/// the counter reflects every occurrence), and logs a `tracing::warn!`
+/// line the first time this specific tenant hits it (see
+/// [`warned_tenants`]).
+fn report_peer_registry_saturation(tenant_id: &str, cap: usize, scope: &'static str) {
+    let mut warned = warned_tenants().lock();
+    let already_warned = warned.contains(tenant_id);
+    if !already_warned && warned.len() < MAX_TRACKED_PEERS {
+        warned.insert(tenant_id.to_string());
+    }
+    drop(warned);
+    if !already_warned {
+        tracing::warn!(
+            target: "sbproxy::mcp::peer_profile",
+            tenant = tenant_id,
+            scope,
+            cap,
+            "mcp peer profile registry is full; this tenant's new peer pairs get no downgrade baseline until it drains"
+        );
+    }
+    sbproxy_observe::metrics::record_mcp_peer_registry_saturated();
 }
 
 /// Observe one peer contact for one tenant against the process-global
 /// registry, persist the resulting profile, and report the verdict the
-/// caller must act on: `Refused` means the call must not proceed.
+/// caller must act on: `Refused` means the call must not proceed, and
+/// [`ObservationVerdict::Saturated`] means there is no profile to
+/// compare against at all -- the caller decides what that means for
+/// the configured [`PeerDowngradePolicy`].
 pub fn observe_and_record(
     tenant_id: &str,
     peer_key: &str,
@@ -331,6 +444,7 @@ pub fn observe_and_record(
         policy,
         SystemTime::now(),
         MAX_TRACKED_PEERS,
+        MAX_TRACKED_PEERS_PER_TENANT,
     )
 }
 
@@ -374,22 +488,40 @@ fn observe_and_record_capped(
     policy: PeerDowngradePolicy,
     now: SystemTime,
     cap: usize,
+    tenant_cap: usize,
 ) -> ObservationVerdict {
     let key = (tenant_id.to_string(), peer_key.to_string());
-    let effective_key = if profiles.contains_key(&key) || profiles.len() < cap {
-        key
-    } else {
-        if !registry_saturated().swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                target: "sbproxy::mcp::peer_profile",
-                max_peers = cap,
-                "mcp peer profile registry is full; new tenant/server pairs share a fallback profile"
-            );
-        }
-        (OVERFLOW_TENANT.to_string(), OVERFLOW_PEER.to_string())
-    };
 
-    let prior = profiles.get(&effective_key).cloned();
+    // An existing pair always gets to observe against its own history,
+    // cap or no cap: neither cap check below applies to a pair that
+    // already has a dedicated slot, only to minting a *new* one.
+    if !profiles.contains_key(&key) {
+        // Per-tenant sub-cap first (WOR-2384 fix round N, item 5 of
+        // the whole-branch review): checking the global cap first
+        // would let a 17th tenant be refused outright the moment the
+        // registry as a whole is full, even though *that* tenant has
+        // tracked nothing yet -- an honest refusal names the actual
+        // reason the caller hit, and "your own tenant is at its
+        // sub-cap" is the more common, more actionable one to report
+        // first. Both checks still exist because they answer
+        // different questions: the sub-cap bounds one tenant's own
+        // flood; the global cap bounds how many *distinct* tenants
+        // this process tracks profiles for at all, 16 at a time at
+        // full sub-cap (`MAX_TRACKED_PEERS / MAX_TRACKED_PEERS_PER_TENANT`)
+        // -- a deployment-sizing fact, not a per-tenant isolation
+        // guarantee.
+        let tenant_live = profiles.keys().filter(|(t, _)| t == tenant_id).count();
+        if tenant_live >= tenant_cap {
+            report_peer_registry_saturation(tenant_id, tenant_cap, "tenant");
+            return ObservationVerdict::Saturated;
+        }
+        if profiles.len() >= cap {
+            report_peer_registry_saturation(tenant_id, cap, "global");
+            return ObservationVerdict::Saturated;
+        }
+    }
+
+    let prior = profiles.get(&key).cloned();
     let (updated, verdict) = observe(
         prior.as_ref(),
         observed_protocol,
@@ -397,7 +529,7 @@ fn observe_and_record_capped(
         policy,
         now,
     );
-    profiles.insert(effective_key, updated);
+    profiles.insert(key, updated);
     verdict
 }
 
@@ -409,7 +541,7 @@ mod tests {
     /// (the process-global registry is shared) never collide.
     fn unique_tenant(label: &str) -> String {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("sbproxy-test-tenant-{label}-{n}")
     }
 
@@ -651,6 +783,7 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 SystemTime::now(),
                 MAX_TRACKED_PEERS,
+                MAX_TRACKED_PEERS_PER_TENANT,
             ),
             ObservationVerdict::Allowed
         );
@@ -668,6 +801,7 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 SystemTime::now(),
                 MAX_TRACKED_PEERS,
+                MAX_TRACKED_PEERS_PER_TENANT,
             ),
             ObservationVerdict::Allowed
         );
@@ -682,6 +816,7 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 SystemTime::now(),
                 MAX_TRACKED_PEERS,
+                MAX_TRACKED_PEERS_PER_TENANT,
             ),
             ObservationVerdict::Refused(PeerDowngradeKind::Protocol)
         );
@@ -711,6 +846,7 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 SystemTime::now(),
                 MAX_TRACKED_PEERS,
+                MAX_TRACKED_PEERS_PER_TENANT,
             ),
             ObservationVerdict::Allowed
         );
@@ -724,6 +860,7 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 SystemTime::now(),
                 MAX_TRACKED_PEERS,
+                MAX_TRACKED_PEERS_PER_TENANT,
             ),
             ObservationVerdict::Refused(PeerDowngradeKind::Protocol),
             "before the edit, a legacy answer is still a downgrade"
@@ -742,6 +879,7 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 SystemTime::now(),
                 MAX_TRACKED_PEERS,
+                MAX_TRACKED_PEERS_PER_TENANT,
             ),
             ObservationVerdict::Allowed,
             "the edited entry's new peer_key starts with no recorded history"
@@ -773,45 +911,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pairs_past_the_cap_share_the_overflow_profile_instead_of_losing_downgrade_detection() {
-        // Mirrors evidence_seq's overflow test: exercises
-        // `observe_and_record_capped` directly against a local,
-        // throwaway map and a cap of 2, rather than filling the real
-        // 4096-entry process-global registry.
-        let mut profiles = HashMap::new();
-        let cap = 2;
-        let now = SystemTime::now();
+    // --- Bounded peer registry (WOR-2384 fix round N: fail closed, no
+    // shared overflow profile -- mirrors `sessions.rs`'s own
+    // redesign) ---
 
+    #[test]
+    fn observations_below_both_caps_succeed_independently() {
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (8, 8);
         assert_eq!(
             observe_and_record_capped(
                 &mut profiles,
-                "t1",
+                "tenant-a",
                 "k1",
                 MODERN,
                 false,
                 PeerDowngradePolicy::Block,
-                now,
+                SystemTime::now(),
                 cap,
+                tenant_cap,
             ),
             ObservationVerdict::Allowed
         );
         assert_eq!(
             observe_and_record_capped(
                 &mut profiles,
-                "t2",
+                "tenant-a",
                 "k2",
-                LEGACY,
+                MODERN,
                 false,
                 PeerDowngradePolicy::Block,
-                now,
+                SystemTime::now(),
                 cap,
+                tenant_cap,
             ),
             ObservationVerdict::Allowed
         );
-        // The map is now at the cap. A pair never seen before shares
-        // the overflow bucket, which was seeded modern by nobody yet,
-        // so this first overflow contact still just records.
+        assert_eq!(profiles.len(), 2);
+    }
+
+    #[test]
+    fn a_new_pair_past_the_global_cap_is_saturated_and_tracks_nothing() {
+        // Mirrors `sessions.rs`'s own global-cap test: exercises
+        // `observe_and_record_capped` directly against a local,
+        // throwaway map and a small cap, rather than filling the real
+        // 4096-entry process-global registry.
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (2, 100);
+        let now = SystemTime::now();
+        observe_and_record_capped(
+            &mut profiles,
+            "t1",
+            "k1",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+        observe_and_record_capped(
+            &mut profiles,
+            "t2",
+            "k2",
+            LEGACY,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+
+        // The registry is now at its global cap. A pair never seen
+        // before -- a third, distinct tenant -- gets no profile at
+        // all: not a shared one, not a dedicated one.
         assert_eq!(
             observe_and_record_capped(
                 &mut profiles,
@@ -822,42 +995,265 @@ mod tests {
                 PeerDowngradePolicy::Block,
                 now,
                 cap,
+                tenant_cap,
             ),
-            ObservationVerdict::Allowed
+            ObservationVerdict::Saturated,
+            "a pair past the global cap must be refused tracking, never shared"
         );
-        // A second, distinct overflow pair now collides with the first
-        // overflow pair's recorded modern high-water mark: a legacy
-        // contact from an entirely different (tenant, server) is
-        // flagged, because cardinality pressure forced them to share
-        // one bucket. This is the documented, safe-direction tradeoff:
-        // false positives under saturation, never a silent bypass.
+        assert_eq!(
+            profiles.len(),
+            2,
+            "a saturated observation must not insert anything, shared or otherwise"
+        );
+        // The two pairs that already had a dedicated slot are
+        // completely unaffected -- neither one now compares against
+        // whatever the refused t3 pair observed, because nothing
+        // about t3 was ever recorded anywhere.
         assert_eq!(
             observe_and_record_capped(
                 &mut profiles,
-                "t4",
-                "k4",
+                "t1",
+                "k1",
                 LEGACY,
                 false,
                 PeerDowngradePolicy::Block,
                 now,
                 cap,
+                tenant_cap,
             ),
-            ObservationVerdict::Refused(PeerDowngradeKind::Protocol)
+            ObservationVerdict::Refused(PeerDowngradeKind::Protocol),
+            "t1's own recorded modern high-water mark must still be enforced"
         );
-        // A pair that already had a dedicated slot before the cap was
-        // hit is unaffected.
+    }
+
+    #[test]
+    fn a_new_pair_past_the_tenant_sub_cap_is_saturated_while_other_tenants_are_unaffected() {
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (100, 2);
+        let now = SystemTime::now();
+        observe_and_record_capped(
+            &mut profiles,
+            "tenant-a",
+            "k1",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+        observe_and_record_capped(
+            &mut profiles,
+            "tenant-a",
+            "k2",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+
         assert_eq!(
             observe_and_record_capped(
                 &mut profiles,
-                "t2",
-                "k2",
+                "tenant-a",
+                "k3",
                 MODERN,
                 false,
                 PeerDowngradePolicy::Block,
                 now,
                 cap,
+                tenant_cap,
             ),
-            ObservationVerdict::Allowed
+            ObservationVerdict::Saturated,
+            "tenant-a is at its own sub-cap"
+        );
+        assert_eq!(
+            observe_and_record_capped(
+                &mut profiles,
+                "tenant-b",
+                "k1",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
+                tenant_cap,
+            ),
+            ObservationVerdict::Allowed,
+            "a different tenant, unaffected by tenant-a's sub-cap, must still be tracked"
+        );
+    }
+
+    #[test]
+    fn the_tenant_sub_cap_is_checked_before_the_global_cap() {
+        // WOR-2384 whole-branch review, item 5: checking the global
+        // cap first would refuse a brand-new tenant that has tracked
+        // nothing itself, once the registry as a whole happens to be
+        // full -- an honest refusal names the reason the *caller*
+        // actually hit. Set the global cap equal to the tenant cap so
+        // both are simultaneously true, and confirm the sub-cap is
+        // still what a caller would see reported first (observable
+        // here as: the third observation for the same tenant is
+        // refused with the registry still one slot under the global
+        // cap, proving the tenant check ran, and won, before the
+        // global one could).
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (3, 2);
+        let now = SystemTime::now();
+        observe_and_record_capped(
+            &mut profiles,
+            "tenant-a",
+            "k1",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+        observe_and_record_capped(
+            &mut profiles,
+            "tenant-a",
+            "k2",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+        assert_eq!(profiles.len(), 2, "one slot under the global cap of 3");
+        assert_eq!(
+            observe_and_record_capped(
+                &mut profiles,
+                "tenant-a",
+                "k3",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
+                tenant_cap,
+            ),
+            ObservationVerdict::Saturated,
+            "tenant-a's own sub-cap refuses this before the global cap ever would"
+        );
+    }
+
+    #[test]
+    fn existing_pairs_keep_working_when_the_registry_is_saturated() {
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (1, 100);
+        let now = SystemTime::now();
+        observe_and_record_capped(
+            &mut profiles,
+            "tenant-a",
+            "k1",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Block,
+            now,
+            cap,
+            tenant_cap,
+        );
+
+        assert_eq!(
+            observe_and_record_capped(
+                &mut profiles,
+                "tenant-b",
+                "k1",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
+                tenant_cap,
+            ),
+            ObservationVerdict::Saturated
+        );
+
+        // The pre-existing pair is untouched: still compares against
+        // its own real history, nothing about refusing a *new* pair
+        // reaches back into what already exists.
+        assert_eq!(
+            observe_and_record_capped(
+                &mut profiles,
+                "tenant-a",
+                "k1",
+                LEGACY,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
+                tenant_cap,
+            ),
+            ObservationVerdict::Refused(PeerDowngradeKind::Protocol)
+        );
+    }
+
+    #[test]
+    fn a_flood_of_new_pairs_never_grows_the_registry_past_the_cap() {
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (8, 100);
+        let now = SystemTime::now();
+        for i in 0..cap * 10 {
+            observe_and_record_capped(
+                &mut profiles,
+                &format!("tenant-{i}"),
+                "k",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Block,
+                now,
+                cap,
+                tenant_cap,
+            );
+        }
+        assert_eq!(
+            profiles.len(),
+            cap,
+            "exactly the cap's worth of profiles survive a flood of distinct-tenant \
+             observations, none shared, none silently dropped past the cap"
+        );
+    }
+
+    #[test]
+    fn a_saturated_registry_under_warn_policy_still_reports_saturated() {
+        // `ObservationVerdict::Saturated` itself carries no policy
+        // opinion -- the caller (`mcp_peer_downgrade_check` in
+        // sbproxy-core) is the one that turns this into "refuse" under
+        // `block` or "allow" under `warn`. This only proves the
+        // registry-capacity signal itself does not silently disappear
+        // just because the configured policy is `warn`.
+        let mut profiles = HashMap::new();
+        let (cap, tenant_cap) = (1, 100);
+        let now = SystemTime::now();
+        observe_and_record_capped(
+            &mut profiles,
+            "tenant-a",
+            "k1",
+            MODERN,
+            false,
+            PeerDowngradePolicy::Warn,
+            now,
+            cap,
+            tenant_cap,
+        );
+        assert_eq!(
+            observe_and_record_capped(
+                &mut profiles,
+                "tenant-b",
+                "k1",
+                MODERN,
+                false,
+                PeerDowngradePolicy::Warn,
+                now,
+                cap,
+                tenant_cap,
+            ),
+            ObservationVerdict::Saturated
         );
     }
 
@@ -899,6 +1295,19 @@ mod tests {
         // since a SIEM rule keyed on one must not also match the other.
         assert_ne!(PROTOCOL_PIN_MISMATCH_RULE_ID, PEER_DOWNGRADE_RULE_ID);
         assert_eq!(PROTOCOL_PIN_MISMATCH_RULE_ID, "protocol_pin_mismatch");
+    }
+
+    #[test]
+    fn peer_profile_saturated_rule_id_is_distinct_from_the_other_two() {
+        // WOR-2384 whole-branch review, item 1: a saturated registry is
+        // neither a demonstrated downgrade nor a pin mismatch, so it
+        // must carry its own rule id, not collide with either.
+        assert_ne!(PEER_PROFILE_SATURATED_RULE_ID, PEER_DOWNGRADE_RULE_ID);
+        assert_ne!(
+            PEER_PROFILE_SATURATED_RULE_ID,
+            PROTOCOL_PIN_MISMATCH_RULE_ID
+        );
+        assert_eq!(PEER_PROFILE_SATURATED_RULE_ID, "peer_profile_saturated");
     }
 
     #[test]

@@ -2880,9 +2880,22 @@ impl McpFederation {
                     Some(e),
                 );
                 // WOR-2384 (MCP09) + WOR-2486: the refusal also reaches
-                // the typed `egress_refused` event, labeled with the
-                // same federated name the sighting row carries.
-                record_egress_refused(EgressPurpose::OpenApiTool, e, "", federated_name);
+                // the typed `egress_refused` event. Whole-branch
+                // review, item 6: labeled with `server.name`, not
+                // `federated_name`. `record_egress_seen`'s sighting row
+                // just above stays on `federated_name` deliberately --
+                // that inventory is keyed on `(purpose, host, port)`,
+                // capped at 1024 entries regardless of how many
+                // distinct `origin` strings pass through it, so a tool
+                // name there cannot grow the map unboundedly.
+                // `record_egress_refused` is different: `origin` is a
+                // literal Prometheus label value on
+                // `sbproxy_egress_refused_total`, with no cap of its
+                // own, so an unbounded, caller-influenceable tool name
+                // there is a real cardinality-explosion vector this
+                // fixes. The sibling `McpUpstream` egress-refused site
+                // already uses `&server.name` for the same reason.
+                record_egress_refused(EgressPurpose::OpenApiTool, e, "", &server.name);
                 return Err(anyhow::anyhow!("egress denied: {e:?}"));
             }
         };

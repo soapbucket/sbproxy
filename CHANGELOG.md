@@ -13,7 +13,9 @@ the next version cut.
 ### Added
 
 - **MCP tool calls emit a governance evidence event, with an optional
-  fail-closed guarantee.** A twelfth `events:` type,
+  fail-closed guarantee.** The `events:` type list grows to thirteen
+  declared types, eleven of which publish today (see
+  [events.md](docs/events.md)). The new one,
   `mcp_governance_decision`, carries OTel GenAI/MCP semantic-convention
   attribute names plus sbproxy's own `sbproxy.*` fields (verdict,
   redacted reason, a salted argument hash, and a per-tenant gapless

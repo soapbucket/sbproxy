@@ -583,6 +583,12 @@ its own reason and its own subset of fields:
   only a *dispatched* call also carries a salted digest of the arguments
   (`sbproxy.tool.arguments_hash`), since a call refused before dispatch was
   never captured to hash in the first place.
+- **`resources/read` and `prompts/get` decisions.** A `draft`-server or
+  peer-downgrade refusal, a deprecated-server warning, or a content-filter
+  warn/redact/block on either method's result, reason and rule id matching
+  the identical gate's `tools/call` record exactly. `mcp.method.name` names
+  the method (`resources/read` or `prompts/get`) instead of `tools/call`;
+  neither carries `gen_ai.tool.name`, since neither method names a tool.
 - **Tool definition changes.** The version-lockfile gate's per-refresh
   contract check, reason `tool_definition_changed`. See [A tool definition
   changing after you approved it](#a-tool-definition-changing-after-you-approved-it).
