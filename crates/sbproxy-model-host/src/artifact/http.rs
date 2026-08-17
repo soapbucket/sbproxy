@@ -262,9 +262,9 @@ impl HttpArtifactTransport {
     /// under a single, consistent snapshot even though the registry
     /// itself can change between separate downloads.
     fn effective_egress(&self) -> Option<EgressAuthorizer> {
-        self.egress_override.clone().or_else(|| {
-            sbproxy_security::egress::configured_gate(EgressPurpose::ModelArtifact)
-        })
+        self.egress_override
+            .clone()
+            .or_else(|| sbproxy_security::egress::configured_gate(EgressPurpose::ModelArtifact))
     }
 
     /// Follow the redirect chain for one artifact `GET`, re-authorizing
@@ -736,10 +736,9 @@ mod tests {
             EgressPurpose::ModelArtifact,
             Some(enforce_model_artifact(&["evil.example"])),
         );
-        let transport =
-            HttpArtifactTransport::new()
-                .expect("transport builds")
-                .with_egress(enforce_model_artifact(&["huggingface.co"]));
+        let transport = HttpArtifactTransport::new()
+            .expect("transport builds")
+            .with_egress(enforce_model_artifact(&["huggingface.co"]));
 
         let err = transport
             .get(TransportRequest {
@@ -749,9 +748,7 @@ mod tests {
                 credential: None,
             })
             .await
-            .expect_err(
-                "the fixed override, not the more permissive registry entry, must decide",
-            );
+            .expect_err("the fixed override, not the more permissive registry entry, must decide");
         match &err {
             ArtifactError::Transport(msg) => {
                 assert!(
