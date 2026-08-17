@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-09*
 
+![A request denied by the WAF baseline inside a layered ip_filter -> ddos -> waf -> dlp stack](assets/waf-layered.gif)
+
 SBproxy ships a Web Application Firewall. It is a curated signature
 baseline of 16 rules, against roughly 900 in the OWASP Core Rule Set.
 Operators reasonably ask what to do about that gap. This page records

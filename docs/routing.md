@@ -3,6 +3,8 @@
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
+![The same hostname routed to different backends by request body content](assets/body-routing.gif)
+
 ## How a request finds an origin
 
 Each key under `origins:` is a hostname. SBproxy matches the inbound `Host` header (or `:authority` on HTTP/2+) against those keys and runs that origin's configuration.

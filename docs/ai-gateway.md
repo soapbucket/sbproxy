@@ -1013,6 +1013,8 @@ Replacing either file at the same path invalidates reuse on reload.
 The runnable configuration is
 [ai-classifier-routing](../examples/ai-classifier-routing/).
 
+![Email, SSN, and credit card redacted from a chat completion request body before it reaches the provider](assets/pii-redaction.gif)
+
 ### Guardrail mesh
 
 By default the input guardrails run as a serial chain that blocks on the first security detector to flag. The opt-in mesh runs them as a cascade instead, collects security verdicts plus routing labels, and fuses the security verdicts under a quorum rule, with optional redact-and-continue, a verdict cache, and a latency budget for the expensive classifiers. Switch it on with a `mesh` block under `guardrails`:

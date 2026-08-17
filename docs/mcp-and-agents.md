@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![Initialize an MCP session against the admin API and confirm the notification handshake](assets/admin-mcp.gif)
+
 If you are exposing tools to an agent, or you are the agent calling
 someone else's tools, this page is the map. SBproxy speaks two
 protocols for agent traffic: MCP (Model Context Protocol, for tool

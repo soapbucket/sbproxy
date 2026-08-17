@@ -20,6 +20,28 @@ order" view, start at [core-concepts.md](core-concepts.md) or
 
 ## The pipeline at a glance
 
+```mermaid
+flowchart TD
+    A[Connection accepted] --> B["request_filter\nhostname match, auth, policy,\ncache lookup, forward rules"]
+    B -->|denied at any step| X[Error response, pipeline short-circuits]
+    B --> C[upstream_peer\nrouting / load balancer / ai_routing]
+    C --> D{Action dispatch}
+    D -->|proxy / load_balancer| E1[Plain HTTP origin]
+    D -->|ai_proxy| E2[AI provider or local model]
+    D -->|mcp / a2a| E3[MCP tool call or A2A envelope]
+    D -->|payment-gated| E4[402 challenge, then origin]
+    E1 --> F[response_filter\nsecurity headers, anomaly hook]
+    E2 --> F
+    E3 --> F
+    E4 --> F
+    F --> G[response_body_filter\ntransforms, cache write]
+    G --> H[logging\nmetrics, access log, event bus]
+    H --> I[Response returned]
+```
+
+The diagram above is the shape; the listing below is the detail, with
+every hook attachment point named against its exact step number.
+
 ```
 request_filter
   1.  Trace context extract (W3C / B3)
