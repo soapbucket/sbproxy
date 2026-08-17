@@ -57,13 +57,13 @@ cd sbproxy
 
 ## Security coverage
 
-sbproxy publishes a per-category mapping against the OWASP LLM Top 10, 2026 edition (published 2026-08-03). Coverage is stated as full, partial, or out of gateway scope: full means enforced in the traffic path with tests, partial means enforced with named gaps, and out of scope means the risk lives in the application or provider.
+sbproxy publishes a per-category mapping against the OWASP LLM Top 10, 2026 edition (published 2026-08-03). Coverage is stated as enforced, enforced with named limits, or out of gateway scope: enforced means the control runs in the traffic path with a named test or signal proving it, enforced with named limits adds a stated boundary and the reason it holds, and out of gateway scope means the risk lives in the application or provider.
 
-sbproxy also holds itself to a gateway-layer control set for failure modes no published list covers: credential custody, cross-tenant boundaries, decisions without a record, denial of wallet, streaming inspection parity, telemetry leakage, direct-to-provider egress, and tamper-evident change control.
+The page leads with eight gateway-layer controls no published list covers: credential custody; cross-tenant boundaries; routing decisions leave a record; denial of wallet is enforcement, not observation; streaming parity; telemetry does not leak the traffic it audits; egress is inventoried; and change control is tamper-evident. Each OWASP category section names its config keys and a proof test.
 
 Multipart requests are refused on JSON-only surfaces. Surfaces built to accept multipart do not debit token budgets.
 
-[AI gateway security coverage](docs/ai-gateway-security-coverage.md) has the full mapping and control set. [Security](docs/security.md) maps what the gateway covers across API, AI model, MCP, and proxy-itself traffic.
+[AI gateway security coverage](docs/ai-gateway-security-coverage.md) carries the per-category mapping and the control set in detail. [Security](docs/security.md) maps what the gateway covers across API, AI model, MCP, and proxy-itself traffic.
 
 ## Install alternatives
 
