@@ -1,5 +1,7 @@
 # Predictive budget: warn, then downgrade, then block
 
+![Predictive budget: warn, then downgrade, then block](../../docs/assets/ai-predictive-budget.gif)
+
 The runnable half of [docs/ai-predictive-budget.md](../../docs/ai-predictive-budget.md). A fixed-window budget is a cliff: requests pass until the cap, then stop. Soft landing degrades on the way up instead, so spend tapers rather than ending.
 
 | Band | Preflight fraction | What happens to the request |

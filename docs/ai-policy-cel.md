@@ -1,6 +1,6 @@
 # AI policy plane (CEL)
 
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -89,7 +89,9 @@ for the shared grammar and rejection rules.
 This vocabulary is engine-neutral: a multi-engine `ai_routing_policy`
 reads exactly these paths in Lua and JavaScript (as an `ai` global), in
 Rego (as `input.ai`), and in WebAssembly (as the `ai` field of the
-request envelope), kept identical by a parity test.
+request envelope), kept identical by a parity test. See
+[`examples/ai-routing-policy/`](../examples/ai-routing-policy/) for a
+complete working config that hands a routing decision to CEL this way.
 
 | Field | Type | Meaning |
 |---|---|---|

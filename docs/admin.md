@@ -273,7 +273,10 @@ authenticates an expiring one-time cluster token instead of an existing admin
 operator. Full per-route schemas, request/response shapes, and status codes
 live in [admin-api-reference.md](admin-api-reference.md); a task-oriented
 walkthrough with a curl cookbook lives in
-[admin-api-guide.md](admin-api-guide.md). In short, the surface covers:
+[admin-api-guide.md](admin-api-guide.md). See
+[`examples/admin-mcp/`](../examples/admin-mcp/) for a config that
+exposes a curated subset of this surface as MCP tools. In short, the
+surface covers:
 
 | Family | Covers |
 |---|---|
@@ -300,7 +303,9 @@ reference below:
   environment-variable interpolation (`${ENV_VAR}`) and secret-backend
   references are stored and shown exactly as written. A secret is never
   resolved into the saved config or exposed in the editor. See
-  [secrets.md](secrets.md).
+  [secrets.md](secrets.md). For a fleet where this route is signed and
+  distributed from one authority node instead of edited per node, see
+  [`examples/config-authority/`](../examples/config-authority/).
 - **Model host and cluster deployment mutations** are authority-gated:
   `PUT /admin/model-host/deployments` only works under `admin_managed`
   authority (`file_managed` config stays read-only through this API; cluster

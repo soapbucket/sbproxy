@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-09*
 
+![Layered WAF](../../docs/assets/waf-layered.gif)
+
 Four screening policies on one origin, in the order they should run: `ip_filter` (403 for a source outside the allowlist), `ddos` (429 past the per-IP ceiling), `waf` (403 on an attack signature), and `dlp` (403 on a leaking credential). The WAF baseline is 16 rules and is the narrowest layer here; this config shows the stack it belongs to, with `proxy.trusted_proxies` set so the IP-keyed layers resolve a real client address instead of the address of whatever proxy sits in front.
 
 ## Run

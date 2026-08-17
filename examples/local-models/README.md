@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![Hybrid local + cloud AI gateway](../../docs/assets/local-models.gif)
+
 Routes cheap traffic to a locally-hosted model (Ollama, vLLM, LM Studio, Hugging Face TGI, or llama.cpp) and the long tail or tougher prompts to a hosted provider. The proxy presents an OpenAI-compatible interface to clients; each backend listed here also speaks OpenAI-compatible (`/v1/chat/completions` directly), so no format translation is needed and bytes pass through. Strategy is `fallback_chain`: try local first, fall through to OpenAI on error or unavailability. Switch to `cost_optimized` to send cheaper traffic to local even when both are healthy, or `weighted` to mix at a fixed ratio. The example provider list points at Ollama; the bottom of the `sb.yml` shows the same shape for vLLM, LM Studio, TGI, and llama.cpp.
 
 ## Run

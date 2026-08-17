@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-08*
 
+![Body-based routing](../../docs/assets/body-routing.gif)
+
 A single origin on `llm.local` routes each request on the `model` field of its JSON body. Two forward rules carry a `body` matcher that addresses the field with an RFC 6901 JSON Pointer (`/model`) and compares it by prefix: `gpt-` models land on one inline child origin, `claude-` models on another, and everything else falls through to the default action that proxies to `test.sbproxy.dev/anything`. Both child origins are `static` stubs standing in for dedicated model pools so the example runs with no upstream of its own.
 
 The body is buffered (up to 64 KiB) before the route is chosen and replayed upstream byte for byte, so routing on it does not consume it. Origins without a body matcher never buffer anything. A body the matcher cannot read (not JSON, no `model` field, over the cap) is a miss, not an error: the request takes the default action exactly as it would have without the rule.

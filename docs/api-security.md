@@ -57,7 +57,9 @@ distinct object ids than a real user would, which is what scraping looks like
 when every individual request is authorized.
 
 See [object-authz.md](object-authz.md) for the full matcher surface, including
-tenant claims and collection endpoints.
+tenant claims and collection endpoints, and
+[`examples/object-authz/`](../examples/object-authz/) for a complete working
+config.
 
 **Still yours.** The gateway compares an identifier in the request against a
 claim in the token. It cannot know that order 1042 belongs to user 7 unless
@@ -94,6 +96,9 @@ which is the behavior you want.
 
 Every auth failure is recorded as a structured `auth_denied` audit event with
 the scheme that rejected it, and never with the credential.
+
+See [`examples/auth-jwt/`](../examples/auth-jwt/) for a complete working
+config.
 
 **Still yours.** Choosing an audience and issuer that actually narrow anything.
 A JWT validated against a wildcard audience is a validated JWT that proves
@@ -135,6 +140,9 @@ Rate limit counters are shared across nodes when clustering is configured, so a
 limit means the same thing behind a load balancer instead of becoming
 per-instance. See [configuration.md](configuration.md) for the cluster fields.
 
+See [`examples/rate-limiting/`](../examples/rate-limiting/) for a complete
+working config.
+
 **Still yours.** Picking numbers. A limit set above your actual capacity is
 documentation, not protection.
 
@@ -166,8 +174,14 @@ Validate against the contract you publish:
 own specification does not describe, including fields an attacker hoped were
 silently bound. `mode: log` runs it in observation first, which is how you find
 out what your clients actually send before you start refusing. The spec goes
-inline or on disk; see [openapi-validation.md](openapi-validation.md) for the
+inline or on disk; see [openapi-validation.md](openapi-validation.md) and
+[`examples/openapi-validation/`](../examples/openapi-validation/) for the
 full field set.
+
+`request_validator` is the narrower tool when you want to check one field
+without publishing a whole spec; see
+[`examples/request-validator/`](../examples/request-validator/) for a
+complete working config.
 
 `http_framing` covers request smuggling and the framing tricks that let one
 request look like two, refusing conflicting `Content-Length` and
@@ -262,6 +276,8 @@ If your API is called from a browser, the boring headers are most of the work:
 `content_digest` binds a body to its `Content-Digest` header so a proxy in
 between cannot alter it unnoticed.
 
+See [`examples/csrf/`](../examples/csrf/) for a complete working config.
+
 **Still yours.** CORS policy is a decision about who should be able to call you,
 and no default is right for everyone.
 
@@ -285,6 +301,9 @@ which is the difference between a crawler claiming to be someone and one proving
 it. Its directory and key settings are in [web-bot-auth.md](web-bot-auth.md).
 `pay_per_crawl` turns unwanted automation into a priced transaction rather than
 a block.
+
+See [`examples/ip-filter/`](../examples/ip-filter/) for a complete working
+config of the `ip_filtering` policy above.
 
 **Still yours.** Deciding which bots you want. The gateway will enforce either
 answer.

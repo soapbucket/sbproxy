@@ -2,6 +2,8 @@
 
 *Last modified: 2026-06-24*
 
+![AI gateway: model group (one public name, several deployments)](../../docs/assets/ai-model-group.gif)
+
 A model group is LiteLLM's core load-balancing abstraction: several deployments share one public model name, and requests to that name are spread across them. SBproxy expresses it directly. List each deployment as a provider whose `models` list declares the same model. The requested model selects the group (model-based provider routing), and the `routing` strategy load-balances across the matching deployments. Outlier detection ejects a failing deployment without taking the group offline.
 
 This is also the shape the LiteLLM importer emits: two `model_list` entries that share a `model_name` become two providers declaring that model. See [docs/migration-litellm.md](../../docs/migration-litellm.md).

@@ -46,6 +46,9 @@ Four shapes make up the current vocabulary. Anything that does not match one of 
 
 `localsecret://` selects the local static-map provider, the same provider a backend configures with `type: local` (see [File And Static Map Backends](#file-and-static-map-backends) below). It has no relationship to environment variables: `localsecret://env/some-key` looks up a key named `some-key` in a backend named `env`, which is not the `env:` environment-variable form above. There is no `env://` URI scheme; write `${VAR_NAME}` or `env:VAR_NAME` for environment variables instead. `secret://` resolves identically and still works, but logs a one-time deprecation warning; write `localsecret://` in new config.
 
+See [`examples/vault-reference/`](../examples/vault-reference/) for a
+complete working config showing every scheme above alongside `${ENV}`.
+
 ### Deprecated Forms
 
 Two older shapes still work, each logging a one-time warning, and neither is what to write in new config:

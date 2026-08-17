@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![Prompt injection v2](../../docs/assets/prompt-injection-v2.gif)
+
 The successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a numeric score plus a categorical label, and the policy maps the score onto an action (`tag` (default), `block`, or `log`). This example explicitly pins `detector: heuristic-v1`, so it remains self-contained and never inspects local model artifacts. Omitting the field instead activates verified in-process auto-selection when a complete model and tokenizer pair is staged.
 
 ## Run

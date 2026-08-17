@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![AI gateway: per-surface rate limits](../../docs/assets/ai-per-surface-rate-limits.gif)
+
 Different OpenAI surfaces have different cost and capacity profiles. Chat completions are cheap and high volume; image generation is slow and expensive; audio speech bills per character; reranking bills per document. Putting one global cap on the origin does not capture this. Per-surface rate limits cap each classified surface independently so an image-generation burst does not starve chat throughput, and a runaway batch job cannot hold up interactive traffic.
 
 Surface labels come from `AiSurface::label()`: `chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`. Each cap is a sliding one-minute window; the proxy returns 429 before any upstream call when the cap fires.

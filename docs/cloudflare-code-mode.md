@@ -1,5 +1,5 @@
 # Cloudflare Code Mode
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-16*
 
 SBproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code
@@ -8,6 +8,9 @@ module and invoke each tool as an ordinary async function. Code Mode
 compresses a large tool catalog from many tool-call JSONs down to a
 single typed module, cutting the agent's token spend by roughly an
 order of magnitude on large surfaces.
+
+See [`examples/mcp-code-mode/`](../examples/mcp-code-mode/) for a complete
+working config.
 
 ## What it emits
 

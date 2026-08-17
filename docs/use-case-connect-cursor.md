@@ -1,6 +1,6 @@
 # Connect Cursor to a governed gateway
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 Cursor's "Override OpenAI Base URL" setting redirects its OpenAI-key traffic to any OpenAI-compatible endpoint, which is enough to reach a generic multi-provider proxy but buys nothing beyond it: no per-key budgets, no attribution, no guardrails on the prompt. This page points that same setting at SBproxy, so the base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -19,7 +19,7 @@ OpenAI chat-completions (`POST /v1/chat/completions`). SBproxy's `ai_proxy` acti
 
 ## A governed gateway, not just a proxy
 
-The `sb.yml` below is the same shape as [use-case-own-openrouter.md](use-case-own-openrouter.md): one data-plane port, dynamic key management, and a budget plus a usage ledger. Save it and start the gateway before touching Cursor's settings.
+The `sb.yml` below is the same shape as [use-case-own-openrouter.md](use-case-own-openrouter.md) and its runnable [`examples/use-case-own-openrouter/`](../examples/use-case-own-openrouter/): one data-plane port, dynamic key management, and a budget plus a usage ledger. Save it and start the gateway before touching Cursor's settings.
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
