@@ -622,7 +622,7 @@ Reach for it to run a policy pasted from an older OPA install rather than rewrit
 
 ### `print()` capture
 
-A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior for every `policy: rego` and every `ai_routing_policy` `engine: rego`.
+A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior of Rego evaluation itself, not something each call site opts into, so it covers every surface that compiles a Rego module: `policy: rego`, `ai_routing_policy` `engine: rego`, a [request/response modifier's](#rego-modifiers) `rego_module`, and a signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook.
 
 ### Rego modifiers
 
@@ -650,7 +650,17 @@ response_modifiers:
       }
 ```
 
-The queried rule is a fixed name, `data.sbproxy.modify_request` / `data.sbproxy.modify_response`, the same way Lua and JavaScript modifiers call a fixed function name (`modify_request` / `modify_response`) with no config knob to rename it. Unlike `policy: rego`, a module that fails to parse does not refuse the config: the failure posture here matches the Lua/JS modifier row in [§11](#error-behavior), not the `rego` policy row above. See [§7](#7-modifier-reference) for the full modifier field reference.
+`input` merges what Lua's/JavaScript's two arguments (`req`/`resp` and `ctx`) carry into one document:
+
+| `input` key | Present on | Meaning |
+|---|---|---|
+| `input.request.method`, `.path`, `.host`, `.headers` | request modifiers | same fields Lua's/JavaScript's `req` argument carries |
+| `input.request.aipref.{train,search,ai_input}` (also `input.request.aipref["ai-input"]`) | both | mirrors `ctx.request.aipref` |
+| `input.request.tls.*` | both | TLS fingerprint fields, mirrors `ctx.request.tls` |
+| `input.principal.*` | both | mirrors `ctx.principal`, unchanged |
+| `input.response.status_code`, `.headers` | response modifiers | same fields Lua's/JavaScript's `resp` argument carries |
+
+The queried rule is a fixed name, `data.sbproxy.modify_request` / `data.sbproxy.modify_response`, the same way Lua and JavaScript modifiers call a fixed function name (`modify_request` / `modify_response`) with no config knob to rename it. Unlike `policy: rego`, a module that fails to parse does not refuse the config: the failure posture here matches the Lua/JS modifier row in [§11](#error-behavior), not the `rego` policy row above. There is also no `data` knob here: `policy: rego`'s base-data table (above) has no modifier equivalent, matching Lua's and JavaScript's modifier forms, which have no analogous side-table either. See [§7](#7-modifier-reference) for the full modifier field reference.
 
 ### Testing Rego policies offline: `sbproxy rego test`
 
@@ -704,7 +714,7 @@ coverage: policy.rego 4/4 lines (100.0%)
 ```
 
 
-Exit code `0`. A failing case exits `1` and names what it expected (`FAIL <fixture> :: <case>: expected <value>, got <value>`); `--min-coverage <PCT>` also exits `1` when aggregate coverage across every fixture in the run falls short. A fixture that is itself broken (unreadable, malformed YAML, a `module`/`module_path` conflict, no `cases`, a non-positive `budget_ms`) is recorded against that fixture and exits `2`, without discarding the results of every other fixture in the same run. `--format json` emits one structured object (`schema_version`, `cases`, `coverage`, `errors`, ...) instead of the text lines above, for a CI step that parses the result rather than scrapes it.
+Exit code `0`. A failing case exits `1` and names what it expected (`FAIL <fixture> :: <case>: expected <value>, got <value>`); `--min-coverage <PCT>` also exits `1` when aggregate coverage across every fixture in the run falls short. A fixture that is itself broken (unreadable, malformed YAML, a `module`/`module_path` conflict, no `cases`, a non-positive `budget_ms`) is recorded against that fixture and exits `2`, without discarding the results of every other fixture in the same run. `--format json` emits one structured object (`schema_version`, `cases`, `coverage`, `errors`, ...) instead of the text lines above, for a CI step that parses the result rather than scrapes it. Fixture paths are trusted input: unlike a bundle manifest's `entry`, a fixture's `module_path` resolves against the fixture file's own directory with no path-traversal guard, so run `sbproxy rego test` only against fixtures you trust, including in CI.
 
 ---
 
@@ -1252,6 +1262,8 @@ response_modifiers:
 
 For JSON body surgery on responses, prefer the JSON transforms: the typed `json` transform (`set` / `remove` / `rename` fields) for static edits, or `lua_json` / `js_json` for computed edits.
 
+When one modifier entry declares more than one script form together, they all run, in the fixed order `lua_script`, then `js_script`, then `rego_module` / `rego_module_path`, and the later engine wins when more than one sets the same header name.
+
 ---
 
 ## 8. AI-gateway scripting pointers
@@ -1274,10 +1286,13 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 
 ### Rego
 
+The four bullets below describe `policies[] type: rego` and `ai_routing_policy` `engine: rego`, the two surfaces §3a documents in full. The [Rego modifiers](#rego-modifiers) and [`runtime: rego` bundle](extension-bundles.md#rego) surfaces share the same Regorus engine and the same budget mechanism, but not this section's compile-time or failure-posture claims; see the fifth bullet.
+
 - One evaluation runs under `budget_ms` (default 50 ms, matching the extension-bundle sandbox default), enforced by the Regorus execution timer, which checks the deadline every thousand work units. `budget_ms: 0` is refused at config load.
 - Deliberately has no memory or stack cap and no fuel: the execution timer bounds total work, and a policy is one bounded evaluation over an already-bounded input document rather than a body-sized stream.
 - Configured per policy (`policies[] type: rego`, field `budget_ms`), not under `proxy.scripting`. Modules are compiled and semantically checked at config load, including one trial evaluation, so authoring mistakes cannot defer to request time.
 - Every fault denies the request; there is no `failure_posture` knob on this surface. See [§3a](#failure-posture).
+- A [request/response modifier's](#rego-modifiers) `rego_module` compiles fresh per invocation instead, under its own `rego_budget_ms` (same 50 ms default), and a fault is logged and the modifier skipped rather than denying, matching the Lua/JS modifier posture. A signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook compiles once at candidate load like `policies[] type: rego`, but a request-time fault propagates to the bundle manifest's `failure_posture` (`open` admits, `closed` refuses) instead of always denying, the same fault path every other bundle policy hook shares.
 
 ### Lua
 
@@ -1308,7 +1323,7 @@ One row per engine; every empty cell is a decision, not an omission, and the not
 | Engine | Wall clock | Memory | Stack | Fuel | Output cap | Limits configured in |
 |---|---|---|---|---|---|---|
 | CEL | none (terminates by construction; regex caps only) | none | none | none | none | nowhere: the regex caps are fixed |
-| Rego | `budget_ms`, default 50 ms | none | none | none | none | per policy (`budget_ms`) |
+| Rego | `budget_ms` (policy/routing) or `rego_budget_ms` (modifiers), default 50 ms either way | none | none | none | none | per policy (`budget_ms`) or per modifier (`rego_budget_ms`) |
 | Lua | 100 ms interrupt | 8 MB allocator | none | none (wall clock covers it) | none | `proxy.scripting.lua.sandbox` |
 | JavaScript (inline) | 100 ms watchdog | 16 MB heap | 1 MB native | none (wall clock covers it) | none | `proxy.scripting.javascript.sandbox` |
 | WASM (`transform: wasm`) | `timeout_ms`, default 1 s, epoch interruption | `max_memory_pages`, default 256 pages (16 MiB) | module-internal | `max_fuel`, default 10^9 | none | the transform's own config block |
@@ -1326,7 +1341,7 @@ CEL evaluates in microseconds per request and fits any routing decision, includi
 
 Lua and JavaScript build a fresh interpreter state per invocation. That is the isolation guarantee, and it means simple scripts complete in well under a millisecond but there is no cross-request state to amortize into.
 
-WASM has a one-time compilation cost at config load; subsequent invocations run at near-native speed inside the Wasmtime sandbox, paying one instantiation per request.
+WASM has a one-time compilation cost at config load; subsequent invocations run at near-native speed inside the Wasmtime sandbox, paying one instantiation per request. `policies[] type: rego`, `ai_routing_policy`, and a bundle's `runtime: rego` policy hook share that one-time cost: each compiles and trial-evaluates its module once, at config load or candidate load. A [request/response modifier's](#rego-modifiers) `rego_module` does not: it compiles fresh (parse plus one trial evaluation) on every invocation, so a broken module stamps a `record_script_compile` failure on every request that reaches it rather than once at load, the trade-off for `rego_module`/`rego_module_path` living in a list evaluated per request rather than a config-load-time slot.
 
 Tips:
 - Prefer `startsWith`, `endsWith`, or `contains` over `regex_match` in CEL hot paths.

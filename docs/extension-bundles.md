@@ -128,7 +128,7 @@ Writing nothing on the attachment is not the same as writing `open` there. A bun
 
 `digest_scope: entry` is the default and covers the exact bytes of the single file named by `entry`. Nothing else: not `bundle.yaml`, not the WAT or TypeScript source used to build the entry, not any other file in the directory. Every manifest written before `digest_scope` existed means this, which is why it stays the default.
 
-Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, and `permissions` live, and the permission lines are what decide which destinations guest code may ask for. Pinning the code while leaving the file that declares its capabilities unpinned is the verification the wrong way round.
+Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, `permissions`, and a `runtime: rego` hook's `query` all live, and the permission lines are what decide which destinations guest code may ask for. Pinning the code while leaving the file that declares its capabilities unpinned is the verification the wrong way round. An unpinned `query` is a narrower version of the same problem: a `bundle.yaml` edit can point evaluation at a different rule without touching the pinned module's bytes at all, but only among whatever rules that already-pinned module happens to define, not arbitrary new logic.
 
 `digest_scope: bundle_v1` covers `bundle.yaml` and every other file the bundle ships:
 
@@ -283,7 +283,7 @@ hooks:
       body_mode: none
 ```
 
-The rule reads the same JSON envelope a JavaScript or WASM policy hook reads: `input.request.method`, `input.request.uri`, `input.request.headers`, and `input.config` (the attachment's resolved `vars`, after `config_schema` defaults and `secret_vars` resolution). This is the wire-level request, not the internally resolved `CelContext` `policy: rego` reads from `sb.yml`; a bundle hook never sees trust tier or principal the way a built-in enforcer can. The query must evaluate to a Rego boolean: `true` allows, and `false`, an evaluation error, or a non-boolean result all deny, matching `policy: rego`'s fail-closed posture.
+The rule reads the same JSON envelope a JavaScript or WASM policy hook reads: `input.request.method`, `input.request.uri`, `input.request.headers`, and `input.config` (the attachment's resolved `vars`, after `config_schema` defaults and `secret_vars` resolution). This is the wire-level request, not the internally resolved `CelContext` `policy: rego` reads from `sb.yml`; a bundle hook never sees trust tier or principal the way a built-in enforcer can. The query must evaluate to a Rego boolean: `true` allows and `false` denies, both with the fixed status and message `policy: rego` itself defaults to. A budget-exceeded, non-boolean-result, or other internal evaluation fault is not a decision, so it does not deny by itself: it reaches the same `failure_posture` handling every other bundle policy hook's fault reaches (`open` admits, `closed` refuses), rather than always denying the way `policy: rego`'s own unconditional fail-closed posture does.
 
 A denial is always a fixed `403` with body `forbidden by policy`. `policy: rego`'s `deny_status`/`deny_message` knobs do not apply inside a bundle.
 

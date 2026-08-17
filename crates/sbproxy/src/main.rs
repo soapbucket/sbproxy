@@ -1038,13 +1038,13 @@ struct RegoCmd {
 enum RegoSub {
     /// Run one or more Rego fixture files against the module(s) they
     /// name and print a coverage summary. The offline `opa test`
-    /// analogue: every fixture compiles its module through the same
-    /// `CompiledRego::compile` a live `policy: rego` or
-    /// `ai_routing_policy` uses (`module_path` and `rego_v0` honored),
-    /// so a fixture that passes here behaves identically pasted into
-    /// config. Exit 0 when every case passes and (with `--min-coverage`)
-    /// coverage clears the threshold; 1 when a case fails, a fixture is
-    /// malformed, or coverage falls short.
+    /// analogue: every fixture compiles its module the same way a
+    /// live `policy: rego` or `ai_routing_policy` does (`module_path`
+    /// and `rego_v0` honored), so a fixture that passes here behaves
+    /// identically pasted into config. Exit 0 when every case passes
+    /// and (with `--min-coverage`) coverage clears the threshold; 1
+    /// when a case fails or coverage falls short; 2 when a fixture
+    /// itself is malformed.
     Test(RegoTestArgs),
 }
 

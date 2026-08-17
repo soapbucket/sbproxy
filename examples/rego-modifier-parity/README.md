@@ -20,12 +20,14 @@ Before the module ever reaches `sb.yml`, `sbproxy rego test` runs it against a f
 sbproxy rego test examples/rego-modifier-parity/policy_test.yaml
 ```
 
+<!-- CAPTURE: sbproxy rego test examples/rego-modifier-parity/policy_test.yaml -->
+
 ```text
 PASS examples/rego-modifier-parity/policy_test.yaml :: strong trust tier is allowed
 PASS examples/rego-modifier-parity/policy_test.yaml :: public GET is allowed regardless of trust tier
 PASS examples/rego-modifier-parity/policy_test.yaml :: private path with no strong trust tier is denied
 PASS examples/rego-modifier-parity/policy_test.yaml :: POST to a public path is denied
-coverage: policy.rego 3/3 lines (100.0%)
+coverage: policy.rego 4/4 lines (100.0%)
 4 passed, 0 failed, 0 errored, 100.0% total coverage
 ```
 
