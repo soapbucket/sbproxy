@@ -926,15 +926,28 @@ fn hmac_hex(key: &[u8; 32], data: &[u8], hex_len: usize) -> Option<String> {
     Some(full[..hex_len.min(full.len())].to_string())
 }
 
-/// HMAC-SHA256 a field's name-bound value: `name || 0x00 ||
+/// HMAC-SHA256 a field's name-bound value: `b"value\0" || name || 0x00 ||
 /// canonical(value)`. Binding the name into the value's own MAC
 /// (WOR-2478 I3/M6) means two mutations that set different fields to the
 /// same value no longer fingerprint identically: `{"status":"blocked"}`
 /// and some future `{"role":"blocked"}` disagree, where the bare value
 /// digest alone would not have.
+///
+/// The leading `b"value\0"` domain-separates this input from
+/// [`hmac_name`]'s (WOR-2478 review, M8): without it, a field literally
+/// named `name` whose canonical value bytes equal some other field's raw
+/// name would make `hmac_value(key, "name", that_value)` and
+/// `hmac_name(key, that_other_field)` hash the identical byte string
+/// (`hmac_name`'s `b"name\0" || name` looks exactly like `hmac_value`'s
+/// old `name || 0x00 || canonical(value)` in that one case), so the two
+/// keyspaces the doc comment on `hmac_name` claims are kept apart were
+/// not, for that input. Prefixing both functions with their own literal
+/// tag closes it: the two inputs now differ in their first six bytes no
+/// matter what `name` or `value` a caller passes.
 fn hmac_value(key: &[u8; 32], name: &str, value: &serde_json::Value) -> Option<String> {
     let canonical = serde_json::to_vec(value).ok()?;
-    let mut data = Vec::with_capacity(name.len() + 1 + canonical.len());
+    let mut data = Vec::with_capacity(6 + name.len() + 1 + canonical.len());
+    data.extend_from_slice(b"value\0");
     data.extend_from_slice(name.as_bytes());
     data.push(0);
     data.extend_from_slice(&canonical);
