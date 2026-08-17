@@ -25,7 +25,7 @@ There is also a separate in-process `EventBus` that embedders can register closu
 | `budget_exceeded` | An AI spend or quota budget was exhausted. |
 | `guardrail_triggered` | An AI guardrail flagged or blocked content. |
 | `config_reloaded` | The proxy configuration changed. |
-| `mcp_governance_decision` | An MCP `tools/call` was decided: allowed, refused by a governance gate (dual-LLM quarantine, modern output-schema validation), or refused before dispatch (RBAC, per-tool quota). |
+| `mcp_governance_decision` | An MCP interaction was decided: a `tools/call` allowed, refused by a governance gate (dual-LLM quarantine, modern output-schema validation, argument policy, peer downgrade, registry approval status), or refused before dispatch (RBAC, per-tool quota); a federated tool's contract changed against its version lockfile; or a federated server's registry approval status transitioned (draft, approved, deprecated) across a config reload. |
 
 Circuit-breaker activity is a metric (`sbproxy_circuit_breaker_transitions_total`), not an event. See [metrics-stability.md](metrics-stability.md).
 
@@ -40,7 +40,7 @@ Six. The other six are enum variants an embedder can publish, and configuring a 
 | `auth_denied` | Every authentication rejection, including forward-auth and digest challenges. |
 | `policy_denied` | Every policy block (rate limit, IP filter, WAF, object authorization, A2A, prompt injection) and every HTTP framing violation. |
 | `config_reloaded` | A configuration change through the admin API, carrying the revision pair and the origin delta. |
-| `mcp_governance_decision` | The same MCP tool-call funnel every dispatch already passes through, alongside the decision-audit record, plus the RBAC and per-tool-quota denial sites that refuse a call before it ever reaches that funnel. |
+| `mcp_governance_decision` | The same MCP tool-call funnel every dispatch already passes through, alongside the decision-audit record, plus the RBAC and per-tool-quota denial sites that refuse a call before it ever reaches that funnel; the tool-version lockfile gate's per-refresh contract check; and the federated-server approval-status compile-time transition check. |
 
 `request_started`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, and `guardrail_triggered` have no emitter in this build. The cache path reports through `sbproxy_cache_*`, and the AI path reports through `sbproxy_ai_*` and the [usage ledger](ai-usage-ledger.md), which is where the gateway's own accounting lives. Point a sink at those six only if your own code publishes them.
 
@@ -56,7 +56,7 @@ pub struct ProxyEvent {
 }
 ```
 
-`data` is the record the emitting channel already built. For `auth_denied` and `policy_denied` it is the `security_audit` entry: timestamp, event type, reason, hostname, client IP, request id, method, status code, tenant id, credential provider and mode, and the public key id. For `config_reloaded` it is the `config_audit` entry: source, origin delta, actor, and the before and after revisions. For `request_completed` and `request_error` it is the full request envelope, including latency, status, provider, model, token counts, and cost. For `mcp_governance_decision` it is OTel GenAI/MCP semantic-convention attribute names (Development stability) plus sbproxy's own `sbproxy.*` namespace: the tool name and call id, the MCP method and protocol version, the decision verdict and redacted reason, a salted hash of the tool arguments (never the arguments themselves), the tenant id, and a per-tenant gapless sequence number a SIEM can use to detect a dropped record.
+`data` is the record the emitting channel already built. For `auth_denied` and `policy_denied` it is the `security_audit` entry: timestamp, event type, reason, hostname, client IP, request id, method, status code, tenant id, credential provider and mode, and the public key id. For `config_reloaded` it is the `config_audit` entry: source, origin delta, actor, and the before and after revisions. For `request_completed` and `request_error` it is the full request envelope, including latency, status, provider, model, token counts, and cost. For `mcp_governance_decision` it is OTel GenAI/MCP semantic-convention attribute names (Development stability) plus sbproxy's own `sbproxy.*` namespace: the tool name and call id, the MCP method and protocol version, the decision verdict and redacted reason, a salted hash of the tool arguments (never the arguments themselves, unless `mcp_audit.capture_arguments` opts a deployment into the redacted, size-bounded verbatim arguments too), the tenant id, and a per-tenant gapless sequence number a SIEM can use to detect a dropped record. A tool-definition-change or registry-status-change record instead carries digest prefixes or the old/new status labels; see [mcp-security.md](mcp-security.md#no-usable-record-of-what-happened) for the full field mapping.
 
 None of those payloads carries a credential, and that is a property under test rather than a convention. `api_key_id` is the public id or a derived `sk_<hex>` fingerprint and never the secret. `prompt_fingerprint` is salted and non-reversible. No field holds prompt text, a header value, or a resolved config value. A field added to either record fails a test until somebody has confirmed it can be sent to a third party, because with a webhook sink these bytes leave your network.
 
@@ -174,6 +174,12 @@ A `fail_closed` entry does not have to also appear in `types`, but if it does no
 
 `sbproxy.evidence.seq` only advances while something installed would actually receive `mcp_governance_decision`, so the sequence covers the period evidence emission is enabled: turning it off freezes the counter rather than creating a gap, and turning it back on resumes from where it left off.
 
+## Retention
+
+There is no `retention:` key anywhere in the `events:` block, and that is deliberate rather than an omission. The gateway is a producer, not a store: it appends to a file or POSTs to a webhook and moves on, and a per-event-type retention window would mean the proxy owning a decision it has no way to enforce once the bytes have left the process.
+
+`sbproxy.evidence.seq` is what makes retention safe to delegate entirely. Because the sequence is gapless per tenant while emission is enabled, a consumer on the SIEM side can always prove it has received every record in a range rather than trusting that it has: a missing number is a detectable hole, not a silent one. That is the property a retention policy actually needs, and it lives on the SIEM side of the wire, where the durable store, the query engine, and the compliance window already are. Configure retention there, the same as you would for any other ingested log stream.
+
 ## Shutdown does not flush
 
 Stated plainly so nobody assumes otherwise. On `SIGTERM` or `SIGKILL` the process exits with whatever is still queued still queued: up to `queue_capacity` events, plus the batch the worker was mid-delivery on.
@@ -192,7 +198,7 @@ Every one of these is a config that would compile, boot, serve traffic, and deli
 - `queue_capacity: 0`.
 - `types:` or `queue_capacity:` under `sink: none`.
 - An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all twelve.
-- Any key the block does not define, so a hopeful `retries:` or `batch_size:` fails rather than being dropped.
+- Any key the block does not define, so a hopeful `retries:`, `batch_size:`, or `retention:` fails rather than being dropped. See [Retention](#retention) for why the last one is absent on purpose.
 
 ## Not implemented
 

@@ -68,7 +68,7 @@
 //! and applies a small allowlist guardrail at request time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use sbproxy_extension::cel::{CelSurface, CompiledCel};
@@ -208,6 +208,48 @@ pub struct McpActionConfig {
     /// ledger only.
     #[serde(default)]
     pub usage_sinks: Vec<sbproxy_ai::usage_sink::UsageSinkConfig>,
+    /// Verbatim tool-call argument capture for `mcp_governance_decision`
+    /// evidence events (WOR-2392). Absent keeps every field at its
+    /// default (`capture_arguments: false`). See [`McpAuditConfig`].
+    #[serde(default)]
+    pub mcp_audit: McpAuditConfig,
+}
+
+/// `mcp_audit:` block (WOR-2392): governs whether the
+/// `mcp_governance_decision` evidence stream carries verbatim tool-call
+/// arguments, on top of the `sbproxy.tool.arguments_hash` digest every
+/// dispatched call already carries unconditionally.
+///
+/// ```yaml
+/// origins:
+///   "mcp.example.com":
+///     action:
+///       type: mcp
+///       mcp_audit:
+///         capture_arguments: true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpAuditConfig {
+    /// When `true`, a dispatched `tools/call`'s `mcp_governance_decision`
+    /// event also carries `gen_ai.tool.call.arguments`: the call's
+    /// arguments, redacted (`sbproxy_observe::redact::redact_secrets`)
+    /// and size-bounded the same way the pre-existing `mcp_audit`
+    /// tracing event's own content fields already are, rather than
+    /// only the salted digest every call already carries.
+    ///
+    /// Off by default. Shipping raw tool-call arguments to every
+    /// configured `events:` sink (a file, a webhook, potentially a
+    /// third-party SIEM) is a real privacy and exfiltration-surface
+    /// tradeoff: an argument the redaction pass does not recognize as
+    /// a credential (a customer's PII, business-sensitive free text)
+    /// still ships verbatim. An operator who wants "which agent called
+    /// which tool with what arguments" answerable from exported logs
+    /// alone must opt into that explicitly; a proxy should not make
+    /// that decision silently on their behalf. See
+    /// `docs/mcp-security.md`'s "Verbatim argument capture" section for
+    /// the full tradeoff.
+    #[serde(default)]
+    pub capture_arguments: bool,
 }
 
 /// One `argument_policies[]` entry (WOR-2384, MCP05): a CEL or Rego
@@ -794,6 +836,181 @@ pub const MCP_SERVER_DRAFT_REASON: &str = "server_draft";
 /// server's warn-level governance event.
 pub const MCP_SERVER_DEPRECATED_REASON: &str = "mcp_server_deprecated";
 
+/// `sbproxy.decision.reason` for an approval-status *transition*
+/// observed across a config reload (WOR-2392): a federated server's
+/// `status:` moved from one value to another between two successful
+/// compiles of the action that declares it. Distinct from
+/// [`MCP_SERVER_DRAFT_REASON`] / [`MCP_SERVER_DEPRECATED_REASON`],
+/// which are the per-`tools/call` reasons a server's *current* status
+/// produces on every call while that status holds; this reason fires
+/// once, at the moment the status itself changes, so an auditor can
+/// see when a server moved into (or out of) `draft` or `deprecated`
+/// without reconstructing it from call volume.
+pub const MCP_SERVER_STATUS_CHANGED_REASON: &str = "server_status_changed";
+
+/// Process-global memory of each federated server's last-compiled
+/// registry approval status, keyed by
+/// [`McpServerPrefix::peer_key`] (WOR-2392).
+///
+/// Approval status is a proxy-wide governance fact the operator's own
+/// config sets, not something the caller's identity picks out -- the
+/// same reasoning
+/// [`sbproxy_extension::mcp::McpFederation`]'s `server_protocol_versions`
+/// doc comment gives for *not* scoping that map per tenant. So unlike
+/// [`sbproxy_extension::mcp::peer_profile`] (keyed `(tenant_id,
+/// peer_key)`, populated by request-time negotiation), this registry is
+/// keyed by `peer_key` alone and is consulted once per action compile
+/// (`McpAction::from_parsed`), not once per request.
+///
+/// `peer_key` already changes whenever an operator edits a server
+/// entry's `name`, `origin`, `protocol`, or `downgrade` (see
+/// `McpServerPrefix::peer_key`'s doc comment on the field it is stored
+/// in), so an edited server starts a fresh entry here too: a rename or
+/// a re-pointed origin is never mistaken for a status transition on
+/// some unrelated logical server that happens to reuse the name.
+static SERVER_STATUS_REGISTRY: OnceLock<
+    parking_lot::Mutex<HashMap<String, McpServerApprovalStatus>>,
+> = OnceLock::new();
+
+/// Ceiling on the number of `peer_key`s [`SERVER_STATUS_REGISTRY`]
+/// tracks. Mirrors
+/// [`sbproxy_extension::mcp::peer_profile::MAX_TRACKED_PEERS`]'s order
+/// of magnitude. `peer_key` is operator-controlled config rather than
+/// caller-controlled request input, so unbounded growth here would
+/// need an operator reloading with an ever-growing set of distinct
+/// server identities across the process lifetime -- self-inflicted,
+/// not an attacker path -- but the cap is cheap insurance regardless.
+const MAX_TRACKED_SERVER_STATUSES: usize = 4096;
+
+/// Latches the past-cap warning to once per process, mirroring
+/// `sbproxy_extension::mcp::peer_profile`'s own saturation-warning
+/// idiom.
+static SERVER_STATUS_REGISTRY_SATURATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Compare `status` against [`SERVER_STATUS_REGISTRY`]'s last-recorded
+/// value for `peer_key`, update it, and return the *previous* status
+/// only when this compile observes an actual change.
+///
+/// Returns `None` on the first compile ever seen for a fresh
+/// `peer_key` (nothing to have changed from -- a fresh deployment must
+/// not manufacture a "changed" event for every server on its very
+/// first config load) and `None` on a repeat compile that reports the
+/// same status as last time (the common case: every hot reload
+/// recompiles every origin's `McpAction` from scratch, changed or not,
+/// so this runs far more often than the status itself actually moves).
+///
+/// A `peer_key` past [`MAX_TRACKED_SERVER_STATUSES`] is silently not
+/// tracked (logged once) rather than growing the map or failing the
+/// compile: an untracked server just does not get transition
+/// detection, the same "degrade observability, never availability"
+/// posture [`sbproxy_extension::mcp::peer_profile`]'s own overflow
+/// bucket takes for a different registry.
+fn observe_server_status_transition(
+    peer_key: &str,
+    status: McpServerApprovalStatus,
+) -> Option<McpServerApprovalStatus> {
+    let registry = SERVER_STATUS_REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let mut map = registry.lock();
+    if let Some(prev) = map.get(peer_key).copied() {
+        map.insert(peer_key.to_string(), status);
+        return (prev != status).then_some(prev);
+    }
+    if map.len() >= MAX_TRACKED_SERVER_STATUSES {
+        if !SERVER_STATUS_REGISTRY_SATURATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                tracked = MAX_TRACKED_SERVER_STATUSES,
+                "mcp server-status registry saturated; further approval-status transitions will \
+                 not be detected until a tracked server's config identity changes"
+            );
+        }
+        return None;
+    }
+    map.insert(peer_key.to_string(), status);
+    None
+}
+
+/// Wire-form label for one [`McpServerApprovalStatus`], matching
+/// [`McpServerApprovalStatus`]'s own `#[serde(rename_all =
+/// "snake_case")]` wire form exactly (`Draft` -> `"draft"`, etc.), used
+/// for the `sbproxy.registry.status.old` / `.new` governance-evidence
+/// fields rather than `serde_json`-serializing the enum, since the
+/// evidence payload is hand-assembled `serde_json::Value` rather than
+/// derive-serialized.
+fn server_approval_status_label(status: McpServerApprovalStatus) -> &'static str {
+    match status {
+        McpServerApprovalStatus::Draft => "draft",
+        McpServerApprovalStatus::Approved => "approved",
+        McpServerApprovalStatus::Deprecated => "deprecated",
+    }
+}
+
+/// WOR-2392: emit one `mcp_governance_decision` evidence event when
+/// [`observe_server_status_transition`] reports an approval-status
+/// change for `server_name`. Reason [`MCP_SERVER_STATUS_CHANGED_REASON`],
+/// rule_id [`MCP_SERVER_APPROVAL_RULE_ID`] -- the same rule id the
+/// per-call `draft`/`deprecated` denials already carry, because this is
+/// the same governance rule observed at a different moment (the
+/// transition itself), not a different rule.
+///
+/// Verdict mirrors the *resulting* status's own call-time posture:
+/// `deny` when the server just became `draft` (every call is now
+/// refused), `warn` when it just became `deprecated` (calls still
+/// proceed but every one already warns), `allow` when it just became
+/// `approved`.
+///
+/// Like [`sbproxy_extension::mcp::federation`]'s
+/// `tool_definition_changed` emission, config compile has no
+/// per-request tenant and no single inbound origin to attribute this
+/// to, so `hostname` and `tenant_id` are both empty --
+/// [`sbproxy_observe::events::EventType::ConfigReloaded`]'s own
+/// convention for a proxy-wide fact with no request behind it.
+fn emit_server_status_changed_event(
+    server_name: &str,
+    old_status: McpServerApprovalStatus,
+    new_status: McpServerApprovalStatus,
+) {
+    use sbproxy_observe::events::{EventType, ProxyEvent};
+
+    let event_type = EventType::McpGovernanceDecision;
+    if !sbproxy_observe::event_sink::wants_event(event_type) {
+        return;
+    }
+    let seq = sbproxy_observe::evidence_seq::next_seq("");
+    let (verdict, is_deny) = match new_status {
+        McpServerApprovalStatus::Draft => ("deny", true),
+        McpServerApprovalStatus::Deprecated => ("warn", false),
+        McpServerApprovalStatus::Approved => ("allow", false),
+    };
+    let mut fields = serde_json::Map::new();
+    fields.insert("sbproxy.tool.server".to_string(), server_name.into());
+    fields.insert("sbproxy.decision.verdict".to_string(), verdict.into());
+    fields.insert(
+        "sbproxy.decision.reason".to_string(),
+        MCP_SERVER_STATUS_CHANGED_REASON.into(),
+    );
+    fields.insert(
+        "sbproxy.decision.rule_id".to_string(),
+        MCP_SERVER_APPROVAL_RULE_ID.into(),
+    );
+    if is_deny {
+        fields.insert("error.type".to_string(), "policy_denied".into());
+    }
+    fields.insert(
+        "sbproxy.registry.status.old".to_string(),
+        server_approval_status_label(old_status).into(),
+    );
+    fields.insert(
+        "sbproxy.registry.status.new".to_string(),
+        server_approval_status_label(new_status).into(),
+    );
+    fields.insert("sbproxy.tenant.id".to_string(), "".into());
+    fields.insert("sbproxy.evidence.seq".to_string(), seq.into());
+    let data = serde_json::Value::Object(fields);
+    let event = ProxyEvent::new(event_type, String::new(), String::new(), data);
+    sbproxy_observe::event_sink::publish_proxy_event(event_type, || event);
+}
+
 /// `sbproxy.decision.reason` for an `argument_policies[]` verdict of
 /// either polarity (WOR-2384, MCP05): names the gate (this one) that
 /// produced the event. The specific rule is carried separately, as
@@ -1135,6 +1352,12 @@ pub struct McpAction {
     /// always returns [`McpArgumentPolicyVerdict::Allow`] without
     /// building a CEL/Rego context.
     pub argument_policies: Vec<CompiledMcpArgumentPolicy>,
+    /// `mcp_audit.capture_arguments` (WOR-2392). When true, a
+    /// dispatched `tools/call`'s `mcp_governance_decision` event
+    /// carries the redacted, size-bounded verbatim call arguments
+    /// under `gen_ai.tool.call.arguments`. Off by default. See
+    /// [`McpAuditConfig::capture_arguments`].
+    pub mcp_audit_capture_arguments: bool,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -1715,6 +1938,16 @@ impl McpAction {
                 &upstream.protocol,
                 upstream.downgrade.peer_key_component(),
             );
+            // WOR-2392: registry-change visibility. `from_parsed` runs
+            // on every hot reload for every origin (compile does not
+            // skip unchanged origins), so comparing against the last
+            // status this exact `peer_key` compiled with is what turns
+            // "ran again" into "actually changed" -- see
+            // `observe_server_status_transition`'s doc comment.
+            let status_transition = observe_server_status_transition(&peer_key, upstream.status);
+            if let Some(prev_status) = status_transition {
+                emit_server_status_changed_event(&name, prev_status, upstream.status);
+            }
             prefixes.insert(
                 name.clone(),
                 McpServerPrefix {
@@ -1895,6 +2128,7 @@ impl McpAction {
             tool_pricing: cfg.tool_pricing,
             usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
             argument_policies,
+            mcp_audit_capture_arguments: cfg.mcp_audit.capture_arguments,
         })
     }
 
@@ -4302,5 +4536,225 @@ allow := false if {
             },
             "a panicking rule must deny even under mode: warn, and must flag panicked: {verdict:?}"
         );
+    }
+
+    // --- Registry-change visibility (WOR-2392) ---
+
+    fn wor_2392_status_config(status: Option<&str>) -> serde_json::Value {
+        let mut server = json!({
+            "origin": "https://wor2392-status.example.com/mcp",
+            "prefix": "wor2392-status-server",
+        });
+        if let Some(status) = status {
+            server["status"] = json!(status);
+        }
+        json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2392-status-fixture", "version": "1.0.0"},
+            "federated_servers": [server]
+        })
+    }
+
+    fn wor_2392_poll_status_events(
+        path: &std::path::Path,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                for line in contents.lines() {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        if predicate(&event) {
+                            return Some(event);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    fn wor_2392_count_status_events(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|event| {
+                        event["data"]["sbproxy.decision.reason"] == "server_status_changed"
+                            && event["data"]["sbproxy.tool.server"] == "wor2392-status-server"
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// WOR-2392: an approval-status *transition* observed across a
+    /// config reload must reach `mcp_governance_decision` exactly once
+    /// per actual change -- never on the very first compile (nothing to
+    /// have changed from), never twice for a repeat compile that
+    /// reports the same status (every hot reload recompiles every
+    /// origin's `McpAction` from scratch, changed or not), and with a
+    /// verdict that mirrors the resulting status's own call-time
+    /// posture in both directions (draft -> deny, back to approved ->
+    /// allow).
+    #[test]
+    fn wor_2392_server_status_transition_across_reloads_emits_one_governance_event() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("wor2392-status-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("event egress installs exactly once per test binary");
+
+        // Phase 1: first-ever compile for this peer_key (no `status:`
+        // -> defaults to `approved`). Nothing recorded yet to have
+        // transitioned from, so this must not manufacture an event.
+        // Deterministic without polling: `observe_server_status_transition`
+        // returns `None` here, so the emit path is never reached and
+        // nothing is ever queued to the egress worker for this call.
+        let first = McpAction::from_config(wor_2392_status_config(None))
+            .expect("first compile (approved, implicit)");
+        assert_eq!(
+            first.server_status("wor2392-status-server"),
+            McpServerApprovalStatus::Approved
+        );
+        assert_eq!(
+            wor_2392_count_status_events(&events_path),
+            0,
+            "the first-ever compile for a peer_key must not emit a transition event"
+        );
+
+        // Phase 2: recompile the same server entry as `draft`. Same
+        // `name`/`origin`/`protocol`/`downgrade`, so the same
+        // `peer_key` -- this must read as a transition on the SAME
+        // logical server, not a fresh, untracked one.
+        let second = McpAction::from_config(wor_2392_status_config(Some("draft")))
+            .expect("second compile (draft)");
+        assert_eq!(
+            second.server_status("wor2392-status-server"),
+            McpServerApprovalStatus::Draft
+        );
+        let deny_event = wor_2392_poll_status_events(&events_path, |event| {
+            event["data"]["sbproxy.decision.reason"] == "server_status_changed"
+        })
+        .expect(
+            "an mcp_governance_decision event for the draft transition was not observed within 5s",
+        );
+        assert_eq!(deny_event["event_type"], "mcp_governance_decision");
+        assert_eq!(
+            deny_event["data"]["sbproxy.tool.server"],
+            "wor2392-status-server"
+        );
+        assert_eq!(deny_event["data"]["sbproxy.decision.verdict"], "deny");
+        assert_eq!(deny_event["data"]["error.type"], "policy_denied");
+        assert_eq!(
+            deny_event["data"]["sbproxy.decision.rule_id"],
+            "mcp_server_approval"
+        );
+        assert_eq!(deny_event["data"]["sbproxy.registry.status.old"], "approved");
+        assert_eq!(deny_event["data"]["sbproxy.registry.status.new"], "draft");
+
+        // Phase 3: recompile again with the SAME `draft` status. No
+        // change, so no second event -- proves this is a transition
+        // detector, not a per-compile logger. Deterministic: nothing is
+        // queued to the egress worker by an unchanged compile, so
+        // there is no delivery race to poll for.
+        let third = McpAction::from_config(wor_2392_status_config(Some("draft")))
+            .expect("third compile (still draft)");
+        assert_eq!(
+            third.server_status("wor2392-status-server"),
+            McpServerApprovalStatus::Draft
+        );
+        assert_eq!(
+            wor_2392_count_status_events(&events_path),
+            1,
+            "a repeat compile reporting the same status must not emit a second event"
+        );
+
+        // Phase 4: recompile back to `approved`. A second transition,
+        // in the other direction, must emit its own event with an
+        // `allow` verdict and no `error.type`.
+        let _fourth = McpAction::from_config(wor_2392_status_config(Some("approved")))
+            .expect("fourth compile (back to approved)");
+        let allow_event = wor_2392_poll_status_events(&events_path, |event| {
+            event["data"]["sbproxy.decision.reason"] == "server_status_changed"
+                && event["data"]["sbproxy.registry.status.new"] == "approved"
+        })
+        .expect(
+            "an mcp_governance_decision event for the approved transition was not observed \
+             within 5s",
+        );
+        assert_eq!(allow_event["data"]["sbproxy.decision.verdict"], "allow");
+        assert!(
+            allow_event["data"].get("error.type").is_none(),
+            "an allow verdict must not stamp error.type: {allow_event:?}"
+        );
+        assert_eq!(allow_event["data"]["sbproxy.registry.status.old"], "draft");
+        assert_eq!(
+            wor_2392_count_status_events(&events_path),
+            2,
+            "exactly two transitions occurred across all four compiles"
+        );
+    }
+
+    // --- Verbatim argument capture opt-in (WOR-2392) ---
+
+    fn wor_2392_capture_config(mcp_audit: Option<serde_json::Value>) -> serde_json::Value {
+        let mut cfg = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "https://wor2392-capture.example.com/mcp",
+                "prefix": "wor2392-capture-server",
+            }]
+        });
+        if let Some(mcp_audit) = mcp_audit {
+            cfg["mcp_audit"] = mcp_audit;
+        }
+        cfg
+    }
+
+    #[test]
+    fn mcp_audit_capture_arguments_defaults_to_false() {
+        let no_block = McpAction::from_config(wor_2392_capture_config(None))
+            .expect("no mcp_audit block compiles");
+        assert!(
+            !no_block.mcp_audit_capture_arguments,
+            "an absent mcp_audit: block must default capture_arguments to false"
+        );
+
+        let explicit_default = McpAction::from_config(wor_2392_capture_config(Some(json!({}))))
+            .expect("empty mcp_audit block compiles");
+        assert!(
+            !explicit_default.mcp_audit_capture_arguments,
+            "an mcp_audit: block with no capture_arguments key must default to false"
+        );
+
+        let explicit_false =
+            McpAction::from_config(wor_2392_capture_config(Some(json!({
+                "capture_arguments": false
+            }))))
+            .expect("mcp_audit.capture_arguments: false compiles");
+        assert!(!explicit_false.mcp_audit_capture_arguments);
+    }
+
+    #[test]
+    fn mcp_audit_capture_arguments_true_when_configured() {
+        let action = McpAction::from_config(wor_2392_capture_config(Some(json!({
+            "capture_arguments": true
+        }))))
+        .expect("mcp_audit.capture_arguments: true compiles");
+        assert!(action.mcp_audit_capture_arguments);
     }
 }

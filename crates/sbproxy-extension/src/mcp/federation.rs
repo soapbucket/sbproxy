@@ -3754,7 +3754,18 @@ impl McpFederation {
                         security = verdict.findings.iter().any(|f| f.security),
                         "tool contract changed without a matching version bump"
                     );
-                    if gate.mode == VersioningMode::Block {
+                    let is_blocked = gate.mode == VersioningMode::Block;
+                    // WOR-2392: the SIEM-routable sibling of the
+                    // `sbproxy::audit` line just above -- same fact,
+                    // same verdict, delivered on the `events:` bus
+                    // instead of (or in addition to) a log line.
+                    emit_tool_definition_changed_event(
+                        name,
+                        &tool.server_name,
+                        is_blocked,
+                        &verdict,
+                    );
+                    if is_blocked {
                         blocked.insert(name.clone(), detail);
                     }
                 }
@@ -4106,6 +4117,106 @@ fn modern_serialized_tool_entry(tool: &FederatedTool) -> Option<SerializedToolEn
         server_name: tool.server_name.clone(),
         json: contract.as_value().to_string(),
     })
+}
+
+/// Stable `sbproxy.decision.rule_id` every `tool_definition_changed`
+/// `mcp_governance_decision` event carries (WOR-2392): the
+/// WOR-1635/2444 lockfile/digest gate is the one rule that produces
+/// this reason, the same one-rule-id-per-mechanism convention
+/// [`super::peer_profile::PEER_DOWNGRADE_RULE_ID`] and
+/// `sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID`
+/// (a different crate; not importable from here) already follow.
+pub const TOOL_VERSIONING_VIOLATION_RULE_ID: &str = "mcp_tool_versioning";
+
+/// Truncate a `contract_digest` string (e.g. `mcp-contract-v2-sha256:ab12..`)
+/// to a short, stable prefix for a governance-evidence field.
+///
+/// The digest is not secret -- it is a structural fingerprint of a tool
+/// contract, not the contract itself -- so no redaction or salting
+/// applies here, unlike `mcp_audit`'s content-field hashing. Truncation
+/// exists only to keep the event payload small; enough characters
+/// survive (including any `scheme:` prefix) to correlate against the
+/// lockfile or a wider audit-target log line by eye.
+fn digest_field_prefix(digest: &str) -> String {
+    const PREFIX_LEN: usize = 24;
+    match digest.char_indices().nth(PREFIX_LEN) {
+        Some((byte_idx, _)) => digest[..byte_idx].to_string(),
+        None => digest.to_string(),
+    }
+}
+
+/// WOR-2392: emit one `mcp_governance_decision` evidence event when
+/// [`McpFederation::evaluate_tool_versioning_snapshot`] grades a live
+/// contract change as [`super::compat::BumpVerdict::Violation`] (a
+/// tool's live contract moved without a matching declared version
+/// bump). Reason `tool_definition_changed`. Verdict mirrors exactly
+/// what that call site already decided for this violation -- `deny`
+/// under `VersioningMode::Block` (the tool is refused), `warn`
+/// otherwise (the tool still serves, but the change is on record) --
+/// so this event never disagrees with the enforcement path it
+/// describes.
+///
+/// Carries only digest prefixes ([`digest_field_prefix`]), never the
+/// tool contract or its full description text: the same "digests,
+/// never definitions" discipline the lockfile gate itself already
+/// applies when it logs `mcp.tool_versioning.violation`.
+///
+/// This is a background refresh-loop detection, not a per-request
+/// decision: there is no `RequestContext`, no single tenant, and no
+/// one inbound origin to attribute it to. `hostname` and `tenant_id`
+/// are both empty, the same convention
+/// [`sbproxy_observe::events::EventType::ConfigReloaded`] already uses
+/// for a proxy-wide fact with no request behind it; the per-tenant
+/// evidence sequence advances in the shared empty-tenant bucket that
+/// convention implies.
+fn emit_tool_definition_changed_event(
+    tool_name: &str,
+    server: &str,
+    blocked: bool,
+    verdict: &super::compat::CompatibilityVerdict,
+) {
+    use sbproxy_observe::events::{EventType, ProxyEvent};
+
+    let event_type = EventType::McpGovernanceDecision;
+    // Mirrors `emit_mcp_governance_evidence`'s own ordering (WOR-2384):
+    // check whether anything would even receive this before taking the
+    // evidence-sequence lock or building the payload, so the sequence
+    // only advances across the window delivery is actually enabled.
+    if !sbproxy_observe::event_sink::wants_event(event_type) {
+        return;
+    }
+    let seq = sbproxy_observe::evidence_seq::next_seq("");
+    let mut fields = serde_json::Map::new();
+    fields.insert("gen_ai.tool.name".to_string(), tool_name.into());
+    fields.insert("sbproxy.tool.server".to_string(), server.into());
+    fields.insert(
+        "sbproxy.decision.verdict".to_string(),
+        (if blocked { "deny" } else { "warn" }).into(),
+    );
+    fields.insert(
+        "sbproxy.decision.reason".to_string(),
+        "tool_definition_changed".into(),
+    );
+    fields.insert(
+        "sbproxy.decision.rule_id".to_string(),
+        TOOL_VERSIONING_VIOLATION_RULE_ID.into(),
+    );
+    if blocked {
+        fields.insert("error.type".to_string(), "policy_denied".into());
+    }
+    fields.insert(
+        "sbproxy.tool.digest.old".to_string(),
+        digest_field_prefix(&verdict.from_digest).into(),
+    );
+    fields.insert(
+        "sbproxy.tool.digest.new".to_string(),
+        digest_field_prefix(&verdict.to_digest).into(),
+    );
+    fields.insert("sbproxy.tenant.id".to_string(), "".into());
+    fields.insert("sbproxy.evidence.seq".to_string(), seq.into());
+    let data = serde_json::Value::Object(fields);
+    let event = ProxyEvent::new(event_type, String::new(), String::new(), data);
+    sbproxy_observe::event_sink::publish_proxy_event(event_type, || event);
 }
 
 /// Project and digest a live tool under the same scheme its baseline was
@@ -6722,6 +6833,143 @@ mod tests {
             .await;
         assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Poll `path` (an NDJSON event log) until a line satisfies
+    /// `predicate` or 5s elapse. Delivery is asynchronous (a background
+    /// worker drains the egress queue), so a single read right after
+    /// the triggering call would be racy.
+    async fn poll_for_governance_event(
+        path: &std::path::Path,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                for line in contents.lines() {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        if predicate(&event) {
+                            return Some(event);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// WOR-2392: a live contract change graded `BumpVerdict::Violation`
+    /// (no matching declared version bump) must reach the
+    /// `mcp_governance_decision` evidence bus with reason
+    /// `tool_definition_changed`, carrying only digest prefixes (never
+    /// the contract text) and a verdict that matches whatever the gate
+    /// itself decided -- `deny` in `Block` mode (where the tool is also
+    /// refused), `warn` in `Warn` mode (where it is not).
+    ///
+    /// One test, two scenarios, sharing a single installed egress:
+    /// `install_event_egress` is a process-wide, set-once slot (see
+    /// `sbproxy_observe::event_sink`'s module docs), so this is the one
+    /// place in this crate's test binary allowed to call it, the same
+    /// discipline `action_dispatch.rs`'s
+    /// `wor_2384_rbac_denied_tools_call_emits_a_deny_governance_event`
+    /// documents for the same reason in a different crate.
+    #[tokio::test]
+    async fn wor_2392_definition_change_emits_governance_events_matching_gate_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("definition-change-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("event egress installs exactly once per test binary");
+
+        // --- Scenario 1: Block mode -> verdict deny, error.type set,
+        // and the tool is also blocked (the pre-existing behavior this
+        // event must never disagree with). ---
+        {
+            let path = write_lockfile("wor2392-block", &gate_lockfile("original description"));
+            let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+            fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+                .await;
+            assert!(
+                fed.version_blocked().contains_key("search"),
+                "block mode must still block the violating tool"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == "search"
+                    && event["data"]["sbproxy.decision.reason"] == "tool_definition_changed"
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the block-mode definition change \
+                 was not observed within 5s",
+            );
+            assert_eq!(event["event_type"], "mcp_governance_decision");
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+            assert_eq!(event["data"]["error.type"], "policy_denied");
+            assert_eq!(event["data"]["sbproxy.tool.server"], "srv");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "mcp_tool_versioning"
+            );
+            let old_digest = event["data"]["sbproxy.tool.digest.old"]
+                .as_str()
+                .expect("old digest field present");
+            let new_digest = event["data"]["sbproxy.tool.digest.new"]
+                .as_str()
+                .expect("new digest field present");
+            assert_ne!(
+                old_digest, new_digest,
+                "a definition change must carry two different digests"
+            );
+            assert!(
+                !old_digest.contains("description")
+                    && !new_digest.contains("description")
+                    && !old_digest.contains("meaning")
+                    && !new_digest.contains("meaning"),
+                "digest fields must never carry contract text: old={old_digest} new={new_digest}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+
+        // --- Scenario 2: Warn mode -> verdict warn, no error.type, and
+        // the tool is NOT blocked. ---
+        {
+            let path = write_lockfile("wor2392-warn", &gate_lockfile("original description"));
+            let fed = gated_federation(path.clone(), VersioningMode::Warn, None);
+            fed.evaluate_tool_versioning(&gate_registry("a warn-mode rewrite"))
+                .await;
+            assert!(
+                fed.version_blocked().is_empty(),
+                "warn mode must never block"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == "search"
+                    && event["data"]["sbproxy.decision.reason"] == "tool_definition_changed"
+                    && event["data"]["sbproxy.decision.verdict"] == "warn"
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the warn-mode definition change \
+                 was not observed within 5s",
+            );
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "warn");
+            assert!(
+                event["data"].get("error.type").is_none(),
+                "a warn verdict must not stamp error.type: {event:?}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[tokio::test]

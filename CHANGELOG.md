@@ -26,6 +26,21 @@ the next version cut.
   counts every refusal. Everything else keeps the existing best-effort,
   drop-and-count contract.
 
+- **`mcp_governance_decision` covers tool-definition and registry
+  changes, plus an opt-in verbatim-arguments capture.** The
+  version-lockfile gate now emits a `tool_definition_changed` record
+  (verdict matching the gate's own `mode: block`/`warn` posture, old
+  and new contract-digest prefixes, never the contract text) whenever
+  a live tool contract moves without a matching declared version bump.
+  A federated server's registry approval status transitioning across a
+  config reload (`draft`, `approved`, `deprecated`) emits one
+  `server_status_changed` record per transition, not one per call.
+  New `mcp_audit.capture_arguments` (default `false`) opts a dispatched
+  call's record into `gen_ai.tool.call.arguments`: the call's
+  arguments, redacted and size-bounded the same way `mcp_audit`'s own
+  content fields already are, alongside the salted digest every call
+  already carries.
+
 - **Federated MCP servers resist a silent protocol or auth downgrade.**
   `federated_servers[].protocol` pins one upstream to `2025-06-18`
   (the only era outbound federation speaks today; pinning `2026-07-28`

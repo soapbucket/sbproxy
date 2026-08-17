@@ -179,7 +179,12 @@ into one a host auto-approves, and that is a change worth noticing.
 Verdicts land on `sbproxy_mcp_tool_compat_verdicts_total`, and each change
 emits an audit event: `mcp.tool_versioning.changed`,
 `mcp.tool_versioning.renamed`, `mcp.tool_versioning.removed`, or
-`mcp.tool_versioning.needs_confirmation`.
+`mcp.tool_versioning.needs_confirmation`. An unbumped change graded a
+violation also reaches your SIEM through `events:`: a
+`mcp_governance_decision` record with reason `tool_definition_changed`,
+verdict `deny` in `mode: block` or `warn` otherwise, and old/new digest
+prefixes rather than the contract text itself. See [No usable record of
+what happened](#no-usable-record-of-what-happened).
 
 Renames are caught too. The digest covers the name, so a renamed tool would
 otherwise look like a brand new one; the gate re-digests each baseline with the
@@ -345,12 +350,16 @@ an authorization problem, not an authentication one. See the RBAC section above.
 
 ## No usable record of what happened
 
-**What goes wrong.** An incident review asks which tool was called, by whom,
-with what, and the answer is scattered across application logs that were never
-designed for the question.
+**What goes wrong.** An incident review asks which agent called which tool
+with what arguments, and who approved that access, and the answer is
+scattered across application logs that were never designed for the question.
+This is MCP08 in the OWASP taxonomy: an interaction log an auditor can
+actually answer that question from, without reconstructing it from call
+volume or grepping free text.
 
-**What the gateway does.** Every governed decision emits a structured record on
-the security audit stream, and tool dispatch is metered.
+**What the gateway does.** Every governed decision emits a `mcp_governance_decision`
+record over `events:` (see [events.md](events.md)), and tool dispatch is
+metered:
 
 ```
 sbproxy_mcp_tool_dispatch_total
@@ -358,12 +367,79 @@ sbproxy_mcp_tool_dispatch_duration_seconds
 sbproxy_mcp_tool_cost_usd_total
 ```
 
-Evidence is structured logs aimed at your SIEM rather than a separate store, so
-it lands beside every other denial you already collect. The session ledger
-records per-session activity; see [mcp.md](mcp.md).
+`mcp_governance_decision` is one wire event covering three moments, each with
+its own reason and its own subset of fields:
 
-**Still yours.** Retention, correlation, and alerting. The gateway emits; your
-SIEM decides what matters.
+- **Tool invocations.** Every dispatched `tools/call`, plus every call refused
+  before dispatch (RBAC, per-tool quota, an argument policy, a downgraded
+  peer, a `draft` server). Carries the decision, a salted digest of the
+  arguments, and, opt-in, the arguments themselves (below).
+- **Tool definition changes.** The version-lockfile gate's per-refresh
+  contract check, reason `tool_definition_changed`. See [A tool definition
+  changing after you approved it](#a-tool-definition-changing-after-you-approved-it).
+- **Registry changes.** A federated server's approval status (`draft`,
+  `approved`, `deprecated`) transitioning across a config reload, reason
+  `server_status_changed`, emitted once per transition rather than once per
+  call.
+
+### Field mapping
+
+The OWASP MCP Top 10 is still in incubation, so treat the left column as the
+audit question rather than a stable section number. Right column names are
+this event's actual field names.
+
+| MCP08 asks | sbproxy field | Present on |
+|---|---|---|
+| Which tenant / caller | `tenant_id` (envelope), `sbproxy.tenant.id` | every record |
+| Which tool | `gen_ai.tool.name` | tool-invocation and definition-change records |
+| On which upstream server | `sbproxy.tool.server` | every record |
+| With what arguments | `sbproxy.tool.arguments_hash` (always, salted digest) / `gen_ai.tool.call.arguments` (opt-in, verbatim) | tool-invocation records |
+| What was decided, and why | `sbproxy.decision.verdict`, `sbproxy.decision.reason` | every record |
+| Under which rule | `sbproxy.decision.rule_id` | records where a named rule fired |
+| When, in order, without gaps | `sbproxy.evidence.seq`, `timestamp` (envelope) | every record |
+| What the tool contract was before/after | `sbproxy.tool.digest.old`, `sbproxy.tool.digest.new` | definition-change records |
+| What the registry status was before/after | `sbproxy.registry.status.old`, `sbproxy.registry.status.new` | registry-change records |
+
+"Who approved that access" splits in two. Which rule authorized a call is on
+the record (`sbproxy.decision.rule_id`, `sbproxy.decision.reason`). Who
+approved a *server's* registry status (`federated_servers[].approved_by` /
+`approved_at`) is operator-attested config, never verified by the gateway,
+and travels through the ordinary config-change audit trail rather than a
+dedicated event field: it is a fact about your process, not one the gateway
+can witness.
+
+### Verbatim argument capture
+
+`sbproxy.tool.arguments_hash` ships on every tool-invocation record by
+default: enough to confirm two calls used the same arguments, or that a
+specific known-bad payload was replayed, without the arguments themselves
+ever leaving the process. That is deliberately not enough to answer "what
+were the arguments," and closing that gap is an explicit opt-in:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      mcp_audit:
+        capture_arguments: true
+```
+
+When set, the record also carries `gen_ai.tool.call.arguments`: the call's
+arguments, redacted (the same secret-pattern scrub `mcp_audit`'s own content
+fields already go through) and capped at 8 KiB, the same bound. Off by
+default, because shipping raw tool-call arguments to every configured
+`events:` sink is a real tradeoff, not a free one: the redaction pass
+recognizes credential shapes, not your customers' PII or business-sensitive
+free text sitting in an argument the model happened to fill in. Turn this on
+only once you have looked at what your tools actually receive.
+
+Evidence is structured logs aimed at your SIEM rather than a separate store,
+so it lands beside every other denial you already collect. The session
+ledger records per-session activity; see [mcp.md](mcp.md).
+
+**Still yours.** Retention, correlation, and alerting. `sbproxy.evidence.seq`
+is a gapless per-tenant counter while emission is enabled, which is what
+makes SIEM-side retention safe to rely on: your consumer can prove it has
+every record rather than trusting that it does. See [events.md](events.md#retention).
+The gateway emits; your SIEM decides what matters and how long to keep it.
 
 ## Servers nobody sanctioned
 
@@ -405,4 +481,6 @@ the `ai_proxy` origin whose keys name it, and grep for
   mechanisms in depth, including supervised stdio and run-as-user.
 - [tool-versioning.md](tool-versioning.md) for the digest recipe and the
   compatibility oracle.
+- [events.md](events.md) for the `mcp_governance_decision` wire shape,
+  fail-closed delivery, and retention.
 - [security.md](security.md) for the whole picture.

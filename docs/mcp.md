@@ -861,10 +861,17 @@ When a subscriber is attached to the `mcp_audit` tracing target, each
 arguments, the SEP-1865 `params.audit.cause` when present, the upstream
 status, and the duration. The event is gated on that subscriber, so a
 deployment that attaches none pays nothing; there is no separate YAML
-knob. The per-call spend and behavioral
+knob for this specific event. The per-call spend and behavioral
 record live in the session ledger below, not this event. Source:
 `emit_mcp_prompt_audit` in
 `crates/sbproxy-core/src/server/action_dispatch.rs`.
+
+A related, `events:`-facing knob does exist: `mcp_audit.capture_arguments`
+opts a dispatched call's `mcp_governance_decision` evidence event into
+carrying the redacted, size-bounded call arguments too, independent of
+whether anything subscribes to the `mcp_audit` tracing target above.
+Off by default. See [mcp-security.md](mcp-security.md#no-usable-record-of-what-happened)
+for the tradeoff and [events.md](events.md) for the event shape.
 
 ## Session ledger
 

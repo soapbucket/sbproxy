@@ -3794,6 +3794,7 @@ pub(super) async fn handle_mcp_action(
                                     None,
                                     McpGovernanceVerdict::Deny("rbac_denied"),
                                     None,
+                                    None,
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
                                 } else {
@@ -3848,6 +3849,7 @@ pub(super) async fn handle_mcp_action(
                                         sbproxy_modules::action::mcp::MCP_ARGUMENT_POLICY_REASON,
                                     ),
                                     Some(rule_name.as_str()),
+                                    None,
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
                                 } else {
@@ -3885,6 +3887,7 @@ pub(super) async fn handle_mcp_action(
                                     is_modern,
                                     None,
                                     McpGovernanceVerdict::Deny("quota_exceeded"),
+                                    None,
                                     None,
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
@@ -3947,6 +3950,7 @@ pub(super) async fn handle_mcp_action(
                                             sbproxy_modules::action::mcp::MCP_ARGUMENT_POLICY_REASON,
                                         ),
                                         Some(rule_name.as_str()),
+                                        None,
                                     ) {
                                         let response =
                                             mcp_evidence_unavailable_response(request.id.clone());
@@ -4002,6 +4006,7 @@ pub(super) async fn handle_mcp_action(
                                             sbproxy_modules::action::mcp::MCP_SERVER_DEPRECATED_REASON,
                                         ),
                                         Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
+                                        None,
                                     ) {
                                         let response =
                                             mcp_evidence_unavailable_response(request.id.clone());
@@ -4062,6 +4067,7 @@ pub(super) async fn handle_mcp_action(
                                             None,
                                             McpGovernanceVerdict::Warn(reason_code),
                                             Some(rule_id),
+                                            None,
                                         ) {
                                             let response = mcp_evidence_unavailable_response(
                                                 request.id.clone(),
@@ -4115,6 +4121,7 @@ pub(super) async fn handle_mcp_action(
                                             None,
                                             McpGovernanceVerdict::Deny(reason_code),
                                             Some(rule_id),
+                                            None,
                                         ) {
                                             mcp_evidence_unavailable_response(request.id.clone())
                                         } else {
@@ -4195,6 +4202,19 @@ pub(super) async fn handle_mcp_action(
                                 } else {
                                     None
                                 };
+
+                                // WOR-2392: `mcp_audit.capture_arguments`
+                                // opts into verbatim tool-call arguments
+                                // on the `mcp_governance_decision` event,
+                                // independent of whether anything
+                                // subscribes to the `mcp_audit` tracing
+                                // target above -- the governance event's
+                                // `events:` sink is a separate delivery
+                                // path with its own enablement.
+                                let governance_tool_arguments = governance_tool_arguments_field(
+                                    mcp.mcp_audit_capture_arguments,
+                                    &arguments,
+                                );
 
                                 let run_as_user = federated
                                     .as_ref()
@@ -4537,6 +4557,7 @@ pub(super) async fn handle_mcp_action(
                                     is_modern,
                                     tool_arguments_hash.as_deref(),
                                     governance_denial_reason.as_deref(),
+                                    governance_tool_arguments.as_deref(),
                                 );
 
                                 // WOR-508: bridge the prompt-linked audit
@@ -4745,6 +4766,7 @@ fn mcp_server_draft_denial(
             None,
             McpGovernanceVerdict::Deny(sbproxy_modules::action::mcp::MCP_SERVER_DRAFT_REASON),
             Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
+            None,
         ) {
             mcp_evidence_unavailable_response(request_id)
         } else {
@@ -5081,6 +5103,35 @@ fn bound_mcp_audit_field(value: &str) -> String {
     format!("{}...[truncated]", &redacted[..end])
 }
 
+/// WOR-2392: compute the `gen_ai.tool.call.arguments` field for the
+/// `mcp_governance_decision` event, or `None` when
+/// `mcp_audit.capture_arguments` is not configured true.
+///
+/// Pure and independent of the `mcp_audit` tracing target's own
+/// enablement (unlike [`McpAuditCapture`], which only exists when a
+/// subscriber has attached to that target): the governance event's
+/// `events:` sink is a separate delivery path with its own opt-in, so
+/// this must not silently depend on whether anything is listening on
+/// the `mcp_audit` target too.
+///
+/// Redacted and size-bounded through [`bound_mcp_audit_field`] -- the
+/// exact same pass `mcp_audit`'s own content fields (and
+/// `sbproxy.tool.arguments_hash`'s input) already go through -- so a
+/// credential or other secret shape planted in a tool-call argument
+/// can never reach this field verbatim, regardless of whether
+/// `redact_secrets` alone would have caught it in the raw JSON text.
+fn governance_tool_arguments_field(
+    capture_arguments: bool,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if !capture_arguments {
+        return None;
+    }
+    serde_json::to_string(arguments)
+        .ok()
+        .map(|raw| bound_mcp_audit_field(&raw))
+}
+
 fn emit_tool_call_ledger(
     ctx: &RequestContext,
     tool_name: &str,
@@ -5268,6 +5319,7 @@ fn emit_mcp_tool_attribution(
     is_modern: bool,
     tool_arguments_hash: Option<&str>,
     governance_denial_reason: Option<&str>,
+    tool_arguments_verbatim: Option<&str>,
 ) -> bool {
     let (result_label, is_error): (&'static str, bool) = match outcome {
         Ok(value) => {
@@ -5325,6 +5377,7 @@ fn emit_mcp_tool_attribution(
         tool_arguments_hash,
         verdict,
         None,
+        tool_arguments_verbatim,
     );
 
     // WOR-2169: record the call for the durable billing queue, which is
@@ -5475,7 +5528,14 @@ fn mcp_governance_fail_closed(
 /// peer-downgrade sites, which pass
 /// [`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`] or
 /// [`sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID`].
-#[allow(clippy::too_many_arguments)] // one shape reused at five call sites, mirroring emit_mcp_tool_attribution's own field-per-argument style
+///
+/// `tool_arguments_verbatim` (WOR-2392) is `None` at every pre-dispatch
+/// site for the same reason `tool_arguments_hash` is: no call was ever
+/// dispatched, so there is nothing to have captured. Only
+/// [`emit_mcp_tool_attribution`]'s post-dispatch funnel ever passes
+/// `Some`, and only when `mcp_audit.capture_arguments` is configured
+/// true.
+#[allow(clippy::too_many_arguments)] // one shape reused at nine call sites, mirroring emit_mcp_tool_attribution's own field-per-argument style
 fn emit_mcp_governance_evidence(
     ctx: &RequestContext,
     tool_name: &str,
@@ -5485,6 +5545,7 @@ fn emit_mcp_governance_evidence(
     tool_arguments_hash: Option<&str>,
     verdict: McpGovernanceVerdict<'_>,
     rule_id: Option<&str>,
+    tool_arguments_verbatim: Option<&str>,
 ) -> bool {
     use sbproxy_observe::events::{EventType, ProxyEvent};
 
@@ -5534,6 +5595,7 @@ fn emit_mcp_governance_evidence(
         tool_arguments_hash,
         seq,
         rule_id,
+        tool_arguments_verbatim,
     );
     let event = ProxyEvent::new(
         event_type,
@@ -5821,12 +5883,17 @@ fn mcp_peer_downgrade_refusal_for_non_tool_call(
 /// Field provenance:
 /// - `gen_ai.*` and `mcp.*` names come from the OTel GenAI MCP semantic
 ///   conventions, schema `gen-ai-dev/1.42.0-dev`, all Development
-///   stability. `gen_ai.tool.call.arguments` is deliberately absent:
-///   the spec marks it opt-in, and shipping raw tool arguments to every
+///   stability. `gen_ai.tool.call.arguments` is absent by default: the
+///   spec marks it opt-in, and shipping raw tool arguments to every
 ///   configured `events:` sink by default would make a webhook target a
 ///   second place a credential pasted into a tool call could leak from.
-///   That capability is a future explicit opt-in, not something this
-///   record ships.
+///   `arguments_verbatim` (WOR-2392) is that explicit opt-in: `Some`
+///   only when the action's `mcp_audit.capture_arguments` is `true`,
+///   and only ever the redacted, size-bounded string
+///   [`emit_mcp_tool_attribution`]'s call site already computed with
+///   `bound_mcp_audit_field` (the same redact-and-cap pass `mcp_audit`'s
+///   own content fields go through), never the raw arguments
+///   themselves.
 /// - `sbproxy.*` names are this crate's own, namespaced so they can
 ///   never collide with a semconv key the same schema adds later.
 ///   `sbproxy.decision.rule_id` is part of that namespace; most callers
@@ -5864,6 +5931,7 @@ fn mcp_governance_event_data(
     arguments_hash: Option<&str>,
     seq: u64,
     rule_id: Option<&str>,
+    arguments_verbatim: Option<&str>,
 ) -> serde_json::Value {
     let (verdict_label, raw_denial_reason, is_policy_denied) = match verdict {
         McpGovernanceVerdict::Allow => ("allow", None, false),
@@ -5900,6 +5968,12 @@ fn mcp_governance_event_data(
     }
     if let Some(hash) = arguments_hash {
         fields.insert("sbproxy.tool.arguments_hash".to_string(), hash.into());
+    }
+    if let Some(verbatim) = arguments_verbatim {
+        fields.insert(
+            "gen_ai.tool.call.arguments".to_string(),
+            verbatim.into(),
+        );
     }
     fields.insert("sbproxy.tool.server".to_string(), server.into());
     fields.insert("sbproxy.tenant.id".to_string(), tenant_id.into());
@@ -6820,7 +6894,10 @@ mod mcp_audit_redaction_tests {
 
 #[cfg(test)]
 mod mcp_governance_evidence_tests {
-    use super::{mcp_governance_event_data, mcp_governance_fail_closed, McpGovernanceVerdict};
+    use super::{
+        governance_tool_arguments_field, mcp_governance_event_data, mcp_governance_fail_closed,
+        McpGovernanceVerdict, MCP_AUDIT_FIELD_MAX_BYTES,
+    };
     use sbproxy_config::types::EventsConfig;
     use sbproxy_observe::events::EventType;
 
@@ -6878,6 +6955,7 @@ mod mcp_governance_evidence_tests {
             None,
             Some("deadbeefcafef00d"),
             7,
+            None,
             None,
         );
         let obj = data.as_object().expect("object payload");
@@ -6946,6 +7024,102 @@ mod mcp_governance_evidence_tests {
         );
     }
 
+    /// WOR-2392: `gen_ai.tool.call.arguments` only ever appears when the
+    /// caller supplies `Some` -- proving the opt-in is off by default at
+    /// the payload-builder level, on top of `governance_tool_arguments_field`
+    /// (below) proving it off by default at the config level.
+    #[test]
+    fn verbatim_arguments_appear_only_when_the_caller_supplies_them() {
+        let without = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            McpGovernanceVerdict::Allow,
+            None,
+            None,
+            1,
+            None,
+            None,
+        );
+        assert!(
+            without.get("gen_ai.tool.call.arguments").is_none(),
+            "the field must be absent (not null) when the caller passes None: {without:?}"
+        );
+
+        let with = mcp_governance_event_data(
+            "search",
+            "acme-server",
+            "req-123",
+            None,
+            "2025-06-18",
+            "acme",
+            "api.example.com",
+            McpGovernanceVerdict::Allow,
+            None,
+            None,
+            1,
+            None,
+            Some(r#"{"city":"sf"}"#),
+        );
+        assert_eq!(with["gen_ai.tool.call.arguments"], r#"{"city":"sf"}"#);
+    }
+
+    /// WOR-2392: `mcp_audit.capture_arguments` is the config knob that
+    /// decides whether [`governance_tool_arguments_field`] does
+    /// anything at all. Off (the default, and any explicit `false`)
+    /// must produce `None` regardless of what the arguments contain --
+    /// this is the "off by default, field absent" half of the red-first
+    /// bar. A non-trivial payload (not `Value::Null`) is used
+    /// deliberately, so this cannot pass merely because there was
+    /// nothing to serialize.
+    #[test]
+    fn governance_tool_arguments_field_is_none_when_capture_is_disabled() {
+        assert_eq!(
+            governance_tool_arguments_field(false, &serde_json::json!({"city": "sf"})),
+            None
+        );
+    }
+
+    /// WOR-2392: when enabled, the captured value is the redacted,
+    /// size-bounded string [`bound_mcp_audit_field`] produces -- never
+    /// the raw serialized arguments. A planted `Authorization: Bearer`
+    /// fragment (the same shape `mcp_audit_redaction_tests` plants
+    /// elsewhere in this module) must not survive into the captured
+    /// value, and an unredacted field (the city) must, proving this is
+    /// redaction, not truncation-that-happens-to-remove-secrets.
+    #[test]
+    fn governance_tool_arguments_field_redacts_and_bounds_when_capture_is_enabled() {
+        let planted = serde_json::json!({
+            "city": "sf",
+            "note": "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc",
+        });
+        let captured = governance_tool_arguments_field(true, &planted)
+            .expect("capture_arguments: true must produce Some");
+        assert!(
+            captured.contains("sf"),
+            "an unredacted field must still be present: {captured}"
+        );
+        assert!(
+            !captured.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc"),
+            "a bearer-token-shaped fragment leaked into the captured arguments: {captured}"
+        );
+
+        // Size bound: reuses `MCP_AUDIT_FIELD_MAX_BYTES`, the same cap
+        // `mcp_audit`'s own content fields already enforce.
+        let oversize = serde_json::json!({ "blob": "x".repeat(MCP_AUDIT_FIELD_MAX_BYTES * 2) });
+        let bounded = governance_tool_arguments_field(true, &oversize)
+            .expect("capture_arguments: true must produce Some");
+        assert!(
+            bounded.len() <= MCP_AUDIT_FIELD_MAX_BYTES + "...[truncated]".len(),
+            "captured arguments exceeded the mcp_audit content-field bound: {} bytes",
+            bounded.len()
+        );
+    }
+
     /// The deny shape: `error.type`, `sbproxy.decision.reason`, and no
     /// `mcp.session.id` when the call carried none.
     #[test]
@@ -6962,6 +7136,7 @@ mod mcp_governance_evidence_tests {
             None,
             None,
             1,
+            None,
             None,
         );
         assert_eq!(data["sbproxy.decision.verdict"], "deny");
@@ -6995,6 +7170,7 @@ mod mcp_governance_evidence_tests {
             None,
             None,
             1,
+            None,
             None,
         );
         let reason = data["sbproxy.decision.reason"]
@@ -7033,6 +7209,7 @@ mod mcp_governance_evidence_tests {
             None,
             1,
             None,
+            None,
         );
         assert!(without.get("sbproxy.decision.rule_id").is_none());
 
@@ -7049,6 +7226,7 @@ mod mcp_governance_evidence_tests {
             None,
             1,
             Some(sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID),
+            None,
         );
         assert_eq!(downgrade["sbproxy.decision.rule_id"], "peer_downgrade");
 
@@ -7065,6 +7243,7 @@ mod mcp_governance_evidence_tests {
             None,
             1,
             Some(sbproxy_extension::mcp::peer_profile::PROTOCOL_PIN_MISMATCH_RULE_ID),
+            None,
         );
         assert_eq!(
             pin_mismatch["sbproxy.decision.rule_id"],
@@ -7094,6 +7273,7 @@ mod mcp_governance_evidence_tests {
             None,
             1,
             Some(sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID),
+            None,
         );
         assert_eq!(data["sbproxy.decision.verdict"], "warn");
         assert_eq!(data["sbproxy.decision.reason"], "peer_protocol_downgrade");
