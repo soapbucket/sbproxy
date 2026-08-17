@@ -4,7 +4,7 @@
 
 # SBproxy
 
-*Last modified: 2026-08-10*
+*Last modified: 2026-08-16*
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
@@ -54,6 +54,16 @@ cd sbproxy
 | Expose or federate MCP tools | [MCP gateway](docs/mcp.md) |
 | Run the Kubernetes operator | [Operator quickstart](docs/quickstart-operator.md) |
 | Upgrade a running deployment | [Upgrade guide](docs/upgrade.md) |
+
+## Security coverage
+
+sbproxy publishes a per-category mapping against the OWASP LLM Top 10, 2026 edition (published 2026-08-03). Coverage is stated as full, partial, or out of gateway scope: full means enforced in the traffic path with tests, partial means enforced with named gaps, and out of scope means the risk lives in the application or provider.
+
+sbproxy also holds itself to a gateway-layer control set for failure modes no published list covers: credential custody, cross-tenant boundaries, decisions without a record, denial of wallet, streaming inspection parity, telemetry leakage, direct-to-provider egress, and tamper-evident change control.
+
+Multipart requests are refused on JSON-only surfaces. Surfaces built to accept multipart do not debit token budgets.
+
+[AI gateway security coverage](docs/ai-gateway-security-coverage.md) has the full mapping and control set. [Security](docs/security.md) maps what the gateway covers across API, AI model, MCP, and proxy-itself traffic.
 
 ## Install alternatives
 
