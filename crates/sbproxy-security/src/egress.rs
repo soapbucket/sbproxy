@@ -667,7 +667,8 @@ pub fn record_egress_refused(
 /// installed once at boot is the whole bridge: this crate never learns
 /// what `sbproxy_observe::EventType::EgressRefused` is, only that
 /// something wants to know when [`record_egress_refused`] fires.
-pub type EgressRefusedHook = fn(purpose: EgressPurpose, reason: EgressDenied, tenant: &str, origin: &str);
+pub type EgressRefusedHook =
+    fn(purpose: EgressPurpose, reason: EgressDenied, tenant: &str, origin: &str);
 
 static EGRESS_REFUSED_HOOK: std::sync::OnceLock<EgressRefusedHook> = std::sync::OnceLock::new();
 

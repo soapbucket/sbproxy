@@ -759,7 +759,13 @@ mod tests {
     /// path itself, not just the audit trail.
     #[test]
     fn record_mtls_rejection_audit_does_not_panic_for_any_reason() {
-        for reason in ["untrusted_issuer", "expired", "revoked", "other", "cn_mismatch"] {
+        for reason in [
+            "untrusted_issuer",
+            "expired",
+            "revoked",
+            "other",
+            "cn_mismatch",
+        ] {
             record_mtls_rejection_audit(reason, "test.example.com");
         }
     }

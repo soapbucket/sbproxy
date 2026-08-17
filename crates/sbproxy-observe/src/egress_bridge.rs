@@ -38,7 +38,12 @@ use crate::events::{EventType, ProxyEvent};
 /// `"unset"` sentinel `record_egress_refused` substitutes for an empty
 /// one. All four are safe to ship to a third-party `events:` sink
 /// unchanged.
-fn build_event(purpose: EgressPurpose, reason: EgressDenied, tenant: &str, origin: &str) -> ProxyEvent {
+fn build_event(
+    purpose: EgressPurpose,
+    reason: EgressDenied,
+    tenant: &str,
+    origin: &str,
+) -> ProxyEvent {
     ProxyEvent::new(
         EventType::EgressRefused,
         origin.to_owned(),

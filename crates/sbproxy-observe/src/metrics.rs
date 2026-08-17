@@ -5881,7 +5881,9 @@ mod tests {
         assert!(output.contains("\"tenant\":\"acme\""));
         // And the metric still fires: this wraps `record_circuit_breaker`
         // rather than replacing it.
-        assert!(output_or_metric_has_transition("breaker-transition.example.com"));
+        assert!(output_or_metric_has_transition(
+            "breaker-transition.example.com"
+        ));
     }
 
     fn output_or_metric_has_transition(origin: &str) -> bool {

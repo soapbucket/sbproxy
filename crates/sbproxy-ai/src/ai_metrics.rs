@@ -2489,7 +2489,10 @@ mod tests {
     #[test]
     fn provider_selected_event_carries_the_transition() {
         let event = super::provider_selected_event("primary", "backup", "http_503", "acme");
-        assert_eq!(event.event_type, sbproxy_observe::EventType::ProviderSelected);
+        assert_eq!(
+            event.event_type,
+            sbproxy_observe::EventType::ProviderSelected
+        );
         assert_eq!(event.hostname, "backup");
         assert_eq!(event.tenant_id, "acme");
         assert_eq!(event.data["from_provider"], "primary");

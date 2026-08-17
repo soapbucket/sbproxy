@@ -2943,18 +2943,21 @@ fn record_guardrail_decision(
     // and only a block ("triggered") publishes, not an allow with a
     // near-miss flag count.
     if outcome == sbproxy_observe::decision::DecisionOutcome::Deny {
-        sbproxy_observe::publish_proxy_event(sbproxy_observe::EventType::GuardrailTriggered, || {
-            sbproxy_observe::ProxyEvent::new(
-                sbproxy_observe::EventType::GuardrailTriggered,
-                origin_for_family.to_owned(),
-                ctx.tenant_id.to_string(),
-                serde_json::json!({
-                    "stage": stage,
-                    "guardrail": guardrail,
-                    "flagged_count": flagged_count,
-                }),
-            )
-        });
+        sbproxy_observe::publish_proxy_event(
+            sbproxy_observe::EventType::GuardrailTriggered,
+            || {
+                sbproxy_observe::ProxyEvent::new(
+                    sbproxy_observe::EventType::GuardrailTriggered,
+                    origin_for_family.to_owned(),
+                    ctx.tenant_id.to_string(),
+                    serde_json::json!({
+                        "stage": stage,
+                        "guardrail": guardrail,
+                        "flagged_count": flagged_count,
+                    }),
+                )
+            },
+        );
     }
 
     let Some(origin_id) = origin_id else {
@@ -9029,7 +9032,9 @@ fn record_ai_failure_decision(
     kind: &str,
     diagnostic: &AiProviderErrorDiagnostic,
 ) {
-    use sbproxy_observe::decision::{DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome};
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
 
     let Some(ctx) = ctx else {
         return;
@@ -9100,7 +9105,9 @@ fn record_ai_close_decision(
     ctx: Option<&RequestContext>,
     summary: &crate::ai_extensions::AiCloseSummary,
 ) {
-    use sbproxy_observe::decision::{DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome};
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
 
     let Some(ctx) = ctx else {
         return;
@@ -17973,10 +17980,16 @@ origins:
             "ai.failure must reach the bus; a silent miss here would make this test pass \
              without checking anything",
         );
-        assert_eq!(audit.event, sbproxy_observe::decision::DecisionEvent::AiFailure);
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiFailure
+        );
         assert_eq!(audit.tenant, "acme");
         assert_eq!(audit.origin, "ai-failure.test");
-        assert_eq!(audit.outcome, sbproxy_observe::decision::DecisionOutcome::Error);
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Error
+        );
         assert_eq!(audit.details.selected_provider.as_deref(), Some("openai"));
         assert_eq!(
             audit.details.verdict.as_deref(),
@@ -18017,7 +18030,13 @@ origins:
         let (bus, mut rx) = crate::policy_bus::channel(8);
         crate::policy_bus::init_global_bus(bus);
 
-        record_ai_provider_response_failure(&tracing::Span::none(), "openai", 200, None, Some(&ctx));
+        record_ai_provider_response_failure(
+            &tracing::Span::none(),
+            "openai",
+            200,
+            None,
+            Some(&ctx),
+        );
 
         while let Ok(record) = rx.try_recv() {
             if let crate::policy_bus::AuditRecord::Decision(audit) = record {
@@ -18086,10 +18105,16 @@ origins:
             "ai.close must reach the bus; a silent miss here would make this test pass \
              without checking anything",
         );
-        assert_eq!(audit.event, sbproxy_observe::decision::DecisionEvent::AiClose);
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiClose
+        );
         assert_eq!(audit.tenant, "acme");
         assert_eq!(audit.origin, "ai-close.test");
-        assert_eq!(audit.outcome, sbproxy_observe::decision::DecisionOutcome::Allow);
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Allow
+        );
         assert_eq!(audit.details.verdict.as_deref(), Some("tool_calls"));
     }
 

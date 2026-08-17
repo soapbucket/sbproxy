@@ -1591,15 +1591,24 @@ mod tests {
     fn ai_failure_detail_carries_provider_and_kind() {
         let detail = DecisionDetails::ai_failure("openai", "upstream_5xx");
         let rendered = serde_json::to_string(&detail).expect("serializes");
-        assert!(rendered.contains("\"selected_provider\":\"openai\""), "{rendered}");
-        assert!(rendered.contains("\"verdict\":\"upstream_5xx\""), "{rendered}");
+        assert!(
+            rendered.contains("\"selected_provider\":\"openai\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"verdict\":\"upstream_5xx\""),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn ai_close_detail_carries_the_finish_reason() {
         let detail = DecisionDetails::ai_close(Some("tool_calls"));
         let rendered = serde_json::to_string(&detail).expect("serializes");
-        assert!(rendered.contains("\"verdict\":\"tool_calls\""), "{rendered}");
+        assert!(
+            rendered.contains("\"verdict\":\"tool_calls\""),
+            "{rendered}"
+        );
 
         // No finish reason (a stream that never delivered one) omits
         // the field entirely rather than emitting an empty string,

@@ -559,8 +559,7 @@ impl ConfigAuditEntry {
     /// scrubbed, and secrets-by-convention", read the reason before
     /// wiring a sink you do not already trust with your config's shape.
     pub fn with_rejection_reason(mut self, reason: impl AsRef<str>) -> Self {
-        self.rejection_reason =
-            Some(sbproxy_util::truncate_utf8(reason.as_ref(), 512).to_owned());
+        self.rejection_reason = Some(sbproxy_util::truncate_utf8(reason.as_ref(), 512).to_owned());
         self
     }
 }
@@ -770,12 +769,8 @@ mod tests {
             .with_actor("operator-cfg-reject")
             .with_rejection_reason("origin \"ring-reject.example\": invalid regex")
             .emit();
-        let events = crate::audit_ring::recent_audit_events(
-            10,
-            Some("config"),
-            Some("file_watcher"),
-            None,
-        );
+        let events =
+            crate::audit_ring::recent_audit_events(10, Some("config"), Some("file_watcher"), None);
         let event = events
             .iter()
             .find(|e| e.actor.as_deref() == Some("operator-cfg-reject"))
@@ -952,7 +947,9 @@ mod tests {
         );
 
         let rejected = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
-            .with_rejection_reason("origin \"api.example.com\": model_rate_limits[0]: invalid regex");
+            .with_rejection_reason(
+                "origin \"api.example.com\": model_rate_limits[0]: invalid regex",
+            );
         let json = serde_json::to_string(&rejected).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(

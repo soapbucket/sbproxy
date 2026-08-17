@@ -721,9 +721,7 @@ fn warn_unwired_proxy_events(cfg: &sbproxy_config::types::EventsConfig) {
 /// [`unwired_decision_audit_events`] is split from its warning: the
 /// warning itself only logs, and a feed that silently names the wrong
 /// types is exactly the failure this surface exists to avoid.
-pub(super) fn unwired_proxy_events(
-    cfg: &sbproxy_config::types::EventsConfig,
-) -> Vec<&'static str> {
+pub(super) fn unwired_proxy_events(cfg: &sbproxy_config::types::EventsConfig) -> Vec<&'static str> {
     use sbproxy_observe::EventType;
 
     // Empty `types:` means every type, the same reading
@@ -5881,11 +5879,8 @@ origins:
 "#,
         )
         .expect("rejected fixture config still compiles at the YAML/schema layer");
-        let reject_result = reload_for_extension_refresh(
-            "extension-refresh-audit-test.yml",
-            rejected,
-            candidate,
-        );
+        let reject_result =
+            reload_for_extension_refresh("extension-refresh-audit-test.yml", rejected, candidate);
         assert!(
             reject_result.is_err(),
             "the invalid CEL fixture must fail pipeline construction, or this test is not \
@@ -5904,9 +5899,11 @@ origins:
              config_audit: before={before}, after={events:?}"
         );
         assert!(
-            events
-                .iter()
-                .any(|e| e.detail.as_deref().unwrap_or_default().starts_with("rejected:")),
+            events.iter().any(|e| e
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("rejected:")),
             "the rejection must be distinguishable from the accepted entry: {events:?}"
         );
     }

@@ -2846,9 +2846,9 @@ mod tests {
             "the failure must record closed->open: {transition_lines:?}"
         );
         assert!(
-            transition_lines.iter().any(|l| l
-                .contains("from_state=\"half_open\"")
-                && l.contains("to_state=\"closed\"")),
+            transition_lines.iter().any(
+                |l| l.contains("from_state=\"half_open\"") && l.contains("to_state=\"closed\"")
+            ),
             "the recovery must record half_open->closed: {transition_lines:?}"
         );
     }

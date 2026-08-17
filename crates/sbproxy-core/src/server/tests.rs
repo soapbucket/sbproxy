@@ -3296,11 +3296,10 @@ fn a_file_watcher_rejection_reaches_config_audit() {
     tmp.flush().unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
-    let before = sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None)
-        .len();
+    let before =
+        sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None).len();
     let _ = reload_from_config_path(&path).expect_err("broken YAML must fail");
-    let events =
-        sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
+    let events = sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
     assert!(
         events.len() > before,
         "the rejection must reach the audit ring, not just the metric"
@@ -3310,7 +3309,10 @@ fn a_file_watcher_rejection_reaches_config_audit() {
         .find(|e| e.kind == "file_watcher")
         .expect("a file_watcher-sourced config_audit entry must exist");
     assert!(
-        ours.detail.as_deref().unwrap_or_default().starts_with("rejected:"),
+        ours.detail
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("rejected:"),
         "must read as a rejection, not an accepted no-op reload: {:?}",
         ours.detail
     );
@@ -3337,13 +3339,21 @@ origins:
     let path = tmp.path().to_str().unwrap().to_string();
 
     reload_from_config_path(&path).expect("valid config reloads");
-    let events =
-        sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
+    let events = sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
     let ours = events
         .iter()
-        .find(|e| e.kind == "file_watcher" && e.detail.as_deref().is_some_and(|d| !d.starts_with("rejected:")))
+        .find(|e| {
+            e.kind == "file_watcher"
+                && e.detail
+                    .as_deref()
+                    .is_some_and(|d| !d.starts_with("rejected:"))
+        })
         .expect("an accepted file_watcher-sourced config_audit entry must exist");
-    assert!(!ours.detail.as_deref().unwrap_or_default().starts_with("rejected:"));
+    assert!(!ours
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("rejected:"));
 }
 
 // --- WOR-2162: a reload carrying invalid CEL is rejected whole ---
@@ -4697,7 +4707,11 @@ origins:
         unwired.contains(&"cache_hit") && unwired.contains(&"cache_miss"),
         "an implicit all-types selection must still catch the dead types: {unwired:?}"
     );
-    assert_eq!(unwired.len(), 2, "only cache_hit and cache_miss have no emitter: {unwired:?}");
+    assert_eq!(
+        unwired.len(),
+        2,
+        "only cache_hit and cache_miss have no emitter: {unwired:?}"
+    );
 }
 
 /// Every auth decision goes through the one seam (WOR-2446).

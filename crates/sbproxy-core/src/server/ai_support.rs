@@ -1136,9 +1136,10 @@ pub(crate) fn budget_preflight(
                 // actually crosses a cap, never for a request that
                 // stays under one (the `!result.exceeded` check above
                 // `continue`s before reaching here).
-                sbproxy_observe::publish_proxy_event(sbproxy_observe::EventType::BudgetExceeded, || {
-                    budget_exceeded_event(tenant_id, origin, limit, &result.reason)
-                });
+                sbproxy_observe::publish_proxy_event(
+                    sbproxy_observe::EventType::BudgetExceeded,
+                    || budget_exceeded_event(tenant_id, origin, limit, &result.reason),
+                );
                 return BudgetGate::Block {
                     status: 402,
                     body: serde_json::to_vec(&body).unwrap_or_default(),
