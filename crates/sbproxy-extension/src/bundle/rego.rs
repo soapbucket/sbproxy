@@ -32,9 +32,21 @@
 //!
 //! Simpler than the JavaScript/WASM envelope's `allow`/`deny` result:
 //! the pinned query must evaluate to a Rego boolean, exactly like
-//! `policy: rego`. `true` allows; `false`, an evaluation error, or a
-//! non-boolean result all deny with a fixed status and message,
-//! matching `policy: rego`'s own defaults and its fail-closed posture.
+//! `policy: rego`. `true` allows; `false` denies, with the fixed
+//! [`DENY_STATUS`]/[`DENY_MESSAGE`] `policy: rego` itself defaults to.
+//!
+//! A budget-exceeded, non-boolean-result, or other internal
+//! evaluation fault is different from a `false` result: it is not a
+//! decision, so [`RegoPolicyAdapter::enforce`] propagates it as an
+//! `Err` rather than folding it into a deny. That is what lets the
+//! bundle's own `failure_posture` (the same knob every other bundle
+//! policy hook's fault reaches, via the shared handling in
+//! `sbproxy-core::server`) decide whether the request is admitted or
+//! refused, instead of this adapter unilaterally denying regardless
+//! of what the operator configured. `policy: rego` has no
+//! `failure_posture` of its own and fails closed unconditionally on a
+//! fault; a bundled Rego policy is not that surface and must not
+//! silently inherit its posture.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -151,17 +163,24 @@ impl PolicyEnforcer for RegoPolicyAdapter {
                 // every later one forever.
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let allowed = match compiled.eval_bool_json(input, "") {
-                Ok(allowed) => allowed,
-                Err(error) => {
-                    tracing::warn!(
-                        type_name = %self.type_name,
-                        %error,
-                        "rego bundle policy failed to evaluate; denying"
-                    );
-                    false
-                }
-            };
+            // WOR-2482 review (I1): an evaluation fault (budget
+            // exceeded, a non-boolean rule result, an internal
+            // Regorus error) is not a decision, so it must not be
+            // swallowed into a hardcoded deny the way a real `false`
+            // result is below. Propagating it as `Err`, exactly like
+            // `JavascriptPolicyAdapter::enforce`'s
+            // `RuntimeFailure::into_plugin_error` does, is what lets
+            // the shared `failure_posture` handling in
+            // `sbproxy-core::server` (the same path every other
+            // bundle policy hook's fault reaches) decide admit or
+            // refuse. Swallowing it here made `failure_posture: open`
+            // silently behave like `closed` for this hook alone.
+            let allowed = compiled.eval_bool_json(input, "").map_err(|error| {
+                PluginError::Internal(anyhow::anyhow!(
+                    "rego bundle policy `{}` failed to evaluate: {error}",
+                    self.type_name
+                ))
+            })?;
             drop(compiled);
             Ok(if allowed {
                 PolicyDecision::Allow
@@ -327,6 +346,34 @@ allow if {
             .await
             .expect("evaluates");
         assert!(matches!(denied, PolicyDecision::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_evaluation_fault_propagates_as_a_plugin_error_rather_than_denying() {
+        // WOR-2482 review finding I1: `enforce` used to swallow an
+        // evaluation fault into a hardcoded `Ok(Deny)`, which made
+        // `failure_posture: open` silently behave like `closed` for
+        // this hook alone (the shared posture handling in
+        // `sbproxy-core::server` only ever sees an `Err`). A rule that
+        // returns a document rather than a boolean passes candidate
+        // load (the load-time trial only proves the rule evaluates,
+        // not that its value is boolean) and faults here instead.
+        const RETURNS_A_DOCUMENT: &str = r#"
+package sbproxy
+
+allow := {"reason": "not a boolean"}
+"#;
+        let fixture = fixture(RETURNS_A_DOCUMENT, "");
+        let adapter = build_rego_policy(fixture.hook(), json!({})).expect("adapter builds");
+
+        let error = adapter
+            .enforce(&request("GET", "/"), &mut ())
+            .await
+            .expect_err("a non-boolean rule result is a fault, not a decision");
+        assert!(
+            error.to_string().contains("rather than a boolean"),
+            "{error}"
+        );
     }
 
     #[test]
