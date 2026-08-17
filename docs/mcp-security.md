@@ -268,6 +268,70 @@ framing: it assumes the model will be steered and removes the combination that
 makes steering costly. The quarantine judge is another model, with everything
 that implies.
 
+## A session that reads something untrusted, then tries to leave
+
+**What goes wrong.** An agent session reads data from a source it does not
+fully control (a federated server nobody has vetted, a search result, a
+document another tenant uploaded), and the same session then calls a tool
+that sends data somewhere external or changes state. If the read carried
+injected instructions, the outbound call is how they leave. This is Meta's
+Rule of Two, collapsed to the two signals a gateway can observe
+deterministically at the dispatch seam: at most two of {touched untrusted
+input, touched sensitive data, took an externally visible or state-changing
+action} in one session; the third is the violation.
+
+**What the gateway does.** `flow` tracks two session-scoped labels,
+most-restrictive-wins and never lowering within a session: `integrity`
+(`trusted` -> `tainted`) and `exfil_allowed` (`true` -> sticky `false`). A
+`tools/call` result from a server outside `trusted_servers` taints the
+session; a tainted session's `exfil_allowed` flips `false`; a later call to
+a tool matching `outbound_tools` while `exfil_allowed` is `false` is the
+violation.
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      sessions:
+        enabled: true
+      flow:
+        mode: block
+        trusted_servers: [internal-docs]
+        outbound_tools: ["email.*", "slack.*"]
+```
+
+`mode: warn` logs and emits a `mcp_governance_decision` event with verdict
+`warn` but allows the call; `mode: block` refuses it before dispatch with
+verdict `deny`. `mode: off` (the default) tracks nothing at all. Both active
+modes carry `sbproxy.decision.rule_id` of `flow_taint` (the read that
+tainted the session) or `flow_exfil_block` (the outbound call the taint then
+blocked), so a SIEM can tell which half of the sequence it is looking at.
+This runs after RBAC, per-tool quota, and `argument_policies[]` have already
+allowed the call, so it can only narrow that allow, never widen it, and it
+composes with `lethal_trifecta` and `dual_llm_quarantine` above rather than
+replacing either. Without `sessions.enabled: true`, this degrades to
+single-call scope: with no memory across calls, the only thing one call can
+prove is whether it is itself both a read from an untrusted server and an
+outbound call.
+
+A custom CEL or Rego rule under `argument_policies[]` can read the same
+labels directly, `mcp.session.integrity` and `mcp.session.exfil_allowed`, to
+compose a tighter policy than the built-in gate, for example denying
+outright the moment a session is tainted rather than only gating the tools
+named in `outbound_tools`.
+
+**Still yours.** This is a deterministic, config-driven approximation of the
+Rule of Two, not a semantic understanding of what a session actually did. It
+has real false positives: a session that reads one untrusted paragraph for
+unrelated reasons and later, coincidentally, sends an unrelated email is
+blocked exactly the same as one that is actually exfiltrating. The
+literature proposing this class of control is explicit about the same
+tradeoff, and the honest framing carries over here: this constrains the
+blast radius of a session that might be compromised, it does not detect
+whether one actually is. Naming which servers are `trusted_servers` and
+which tools are `outbound_tools` is the operator's judgment call, not
+something the gateway can infer from a catalog; an empty `trusted_servers`
+list (the default) trusts nothing, and an empty `outbound_tools` list (also
+the default) makes the gate a no-op regardless of `mode`.
+
 ## Untrusted or unexpected upstream servers
 
 **What goes wrong.** A federated server resolves somewhere you did not intend,

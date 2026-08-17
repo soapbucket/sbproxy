@@ -96,6 +96,28 @@ the next version cut.
   `tools/call` requests with a compiled contract now also get the
   JSON-Schema check modern-era calls already had.
 
+- **Deterministic session-flow enforcement gates a session that read
+  something untrusted, then tries to leave.** An `mcp` action's `flow`
+  block tracks two session-scoped, most-restrictive-wins labels that
+  never lower within a session: `integrity` (`trusted` -> `tainted`)
+  and `exfil_allowed` (`true` -> sticky `false`). A `tools/call` result
+  from a server outside `flow.trusted_servers` taints the session
+  (unlabeled upstream is untrusted, fail closed); a tainted session's
+  `exfil_allowed` flips `false`; a later call to a tool matching
+  `flow.outbound_tools` while `exfil_allowed` is `false` is the
+  violation. `flow.mode: warn` logs and emits a `mcp_governance_decision`
+  event with verdict `warn`; `mode: block` refuses the call before
+  dispatch with verdict `deny`; `mode: off` (the default) tracks
+  nothing. Both carry `sbproxy.decision.rule_id` of `flow_taint` or
+  `flow_exfil_block`. Runs after RBAC, per-tool quota, and
+  `argument_policies[]` have already allowed the call, and composes with
+  (rather than replaces) `lethal_trifecta` and `dual_llm_quarantine`.
+  Without `sessions.enabled: true`, this degrades to single-call scope,
+  the same fallback `lethal_trifecta` uses. The labels are also exposed
+  on the `mcp` CEL/Rego namespace as `mcp.session.integrity` and
+  `mcp.session.exfil_allowed`, so a custom `argument_policies[]` rule
+  can compose a tighter policy on top.
+
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
   job) fails when an Apache-2.0-only dependency is missing a stanza,

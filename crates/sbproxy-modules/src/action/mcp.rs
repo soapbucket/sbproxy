@@ -113,6 +113,14 @@ pub struct McpActionConfig {
     /// [`McpArgumentPolicyConfig`].
     #[serde(default)]
     pub argument_policies: Vec<McpArgumentPolicyConfig>,
+    /// Deterministic session flow enforcement (WOR-2384, MCP06): a
+    /// two-label (integrity / exfil-allowed) session guardrail that
+    /// taints a session the first time it reads a `tools/call` result
+    /// from a server outside `trusted_servers`, and then gates any
+    /// later call to an `outbound_tools`-classified tool while the
+    /// session is tainted. See [`McpFlowConfig`].
+    #[serde(default)]
+    pub flow: McpFlowConfig,
     /// Default egress policy for OpenAPI-backed REST tool calls.
     /// Per-server `egress` overrides this block. Omitted preserves
     /// the legacy allow-all behavior.
@@ -344,6 +352,100 @@ pub enum McpArgumentPolicyModeConfig {
     Warn,
     /// Refuse the call with a JSON-RPC error and emit governance
     /// evidence with verdict `deny`.
+    Block,
+}
+
+/// Deterministic session flow enforcement (WOR-2384, MCP06).
+///
+/// SESSION-SCOPED two-axis labels, not per-datum taint: the session
+/// accumulates an [`sbproxy_extension::mcp::sessions::SessionIntegrity`]
+/// label (`trusted` -> `tainted`) and an `exfil_allowed` bit from what
+/// it has read, most-restrictive-wins, never lowering back within the
+/// session's lifetime. The operator-facing framing is Meta's Rule of
+/// Two, collapsed to the two signals this gateway can observe
+/// deterministically at the MCP dispatch seam: did the session read
+/// from an untrusted source, and is it now trying to leave via an
+/// outbound-classified tool.
+///
+/// ```yaml
+/// action:
+///   type: mcp
+///   flow:
+///     mode: block
+///     trusted_servers: [internal-docs]
+///     outbound_tools: ["email.*", "slack.*"]
+/// ```
+///
+/// A `tools/call` RESULT from a server not in `trusted_servers` taints
+/// the session (unlabeled upstream = untrusted, the fail-closed
+/// default from the settled decisions); once tainted, `exfil_allowed`
+/// flips `false`, sticky. A later call to a tool matching
+/// `outbound_tools` while `exfil_allowed == false` is the violation:
+/// `mode: warn` logs and emits governance evidence but allows the call;
+/// `mode: block` refuses it before dispatch. `sessions.enabled = false`
+/// degrades this to single-call scope, exactly like the
+/// `lethal_trifecta` guardrail: with no cross-call memory, the only
+/// thing one call can prove is whether it is itself both a read from
+/// an untrusted server and an outbound-classified tool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpFlowConfig {
+    /// `off` (default): flow enforcement is disabled entirely -- no
+    /// session-taint tracking, no outbound gate, no governance
+    /// evidence, and the `mcp.session.integrity` / `.exfil_allowed`
+    /// CEL bindings stay at their `trusted` / `true` defaults forever.
+    /// `warn` tracks taint and emits governance evidence on an
+    /// outbound violation but allows the call. `block` refuses the
+    /// call before dispatch.
+    #[serde(default)]
+    pub mode: McpFlowModeConfig,
+    /// Federated server names whose `tools/call` results do not taint
+    /// the session. An empty list (the default) trusts nothing: every
+    /// server is untrusted, the fail-closed default from the settled
+    /// decisions (unlabeled upstream = untrusted).
+    #[serde(default)]
+    pub trusted_servers: Vec<String>,
+    /// Glob patterns (matched against the advertised, namespaced tool
+    /// name via [`sbproxy_util::prefix_glob_match`]) classifying a tool
+    /// as externally-visible / state-changing, i.e. capable of
+    /// exfiltrating whatever the session has read. An empty list (the
+    /// default) classifies no tool as outbound, which makes the gate a
+    /// no-op regardless of `mode` -- an operator must name at least one
+    /// pattern for this guardrail to do anything.
+    #[serde(default)]
+    pub outbound_tools: Vec<String>,
+    /// Whether a `tools/call` result from a server outside
+    /// `trusted_servers` taints the session. Defaults to `true`.
+    /// Setting this `false` keeps the outbound gate active (it still
+    /// reads the session's *current* labels) while disabling the only
+    /// mechanism that would ever move them off their `trusted` / `true`
+    /// defaults -- an escape hatch for rolling this guardrail out
+    /// before turning on its read-tainting half.
+    #[serde(default = "default_true")]
+    pub taint_reads: bool,
+}
+
+impl Default for McpFlowConfig {
+    fn default() -> Self {
+        Self {
+            mode: McpFlowModeConfig::default(),
+            trusted_servers: Vec::new(),
+            outbound_tools: Vec::new(),
+            taint_reads: true,
+        }
+    }
+}
+
+/// `flow.mode` (WOR-2384, MCP06).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFlowModeConfig {
+    /// Disabled: no taint tracking, no outbound gate, no evidence.
+    #[default]
+    Off,
+    /// Track taint and emit governance evidence on a violation, but
+    /// never refuse a call.
+    Warn,
+    /// Refuse a violating call before dispatch with a JSON-RPC error.
     Block,
 }
 
@@ -1352,6 +1454,9 @@ pub struct McpAction {
     /// always returns [`McpArgumentPolicyVerdict::Allow`] without
     /// building a CEL/Rego context.
     pub argument_policies: Vec<CompiledMcpArgumentPolicy>,
+    /// Compiled session-flow guardrail (WOR-2384, MCP06). `None` when
+    /// `flow.mode` is `off` (the default). See [`McpFlowConfig`].
+    flow: Option<CompiledMcpFlow>,
     /// `mcp_audit.capture_arguments` (WOR-2392). When true, a
     /// dispatched `tools/call`'s `mcp_governance_decision` event
     /// carries the redacted, size-bounded verbatim call arguments
@@ -1425,6 +1530,83 @@ impl McpLethalTrifectaGuardrail {
         }
     }
 }
+
+/// Compiled `flow.mode` (WOR-2384, MCP06): only the two active modes.
+/// `McpFlowModeConfig::Off` compiles to `McpAction::flow: None`
+/// entirely, so a compiled [`CompiledMcpFlow`] is only ever
+/// constructed for `warn` or `block`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompiledMcpFlowMode {
+    Warn,
+    Block,
+}
+
+/// Compiled session-flow guardrail (WOR-2384, MCP06). See
+/// [`McpFlowConfig`] for the operator-facing semantics.
+#[derive(Debug, Clone)]
+pub struct CompiledMcpFlow {
+    mode: CompiledMcpFlowMode,
+    trusted_servers: HashSet<String>,
+    outbound_tools: Vec<String>,
+    taint_reads: bool,
+}
+
+impl CompiledMcpFlow {
+    fn is_trusted(&self, server: &str) -> bool {
+        self.trusted_servers.contains(server)
+    }
+
+    fn is_outbound(&self, tool_name: &str) -> bool {
+        self.outbound_tools
+            .iter()
+            .any(|p| sbproxy_util::prefix_glob_match(p, tool_name))
+    }
+}
+
+/// Compile `flow:` into an active guardrail, or `None` for `mode: off`
+/// (the default).
+fn compile_mcp_flow(cfg: &McpFlowConfig) -> Option<CompiledMcpFlow> {
+    let mode = match cfg.mode {
+        McpFlowModeConfig::Off => return None,
+        McpFlowModeConfig::Warn => CompiledMcpFlowMode::Warn,
+        McpFlowModeConfig::Block => CompiledMcpFlowMode::Block,
+    };
+    Some(CompiledMcpFlow {
+        mode,
+        trusted_servers: cfg.trusted_servers.iter().cloned().collect(),
+        outbound_tools: cfg.outbound_tools.clone(),
+        taint_reads: cfg.taint_reads,
+    })
+}
+
+/// Verdict from [`McpAction::flow_pre_dispatch_check`] (WOR-2384,
+/// MCP06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpFlowVerdict {
+    /// No objection: flow enforcement is off, the tool is not
+    /// classified `outbound_tools`, or the session's `exfil_allowed`
+    /// label is still `true`.
+    Allow,
+    /// A violation under `mode: warn`: the call proceeds, but the
+    /// caller must log and emit governance evidence with verdict
+    /// `warn`.
+    Warn,
+    /// A violation under `mode: block`: the caller must refuse the
+    /// call before dispatch and emit governance evidence with verdict
+    /// `deny`.
+    Deny,
+}
+
+/// Rule id for a session-flow taint transition (WOR-2384, MCP06),
+/// carried as `sbproxy.decision.rule_id` on the `mcp_governance_decision`
+/// event [`McpAction::flow_record_result`]'s caller emits when a call's
+/// result is what newly tainted the session.
+pub const MCP_FLOW_TAINT_RULE_ID: &str = "flow_taint";
+
+/// Rule id for a session-flow outbound violation (WOR-2384, MCP06):
+/// an `outbound_tools`-classified tool called while the session's
+/// `exfil_allowed` label is `false`.
+pub const MCP_FLOW_EXFIL_BLOCK_RULE_ID: &str = "flow_exfil_block";
 
 /// HTTP judge transport for dual-LLM quarantine (WOR-1789 / GS).
 ///
@@ -2100,6 +2282,9 @@ impl McpAction {
             .map(compile_mcp_argument_policy)
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        // WOR-2384 (MCP06): `None` for `mode: off`, the default.
+        let flow = compile_mcp_flow(&cfg.flow);
+
         Ok(Self {
             mode: cfg.mode,
             server_name,
@@ -2128,6 +2313,7 @@ impl McpAction {
             tool_pricing: cfg.tool_pricing,
             usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
             argument_policies,
+            flow,
             mcp_audit_capture_arguments: cfg.mcp_audit.capture_arguments,
         })
     }
@@ -2163,6 +2349,13 @@ impl McpAction {
             return McpArgumentPolicyVerdict::Allow;
         }
 
+        // WOR-2384 (MCP06): expose the session's current flow labels
+        // to a custom rule so it can compose with the built-in
+        // Rule-of-Two gate (e.g. deny outright the moment a session is
+        // tainted, tighter than the built-in gate's "only the outbound
+        // tools" scope).
+        let flow_labels = self.current_flow_labels(session_id);
+
         let view = sbproxy_extension::cel::context::McpArgumentPolicyView {
             tool_name,
             server,
@@ -2173,6 +2366,8 @@ impl McpAction {
             principal_project: principal.attrs.project.as_deref(),
             principal_user: principal.attrs.user.as_deref(),
             arguments,
+            session_integrity: flow_labels.integrity.as_str(),
+            session_exfil_allowed: flow_labels.exfil_allowed,
         };
         let ctx = sbproxy_extension::cel::context::build_mcp_argument_policy_context(&view);
 
@@ -2230,6 +2425,92 @@ impl McpAction {
         match warned {
             Some(rule_name) => McpArgumentPolicyVerdict::Warn { rule_name },
             None => McpArgumentPolicyVerdict::Allow,
+        }
+    }
+
+    /// Current session-flow labels (WOR-2384, MCP06), for both the
+    /// pre-dispatch gate below and CEL/Rego exposure via
+    /// `mcp.session.integrity` / `mcp.session.exfil_allowed`.
+    ///
+    /// Defaults to [`sbproxy_extension::mcp::sessions::FlowLabels::default`]
+    /// (`trusted` / `true`) when flow tracking is off, sessions are
+    /// disabled, or the session id is unknown to the store -- this
+    /// accessor only supplies *read visibility*; the fail-closed
+    /// behavior lives in what taints a session in the first place
+    /// ([`Self::flow_record_result`]) and in the gate that consults it
+    /// ([`Self::flow_pre_dispatch_check`]), not in this getter.
+    fn current_flow_labels(&self, session_id: Option<&str>) -> sbproxy_extension::mcp::sessions::FlowLabels {
+        match (self.sessions.as_deref(), session_id) {
+            (Some(store), Some(id)) => store.flow_labels(id).unwrap_or_default(),
+            _ => Default::default(),
+        }
+    }
+
+    /// Pre-dispatch session-flow gate (WOR-2384, MCP06). Call this
+    /// after RBAC, per-tool quota, and `argument_policies[]` have
+    /// already allowed the call, before dispatch. `server` is the
+    /// resolved federated server that will serve `tool_name`.
+    ///
+    /// `McpFlowVerdict::Allow` when flow enforcement is off
+    /// (`self.flow` is `None`), `tool_name` does not match
+    /// `outbound_tools`, or the session's `exfil_allowed` label is
+    /// still `true`. Otherwise `Warn` or `Deny`, following `mode`.
+    ///
+    /// `sessions.enabled == false` degrades to single-call scope,
+    /// exactly like `lethal_trifecta`'s `classify()`-only fallback:
+    /// with no cross-call memory, the only thing one call can prove is
+    /// whether it is itself both a read from an untrusted server *and*
+    /// an outbound-classified tool.
+    pub fn flow_pre_dispatch_check(
+        &self,
+        session_id: Option<&str>,
+        tool_name: &str,
+        server: &str,
+    ) -> McpFlowVerdict {
+        let Some(flow) = self.flow.as_ref() else {
+            return McpFlowVerdict::Allow;
+        };
+        if !flow.is_outbound(tool_name) {
+            return McpFlowVerdict::Allow;
+        }
+        let violated = match (self.sessions.as_deref(), session_id) {
+            (Some(store), Some(id)) => !store.flow_labels(id).unwrap_or_default().exfil_allowed,
+            _ => flow.taint_reads && !flow.is_trusted(server),
+        };
+        if !violated {
+            return McpFlowVerdict::Allow;
+        }
+        match flow.mode {
+            CompiledMcpFlowMode::Block => McpFlowVerdict::Deny,
+            CompiledMcpFlowMode::Warn => McpFlowVerdict::Warn,
+        }
+    }
+
+    /// Record a `tools/call` RESULT for session-flow taint tracking
+    /// (WOR-2384, MCP06). Call after a successful dispatch to `server`,
+    /// before any later call in the same session consults
+    /// [`Self::flow_pre_dispatch_check`].
+    ///
+    /// Returns `true` only on the call that newly tainted the session
+    /// (the caller should emit a `flow_taint` governance evidence
+    /// event); `false` when flow enforcement is off, `taint_reads` is
+    /// off, `server` is on `trusted_servers`, the session was already
+    /// tainted, or sessions are disabled (no memory to persist a
+    /// transition into).
+    pub fn flow_record_result(&self, session_id: Option<&str>, server: &str) -> bool {
+        let Some(flow) = self.flow.as_ref() else {
+            return false;
+        };
+        if !flow.taint_reads || flow.is_trusted(server) {
+            return false;
+        }
+        match (self.sessions.as_deref(), session_id) {
+            (Some(store), Some(id)) => store.taint(id).is_some_and(|r| r.newly_tainted),
+            // No session memory: nothing persists across calls, so
+            // there is no "newly tainted" transition to report. The
+            // single-call-scope fallback in `flow_pre_dispatch_check`
+            // is what still enforces something meaningful here.
+            _ => false,
         }
     }
 
@@ -4757,5 +5038,306 @@ allow := false if {
         }))))
         .expect("mcp_audit.capture_arguments: true compiles");
         assert!(action.mcp_audit_capture_arguments);
+    }
+
+    // --- Session flow enforcement (WOR-2384, MCP06) ---
+
+    fn flow_action(flow_cfg: serde_json::Value, sessions_enabled: bool) -> McpAction {
+        let mut cfg = json!({
+            "type": "mcp",
+            "server_info": {"name": "flow-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                { "origin": "trusted.example.com", "prefix": "trusted-srv" },
+                { "origin": "untrusted.example.com", "prefix": "untrusted-srv" }
+            ],
+            "flow": flow_cfg,
+        });
+        if sessions_enabled {
+            cfg["sessions"] = json!({"enabled": true});
+        }
+        McpAction::from_config(cfg).expect("flow fixture compiles")
+    }
+
+    fn block_flow_cfg() -> serde_json::Value {
+        json!({
+            "mode": "block",
+            "trusted_servers": ["trusted-srv"],
+            "outbound_tools": ["send_email"],
+        })
+    }
+
+    #[test]
+    fn taint_then_outbound_is_refused_in_block_mode() {
+        // WOR-2384 red-first: fails today because `McpFlowConfig`,
+        // `flow_pre_dispatch_check`, and `flow_record_result` do not
+        // exist yet.
+        let action = flow_action(block_flow_cfg(), true);
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+
+        let newly_tainted = action.flow_record_result(Some(&session_id), "untrusted-srv");
+        assert!(newly_tainted, "the first untrusted read must newly taint");
+
+        let verdict =
+            action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
+        assert_eq!(verdict, McpFlowVerdict::Deny);
+    }
+
+    #[test]
+    fn an_untainted_session_may_still_call_outbound_tools() {
+        let action = flow_action(block_flow_cfg(), true);
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let verdict =
+            action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
+        assert_eq!(verdict, McpFlowVerdict::Allow);
+    }
+
+    #[test]
+    fn trusted_server_reads_never_taint() {
+        let action = flow_action(block_flow_cfg(), true);
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let newly_tainted = action.flow_record_result(Some(&session_id), "trusted-srv");
+        assert!(!newly_tainted);
+        let verdict =
+            action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
+        assert_eq!(
+            verdict,
+            McpFlowVerdict::Allow,
+            "a session that has only ever read trusted servers must not be gated"
+        );
+    }
+
+    #[test]
+    fn taint_is_sticky_across_a_later_trusted_read() {
+        let action = flow_action(block_flow_cfg(), true);
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        assert!(action.flow_record_result(Some(&session_id), "untrusted-srv"));
+
+        // A later read from a *trusted* server must not undo the taint.
+        assert!(!action.flow_record_result(Some(&session_id), "trusted-srv"));
+
+        let verdict =
+            action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
+        assert_eq!(
+            verdict,
+            McpFlowVerdict::Deny,
+            "taint must remain sticky across a later trusted-server read"
+        );
+    }
+
+    #[test]
+    fn a_second_untrusted_read_is_not_reported_as_a_new_transition() {
+        let action = flow_action(block_flow_cfg(), true);
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        assert!(action.flow_record_result(Some(&session_id), "untrusted-srv"));
+        assert!(
+            !action.flow_record_result(Some(&session_id), "untrusted-srv"),
+            "a session already tainted must not report a second transition"
+        );
+    }
+
+    #[test]
+    fn warn_mode_reports_warn_and_does_not_deny() {
+        let action = flow_action(
+            json!({
+                "mode": "warn",
+                "trusted_servers": ["trusted-srv"],
+                "outbound_tools": ["send_email"],
+            }),
+            true,
+        );
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        action.flow_record_result(Some(&session_id), "untrusted-srv");
+        let verdict =
+            action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
+        assert_eq!(verdict, McpFlowVerdict::Warn, "warn mode must not deny");
+    }
+
+    #[test]
+    fn mode_off_is_a_no_op_even_when_flow_would_otherwise_trip() {
+        let action = flow_action(json!({}), true); // mode omitted -> off
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        assert!(!action.flow_record_result(Some(&session_id), "untrusted-srv"));
+        let verdict =
+            action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
+        assert_eq!(verdict, McpFlowVerdict::Allow);
+    }
+
+    #[test]
+    fn a_tool_not_matching_outbound_tools_is_never_gated() {
+        let action = flow_action(block_flow_cfg(), true);
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        action.flow_record_result(Some(&session_id), "untrusted-srv");
+        let verdict = action.flow_pre_dispatch_check(Some(&session_id), "read_file", "trusted-srv");
+        assert_eq!(
+            verdict,
+            McpFlowVerdict::Allow,
+            "a tainted session may still call a tool that isn't classified outbound"
+        );
+    }
+
+    #[test]
+    fn sessions_disabled_degrades_to_single_call_scope() {
+        let action = flow_action(block_flow_cfg(), false);
+        assert!(action.sessions.is_none());
+
+        // No cross-call memory: an outbound call served by the
+        // *trusted* server is never a violation on its own.
+        let allowed = action.flow_pre_dispatch_check(None, "send_email", "trusted-srv");
+        assert_eq!(allowed, McpFlowVerdict::Allow);
+
+        // The same call served by the *untrusted* server is, in the
+        // same instant, both a read from an untrusted source and an
+        // outbound call -- the only thing a single call without memory
+        // can prove, mirroring `lethal_trifecta`'s degraded
+        // classify()-only fallback.
+        let denied = action.flow_pre_dispatch_check(None, "send_email", "untrusted-srv");
+        assert_eq!(denied, McpFlowVerdict::Deny);
+    }
+
+    #[test]
+    fn sessions_are_isolated_per_session_and_per_tenant() {
+        let action = flow_action(block_flow_cfg(), true);
+        let store = action.sessions.as_ref().expect("sessions enabled");
+        let tenant_a_session = store.create();
+        let tenant_b_session = store.create();
+
+        action.flow_record_result(Some(&tenant_a_session), "untrusted-srv");
+
+        let a_verdict =
+            action.flow_pre_dispatch_check(Some(&tenant_a_session), "send_email", "trusted-srv");
+        assert_eq!(a_verdict, McpFlowVerdict::Deny);
+
+        let b_verdict =
+            action.flow_pre_dispatch_check(Some(&tenant_b_session), "send_email", "trusted-srv");
+        assert_eq!(
+            b_verdict,
+            McpFlowVerdict::Allow,
+            "tainting tenant A's session must never affect tenant B's session"
+        );
+    }
+
+    #[test]
+    fn flow_labels_are_exposed_on_the_mcp_cel_namespace_and_move_with_taint() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "server_info": {"name": "flow-cel-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                { "origin": "trusted.example.com", "prefix": "trusted-srv" },
+                { "origin": "untrusted.example.com", "prefix": "untrusted-srv" }
+            ],
+            "sessions": {"enabled": true},
+            "flow": {
+                "mode": "block",
+                "trusted_servers": ["trusted-srv"],
+                "outbound_tools": ["send_email"],
+            },
+            "argument_policies": [{
+                "name": "reject-outbound-while-tainted",
+                "engine": "cel",
+                "source": "mcp.session.integrity != \"tainted\" || mcp.session.exfil_allowed",
+                "mode": "block",
+            }]
+        }))
+        .expect("flow + argument_policies fixture compiles");
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+
+        let allow = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "send_email",
+            "trusted-srv",
+            "acme",
+            Some(&session_id),
+            &json!({}),
+        );
+        assert_eq!(
+            allow,
+            McpArgumentPolicyVerdict::Allow,
+            "an untainted session's labels must read trusted/true"
+        );
+
+        action.flow_record_result(Some(&session_id), "untrusted-srv");
+
+        let deny = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "send_email",
+            "trusted-srv",
+            "acme",
+            Some(&session_id),
+            &json!({}),
+        );
+        assert_eq!(
+            deny,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "reject-outbound-while-tainted".to_string(),
+                panicked: false,
+            }
+        );
+    }
+
+    #[test]
+    fn flow_labels_are_exposed_identically_to_a_rego_rule() {
+        // Parity with the CEL exposure test above: the same
+        // `mcp.session.integrity` / `mcp.session.exfil_allowed`
+        // bindings must read back identically under `engine: rego`,
+        // since both engines are fed the same context.
+        const MODULE: &str = r#"
+package sbproxy
+
+default allow := true
+
+allow := false if {
+    input.mcp.session.integrity == "tainted"
+}
+"#;
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "server_info": {"name": "flow-rego-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                { "origin": "trusted.example.com", "prefix": "trusted-srv" },
+                { "origin": "untrusted.example.com", "prefix": "untrusted-srv" }
+            ],
+            "sessions": {"enabled": true},
+            "flow": {
+                "mode": "block",
+                "trusted_servers": ["trusted-srv"],
+                "outbound_tools": ["send_email"],
+            },
+            "argument_policies": [{
+                "name": "reject-while-tainted-rego",
+                "engine": "rego",
+                "source": MODULE,
+                "mode": "block",
+            }]
+        }))
+        .expect("flow + rego argument_policies fixture compiles");
+        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+
+        let allow = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "send_email",
+            "trusted-srv",
+            "acme",
+            Some(&session_id),
+            &json!({}),
+        );
+        assert_eq!(allow, McpArgumentPolicyVerdict::Allow);
+
+        action.flow_record_result(Some(&session_id), "untrusted-srv");
+
+        let deny = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "send_email",
+            "trusted-srv",
+            "acme",
+            Some(&session_id),
+            &json!({}),
+        );
+        assert_eq!(
+            deny,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "reject-while-tainted-rego".to_string(),
+                panicked: false,
+            }
+        );
     }
 }

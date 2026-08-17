@@ -915,6 +915,18 @@ pub struct McpArgumentPolicyView<'a> {
     /// than reading a default -- which fails this surface closed, per
     /// the module's evaluation-error posture.
     pub arguments: &'a serde_json::Value,
+    /// Session-flow data-provenance integrity (WOR-2384, MCP06):
+    /// `"trusted"` or `"tainted"`. See
+    /// [`sbproxy_extension::mcp::sessions::SessionIntegrity::as_str`].
+    /// Always `"trusted"` when flow enforcement is off, sessions are
+    /// disabled, or the session has never read anything.
+    pub session_integrity: &'a str,
+    /// Session-flow exfiltration-allowed label (WOR-2384, MCP06): `true`
+    /// until the session is tainted, then sticky `false`. A custom rule
+    /// composes with the built-in Rule-of-Two flow gate by reading this
+    /// directly, e.g. to deny outright rather than only gate
+    /// `outbound_tools`-classified tools.
+    pub session_exfil_allowed: bool,
 }
 
 /// Build the `mcp` CEL/Rego namespace for one tool call (WOR-2384,
@@ -932,6 +944,10 @@ pub struct McpArgumentPolicyView<'a> {
 /// - `mcp.tool.name` - the tool being called
 /// - `mcp.server` - owning federated server name
 /// - `mcp.session.id` - MCP session id, `""` when sessions are disabled
+/// - `mcp.session.integrity` - session-flow integrity (WOR-2384, MCP06):
+///   `"trusted"` or `"tainted"`
+/// - `mcp.session.exfil_allowed` - session-flow exfiltration-allowed
+///   label (WOR-2384, MCP06): `true` until the session is tainted
 /// - `mcp.arguments` - the parsed call arguments (map, or `null`/scalar
 ///   if the caller supplied something other than an object)
 /// - `mcp.tenant` - host-derived tenant id
@@ -954,6 +970,14 @@ pub fn build_mcp_argument_policy_context(view: &McpArgumentPolicyView<'_>) -> Ce
     session.insert(
         "id".to_string(),
         CelValue::String(view.session_id.unwrap_or("").to_string()),
+    );
+    session.insert(
+        "integrity".to_string(),
+        CelValue::String(view.session_integrity.to_string()),
+    );
+    session.insert(
+        "exfil_allowed".to_string(),
+        CelValue::Bool(view.session_exfil_allowed),
     );
 
     let mut principal = HashMap::new();
@@ -2209,6 +2233,8 @@ mod mcp_argument_policy_context_tests {
             principal_project: Some("proj-x"),
             principal_user: Some("alice@acme.com"),
             arguments: &arguments,
+            session_integrity: "tainted",
+            session_exfil_allowed: false,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         let engine = CelEngine::new();
@@ -2216,6 +2242,8 @@ mod mcp_argument_policy_context_tests {
             (r#"mcp.tool.name == "send_email""#, "tool.name"),
             (r#"mcp.server == "gh""#, "server"),
             (r#"mcp.session.id == "sess-1""#, "session.id"),
+            (r#"mcp.session.integrity == "tainted""#, "session.integrity"),
+            (r#"mcp.session.exfil_allowed == false"#, "session.exfil_allowed"),
             (r#"mcp.tenant == "acme""#, "tenant"),
             (r#"mcp.principal.sub == "alice""#, "principal.sub"),
             (r#"mcp.principal.team == "platform""#, "principal.team"),
@@ -2247,6 +2275,8 @@ mod mcp_argument_policy_context_tests {
             principal_project: None,
             principal_user: None,
             arguments: &arguments,
+            session_integrity: "trusted",
+            session_exfil_allowed: true,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         let engine = CelEngine::new();
@@ -2255,6 +2285,12 @@ mod mcp_argument_policy_context_tests {
             .unwrap_or(false));
         assert!(engine
             .eval_bool_source(r#"mcp.principal.team == """#, &ctx)
+            .unwrap_or(false));
+        assert!(engine
+            .eval_bool_source(r#"mcp.session.integrity == "trusted""#, &ctx)
+            .unwrap_or(false));
+        assert!(engine
+            .eval_bool_source(r#"mcp.session.exfil_allowed == true"#, &ctx)
             .unwrap_or(false));
     }
 
@@ -2273,6 +2309,8 @@ mod mcp_argument_policy_context_tests {
             principal_project: None,
             principal_user: None,
             arguments: &arguments,
+            session_integrity: "trusted",
+            session_exfil_allowed: true,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         assert!(!ctx.variables.contains_key("request"));

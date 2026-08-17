@@ -4143,6 +4143,109 @@ pub(super) async fn handle_mcp_action(
                                     }
                                 }
 
+                                // WOR-2384 (MCP06): deterministic session
+                                // flow enforcement. Runs after RBAC,
+                                // per-tool quota, argument policies, the
+                                // deprecated-server warning, and the
+                                // peer-downgrade check have all already
+                                // allowed the call -- structural
+                                // monotonicity continues: this can only
+                                // narrow that allow, never widen it.
+                                match mcp.flow_pre_dispatch_check(
+                                    mcp_session_id.as_deref(),
+                                    &name,
+                                    governed_server,
+                                ) {
+                                    sbproxy_modules::action::mcp::McpFlowVerdict::Allow => {}
+                                    sbproxy_modules::action::mcp::McpFlowVerdict::Warn => {
+                                        tracing::warn!(
+                                            target: "sbproxy::mcp::flow",
+                                            tool = %name,
+                                            server = %governed_server,
+                                            tenant = %ctx.tenant_id,
+                                            "MCP tools/call violated session-flow guardrail (warn mode: allowed)",
+                                        );
+                                        sbproxy_observe::metrics::record_mcp_flow(
+                                            ctx.tenant_id.as_str(),
+                                            sbproxy_modules::action::mcp::MCP_FLOW_EXFIL_BLOCK_RULE_ID,
+                                            "warn",
+                                        );
+                                        if emit_mcp_governance_evidence(
+                                            ctx,
+                                            &name,
+                                            governed_server,
+                                            mcp_session_id.as_deref(),
+                                            is_modern,
+                                            None,
+                                            McpGovernanceVerdict::Warn(
+                                                sbproxy_modules::action::mcp::MCP_FLOW_EXFIL_BLOCK_RULE_ID,
+                                            ),
+                                            Some(sbproxy_modules::action::mcp::MCP_FLOW_EXFIL_BLOCK_RULE_ID),
+                                            None,
+                                        ) {
+                                            let response = mcp_evidence_unavailable_response(
+                                                request.id.clone(),
+                                            );
+                                            return write_mcp_application_response(
+                                                session,
+                                                &response,
+                                                &request_id,
+                                                &rpc_method,
+                                                modern_server.as_ref(),
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    sbproxy_modules::action::mcp::McpFlowVerdict::Deny => {
+                                        tracing::warn!(
+                                            target: "sbproxy::mcp::flow",
+                                            tool = %name,
+                                            server = %governed_server,
+                                            tenant = %ctx.tenant_id,
+                                            "MCP tools/call refused by session-flow guardrail",
+                                        );
+                                        sbproxy_observe::metrics::record_mcp_flow(
+                                            ctx.tenant_id.as_str(),
+                                            sbproxy_modules::action::mcp::MCP_FLOW_EXFIL_BLOCK_RULE_ID,
+                                            "deny",
+                                        );
+                                        let response = if emit_mcp_governance_evidence(
+                                            ctx,
+                                            &name,
+                                            governed_server,
+                                            mcp_session_id.as_deref(),
+                                            is_modern,
+                                            None,
+                                            McpGovernanceVerdict::Deny(
+                                                sbproxy_modules::action::mcp::MCP_FLOW_EXFIL_BLOCK_RULE_ID,
+                                            ),
+                                            Some(sbproxy_modules::action::mcp::MCP_FLOW_EXFIL_BLOCK_RULE_ID),
+                                            None,
+                                        ) {
+                                            mcp_evidence_unavailable_response(request.id.clone())
+                                        } else {
+                                            JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                INVALID_PARAMS,
+                                                &format!(
+                                                    "tool '{}' is refused by the session-flow guardrail (session is tainted; this tool is classified outbound)",
+                                                    name,
+                                                ),
+                                            )
+                                        };
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
                                 // Per-server timeout. The
                                 // dispatcher inside `call_tool` shares one
                                 // reqwest::Client across upstreams; the
@@ -4385,6 +4488,16 @@ pub(super) async fn handle_mcp_action(
                                     None => call.await,
                                 };
 
+                                // WOR-2384 (MCP06): captured before any
+                                // later validation or quarantine pass can
+                                // rewrite `outcome` to `Err`. This is the
+                                // literal "a tools/call RESULT" signal
+                                // session-flow taint tracking reacts to --
+                                // the untrusted server produced a response
+                                // at all, independent of what the proxy
+                                // decides to do with it afterward.
+                                let dispatch_produced_result = outcome.is_ok();
+
                                 // Validate and reconstruct the exact modern
                                 // ToolResult document before any output judge,
                                 // ledger, audit emission, response adapter, or
@@ -4536,6 +4649,70 @@ pub(super) async fn handle_mcp_action(
                                 let tool_arguments_hash = mcp_audit_capture.as_ref().map(|cap| {
                                     sha256_hex_prefix(&bound_mcp_audit_field(&cap.args_json))
                                 });
+
+                                // WOR-2384 (MCP06): a genuine result from
+                                // an untrusted server taints the session,
+                                // before the attribution funnel below. A
+                                // call refused earlier in this arm never
+                                // reaches here at all (each denial branch
+                                // above returns early), so only a call
+                                // that actually dispatched can taint.
+                                // `flow_record_result` itself is a no-op
+                                // when flow enforcement is off, the
+                                // server is trusted, or the session was
+                                // already tainted; it reports `true` only
+                                // on the call that newly flips the label,
+                                // which is the only transition worth its
+                                // own evidence event.
+                                if dispatch_produced_result
+                                    && mcp.flow_record_result(mcp_session_id.as_deref(), governed_server)
+                                {
+                                    tracing::warn!(
+                                        target: "sbproxy::mcp::flow",
+                                        tool = %name,
+                                        server = %governed_server,
+                                        tenant = %ctx.tenant_id,
+                                        "MCP session newly tainted by an untrusted-server tools/call result",
+                                    );
+                                    sbproxy_observe::metrics::record_mcp_flow(
+                                        ctx.tenant_id.as_str(),
+                                        sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID,
+                                        "warn",
+                                    );
+                                    // A taint transition is a governance
+                                    // signal worth its own record,
+                                    // independent of how this call's own
+                                    // response turns out below. `Warn`,
+                                    // never `Deny`: the read that caused
+                                    // the transition was itself permitted
+                                    // -- this guardrail only ever gates a
+                                    // *later* outbound call.
+                                    if emit_mcp_governance_evidence(
+                                        ctx,
+                                        &name,
+                                        governed_server,
+                                        mcp_session_id.as_deref(),
+                                        is_modern,
+                                        tool_arguments_hash.as_deref(),
+                                        McpGovernanceVerdict::Warn(
+                                            sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID,
+                                        ),
+                                        Some(sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID),
+                                        None,
+                                    ) {
+                                        let response =
+                                            mcp_evidence_unavailable_response(request.id.clone());
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
 
                                 // WOR-1644: attribute the call into the
                                 // usage plane. Metrics always fire;
@@ -9679,6 +9856,133 @@ mod mcp_catalog_snapshot_tests {
             assert_eq!(
                 event["data"]["sbproxy.decision.reason"], "rbac_denied",
                 "the reason must name RBAC, not the argument policy that never ran: {event:?}"
+            );
+        }
+
+        // --- Scenario 11 (WOR-2384, MCP06): the session-flow guardrail
+        // wiring proof, sessions disabled (single-call scope).
+        // `trusted_servers` is empty, so every server is untrusted by
+        // the fail-closed default; a call to an
+        // `outbound_tools`-classified tool is, in the same instant,
+        // both an untrusted-server read and an outbound call -- the
+        // only thing a single call without session memory can prove --
+        // and `mode: block` must refuse it before dispatch ever reaches
+        // the (deliberately unreachable) upstream. ---
+        {
+            const TOOL_NAME: &str = "wor2384-flow-mcp06-block-fixture";
+            const SERVER: &str = "flow-block-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "flow-block-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER
+                }],
+                "flow": {
+                    "mode": "block",
+                    "outbound_tools": [TOOL_NAME]
+                }
+            }))
+            .expect("flow block fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains("session-flow guardrail"),
+                "expected a session-flow refusal (the unreachable upstream must never be \
+                 dialed): {message}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the flow block fixture was not \
+                 observed within 5s",
+            );
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+            assert_eq!(event["data"]["sbproxy.decision.rule_id"], "flow_exfil_block");
+            assert!(
+                event["data"].get("sbproxy.tool.arguments_hash").is_none(),
+                "a pre-dispatch flow refusal never dispatched, so no arguments were \
+                 captured to hash: {event:?}"
+            );
+        }
+
+        // --- Scenario 12 (WOR-2384, MCP06): `mode: warn` emits the
+        // same rule_id with verdict `warn` but lets the call proceed to
+        // (failed, unreachable-upstream) dispatch, same shape as
+        // scenario 9 for argument policies. ---
+        {
+            const TOOL_NAME: &str = "wor2384-flow-mcp06-warn-fixture";
+            const SERVER: &str = "flow-warn-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "flow-warn-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER
+                }],
+                "flow": {
+                    "mode": "warn",
+                    "outbound_tools": [TOOL_NAME]
+                }
+            }))
+            .expect("flow warn fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call error message");
+            assert!(
+                !message.contains("session-flow guardrail"),
+                "warn mode must not refuse the call itself: {message}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "warn"
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision warn event for the flow warn fixture was not \
+                 observed within 5s",
+            );
+            assert_eq!(event["data"]["sbproxy.decision.rule_id"], "flow_exfil_block");
+            assert!(
+                event["data"].get("error.type").is_none(),
+                "a warn verdict must not stamp error.type: {event:?}"
             );
         }
     }

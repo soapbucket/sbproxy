@@ -2208,6 +2208,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_flow_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_flow"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "rule", "verdict"],
+        description: "MCP session-flow enforcement triggers, by tenant, rule id, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_tool_cost_usd_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_tool_cost"),
@@ -3590,6 +3601,10 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     // outcome for one tenant's tool-call traffic, same reasoning as the
     // evidence fail-closed counter directly above.
     "sbproxy_mcp_argument_policy_total",
+    // WOR-2384 (MCP06). A session-flow enforcement trigger is a
+    // security-policy outcome for one tenant's tool-call traffic, same
+    // reasoning as the argument-policy counter directly above.
+    "sbproxy_mcp_flow_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
     // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a

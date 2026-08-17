@@ -4357,6 +4357,37 @@ pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static st
         .inc();
 }
 
+/// Record one session-flow enforcement outcome that was not a plain
+/// allow, on `sbproxy_mcp_flow_total{tenant, rule, verdict}` (WOR-2384,
+/// MCP06). `rule` is one of the closed set `"flow_taint"` (a session
+/// newly tainted) or `"flow_exfil_block"` (an outbound-tool call while
+/// `exfil_allowed == false`). `verdict` is
+/// `"warn"` or `"deny"`; a compliant call is not recorded here,
+/// matching the sibling `mcp_rbac` / `mcp_quota` / `mcp_peer_downgrade`
+/// / `mcp_argument_policy` triggers, which also only ever record a
+/// triggered outcome.
+///
+/// `rule` is a fixed, closed-vocabulary string (not operator-supplied,
+/// unlike `sbproxy_mcp_argument_policy_total`'s `rule` label), so
+/// cardinality here is bounded by this crate rather than by config.
+pub fn record_mcp_flow(tenant: &str, rule: &'static str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_flow_total",
+            "MCP session-flow enforcement triggers, by tenant, rule id, and verdict",
+            &["tenant", "rule", "verdict"],
+        )
+        .expect("mcp flow counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[tenant.as_str(), rule, verdict])
+        .inc();
+}
+
 /// Record a static tool-poisoning indicator found in advertised tool text on
 /// `sbproxy_mcp_poison_indicators_total{field, indicator, kind}`.
 ///
@@ -7095,6 +7126,26 @@ mod tests {
                     && *value >= 1.0
             }),
             "sbproxy_mcp_argument_policy_total did not register or did not carry \
+             the tenant/rule/verdict labels: {counted:?}"
+        );
+    }
+
+    /// A session-flow enforcement trigger is counted on
+    /// `sbproxy_mcp_flow_total{tenant, rule, verdict}` and carries all
+    /// three labels (WOR-2384, MCP06).
+    #[test]
+    fn mcp_flow_trigger_is_counted_with_its_tenant_rule_and_verdict_labels() {
+        record_mcp_flow("acme", "flow_exfil_block", "deny");
+
+        let counted = gathered_series("sbproxy_mcp_flow_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=flow_exfil_block")
+                    && labels.contains("verdict=deny")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_flow_total did not register or did not carry \
              the tenant/rule/verdict labels: {counted:?}"
         );
     }
