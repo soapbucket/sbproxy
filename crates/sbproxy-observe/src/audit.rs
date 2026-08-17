@@ -72,10 +72,10 @@ pub struct ConfigAuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_revision: Option<String>,
     /// Why the reload was refused, when this entry records a rejection
-    /// rather than an applied change (WOR-2486). The compile or
-    /// validation error string, truncated and never a resolved secret
-    /// or config fragment; see [`Self::with_rejection_reason`]. `None`
-    /// on an accepted reload.
+    /// rather than an applied change (WOR-2486). `None` on an accepted
+    /// reload. The actual contract this field keeps, and does not, is
+    /// on [`Self::with_rejection_reason`]; read it before pointing a
+    /// sink at this field that assumes more than that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection_reason: Option<String>,
 }
@@ -534,11 +534,30 @@ impl ConfigAuditEntry {
 
     /// Attach the reason a reload was refused (WOR-2486).
     ///
-    /// `reason` is bounded to 512 bytes here, the same ceiling
-    /// `RedactedReason` uses on the decision-audit side: a compile or
-    /// validation error can echo a filesystem path or a fragment of the
-    /// offending document, and this record ships to the same
-    /// third-party sinks `events:` does.
+    /// The honest contract, not the aspirational one: `reason` is
+    /// **bounded** to 512 bytes here, the same ceiling `RedactedReason`
+    /// uses on the decision-audit side, and this record ships to the
+    /// same third-party sinks `events:` does. It is **not** scrubbed
+    /// of config content in general. A compile or validation error
+    /// routinely echoes a fragment of the document it is complaining
+    /// about, an invalid CEL expression, an unrecognized key, an
+    /// origin hostname, because naming the offending fragment is how a
+    /// validation error explains itself; nothing here tells that fragment
+    /// apart from ordinary error prose.
+    ///
+    /// The one thing callers are expected to scrub before this is
+    /// called is the config **path**: `crate::path_redact` (in
+    /// `sbproxy-core`) strips the filesystem path a reload was told to
+    /// read out of the error text first, because that path is this
+    /// node's local layout and every call site knows it in advance. A
+    /// resolved secret should not appear either, by the convention
+    /// every secret-reference resolver in this codebase already
+    /// follows (report the unresolved reference, never the value), but
+    /// that convention lives in the resolvers, not enforced here: this
+    /// function performs no content inspection of its own. If your
+    /// threat model needs a stronger guarantee than "bounded, path-
+    /// scrubbed, and secrets-by-convention", read the reason before
+    /// wiring a sink you do not already trust with your config's shape.
     pub fn with_rejection_reason(mut self, reason: impl AsRef<str>) -> Self {
         self.rejection_reason =
             Some(sbproxy_util::truncate_utf8(reason.as_ref(), 512).to_owned());
@@ -993,6 +1012,45 @@ mod tests {
         let json_anon = serde_json::to_string(&entry_anon).unwrap();
         let v_anon: serde_json::Value = serde_json::from_str(&json_anon).unwrap();
         assert!(v_anon.get("tenant_id").is_none());
+    }
+
+    /// WOR-2486 fix round 1, C2: verifies the claim `sbproxy_tls::mtls`'s
+    /// CN sanitizer's doc comment relies on, rather than assuming it.
+    ///
+    /// `sbproxy_meter::ledger::UsageLedger::append_checked` writes one
+    /// `serde_json::to_string(&entry)` result per `writeln!` call to the
+    /// hash-chained file: exactly this crate's own serialization, not a
+    /// hand-rolled format. A `reason` (or any other free-text field)
+    /// carrying a raw newline must not be able to start a second NDJSON
+    /// record inside a value meant to hold one field, because every
+    /// downstream chain reader (`sbproxy audit verify`, a SIEM's NDJSON
+    /// parser) treats one physical line as one record.
+    #[test]
+    fn security_audit_entry_reason_cannot_split_the_chained_ndjson_line() {
+        let entry = SecurityAuditEntry::auth_failure(
+            "auth_mtls_rejected",
+            "mtls:untrusted_issuer cn=evil.example\ncn=trusted.example",
+            495,
+            None,
+            None,
+            None,
+            None,
+        );
+        // The exact call `UsageLedger::append_checked` makes before its
+        // own `writeln!`.
+        let line = serde_json::to_string(&entry).expect("entry serializes");
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "a raw newline in a field must not produce a second physical line: {line:?}"
+        );
+        // And the value round-trips: JSON escaping, not data loss, is
+        // what prevents the split.
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("line parses");
+        assert_eq!(
+            parsed["reason"],
+            "mtls:untrusted_issuer cn=evil.example\ncn=trusted.example"
+        );
     }
 
     // --- WOR-2318: the `events:` egress bridge ---

@@ -429,8 +429,60 @@ fn record_mtls_rejection_audit(reason: &str, cn: &str) {
 /// only gives an mTLS rejection the same two-field shape every other
 /// `auth_failure` gets (`event_type` plus `reason`), and there is no
 /// third slot to give the certificate's own claimed identity.
+///
+/// `cn` is sanitized and bounded before it enters this string (WOR-2486
+/// fix round 1, C2). It is the *rejected* certificate's own claimed
+/// Common Name: attacker-controlled, reachable pre-authentication (no
+/// trust decision has been made yet), and otherwise unbounded.
+/// `SecurityAuditEntry::reason` is free text, and with `audit.sink:
+/// chain` it is appended verbatim to a non-rotating, append-only file,
+/// so an oversized CN costs unbounded disk on that file for every
+/// rejected handshake an attacker cares to send.
 fn mtls_rejection_auth_type(reason: &str, cn: &str) -> String {
-    format!("mtls:{reason} cn={cn}")
+    format!("mtls:{reason} cn={}", sanitize_rejected_cn(cn))
+}
+
+/// Upper bound on the sanitized CN, in bytes.
+///
+/// Common Names are conventionally well under this (RFC 5280 caps the
+/// underlying `DirectoryString` at 64 characters for most profiles,
+/// though nothing on the wire enforces that on an untrusted,
+/// not-yet-validated cert), so this only ever trims a CN that is
+/// already abusing the field.
+const MAX_REJECTED_CN_BYTES: usize = 128;
+
+/// Strip control characters and bound an untrusted certificate's CN
+/// before it reaches an audit record (WOR-2486 fix round 1, C2).
+///
+/// Two passes, in this order:
+///
+/// 1. Drop every Unicode control character (`char::is_control`, which
+///    covers the full C0 set including `\n`, `\r`, and `\t`, plus C1).
+///    This is not a record-splitting defense against the on-disk chain:
+///    `sbproxy_meter::ledger` writes one `serde_json::to_string`-encoded
+///    line per `writeln!` call, and JSON string encoding already escapes
+///    a raw newline as `\n` (two ASCII bytes) rather than emitting one,
+///    so a literal control byte can never split an NDJSON line here.
+///    Verified, not assumed: see
+///    `security_audit_entry_reason_cannot_split_the_chained_ndjson_line`
+///    in `sbproxy_observe::audit`, which exercises the same
+///    `serde_json::to_string` path `sbproxy_meter::ledger` writes
+///    through.
+///    Stripped anyway, because a control character survives that escaping
+///    as visual noise (`cn=evil.example\ncn=trusted.example` reads as two
+///    fields to a human or a naive downstream parser even though it is
+///    one JSON string), and because the field is meant to hold a
+///    hostname-shaped value, not arbitrary bytes.
+/// 2. Bound to [`MAX_REJECTED_CN_BYTES`], last, on a UTF-8 character
+///    boundary. Last because bounding first could cut inside a
+///    multi-byte control sequence and leave a partial one behind.
+fn sanitize_rejected_cn(cn: &str) -> String {
+    let stripped: String = cn.chars().filter(|c| !c.is_control()).collect();
+    let mut end = stripped.len().min(MAX_REJECTED_CN_BYTES);
+    while end > 0 && !stripped.is_char_boundary(end) {
+        end -= 1;
+    }
+    stripped[..end].to_string()
 }
 
 /// Parse an end-entity DER into `ClientCertInfo`. Returns `None` when
@@ -641,6 +693,62 @@ mod tests {
         assert_eq!(
             mtls_rejection_auth_type("cn_mismatch", "wrong-cn.example"),
             "mtls:cn_mismatch cn=wrong-cn.example"
+        );
+    }
+
+    /// WOR-2486 fix round 1, C2. Red first: before this fix, the
+    /// rejected certificate's raw, attacker-chosen CN went straight into
+    /// `SecurityAuditEntry::reason` with no bound and no stripping.
+    #[test]
+    fn sanitize_rejected_cn_bounds_an_oversized_cn() {
+        let oversized = "a".repeat(1000);
+        let sanitized = sanitize_rejected_cn(&oversized);
+        assert_eq!(sanitized.len(), MAX_REJECTED_CN_BYTES);
+        assert!(oversized.len() > MAX_REJECTED_CN_BYTES);
+    }
+
+    /// A multi-byte character sitting on the truncation boundary must
+    /// not be cut mid-codepoint.
+    #[test]
+    fn sanitize_rejected_cn_truncates_on_a_char_boundary() {
+        // Three-byte UTF-8 characters repeated past the byte cap; a naive
+        // byte-index truncation at exactly MAX_REJECTED_CN_BYTES would
+        // split the codepoint straddling that boundary.
+        let oversized = "\u{2603}".repeat(100); // snowman, 3 bytes each
+        let sanitized = sanitize_rejected_cn(&oversized);
+        assert!(sanitized.len() <= MAX_REJECTED_CN_BYTES);
+        assert!(
+            sanitized.chars().all(|c| c == '\u{2603}'),
+            "truncation must not leave a partial codepoint: {sanitized:?}"
+        );
+    }
+
+    /// The CN this test embeds is exactly the shape an attacker would
+    /// send: a raw newline attempting to look like a second audit
+    /// record, plus a CR and a tab for good measure.
+    #[test]
+    fn sanitize_rejected_cn_strips_control_characters() {
+        let hostile = "evil.example\ncn=trusted.example\r\n\tafter-tab";
+        let sanitized = sanitize_rejected_cn(hostile);
+        assert!(!sanitized.contains('\n'), "{sanitized:?}");
+        assert!(!sanitized.contains('\r'), "{sanitized:?}");
+        assert!(!sanitized.contains('\t'), "{sanitized:?}");
+        assert_eq!(sanitized, "evil.examplecn=trusted.exampleafter-tab");
+    }
+
+    /// The composed `auth_type` string a real rejection builds must
+    /// carry neither an oversized nor a control-character-bearing CN,
+    /// end to end through `mtls_rejection_auth_type`, not just through
+    /// the sanitizer in isolation.
+    #[test]
+    fn mtls_rejection_auth_type_sanitizes_and_bounds_the_cn() {
+        let hostile = format!("legit.example\nX-Injected: true{}", "z".repeat(500));
+        let auth_type = mtls_rejection_auth_type("untrusted_issuer", &hostile);
+        assert!(!auth_type.contains('\n'), "{auth_type:?}");
+        assert!(
+            auth_type.len() <= "mtls:untrusted_issuer cn=".len() + MAX_REJECTED_CN_BYTES,
+            "the composed string must stay bounded: {} bytes",
+            auth_type.len()
         );
     }
 
