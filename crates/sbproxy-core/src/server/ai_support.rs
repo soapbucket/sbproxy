@@ -2985,11 +2985,15 @@ pub(super) async fn relay_ai_response_with_idempotency(
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
     let translated =
         sbproxy_ai::translators::translate_success_response_bytes(format, status, &resp_body);
+    // No `RequestContext` in scope on this relay path (mirrors the same
+    // gap on `relay_ai_response` in `ai_dispatch.rs`): the failure is
+    // still logged and metriced, just not decision-audited.
     crate::server::ai_dispatch::record_ai_provider_response_failure(
         ai_span,
         provider_name,
         status,
         Some(&translated),
+        None,
     );
     let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
         status,
