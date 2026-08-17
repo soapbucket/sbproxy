@@ -270,6 +270,7 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcom
         Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
+    audit_reload_outcome("file_watcher", &result);
     result
 }
 
@@ -286,7 +287,41 @@ fn reload_from_config_text(config_path: &str, yaml: &str) -> anyhow::Result<Relo
         Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
+    audit_reload_outcome("file_watcher", &result);
     result
+}
+
+/// Emit a `config_audit` record for a reload outcome on a non-admin path
+/// (WOR-2486): the file watcher, SIGHUP, the remote config-source
+/// refresh poller, and the config-authority bundle apply.
+///
+/// The admin API records its own entry at its own call site (`admin.rs`),
+/// carrying the actor and revision pair only that HTTP layer has; this
+/// covers every other path, which had none for either outcome, and adds
+/// the admin path's missing rejection case too. `source` is the same
+/// vocabulary [`sbproxy_observe::ConfigAuditEntry::source`] already
+/// documents (`"file_watcher"`, `"api"`, ...), extended with
+/// `"config_authority"` and `"config_refresh_poller"` for the two paths
+/// that had no entry at all before this.
+///
+/// A rejection never carries config contents: `{error:#}` can echo a
+/// filesystem path or a fragment of the offending document on some
+/// failure branches, and `with_rejection_reason` bounds it to 512 bytes,
+/// the same ceiling the decision-audit `reason` field uses, before it
+/// reaches a record that ships to the same third-party sinks `events:`
+/// does.
+fn audit_reload_outcome(source: &str, result: &anyhow::Result<ReloadOutcome>) {
+    match result {
+        Ok(_) => {
+            sbproxy_observe::ConfigAuditEntry::new(source, Vec::new(), Vec::new(), Vec::new())
+                .emit();
+        }
+        Err(error) => {
+            sbproxy_observe::ConfigAuditEntry::new(source, Vec::new(), Vec::new(), Vec::new())
+                .with_rejection_reason(format!("{error:#}"))
+                .emit();
+        }
+    }
 }
 
 /// WOR-1186: build the configured session-ledger sink and register it
@@ -624,6 +659,62 @@ fn resolve_events_signing_secret(reference: Option<&str>) -> anyhow::Result<Opti
     }
 }
 
+/// Warn about `events.types` entries an operator selected that nothing
+/// publishes yet (WOR-2486, mirroring [`warn_unwired_decision_audit_events`]
+/// for the typed proxy event feed).
+///
+/// `events.types:` accepts every declared
+/// [`sbproxy_observe::EventType`] on purpose (see `validate_events` in
+/// `sbproxy-config`): refusing an unwired one would block
+/// pre-configuring a type a later release wires, and would fail a
+/// correct config over a gap in this crate's own instrumentation. That
+/// leaves the operator with no signal at the moment the mistake is
+/// made, and a silent `events:` sink reads exactly like a sink with
+/// nothing to report.
+///
+/// Called only when `events:` is present, same as
+/// [`install_event_egress`]: an absent block has no sink to warn about,
+/// and `sink: none` cannot carry a non-empty `types:` past config
+/// validation.
+fn warn_unwired_proxy_events(cfg: &sbproxy_config::types::EventsConfig) {
+    let unwired = unwired_proxy_events(cfg);
+    if !unwired.is_empty() {
+        tracing::warn!(
+            events = %unwired.join(", "),
+            "events.types selects event types that nothing publishes yet; the configured sink \
+             will not see these until their emitters ship"
+        );
+    }
+}
+
+/// The `events.types` entries this block selects that publish nothing.
+///
+/// Split out of the warning so it is testable directly, the same reason
+/// [`unwired_decision_audit_events`] is split from its warning: the
+/// warning itself only logs, and a feed that silently names the wrong
+/// types is exactly the failure this surface exists to avoid.
+pub(super) fn unwired_proxy_events(
+    cfg: &sbproxy_config::types::EventsConfig,
+) -> Vec<&'static str> {
+    use sbproxy_observe::EventType;
+
+    // Empty `types:` means every type, the same reading
+    // `build_event_egress` gives it.
+    let selected: Vec<EventType> = if cfg.types.is_empty() {
+        sbproxy_observe::ALL_EVENT_TYPES.to_vec()
+    } else {
+        cfg.types
+            .iter()
+            .filter_map(|name| EventType::from_name(name))
+            .collect()
+    };
+    selected
+        .iter()
+        .filter(|event_type| !event_type.has_emitter())
+        .map(|event_type| event_type.as_str())
+        .collect()
+}
+
 /// WOR-2318: start the configured event egress and register it
 /// process-wide.
 ///
@@ -934,12 +1025,20 @@ pub enum TryReloadOutcome {
 ///
 /// Returns `Err` under exactly the conditions [`reload_from_config_yaml`]
 /// does. Contention is `Ok(TryReloadOutcome::Busy)`, never an error.
+// `source` is the WOR-2486 addition: `audit_reload_outcome` needs a
+// `config_audit` source label, and the two callers of this function
+// (the config-authority bundle apply and the remote config-source
+// refresh poller) are different enough that one guessed label would be
+// wrong for one of them.
 pub(crate) fn try_reload_from_config_yaml(
     config_path: &str,
     yaml: &str,
+    source: &str,
 ) -> anyhow::Result<TryReloadOutcome> {
     let _reload_guard = match CONFIG_RELOAD_LOCK.try_lock() {
         Ok(guard) => guard,
+        // Busy is not a reload attempt: nothing was examined, so there
+        // is nothing to audit. The caller retries on its own schedule.
         Err(std::sync::TryLockError::WouldBlock) => return Ok(TryReloadOutcome::Busy),
         // A poisoned lock means some other reload panicked mid-flight.
         // The guarded data is `()`, so there is no corrupt state to
@@ -947,7 +1046,9 @@ pub(crate) fn try_reload_from_config_yaml(
         // worse than proceeding.
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
     };
-    reload_from_config_yaml_locked(config_path, yaml).map(TryReloadOutcome::Applied)
+    let result = reload_from_config_yaml_locked(config_path, yaml);
+    audit_reload_outcome(source, &result);
+    result.map(TryReloadOutcome::Applied)
 }
 
 /// What one non-blocking extension bundle refresh attempt did.
@@ -2064,7 +2165,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // starts nothing and cannot fail.
     if let Some(cfg) = compiled.events.as_ref() {
         install_event_egress(cfg)?;
+        warn_unwired_proxy_events(cfg);
     }
+
+    // --- WOR-2486: bridge egress refusals onto the typed event feed ---
+    //
+    // Unconditional, unlike the two sinks above: `sbproxy-security` is a
+    // leaf crate that cannot depend on `sbproxy-observe` (see the doc on
+    // `sbproxy_security::egress::install_egress_refused_hook`), so this
+    // is the one place the bridge can be wired regardless of whether
+    // `events:` is configured. The hook itself is a relaxed load when no
+    // egress is installed, so registering it costs nothing on a
+    // deployment that never sets `events:`.
+    let _ = sbproxy_security::egress::install_egress_refused_hook(
+        sbproxy_observe::egress_bridge::bridge,
+    );
 
     // WOR-1164: install the detection singletons (agent-class resolver,
     // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer).

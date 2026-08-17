@@ -1265,6 +1265,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: config source resolution failed");
             let msg = sanitise_path_in_error(&format!("{e:#}"), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 400,
                 "application/json",
@@ -1280,6 +1281,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: YAML parse failed");
             let msg = sanitise_path_in_error(&e.to_string(), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 400,
                 "application/json",
@@ -1303,6 +1305,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     {
         tracing::warn!(error = ?error, "admin reload: pipeline compile failed");
         let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
+        audit_admin_reload_rejection(&prior_revision, &msg);
         return (
             400,
             "application/json",
@@ -1327,6 +1330,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
             // operator saw a path they could read and nothing to act on.
             tracing::error!(error = ?error, "admin reload: shared reload transaction failed");
             let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 500,
                 "application/json",
@@ -3382,6 +3386,27 @@ pub(crate) fn current_admin_actor() -> Option<String> {
 /// handlers below the sync dispatcher that gate on admin-only reads.
 pub(crate) fn current_admin_role() -> Option<AdminRole> {
     CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().as_ref().map(|(_, role)| *role))
+}
+
+/// Emit a `config_audit` record for a `POST /admin/reload` rejection
+/// (WOR-2486).
+///
+/// The success arm has audited since `ConfigAuditEntry`'s original
+/// production call site; every rejection arm on this path (source
+/// resolution, YAML parse, pipeline compile, and the shared runtime
+/// transaction) had none. `reason` is expected already path-scrubbed by
+/// [`sanitise_path_in_error`], the same text the HTTP response carries,
+/// so the record never says more than the caller who triggered it
+/// already saw.
+fn audit_admin_reload_rejection(prior_revision: &str, reason: &str) {
+    let mut entry =
+        sbproxy_observe::ConfigAuditEntry::new("api", Vec::new(), Vec::new(), Vec::new())
+            .with_revisions(Some(prior_revision), None::<&str>)
+            .with_rejection_reason(reason);
+    if let Some(actor) = current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    entry.emit();
 }
 
 /// Clears the actor slot when the dispatch scope ends.

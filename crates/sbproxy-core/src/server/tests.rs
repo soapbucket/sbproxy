@@ -3282,6 +3282,70 @@ fn reload_from_config_path_propagates_compile_errors() {
     let _ = format!("{err}");
 }
 
+/// WOR-2486: a file-watcher-path rejection now reaches `config_audit`.
+/// Before this wiring, `ConfigAuditEntry` had exactly one production
+/// call site (the admin API's success arm); a compile failure on the
+/// file-watcher/SIGHUP path was invisible to the one channel built to
+/// answer "what changed and who changed it" (it was never in `config_audit`
+/// at all, accepted or rejected).
+#[test]
+fn a_file_watcher_rejection_reaches_config_audit() {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    tmp.write_all(b"proxy: !! no\n  origins ....\n").unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    let before = sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None)
+        .len();
+    let _ = reload_from_config_path(&path).expect_err("broken YAML must fail");
+    let events =
+        sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
+    assert!(
+        events.len() > before,
+        "the rejection must reach the audit ring, not just the metric"
+    );
+    let ours = events
+        .iter()
+        .find(|e| e.kind == "file_watcher")
+        .expect("a file_watcher-sourced config_audit entry must exist");
+    assert!(
+        ours.detail.as_deref().unwrap_or_default().starts_with("rejected:"),
+        "must read as a rejection, not an accepted no-op reload: {:?}",
+        ours.detail
+    );
+}
+
+/// The accepted half of the pair above: a successful file-watcher-path
+/// reload also reaches `config_audit`, which it never did before this
+/// wiring either (only the admin API's success arm did).
+#[test]
+fn a_file_watcher_success_reaches_config_audit() {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "file-watcher-audit.test":
+    action:
+      type: static
+      body: ok
+"#;
+    tmp.write_all(yaml.as_bytes()).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    reload_from_config_path(&path).expect("valid config reloads");
+    let events =
+        sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), None, None);
+    let ours = events
+        .iter()
+        .find(|e| e.kind == "file_watcher" && e.detail.as_deref().is_some_and(|d| !d.starts_with("rejected:")))
+        .expect("an accepted file_watcher-sourced config_audit entry must exist");
+    assert!(!ours.detail.as_deref().unwrap_or_default().starts_with("rejected:"));
+}
+
 // --- WOR-2162: a reload carrying invalid CEL is rejected whole ---
 
 #[test]
@@ -4570,6 +4634,70 @@ origins:
         "under the converged shape policy publishes on exactly this feed; warning that nothing \
          publishes it is wrong about the one event the operator turned on"
     );
+}
+
+/// The `events.types` boot warning has to name a dead type and stay
+/// silent about a wired one (WOR-2486, mirroring
+/// `a_superseded_event_is_reported_separately_from_an_unwired_one` for
+/// the typed proxy event feed).
+#[test]
+fn unwired_proxy_events_names_cache_hit_but_not_policy_denied() {
+    let yaml = r#"events:
+  sink: file
+  path: /tmp/sbproxy-events-test.ndjson
+  types:
+    - cache_hit
+    - policy_denied
+origins:
+  "events.test":
+    action:
+      type: static
+      body: ok
+"#;
+    let compiled = sbproxy_config::compile_config(yaml).expect("fixture config");
+    let events_cfg = compiled
+        .events
+        .as_ref()
+        .expect("events block compiles from the fixture");
+    let unwired = super::lifecycle::unwired_proxy_events(events_cfg);
+
+    assert!(
+        unwired.contains(&"cache_hit"),
+        "cache_hit has no emitter by design and must be named: {unwired:?}"
+    );
+    assert!(
+        !unwired.contains(&"policy_denied"),
+        "policy_denied publishes through the SecurityAuditEntry bridge and must not be named: \
+         {unwired:?}"
+    );
+}
+
+/// An empty `types:` means "every type", the same reading
+/// `build_event_egress` gives it, so the warning still has to catch a
+/// dead type nobody explicitly named.
+#[test]
+fn unwired_proxy_events_covers_the_implicit_all_selection() {
+    let yaml = r#"events:
+  sink: file
+  path: /tmp/sbproxy-events-test-all.ndjson
+origins:
+  "events-all.test":
+    action:
+      type: static
+      body: ok
+"#;
+    let compiled = sbproxy_config::compile_config(yaml).expect("fixture config");
+    let events_cfg = compiled
+        .events
+        .as_ref()
+        .expect("events block compiles from the fixture");
+    let unwired = super::lifecycle::unwired_proxy_events(events_cfg);
+
+    assert!(
+        unwired.contains(&"cache_hit") && unwired.contains(&"cache_miss"),
+        "an implicit all-types selection must still catch the dead types: {unwired:?}"
+    );
+    assert_eq!(unwired.len(), 2, "only cache_hit and cache_miss have no emitter: {unwired:?}");
 }
 
 /// Every auth decision goes through the one seam (WOR-2446).

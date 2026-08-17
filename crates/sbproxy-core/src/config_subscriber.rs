@@ -885,6 +885,7 @@ impl ConfigSubscriber {
         let outcome = match crate::server::try_reload_from_config_yaml(
             &self.config_path,
             &candidate.merged_yaml,
+            "config_authority",
         ) {
             Ok(TryReloadOutcome::Applied(outcome)) => outcome,
             Ok(TryReloadOutcome::Busy) => {
