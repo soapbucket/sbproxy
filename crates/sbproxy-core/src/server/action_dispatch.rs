@@ -11206,7 +11206,10 @@ mod mcp_catalog_snapshot_tests {
                  observed within 5s",
             );
             assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
-            assert_eq!(event["data"]["sbproxy.decision.rule_id"], "flow_exfil_block");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "flow_exfil_block"
+            );
             assert_eq!(event["data"]["sbproxy.decision.reason"], "session_flow");
         }
     }

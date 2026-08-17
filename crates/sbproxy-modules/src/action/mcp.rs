@@ -3157,8 +3157,7 @@ impl McpAction {
         if !flow.is_outbound(tool_name) {
             return McpFlowVerdict::Allow;
         }
-        let (integrity_tainted, sensitive_touched) = match (self.sessions.as_deref(), session_id)
-        {
+        let (integrity_tainted, sensitive_touched) = match (self.sessions.as_deref(), session_id) {
             (Some(store), Some(id)) => {
                 let labels = store.flow_labels(id).unwrap_or_default();
                 (
@@ -3236,7 +3235,9 @@ impl McpAction {
             && !flow.is_trusted(server)
             && store.taint(id).is_some_and(|r| r.transitioned);
         let newly_sensitive = flow.is_sensitive(server, tool_name)
-            && store.mark_sensitive_touched(id).is_some_and(|r| r.transitioned);
+            && store
+                .mark_sensitive_touched(id)
+                .is_some_and(|r| r.transitioned);
         McpFlowRecordOutcome {
             newly_tainted,
             newly_sensitive,
@@ -6187,7 +6188,10 @@ allow := false if {
         let outcome =
             action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv");
         assert!(outcome.newly_tainted);
-        assert!(!outcome.newly_sensitive, "untrusted-srv is not declared sensitive");
+        assert!(
+            !outcome.newly_sensitive,
+            "untrusted-srv is not declared sensitive"
+        );
 
         let verdict =
             action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
@@ -6211,7 +6215,10 @@ allow := false if {
             Some("fetch_doc"),
             "sensitive-trusted-srv",
         );
-        assert!(!outcome.newly_tainted, "sensitive-trusted-srv is a trusted server");
+        assert!(
+            !outcome.newly_tainted,
+            "sensitive-trusted-srv is a trusted server"
+        );
         assert!(outcome.newly_sensitive);
 
         let verdict =
@@ -6240,8 +6247,7 @@ allow := false if {
         assert!(outcome.newly_sensitive);
 
         // `read_file` is not classified `outbound_tools`.
-        let verdict =
-            action.flow_pre_dispatch_check(Some(&session_id), "read_file", "trusted-srv");
+        let verdict = action.flow_pre_dispatch_check(Some(&session_id), "read_file", "trusted-srv");
         assert_eq!(
             verdict,
             McpFlowVerdict::Allow,
@@ -6257,7 +6263,11 @@ allow := false if {
             .as_ref()
             .expect("sessions enabled")
             .create("acme");
-        action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
+        action.flow_record_entry(
+            Some(&session_id),
+            Some("fetch_doc"),
+            "sensitive-untrusted-srv",
+        );
 
         let verdict =
             action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
@@ -6285,7 +6295,11 @@ allow := false if {
             .as_ref()
             .expect("sessions enabled")
             .create("acme");
-        action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
+        action.flow_record_entry(
+            Some(&session_id),
+            Some("fetch_doc"),
+            "sensitive-untrusted-srv",
+        );
 
         let verdict =
             action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
@@ -6376,8 +6390,7 @@ allow := false if {
             .as_ref()
             .expect("sessions enabled")
             .create("acme");
-        let outcome =
-            action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "trusted-srv");
+        let outcome = action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "trusted-srv");
         assert!(!outcome.newly_tainted);
         assert!(!outcome.newly_sensitive);
         let verdict =
@@ -6452,12 +6465,20 @@ allow := false if {
             .create("acme");
         assert!(
             action
-                .flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-trusted-srv")
+                .flow_record_entry(
+                    Some(&session_id),
+                    Some("fetch_doc"),
+                    "sensitive-trusted-srv"
+                )
                 .newly_sensitive
         );
         assert!(
             !action
-                .flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-trusted-srv")
+                .flow_record_entry(
+                    Some(&session_id),
+                    Some("fetch_doc"),
+                    "sensitive-trusted-srv"
+                )
                 .newly_sensitive,
             "a session that already touched sensitive data must not report a second transition"
         );
@@ -6543,7 +6564,11 @@ allow := false if {
             .as_ref()
             .expect("sessions enabled")
             .create("acme");
-        action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
+        action.flow_record_entry(
+            Some(&session_id),
+            Some("fetch_doc"),
+            "sensitive-untrusted-srv",
+        );
         let verdict = action.flow_pre_dispatch_check(Some(&session_id), "read_file", "trusted-srv");
         assert_eq!(
             verdict,
@@ -6565,8 +6590,7 @@ allow := false if {
 
         // A trusted-but-sensitive server supplies only the other single
         // leg, alone.
-        let other_leg =
-            action.flow_pre_dispatch_check(None, "send_email", "sensitive-trusted-srv");
+        let other_leg = action.flow_pre_dispatch_check(None, "send_email", "sensitive-trusted-srv");
         assert_eq!(other_leg, McpFlowVerdict::Allow);
 
         // Only a server that is BOTH untrusted AND sensitive supplies
@@ -6679,7 +6703,11 @@ allow := false if {
             "an untouched session's labels must read trusted/false"
         );
 
-        action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
+        action.flow_record_entry(
+            Some(&session_id),
+            Some("fetch_doc"),
+            "sensitive-untrusted-srv",
+        );
 
         let deny = action.evaluate_argument_policies(
             &principal_for("acme"),
@@ -6749,7 +6777,11 @@ allow := false if {
         );
         assert_eq!(allow, McpArgumentPolicyVerdict::Allow);
 
-        action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-trusted-srv");
+        action.flow_record_entry(
+            Some(&session_id),
+            Some("fetch_doc"),
+            "sensitive-trusted-srv",
+        );
 
         let deny = action.evaluate_argument_policies(
             &principal_for("acme"),
