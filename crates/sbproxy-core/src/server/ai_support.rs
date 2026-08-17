@@ -1170,16 +1170,25 @@ pub(crate) fn budget_preflight(
                             reason = %result.reason,
                             "AI budget: limit exceeded (downgrade unset and no candidates; blocking)"
                         );
+                        let downgrade_reason =
+                            format!("{}; downgrade target unavailable", result.reason);
                         let body = serde_json::json!({
                             "error": {
                                 "type": "budget_exceeded",
                                 "scope": scope_label(&limit.scope),
-                                "message": format!(
-                                    "{}; downgrade target unavailable",
-                                    result.reason
-                                ),
+                                "message": &downgrade_reason,
                             }
                         });
+                        // WOR-2486 fix round 1, I3: the second
+                        // `BudgetGate::Block` construction site. A
+                        // downgrade limit with no configured
+                        // `downgrade_to` and no cheaper candidate in the
+                        // provider catalog still denies the request at
+                        // 402, so it still counts as crossing the cap.
+                        sbproxy_observe::publish_proxy_event(
+                            sbproxy_observe::EventType::BudgetExceeded,
+                            || budget_exceeded_event(tenant_id, origin, limit, &downgrade_reason),
+                        );
                         return BudgetGate::Block {
                             status: 402,
                             body: serde_json::to_vec(&body).unwrap_or_default(),
@@ -1283,6 +1292,47 @@ mod budget_preflight_tests {
         assert_eq!(body["error"]["type"], "budget_exceeded");
         assert_eq!(body["error"]["scope"], "workspace");
         assert_eq!(body["error"]["message"], "token limit exceeded: 100 >= 100");
+    }
+
+    /// WOR-2486 fix round 1, I3: the second `BudgetGate::Block`
+    /// construction site (a `Downgrade`-action limit with no configured
+    /// `downgrade_to` and no cheaper candidate in the provider catalog
+    /// still denies the request at 402) must also publish
+    /// `budget_exceeded`. Before this fix only the first `Block` arm
+    /// did, so a deployment using downgrade-by-default budgets with no
+    /// catalog to downgrade into had a real 402 with no event behind it.
+    #[test]
+    fn budget_preflight_downgrade_with_no_candidates_blocks_and_publishes() {
+        let key = "workspace:budget-preflight-downgrade-no-candidates";
+        let gate = budget_preflight(
+            // No `downgrade_to`, and `providers: &[]` below leaves no
+            // catalog to pick a cheaper model from, so this must fall
+            // through to the `None` arm of the `Downgrade` match rather
+            // than the `Some(model)` arm the other downgrade test covers.
+            &workspace_budget(OnExceedAction::Downgrade, None),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+            "tenant-a",
+            "budget-preflight-downgrade-no-candidates-origin",
+        );
+
+        let BudgetGate::Block { status, body } = gate else {
+            panic!("a downgrade limit with no candidate must still block");
+        };
+        assert_eq!(status, 402);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("budget JSON");
+        assert_eq!(body["error"]["type"], "budget_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("downgrade target unavailable"),
+            "{body}"
+        );
+        // The publish_proxy_event call on this branch must not panic
+        // even with no egress installed; if it did, the assertions
+        // above would never run.
     }
 
     /// WOR-2486: the fields a SIEM rule selects on. Red-first: before
