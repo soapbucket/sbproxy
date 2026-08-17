@@ -540,9 +540,13 @@ pub struct McpFederatedServerConfig {
     /// startup, not the hot path.
     #[serde(default)]
     pub spec_path: Option<String>,
-    /// Egress policy for this upstream's OpenAPI REST calls. Applies
-    /// only when `type: openapi`; omitted inherits action-level
-    /// `egress`, then allow-all.
+    /// Egress policy for this upstream's outbound dials: the OpenAPI
+    /// REST calls a `type: openapi` server makes, or the base MCP
+    /// connect (`EgressPurpose::McpUpstream`, WOR-2384 / MCP09) a
+    /// plain `type: mcp` server makes over `streamable_http` or `sse`.
+    /// `stdio` servers spawn a local process and never consult this
+    /// policy. Omitted inherits action-level `egress`, then allow-all
+    /// (legacy, ungated).
     #[serde(default)]
     pub egress: Option<EgressPolicy>,
     /// Static headers attached to every REST request an `openapi`
@@ -583,6 +587,33 @@ pub struct McpFederatedServerConfig {
     /// when `protocol:` is pinned. WOR-2384.
     #[serde(default)]
     pub downgrade: McpDowngradePolicy,
+    /// Registry approval status for this upstream (WOR-2384, MCP09;
+    /// SOTA pick: a Draft -> Approved -> Deprecated lifecycle, the
+    /// shape of AWS's Draft/Curator/Consumer MCP-registry guidance
+    /// without a separate curator identity to manage). Absent means
+    /// `approved`, the default, so every config written before this
+    /// field existed keeps working unchanged. `draft` hides this
+    /// server's tools from `tools/list` and refuses every call
+    /// against them, naming the status in the refusal. `deprecated`
+    /// keeps the server fully callable, so existing integrations do
+    /// not break, but emits a warn-level `mcp_governance_decision`
+    /// event on every call, so a slow migration off a sunset server
+    /// stays visible without an outage.
+    #[serde(default)]
+    pub status: McpServerApprovalStatus,
+    /// Free-text record of who approved this server. Operator
+    /// attested: sbproxy never verifies the value or requires one to
+    /// be set for `status: approved`; it is only stored and can be
+    /// surfaced in an audit review. Changing it is audited the same
+    /// way every other config edit is (`config_audit`), not by a
+    /// dedicated event.
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    /// Free-text record of when this server was approved. Operator
+    /// attested like `approved_by`: never parsed as a timestamp and
+    /// never verified, just stored and surfaced.
+    #[serde(default)]
+    pub approved_at: Option<String>,
 }
 
 fn default_federated_protocol() -> String {
@@ -626,6 +657,35 @@ impl McpDowngradePolicy {
         }
     }
 }
+
+/// Wire form of `federated_servers[].status` (WOR-2384, MCP09). See
+/// [`McpFederatedServerConfig::status`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerApprovalStatus {
+    /// Registered but not yet reviewed. This server's tools are
+    /// hidden from `tools/list` and every call against them is
+    /// refused, naming the status.
+    Draft,
+    /// Reviewed and in normal service (default).
+    #[default]
+    Approved,
+    /// Still fully callable, but every call emits a warn-level
+    /// `mcp_governance_decision` event, so a slow migration off a
+    /// sunset server is visible without breaking it.
+    Deprecated,
+}
+
+/// Stable `sbproxy.decision.rule_id` for a `deprecated` server's
+/// warn-level `mcp_governance_decision` event (WOR-2384, MCP09). A
+/// `draft` server's refusal is a simpler, pre-dispatch guardrail (like
+/// `tool_allowlist` or the lethal-trifecta guardrail) and is not wired
+/// to the governance evidence bus, so it carries no rule_id of its
+/// own; only `deprecated`'s event does.
+pub const MCP_SERVER_APPROVAL_RULE_ID: &str = "mcp_server_approval";
+/// `sbproxy.decision.reason` / policy-metric label for a `deprecated`
+/// server's warn-level governance event.
+pub const MCP_SERVER_DEPRECATED_REASON: &str = "mcp_server_deprecated";
 
 /// One entry in the gateway-level guardrails list.
 #[derive(Debug, Clone, Deserialize)]
@@ -978,6 +1038,9 @@ pub struct McpServerPrefix {
     /// downgrade)`. See
     /// [`sbproxy_extension::mcp::peer_profile::peer_key`]. WOR-2384.
     pub peer_key: String,
+    /// Registry approval status (WOR-2384, MCP09). See
+    /// [`McpFederatedServerConfig::status`].
+    pub status: McpServerApprovalStatus,
 }
 
 impl McpServerPrefix {
@@ -1248,6 +1311,21 @@ impl McpAction {
                     upstream.origin
                 );
             }
+            // WOR-2384 (MCP09): computed once per server so both the
+            // `openapi` REST-call gate (`OpenApiBacking::egress_policy`,
+            // pre-existing) and the base MCP dial gate
+            // (`McpServerConfig::egress_policy`, new) apply the exact
+            // same precedence -- per-server `egress:` over the
+            // action-level default over allow-all -- regardless of
+            // which kind of upstream this is. `stdio` servers get one
+            // too (uniform construction) but it is never consulted:
+            // stdio is a local process spawn, not a network dial.
+            let server_egress_policy = upstream
+                .egress
+                .clone()
+                .unwrap_or_else(|| action_egress.clone())
+                .with_scope(format!("server:{name}"));
+
             let (url, openapi) = if is_stdio {
                 let command = upstream.command.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1279,11 +1357,7 @@ impl McpAction {
                         base_url,
                         tools,
                         routes,
-                        egress_policy: upstream
-                            .egress
-                            .clone()
-                            .unwrap_or_else(|| action_egress.clone())
-                            .with_scope(format!("server:{name}")),
+                        egress_policy: server_egress_policy.clone(),
                         headers: upstream
                             .headers
                             .iter()
@@ -1301,6 +1375,7 @@ impl McpAction {
                 transport,
                 namespace: upstream.namespace,
                 openapi,
+                egress_policy: server_egress_policy,
             });
             // WOR-2384: computed before `upstream.protocol` /
             // `upstream.downgrade` are moved into the struct literal
@@ -1326,6 +1401,7 @@ impl McpAction {
                     protocol: upstream.protocol,
                     downgrade: upstream.downgrade,
                     peer_key,
+                    status: upstream.status,
                 },
             );
         }
@@ -1497,6 +1573,17 @@ impl McpAction {
     pub fn policy_for_server(&self, server_name: &str) -> Option<&ToolAccessPolicy> {
         let label = self.prefix_for(server_name)?.rbac.as_deref()?;
         self.rbac_policies.get(label)
+    }
+
+    /// Registry approval status for a federated server (WOR-2384,
+    /// MCP09). An unknown server name returns the default
+    /// (`approved`), matching the "unknown server means don't
+    /// specially guard it" convention the sibling per-server lookups
+    /// on this type already use.
+    pub fn server_status(&self, server_name: &str) -> McpServerApprovalStatus {
+        self.prefix_for(server_name)
+            .map(|p| p.status)
+            .unwrap_or_default()
     }
 
     /// Per-server timeout for `tools/call`. `None` when not configured;
@@ -3161,6 +3248,9 @@ mod tests {
                 egress: None,
                 protocol: default_federated_protocol(),
                 downgrade: McpDowngradePolicy::default(),
+                status: McpServerApprovalStatus::default(),
+                approved_by: None,
+                approved_at: None,
             };
             assert_eq!(entry.timeout, Some(expected), "parsed {raw}");
         }

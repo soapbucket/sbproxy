@@ -27,7 +27,10 @@ use super::protocol::{
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse, META_TRACEPARENT, SEP_414_RESERVED_META_KEYS};
-use sbproxy_security::egress::{AuthorizedDestination, EgressPurpose, HostResolver};
+use sbproxy_security::egress::{
+    record_egress_refused, record_egress_seen, AuthorizedDestination, EgressPurpose,
+    EgressSightingStatus, HostResolver,
+};
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
 ///
@@ -96,7 +99,7 @@ pub struct OpenApiBacking {
 }
 
 /// Configuration for one upstream MCP server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct McpServerConfig {
     /// Human-readable name for this server.
     pub name: String,
@@ -110,6 +113,13 @@ pub struct McpServerConfig {
     /// spec (tools derived locally, `tools/call` dispatched as REST)
     /// rather than by speaking MCP to `url`.
     pub openapi: Option<OpenApiBacking>,
+    /// Deterministic egress policy for the base MCP dial itself
+    /// (`EgressPurpose::McpUpstream`, WOR-2384 / MCP09), independent
+    /// of any `OpenApiBacking::egress_policy` an `openapi`-backed
+    /// server also carries for its REST calls. `stdio` servers carry
+    /// a policy too (uniform construction) but it is never consulted:
+    /// stdio is a local process spawn, not a network dial.
+    pub egress_policy: EgressPolicy,
 }
 
 /// Resolve the advertised (and registry-key) name for a tool or resource
@@ -2804,10 +2814,29 @@ impl McpFederation {
         let url = Url::parse(&format!("{base}{path}"))
             .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
         // Deny unlisted hosts before any I/O (WOR-1791 / G2).
-        let mut dest = backing
+        let mut dest = match backing
             .egress_policy
             .authorize(EgressPurpose::OpenApiTool, url.as_str(), resolver)
-            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
+        {
+            Ok(dest) => dest,
+            Err(e) => {
+                // WOR-2384 (MCP09): this denial used to be silent --
+                // the sighting inventory never heard about an
+                // OpenAPI-tool egress decision at all, allowed or
+                // denied. Record it here so `GET /api/egress` reflects
+                // a refused destination the same way every purpose
+                // that already gates production traffic does.
+                record_egress_seen(
+                    EgressPurpose::OpenApiTool,
+                    url.as_str(),
+                    &server.name,
+                    EgressSightingStatus::Denied,
+                    Some(e),
+                );
+                record_egress_refused(EgressPurpose::OpenApiTool, e, "", &server.name);
+                return Err(anyhow::anyhow!("egress denied: {e:?}"));
+            }
+        };
 
         let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
             .into_iter()
@@ -2967,6 +2996,16 @@ impl McpFederation {
         req: &JsonRpcRequest,
         extra_headers: &[(String, String)],
     ) -> anyhow::Result<JsonRpcResponse> {
+        // WOR-2384 (MCP09): every non-stdio dial to this upstream --
+        // the `initialize` capability probe, `tools/call`,
+        // `refresh_tools`, `refresh_resources`, `refresh_prompts` --
+        // funnels through this one function, so gating here covers
+        // every connect site the base (non-`openapi`) MCP path has.
+        // `stdio` spawns a local process and is out of scope for a
+        // network egress purpose.
+        if server.transport.as_str() != "stdio" {
+            self.authorize_mcp_upstream_dial(server)?;
+        }
         let result = match server.transport.as_str() {
             "sse" => {
                 send_via_sse(
@@ -3008,6 +3047,57 @@ impl McpFederation {
             sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(e));
         }
         result
+    }
+
+    /// Authorize the base MCP dial itself (`EgressPurpose::McpUpstream`,
+    /// WOR-2384 / MCP09) before any connect, mirroring the discipline
+    /// `EgressPurpose::OpenApiTool` already applies to `type: openapi`
+    /// REST calls a few methods above. The branch inspected is
+    /// `server.egress_policy.mode` directly, never a collapsed
+    /// `Result`: a server with no `egress:` configured (the
+    /// legacy-compatible default) is stamped `Ungated` in the
+    /// sightings inventory rather than silently counted as "allowed",
+    /// the same wrinkle the AI-provider gate closed for
+    /// `EgressPurpose::AiProvider` (WOR-2476). Callers skip this for
+    /// `stdio` servers: a local process spawn is not a network dial
+    /// and has no `EgressPurpose::McpUpstream` sighting to record.
+    fn authorize_mcp_upstream_dial(&self, server: &McpServerConfig) -> anyhow::Result<()> {
+        if !server.egress_policy.mode.is_enforce() {
+            record_egress_seen(
+                EgressPurpose::McpUpstream,
+                &server.url,
+                &server.name,
+                EgressSightingStatus::Ungated,
+                None,
+            );
+            return Ok(());
+        }
+        match server
+            .egress_policy
+            .authorize(EgressPurpose::McpUpstream, &server.url, &SystemHostResolver)
+        {
+            Ok(_) => {
+                record_egress_seen(
+                    EgressPurpose::McpUpstream,
+                    &server.url,
+                    &server.name,
+                    EgressSightingStatus::Allowed,
+                    None,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                record_egress_seen(
+                    EgressPurpose::McpUpstream,
+                    &server.url,
+                    &server.name,
+                    EgressSightingStatus::Denied,
+                    Some(e),
+                );
+                record_egress_refused(EgressPurpose::McpUpstream, e, "", &server.name);
+                Err(anyhow::anyhow!("egress denied: {e:?}"))
+            }
+        }
     }
 
     /// Test-only: publish a tool registry and its matching version-gate
@@ -4257,6 +4347,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         }
     }
 
@@ -4588,6 +4679,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            egress_policy: EgressPolicy::default(),
         }]);
 
         assert_eq!(federation.refresh_tools().await.expect("refresh"), 1);
@@ -6012,6 +6104,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
         let mut caps = HashMap::new();
@@ -7318,6 +7411,7 @@ mod tests {
             transport: "sse".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         };
         assert_eq!(config.transport, "sse");
     }
@@ -7360,6 +7454,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
         let mut tools = HashMap::new();
@@ -7422,6 +7517,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            egress_policy: EgressPolicy::default(),
         };
 
         let err = fed
@@ -7437,6 +7533,149 @@ mod tests {
             !rendered.contains("api.example.com"),
             "denial must not embed the blocked host, got: {rendered}"
         );
+
+        // WOR-2384 (MCP09): this denial used to be silent -- the
+        // sighting inventory never heard about an `openapi_tool`
+        // egress decision at all. It must now show up as a `denied`
+        // sighting, same as every purpose that already gates
+        // production traffic.
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let sighting = snapshot
+            .iter()
+            .find(|s| s.purpose == "openapi_tool" && s.host == "api.example.com" && s.port == 443)
+            .expect(
+                "a denied openapi_tool dial must be recorded in the egress inventory snapshot",
+            );
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.last_reason, Some("unlisted_host"));
+    }
+
+    /// WOR-2384 (MCP09): `EgressPurpose::McpUpstream` had zero production
+    /// call sites before this change -- a private-address `type: mcp`
+    /// origin dialled through unchecked regardless of any `egress:`
+    /// configured for it, because no gate existed at all. Exercises all
+    /// three sighting states from the one real gate function
+    /// (`authorize_mcp_upstream_dial`), each against a distinct port so
+    /// the assertions below can find their own entry in the process-wide
+    /// inventory without depending on test execution order.
+    #[test]
+    fn mcp_upstream_dial_is_gated_and_inventoried_for_all_three_sighting_states() {
+        let fed = McpFederation::new(vec![]);
+
+        // Ungated: no `egress:` configured for this server (the
+        // legacy-compatible, allow-by-default default).
+        let ungated = McpServerConfig {
+            name: "ungated-mcp".to_string(),
+            url: "http://127.0.0.1:18391/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy::default(),
+        };
+        fed.authorize_mcp_upstream_dial(&ungated)
+            .expect("an unconfigured egress policy must not block the dial");
+
+        // Allowed: enforce mode, host listed, private address explicitly
+        // opted in (this is a loopback fixture host, not a real private
+        // network).
+        let allowed = McpServerConfig {
+            name: "allowed-mcp".to_string(),
+            url: "http://127.0.0.1:18392/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:allowed-mcp".to_string(),
+            },
+        };
+        fed.authorize_mcp_upstream_dial(&allowed)
+            .expect("a listed, allow-private host must authorize");
+
+        // Denied: the headline red-first case -- a private-address
+        // `type: mcp` origin is refused when the egress mode denies it.
+        // Before this change nothing gated this dial at all, so this
+        // call would have succeeded.
+        let denied = McpServerConfig {
+            name: "denied-mcp".to_string(),
+            url: "http://127.0.0.1:18393/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: false,
+                scope: "server:denied-mcp".to_string(),
+            },
+        };
+        let err = fed
+            .authorize_mcp_upstream_dial(&denied)
+            .expect_err("a private address must be refused when egress mode denies it");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("PrivateAddress"),
+            "denial must use the closed EgressDenied vocabulary, got: {rendered}"
+        );
+
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let find = |port: u16| {
+            snapshot
+                .iter()
+                .find(|s| s.purpose == "mcp_upstream" && s.host == "127.0.0.1" && s.port == port)
+                .unwrap_or_else(|| panic!("no mcp_upstream sighting recorded for port {port}"))
+        };
+        assert_eq!(find(18391).status, "ungated");
+        assert_eq!(find(18392).status, "allowed");
+        assert_eq!(find(18393).status, "denied");
+        assert_eq!(find(18393).last_reason, Some("private_address"));
+    }
+
+    /// WOR-2384 (MCP09): a covered function is not a wired one -- this
+    /// proves the gate runs through the real `refresh_tools` ->
+    /// `fetch_tools_from_server` -> `dispatch_request` path a live
+    /// deployment actually uses, not just that
+    /// `authorize_mcp_upstream_dial` behaves correctly when called
+    /// directly (the test above). No listener is bound on this port at
+    /// all, so a plain connection refusal would also make
+    /// `refresh_tools` return zero tools; the inventory assertion is
+    /// what distinguishes "the egress gate refused it" from "nothing
+    /// was listening".
+    #[tokio::test]
+    async fn refresh_tools_records_a_denied_mcp_upstream_sighting_for_a_gated_private_server() {
+        let server = McpServerConfig {
+            name: "gated-mcp".to_string(),
+            url: "http://127.0.0.1:18394/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: false,
+                scope: "server:gated-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![server]);
+
+        let count = fed
+            .refresh_tools()
+            .await
+            .expect("refresh_tools must not bail out on a per-server failure");
+        assert_eq!(count, 0, "the gated server's tools must never be fetched");
+
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let sighting = snapshot
+            .iter()
+            .find(|s| s.purpose == "mcp_upstream" && s.host == "127.0.0.1" && s.port == 18394)
+            .expect("refresh_tools must have run the dial through the mcp_upstream egress gate");
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.last_reason, Some("private_address"));
     }
 
     #[tokio::test]
@@ -7489,6 +7728,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            egress_policy: EgressPolicy::default(),
         };
 
         let err = fed
@@ -7574,6 +7814,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            egress_policy: EgressPolicy::default(),
         }
     }
 
@@ -8425,6 +8666,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
         let mut tools = HashMap::new();

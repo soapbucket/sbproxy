@@ -216,10 +216,14 @@ that implies.
 or a tool call reaches a host nobody approved. In the worst version this is an
 internal address.
 
-**What the gateway does.** For an OpenAPI-backed federated server
-(`type: openapi`), egress is deny-by-default per origin and per federated
-server, and the authorizer refuses destinations that resolve to private
-address space unless explicitly allowed.
+**What the gateway does.** Egress is deny-by-default per origin and per
+federated server, and the authorizer refuses destinations that resolve to
+private address space unless explicitly allowed. This applies both to an
+OpenAPI-backed server's REST calls (`type: openapi`) and, since WOR-2384, to
+a plain `type: mcp` server's base connect over `streamable_http` or `sse`.
+Every dial's outcome (allowed, denied, or ungated, when no `egress:` is
+configured) is recorded and readable at `GET /api/egress`; see
+[admin-api-reference.md](admin-api-reference.md).
 
 <!-- sbproxy-config-excerpt -->
 ```yaml
@@ -235,13 +239,15 @@ address space unless explicitly allowed.
             hosts: [api.example.com]
 ```
 
-**Still yours.** This egress control is scoped to OpenAPI-backed servers. A
-plain `type: mcp` federated server dials its configured `origin` directly:
-there is no deny-by-default allowlist and no private-address check on that
-path today, so keeping the origin honest is a network-design problem, not a
-config one. SBproxy also does not implement per-upstream certificate pinning.
-TLS validation is standard chain validation. If you need to pin a specific key
-for an upstream, that is not available here today.
+**Still yours.** `stdio` servers spawn a local process and are outside this
+control entirely; keeping the launched command honest is a supply-chain
+problem, not a config one. Without an `egress:` block at all (the legacy
+default, `mode: allow_by_default`), any server dials its origin unchecked,
+same as before this control existed; the sighting inventory still records the
+dial as `ungated` rather than staying silent about it. SBproxy also does not
+implement per-upstream certificate pinning. TLS validation is standard chain
+validation. If you need to pin a specific key for an upstream, that is not
+available here today.
 
 ## Weak authentication on the MCP endpoint itself
 

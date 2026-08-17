@@ -47,6 +47,23 @@ the next version cut.
   `resources/read` and `prompts/get` reach the same downgrade check for
   the federated peer they contact, alongside `tools/call`.
 
+- **The base MCP connect is gated and inventoried, and federated
+  servers get a registry approval status.** `federated_servers[].egress`
+  now applies to a plain `type: mcp` server's base connect
+  (`streamable_http` or `sse`), not just a `type: openapi` server's REST
+  calls; an unconfigured policy is stamped `ungated` rather than
+  silently allowed, and every dial's outcome shows up at
+  `GET /api/egress` under purpose `mcp_upstream`. A `type: openapi`
+  server's egress denial, previously silent, is now recorded there too.
+  `federated_servers[].status: draft | approved | deprecated` (absent
+  means `approved`, so existing configs are unaffected) stages a
+  Draft-to-Approved-to-Deprecated review lifecycle: `draft` hides a
+  server's tools from `tools/list` and refuses every call against them,
+  naming the status; `deprecated` keeps the server fully callable but
+  emits a warn-level `mcp_governance_decision` event on every call.
+  Optional `approved_by` / `approved_at` metadata is operator-attested
+  and stored, not verified.
+
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
   job) fails when an Apache-2.0-only dependency is missing a stanza,

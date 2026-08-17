@@ -993,10 +993,12 @@ may call the route.
 
 The inventory is process-lifetime and in-memory: it clears on restart and
 is capped at 1,024 tracked destinations, after which a new destination
-stops being tracked while every already-tracked one keeps updating. Today
-the AI-provider egress gate is the only writer; other egress purposes
-(token exchange, MCP auth, artifacts, webhooks) pass the same authorizer
-but are not yet inventoried here.
+stops being tracked while every already-tracked one keeps updating. The
+AI-provider egress gate and the MCP-upstream egress gate (WOR-2384: the
+base MCP connect for a plain `type: mcp` federated server, and the
+`type: openapi` REST-call gate's denials) both write to it today; other
+egress purposes (token exchange, MCP auth, artifacts, webhooks) pass the
+same authorizer but are not yet inventoried here.
 
 | Status | When |
 |---|---|

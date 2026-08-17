@@ -54,11 +54,13 @@ it.
 7. **Provider-endpoint egress is inventoried.** Every AI provider
    endpoint the gateway reaches is recorded with its authorization
    status (allowed, denied, or ungated) and last-seen time, and is
-   readable from the admin API. Other egress purposes (token exchange,
-   MCP auth, artifacts, webhooks) pass the same authorizer but are not
-   yet inventoried. Traffic that never crosses the gateway is invisible
-   to it; the deployment recipe for making the gateway the only path is
-   part of the control, not an afterthought.
+   readable from the admin API. The base MCP connect for a federated
+   `type: mcp` server, and `type: openapi` REST-call denials, are
+   inventoried the same way (WOR-2384). Other egress purposes (token
+   exchange, MCP auth token minting, artifacts, webhooks) pass the same
+   authorizer but are not yet inventoried. Traffic that never crosses
+   the gateway is invisible to it; the deployment recipe for making the
+   gateway the only path is part of the control, not an afterthought.
 8. **Change control is tamper-evident.** Security refusals and config
    changes append to hash-chained, signed files that verify offline;
    a chain that cannot open fails the boot; an append failure is a

@@ -2861,6 +2861,14 @@ pub(super) async fn handle_mcp_action(
                             if version_blocked.contains_key(&entry.name)
                                 || rollout_hidden.contains(&entry.name)
                                 || !mcp.is_tool_allowed(&entry.name)
+                                // WOR-2384 (MCP09): a `draft` server's
+                                // tools are neither advertised nor
+                                // callable until an operator approves
+                                // the server.
+                                || matches!(
+                                    mcp.server_status(&entry.server_name),
+                                    sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+                                )
                             {
                                 continue;
                             }
@@ -2974,6 +2982,15 @@ pub(super) async fn handle_mcp_action(
                             continue;
                         }
                         if !mcp.is_tool_allowed(&entry.name) {
+                            continue;
+                        }
+                        // WOR-2384 (MCP09): a `draft` server's tools
+                        // are neither advertised nor callable until an
+                        // operator approves the server.
+                        if matches!(
+                            mcp.server_status(&entry.server_name),
+                            sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+                        ) {
                             continue;
                         }
                         if let Some(policy) = mcp.policy_for_server(&entry.server_name) {
@@ -3568,6 +3585,14 @@ pub(super) async fn handle_mcp_action(
                                 INVALID_PARAMS,
                                 &format!("tool '{}' is blocked by tool_allowlist guardrail", name),
                             )
+                        } else if let Some(denial) = mcp_server_draft_denial(
+                            mcp,
+                            federated.as_ref(),
+                            &name,
+                            ctx.hostname.as_str(),
+                            request.id.clone(),
+                        ) {
+                            denial
                         } else {
                             // WOR-186 + WOR-1065 + WOR-1066: per-server
                             // RBAC + per-tool quota + timeout enforcement.
@@ -3707,6 +3732,61 @@ pub(super) async fn handle_mcp_action(
                                     )
                                 }
                             } else {
+                                // WOR-2384 (MCP09): a `deprecated`
+                                // server stays fully callable -- unlike
+                                // `draft`, existing integrations do not
+                                // break -- but every call must still
+                                // reach the governance evidence feed
+                                // with verdict "warn", so a slow
+                                // migration off a sunset server stays
+                                // visible without an outage. Runs
+                                // before the peer-downgrade check below
+                                // so a server that is both deprecated
+                                // and downgraded still gets both
+                                // signals recorded independently, each
+                                // under its own rule_id/reason.
+                                if matches!(
+                                    mcp.server_status(governed_server),
+                                    sbproxy_modules::action::mcp::McpServerApprovalStatus::Deprecated
+                                ) {
+                                    tracing::warn!(
+                                        target: "sbproxy::mcp::server_approval",
+                                        tool = %name,
+                                        server = %governed_server,
+                                        tenant = %ctx.tenant_id,
+                                        "MCP tools/call served by a deprecated federated server",
+                                    );
+                                    sbproxy_observe::metrics::record_policy(
+                                        ctx.hostname.as_str(),
+                                        "mcp_server_approval",
+                                        "warn",
+                                    );
+                                    if emit_mcp_governance_evidence(
+                                        ctx,
+                                        &name,
+                                        governed_server,
+                                        mcp_session_id.as_deref(),
+                                        is_modern,
+                                        None,
+                                        McpGovernanceVerdict::Warn(
+                                            sbproxy_modules::action::mcp::MCP_SERVER_DEPRECATED_REASON,
+                                        ),
+                                        Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
+                                    ) {
+                                        let response =
+                                            mcp_evidence_unavailable_response(request.id.clone());
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
                                 // WOR-2384 fix round 1: the peer-downgrade
                                 // check runs first inside this branch
                                 // (RBAC and quota already passed). A
@@ -4377,6 +4457,42 @@ fn mcp_lethal_trifecta_denial(
         &format!(
             "tool '{}' is blocked by lethal-trifecta session guardrail",
             tool_name
+        ),
+    ))
+}
+
+/// WOR-2384 (MCP09): a `draft` federated server's tools are neither
+/// advertised in `tools/list` (see the two filter loops above) nor
+/// callable. `None` when the tool did not resolve to any federated
+/// server (a separate, unrelated "unknown tool" outcome handled
+/// elsewhere) or when the resolved server's status is not `draft`.
+fn mcp_server_draft_denial(
+    mcp: &sbproxy_modules::action::McpAction,
+    federated: Option<&sbproxy_extension::mcp::FederatedTool>,
+    tool_name: &str,
+    hostname: &str,
+    request_id: Option<serde_json::Value>,
+) -> Option<sbproxy_extension::mcp::types::JsonRpcResponse> {
+    let server_name = federated?.server_name.as_str();
+    if !matches!(
+        mcp.server_status(server_name),
+        sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+    ) {
+        return None;
+    }
+    tracing::warn!(
+        target: "sbproxy::mcp::server_approval",
+        tool = %tool_name,
+        server = %server_name,
+        "MCP tools/call denied: federated server is not yet approved (status: draft)",
+    );
+    sbproxy_observe::metrics::record_policy(hostname, "mcp_server_approval", "deny");
+    Some(sbproxy_extension::mcp::types::JsonRpcResponse::error(
+        request_id,
+        sbproxy_extension::mcp::types::INVALID_PARAMS,
+        &format!(
+            "tool '{}' is served by federated server '{}', which has status 'draft' and is not yet approved for calls",
+            tool_name, server_name
         ),
     ))
 }
@@ -5408,8 +5524,11 @@ fn mcp_peer_downgrade_refusal_for_non_tool_call(
 ///   still pass `None` (nothing upstream of them names a rule id for
 ///   their denial), but the WOR-2384 peer-downgrade refusal sites do
 ///   pass one (`sbproxy_extension::mcp::peer_profile::PEER_DOWNGRADE_RULE_ID`
-///   or `PROTOCOL_PIN_MISMATCH_RULE_ID`), since those are exactly the
-///   kind of stable, SIEM-rule-friendly labels the field exists for.
+///   or `PROTOCOL_PIN_MISMATCH_RULE_ID`), and so does the WOR-2384
+///   `deprecated`-server warn site
+///   (`sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID`),
+///   since those are exactly the kind of stable, SIEM-rule-friendly
+///   labels the field exists for.
 /// - `verdict` (fix round 1, item 3) is `"allow"`, `"warn"`, or
 ///   `"deny"`; only `"deny"` stamps `error.type: "policy_denied"`, but
 ///   both `"warn"` and `"deny"` carry a reason. The reason is redacted
@@ -8041,6 +8160,96 @@ mod mcp_catalog_snapshot_tests {
         }
     }
 
+    /// WOR-2384 (MCP09): registry approval framing. `draft` hides a
+    /// server's tools from `tools/list` and refuses every call against
+    /// them, naming the status. `deprecated` stays fully visible and
+    /// callable -- its warn-level governance event is proven separately
+    /// (scenario 6 of
+    /// `wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios`,
+    /// below, since that is the one test in this module allowed to
+    /// install the process-wide event egress). Absent `status` must
+    /// behave exactly like it did before this field existed
+    /// (back-compat).
+    #[tokio::test]
+    async fn wor_2384_server_approval_status_gates_tools_list_and_tools_call() {
+        const TOOL_NAME: &str = "wor2384-approval-status-fixture";
+        const SERVER: &str = "approval-status-server";
+        let cases: [(Option<&str>, bool, Option<&str>); 3] = [
+            (None, true, None),
+            (Some("draft"), false, Some("draft")),
+            (Some("deprecated"), true, None),
+        ];
+
+        for (status, should_be_listed, should_be_refused_naming) in cases {
+            let mut federated_server = json!({
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": SERVER
+            });
+            if let Some(status) = status {
+                federated_server["status"] = json!(status);
+            }
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "approval-status-fixture", "version": "1.0.0"},
+                "federated_servers": [federated_server]
+            }))
+            .unwrap_or_else(|e| panic!("approval-status fixture (status {status:?}) compiles: {e}"));
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let list = mcp_handler_exchange(
+                &action,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            )
+            .await;
+            let listed = list["result"]["tools"]
+                .as_array()
+                .expect("tools/list result")
+                .iter()
+                .any(|tool| tool["name"] == TOOL_NAME);
+            assert_eq!(
+                listed, should_be_listed,
+                "status {status:?}: unexpected tools/list visibility"
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            match should_be_refused_naming {
+                Some(needle) => {
+                    let message = call["error"]["message"].as_str().unwrap_or_else(|| {
+                        panic!("status {status:?}: expected a tools/call refusal, got: {call:?}")
+                    });
+                    assert!(
+                        message.contains(needle),
+                        "status {status:?}: refusal must name the status, got: {message}"
+                    );
+                }
+                None => {
+                    // Not refused by the approval-status gate: the
+                    // fixture upstream is unreachable, so the call
+                    // still fails at real dispatch, but never with the
+                    // draft wording.
+                    let message = call["error"]["message"].as_str().unwrap_or_default();
+                    assert!(
+                        !message.contains("not yet approved"),
+                        "status {status:?}: must not be refused by the approval-status gate, got: {message}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios() {
         // WOR-2384 red-first, extended in fix round 1 (renamed from
@@ -8478,6 +8687,76 @@ mod mcp_catalog_snapshot_tests {
             assert_eq!(
                 event["data"]["sbproxy.decision.reason"], "peer_auth_posture_downgrade",
                 "{event:?}"
+            );
+        }
+
+        // --- Scenario 6 (WOR-2384, MCP09): a `deprecated` federated
+        // server stays fully callable -- unlike `draft`, proven
+        // separately in
+        // `wor_2384_server_approval_status_gates_tools_list_and_tools_call`
+        // -- but every call must still reach the governance evidence
+        // feed with verdict "warn", so a slow migration off a sunset
+        // server stays visible without an outage. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-deprecated-fixture";
+            const SERVER: &str = "deprecated-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "deprecated-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "status": "deprecated"
+                }]
+            }))
+            .expect("deprecated-server governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            // The fixture upstream is unreachable, so the call still
+            // fails at real dispatch -- the point of this scenario is
+            // that it is NOT refused by the approval-status gate
+            // itself, unlike a `draft` server's refusal.
+            assert!(
+                !call["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not yet approved"),
+                "a deprecated server must never be refused the way a draft one is: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "warn"
+            })
+            .await
+            .expect(
+                "a deprecated-server mcp_governance_decision warn event was not observed within 5s",
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "mcp_server_approval"
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"], "mcp_server_deprecated",
+                "{event:?}"
+            );
+            assert!(
+                event["data"].get("error.type").is_none(),
+                "a warn verdict must not stamp error.type: {event:?}"
             );
         }
     }
