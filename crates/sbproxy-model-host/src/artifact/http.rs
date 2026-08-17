@@ -759,9 +759,9 @@ mod tests {
             })
             .await
         {
-            Ok(_) => panic!(
-                "the fixed override, not the more permissive registry entry, must decide"
-            ),
+            Ok(_) => {
+                panic!("the fixed override, not the more permissive registry entry, must decide")
+            }
             Err(ArtifactError::Transport(msg)) => {
                 assert!(
                     msg.contains("egress denied"),
