@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-16*
 
+![AI gateway: Google Gemini direct](../../docs/assets/ai-gemini-direct.gif)
+
 Direct integration with the Google Gemini API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to Gemini's `:generateContent` shape on the way out and converts the response back to OpenAI shape on the way in. The translator hoists `system` role messages to `systemInstruction`, moves sampling knobs under `generationConfig`, rewrites `tools` to `functionDeclarations`, drops OpenAI-only fields, rewrites the path, then reassembles `choices[].message.content` from Gemini's content parts and renames usage fields. The result is that any OpenAI SDK works against `ai.local` without modification, and Gemini does the work.
 
 ## Run

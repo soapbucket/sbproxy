@@ -1,6 +1,6 @@
 # Connect Codex to a governed gateway
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-16*
 
 Codex CLI's config format makes it easy to point at any OpenAI-compatible endpoint. That is also exactly what a generic multi-provider proxy needs: no per-key budgets, no attribution, no guardrails on the prompt, nothing recording what got spent. This page connects Codex to SBproxy instead, so the same base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -32,7 +32,7 @@ OpenAI chat-completions (`POST /v1/chat/completions`). SBproxy's `ai_proxy` acti
 
 ## A governed gateway, not just a proxy
 
-The `sb.yml` below is the same shape as [use-case-own-openrouter.md](use-case-own-openrouter.md): one data-plane port, dynamic key management so keys are a runtime resource instead of lines in a file, and a budget plus a usage ledger. Save it and start the gateway before touching Codex.
+The `sb.yml` below is the same shape as [use-case-own-openrouter.md](use-case-own-openrouter.md) and its runnable [`examples/use-case-own-openrouter/`](../examples/use-case-own-openrouter/): one data-plane port, dynamic key management so keys are a runtime resource instead of lines in a file, and a budget plus a usage ledger. Save it and start the gateway before touching Codex.
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json

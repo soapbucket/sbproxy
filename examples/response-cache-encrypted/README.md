@@ -2,6 +2,8 @@
 
 *Last modified: 2026-07-23*
 
+![Encrypted file-backed response cache](../../docs/assets/response-cache-encrypted.gif)
+
 The response cache normally lives in the proxy's own memory, so it starts
 cold after every restart and no two replicas share it. This example points
 it at a directory instead, and seals what lands in that directory.

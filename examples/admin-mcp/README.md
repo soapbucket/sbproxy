@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-08*
 
+![Manage SBproxy over MCP](../../docs/assets/admin-mcp.gif)
+
 This example turns the gateway's own admin API into MCP tools, so an MCP client such as Claude Code or Cursor can check health, read config, and inspect spend by calling tools instead of shelling out to curl. One process serves both surfaces: the admin API on `127.0.0.1:9090`, and an `mcp` origin on the data plane whose `type: openapi` federated server points back at that admin port.
 
 The OpenAPI spec in `sb.yml` is a hand-declared, curated subset of the admin control plane (the document the admin server emits at `/api/openapi.json` describes the routes the gateway proxies, not the admin API itself). Each declared operation becomes one MCP tool, and each `tools/call` dispatches as a REST request to the admin port with the admin Basic credential attached from the server's static `headers:` entry. The MCP client never holds or sees the credential.

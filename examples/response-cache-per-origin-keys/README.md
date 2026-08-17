@@ -1,5 +1,7 @@
 # Per-tenant response-cache encryption keys
 
+![Per-tenant response-cache encryption keys](../../docs/assets/response-cache-per-origin-keys.gif)
+
 One response-cache store serves every origin in a process. By default one
 key seals every origin's entries too, which means the only thing keeping
 two tenants apart in the cache is the cache key. This example gives each

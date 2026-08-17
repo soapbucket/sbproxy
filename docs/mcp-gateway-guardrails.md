@@ -5,7 +5,11 @@ SBproxy's MCP gateway carries a small set of guardrail mechanisms for
 tool traffic: egress control, session risk accumulation, output
 quarantine, stdio supervision, run-as-user auth, and result
 compaction. They are implemented inside the sbproxy repository and are
-configured on the `mcp` action.
+configured on the `mcp` action. For fusing several such verdicts under
+one rule instead of stopping at the first hit, see
+[`examples/ai-guardrail-mesh/`](../examples/ai-guardrail-mesh/); for an
+out-of-process classifier guardrail on the same request path, see
+[`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/).
 
 ## Mechanisms
 
@@ -55,6 +59,11 @@ action:
 
 Without sessions, the guardrail still blocks a single tool that is
 classified as both private data and external communication.
+
+See [`examples/mcp-sessions/`](../examples/mcp-sessions/) for the session
+lifecycle this guardrail's risk accumulation reads from, and
+[`examples/mcp-rbac-quotas/`](../examples/mcp-rbac-quotas/) for per-tool
+RBAC and quotas enforced alongside it.
 
 ### Dual-LLM quarantine
 
@@ -134,6 +143,10 @@ action:
 
 Supported `upstream_auth.type` values: `service_credential`,
 `token_exchange`, and `per_user_credential`.
+
+See [`examples/mcp-oauth-discovery/`](../examples/mcp-oauth-discovery/) for
+the OAuth discovery surface (RFC 9728) a caller authenticates against
+before run-as-user auth mints its own upstream credential.
 
 ### Token compaction
 

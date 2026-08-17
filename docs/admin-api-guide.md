@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-08-03*
+*Last modified: 2026-08-16*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -8,7 +8,11 @@ operators reach for most. For the exhaustive per-route schema (every
 field, every status code), see [admin-api-reference.md](admin-api-reference.md).
 For the built-in dashboard that sits on top of this API, see
 [admin-ui.md](admin-ui.md). For enabling, TLS, and the security posture,
-see [admin.md](admin.md).
+see [admin.md](admin.md). For a runnable config that calls this API, see
+[`examples/admin-mcp/`](../examples/admin-mcp/); it wraps a curated subset
+of the admin routes as MCP tools, so the requests it makes are MCP
+`tools/call` dispatches rather than the curl calls below, but they hit
+the same admin server.
 
 ## Control plane, not data plane
 

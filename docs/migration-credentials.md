@@ -95,6 +95,9 @@ origins:
 
 The legacy `max_tokens_per_minute: 60000` has no equivalent and is dropped; if the key needs a token ceiling, use `attrs.budget.max_tokens`.
 
+See [`examples/ai-virtual-keys/`](../examples/ai-virtual-keys/) for a
+complete working config of the migrated `credentials:` shape.
+
 Behavior is identical at runtime: the compile-time lowering materializes the credentials of type `ai_provider` as entries in the legacy `VirtualKeyConfig` registry the AI dispatch already reads. Existing access-log columns (`project`, `user`, `metadata`) and per-credential attribution metrics keep populating from the unified `Principal` write.
 
 ## Multi-tenant scope
@@ -106,6 +109,9 @@ The new block lives at three scopes:
 * `origins[].credentials:` - origin-scoped credentials (the closest analog to today's `virtual_keys:`).
 
 Resolution at request time walks origin → tenant → proxy. A credential at origin with the same `name:` as one at tenant or proxy scope shadows the broader scope. This lets an operator declare a shared `proxy.credentials[].openai-shared` default and then re-declare `openai-shared` at a tenant scope to override the key + budget for that tenant only.
+
+See [`examples/multi-tenant-saas/`](../examples/multi-tenant-saas/) for a
+complete working config of tenant-scoped credentials.
 
 ## Field reference
 

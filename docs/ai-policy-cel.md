@@ -89,8 +89,11 @@ for the shared grammar and rejection rules.
 This vocabulary is engine-neutral: a multi-engine `ai_routing_policy`
 reads exactly these paths in Lua and JavaScript (as an `ai` global), in
 Rego (as `input.ai`), and in WebAssembly (as the `ai` field of the
-request envelope), kept identical by a parity test. Coming from OPA and
-want the Rego side first: see [opa-rego-policies.md](opa-rego-policies.md).
+request envelope), kept identical by a parity test. See
+[`examples/ai-routing-policy/`](../examples/ai-routing-policy/) for a
+complete working config that hands a routing decision to CEL this way.
+Coming from OPA and want the Rego side first: see
+[opa-rego-policies.md](opa-rego-policies.md).
 
 | Field | Type | Meaning |
 |---|---|---|

@@ -37,7 +37,7 @@ Type `sbproxy config import-litellm examples/migrate-litellm/config.yaml --out /
 Enter
 Sleep 3s
 
-Type `# Unmapped keys become warnings, never silent drops. Here is the result:`
+Type `# Unmapped keys become warnings, never silent drops:`
 Enter
 Type `head -n 16 /tmp/sb.yml`
 Enter
