@@ -468,8 +468,11 @@ its own reason and its own subset of fields:
 
 - **Tool invocations.** Every dispatched `tools/call`, plus every call refused
   before dispatch (RBAC, per-tool quota, an argument policy, a downgraded
-  peer, a `draft` server). Carries the decision, a salted digest of the
-  arguments, and, opt-in, the arguments themselves (below).
+  peer, a `draft` server, a session-flow guardrail violation). Every one of
+  these carries the decision and, opt-in, the arguments themselves (below);
+  only a *dispatched* call also carries a salted digest of the arguments
+  (`sbproxy.tool.arguments_hash`), since a call refused before dispatch was
+  never captured to hash in the first place.
 - **Tool definition changes.** The version-lockfile gate's per-refresh
   contract check, reason `tool_definition_changed`. See [A tool definition
   changing after you approved it](#a-tool-definition-changing-after-you-approved-it).
@@ -489,12 +492,21 @@ this event's actual field names.
 | Which tenant / caller | `tenant_id` (envelope), `sbproxy.tenant.id` | every record |
 | Which tool | `gen_ai.tool.name` | tool-invocation and definition-change records |
 | On which upstream server | `sbproxy.tool.server` | every record |
-| With what arguments | `sbproxy.tool.arguments_hash` (always, salted digest) / `gen_ai.tool.call.arguments` (opt-in, verbatim) | tool-invocation records |
+| With what arguments | `sbproxy.tool.arguments_hash` (dispatched calls only, salted digest) / `gen_ai.tool.call.arguments` (opt-in, verbatim, every tool-invocation record, dispatched or refused) | tool-invocation records |
 | What was decided, and why | `sbproxy.decision.verdict`, `sbproxy.decision.reason` | every record |
 | Under which rule | `sbproxy.decision.rule_id` | records where a named rule fired |
 | When, in order, without gaps | `sbproxy.evidence.seq`, `timestamp` (envelope) | every record |
 | What the tool contract was before/after | `sbproxy.tool.digest.old`, `sbproxy.tool.digest.new` | definition-change records |
 | What the registry status was before/after | `sbproxy.registry.status.old`, `sbproxy.registry.status.new` | registry-change records |
+
+The gapless property on `sbproxy.evidence.seq` is per tenant. Tool-invocation
+records carry the caller's own tenant, so gaps are detectable within one
+tenant's own traffic. Definition-change and registry-change records have no
+caller (they come from a background catalog refresh or a config reload, not a
+request) and share one sequence under the empty-tenant bucket; do not expect
+per-record-kind gaplessness across that shared bucket, only across each
+tenant's own tool-invocation stream and the shared background-event stream
+each on their own terms.
 
 "Who approved that access" splits in two. Which rule authorized a call is on
 the record (`sbproxy.decision.rule_id`, `sbproxy.decision.reason`). Who
@@ -506,11 +518,15 @@ can witness.
 
 ### Verbatim argument capture
 
-`sbproxy.tool.arguments_hash` ships on every tool-invocation record by
-default: enough to confirm two calls used the same arguments, or that a
+`sbproxy.tool.arguments_hash` ships by default on a *dispatched* call's
+record: enough to confirm two calls used the same arguments, or that a
 specific known-bad payload was replayed, without the arguments themselves
-ever leaving the process. That is deliberately not enough to answer "what
-were the arguments," and closing that gap is an explicit opt-in:
+ever leaving the process. A call refused before dispatch (RBAC, quota, an
+argument policy, a downgraded peer, a `draft` server, a session-flow
+guardrail violation) carries no hash either, by default, for the same
+reason it carries no upstream response: nothing was captured to hash. That
+is deliberately not enough to answer "what were the arguments" on any
+record, and closing that gap is an explicit opt-in:
 
 <!-- sbproxy-config-excerpt -->
 ```yaml
@@ -518,9 +534,10 @@ were the arguments," and closing that gap is an explicit opt-in:
         capture_arguments: true
 ```
 
-When set, the record also carries `gen_ai.tool.call.arguments`: the call's
-arguments, redacted (the same secret-pattern scrub `mcp_audit`'s own content
-fields already go through) and capped at 8 KiB, the same bound. Off by
+When set, every tool-invocation record, dispatched or refused, also carries
+`gen_ai.tool.call.arguments`: the call's arguments, redacted (the same
+secret-pattern scrub `mcp_audit`'s own content fields already go through)
+and capped at 8 KiB, the same bound. Off by
 default, because shipping raw tool-call arguments to every configured
 `events:` sink is a real tradeoff, not a free one: the redaction pass
 recognizes credential shapes, not your customers' PII or business-sensitive

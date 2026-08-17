@@ -3678,6 +3678,26 @@ pub(super) async fn handle_mcp_action(
                                 })
                         };
 
+                        // WOR-2392 fix round 1: computed once, before
+                        // every pre-dispatch denial/warn branch below
+                        // (draft, RBAC, argument policy, quota,
+                        // deprecated-server, peer-downgrade, flow) so
+                        // `mcp_audit.capture_arguments` applies
+                        // uniformly regardless of which branch fires.
+                        // Previously only a call that reached dispatch
+                        // (the post-dispatch funnel below) captured
+                        // verbatim arguments, which inverted the
+                        // feature's value: a denial is exactly the
+                        // moment an auditor most wants to see what was
+                        // attempted. `arguments` here is the same value
+                        // every pre-dispatch check below reads (RBAC,
+                        // argument_policies, modern schema validation),
+                        // captured before any of them can consume it.
+                        let governance_tool_arguments = governance_tool_arguments_field(
+                            mcp.mcp_audit_capture_arguments,
+                            &arguments,
+                        );
+
                         // WOR-1635: version-gate check first; a
                         // blocked tool is invisible in tools/list and
                         // must fail calls with the violation detail.
@@ -3716,6 +3736,7 @@ pub(super) async fn handle_mcp_action(
                             mcp_session_id.as_deref(),
                             is_modern,
                             request.id.clone(),
+                            governance_tool_arguments.as_deref(),
                         ) {
                             denial
                         } else {
@@ -3830,7 +3851,7 @@ pub(super) async fn handle_mcp_action(
                                     None,
                                     McpGovernanceVerdict::Deny("rbac_denied"),
                                     None,
-                                    None,
+                                    governance_tool_arguments.as_deref(),
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
                                 } else {
@@ -3885,7 +3906,7 @@ pub(super) async fn handle_mcp_action(
                                         sbproxy_modules::action::mcp::MCP_ARGUMENT_POLICY_REASON,
                                     ),
                                     Some(rule_name.as_str()),
-                                    None,
+                                    governance_tool_arguments.as_deref(),
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
                                 } else {
@@ -3924,7 +3945,7 @@ pub(super) async fn handle_mcp_action(
                                     None,
                                     McpGovernanceVerdict::Deny("quota_exceeded"),
                                     None,
-                                    None,
+                                    governance_tool_arguments.as_deref(),
                                 ) {
                                     mcp_evidence_unavailable_response(request.id.clone())
                                 } else {
@@ -3986,7 +4007,7 @@ pub(super) async fn handle_mcp_action(
                                             sbproxy_modules::action::mcp::MCP_ARGUMENT_POLICY_REASON,
                                         ),
                                         Some(rule_name.as_str()),
-                                        None,
+                                        governance_tool_arguments.as_deref(),
                                     ) {
                                         let response =
                                             mcp_evidence_unavailable_response(request.id.clone());
@@ -4042,7 +4063,7 @@ pub(super) async fn handle_mcp_action(
                                             sbproxy_modules::action::mcp::MCP_SERVER_DEPRECATED_REASON,
                                         ),
                                         Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
-                                        None,
+                                        governance_tool_arguments.as_deref(),
                                     ) {
                                         let response =
                                             mcp_evidence_unavailable_response(request.id.clone());
@@ -4103,7 +4124,7 @@ pub(super) async fn handle_mcp_action(
                                             None,
                                             McpGovernanceVerdict::Warn(reason_code),
                                             Some(rule_id),
-                                            None,
+                                            governance_tool_arguments.as_deref(),
                                         ) {
                                             let response = mcp_evidence_unavailable_response(
                                                 request.id.clone(),
@@ -4157,7 +4178,7 @@ pub(super) async fn handle_mcp_action(
                                             None,
                                             McpGovernanceVerdict::Deny(reason_code),
                                             Some(rule_id),
-                                            None,
+                                            governance_tool_arguments.as_deref(),
                                         ) {
                                             mcp_evidence_unavailable_response(request.id.clone())
                                         } else {
@@ -4218,7 +4239,7 @@ pub(super) async fn handle_mcp_action(
                                             None,
                                             McpGovernanceVerdict::Warn(rule_id),
                                             Some(rule_id),
-                                            None,
+                                            governance_tool_arguments.as_deref(),
                                         ) {
                                             let response = mcp_evidence_unavailable_response(
                                                 request.id.clone(),
@@ -4259,7 +4280,7 @@ pub(super) async fn handle_mcp_action(
                                             None,
                                             McpGovernanceVerdict::Deny(rule_id),
                                             Some(rule_id),
-                                            None,
+                                            governance_tool_arguments.as_deref(),
                                         ) {
                                             mcp_evidence_unavailable_response(request.id.clone())
                                         } else {
@@ -4344,19 +4365,19 @@ pub(super) async fn handle_mcp_action(
                                     None
                                 };
 
-                                // WOR-2392: `mcp_audit.capture_arguments`
-                                // opts into verbatim tool-call arguments
-                                // on the `mcp_governance_decision` event,
-                                // independent of whether anything
-                                // subscribes to the `mcp_audit` tracing
-                                // target above -- the governance event's
-                                // `events:` sink is a separate delivery
-                                // path with its own enablement.
-                                let governance_tool_arguments = governance_tool_arguments_field(
-                                    mcp.mcp_audit_capture_arguments,
-                                    &arguments,
-                                );
-
+                                // WOR-2392 fix round 1: `governance_tool_arguments`
+                                // is computed once, before the whole
+                                // pre-dispatch chain above (see that
+                                // comment), and reused here rather than
+                                // recomputed -- both because `arguments`
+                                // by this point may have been rewritten
+                                // by rollout adaptation earlier (the
+                                // pre-dispatch computation runs after
+                                // that, so it already reflects it) and
+                                // because every pre-dispatch denial/warn
+                                // branch above needs the identical
+                                // value, not nine independently-redacted
+                                // copies of the same JSON.
                                 let run_as_user = federated
                                     .as_ref()
                                     .map(|t| mcp.run_as_user_for_server(&t.server_name))
@@ -4996,6 +5017,14 @@ fn mcp_lethal_trifecta_denial(
 /// itself fails under `events.fail_closed`, the caller gets
 /// [`mcp_evidence_unavailable_response`] instead of the plain draft
 /// denial.
+///
+/// WOR-2392 fix round 1: `tool_arguments_verbatim` is the caller's
+/// already-computed `governance_tool_arguments_field` result (the same
+/// value every other pre-dispatch denial/warn site in
+/// [`handle_mcp_action`] reuses), threaded through rather than
+/// recomputed here -- this denial is exactly the moment
+/// `mcp_audit.capture_arguments` exists for: the call never dispatched,
+/// so the post-dispatch funnel's own capture never ran.
 #[allow(clippy::too_many_arguments)]
 fn mcp_server_draft_denial(
     ctx: &RequestContext,
@@ -5005,6 +5034,7 @@ fn mcp_server_draft_denial(
     mcp_session_id: Option<&str>,
     is_modern: bool,
     request_id: Option<serde_json::Value>,
+    tool_arguments_verbatim: Option<&str>,
 ) -> Option<sbproxy_extension::mcp::types::JsonRpcResponse> {
     let server_name = federated?.server_name.as_str();
     if !matches!(
@@ -5034,7 +5064,7 @@ fn mcp_server_draft_denial(
             None,
             McpGovernanceVerdict::Deny(sbproxy_modules::action::mcp::MCP_SERVER_DRAFT_REASON),
             Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
-            None,
+            tool_arguments_verbatim,
         ) {
             mcp_evidence_unavailable_response(request_id)
         } else {

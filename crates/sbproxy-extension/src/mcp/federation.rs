@@ -4128,21 +4128,34 @@ fn modern_serialized_tool_entry(tool: &FederatedTool) -> Option<SerializedToolEn
 /// (a different crate; not importable from here) already follow.
 pub const TOOL_VERSIONING_VIOLATION_RULE_ID: &str = "mcp_tool_versioning";
 
-/// Truncate a `contract_digest` string (e.g. `mcp-contract-v2-sha256:ab12..`)
-/// to a short, stable prefix for a governance-evidence field.
+/// Truncate a `contract_digest` string (e.g. `sha256:ab12..` or
+/// `mcp-contract-v2-sha256:ab12..`) to a short, stable prefix for a
+/// governance-evidence field.
 ///
 /// The digest is not secret -- it is a structural fingerprint of a tool
 /// contract, not the contract itself -- so no redaction or salting
 /// applies here, unlike `mcp_audit`'s content-field hashing. Truncation
-/// exists only to keep the event payload small; enough characters
-/// survive (including any `scheme:` prefix) to correlate against the
-/// lockfile or a wider audit-target log line by eye.
+/// exists only to keep the event payload small.
+///
+/// WOR-2392 fix round 1: a flat leading-N-chars truncation used to slice
+/// through the `scheme:` prefix itself before reaching any hash
+/// material. `mcp-contract-v2-sha256:` alone is 23 characters, so a
+/// flat 24-char prefix kept exactly one hex digit of the actual digest
+/// -- correlating two v2-scheme events against each other, or against
+/// the lockfile, was close to impossible. This keeps the *whole*
+/// scheme prefix (so the reader can still tell which digest scheme
+/// produced it) plus `HEX_PREFIX_LEN` characters of the hash material
+/// that follows the scheme's `:`, so both the short legacy `sha256:`
+/// scheme and the long `mcp-contract-v2-sha256:` one keep the same
+/// amount of real correlation entropy. A digest with no `:` (a future
+/// scheme this build does not recognize the shape of) falls back to a
+/// flat prefix of the whole string.
 fn digest_field_prefix(digest: &str) -> String {
-    const PREFIX_LEN: usize = 24;
-    match digest.char_indices().nth(PREFIX_LEN) {
-        Some((byte_idx, _)) => digest[..byte_idx].to_string(),
-        None => digest.to_string(),
-    }
+    const HEX_PREFIX_LEN: usize = 16;
+    let scheme_end = digest.find(':').map(|i| i + 1).unwrap_or(0);
+    let (scheme, hash_material) = digest.split_at(scheme_end);
+    let hash_prefix: String = hash_material.chars().take(HEX_PREFIX_LEN).collect();
+    format!("{scheme}{hash_prefix}")
 }
 
 /// WOR-2392: emit one `mcp_governance_decision` evidence event when
@@ -6893,11 +6906,14 @@ mod tests {
 
         // --- Scenario 1: Block mode -> verdict deny, error.type set,
         // and the tool is also blocked (the pre-existing behavior this
-        // event must never disagree with). ---
+        // event must never disagree with). Uses the v2 digest scheme
+        // deliberately (WOR-2392 fix round 1): `mcp-contract-v2-sha256:`
+        // alone is 23 characters, so this is the scheme a flat
+        // leading-N-chars truncation bug would have all but erased. ---
         {
-            let path = write_lockfile("wor2392-block", &gate_lockfile("original description"));
+            let path = write_lockfile("wor2392-block", &output_schema_lockfile("old", true));
             let fed = gated_federation(path.clone(), VersioningMode::Block, None);
-            fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+            fed.evaluate_tool_versioning(&output_schema_tool("new"))
                 .await;
             assert!(
                 fed.version_blocked().contains_key("search"),
@@ -6932,12 +6948,30 @@ mod tests {
                 "a definition change must carry two different digests"
             );
             assert!(
-                !old_digest.contains("description")
-                    && !new_digest.contains("description")
-                    && !old_digest.contains("meaning")
-                    && !new_digest.contains("meaning"),
+                !old_digest.contains("public repositories")
+                    && !new_digest.contains("public repositories"),
                 "digest fields must never carry contract text: old={old_digest} new={new_digest}"
             );
+            // The bug this guards: a flat 24-char prefix left exactly
+            // one hex digit of real hash material after the 23-char v2
+            // scheme name, making every v2 digest field correlate to
+            // nothing. Both fields must carry the whole scheme name
+            // *and* real hash material beyond it.
+            const V2_SCHEME: &str = "mcp-contract-v2-sha256:";
+            for (label, digest) in [("old", old_digest), ("new", new_digest)] {
+                assert!(
+                    digest.starts_with(V2_SCHEME),
+                    "{label} digest must keep the full v2 scheme prefix: {digest}"
+                );
+                let hash_part = &digest[V2_SCHEME.len()..];
+                assert!(
+                    hash_part.len() >= 12,
+                    "{label} digest must keep real hash material after the v2 scheme \
+                     prefix, not just the scheme name: {digest:?} (hash part {hash_part:?}, \
+                     {} chars)",
+                    hash_part.len()
+                );
+            }
             let _ = std::fs::remove_file(path);
         }
 
@@ -6970,6 +7004,49 @@ mod tests {
             );
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// WOR-2392 fix round 1: a flat leading-N-chars truncation used to
+    /// slice through the entire `mcp-contract-v2-sha256:` scheme name
+    /// (23 characters) and leave exactly one hex digit of real hash
+    /// material at a 24-char prefix length -- correlating two v2-scheme
+    /// digests, or one against the lockfile, was close to impossible.
+    /// Both the short legacy `sha256:` scheme and the long v2 scheme
+    /// must keep the *whole* scheme name plus a real run of hash
+    /// characters after it.
+    #[test]
+    fn digest_field_prefix_keeps_real_hash_material_under_both_schemes() {
+        let v1 = "sha256:abcdef0123456789fedcba9876543210";
+        let v1_prefix = digest_field_prefix(v1);
+        assert!(
+            v1_prefix.starts_with("sha256:"),
+            "must keep the legacy scheme prefix: {v1_prefix}"
+        );
+        assert_eq!(
+            &v1_prefix["sha256:".len()..],
+            "abcdef0123456789",
+            "must keep 16 hex chars of real hash material: {v1_prefix}"
+        );
+
+        let v2 = "mcp-contract-v2-sha256:abcdef0123456789fedcba9876543210";
+        let v2_prefix = digest_field_prefix(v2);
+        assert!(
+            v2_prefix.starts_with("mcp-contract-v2-sha256:"),
+            "must keep the full v2 scheme prefix: {v2_prefix}"
+        );
+        let v2_hash_part = &v2_prefix["mcp-contract-v2-sha256:".len()..];
+        assert_eq!(
+            v2_hash_part, "abcdef0123456789",
+            "the v2 scheme must keep the same 16 hex chars of real hash material as the \
+             legacy scheme does, not the one leftover digit a flat 24-char prefix left: \
+             {v2_prefix}"
+        );
+
+        // A scheme this build does not recognize the shape of (no `:`)
+        // falls back to a flat prefix of the whole string rather than
+        // panicking.
+        let unscoped = "deadbeefcafef00d1234567890abcdef";
+        assert_eq!(digest_field_prefix(unscoped), "deadbeefcafef00d");
     }
 
     #[tokio::test]
