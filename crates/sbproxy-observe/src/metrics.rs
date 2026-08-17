@@ -5904,7 +5904,10 @@ mod tests {
     }
 
     fn output_or_metric_has_transition(origin: &str) -> bool {
-        for family in prometheus::gather() {
+        // `metrics().registry` is the canonical scrape registry that owns
+        // `sbproxy_circuit_breaker_transitions_total`; the process-global
+        // `prometheus::gather()` never sees it (see `ProxyMetrics::new`).
+        for family in metrics().registry.gather() {
             if family.name() != "sbproxy_circuit_breaker_transitions_total" {
                 continue;
             }
