@@ -2814,10 +2814,11 @@ impl McpFederation {
         let url = Url::parse(&format!("{base}{path}"))
             .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
         // Deny unlisted hosts before any I/O (WOR-1791 / G2).
-        let mut dest = match backing
-            .egress_policy
-            .authorize(EgressPurpose::OpenApiTool, url.as_str(), resolver)
-        {
+        let mut dest = match backing.egress_policy.authorize(
+            EgressPurpose::OpenApiTool,
+            url.as_str(),
+            resolver,
+        ) {
             Ok(dest) => dest,
             Err(e) => {
                 // WOR-2384 (MCP09): this denial used to be silent --
@@ -3072,10 +3073,11 @@ impl McpFederation {
             );
             return Ok(());
         }
-        match server
-            .egress_policy
-            .authorize(EgressPurpose::McpUpstream, &server.url, &SystemHostResolver)
-        {
+        match server.egress_policy.authorize(
+            EgressPurpose::McpUpstream,
+            &server.url,
+            &SystemHostResolver,
+        ) {
             Ok(_) => {
                 record_egress_seen(
                     EgressPurpose::McpUpstream,
@@ -7543,9 +7545,7 @@ mod tests {
         let sighting = snapshot
             .iter()
             .find(|s| s.purpose == "openapi_tool" && s.host == "api.example.com" && s.port == 443)
-            .expect(
-                "a denied openapi_tool dial must be recorded in the egress inventory snapshot",
-            );
+            .expect("a denied openapi_tool dial must be recorded in the egress inventory snapshot");
         assert_eq!(sighting.status, "denied");
         assert_eq!(sighting.last_reason, Some("unlisted_host"));
     }

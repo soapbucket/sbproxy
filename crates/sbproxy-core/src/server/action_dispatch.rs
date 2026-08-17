@@ -8194,7 +8194,9 @@ mod mcp_catalog_snapshot_tests {
                 "server_info": {"name": "approval-status-fixture", "version": "1.0.0"},
                 "federated_servers": [federated_server]
             }))
-            .unwrap_or_else(|e| panic!("approval-status fixture (status {status:?}) compiles: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("approval-status fixture (status {status:?}) compiles: {e}")
+            });
             action.federation.seed_tools_for_test(
                 HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
                 None,
