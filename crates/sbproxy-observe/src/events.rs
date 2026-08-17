@@ -213,6 +213,9 @@ pub enum EventType {
     GuardrailTriggered,
     /// Event name `config_reloaded`. The proxy configuration was reloaded.
     ConfigReloaded,
+    /// Event name `egress_refused`. An outbound dial was refused by
+    /// purpose-scoped egress authorization (WOR-2486).
+    EgressRefused,
 }
 
 impl ProxyEvent {
@@ -252,10 +255,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a twelfth event type that no `events:` sink can
-/// ever be told to deliver, which looks exactly like a working sink to
-/// everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 11] = [
+/// mode this prevents is a thirteenth event type that no `events:` sink
+/// can ever be told to deliver, which looks exactly like a working sink
+/// to everyone except the operator waiting for the event.
+pub const ALL_EVENT_TYPES: [EventType; 12] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -267,6 +270,7 @@ pub const ALL_EVENT_TYPES: [EventType; 11] = [
     EventType::BudgetExceeded,
     EventType::GuardrailTriggered,
     EventType::ConfigReloaded,
+    EventType::EgressRefused,
 ];
 
 impl EventType {
@@ -290,6 +294,7 @@ impl EventType {
             Self::BudgetExceeded => "budget_exceeded",
             Self::GuardrailTriggered => "guardrail_triggered",
             Self::ConfigReloaded => "config_reloaded",
+            Self::EgressRefused => "egress_refused",
         }
     }
 
@@ -317,7 +322,43 @@ impl EventType {
             Self::BudgetExceeded => 8,
             Self::GuardrailTriggered => 9,
             Self::ConfigReloaded => 10,
+            Self::EgressRefused => 11,
         }
+    }
+
+    /// Whether this event type has a production call site that
+    /// publishes it today (WOR-2486, mirroring
+    /// [`crate::decision::DecisionEvent::has_emitter`]).
+    ///
+    /// `events.types:` accepts every declared variant, including one
+    /// with no emitter yet: refusing an unwired name would block
+    /// pre-configuring a type a later release wires, and would fail a
+    /// correct config over a gap in this crate's own instrumentation.
+    /// That leaves the same hole `has_emitter` closes for decision
+    /// events: silence from a configured sink reads exactly like a sink
+    /// with nothing to report. Boot reads this to warn instead.
+    ///
+    /// **Hand-maintained, and it will drift if you let it.** Wiring a
+    /// new emitter means flipping its arm here in the same change.
+    pub const fn has_emitter(self) -> bool {
+        matches!(
+            self,
+            Self::RequestStarted
+                | Self::RequestCompleted
+                | Self::RequestError
+                | Self::AuthDenied
+                | Self::PolicyDenied
+                | Self::ProviderSelected
+                | Self::BudgetExceeded
+                | Self::GuardrailTriggered
+                | Self::ConfigReloaded
+                | Self::EgressRefused
+        )
+        // `CacheHit` and `CacheMiss` are deliberately absent: wiring
+        // them per-request would put an NDJSON line on every configured
+        // webhook sink per cache lookup (WOR-2486 sweep). Their
+        // forensic value already lives on `DecisionEvent::CacheAdmit` /
+        // `CacheKey` and the access log's `cache_status` column.
     }
 }
 
@@ -469,6 +510,7 @@ mod tests {
             (EventType::BudgetExceeded, "\"budget_exceeded\""),
             (EventType::GuardrailTriggered, "\"guardrail_triggered\""),
             (EventType::ConfigReloaded, "\"config_reloaded\""),
+            (EventType::EgressRefused, "\"egress_refused\""),
         ];
 
         for (variant, expected) in variants {
@@ -515,6 +557,23 @@ mod tests {
                  route it to another type's bit"
             );
         }
+    }
+
+    #[test]
+    fn cache_hit_and_cache_miss_are_the_only_events_with_no_emitter() {
+        // WOR-2486: the boot warning in
+        // `sbproxy_core::server::lifecycle::warn_unwired_proxy_events`
+        // trusts this to name every dead type. Both this test and the
+        // ruling it pins are read together: cache_hit/cache_miss stay
+        // dead on purpose (cardinality), and everything else declared
+        // on the enum must have shipped a real emitter by the time it
+        // is added to `ALL_EVENT_TYPES`.
+        let unwired: Vec<&str> = ALL_EVENT_TYPES
+            .into_iter()
+            .filter(|event_type| !event_type.has_emitter())
+            .map(|event_type| event_type.as_str())
+            .collect();
+        assert_eq!(unwired, vec!["cache_hit", "cache_miss"]);
     }
 
     #[test]

@@ -80,7 +80,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub request_events: Option<RequestEventsConfig>,
     /// Where typed proxy events go. Absent, or present with the default
-    /// `sink: none`, means the eleven event types stay in-process and
+    /// `sink: none`, means the twelve event types stay in-process and
     /// nothing leaves the proxy.
     #[serde(default)]
     pub events: Option<EventsConfig>,
@@ -537,7 +537,7 @@ pub struct EventsConfig {
     /// any host that can reach the endpoint can forge.
     #[serde(default)]
     pub signing_secret: Option<String>,
-    /// Which of the eleven event types to deliver. Empty or absent means
+    /// Which of the twelve event types to deliver. Empty or absent means
     /// all of them.
     ///
     /// Names are the snake_case wire names (`policy_denied`,

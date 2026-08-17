@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Egress for the eleven [`crate::events::EventType`] variants: the
+//! Egress for the twelve [`crate::events::EventType`] variants: the
 //! `events:` block's file and webhook sinks.
 //!
 //! # The defect this closes
@@ -104,9 +104,9 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// request path, once per candidate event, before anything is allocated:
 /// it has to be cheaper than the event it is deciding not to build.
 ///
-/// `u16` holds the eleven bits [`ALL_EVENT_TYPES`] declares with room to
-/// spare. A twelfth variant is caught by that array's fixed length long
-/// before it reaches the width of this word.
+/// `u16` holds the twelve bits [`ALL_EVENT_TYPES`] declares with room to
+/// spare. A thirteenth variant is caught by that array's fixed length
+/// long before it reaches the width of this word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventTypeMask(u16);
 

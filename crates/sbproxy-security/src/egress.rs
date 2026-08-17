@@ -652,6 +652,33 @@ pub fn record_egress_refused(
         origin = origin,
         "outbound dial refused by egress authorization"
     );
+    if let Some(hook) = EGRESS_REFUSED_HOOK.get() {
+        hook(purpose, reason, tenant, origin);
+    }
+}
+
+/// A bridge a higher layer installs so a refusal also reaches a typed
+/// event feed (WOR-2486).
+///
+/// `sbproxy-security` is a leaf crate deliberately kept off
+/// `sbproxy-observe` (see the dependency note on this module's
+/// `Cargo.toml`: `sbproxy-observe` depends on `sbproxy-security`, not
+/// the other way, or the workspace would not build). A function pointer
+/// installed once at boot is the whole bridge: this crate never learns
+/// what `sbproxy_observe::EventType::EgressRefused` is, only that
+/// something wants to know when [`record_egress_refused`] fires.
+pub type EgressRefusedHook = fn(purpose: EgressPurpose, reason: EgressDenied, tenant: &str, origin: &str);
+
+static EGRESS_REFUSED_HOOK: std::sync::OnceLock<EgressRefusedHook> = std::sync::OnceLock::new();
+
+/// Install the bridge. Startup-only and set-once, like the process-wide
+/// event egress it typically feeds: returns `Err` if one is already
+/// registered, so a second boot path finds out rather than silently
+/// replacing the first.
+pub fn install_egress_refused_hook(hook: EgressRefusedHook) -> Result<(), &'static str> {
+    EGRESS_REFUSED_HOOK
+        .set(hook)
+        .map_err(|_| "egress refused hook already registered")
 }
 
 /// Outcome recorded for one observed egress destination.
@@ -964,6 +991,55 @@ mod tests {
         let mut purposes = HashMap::new();
         purposes.insert(EgressPurpose::AiProvider, allow);
         EgressConfig { purposes }
+    }
+
+    /// WOR-2486: `record_egress_refused` bridges to a typed event feed
+    /// through a boot-installed hook, because `sbproxy-security` cannot
+    /// depend on `sbproxy-observe` (see the doc on
+    /// `install_egress_refused_hook`). This is the only test in the
+    /// crate that installs the hook: it is set-once, like the process
+    /// egress it typically feeds.
+    #[test]
+    fn record_egress_refused_calls_the_installed_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SEEN: std::sync::Mutex<Vec<(&'static str, &'static str, String, String)>> =
+            std::sync::Mutex::new(Vec::new());
+
+        fn hook(purpose: EgressPurpose, reason: EgressDenied, tenant: &str, origin: &str) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            SEEN.lock().expect("test lock").push((
+                purpose.as_label(),
+                reason.as_label(),
+                tenant.to_owned(),
+                origin.to_owned(),
+            ));
+        }
+
+        let _ = install_egress_refused_hook(hook);
+
+        record_egress_refused(
+            EgressPurpose::TokenExchange,
+            EgressDenied::UnlistedHost,
+            "acme",
+            "mcp-upstream",
+        );
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "the hook must fire exactly once per refusal"
+        );
+        let seen = SEEN.lock().expect("test lock");
+        assert_eq!(
+            seen.last(),
+            Some(&(
+                "token_exchange",
+                "unlisted_host",
+                "acme".to_string(),
+                "mcp-upstream".to_string()
+            ))
+        );
     }
 
     #[test]
