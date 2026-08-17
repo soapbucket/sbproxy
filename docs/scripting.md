@@ -699,16 +699,10 @@ PASS examples/rego-modifier-parity/policy_test.yaml :: strong trust tier is allo
 PASS examples/rego-modifier-parity/policy_test.yaml :: public GET is allowed regardless of trust tier
 PASS examples/rego-modifier-parity/policy_test.yaml :: private path with no strong trust tier is denied
 PASS examples/rego-modifier-parity/policy_test.yaml :: POST to a public path is denied
-coverage: policy.rego 3/3 lines (100.0%)
+coverage: policy.rego 4/4 lines (100.0%)
 4 passed, 0 failed, 0 errored, 100.0% total coverage
 ```
 
-<!-- Hand-traced against the CLI's own formatting code, not replayed
-     against a built binary. Run `python3 scripts/check-doc-captures.py
-     --update` (with a built `sbproxy` on the binary path) before
-     merge; the coverage line's `3/3` in particular depends on whether
-     Regorus counts a `default allow := false` line as coverable,
-     which this pass could not confirm without compiling. -->
 
 Exit code `0`. A failing case exits `1` and names what it expected (`FAIL <fixture> :: <case>: expected <value>, got <value>`); `--min-coverage <PCT>` also exits `1` when aggregate coverage across every fixture in the run falls short. A fixture that is itself broken (unreadable, malformed YAML, a `module`/`module_path` conflict, no `cases`, a non-positive `budget_ms`) is recorded against that fixture and exits `2`, without discarding the results of every other fixture in the same run. `--format json` emits one structured object (`schema_version`, `cases`, `coverage`, `errors`, ...) instead of the text lines above, for a CI step that parses the result rather than scrapes it.
 
