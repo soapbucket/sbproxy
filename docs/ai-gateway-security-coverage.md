@@ -161,7 +161,14 @@ engine artifact downloads, extension bundle hooks, and the OTLP telemetry
 exporters), is recorded with its authorization status and last-seen time,
 readable from the admin API.
 
-Config: the top-level `egress:` block, `mode: deny_by_default` per purpose.
+Config: the top-level `egress:` block arms six of the ten through five
+sub-blocks (`ai_providers`, `usage_sinks` covers both usage sinks and
+webhooks, `model_artifacts`, `token_exchange` for the non-MCP resolver,
+`telemetry`), each `mode: deny_by_default`. OpenAPI-backed MCP tools and
+the dual-LLM quarantine judge arm from a per-server or per-action
+`egress:` block instead. Extension bundle hooks are always armed
+automatically from the bundle's own outbound grant. Engine artifact
+downloads pass no authorizer today and cannot be armed by any config.
 Signal: `GET /api/egress`,
 `sbproxy_egress_refused_total{purpose,reason,tenant,origin}`. Proof:
 `crates/sbproxy-security/src/egress.rs::egress_seen_records_a_single_sighting_with_counts`,
@@ -358,8 +365,10 @@ outbound destination it should not: a compromised registry, a redirected
 webhook, a rebound DNS answer.
 
 **What sbproxy enforces.** A default-deny, DNS-pinned egress authorizer
-covers ten wired purposes (see [control 7](#7-egress-is-inventoried)
-above). Every redirect hop is re-authorized as a new destination, capped at
+covers ten wired purposes once armed (see [control 7](#7-egress-is-inventoried)
+above for which config surface arms which purpose; engine artifact
+downloads cannot be armed today and stay ungated). Every redirect hop is
+re-authorized as a new destination, capped at
 ten hops, with credentials stripped on any cross-origin hop, including
 vendor header names such as `x-api-key` that an HTTP client's own
 stripping does not cover. OTLP telemetry exporters are authorized once at

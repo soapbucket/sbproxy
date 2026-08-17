@@ -1000,13 +1000,26 @@ model and engine artifact downloads, extension bundle hooks, and the
 OTLP telemetry exporters. `mcp_upstream` is a reserved purpose label
 with no production call site yet, so it never appears.
 
-Until an operator configures the top-level `egress:` section (WOR-2476,
-WOR-2481), every purpose above is `ungated`: it appears in this
-inventory, but nothing was ever denied because nothing was armed. See
-[Egress allowlists](configuration.md#egress-allowlists) for the
-`ai_providers` / `usage_sinks` / `model_artifacts` / `token_exchange` /
-`telemetry` sub-blocks that turn a purpose's sightings into `allowed` or
-`denied`.
+The top-level `egress:` section (see
+[Egress allowlists](configuration.md#egress-allowlists)) arms six of
+the purposes above through five sub-blocks: `ai_providers` (AI
+providers), `usage_sinks` (usage sinks and webhooks, one allowlist for
+both), `model_artifacts`, `token_exchange` (the non-MCP token-exchange
+resolver only), and `telemetry`. Until a sub-block sets
+`mode: deny_by_default`, its purpose stays `ungated`: reached, but
+nothing was ever denied because nothing was armed.
+
+Three more purposes arm outside that section, per-tool or per-action:
+OpenAPI-backed MCP tools and the MCP token-exchange path each take a
+per-server `egress:` block (see [mcp-security.md](mcp-security.md));
+the dual-LLM quarantine judge takes a per-action `egress:` block.
+Extension bundle hooks are armed automatically from the bundle's own
+outbound grant and never appear as `ungated`.
+
+Two purposes cannot be armed by any config today: engine-artifact
+downloads pass no authorizer, and `mcp_upstream` has no production dial
+to attach one to. Both stay `ungated`, or in `mcp_upstream`'s case
+absent from the inventory entirely, regardless of configuration.
 
 | Status | When |
 |---|---|

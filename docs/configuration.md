@@ -284,7 +284,7 @@ agent_classes:
 ### Egress allowlists
 
 The optional top-level `egress` block arms per-purpose outbound
-allowlists (WOR-2476, WOR-2481). Each sub-block is independently
+allowlists. Each sub-block is independently
 optional; a purpose whose sub-block is omitted, or whose `mode` is left
 at the default `allow_by_default`, stays legacy ungated exactly as if
 `egress:` were absent entirely. Set `mode: deny_by_default` to actually
@@ -315,7 +315,7 @@ egress:
 | `usage_sinks` | `usage_sink` | Webhook, Langfuse, Datadog, and object-store usage-sink deliveries. |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
 | `token_exchange` | `token_exchange` | The non-MCP outbound-credential resolver's OAuth token-endpoint calls. The MCP token-exchange path has its own per-server `egress:` block (see [mcp-security.md](mcp-security.md)) and is unaffected by this section. |
-| `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload does not re-verify an exporter already running (WOR-2481). |
+| `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload does not re-verify an exporter already running. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
 default `allow_by_default`), `hosts` (exact hostnames, case-insensitive),
