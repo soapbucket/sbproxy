@@ -1294,17 +1294,12 @@ fn reload_compiled_config_locked(
         warn_legacy_policy_record_format(compiled);
 
         // WOR-2476: arm the AiProvider, UsageSink, ModelArtifact, and
-        // TokenExchange gates from the compiled `egress:` section before
-        // any of their consumers can read the registry. Must run before
-        // `reload_ai_client` below, which reads `AiProvider` back out of
-        // it.
-        install_egress_gates_from_config(compiled);
-
-        // Rebuild the AI client alongside the catalog. It lives behind an
-        // `ArcSwap`, so this is a lock-free atomic swap from the reload
-        // thread's perspective. The rebuild does not depend on the
-        // catalog reload succeeding, so it runs unconditionally.
-        reload_ai_client();
+        // TokenExchange gates from the compiled `egress:` section, and
+        // rebuild the AI client so it picks up `AiProvider`. The shared
+        // seam `run` (boot) also calls; see its doc comment for why this
+        // is one function with two callers rather than the two-call
+        // sequence it replaced.
+        arm_egress_gates_from_config(compiled);
 
         // WOR-1164: refresh the detection singletons (agent-class resolver,
         // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
@@ -2023,6 +2018,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     install_usage_rollups_from_config(&compiled);
     warn_unwired_decision_audit_events(&compiled);
     warn_legacy_policy_record_format(&compiled);
+    // WOR-2476: this is the startup path (the earlier call site runs on
+    // reload); arms the AiProvider/UsageSink/ModelArtifact/TokenExchange
+    // registry and rebuilds the AI client before the pipeline below is
+    // published, so a `deny_by_default` `egress:` section is live from
+    // this process's very first request, not just from its first reload.
+    arm_egress_gates_from_config(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -4357,26 +4358,39 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 }
 
 /// WOR-2476: install the compiled top-level `egress:` authorizers into
-/// `sbproxy_security::egress`'s process-wide configured-gate registry.
+/// `sbproxy_security::egress`'s process-wide configured-gate registry,
+/// then rebuild the AI client so it picks up `AiProvider` immediately.
 ///
-/// Four of the five arms this section names live behind their own
-/// installer: `reload_ai_client` (called immediately after this, further
-/// down in [`reload_compiled_config_locked`]) reads `AiProvider` back out
-/// of the registry to build the AI client, and the usage-sink builder, the
-/// model-artifact fetcher, and the outbound-credential resolver each read
-/// their own purpose lazily, well after this function returns. Installing
-/// here rather than threading a parameter through every one of those call
-/// chains keeps this function the single seam that has to know the
-/// registry exists.
+/// **The one seam both [`run`] (boot) and [`reload_compiled_config_locked`]
+/// (SIGHUP / file-watcher / admin reload) call.** A prior version of this
+/// arming installed the registry from `reload_compiled_config_locked`
+/// only; boot never called it, so `AI_CLIENT` stayed the ungated
+/// `LazyLock` default and every other purpose's registry slot stayed
+/// empty until the first reload landed. Splitting "install" and "one of
+/// two callers rebuilds the client" back out would silently reintroduce
+/// that gap the moment a future change touched one call site and not the
+/// other; call this one function from both instead.
+///
+/// Three of the five purposes this section names live behind their own,
+/// separate lazy reader: the usage-sink builder, the model-artifact
+/// fetcher, and the outbound-credential resolver each read their own
+/// purpose out of the registry well after this function returns (the
+/// model-artifact fetcher's own staleness window against a
+/// registry-only reload is documented on
+/// [`sbproxy_model_host::HttpArtifactTransport::with_configured_egress`]).
+/// `AiProvider` is the one purpose armed synchronously, right here,
+/// because `AiClient` is a process-wide `ArcSwap` this function owns
+/// rebuilding, not a lazily-read handle some other call site owns.
 ///
 /// `Telemetry` is deliberately not installed here. The OTLP exporters are
-/// built once at process boot, before this reload path ever runs (see
-/// `sbproxy::main`'s `runtime_telemetry_config_for_cli`, which installs
-/// `Telemetry` itself from the same compiled config), and are never
-/// rebuilt on reload, so re-installing it on every reload here would only
-/// ever matter for a `Telemetry` sighting the exporters are not built
-/// again to observe. WOR-2481 tracks adding real reload re-verification.
-fn install_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
+/// built once at process boot, before either caller of this function
+/// runs (see `sbproxy::main`'s `runtime_telemetry_config_for_cli`, which
+/// installs `Telemetry` itself from the same compiled config, ahead of
+/// `run`), and are never rebuilt on reload, so re-installing it on every
+/// reload here would only ever matter for a `Telemetry` sighting the
+/// exporters are not built again to observe. WOR-2481 tracks adding real
+/// reload re-verification.
+fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
     use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
     install_configured_gate(
         EgressPurpose::AiProvider,
@@ -4394,6 +4408,12 @@ fn install_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
         EgressPurpose::TokenExchange,
         compiled.egress.token_exchange.clone(),
     );
+    // Rebuild the AI client immediately, in the same call, so `AiProvider`
+    // is live before this function returns rather than depending on the
+    // caller to remember a second call. Lives behind an `ArcSwap`, so
+    // this is a lock-free atomic swap regardless of which caller (boot
+    // or reload) triggered it.
+    reload_ai_client();
 }
 
 fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) -> bool {
@@ -6349,6 +6369,58 @@ mod event_egress_tests {
             }
             Err(error) => panic!("unexpected boot failure: {error}"),
         }
+    }
+
+    #[test]
+    fn arm_egress_gates_from_config_is_the_seam_run_calls_at_boot() {
+        // WOR-2476 regression: a prior version of this arming installed
+        // the registry from `reload_compiled_config_locked` only, and
+        // rebuilt `AI_CLIENT` as a second, separate call at that same
+        // site. `run` (boot) never called either, so a fresh process
+        // start served every purpose ungated until its first reload,
+        // even with a `deny_by_default` `egress:` section. Drives the
+        // shared seam directly, the exact way `run` calls it (not
+        // `install_configured_gate`, which only proves the registry
+        // slot, not that a live dispatch is actually gated), and checks
+        // both halves of what that one call has to do: arm the
+        // registry, and rebuild the process-wide `ai_client()` so a
+        // real dispatch through it is denied before any reload runs.
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+"#;
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+
+        arm_egress_gates_from_config(&compiled);
+
+        assert!(
+            sbproxy_security::egress::configured_gate(
+                sbproxy_security::egress::EgressPurpose::AiProvider
+            )
+            .is_some(),
+            "the registry must carry the compiled AiProvider authorizer"
+        );
+
+        let client = crate::server::ai_client();
+        let err = client
+            .authorize_provider_url(
+                "https://attacker.test/v1/chat",
+                &sbproxy_security::egress::SystemHostResolver,
+            )
+            .expect_err("a host outside the configured allowlist must be denied");
+        assert_eq!(err, sbproxy_security::egress::EgressDenied::UnlistedHost);
+
+        // Restore the legacy ungated default so a later test in the same
+        // process (the `cargo test` fallback path only; nextest gives
+        // every test its own process) does not inherit this arming.
+        sbproxy_security::egress::install_configured_gate(
+            sbproxy_security::egress::EgressPurpose::AiProvider,
+            None,
+        );
+        reload_ai_client();
     }
 
     #[test]

@@ -902,12 +902,14 @@ pub fn egress_inventory_snapshot() -> Vec<EgressSighting> {
 // between, this registry mirrors [`egress_inventory`]'s shape: a
 // process-wide slot behind a free-function API, so any call site that
 // wants the currently configured authorizer for a purpose reads it with no
-// plumbing. `sbproxy_core::server::lifecycle` installs a fresh value for
-// each purpose at boot and on every successful config reload (in lockstep
-// with `reload_ai_client` and the other `install_*_from_config`
-// installers); the `Telemetry` purpose is the one exception, installed
-// once at boot only, since the OTLP exporters are never rebuilt on reload
-// (WOR-2481 tracks adding that).
+// plumbing. `sbproxy_core::server::lifecycle::arm_egress_gates_from_config`
+// installs a fresh value for each purpose (and rebuilds the AI client that
+// reads `AiProvider` back out) at boot and on every successful config
+// reload: `lifecycle::run` and the reload path both call that one function,
+// deliberately, so a `deny_by_default` purpose is armed on a process's very
+// first request rather than only from its first reload onward. `Telemetry`
+// is the one exception, installed once at boot only, since the OTLP
+// exporters are never rebuilt on reload (WOR-2481 tracks adding that).
 
 fn configured_gates() -> &'static std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>> {
     static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>>> =
