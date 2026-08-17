@@ -1157,7 +1157,7 @@ impl DecisionDetails {
     /// Whether every field is absent, so the OCSF render can leave the
     /// object out rather than emit an empty one.
     ///
-    /// Destructures without `..` on purpose (WOR-2486): the eight
+    /// Destructures without `..` on purpose (WOR-2486): the nine
     /// fields added after the first ten (`tool`, `tool_server`,
     /// `guardrail`, `flagged_count`, `auth_type`, `policy_id`,
     /// `policy_surface`, `verdict`, `decision_latency_ms`) were never

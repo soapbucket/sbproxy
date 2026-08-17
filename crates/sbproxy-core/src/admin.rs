@@ -26,6 +26,13 @@ use sbproxy_config::config_merge::{BaseOrigin, MergeMode, Provenance};
 use sbproxy_config::types::AdminRole;
 use serde::Serialize;
 
+// Shared with the non-admin reload paths (WOR-2486 fix round 1, I5) so
+// a config_audit rejection reason is scrubbed the same way an HTTP
+// response body already is. See `crate::path_redact` for the scrub
+// itself; this file's own reload/validate handlers are its original
+// and largest set of call sites.
+use crate::path_redact::sanitise_path_in_error;
+
 pub mod prompt_persistence;
 pub use prompt_persistence::{prompt_key_ring, PromptPersistence, PromptSealer};
 
@@ -1162,23 +1169,6 @@ pub(crate) fn render_quote_keys_jwks() -> (u16, &'static str, String) {
 
 // --- Reload route ---
 
-/// Sanitise an error message so it never leaks the absolute config
-/// path. The file watcher and the reload route both operate on a
-/// path the operator picked, so a parse failure that includes the
-/// path tells an attacker exactly where the file lives. We strip
-/// the directory component and keep only the file name.
-fn sanitise_path_in_error(msg: &str, full_path: &std::path::Path) -> String {
-    let full = full_path.to_string_lossy();
-    if full.is_empty() {
-        return msg.to_string();
-    }
-    let file_name = full_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<config>".to_string());
-    msg.replace(full.as_ref(), &file_name)
-}
-
 /// Outcome of a `POST /admin/reload` invocation. The
 /// `(status, content_type, body)` triple matches the rest of the
 /// admin route shape so the dispatcher can hand it back unchanged.
@@ -1244,6 +1234,7 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Err(e) => {
             tracing::error!(error = %e, "admin reload: failed to read config file");
             let msg = sanitise_path_in_error(&e.to_string(), &path);
+            audit_admin_reload_rejection(&prior_revision, &msg);
             return (
                 500,
                 "application/json",
@@ -4740,6 +4731,47 @@ mod tests {
         assert!(
             body.contains("this_action_type_does_not_exist"),
             "the error names the payload's fault, not the pointer's: {body}"
+        );
+    }
+
+    /// WOR-2486 fix round 1, I4: the reload handler's file-read failure
+    /// branch (a config path that does not exist, or is not readable)
+    /// never called `audit_admin_reload_rejection`, even though the
+    /// only other four rejection branches on this same handler already
+    /// did. `prior_revision` was in scope the whole time; the call was
+    /// simply missing.
+    #[test]
+    fn a_missing_config_file_is_refused_and_reaches_config_audit() {
+        let mut state = make_state();
+        state.config_path = Some(std::path::PathBuf::from(
+            "/nonexistent/wor-2486-i4-missing-config.yml",
+        ));
+
+        let before =
+            sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), Some("api"), None)
+                .len();
+        let (status, _content_type, body) = handle_reload(&state);
+        assert_eq!(status, 500, "a missing config file is a 500: {body}");
+        assert!(
+            body.contains("failed to read config file"),
+            "the response must name the failure: {body}"
+        );
+
+        let events =
+            sbproxy_observe::audit_ring::recent_audit_events(50, Some("config"), Some("api"), None);
+        assert!(
+            events.len() > before,
+            "the file-read rejection must reach config_audit like every other rejection \
+             branch on this handler does"
+        );
+        assert!(
+            events[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("rejected:"),
+            "{:?}",
+            events[0].detail
         );
     }
 

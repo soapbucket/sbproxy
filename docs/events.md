@@ -65,6 +65,8 @@ The short version, because this page is where the two channels need to be told a
 
 `ai.close` carries one honest caveat the others do not. It publishes only for a request whose AI extension chain (JS, Lua, or WASM bundle hooks on `ai.*` events) is non-empty for that generation, because that is the only place the stream's finish-reason aggregate exists today. A deployment with zero AI extension bundles configured never builds that chain, so `ai.close` publishes nothing there even with `decision_audit` enabled and the boot warning silent (the warning cannot see a gap that is config-shaped rather than code-shaped). If you rely on `ai.close`, confirm you have at least one AI extension hook registered, linked or bundle. This is a narrower guarantee than the funnel-per-event shape the other *Emitted* events carry, and it is called out here rather than left for you to discover against a quiet feed.
 
+`mcp.tool` here covers a successful (or gateway-declined) tool dispatch attribution. It does not cover an MCP request refused before dispatch on RBAC, quota, or a lethal-trifecta session check (tool access, private data, and external communication in one session): those denials are carried by the MCP governance evidence channel, a separate, purpose-built record for exactly that shape of decision, rather than by any channel this page documents.
+
 ## Event shape
 
 ```rust,no_run
@@ -80,7 +82,7 @@ pub struct ProxyEvent {
 `data` is built by whichever channel produced the underlying fact, not invented at the bridge:
 
 - `auth_denied` and `policy_denied` carry the `security_audit` entry: timestamp, event type, reason, hostname, client IP, request id, method, status code, tenant id, credential provider and mode, and the public key id.
-- `config_reloaded` carries the `config_audit` entry: source, origin delta, actor, the before and after revisions, and, on a rejection, a bounded `rejection_reason`.
+- `config_reloaded` carries the `config_audit` entry: source, origin delta, actor, the before and after revisions, and, on a rejection, a `rejection_reason`. That field is bounded to 512 bytes and has the local config path scrubbed out of it, but it is not scrubbed of config content in general: a compile or validation error routinely echoes the fragment it is complaining about (an invalid expression, an unrecognized key, a hostname), because naming the fragment is how the error explains itself. Point a rejection-reason sink at somewhere you already trust with your config's shape.
 - `egress_refused` carries the four fields `record_egress_refused` already puts on its Prometheus series: `purpose`, `reason`, `tenant`, `origin`, all closed, bounded labels.
 - `provider_selected`, `budget_exceeded`, and `guardrail_triggered` carry the fields listed under [Verdict-level, not per-request](#verdict-level-not-per-request) above.
 - `request_completed` and `request_error` carry the full request envelope: latency, status, provider, model, token counts, and cost.
@@ -216,7 +218,7 @@ Four channels write structured records, and only some of that traffic ever reach
 | Channel | Tamper-evident | Reaches `events:`? |
 |---|---|---|
 | `security_audit` | Yes, under `audit.sink: chain` | Yes, bridged: `auth_*` and `forward_auth_*` reasons become `auth_denied`; everything else (framing violations, policy labels) becomes `policy_denied`. |
-| `config_audit` | Yes, under `audit.sink: chain` | Yes, bridged one to one to `config_reloaded`, for both an accepted and a rejected reload, on every reload path (the admin API, the file watcher, SIGHUP, the config-authority bundle apply, and the remote config-source refresh poller). |
+| `config_audit` | Yes, under `audit.sink: chain` | Yes, bridged one to one to `config_reloaded`, for both an accepted and a rejected reload, on every reload path: the admin API, the file watcher, SIGHUP, the config-authority bundle apply, the remote config-source refresh poller, and the Git-backed extension-bundle refresh poller. |
 | `key_audit` | No (deliberately not chainable yet; see [audit-log.md](audit-log.md)) | No. Key-plane mutations (create, rotate, block, revoke) stay on the `key_audit` tracing target only. |
 | Admin action ring | No | No. Console logins, content-inspection reads, and other admin-console actions stay on the `sbproxy::admin::audit` tracing target and the bounded in-memory ring `GET /api/audit/recent` reads. |
 
