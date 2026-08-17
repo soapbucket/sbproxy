@@ -907,6 +907,21 @@ fn otlp_resource(config: &TelemetryConfig) -> Resource {
 /// (stamps the inventory, returns an outcome) is unit-testable on its
 /// own; `std::process::exit` cannot be exercised from within the test
 /// process that calls it.
+///
+/// **Boot-only.** Reserved for the two exporters actually built once, at
+/// process boot, and never again: `build_span_exporter` (traces) and
+/// `init_otlp_metrics_pipeline` (metrics). The log sink is reachable
+/// from a live config reload (`install_sink_dispatcher_from_config` runs
+/// there too, not just at boot), so it calls
+/// [`authorize_telemetry_endpoint_or_reject`] instead, which returns an
+/// error a running process can recover from rather than exiting it.
+/// C2 (WOR-2481 review): the earlier version of this arming called this
+/// exit-on-deny function from the log sink's constructor too, so a
+/// reload that armed `egress.telemetry:` after boot (the registry slot
+/// this checks is otherwise installed once, from `main`, before boot
+/// even starts building a pipeline) could terminate an already-running
+/// process over a log sink, the one OTLP exporter that is not actually
+/// boot-only.
 pub(crate) fn authorize_telemetry_endpoint_or_refuse_boot(endpoint: &str, signal: &str) {
     if let TelemetryEgressOutcome::Denied(denied) = check_telemetry_egress(endpoint, signal) {
         eprintln!(
@@ -918,9 +933,34 @@ pub(crate) fn authorize_telemetry_endpoint_or_refuse_boot(endpoint: &str, signal
     }
 }
 
-/// Decision [`authorize_telemetry_endpoint_or_refuse_boot`] acts on.
+/// Authorize `endpoint` against `egress.telemetry:` and stamp the egress
+/// sightings inventory, returning an error on denial instead of exiting
+/// the process (WOR-2481 review, C2). For the OTLP-logs sink
+/// specifically: unlike the trace and metric exporters, it can be
+/// (re)built from a live config reload
+/// (`install_sink_dispatcher_from_config` runs on every reload, not
+/// only at boot), so a denial here has to be something the caller can
+/// recover from. `OtlpLogSink::new`'s caller in
+/// `sbproxy_core::server::lifecycle` already treats any `Err` from
+/// exporter construction as "log a warning, count it, and run without
+/// this sink" -- the exact posture a denied endpoint should get too,
+/// since continuing to run a process over an operator's own allowlist
+/// doing its job is worse than a missing log sink.
+pub(crate) fn authorize_telemetry_endpoint_or_reject(endpoint: &str, signal: &str) -> Result<()> {
+    match check_telemetry_egress(endpoint, signal) {
+        TelemetryEgressOutcome::Proceed => Ok(()),
+        TelemetryEgressOutcome::Denied(denied) => Err(anyhow::anyhow!(
+            "telemetry {signal} exporter endpoint '{endpoint}' is not on the \
+             egress.telemetry allowlist ({denied:?}). Add it to egress.telemetry.hosts, or \
+             remove the egress.telemetry block to leave telemetry ungated."
+        )),
+    }
+}
+
+/// Decision [`authorize_telemetry_endpoint_or_refuse_boot`] and
+/// [`authorize_telemetry_endpoint_or_reject`] both act on.
 #[derive(Debug, PartialEq, Eq)]
-enum TelemetryEgressOutcome {
+pub(crate) enum TelemetryEgressOutcome {
     /// No authorizer configured for `EgressPurpose::Telemetry` (an
     /// omitted `egress.telemetry:` sub-block), or the configured
     /// authorizer allowed the destination.
@@ -931,10 +971,11 @@ enum TelemetryEgressOutcome {
 
 /// Authorize `endpoint` against `egress.telemetry:` and stamp the egress
 /// sightings inventory, without acting on the result. See
-/// [`authorize_telemetry_endpoint_or_refuse_boot`] for the production
-/// entry point, which is this function plus the fail-loud side effect on
-/// [`TelemetryEgressOutcome::Denied`].
-fn check_telemetry_egress(endpoint: &str, signal: &str) -> TelemetryEgressOutcome {
+/// [`authorize_telemetry_endpoint_or_refuse_boot`] (boot-only, exits on
+/// denial) and [`authorize_telemetry_endpoint_or_reject`] (reload-safe,
+/// returns `Err` on denial) for the two production entry points built
+/// on this shared decision.
+pub(crate) fn check_telemetry_egress(endpoint: &str, signal: &str) -> TelemetryEgressOutcome {
     use sbproxy_security::egress::{
         configured_gate, record_egress_seen, EgressPurpose, EgressSightingStatus,
         SystemHostResolver,
