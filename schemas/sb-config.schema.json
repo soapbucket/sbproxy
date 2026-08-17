@@ -10950,7 +10950,7 @@
       "additionalProperties": false
     },
     "EgressPurposeConfig": {
-      "description": "One purpose's allowlist under the top-level `egress:` section.\n\nShares its vocabulary with the per-tool MCP/OpenAPI `egress:` block; see `sbproxy_extension::mcp::egress::EgressPolicy` for the enforcement semantics this compiles to. Only `hosts` (exact match) and `allow_private` are supported here; the per-tool block's `suffixes` has no equivalent in this section.",
+      "description": "One purpose's allowlist under the top-level `egress:` section.\n\nShares its vocabulary with the per-tool MCP/OpenAPI `egress:` block; see `sbproxy_extension::mcp::egress::EgressPolicy` for the enforcement semantics this compiles to. `hosts` (exact match), `ports`, and `allow_private` are supported here; the per-tool block's `suffixes` has no equivalent in this section.",
       "type": "object",
       "properties": {
         "mode": {
@@ -10974,6 +10974,19 @@
           "description": "When true, resolved private/link-local addresses are permitted for hosts on this allowlist (operator opt-in).",
           "default": false,
           "type": "boolean"
+        },
+        "ports": {
+          "description": "Permitted destination ports. Defaults to `[80, 443]`, the scheme-standard HTTP/HTTPS ports most sub-blocks dial. An override is required for a purpose that does not: `telemetry`'s OTLP endpoint is commonly `4317` (gRPC) or `4318` (HTTP), never `80`/`443`, so the default here would refuse every destination that sub-block reaches with `DisallowedPort` and there would be no `hosts:` fix an operator could make to recover. Refused if present but empty, or if it names port `0`: either would silently refuse every destination this purpose reaches with no indication why.",
+          "default": [
+            80,
+            443
+          ],
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          }
         }
       },
       "additionalProperties": false
