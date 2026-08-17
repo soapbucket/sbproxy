@@ -142,6 +142,23 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
                separates the gateway refusing a call (`policy_denied`, `tool_not_found`) \
                from the upstream failing one the gateway allowed (`tool_error`).",
     },
+    FieldContract {
+        event: DecisionEvent::AiFailure,
+        fields: &["selected_provider", "verdict"],
+        note: "`selected_provider` names which provider's response failed. `verdict` carries \
+               the classified failure kind (`rate_limited`, `content_filter`, `upstream_5xx`, \
+               `provider_error`), a closed vocabulary rather than the raw upstream status text, \
+               which can carry a prompt fragment. The record's own `outcome` is always `error`: \
+               this is an upstream fact, not a proxy policy decision.",
+    },
+    FieldContract {
+        event: DecisionEvent::AiClose,
+        fields: &["verdict"],
+        note: "`verdict` carries the terminal `finish_reason` (`stop`, `length`, `tool_calls`, \
+               `content_filter`, ...). Token counts and cost are not duplicated here: they \
+               already have an authoritative home in the access log and the usage ledger, and \
+               this record's job is marking that the stream reached its end, not re-billing it.",
+    },
 ];
 
 /// Envelope fields every record carries, whatever the event.
