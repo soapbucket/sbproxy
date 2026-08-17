@@ -80,7 +80,7 @@ Config: `proxy.observability.log.decision_audit.events.route.decide: true`
 Named limit: eight of the eighteen possible decision events publish under
 their own label today (`auth`, `cache.admit`, `cache.key`, `route.decide`,
 `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`),
-plus `policy` under the newer record format. The other ten are not one
+plus `policy` under the newer record format. The other nine are not one
 undifferentiated leftover; the code names four deliberate states for them.
 `waf` and `rate_limit` are superseded by policy: both already run in the
 policy chain and publish as a `policy` record naming which one fired, so a
@@ -96,7 +96,13 @@ unwired, no emitter yet. An `events:` key naming a label this proxy does
 not recognize fails config load; a known but unwired label loads and
 warns at boot instead, because refusing every label a later release might
 wire would block pre-configuring it today. Proof:
-`crates/sbproxy-config/src/compiler.rs::decision_audit_refuses_an_unknown_event_label`.
+`crates/sbproxy-config/src/compiler.rs::decision_audit_refuses_an_unknown_event_label`
+(the unrecognized-label refusal),
+`::decision_audit_refuses_the_per_chunk_stream_event` (the
+`ai.stream.event` refusal), and
+`crates/sbproxy-core/src/server/tests.rs::a_superseded_event_is_reported_separately_from_an_unwired_one`,
+`::the_unwired_warning_follows_the_policy_record_format` (the boot warn,
+which lives in `lifecycle.rs::warn_unwired_decision_audit_events`).
 
 ### 4. Denial of wallet is enforcement, not observation
 
