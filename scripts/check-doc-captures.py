@@ -91,6 +91,13 @@ MANIFEST: dict[str, dict] = {
                 "fresh_each": False,
                 "settle_ms": 4000,
             },
+            # Every capture this page has ever needed matches the section
+            # above; unlike docs/payment-settlement.md there is no second
+            # fixture on this page to fall through to. The manifest test
+            # still requires a trailing catch-all, so this repeats the
+            # same stack rather than routing a hypothetical future,
+            # differently-worded capture at nothing.
+            {"stack": "usage_bridge", "fresh_each": False, "settle_ms": 4000},
         ],
     },
     "docs/payment-settlement.md": {
