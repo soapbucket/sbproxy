@@ -3577,6 +3577,7 @@ pub(super) async fn handle_mcp_action(
                                         &routing_headers.params,
                                         &arguments,
                                         mcp.strict_modern_parameter_headers(),
+                                        true,
                                     ) {
                                         Ok(()) => None,
                                         Err(McpModernValidationFailure::HeaderBinding) => {
@@ -3610,7 +3611,35 @@ pub(super) async fn handle_mcp_action(
                                 ))
                             }
                         } else {
-                            None
+                            // WOR-2384 (MCP05): legacy-era calls get the
+                            // same JSON-Schema check as modern ones, but
+                            // only when a compiled contract is available
+                            // -- a legacy tool whose strict schema never
+                            // compiled keeps today's behavior (unchecked)
+                            // rather than being refused for a gap it
+                            // always had. `enforce_header_binding: false`:
+                            // legacy calls carry every argument in the
+                            // JSON-RPC body, with no MCP-Param-* headers
+                            // to mirror against.
+                            federated
+                                .as_ref()
+                                .and_then(|tool| tool.modern_contract.as_ref())
+                                .and_then(|compiled| {
+                                    match mcp_validate_modern_tool_input(
+                                        compiled,
+                                        &routing_headers.params,
+                                        &arguments,
+                                        mcp.strict_modern_parameter_headers(),
+                                        false,
+                                    ) {
+                                        Ok(()) => None,
+                                        Err(_) => Some(JsonRpcResponse::error(
+                                            request.id.clone(),
+                                            INVALID_PARAMS,
+                                            "tool arguments do not conform to the advertised input schema",
+                                        )),
+                                    }
+                                })
                         };
 
                         // WOR-1635: version-gate check first; a
@@ -3687,7 +3716,46 @@ pub(super) async fn handle_mcp_action(
                                 ),
                                 None => false,
                             };
-                            let quota_error = if denied_by_rbac {
+                            // WOR-2384: shared by the pre-dispatch
+                            // denial branches below (RBAC, argument
+                            // policy, quota), which all emit a
+                            // governance evidence event naming the
+                            // resolved server before returning their
+                            // refusal.
+                            let governed_server = federated
+                                .as_ref()
+                                .map(|t| t.server_name.as_str())
+                                .unwrap_or("unknown");
+                            // WOR-2384 (MCP05): argument-level policy,
+                            // evaluated only when RBAC has already
+                            // allowed -- structural monotonicity means
+                            // this can only narrow that allow, never
+                            // override an RBAC deny. Evaluated before
+                            // the per-tool quota check below (the
+                            // task's documented ordering: RBAC, then
+                            // JSON-Schema (already checked above),
+                            // then argument policy, then quota, then
+                            // dispatch), so a call an argument policy
+                            // blocks never consumes a quota slot.
+                            let argument_policy_verdict = if denied_by_rbac {
+                                None
+                            } else {
+                                Some(mcp.evaluate_argument_policies(
+                                    &ctx.principal,
+                                    &name,
+                                    governed_server,
+                                    ctx.tenant_id.as_str(),
+                                    mcp_session_id.as_deref(),
+                                    &arguments,
+                                ))
+                            };
+                            let argument_policy_denied = matches!(
+                                argument_policy_verdict,
+                                Some(sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Deny {
+                                    ..
+                                })
+                            );
+                            let quota_error = if denied_by_rbac || argument_policy_denied {
                                 None
                             } else if let Some(policy) = server_policy {
                                 mcp.quota_store
@@ -3696,15 +3764,6 @@ pub(super) async fn handle_mcp_action(
                             } else {
                                 None
                             };
-                            // WOR-2384: shared by both pre-dispatch
-                            // denial branches below, which both emit a
-                            // governance evidence event naming the
-                            // resolved server before returning their
-                            // refusal.
-                            let governed_server = federated
-                                .as_ref()
-                                .map(|t| t.server_name.as_str())
-                                .unwrap_or("unknown");
                             if denied_by_rbac {
                                 tracing::warn!(
                                     target: "sbproxy::mcp::rbac",
@@ -3744,6 +3803,60 @@ pub(super) async fn handle_mcp_action(
                                         &format!(
                                             "tool '{}' is denied by RBAC policy for caller",
                                             name,
+                                        ),
+                                    )
+                                }
+                            } else if let Some(
+                                sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Deny {
+                                    rule_name,
+                                    panicked,
+                                },
+                            ) = &argument_policy_verdict
+                            {
+                                tracing::warn!(
+                                    target: "sbproxy::mcp::argument_policy",
+                                    tool = %name,
+                                    server = %governed_server,
+                                    tenant = %ctx.tenant_id,
+                                    rule = %rule_name,
+                                    panicked = %panicked,
+                                    "MCP tools/call denied by argument policy",
+                                );
+                                sbproxy_observe::metrics::record_mcp_argument_policy(
+                                    ctx.tenant_id.as_str(),
+                                    rule_name,
+                                    "deny",
+                                );
+                                if *panicked {
+                                    sbproxy_observe::metrics::record_policy_panic(
+                                        "mcp_argument_policy",
+                                    );
+                                }
+                                // WOR-2384: same reasoning as the RBAC
+                                // branch above -- an argument-policy
+                                // refusal never reaches the
+                                // post-dispatch funnel either, since no
+                                // tool was dispatched.
+                                if emit_mcp_governance_evidence(
+                                    ctx,
+                                    &name,
+                                    governed_server,
+                                    mcp_session_id.as_deref(),
+                                    is_modern,
+                                    None,
+                                    McpGovernanceVerdict::Deny(
+                                        sbproxy_modules::action::mcp::MCP_ARGUMENT_POLICY_REASON,
+                                    ),
+                                    Some(rule_name.as_str()),
+                                ) {
+                                    mcp_evidence_unavailable_response(request.id.clone())
+                                } else {
+                                    JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        INVALID_PARAMS,
+                                        &format!(
+                                            "tool '{}' is denied by argument policy '{}'",
+                                            name, rule_name,
                                         ),
                                     )
                                 }
@@ -3792,6 +3905,63 @@ pub(super) async fn handle_mcp_action(
                                     )
                                 }
                             } else {
+                                // WOR-2384 (MCP05): a `mode: warn`
+                                // argument-policy violation still lets
+                                // the call proceed, but the governance
+                                // evidence feed must carry the warning
+                                // -- otherwise a warn-mode rollout of a
+                                // new rule is invisible to a SIEM,
+                                // which is the opposite of what "warn"
+                                // is for. Runs first in this block, same
+                                // reasoning the deprecated-server check
+                                // documents just below: independent
+                                // signals get independent events, each
+                                // under its own rule_id/reason.
+                                if let Some(
+                                    sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Warn {
+                                        rule_name,
+                                    },
+                                ) = &argument_policy_verdict
+                                {
+                                    tracing::warn!(
+                                        target: "sbproxy::mcp::argument_policy",
+                                        tool = %name,
+                                        server = %governed_server,
+                                        tenant = %ctx.tenant_id,
+                                        rule = %rule_name,
+                                        "MCP tools/call argument policy observed a violation (warn mode: allowed)",
+                                    );
+                                    sbproxy_observe::metrics::record_mcp_argument_policy(
+                                        ctx.tenant_id.as_str(),
+                                        rule_name,
+                                        "warn",
+                                    );
+                                    if emit_mcp_governance_evidence(
+                                        ctx,
+                                        &name,
+                                        governed_server,
+                                        mcp_session_id.as_deref(),
+                                        is_modern,
+                                        None,
+                                        McpGovernanceVerdict::Warn(
+                                            sbproxy_modules::action::mcp::MCP_ARGUMENT_POLICY_REASON,
+                                        ),
+                                        Some(rule_name.as_str()),
+                                    ) {
+                                        let response =
+                                            mcp_evidence_unavailable_response(request.id.clone());
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
                                 // WOR-2384 (MCP09): a `deprecated`
                                 // server stays fully callable -- unlike
                                 // `draft`, existing integrations do not
@@ -7548,29 +7718,44 @@ enum McpModernValidationFailure {
     OutputSchema,
 }
 
+/// Validate a `tools/call`'s arguments against a compiled modern
+/// contract's JSON Schema.
+///
+/// `enforce_header_binding` gates the two checks that only make sense
+/// for the MCP 2026-07-28 HTTP transport, where a subset of arguments
+/// can be mirrored onto `MCP-Param-*` headers: header/body agreement
+/// (`x-mcp-header` projections) and, when configured, strict rejection
+/// of an unprojected `mcp-param-*` header. Modern-era calls always pass
+/// `true`. WOR-2384 (MCP05) extended this function so legacy-era calls
+/// with a compiled contract can share the JSON-Schema half -- `false`
+/// here, since legacy calls carry every argument in the JSON-RPC body
+/// and have no header-binding concept to check.
 fn mcp_validate_modern_tool_input(
     compiled: &sbproxy_extension::mcp::protocol::CompiledMcpToolContract,
     headers: &http::HeaderMap,
     arguments: &serde_json::Value,
     strict_parameter_headers: bool,
+    enforce_header_binding: bool,
 ) -> Result<(), McpModernValidationFailure> {
-    sbproxy_extension::mcp::protocol::validate_mirrored_headers(
-        headers,
-        &compiled.header_projections,
-        arguments,
-    )
-    .map_err(|_| McpModernValidationFailure::HeaderBinding)?;
+    if enforce_header_binding {
+        sbproxy_extension::mcp::protocol::validate_mirrored_headers(
+            headers,
+            &compiled.header_projections,
+            arguments,
+        )
+        .map_err(|_| McpModernValidationFailure::HeaderBinding)?;
 
-    if strict_parameter_headers
-        && headers.keys().any(|name| {
-            name.as_str().starts_with("mcp-param-")
-                && !compiled
-                    .header_projections
-                    .iter()
-                    .any(|projection| projection.header_name.as_str() == name.as_str())
-        })
-    {
-        return Err(McpModernValidationFailure::HeaderBinding);
+        if strict_parameter_headers
+            && headers.keys().any(|name| {
+                name.as_str().starts_with("mcp-param-")
+                    && !compiled
+                        .header_projections
+                        .iter()
+                        .any(|projection| projection.header_name.as_str() == name.as_str())
+            })
+        {
+            return Err(McpModernValidationFailure::HeaderBinding);
+        }
     }
 
     if !compiled.input.is_valid(arguments) {
@@ -7673,13 +7858,13 @@ mod mcp_modern_contract_gate_tests {
         let arguments = json!({"region": "us-west1", "count": "not-an-integer"});
 
         assert_eq!(
-            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false),
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false, true),
             Err(McpModernValidationFailure::HeaderBinding)
         );
 
         headers.insert("mcp-param-region", "us-west1".parse().unwrap());
         assert_eq!(
-            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false),
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false, true),
             Err(McpModernValidationFailure::InputSchema)
         );
     }
@@ -7693,12 +7878,41 @@ mod mcp_modern_contract_gate_tests {
         let arguments = json!({"region": "us-west1", "count": 2});
 
         assert_eq!(
-            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false),
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, false, true),
             Ok(())
         );
         assert_eq!(
-            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, true),
+            mcp_validate_modern_tool_input(&compiled, &headers, &arguments, true, true),
             Err(McpModernValidationFailure::HeaderBinding)
+        );
+    }
+
+    #[test]
+    fn wor_2384_legacy_era_schema_validation_rejects_a_shape_mismatch() {
+        // WOR-2384 red-first: before this change, legacy-era
+        // (`enforce_header_binding: false`) calls had no JSON-Schema
+        // check available through this function at all -- the
+        // production call site only ever reached it under
+        // `is_modern`. A malformed argument shape must be rejected the
+        // same way the modern era already rejects it, and header
+        // binding must be skipped entirely: an empty `HeaderMap` with
+        // a strict tool whose contract declares an `x-mcp-header`
+        // projection must not itself trigger `HeaderBinding` (legacy
+        // calls carry every argument in the JSON-RPC body).
+        let compiled = compiled_contract();
+        let empty_headers = http::HeaderMap::new();
+        let bad_shape = json!({"region": "us-west1", "count": "not-an-integer"});
+        assert_eq!(
+            mcp_validate_modern_tool_input(&compiled, &empty_headers, &bad_shape, false, false),
+            Err(McpModernValidationFailure::InputSchema),
+            "a legacy-era call with a compiled contract must still be schema-validated"
+        );
+
+        let conforming = json!({"region": "us-west1", "count": 2});
+        assert_eq!(
+            mcp_validate_modern_tool_input(&compiled, &empty_headers, &conforming, false, false),
+            Ok(()),
+            "a conforming legacy-era call must not be refused for a header binding it never had"
         );
     }
 
@@ -9081,6 +9295,214 @@ mod mcp_catalog_snapshot_tests {
                 "{event:?}"
             );
             assert_eq!(event["data"]["error.type"], "policy_denied");
+        }
+
+        // --- Scenario 8 (WOR-2384, MCP05): the wiring proof. A
+        // `mode: block` argument-policy rule refuses a
+        // path-traversal-shaped argument before dispatch is ever
+        // attempted -- this fails today, before `argument_policies[]`
+        // is wired into `handle_mcp_action` at all. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-argument-policy-deny-fixture";
+            const SERVER: &str = "argument-policy-deny-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "argument-policy-deny-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER
+                }],
+                "argument_policies": [{
+                    "name": "no-path-traversal",
+                    "engine": "cel",
+                    "source": "!mcp.arguments.path.contains(\"..\")",
+                    "mode": "block"
+                }]
+            }))
+            .expect("argument-policy deny governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {"path": "../../etc/passwd"}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains("argument policy"),
+                "expected an argument-policy denial, got: {message}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "deny"
+            })
+            .await
+            .expect(
+                "an argument-policy mcp_governance_decision deny event was not observed within 5s",
+            );
+            assert_eq!(event["data"]["error.type"], "policy_denied");
+            assert_eq!(event["data"]["sbproxy.decision.reason"], "argument_policy");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "no-path-traversal"
+            );
+            assert_eq!(event["data"]["sbproxy.tool.server"], SERVER);
+        }
+
+        // --- Scenario 9 (WOR-2384, MCP05): `mode: warn` allows the
+        // call to proceed (default decision 4) and still emits a
+        // `warn`-verdict governance event, same evidence-completeness
+        // bar the deprecated-server and peer-downgrade warn paths
+        // already meet. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-argument-policy-warn-fixture";
+            const SERVER: &str = "argument-policy-warn-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "argument-policy-warn-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER
+                }],
+                "argument_policies": [{
+                    "name": "no-path-traversal-warn",
+                    "engine": "cel",
+                    "source": "!mcp.arguments.path.contains(\"..\")",
+                    "mode": "warn"
+                }]
+            }))
+            .expect("argument-policy warn governance-evidence fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {"path": "../../etc/passwd"}}
+                }),
+            )
+            .await;
+            // The fixture upstream is unreachable, so the call still
+            // fails at real dispatch -- the point of this scenario is
+            // that it is not refused by the argument-policy verdict
+            // itself, the same way scenario 6 proves a deprecated
+            // server is not refused by its own approval-status check.
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .map(|m| !m.contains("argument policy"))
+                    .unwrap_or(true),
+                "warn mode must not refuse the call for the argument-policy verdict itself: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "warn"
+            })
+            .await
+            .expect(
+                "an argument-policy mcp_governance_decision warn event was not observed within 5s",
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "no-path-traversal-warn"
+            );
+            assert_eq!(event["data"]["sbproxy.decision.reason"], "argument_policy");
+            assert!(
+                event["data"].get("error.type").is_none(),
+                "a warn verdict must not stamp error.type: {event:?}"
+            );
+        }
+
+        // --- Scenario 10 (WOR-2384, MCP05): structural monotonicity,
+        // exercised end to end. An RBAC denial must win over an
+        // argument policy that would also deny the same call, and the
+        // argument policy must never even be consulted: its rule name
+        // must not appear anywhere, and the evidence event's reason
+        // must name RBAC. ---
+        {
+            const TOOL_NAME: &str = "wor2384-governance-evidence-ordering-fixture";
+            const SERVER: &str = "ordering-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "ordering-fixture", "version": "1.0.0"},
+                "rbac_policies": {
+                    "reader": {
+                        "default_allow": false,
+                        "tool_access": [{"principals": [], "allowed": []}]
+                    }
+                },
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER,
+                    "rbac": "reader"
+                }],
+                "argument_policies": [{
+                    "name": "always-deny",
+                    "engine": "cel",
+                    "source": "false",
+                    "mode": "block"
+                }]
+            }))
+            .expect("ordering fixture compiles");
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains("RBAC"),
+                "an RBAC denial must win over an argument policy that would also deny: {message}"
+            );
+            assert!(
+                !message.contains("argument policy"),
+                "the argument policy must never fire once RBAC has already denied: {message}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the ordering fixture was not observed \
+                 within 5s",
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"], "rbac_denied",
+                "the reason must name RBAC, not the argument policy that never ran: {event:?}"
+            );
         }
     }
 

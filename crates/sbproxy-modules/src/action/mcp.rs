@@ -68,9 +68,10 @@
 //! and applies a small allowlist guardrail at request time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 use sbproxy_extension::mcp::access_control::McpPrincipalSelector;
 use sbproxy_extension::mcp::rollout::{
     AdapterPair, PinSpec, RolloutPlan, RolloutSpec, SunsetBehavior, ToolRolloutSpec, VersionSpec,
@@ -80,6 +81,7 @@ use sbproxy_extension::mcp::{
     EgressPolicy, FederationIoSettings, McpFederation, McpServerConfig, NamespaceMode,
     ToolAccessPolicy, ToolQuotaStore, ToolVersioningGate, VersioningMode,
 };
+use sbproxy_extension::rego::CompiledRego;
 use serde::Deserialize;
 
 // --- Wire format ---
@@ -103,6 +105,14 @@ pub struct McpActionConfig {
     /// List of upstream MCP servers to federate.
     #[serde(default)]
     pub federated_servers: Vec<McpFederatedServerConfig>,
+    /// Argument-level `tools/call` authorization rules (WOR-2384,
+    /// MCP05). Each rule is a CEL or Rego expression evaluated against
+    /// the tool-call context (name, server, session, tenant, principal,
+    /// and the parsed arguments) after RBAC and JSON-Schema validation
+    /// pass and before the call dispatches. See the module docs and
+    /// [`McpArgumentPolicyConfig`].
+    #[serde(default)]
+    pub argument_policies: Vec<McpArgumentPolicyConfig>,
     /// Default egress policy for OpenAPI-backed REST tool calls.
     /// Per-server `egress` overrides this block. Omitted preserves
     /// the legacy allow-all behavior.
@@ -198,6 +208,101 @@ pub struct McpActionConfig {
     /// ledger only.
     #[serde(default)]
     pub usage_sinks: Vec<sbproxy_ai::usage_sink::UsageSinkConfig>,
+}
+
+/// One `argument_policies[]` entry (WOR-2384, MCP05): a CEL or Rego
+/// expression evaluated against the tool-call context after RBAC and
+/// JSON-Schema validation pass, before the call quotas and dispatches.
+///
+/// Structural monotonicity (the no-new-policy-languages ruling): this
+/// rule can only narrow an already-passed RBAC decision, never widen
+/// it. The expression's boolean result follows the same polarity every
+/// other CEL/Rego surface in this codebase uses: `true` means the
+/// argument shape is compliant (no objection); `false` means it
+/// violates the rule, which then applies `mode`. An expression that
+/// cannot be evaluated (a runtime error, or a panic inside the engine)
+/// is not a normal `false` -- it is a fail-closed condition and denies
+/// the call regardless of the configured `mode`, mirroring `policy:
+/// rego`'s own evaluation-error posture.
+///
+/// ```yaml
+/// argument_policies:
+///   - name: internal-recipients-only
+///     when: mcp.tool.name == "send_email"
+///     engine: cel
+///     source: mcp.arguments.to.endsWith("@company.com")
+///     mode: block
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpArgumentPolicyConfig {
+    /// Operator-facing rule name. Carried as `sbproxy.decision.rule_id`
+    /// on the `mcp_governance_decision` evidence event this rule
+    /// produces, and as the `rule` label on
+    /// `sbproxy_mcp_argument_policy_total`.
+    pub name: String,
+    /// Optional CEL applicability guard, evaluated against the same
+    /// `mcp.*` context as `source`, regardless of `engine`. When it
+    /// evaluates `false`, this rule does not apply to the call and the
+    /// next rule is consulted. Absent means the rule always applies.
+    /// A guard that itself fails to evaluate is treated as applicable
+    /// (conservative: skipping a rule that could not prove itself
+    /// inapplicable would be the wider failure mode).
+    #[serde(default)]
+    pub when: Option<String>,
+    /// Which engine `source`/`path` is written in.
+    pub engine: McpArgumentPolicyEngineConfig,
+    /// Inline expression source. Exactly one of `source`/`path` is
+    /// required; `path` is read once at config-compile time, mirroring
+    /// `federated_servers[].spec_path` (WOR-1648).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// File path to the expression source, read at config-compile
+    /// time.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// `warn` (default) logs and emits governance evidence with
+    /// verdict `warn`, but allows the call. `block` refuses the call
+    /// with a JSON-RPC error and emits verdict `deny`.
+    #[serde(default)]
+    pub mode: McpArgumentPolicyModeConfig,
+    /// Principal selectors scoping which callers this rule applies to,
+    /// same shape as the RBAC `tool_access[].principals` rows. An
+    /// empty list (the default) applies to every principal. A selector
+    /// naming a `tenant_id` scopes the rule to that tenant only -- a
+    /// rule cannot fire for another tenant's principal, because the
+    /// principal evaluated here is always the request's own,
+    /// host-derived one (WOR-2384's multi-tenant ruling).
+    #[serde(default)]
+    pub principals: Vec<McpPrincipalSelector>,
+}
+
+/// Expression engine for one [`McpArgumentPolicyConfig`] entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpArgumentPolicyEngineConfig {
+    /// CEL, compiled through the same [`sbproxy_extension::cel`] engine
+    /// every other CEL surface in this codebase shares.
+    Cel,
+    /// OPA-compatible Rego, compiled through
+    /// [`sbproxy_extension::rego::CompiledRego`] (the same Regorus
+    /// evaluator `policy: rego` uses).
+    Rego,
+}
+
+/// What happens when an [`McpArgumentPolicyConfig`] rule's expression
+/// evaluates `false` (a violation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpArgumentPolicyModeConfig {
+    /// Log, emit governance evidence with verdict `warn`, allow the
+    /// call. The default (decision 4): an operator adopting argument
+    /// policies sees what would have been refused before anything
+    /// actually refuses traffic.
+    #[default]
+    Warn,
+    /// Refuse the call with a JSON-RPC error and emit governance
+    /// evidence with verdict `deny`.
+    Block,
 }
 
 /// HTTP trust configuration for MCP 2026-07-28 requests.
@@ -689,6 +794,14 @@ pub const MCP_SERVER_DRAFT_REASON: &str = "server_draft";
 /// server's warn-level governance event.
 pub const MCP_SERVER_DEPRECATED_REASON: &str = "mcp_server_deprecated";
 
+/// `sbproxy.decision.reason` for an `argument_policies[]` verdict of
+/// either polarity (WOR-2384, MCP05): names the gate (this one) that
+/// produced the event. The specific rule is carried separately, as
+/// `sbproxy.decision.rule_id` (see [`McpArgumentPolicyVerdict`]'s
+/// `rule_name`), the same reason/rule_id split
+/// `MCP_SERVER_APPROVAL_RULE_ID` and the peer-downgrade rule ids use.
+pub const MCP_ARGUMENT_POLICY_REASON: &str = "argument_policy";
+
 /// One entry in the gateway-level guardrails list.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1017,6 +1130,11 @@ pub struct McpAction {
     /// Built usage sinks for MCP tool-call attribution (WOR-1644),
     /// shared across requests. Empty when none are configured.
     pub usage_sinks: Vec<Arc<dyn sbproxy_ai::usage_sink::UsageSink>>,
+    /// Compiled `argument_policies[]` (WOR-2384, MCP05), in declaration
+    /// order. Empty (the default) means `evaluate_argument_policies`
+    /// always returns [`McpArgumentPolicyVerdict::Allow`] without
+    /// building a CEL/Rego context.
+    pub argument_policies: Vec<CompiledMcpArgumentPolicy>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -1126,6 +1244,205 @@ impl sbproxy_extension::mcp::quarantine::JudgeTransport for GovernedJudgeTranspo
             }
         }
     }
+}
+
+// --- Argument policies (WOR-2384, MCP05) -----------------------------
+
+/// A compiled expression an [`McpArgumentPolicyConfig`] rule evaluates.
+///
+/// A trait rather than a closed `Cel(..) | Rego(..)` enum so tests can
+/// supply a third implementation that panics on purpose, which is the
+/// only way to prove
+/// [`McpAction::evaluate_argument_policies`]'s panic containment without
+/// depending on the CEL or Rego engine misbehaving for real. `&self`
+/// (not `&mut self`): the Rego implementation below hides its required
+/// `&mut` behind an internal mutex, matching how
+/// `crate::policy::rego::RegoPolicy::evaluate` already presents a
+/// shared-reference API over the same engine.
+trait McpArgumentPolicyExpr: Send + Sync + std::fmt::Debug {
+    /// Evaluate against `ctx`. `Ok(true)` is compliant, `Ok(false)` is
+    /// a violation, `Err` is a runtime evaluation failure -- distinct
+    /// from a violation because the caller fails this closed
+    /// regardless of the rule's configured `mode`.
+    fn eval_bool(&self, ctx: &sbproxy_extension::cel::CelContext) -> anyhow::Result<bool>;
+}
+
+impl McpArgumentPolicyExpr for CompiledCel {
+    fn eval_bool(&self, ctx: &sbproxy_extension::cel::CelContext) -> anyhow::Result<bool> {
+        CompiledCel::eval_bool(self, ctx)
+    }
+}
+
+/// Wraps [`CompiledRego`] behind a mutex so [`McpArgumentPolicyExpr`]
+/// can offer `&self`, mirroring `RegoPolicy`'s own reasoning: Regorus
+/// threads `input` through the engine rather than taking it per call,
+/// so a shared engine needs exclusive access for the set-then-evaluate
+/// pair, and the critical section is one evaluation.
+#[derive(Debug)]
+struct RegoArgumentExpr(Mutex<CompiledRego>);
+
+impl McpArgumentPolicyExpr for RegoArgumentExpr {
+    fn eval_bool(&self, ctx: &sbproxy_extension::cel::CelContext) -> anyhow::Result<bool> {
+        let mut compiled = match self.0.lock() {
+            Ok(compiled) => compiled,
+            // A panic mid-evaluation poisons the lock. Recovering is
+            // right for the same reason `RegoPolicy::evaluate` does:
+            // the alternative is that one panicking call denies every
+            // later call to this rule forever.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        compiled.eval_bool(ctx)
+    }
+}
+
+/// Outcome of evaluating one rule's expression, before `mode` is
+/// consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpArgumentPolicyEngineOutcome {
+    /// The expression evaluated `true`: no objection.
+    Compliant,
+    /// The expression evaluated `false`: a violation, subject to
+    /// `mode`.
+    Violation,
+    /// The expression could not be evaluated (a CEL/Rego runtime
+    /// error). Fails closed regardless of `mode`.
+    Error,
+    /// The expression's engine panicked. Fails closed regardless of
+    /// `mode`, and the caller bumps the shared policy-panic counter.
+    Panicked,
+}
+
+/// Catch a panic from `expr.eval_bool(ctx)` and classify the result.
+/// Split from the call site so the classification itself (not just the
+/// catching) is unit-testable against a synthetic `Result`/panic
+/// without needing a real CEL or Rego program to misbehave.
+fn evaluate_mcp_argument_expr(
+    expr: &dyn McpArgumentPolicyExpr,
+    ctx: &sbproxy_extension::cel::CelContext,
+) -> McpArgumentPolicyEngineOutcome {
+    classify_argument_expr_result(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        expr.eval_bool(ctx)
+    })))
+}
+
+/// Pure classification half of [`evaluate_mcp_argument_expr`].
+fn classify_argument_expr_result(
+    result: std::thread::Result<anyhow::Result<bool>>,
+) -> McpArgumentPolicyEngineOutcome {
+    match result {
+        Ok(Ok(true)) => McpArgumentPolicyEngineOutcome::Compliant,
+        Ok(Ok(false)) => McpArgumentPolicyEngineOutcome::Violation,
+        Ok(Err(_)) => McpArgumentPolicyEngineOutcome::Error,
+        Err(_) => McpArgumentPolicyEngineOutcome::Panicked,
+    }
+}
+
+/// One compiled `argument_policies[]` rule.
+#[derive(Debug)]
+pub struct CompiledMcpArgumentPolicy {
+    name: String,
+    when: Option<CompiledCel>,
+    expr: Box<dyn McpArgumentPolicyExpr>,
+    mode: McpArgumentPolicyModeConfig,
+    principals: Vec<McpPrincipalSelector>,
+}
+
+/// Compile one `argument_policies[]` entry. Both the `when` guard and
+/// the main expression are compiled here, once, so a malformed
+/// expression is a config-load error rather than a per-request one.
+fn compile_mcp_argument_policy(
+    cfg: &McpArgumentPolicyConfig,
+) -> anyhow::Result<CompiledMcpArgumentPolicy> {
+    anyhow::ensure!(
+        !cfg.name.trim().is_empty(),
+        "mcp action: argument_policies[].name must not be empty"
+    );
+    let source = match (&cfg.source, &cfg.path) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "mcp action: argument_policies[{}] sets both source and path; pick one",
+            cfg.name
+        ),
+        (Some(source), None) => source.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "mcp action: argument_policies[{}] reading path '{path}': {e}",
+                cfg.name
+            )
+        })?,
+        (None, None) => anyhow::bail!(
+            "mcp action: argument_policies[{}] needs source or path",
+            cfg.name
+        ),
+    };
+
+    let site = format!("mcp argument_policies[{}]", cfg.name);
+    let when = cfg
+        .when
+        .as_ref()
+        .map(|expr| {
+            CompiledCel::compile(
+                CelSurface::McpArgumentPolicy,
+                format!("{site} `when`"),
+                expr,
+            )
+        })
+        .transpose()?;
+
+    let expr: Box<dyn McpArgumentPolicyExpr> = match cfg.engine {
+        McpArgumentPolicyEngineConfig::Cel => Box::new(CompiledCel::compile(
+            CelSurface::McpArgumentPolicy,
+            site,
+            &source,
+        )?),
+        McpArgumentPolicyEngineConfig::Rego => {
+            // Fixed budget and default query, matching `policy: rego`'s
+            // own defaults. Neither is exposed on
+            // `McpArgumentPolicyConfig` today: base-data tables and a
+            // non-default query are `policy: rego` features this
+            // surface has not needed yet, not a deliberate omission.
+            let compiled = CompiledRego::compile(site, &source, "data.sbproxy.allow", 50, None)?;
+            Box::new(RegoArgumentExpr(Mutex::new(compiled)))
+        }
+    };
+
+    Ok(CompiledMcpArgumentPolicy {
+        name: cfg.name.clone(),
+        when,
+        expr,
+        mode: cfg.mode,
+        principals: cfg.principals.clone(),
+    })
+}
+
+/// Verdict from [`McpAction::evaluate_argument_policies`].
+///
+/// Structural monotonicity: this is consulted only after RBAC and
+/// per-tool quota have already allowed the call (see the call site in
+/// `action_dispatch.rs`), so it can only ever narrow that allow, never
+/// grant one RBAC or quota would have refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpArgumentPolicyVerdict {
+    /// No configured rule applied, or every applicable rule was
+    /// compliant.
+    Allow,
+    /// A rule violated under `mode: warn`. The call proceeds; the
+    /// caller must still emit governance evidence with verdict `warn`
+    /// and `rule_name` as the rule id.
+    Warn {
+        /// The first rule (in declaration order) that warned.
+        rule_name: String,
+    },
+    /// The call must be refused: a rule violated under `mode: block`,
+    /// a rule's expression could not be evaluated, or a rule's engine
+    /// panicked. `panicked` distinguishes the last case so the caller
+    /// can bump the shared policy-panic counter.
+    Deny {
+        /// The rule that decided the refusal.
+        rule_name: String,
+        /// Whether the refusal came from a contained panic rather than
+        /// a normal `false` result or evaluation error.
+        panicked: bool,
+    },
 }
 
 impl McpAction {
@@ -1541,6 +1858,15 @@ impl McpAction {
             None => None,
         };
 
+        // WOR-2384 (MCP05): compiled once here so a malformed rule is
+        // a config-load error, exactly like every other CEL/Rego
+        // surface in this codebase.
+        let argument_policies = cfg
+            .argument_policies
+            .iter()
+            .map(compile_mcp_argument_policy)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         Ok(Self {
             mode: cfg.mode,
             server_name,
@@ -1568,7 +1894,110 @@ impl McpAction {
             tool_output_judge,
             tool_pricing: cfg.tool_pricing,
             usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
+            argument_policies,
         })
+    }
+
+    /// Evaluate `argument_policies[]` against one `tools/call` (WOR-2384,
+    /// MCP05).
+    ///
+    /// Call this only after RBAC and per-tool quota have already
+    /// allowed the call: structural monotonicity means this can only
+    /// narrow that allow, never grant one those gates would have
+    /// refused, and the caller (`action_dispatch.rs`) is what makes
+    /// that ordering true, not this function.
+    ///
+    /// Builds the `mcp` CEL/Rego context once and evaluates every
+    /// configured rule in declaration order. A rule whose `principals`
+    /// selector does not match `principal`, or whose `when` guard
+    /// evaluates `false`, does not apply and is skipped. The first
+    /// rule that denies (a `mode: block` violation, an evaluation
+    /// error, or a panic) stops the scan and decides the verdict; a
+    /// `mode: warn` violation is remembered (the first one seen) but
+    /// scanning continues, since a later rule may still deny.
+    #[allow(clippy::too_many_arguments)] // one call site; each argument is an independently-sourced field of the mcp CEL context
+    pub fn evaluate_argument_policies(
+        &self,
+        principal: &sbproxy_plugin::Principal,
+        tool_name: &str,
+        server: &str,
+        tenant: &str,
+        session_id: Option<&str>,
+        arguments: &serde_json::Value,
+    ) -> McpArgumentPolicyVerdict {
+        if self.argument_policies.is_empty() {
+            return McpArgumentPolicyVerdict::Allow;
+        }
+
+        let view = sbproxy_extension::cel::context::McpArgumentPolicyView {
+            tool_name,
+            server,
+            session_id,
+            tenant,
+            principal_sub: principal.sub.as_str(),
+            principal_team: principal.attrs.team.as_deref(),
+            principal_project: principal.attrs.project.as_deref(),
+            principal_user: principal.attrs.user.as_deref(),
+            arguments,
+        };
+        let ctx = sbproxy_extension::cel::context::build_mcp_argument_policy_context(&view);
+
+        let mut warned: Option<String> = None;
+        for rule in &self.argument_policies {
+            if !rule.principals.is_empty()
+                && !rule.principals.iter().any(|s| s.matches(principal))
+            {
+                continue;
+            }
+            if let Some(when) = &rule.when {
+                // A `when` that cannot be evaluated (error or panic) is
+                // conservatively treated as applicable: skipping a rule
+                // that could not prove itself inapplicable is the wider
+                // failure mode, and the main expression below has its
+                // own fail-closed posture for a genuine evaluation
+                // fault.
+                if matches!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        when.eval_bool(&ctx)
+                    })),
+                    Ok(Ok(false))
+                ) {
+                    continue;
+                }
+            }
+            match evaluate_mcp_argument_expr(rule.expr.as_ref(), &ctx) {
+                McpArgumentPolicyEngineOutcome::Compliant => continue,
+                McpArgumentPolicyEngineOutcome::Violation => match rule.mode {
+                    McpArgumentPolicyModeConfig::Block => {
+                        return McpArgumentPolicyVerdict::Deny {
+                            rule_name: rule.name.clone(),
+                            panicked: false,
+                        };
+                    }
+                    McpArgumentPolicyModeConfig::Warn => {
+                        if warned.is_none() {
+                            warned = Some(rule.name.clone());
+                        }
+                    }
+                },
+                McpArgumentPolicyEngineOutcome::Error => {
+                    return McpArgumentPolicyVerdict::Deny {
+                        rule_name: rule.name.clone(),
+                        panicked: false,
+                    };
+                }
+                McpArgumentPolicyEngineOutcome::Panicked => {
+                    return McpArgumentPolicyVerdict::Deny {
+                        rule_name: rule.name.clone(),
+                        panicked: true,
+                    };
+                }
+            }
+        }
+        match warned {
+            Some(rule_name) => McpArgumentPolicyVerdict::Warn { rule_name },
+            None => McpArgumentPolicyVerdict::Allow,
+        }
     }
 
     /// USD cost for one call of `tool`, from the price map (WOR-1644).
@@ -3434,5 +3863,444 @@ mod tests {
             .expect("compiled")
             .peer_key;
         assert_ne!(warn_key, block_key);
+    }
+
+    // --- Argument policies (WOR-2384, MCP05) ---
+
+    fn argument_policy_action(policies: serde_json::Value) -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "server_info": {"name": "argument-policy-fixture", "version": "1.0.0"},
+            "federated_servers": [{ "origin": "example.com", "prefix": "srv" }],
+            "argument_policies": policies
+        }))
+        .expect("argument-policy fixture compiles")
+    }
+
+    fn principal_for(tenant: &str) -> sbproxy_plugin::Principal {
+        let mut principal = sbproxy_plugin::Principal::anonymous();
+        principal.tenant_id = sbproxy_plugin::TenantId::from(tenant);
+        principal
+    }
+
+    #[test]
+    fn a_cel_rule_denies_a_path_traversal_shaped_argument_in_block_mode() {
+        // WOR-2384 red-first: fails today because `evaluate_argument_policies`
+        // (and the `argument_policies[]` config key) do not exist yet.
+        let action = argument_policy_action(json!([{
+            "name": "no-path-traversal",
+            "engine": "cel",
+            "source": "!mcp.arguments.path.contains(\"..\")",
+            "mode": "block"
+        }]));
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({"path": "../../etc/passwd"}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "no-path-traversal".to_string(),
+                panicked: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_compliant_argument_is_allowed_in_block_mode() {
+        let action = argument_policy_action(json!([{
+            "name": "no-path-traversal",
+            "engine": "cel",
+            "source": "!mcp.arguments.path.contains(\"..\")",
+            "mode": "block"
+        }]));
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({"path": "reports/q3.csv"}),
+        );
+        assert_eq!(verdict, McpArgumentPolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn warn_mode_names_the_rule_but_does_not_deny() {
+        let action = argument_policy_action(json!([{
+            "name": "no-path-traversal",
+            "engine": "cel",
+            "source": "!mcp.arguments.path.contains(\"..\")",
+            "mode": "warn"
+        }]));
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({"path": "../../etc/passwd"}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Warn {
+                rule_name: "no-path-traversal".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mode_defaults_to_warn_when_omitted() {
+        let action = argument_policy_action(json!([{
+            "name": "no-path-traversal",
+            "engine": "cel",
+            "source": "!mcp.arguments.path.contains(\"..\")"
+        }]));
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({"path": "../../etc/passwd"}),
+        );
+        assert!(
+            matches!(verdict, McpArgumentPolicyVerdict::Warn { .. }),
+            "an omitted mode must default to warn, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_rego_rule_over_the_same_predicate_produces_the_same_verdict_as_cel() {
+        // Parity test (Rick's directive): CEL and Rego over the same
+        // predicate must agree, in both directions.
+        const MODULE: &str = r#"
+package sbproxy
+
+default allow := true
+
+allow := false if {
+    contains(input.mcp.arguments.path, "..")
+}
+"#;
+        let action = argument_policy_action(json!([{
+            "name": "no-path-traversal-rego",
+            "engine": "rego",
+            "source": MODULE,
+            "mode": "block"
+        }]));
+
+        let denied = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({"path": "../../etc/passwd"}),
+        );
+        assert_eq!(
+            denied,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "no-path-traversal-rego".to_string(),
+                panicked: false,
+            },
+            "rego must deny the same shape cel denies"
+        );
+
+        let allowed = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({"path": "reports/q3.csv"}),
+        );
+        assert_eq!(
+            allowed,
+            McpArgumentPolicyVerdict::Allow,
+            "rego must allow the same shape cel allows"
+        );
+    }
+
+    #[test]
+    fn a_rule_cannot_fire_for_another_tenants_principal_selector() {
+        // Multi-tenant ruling: a policy cannot read (or fire against)
+        // another tenant's state. The rule always denies when it
+        // applies, so a call from a non-matching tenant proves the
+        // selector -- not the predicate -- is what kept it from firing.
+        let action = argument_policy_action(json!([{
+            "name": "tenant-a-only",
+            "engine": "cel",
+            "source": "false",
+            "mode": "block",
+            "principals": [{"tenant_id": "tenant-a"}]
+        }]));
+
+        let other_tenant = action.evaluate_argument_policies(
+            &principal_for("tenant-b"),
+            "any_tool",
+            "srv",
+            "tenant-b",
+            None,
+            &json!({}),
+        );
+        assert_eq!(
+            other_tenant,
+            McpArgumentPolicyVerdict::Allow,
+            "a rule scoped to tenant-a must not fire for tenant-b's principal"
+        );
+
+        let matching_tenant = action.evaluate_argument_policies(
+            &principal_for("tenant-a"),
+            "any_tool",
+            "srv",
+            "tenant-a",
+            None,
+            &json!({}),
+        );
+        assert_eq!(
+            matching_tenant,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "tenant-a-only".to_string(),
+                panicked: false,
+            },
+            "the same rule must fire for the tenant it is scoped to"
+        );
+    }
+
+    #[test]
+    fn an_evaluation_error_denies_regardless_of_configured_mode() {
+        // A policy evaluation ERROR fails closed at this surface (an
+        // unevaluable security policy must not admit), independent of
+        // `mode: warn`. `1 + 1` compiles as valid CEL but is not a
+        // boolean, which is a runtime evaluation error, not a `false`.
+        let action = argument_policy_action(json!([{
+            "name": "not-actually-boolean",
+            "engine": "cel",
+            "source": "1 + 1",
+            "mode": "warn"
+        }]));
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "any_tool",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "not-actually-boolean".to_string(),
+                panicked: false,
+            },
+            "an unevaluable rule must deny even though mode is warn: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_when_guard_scopes_the_rule_to_the_tool_it_names() {
+        let action = argument_policy_action(json!([{
+            "name": "send-email-only",
+            "when": "mcp.tool.name == \"send_email\"",
+            "engine": "cel",
+            "source": "false",
+            "mode": "block"
+        }]));
+        let other_tool = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "read_file",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+        );
+        assert_eq!(
+            other_tool,
+            McpArgumentPolicyVerdict::Allow,
+            "the rule must not apply to a tool `when` does not name"
+        );
+        let named_tool = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "send_email",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+        );
+        assert!(matches!(named_tool, McpArgumentPolicyVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn no_configured_rules_always_allows() {
+        let action = argument_policy_action(json!([]));
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "any_tool",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+        );
+        assert_eq!(verdict, McpArgumentPolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn source_and_path_together_are_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{ "origin": "example.com" }],
+            "argument_policies": [{
+                "name": "bad",
+                "engine": "cel",
+                "source": "true",
+                "path": "/tmp/does-not-matter.cel"
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("source and path together must refuse");
+        assert!(err.to_string().contains("pick one"), "{err}");
+    }
+
+    #[test]
+    fn neither_source_nor_path_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{ "origin": "example.com" }],
+            "argument_policies": [{
+                "name": "bad",
+                "engine": "cel"
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("missing source and path must refuse");
+        assert!(err.to_string().contains("needs source or path"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_rule_name_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{ "origin": "example.com" }],
+            "argument_policies": [{
+                "name": "",
+                "engine": "cel",
+                "source": "true"
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("an empty rule name must refuse");
+        assert!(err.to_string().contains("name"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_cel_expression_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{ "origin": "example.com" }],
+            "argument_policies": [{
+                "name": "bad-cel",
+                "engine": "cel",
+                "source": "this is not valid CEL !!!"
+            }]
+        });
+        assert!(McpAction::from_config(value).is_err());
+    }
+
+    #[test]
+    fn a_malformed_rego_module_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{ "origin": "example.com" }],
+            "argument_policies": [{
+                "name": "bad-rego",
+                "engine": "rego",
+                "source": "not rego !!!"
+            }]
+        });
+        assert!(McpAction::from_config(value).is_err());
+    }
+
+    // --- Panic containment ---
+
+    #[derive(Debug)]
+    struct PanickingExpr;
+
+    impl McpArgumentPolicyExpr for PanickingExpr {
+        fn eval_bool(&self, _ctx: &sbproxy_extension::cel::CelContext) -> anyhow::Result<bool> {
+            panic!("WOR-2384: synthetic panic for argument-policy containment test");
+        }
+    }
+
+    #[test]
+    fn classify_argument_expr_result_maps_every_outcome() {
+        assert_eq!(
+            classify_argument_expr_result(Ok(Ok(true))),
+            McpArgumentPolicyEngineOutcome::Compliant
+        );
+        assert_eq!(
+            classify_argument_expr_result(Ok(Ok(false))),
+            McpArgumentPolicyEngineOutcome::Violation
+        );
+        assert_eq!(
+            classify_argument_expr_result(Ok(Err(anyhow::anyhow!("boom")))),
+            McpArgumentPolicyEngineOutcome::Error
+        );
+        assert_eq!(
+            classify_argument_expr_result(Err(Box::new("synthetic"))),
+            McpArgumentPolicyEngineOutcome::Panicked
+        );
+    }
+
+    #[test]
+    fn evaluate_mcp_argument_expr_contains_a_real_panic() {
+        // Proves `std::panic::catch_unwind` is actually wired around
+        // the call, not just that the classifier maps `Err` correctly
+        // in isolation (the test above).
+        let ctx = sbproxy_extension::cel::context::build_mcp_argument_policy_context(
+            &sbproxy_extension::cel::context::McpArgumentPolicyView {
+                tool_name: "t",
+                server: "s",
+                session_id: None,
+                tenant: "acme",
+                principal_sub: "",
+                principal_team: None,
+                principal_project: None,
+                principal_user: None,
+                arguments: &json!({}),
+            },
+        );
+        let outcome = evaluate_mcp_argument_expr(&PanickingExpr, &ctx);
+        assert_eq!(outcome, McpArgumentPolicyEngineOutcome::Panicked);
+    }
+
+    #[test]
+    fn a_panicking_rule_denies_through_the_full_evaluate_argument_policies_path_and_flags_panicked()
+    {
+        let mut action = argument_policy_action(json!([]));
+        action.argument_policies = vec![CompiledMcpArgumentPolicy {
+            name: "panics".to_string(),
+            when: None,
+            expr: Box::new(PanickingExpr),
+            mode: McpArgumentPolicyModeConfig::Warn,
+            principals: Vec::new(),
+        }];
+        let verdict = action.evaluate_argument_policies(
+            &principal_for("acme"),
+            "any_tool",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "panics".to_string(),
+                panicked: true,
+            },
+            "a panicking rule must deny even under mode: warn, and must flag panicked: {verdict:?}"
+        );
     }
 }

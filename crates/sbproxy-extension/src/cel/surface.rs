@@ -113,6 +113,15 @@ pub enum CelSurface {
     /// each get their own label and can diverge later without one reading
     /// the other's empty bindings.
     AiRouting,
+    /// An `mcp` action's `argument_policies[]` entry (WOR-2384, MCP05).
+    ///
+    /// Another single-namespace surface, like [`Self::AiPolicy`]: the
+    /// whole vocabulary is the gateway-computed `mcp` tool-call view
+    /// (tool name, server, session, tenant, principal, and the parsed
+    /// call arguments). Nothing request-shaped is populated -- an
+    /// argument policy runs at the MCP dispatch seam, not the HTTP
+    /// request phase, so `request.*` here is a typo to refuse at load.
+    McpArgumentPolicy,
 }
 
 /// Bindings shared by every site that starts from `build_request_context`.
@@ -141,6 +150,7 @@ impl CelSurface {
             Self::WafPersistent => "waf persistent rule",
             Self::AiPolicy => "ai_policy `expression`",
             Self::AiRouting => "ai_routing_policy `expression`",
+            Self::McpArgumentPolicy => "mcp `argument_policies`",
         }
     }
 
@@ -210,6 +220,19 @@ impl CelSurface {
             // `AiDecisionView::to_cel`. See ai-policy-cel.md. The routing
             // policy reads the same decision view.
             Self::AiPolicy | Self::AiRouting => vec!["ai"],
+            // The evaluator sets exactly one variable: `mcp`, from
+            // `context::build_mcp_argument_policy_context`. Declared as
+            // 2-segment prefixes so the deeper leaves an operator
+            // actually writes (`mcp.tool.name`, `mcp.principal.sub`,
+            // `mcp.arguments.<field>`) resolve under them.
+            Self::McpArgumentPolicy => vec![
+                "mcp.arguments",
+                "mcp.principal",
+                "mcp.server",
+                "mcp.session",
+                "mcp.tenant",
+                "mcp.tool",
+            ],
             // custom_log builds its own JSON context rather than using
             // the shared builders, which is why its shape is unlike the
             // rest. It is the only site with `attribution` and the only
@@ -248,7 +271,11 @@ impl CelSurface {
     const fn uses_shared_request_context(self) -> bool {
         !matches!(
             self,
-            Self::CustomLogField | Self::TransformCel | Self::AiPolicy | Self::AiRouting
+            Self::CustomLogField
+                | Self::TransformCel
+                | Self::AiPolicy
+                | Self::AiRouting
+                | Self::McpArgumentPolicy
         )
     }
 
@@ -823,5 +850,39 @@ mod tests {
             !available.contains(&"request.time"),
             "custom_log builds its own context and has no request.time"
         );
+    }
+
+    #[test]
+    fn mcp_argument_policy_accepts_the_tool_call_bindings() {
+        // WOR-2384 (MCP05): the shapes docs/scripting examples for
+        // `argument_policies[]` actually write.
+        for source in [
+            r#"mcp.tool.name == "send_email""#,
+            r#"mcp.arguments.to.endsWith("@company.com")"#,
+            "size(mcp.arguments.cc) <= 5",
+            r#"mcp.principal.team == "platform""#,
+            r#"mcp.server == "gh""#,
+            r#"mcp.session.id != """#,
+            r#"mcp.tenant == "acme""#,
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::McpArgumentPolicy
+                .validate("mcp `argument_policies`", source, &program)
+                .unwrap_or_else(|e| panic!("{source} must be a valid mcp argument-policy binding: {e}"));
+        }
+    }
+
+    #[test]
+    fn mcp_argument_policy_refuses_a_request_shaped_binding() {
+        // Argument policies run at the MCP dispatch seam, not the HTTP
+        // request phase: `request.*` is a typo to refuse at load, not a
+        // binding that reads empty.
+        let source = r#"request.method == "POST""#;
+        let program = cel::Program::compile(source).expect("compiles");
+        let error = CelSurface::McpArgumentPolicy
+            .validate("mcp `argument_policies`", source, &program)
+            .expect_err("mcp argument policies do not populate request.*");
+        assert!(error.contains("mcp `argument_policies`"), "{error}");
+        assert!(error.contains("mcp.tool"), "{error}");
     }
 }

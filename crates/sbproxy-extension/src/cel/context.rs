@@ -881,6 +881,111 @@ fn json_to_cel(value: &serde_json::Value) -> CelValue {
     }
 }
 
+/// Borrowed view of one MCP `tools/call` for the `argument_policies[]`
+/// CEL/Rego surface (WOR-2384, MCP05). Unlike [`PrincipalView`], this is
+/// a minimal, MCP-specific shape (`sub`/`team`/`project`/`user` flat
+/// under `mcp.principal`, not the full `attrs`/`claims`/`virtual_key`
+/// tree) because that is the vocabulary the SOTA research and the task
+/// brief settled on for this surface.
+#[derive(Debug, Clone, Copy)]
+pub struct McpArgumentPolicyView<'a> {
+    /// Advertised (namespaced) tool name being called.
+    pub tool_name: &'a str,
+    /// Owning federated server name.
+    pub server: &'a str,
+    /// MCP session id, when `sessions.enabled`.
+    pub session_id: Option<&'a str>,
+    /// Host-derived tenant id. A policy can only ever see the calling
+    /// request's own tenant; there is no cross-tenant lookup surface
+    /// here, so a `principals[]` selector scoped to another tenant
+    /// simply never matches (see `McpPrincipalSelector::matches`).
+    pub tenant: &'a str,
+    /// Subject identifier (JWT sub, VK name, basic-auth username).
+    pub principal_sub: &'a str,
+    /// Attribution: team, when set.
+    pub principal_team: Option<&'a str>,
+    /// Attribution: project, when set.
+    pub principal_project: Option<&'a str>,
+    /// Attribution: user, when set.
+    pub principal_user: Option<&'a str>,
+    /// Parsed `tools/call` arguments (the JSON-RPC `params.arguments`
+    /// document). Bound verbatim as `mcp.arguments`; a `Null` value
+    /// (no arguments supplied) binds as CEL `null`, so a rule that
+    /// selects into it (`mcp.arguments.path`) fails to evaluate rather
+    /// than reading a default -- which fails this surface closed, per
+    /// the module's evaluation-error posture.
+    pub arguments: &'a serde_json::Value,
+}
+
+/// Build the `mcp` CEL/Rego namespace for one tool call (WOR-2384,
+/// MCP05).
+///
+/// A standalone context: unlike [`build_request_context`], this does
+/// not carry `request.*` or `connection.*` -- an argument policy runs
+/// at the MCP dispatch seam, after the HTTP request has already been
+/// authenticated and routed, so nothing in that vocabulary applies.
+/// [`crate::cel::CelSurface::McpArgumentPolicy`] enforces the same
+/// boundary at config-load time.
+///
+/// # Namespace
+///
+/// - `mcp.tool.name` - the tool being called
+/// - `mcp.server` - owning federated server name
+/// - `mcp.session.id` - MCP session id, `""` when sessions are disabled
+/// - `mcp.arguments` - the parsed call arguments (map, or `null`/scalar
+///   if the caller supplied something other than an object)
+/// - `mcp.tenant` - host-derived tenant id
+/// - `mcp.principal.sub` / `.team` / `.project` / `.user` - caller
+///   identity; unset attributes render as `""`
+///
+/// Reused as-is for Rego: [`sbproxy_extension::rego::CompiledRego`]
+/// converts this same [`CelContext`] to `input.mcp.*`, so a CEL rule and
+/// a Rego rule over the same predicate read identical bindings.
+pub fn build_mcp_argument_policy_context(view: &McpArgumentPolicyView<'_>) -> CelContext {
+    let mut ctx = CelContext::new();
+
+    let mut tool = HashMap::new();
+    tool.insert(
+        "name".to_string(),
+        CelValue::String(view.tool_name.to_string()),
+    );
+
+    let mut session = HashMap::new();
+    session.insert(
+        "id".to_string(),
+        CelValue::String(view.session_id.unwrap_or("").to_string()),
+    );
+
+    let mut principal = HashMap::new();
+    principal.insert(
+        "sub".to_string(),
+        CelValue::String(view.principal_sub.to_string()),
+    );
+    principal.insert(
+        "team".to_string(),
+        CelValue::String(view.principal_team.unwrap_or("").to_string()),
+    );
+    principal.insert(
+        "project".to_string(),
+        CelValue::String(view.principal_project.unwrap_or("").to_string()),
+    );
+    principal.insert(
+        "user".to_string(),
+        CelValue::String(view.principal_user.unwrap_or("").to_string()),
+    );
+
+    let mut mcp = HashMap::new();
+    mcp.insert("tool".to_string(), CelValue::Map(tool));
+    mcp.insert("server".to_string(), CelValue::String(view.server.to_string()));
+    mcp.insert("session".to_string(), CelValue::Map(session));
+    mcp.insert("arguments".to_string(), json_to_cel(view.arguments));
+    mcp.insert("tenant".to_string(), CelValue::String(view.tenant.to_string()));
+    mcp.insert("principal".to_string(), CelValue::Map(principal));
+
+    ctx.set("mcp", CelValue::Map(mcp));
+    ctx
+}
+
 /// View of per-request feature flags (WOR-114 Phase 2). Borrowed
 /// from `RequestContext.flags` so the CEL layer never clones.
 ///
@@ -2077,5 +2182,93 @@ mod resolved_key_id_tests {
         assert!(engine
             .eval_bool_source(r#"request.path == "/v1/chat/completions""#, &c)
             .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod mcp_argument_policy_context_tests {
+    use super::*;
+    use crate::cel::CelEngine;
+
+    #[test]
+    fn every_documented_binding_reads_back_what_the_view_supplied() {
+        let arguments = serde_json::json!({"to": "alice@company.com", "cc": ["bob@company.com"]});
+        let view = McpArgumentPolicyView {
+            tool_name: "send_email",
+            server: "gh",
+            session_id: Some("sess-1"),
+            tenant: "acme",
+            principal_sub: "alice",
+            principal_team: Some("platform"),
+            principal_project: Some("proj-x"),
+            principal_user: Some("alice@acme.com"),
+            arguments: &arguments,
+        };
+        let ctx = build_mcp_argument_policy_context(&view);
+        let engine = CelEngine::new();
+        for (expr, label) in [
+            (r#"mcp.tool.name == "send_email""#, "tool.name"),
+            (r#"mcp.server == "gh""#, "server"),
+            (r#"mcp.session.id == "sess-1""#, "session.id"),
+            (r#"mcp.tenant == "acme""#, "tenant"),
+            (r#"mcp.principal.sub == "alice""#, "principal.sub"),
+            (r#"mcp.principal.team == "platform""#, "principal.team"),
+            (r#"mcp.principal.project == "proj-x""#, "principal.project"),
+            (r#"mcp.principal.user == "alice@acme.com""#, "principal.user"),
+            (
+                r#"mcp.arguments.to == "alice@company.com""#,
+                "arguments.to",
+            ),
+            (r#"size(mcp.arguments.cc) == 1"#, "arguments.cc"),
+        ] {
+            assert!(
+                engine.eval_bool_source(expr, &ctx).unwrap_or(false),
+                "{label} did not read back as bound: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_session_and_principal_attributes_render_as_empty_string() {
+        let arguments = serde_json::json!({});
+        let view = McpArgumentPolicyView {
+            tool_name: "search",
+            server: "gh",
+            session_id: None,
+            tenant: "acme",
+            principal_sub: "anon",
+            principal_team: None,
+            principal_project: None,
+            principal_user: None,
+            arguments: &arguments,
+        };
+        let ctx = build_mcp_argument_policy_context(&view);
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"mcp.session.id == """#, &ctx)
+            .unwrap_or(false));
+        assert!(engine
+            .eval_bool_source(r#"mcp.principal.team == """#, &ctx)
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn the_context_carries_no_request_namespace() {
+        // An argument policy runs at the MCP dispatch seam, not the
+        // HTTP request phase: nothing under `request.*` is populated.
+        let arguments = serde_json::json!({});
+        let view = McpArgumentPolicyView {
+            tool_name: "search",
+            server: "gh",
+            session_id: None,
+            tenant: "acme",
+            principal_sub: "anon",
+            principal_team: None,
+            principal_project: None,
+            principal_user: None,
+            arguments: &arguments,
+        };
+        let ctx = build_mcp_argument_policy_context(&view);
+        assert!(!ctx.variables.contains_key("request"));
     }
 }

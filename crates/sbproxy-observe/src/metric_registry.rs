@@ -2197,6 +2197,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_argument_policy_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_argument_policy"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "rule", "verdict"],
+        description: "MCP argument-policy rule triggers, by tenant, rule name, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_tool_cost_usd_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_tool_cost"),
@@ -3575,6 +3586,10 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     // "some evidence write failed somewhere", which cannot tell an
     // operator whose governed calls are being blocked.
     "sbproxy_mcp_evidence_fail_closed_total",
+    // WOR-2384 (MCP05). An argument-policy trigger is a security-policy
+    // outcome for one tenant's tool-call traffic, same reasoning as the
+    // evidence fail-closed counter directly above.
+    "sbproxy_mcp_argument_policy_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
     // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a

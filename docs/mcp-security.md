@@ -100,6 +100,59 @@ upstream. A tool outside the allowlist is not advertised and not callable.
 **Still yours.** Deciding what the right scope is. The gateway enforces the
 list you write; it has no opinion about whether `gh.delete_repo` belongs on it.
 
+## A permitted tool called with an argument that should not be
+
+**What goes wrong.** RBAC and an allowlist answer "can this caller invoke
+`send_email` at all", not "should this particular call go through". A
+principal allowed to call a tool can still supply an argument that steers it
+somewhere it should not go: an external recipient on an internal-only tool, a
+path outside a sandboxed directory, a destination host outside an approved
+set. JSON-Schema validation checks shape, not intent.
+
+**What the gateway does.** `argument_policies[]` evaluates a CEL or
+OPA-compatible Rego expression against the tool-call context, including the
+parsed arguments, after RBAC and JSON-Schema validation pass and before the
+call dispatches:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      argument_policies:
+        - name: internal-recipients-only
+          when: mcp.tool.name == "send_email"
+          engine: cel
+          source: mcp.arguments.to.endsWith("@company.com")
+          mode: block
+        - name: internal-recipients-only-rego
+          engine: rego
+          source: |
+            package sbproxy
+            default allow := false
+            allow if {
+                endswith(input.mcp.arguments.to, "@company.com")
+            }
+          mode: block
+```
+
+The expression's boolean result follows the CEL/Rego convention used
+everywhere else in this gateway: `true` is compliant, `false` is a
+violation. `mode: warn` (the default) logs the violation and emits a
+`mcp_governance_decision` event with verdict `warn`, but the call still
+proceeds; `mode: block` refuses it with a JSON-RPC error and verdict `deny`,
+naming the rule as `sbproxy.decision.rule_id`. A rule can only turn an
+already-passed RBAC allow into a refusal, never the reverse: it runs after
+RBAC and per-tool quota, so an RBAC denial always wins and an argument
+policy never even evaluates against a call RBAC already refused. A rule
+whose expression cannot be evaluated, or whose engine panics, refuses the
+call regardless of the configured `mode`, the same fail-closed posture
+`policy: rego` already has. Optional `principals[]` selectors, the same
+shape as `rbac_policies[].tool_access[].principals`, scope a rule to one
+tenant, team, or project.
+
+**Still yours.** Writing the predicate. The gateway evaluates whatever CEL or
+Rego you give it against `mcp.tool.name`, `mcp.server`, `mcp.session.id`,
+`mcp.arguments`, `mcp.tenant`, and `mcp.principal.{sub,team,project,user}`; it
+has no opinion about which arguments matter for your tools.
+
 ## A tool definition changing after you approved it
 
 **What goes wrong.** This is the rug pull. A server advertises a benign tool,

@@ -64,6 +64,23 @@ the next version cut.
   Optional `approved_by` / `approved_at` metadata is operator-attested
   and stored, not verified.
 
+- **MCP tool calls can be authorized on their arguments, not just their
+  name.** An `mcp` action's `argument_policies[]` evaluates a CEL or
+  OPA-compatible Rego expression against the tool-call context
+  (`mcp.tool.name`, `mcp.server`, `mcp.session.id`, `mcp.arguments`,
+  `mcp.tenant`, `mcp.principal.{sub,team,project,user}`) after RBAC and
+  JSON-Schema validation pass and before the call quotas and
+  dispatches: a rule can only narrow an already-passed RBAC allow,
+  never widen it. `mode: warn` (default) logs and emits a
+  `mcp_governance_decision` event with verdict `warn`; `mode: block`
+  refuses the call with a JSON-RPC error and verdict `deny`, naming the
+  rule as `sbproxy.decision.rule_id`. A rule that cannot be evaluated,
+  or whose engine panics, fails closed regardless of `mode`. Optional
+  `principals[]` selectors scope a rule to a tenant, team, or project,
+  the same shape as the RBAC `tool_access[].principals` rows. Legacy-era
+  `tools/call` requests with a compiled contract now also get the
+  JSON-Schema check modern-era calls already had.
+
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
   job) fails when an Apache-2.0-only dependency is missing a stanza,

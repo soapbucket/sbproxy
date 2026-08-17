@@ -4327,6 +4327,36 @@ pub fn record_evidence_seq_tenant_cap() {
     counter.inc();
 }
 
+/// Record one `argument_policies[]` rule outcome that was not a plain
+/// allow, on `sbproxy_mcp_argument_policy_total{tenant, rule, verdict}`
+/// (WOR-2384, MCP05). `verdict` is `"warn"` or `"deny"`; a compliant
+/// evaluation is not recorded here, matching the sibling `mcp_rbac` /
+/// `mcp_quota` / `mcp_peer_downgrade` policy triggers, which also only
+/// ever record a triggered outcome.
+///
+/// `rule` is the operator-configured rule name. Cardinality is bounded
+/// by config, the same reasoning `sbproxy_mcp_evidence_fail_closed_total`
+/// documents for `tenant`: both label values come from what an operator
+/// wrote, not from caller-controlled request data.
+pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_argument_policy_total",
+            "MCP argument-policy rule triggers, by tenant, rule name, and verdict",
+            &["tenant", "rule", "verdict"],
+        )
+        .expect("mcp argument policy counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    let rule = sanitize_label("rule", rule);
+    counter
+        .with_label_values(&[tenant.as_str(), rule.as_str(), verdict])
+        .inc();
+}
+
 /// Record a static tool-poisoning indicator found in advertised tool text on
 /// `sbproxy_mcp_poison_indicators_total{field, indicator, kind}`.
 ///
@@ -7046,6 +7076,26 @@ mod tests {
                 .any(|(labels, value)| labels.contains("policy=budget_share") && *value >= 1.0),
             "sbproxy_policy_panic_total did not register or did not carry \
              the policy label: {counted:?}"
+        );
+    }
+
+    /// An MCP argument-policy trigger is counted on
+    /// `sbproxy_mcp_argument_policy_total{tenant, rule, verdict}` and
+    /// carries all three labels (WOR-2384, MCP05).
+    #[test]
+    fn mcp_argument_policy_trigger_is_counted_with_its_tenant_rule_and_verdict_labels() {
+        record_mcp_argument_policy("acme", "no-path-traversal", "deny");
+
+        let counted = gathered_series("sbproxy_mcp_argument_policy_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=no-path-traversal")
+                    && labels.contains("verdict=deny")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_argument_policy_total did not register or did not carry \
+             the tenant/rule/verdict labels: {counted:?}"
         );
     }
 }
