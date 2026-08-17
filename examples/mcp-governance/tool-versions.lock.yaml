@@ -1,0 +1,69 @@
+# Committed baseline, as written by `sbproxy mcp lock`. One digest and
+# declared semver per advertised (already prefixed) tool name.
+#
+# `block_unlocked: true` in sb.yml means a tool with no entry here is
+# blocked outright rather than merely reported. Only the four tools
+# this example's walkthrough actually calls are locked below;
+# `crm.hello` and `legacy.hello` (real, live tools on the shared
+# upstream that nothing here calls) are deliberately left unlocked, so
+# `tools/list` shows them missing and a `tools/call` against either
+# comes back "blocked by the version gate" -- the escape hatch closing
+# in front of you rather than a claim you have to take on faith.
+#
+# Regenerate with `sbproxy mcp lock -f sb.yml` after reviewing an
+# upstream change, and check it in CI with `sbproxy mcp verify-lock`,
+# which exits 2 on drift.
+version: 1
+generated_for: mcp.example.com
+tools:
+  reports.hello:
+    semver: "1.0.0"
+    contract_digest: "mcp-contract-v2-sha256:38289291a2871382febce7c3d203754c48b56ecec32359cb8fa96a6fe49ec139"
+    contract:
+      name: reports.hello
+      description: Returns a greeting
+      inputSchema:
+        type: object
+        properties:
+          name:
+            type: string
+            description: Name to greet
+  reports.echo:
+    semver: "1.0.0"
+    contract_digest: "mcp-contract-v2-sha256:cee189e2891763e2907571cfe8f909e9842da8a88c98eb0a0b28f71174a3d704"
+    contract:
+      name: reports.echo
+      description: Echoes back the input
+      inputSchema:
+        type: object
+        properties:
+          message:
+            type: string
+            description: Message to echo
+        required: [message]
+  crm.echo:
+    semver: "1.0.0"
+    contract_digest: "mcp-contract-v2-sha256:3755613087283746f133b410055aed4e98f3416fbe17df8723475bfdc918e4e0"
+    contract:
+      name: crm.echo
+      description: Echoes back the input
+      inputSchema:
+        type: object
+        properties:
+          message:
+            type: string
+            description: Message to echo
+        required: [message]
+  legacy.echo:
+    semver: "1.0.0"
+    contract_digest: "mcp-contract-v2-sha256:9f4f5a0138419a39d96d589b76303d780e77728385c0383e5529ab482a2846b3"
+    contract:
+      name: legacy.echo
+      description: Echoes back the input
+      inputSchema:
+        type: object
+        properties:
+          message:
+            type: string
+            description: Message to echo
+        required: [message]

@@ -1,0 +1,230 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The MCP governance pack, all turned on at once.
+#
+# Every block below defaults OFF in the product. This is the
+# opinionated profile that turns the whole pack on: bearer auth on the
+# endpoint, default-deny RBAC, a pinned tool allowlist, a checked-in
+# tool-versioning lockfile, streamable HTTP sessions, per-upstream
+# egress gating, registry approval status, protocol pinning, argument
+# policies in both CEL and Rego, deterministic session-flow
+# enforcement, response-side content filtering, and a fail-closed
+# governance-evidence feed. See README.md for what each block enforces
+# and a full curl walkthrough with expected outcomes.
+#
+# Three federated servers, all pointed at the project's real,
+# reachable test endpoint (test.sbproxy.dev, which serves two live
+# tools: `hello` and `echo`) so every call below is a genuine round
+# trip, not a transcript:
+#   - reports: approved, trusted, the outbound leg of the session-flow
+#     demo.
+#   - crm: approved but NOT trusted and IS sensitive, standing in for
+#     a customer-data source. Reading it (`crm.echo`) is what taints
+#     and marks a session sensitive.
+#   - legacy: status: draft, never approved. Exists only to show a
+#     draft server's tools refused before dispatch.
+#
+# Run (from inside this directory, so the lockfile and Rego policy
+# paths below resolve):
+#   cd examples/mcp-governance
+#   sbproxy serve -f sb.yml
+#
+# See README.md for the full walkthrough.
+
+proxy:
+  http_bind_port: 8080
+
+# Every governed decision, gapless per tenant while this sink is
+# enabled. File sink so the whole demo works offline: tail
+# mcp-governance-events.ndjson after the calls in README.md and every
+# refusal (and the redact/warn hits) is a line of JSON.
+events:
+  sink: file
+  path: mcp-governance-events.ndjson
+  types:
+    - mcp_governance_decision
+  fail_closed:
+    - mcp_governance_decision
+
+origins:
+  "mcp.example.com":
+    # The first MCP example in this repo to pair authentication with
+    # `action.type: mcp`. Every call below needs
+    # `Authorization: Bearer governance-demo-token`.
+    authentication:
+      type: bearer
+      tokens:
+        - governance-demo-token
+
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: governed-mcp
+        version: "1.0.0"
+
+      # Required for the session-flow guardrail below to have
+      # cross-call memory. Without it, flow degrades to single-call
+      # scope (see docs/mcp-security.md).
+      sessions:
+        enabled: true
+        ttl: "30m"
+
+      # Default-deny. `analyst` can call the two tools this
+      # walkthrough drives on purpose; `reports.echo` is left off the
+      # allowed list so the RBAC-denied test call has something real
+      # to deny.
+      rbac_policies:
+        analyst:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - "reports.hello"
+                - "crm.echo"
+          tool_quotas:
+            - tool_name: "reports.hello"
+              principals: []
+              rate:
+                per: "1m"
+                max: 30
+
+      guardrails:
+        # A second, coarser gate on top of RBAC: every tool this
+        # walkthrough calls has to clear this too. `reports.echo` is
+        # here (so it reaches the RBAC check and gets denied there,
+        # by name, rather than stopped a step earlier) and
+        # `legacy.echo` is here too (so it reaches the draft-server
+        # check rather than being blocked by this guardrail instead).
+        - type: tool_allowlist
+          allow:
+            - reports.hello
+            - reports.echo
+            - crm.echo
+            - legacy.echo
+        # On, and genuinely evaluated on every call in this
+        # walkthrough, but structurally inert here on purpose:
+        # `billing.*` / `notify.*` name tools this demo never
+        # advertises, so the trifecta can never see all three legs at
+        # once. Point these at your own private-data and
+        # external-communication tool names to make it live.
+        - type: lethal_trifecta
+          private_data_tools: ["billing.*"]
+          external_comm_tools: ["notify.*"]
+
+      # Every advertised tool this walkthrough calls is pinned in
+      # tool-versions.lock.yaml. block_unlocked means an upstream tool
+      # with no lockfile entry is blocked outright rather than merely
+      # reported (crm.hello / legacy.hello are real but deliberately
+      # left unlocked -- see the lockfile's own header comment).
+      tool_versioning:
+        lockfile: "tool-versions.lock.yaml"
+        mode: block
+        block_unlocked: true
+
+      # Opt-in probabilistic layer: needs a real judge endpoint, so
+      # it stays commented out here rather than pointed at a
+      # placeholder that would fail closed on every tool result.
+      # Uncomment and set a real `endpoint` to turn it on; it composes
+      # with every guardrail above rather than replacing any of them.
+      # dual_llm_quarantine:
+      #   enabled: true
+      #   endpoint: https://judge.example/v1/chat/completions
+      #   model: judge-model
+      #   timeout: 10s
+
+      federated_servers:
+        - origin: test.sbproxy.dev
+          prefix: reports
+          namespace: always
+          rbac: analyst
+          timeout: 10s
+          status: approved
+          approved_by: security-team@example.com
+          approved_at: "2026-08-01"
+          egress:
+            mode: deny_by_default
+            hosts: [test.sbproxy.dev]
+
+        # Untrusted (absent from flow.trusted_servers below) and
+        # sensitive (present in flow.sensitive_servers): reading this
+        # server is what taints a session and marks it sensitive.
+        # `status: approved` is left off entirely on purpose, to show
+        # the "absent means approved" default next to reports' explicit
+        # form.
+        - origin: test.sbproxy.dev
+          prefix: crm
+          namespace: always
+          rbac: analyst
+          timeout: 10s
+          egress:
+            mode: deny_by_default
+            hosts: [test.sbproxy.dev]
+
+        # Never approved. The draft check runs ahead of RBAC, the
+        # protocol pin, and the downgrade check, so a call here is
+        # always refused by status alone -- which is also why the pin
+        # below is safe to carry: test.sbproxy.dev negotiates
+        # 2024-11-05, not 2025-06-18, so a live call would otherwise
+        # mismatch the pin. Pinning it here turns the surface on
+        # without breaking the two servers this walkthrough actually
+        # dispatches to.
+        - origin: test.sbproxy.dev
+          prefix: legacy
+          namespace: always
+          rbac: analyst
+          timeout: 10s
+          status: draft
+          protocol: "2025-06-18"
+          downgrade: block
+          egress:
+            mode: deny_by_default
+            hosts: [test.sbproxy.dev]
+
+      # Both engine variants over the same predicate, per the epic's
+      # dual-engine ruling: no path-traversal sequence in a `crm.echo`
+      # message argument. The CEL rule is inline; its Rego twin is
+      # loaded by path from policies/. Config-order matters here: the
+      # CEL rule is evaluated first, so it is the one a denial names.
+      argument_policies:
+        - name: no-path-traversal-in-message
+          when: mcp.tool.name == "crm.echo"
+          engine: cel
+          source: '!mcp.arguments.message.contains("../")'
+          mode: block
+        - name: no-path-traversal-in-message-rego
+          when: mcp.tool.name == "crm.echo"
+          engine: rego
+          path: policies/no-path-traversal-in-message.rego
+          mode: block
+
+      # Meta's Rule of Two. `crm` is untrusted (taints integrity) and
+      # sensitive (marks sensitive_touched); `reports.*` is the
+      # outbound leg. One `crm.echo` call followed by a
+      # `reports.hello` call in the same session trips all three legs
+      # of the default `two_of_three` rule and is refused.
+      flow:
+        mode: block
+        rule: two_of_three
+        trusted_servers: [reports]
+        sensitive_servers: [crm]
+        outbound_tools: ["reports.*"]
+
+      # The seam response_filter never reaches: MCP writes its own
+      # response outside the generic HTTP body-filter phase. Runs
+      # against tool-call arguments on the way out and tool-call
+      # results on the way back, before either reaches the upstream
+      # or the caller.
+      content_filters:
+        secrets: redact
+        pii: warn
+
+      # Privacy note: this makes every tool-invocation governance
+      # record -- dispatched or refused -- carry the call's redacted,
+      # size-bounded arguments, not just a hash. Off by default in the
+      # product for a reason: the redaction pass catches credential
+      # shapes, not arbitrary customer PII or business-sensitive free
+      # text an agent happened to put in an argument. See README.md's
+      # privacy note before you carry this setting into your own
+      # deployment.
+      mcp_audit:
+        capture_arguments: true
