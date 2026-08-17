@@ -117,7 +117,7 @@ origins:
       # reported (crm.hello / legacy.hello are real but deliberately
       # left unlocked -- see the lockfile's own header comment).
       tool_versioning:
-        lockfile: "tool-versions.lock.yaml"
+        lockfile: "examples/mcp-governance/tool-versions.lock.yaml"
         mode: block
         block_unlocked: true
 

@@ -35,9 +35,10 @@ Three `federated_servers[]` entries, all pointed at `test.sbproxy.dev`, the proj
 ## Run
 
 ```bash
-cd examples/mcp-governance
-sbproxy serve -f sb.yml
+sbproxy serve -f examples/mcp-governance/sb.yml
 ```
+
+Run it from the repository root: the config's Rego policy and lockfile paths are resolved relative to the working directory the proxy is started from, the same convention `transforms[] type: wasm` uses. Use absolute paths in production. The evidence file `mcp-governance-events.ndjson` is written to that same working directory.
 
 Run every curl below from a second terminal. `sessions.enabled: true` means the gateway needs a session before it answers anything past `initialize`, so each scenario below mints its own with this recipe:
 
