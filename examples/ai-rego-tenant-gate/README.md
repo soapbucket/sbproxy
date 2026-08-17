@@ -1,10 +1,8 @@
-# CEL tenant gate on AI traffic
+# Rego tenant gate on AI traffic
 
 *Last modified: 2026-08-16*
 
-![CEL tenant gate on AI traffic](../../docs/assets/ai-cel-tenant-gate.gif)
-
-A proxy-native pattern: a CEL expression runs at the network layer before any AI provider is contacted. Pure AI gateway libraries cannot reject a request based on the surrounding request context (auth claims, tenant headers, IP, geo) without taking on the proxy role themselves. Two CEL policies layer here: the first requires a non-empty `X-Tenant` header (anything without one gets a 403 before the AI handler reads the body, a hard tenant boundary); the second requires the tenant value to appear in an allow-list (unknown tenants are rejected with a different message so operators can spot misconfigured clients vs. unprovisioned ones). Both checks happen in the same place per-request rate limits and WAF rules run, so a single denial path covers AI, REST, and any other action behind the same hostname.
+The Rego twin of [`examples/ai-cel-tenant-gate/`](../ai-cel-tenant-gate/): the same tenant gate, the same request-time behavior, expressed as `policy: rego` instead of `policy: expression`. Two Rego policies layer here, evaluated in process on the Regorus interpreter before any AI provider is contacted. The first requires a non-empty `X-Tenant` header (anything without one gets a 403 before the AI handler reads the body, a hard tenant boundary); the second requires the tenant value to appear in an allow-list kept in `data`, separate from the policy logic, so an operator edits the allow-list without reading a line of Rego (unknown tenants are rejected with a different message so operators can spot misconfigured clients vs. unprovisioned ones). See [docs/opa-rego-policies.md](../../docs/opa-rego-policies.md) for the full field reference.
 
 ## Run
 
@@ -45,16 +43,16 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ## What this exercises
 
-- `policy.type: expression` running CEL against `request.headers["x-tenant"]`
-- Multiple CEL policies stacked so tenant presence and tenant allow-list are separate denials
+- `policy.type: rego` evaluating a Rego module against `input.request.headers["x-tenant"]`
+- Multiple Rego policies stacked so tenant presence and tenant allow-list are separate denials
+- `data` carrying the allow-list separately from the module, so the table changes without the policy changing
 - `deny_status` and `deny_message` per policy so the operator distinguishes misconfigured clients from unprovisioned ones
 - AI traffic gated at the policy layer, before the `ai_proxy` handler reads the body
 
 ## See also
 
-- [examples/ai-rego-tenant-gate/](../ai-rego-tenant-gate/) - the Rego twin of this example
-- [docs/ai-gateway.md](../../docs/ai-gateway.md)
-- [docs/scripting.md](../../docs/scripting.md)
 - [docs/opa-rego-policies.md](../../docs/opa-rego-policies.md)
-- [docs/features.md](../../docs/features.md)
+- [examples/ai-cel-tenant-gate/](../ai-cel-tenant-gate/) - the CEL twin of this example
+- [docs/scripting.md](../../docs/scripting.md)
+- [docs/ai-gateway.md](../../docs/ai-gateway.md)
 - [docs/configuration.md](../../docs/configuration.md)

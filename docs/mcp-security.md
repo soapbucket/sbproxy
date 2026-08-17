@@ -214,7 +214,14 @@ timeout, a malformed response, or an egress denial all quarantine.
         endpoint: https://judge.example/v1/chat/completions
         model: judge-model
         timeout: 10s
+        egress:
+          mode: deny_by_default
+          hosts: [judge.example]
 ```
+
+`egress` allowlists the judge endpoint itself; omitted, the judge call
+is ungated but still recorded in the egress inventory. See
+[mcp-gateway-guardrails.md](mcp-gateway-guardrails.md#dual-llm-quarantine).
 
 **Still yours.** Neither is a solved-problem control. The trifecta guardrail
 constrains the damage rather than detecting the injection, which is the honest

@@ -2724,17 +2724,17 @@ pub fn handle_admin_request(
             action = "inspect_request_content",
             "admin content inspection"
         );
-        sbproxy_observe::audit_ring::push_audit_event(
-            sbproxy_observe::audit_ring::AuditRingEvent::new(
-                "admin",
-                "inspect_request_content",
-                Some(operator),
-                Some(sample.tenant_id.clone()),
-                sample.api_key_id.clone(),
-                Some(request_id.to_string()),
-                None,
-            ),
-        );
+        // WOR-2478: tees into the durable admin chain, if one is
+        // installed, alongside the existing ring push.
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "inspect_request_content",
+            Some(operator),
+            Some(sample.tenant_id.clone()),
+            sample.api_key_id.clone(),
+            Some(request_id.to_string()),
+            None,
+        )
+        .emit();
         return match serde_json::to_string(&sample) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
@@ -3874,18 +3874,17 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 path = %path,
                 "admin action"
             );
-            // WOR-2094: same event on the console's audit sample.
-            sbproxy_observe::audit_ring::push_audit_event(
-                sbproxy_observe::audit_ring::AuditRingEvent::new(
-                    "admin",
-                    "admin_action",
-                    Some(p.username.clone()),
-                    None,
-                    None,
-                    None,
-                    Some(format!("{method} {path}")),
-                ),
-            );
+            // WOR-2094: same event on the console's audit sample. WOR-2478:
+            // and, if installed, into the durable admin chain.
+            sbproxy_observe::AdminActionAuditEntry::new(
+                "admin_action",
+                Some(p.username.clone()),
+                None,
+                None,
+                None,
+                Some(format!("{method} {path}")),
+            )
+            .emit();
         }
     }
     // A session-authenticated request synthesizes a Basic header so
@@ -4497,18 +4496,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
         None => {
             tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
             // WOR-2094: failed sign-ins are first-class security
-            // events on the console's audit sample.
-            sbproxy_observe::audit_ring::push_audit_event(
-                sbproxy_observe::audit_ring::AuditRingEvent::new(
-                    "admin",
-                    "login_failed",
-                    Some(user.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            );
+            // events on the console's audit sample. WOR-2478: and, if
+            // installed, on the durable admin chain.
+            sbproxy_observe::AdminActionAuditEntry::new(
+                "login_failed",
+                Some(user.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .emit();
             let _ = write_admin_response_headed(
                 sock,
                 401,
@@ -4523,17 +4521,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     let ttl_secs = 8 * 3600;
     let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
     tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
-    sbproxy_observe::audit_ring::push_audit_event(
-        sbproxy_observe::audit_ring::AuditRingEvent::new(
-            "admin",
-            "login",
-            Some(user.clone()),
-            None,
-            None,
-            None,
-            Some(format!("role: {}", role_label(role))),
-        ),
-    );
+    // WOR-2478: tees into the durable admin chain, if one is installed,
+    // alongside the existing ring push.
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "login",
+        Some(user.clone()),
+        None,
+        None,
+        None,
+        Some(format!("role: {}", role_label(role))),
+    )
+    .emit();
     let secure_attr = if secure { "; Secure" } else { "" };
     let cookie = format!(
         "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
@@ -5866,6 +5864,18 @@ mod tests {
             sbproxy_security::egress::EgressSightingStatus::Ungated,
             None,
         );
+        // WOR-2476: a second, distinct non-AI purpose. Before every gate
+        // site stamped a sighting, `ai_provider` was the only purpose the
+        // inventory could ever report; this proves the snapshot carries
+        // more than one purpose, and that a `denied` sighting round-trips
+        // its reason without leaking the URL that produced it.
+        sbproxy_security::egress::record_egress_seen(
+            sbproxy_security::egress::EgressPurpose::TokenExchange,
+            "https://seeded-admin-test-2.invalid:8443/token?secret=y",
+            "admin-test",
+            sbproxy_security::egress::EgressSightingStatus::Denied,
+            Some(sbproxy_security::egress::EgressDenied::UnlistedHost),
+        );
 
         let (status, content_type, body) =
             handle_admin_request("GET", "/api/egress", &state, Some(&auth), None);
@@ -5882,6 +5892,7 @@ mod tests {
             .iter()
             .find(|e| e["host"] == "seeded-admin-test.invalid")
             .expect("seeded sighting must appear in the inventory");
+        assert_eq!(entry["purpose"], "webhook");
         assert!(entry.get("host").is_some());
         assert!(entry.get("status").is_some());
         assert!(entry.get("last_seen_unix_ms").is_some());
@@ -5889,7 +5900,21 @@ mod tests {
             entry.get("url").is_none(),
             "no raw url in an egress entry: {entry}"
         );
+
+        let token_entry = endpoints
+            .iter()
+            .find(|e| e["host"] == "seeded-admin-test-2.invalid")
+            .expect("seeded token_exchange sighting must appear in the inventory");
+        assert_eq!(token_entry["purpose"], "token_exchange");
+        assert_eq!(token_entry["status"], "denied");
+        assert_eq!(token_entry["last_reason"], "unlisted_host");
+        assert!(
+            token_entry.get("url").is_none(),
+            "no raw url in an egress entry: {token_entry}"
+        );
+
         assert!(!body.contains("secret=x"), "no query string: {body}");
+        assert!(!body.contains("secret=y"), "no query string: {body}");
     }
 
     #[tokio::test]
@@ -7829,6 +7854,7 @@ origins:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);

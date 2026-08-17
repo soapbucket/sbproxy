@@ -5163,6 +5163,7 @@ dependencies = [
  "sbproxy-observe",
  "sbproxy-platform",
  "sbproxy-plugin",
+ "sbproxy-security",
  "schemars",
  "serde",
  "serde_ignored",

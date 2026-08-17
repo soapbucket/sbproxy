@@ -50,6 +50,41 @@
 //! That asymmetry is real and is the strongest argument for preferring
 //! CEL where either would do. It is called out in `docs/scripting.md`
 //! rather than papered over.
+//!
+//! # Coverage
+//!
+//! [`CompiledRego::set_enable_coverage`] and
+//! [`CompiledRego::coverage_report`] are thin wrappers over Regorus's
+//! own `set_enable_coverage`/`get_coverage_report`, which this crate
+//! already pays for (the `coverage` Cargo feature is part of Regorus's
+//! `full-opa` default). Nothing on the request path calls either: the
+//! sole caller is `sbproxy rego test`, the offline fixture-driven test
+//! loop, which enables coverage before running a fixture's cases and
+//! reads the report back to print a summary and enforce
+//! `--min-coverage`. A production `policy: rego` or `ai_routing_policy`
+//! engine never turns this on, so evaluating real traffic pays no
+//! coverage-tracking cost.
+//!
+//! # Rego v0 and `print()`
+//!
+//! Regorus defaults to Rego v1 (`if`/`contains` required), matching OPA
+//! 1.0. `compile`'s `rego_v0` parameter is the escape hatch for a module
+//! authored before that switch: it calls
+//! [`regorus::Engine::set_rego_v0`] before the module is parsed, so a
+//! bare `allow { ... }` rule body compiles the way it did on OPA before
+//! 1.0. Leave it `false` for anything written against current OPA.
+//!
+//! `print()` inside a module never reaches stderr here.
+//! [`regorus::Engine::set_gather_prints`] is enabled once, in `compile`,
+//! and [`CompiledRego::eval_bool`] / [`CompiledRego::eval_value`] drain
+//! whatever the evaluation gathered into one `tracing` event per call,
+//! at INFO under the `rego_print` target, naming the site, the query,
+//! and the tenant when the caller has one. A print during the one-time
+//! load-time evaluability trial that `compile` runs is discarded rather
+//! than logged: that trial runs against an empty input for every module
+//! regardless of whether an operator's traffic ever reaches it, so
+//! treating it as a request-time signal would manufacture an event
+//! nothing real produced.
 
 use std::collections::HashMap;
 
@@ -116,8 +151,51 @@ fn data_defines_query_path(data: &serde_json::Value, query: &str) -> bool {
     !cursor.is_null()
 }
 
+/// One source file's line coverage from a [`CompiledRego`] engine, read
+/// back via [`CompiledRego::coverage_report`].
+///
+/// Wraps Regorus's own `coverage::Report`/`coverage::File` (line
+/// granularity: Regorus does not track which named rule a line belongs
+/// to, only whether the interpreter executed it) in a type that does
+/// not leak the `regorus` crate through this module's public surface.
+#[derive(Debug, Clone)]
+pub struct RegoCoverage {
+    /// The name `compile` registered the module under (its `site`
+    /// argument, with `.rego` appended, since that is the string
+    /// `compile` passes to `add_policy`).
+    pub path: String,
+    /// Source line numbers the interpreter executed at least once.
+    pub covered: Vec<u32>,
+    /// Source line numbers the interpreter never reached.
+    pub not_covered: Vec<u32>,
+}
+
+impl RegoCoverage {
+    /// Percentage of `covered ∪ not_covered` lines that were covered.
+    ///
+    /// `100.0` when the module has no lines Regorus tracks coverage for
+    /// at all (for example a comment-only file), since there is nothing
+    /// for a case to have missed.
+    pub fn percent(&self) -> f64 {
+        let total = self.covered.len() + self.not_covered.len();
+        if total == 0 {
+            100.0
+        } else {
+            (self.covered.len() as f64 / total as f64) * 100.0
+        }
+    }
+}
+
 impl CompiledRego {
     /// Parse `module` and pin `query` as the rule this policy evaluates.
+    ///
+    /// `rego_v0` selects the parser dialect: `false` (the default
+    /// everywhere this is called from config) requires current Rego v1
+    /// syntax (`if`/`contains`), matching Regorus's own default and OPA
+    /// 1.0. `true` calls [`regorus::Engine::set_rego_v0`] first, so a
+    /// module written before that switch (`allow { ... }` with no `if`)
+    /// parses. Set it per policy for a pasted-in legacy module rather
+    /// than rewriting it; a module authored fresh should not need it.
     ///
     /// # Errors
     ///
@@ -131,10 +209,22 @@ impl CompiledRego {
         query: impl Into<String>,
         budget_ms: u64,
         data: Option<serde_json::Value>,
+        rego_v0: bool,
     ) -> Result<Self> {
         let site = site.into();
         let query = query.into();
         let mut engine = regorus::Engine::new();
+        // Dialect selection has to precede parsing: v0/v1 changes what
+        // the parser accepts, not a post-parse pass.
+        engine.set_rego_v0(rego_v0);
+        // Gathered rather than left at Regorus's default of stderr, so a
+        // `print()` inside a policy lands in the same structured
+        // tracing every other engine's script signal goes through
+        // rather than on the process's raw stderr. `eval_bool` and
+        // `eval_value` drain this per evaluation; the trial run below
+        // drains and discards it before the engine ever serves a
+        // request.
+        engine.set_gather_prints(true);
         engine
             .add_policy(format!("{site}.rego"), module.to_owned())
             .inspect_err(|_| {
@@ -217,7 +307,15 @@ impl CompiledRego {
         self.engine
             .set_input_json("{}")
             .with_context(|| format!("{}: empty input rejected", self.site))?;
-        self.engine.eval_rule(self.query.clone()).with_context(|| {
+        let result = self.engine.eval_rule(self.query.clone());
+        // Discard rather than log: this trial runs against an empty
+        // input for every module at every boot and reload, whether or
+        // not the policy ever sees real traffic, so a `print()` here
+        // describes the trial, not a request. Draining still matters,
+        // otherwise a print from this call would sit in the buffer and
+        // get attributed to whatever the first real evaluation is.
+        let _ = self.engine.take_prints();
+        result.with_context(|| {
             format!(
                 "{}: rule `{}` could not be evaluated. The module parsed, so this is a \
                      semantic fault: an unsafe variable, or a query naming a rule the module \
@@ -228,6 +326,32 @@ impl CompiledRego {
         Ok(())
     }
 
+    /// Drain `print()` output gathered during the last evaluation into
+    /// tracing, one event per call, and never to stderr.
+    ///
+    /// `compile` turns on [`regorus::Engine::set_gather_prints`] once;
+    /// this is the only place that buffer is read. Called after every
+    /// per-request evaluation attempt, on both the success and the
+    /// error path, since a rule can print before a later line in the
+    /// same evaluation faults. `tenant` is the empty string when the
+    /// caller has none to attribute the event to.
+    fn drain_prints(&mut self, tenant: &str) {
+        let Ok(prints) = self.engine.take_prints() else {
+            // Only errors when gathering was never enabled, which
+            // `compile` always does; nothing to drain either way.
+            return;
+        };
+        for message in prints {
+            tracing::info!(
+                target: "rego_print",
+                site = %self.site,
+                query = %self.query,
+                tenant_id = tenant,
+                "{message}"
+            );
+        }
+    }
+
     /// The config site this policy came from.
     pub fn site(&self) -> &str {
         &self.site
@@ -236,6 +360,41 @@ impl CompiledRego {
     /// The rule reference this policy evaluates.
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Enable or disable Regorus's line-coverage instrumentation on this
+    /// engine.
+    ///
+    /// Off by default, matching Regorus's own default, and nothing on
+    /// the request path calls this; see the module's "Coverage" section.
+    /// Toggling clears whatever coverage the engine has gathered so far
+    /// (Regorus's own documented behavior for `set_enable_coverage`).
+    pub fn set_enable_coverage(&mut self, enable: bool) {
+        self.engine.set_enable_coverage(enable);
+    }
+
+    /// Line coverage gathered across every evaluation since coverage was
+    /// last enabled or cleared, one entry per source file `compile`
+    /// registered (in practice exactly one: this type parses a single
+    /// module).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Regorus cannot assemble the report. The
+    /// public API offers no way to trigger this deliberately; the
+    /// underlying call is fallible so this mirrors it rather than
+    /// hiding a failure behind an empty report.
+    pub fn coverage_report(&self) -> Result<Vec<RegoCoverage>> {
+        let report = self.engine.get_coverage_report()?;
+        Ok(report
+            .files
+            .into_iter()
+            .map(|file| RegoCoverage {
+                path: file.path,
+                covered: file.covered.into_iter().collect(),
+                not_covered: file.not_covered.into_iter().collect(),
+            })
+            .collect())
     }
 
     /// Evaluate the pinned query against `ctx`.
@@ -266,18 +425,27 @@ impl CompiledRego {
         outcome
     }
 
-    /// Evaluate the query against an arbitrary JSON `input` document and
-    /// return the rule's value as JSON.
+    /// Evaluate the pinned query against an arbitrary JSON `input`
+    /// document and return the rule's boolean result.
     ///
-    /// The document form of [`Self::eval_bool`], for callers whose rule
-    /// returns a structured decision (the AI routing plan, WOR-2366)
-    /// rather than an allow/deny. A rule that is defined but undefined for
-    /// this input returns JSON `null`, which such callers read as "the
-    /// policy declined"; it is not an error. Stamps the same script
-    /// metrics as the boolean form.
-    pub fn eval_value(&mut self, input: serde_json::Value) -> Result<serde_json::Value> {
+    /// The JSON-input twin of [`Self::eval_bool`], for a caller that
+    /// does not carry a [`CelContext`] (a signed extension bundle's
+    /// Rego policy hook, WOR-2482, whose input is the same JSON
+    /// envelope a JavaScript or WASM bundle policy hook reads, not the
+    /// CEL-context vocabulary `policy: rego` shares with
+    /// `policy: expression`). Stamps the same script metrics and the
+    /// same "non-boolean is an error" contract as [`Self::eval_bool`].
+    ///
+    /// `tenant` attributes any `print()` output from this evaluation;
+    /// pass the empty string when the caller has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `input` cannot be set, the rule does not
+    /// evaluate, or the result is not a boolean.
+    pub fn eval_bool_json(&mut self, input: serde_json::Value, tenant: &str) -> Result<bool> {
         let start = std::time::Instant::now();
-        let outcome = self.eval_value_inner(input);
+        let outcome = self.eval_bool_from_value(input, tenant);
         sbproxy_observe::metrics::record_script_duration("rego", start.elapsed().as_secs_f64());
         sbproxy_observe::metrics::record_script_invocation(
             "rego",
@@ -290,14 +458,49 @@ impl CompiledRego {
         outcome
     }
 
-    fn eval_value_inner(&mut self, input: serde_json::Value) -> Result<serde_json::Value> {
+    /// Evaluate the query against an arbitrary JSON `input` document and
+    /// return the rule's value as JSON.
+    ///
+    /// The document form of [`Self::eval_bool`], for callers whose rule
+    /// returns a structured decision (the AI routing plan, WOR-2366)
+    /// rather than an allow/deny. A rule that is defined but undefined for
+    /// this input returns JSON `null`, which such callers read as "the
+    /// policy declined"; it is not an error. Stamps the same script
+    /// metrics as the boolean form.
+    ///
+    /// `tenant` attributes any `print()` output from this evaluation;
+    /// pass the empty string when the caller has none.
+    pub fn eval_value(
+        &mut self,
+        input: serde_json::Value,
+        tenant: &str,
+    ) -> Result<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let outcome = self.eval_value_inner(input, tenant);
+        sbproxy_observe::metrics::record_script_duration("rego", start.elapsed().as_secs_f64());
+        sbproxy_observe::metrics::record_script_invocation(
+            "rego",
+            if outcome.is_ok() {
+                "ok"
+            } else {
+                "runtime_error"
+            },
+        );
+        outcome
+    }
+
+    fn eval_value_inner(
+        &mut self,
+        input: serde_json::Value,
+        tenant: &str,
+    ) -> Result<serde_json::Value> {
         use serde::Deserialize;
         let input = regorus::Value::deserialize(input)
             .with_context(|| format!("{}: input document rejected", self.site))?;
         self.engine.set_input(input);
-        let value = self
-            .engine
-            .eval_rule(self.query.clone())
+        let result = self.engine.eval_rule(self.query.clone());
+        self.drain_prints(tenant);
+        let value = result
             .with_context(|| format!("{}: rule `{}` did not evaluate", self.site, self.query))?;
         if value == regorus::Value::Undefined {
             // An undefined rule value is the policy having no opinion for
@@ -309,16 +512,24 @@ impl CompiledRego {
     }
 
     fn eval_bool_inner(&mut self, ctx: &CelContext) -> Result<bool> {
-        use serde::Deserialize;
         // Feed regorus the tree directly rather than serialising to a
         // string it immediately reparses; the conversion is the only
         // pass over the context this way.
-        let input = regorus::Value::deserialize(context_to_input(ctx))
+        self.eval_bool_from_value(context_to_input(ctx), tenant_from_context(ctx))
+    }
+
+    /// Shared tail of [`Self::eval_bool_inner`] and
+    /// [`Self::eval_bool_json`]: set `input`, evaluate the pinned
+    /// query, drain any `print()` output, and require a boolean
+    /// result.
+    fn eval_bool_from_value(&mut self, input: serde_json::Value, tenant: &str) -> Result<bool> {
+        use serde::Deserialize;
+        let input = regorus::Value::deserialize(input)
             .with_context(|| format!("{}: input document rejected", self.site))?;
         self.engine.set_input(input);
-        let value = self
-            .engine
-            .eval_rule(self.query.clone())
+        let result = self.engine.eval_rule(self.query.clone());
+        self.drain_prints(tenant);
+        let value = result
             .with_context(|| format!("{}: rule `{}` did not evaluate", self.site, self.query))?;
         match value {
             regorus::Value::Bool(allowed) => Ok(allowed),
@@ -328,6 +539,22 @@ impl CompiledRego {
                 self.query
             ),
         }
+    }
+}
+
+/// The tenant a `policy: expression`-shaped [`CelContext`] resolved to,
+/// for attributing a `print()` event to the request that produced it.
+///
+/// Mirrors the `principal.tenant_id` binding `populate_principal_namespace`
+/// sets (see [`crate::cel::context`]): the empty string when no principal
+/// namespace was populated, or when it was populated with no tenant.
+fn tenant_from_context(ctx: &CelContext) -> &str {
+    match ctx.variables.get("principal") {
+        Some(CelValue::Map(fields)) => match fields.get("tenant_id") {
+            Some(CelValue::String(tenant)) => tenant.as_str(),
+            _ => "",
+        },
+        _ => "",
     }
 }
 
@@ -409,6 +636,22 @@ allow if {
         ctx
     }
 
+    /// Like [`context`], with the method and path under the caller's
+    /// control, for coverage tests that need to steer which branch of a
+    /// rule body a request takes.
+    fn ctx_for(method: &str, path: &str) -> CelContext {
+        let mut ctx = crate::cel::context::build_request_context(
+            method,
+            path,
+            &http::HeaderMap::new(),
+            None,
+            Some("203.0.113.7"),
+            "api.example.com",
+        );
+        crate::cel::context::populate_trust_tier_namespace(&mut ctx, "anonymous");
+        ctx
+    }
+
     #[test]
     fn a_malformed_module_is_a_config_error_naming_the_site() {
         let error = CompiledRego::compile(
@@ -417,6 +660,7 @@ allow if {
             "data.x",
             50,
             None,
+            false,
         )
         .expect_err("a malformed module must not compile");
         assert!(error.to_string().contains("policy `rego` (authz)"));
@@ -430,6 +674,7 @@ allow if {
             "data.sbproxy.allow",
             50,
             None,
+            false,
         )
         .expect("module compiles");
         let mut ctx = context();
@@ -467,6 +712,7 @@ allow if {
             "data.sbproxy.allow",
             50,
             Some(data),
+            false,
         )
         .expect("a module reading base data compiles");
         // context() builds a GET, which is in the table.
@@ -503,6 +749,7 @@ allow if {
             "data.sbproxy.allow",
             50,
             Some(serde_json::json!({ "sbproxy": { "allow": true } })),
+            false,
         )
         .expect_err("base data at the query path must refuse");
         assert!(
@@ -521,6 +768,7 @@ allow if {
             "data.sbproxy.allow",
             50,
             Some(serde_json::json!({ "sbproxy": { "roles": ["admin"] } })),
+            false,
         )
         .expect("sibling base data does not shadow the rule");
     }
@@ -564,10 +812,68 @@ allow := {"reason": "because"}
             "data.sbproxy.allow",
             50,
             None,
+            false,
         )
         .expect("module compiles");
         let error = policy
             .eval_bool(&context())
+            .expect_err("a document is not a verdict");
+        assert!(
+            error.to_string().contains("rather than a boolean"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn eval_bool_json_evaluates_the_pinned_query_against_arbitrary_json() {
+        // The JSON-input twin `RegoPolicyAdapter` (a bundled Rego
+        // policy hook, WOR-2482) calls instead of `eval_bool`: no
+        // `CelContext` involved, just the JSON envelope a bundle hook
+        // already builds.
+        let mut policy = CompiledRego::compile(
+            "bundle `rego-authz` policy `rego_authz`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+        let denied = policy
+            .eval_bool_json(
+                serde_json::json!({"request": {"method": "POST", "path": "/v1/chat"}}),
+                "",
+            )
+            .expect("evaluates");
+        assert!(!denied, "no rule matches a bare POST with no trust_tier");
+
+        let allowed = policy
+            .eval_bool_json(
+                serde_json::json!({"request": {"method": "GET", "path": "/health"}}),
+                "",
+            )
+            .expect("evaluates");
+        assert!(allowed, "GET /health matches the health-check rule");
+    }
+
+    #[test]
+    fn eval_bool_json_rejects_a_non_boolean_rule_the_same_as_eval_bool() {
+        const RETURNS_A_DOCUMENT: &str = r#"
+package sbproxy
+
+allow := {"reason": "because"}
+"#;
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            RETURNS_A_DOCUMENT,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+        let error = policy
+            .eval_bool_json(serde_json::json!({}), "")
             .expect_err("a document is not a verdict");
         assert!(
             error.to_string().contains("rather than a boolean"),
@@ -586,6 +892,7 @@ allow := {"reason": "because"}
             "data.sbproxy.nonexistent",
             50,
             None,
+            false,
         )
         .expect_err("a query naming no rule must not load");
     }
@@ -603,9 +910,15 @@ allow if {
     x == 1
 }
 "#;
-        let error =
-            CompiledRego::compile("policy `rego`", UNSAFE_VAR, "data.sbproxy.allow", 50, None)
-                .expect_err("an unsafe variable must not load");
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            UNSAFE_VAR,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect_err("an unsafe variable must not load");
         let message = format!("{error:#}");
         assert!(message.contains("semantic fault"), "{message}");
     }
@@ -615,5 +928,351 @@ allow if {
         let mut ctx = CelContext::new();
         ctx.set("score", CelValue::Float(f64::NAN));
         assert_eq!(context_to_input(&ctx)["score"], serde_json::Value::Null);
+    }
+
+    // --- rego_v0 ---
+
+    #[test]
+    fn rego_v0_true_accepts_pre_v1_syntax_the_v1_default_refuses() {
+        // The exact shape Regorus's own `set_rego_v0` doctest uses: a
+        // rule body with no `if`, valid before OPA 1.0 and rejected by
+        // Regorus's v1 default the same way current OPA is.
+        const V0_STYLE: &str = r#"
+package sbproxy
+
+allow {
+    input.request.method == "GET"
+}
+"#;
+        CompiledRego::compile(
+            "policy `rego`",
+            V0_STYLE,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect_err("v0 syntax must not compile under the v1 default");
+
+        let mut accepted = CompiledRego::compile(
+            "policy `rego`",
+            V0_STYLE,
+            "data.sbproxy.allow",
+            50,
+            None,
+            true,
+        )
+        .expect("rego_v0: true compiles the same module");
+        assert!(
+            accepted.eval_bool(&context()).expect("evaluates"),
+            "the v0 rule still decides once it parses"
+        );
+    }
+
+    // --- coverage ---
+
+    #[test]
+    fn coverage_report_reflects_which_branch_a_case_took() {
+        // Two comparisons in one rule body, AND-joined, so Rego's own
+        // short-circuit semantics (not a Regorus implementation detail)
+        // guarantee the second is skipped whenever the first fails.
+        // That guarantee is what this test leans on, rather than a
+        // hardcoded line number for what Regorus's coverage attributes
+        // to a bare `allow if {` declaration line.
+        const MODULE: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    input.request.method == "GET"
+    input.request.path == "/health"
+}
+"#;
+        let method_line = MODULE
+            .lines()
+            .position(|line| line.contains("input.request.method"))
+            .map(|index| index as u32 + 1)
+            .expect("fixture has a method comparison line");
+        let path_line = MODULE
+            .lines()
+            .position(|line| line.contains("input.request.path"))
+            .map(|index| index as u32 + 1)
+            .expect("fixture has a path comparison line");
+        assert_ne!(method_line, path_line);
+
+        let mut both_match = CompiledRego::compile(
+            "coverage test",
+            MODULE,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+        both_match.set_enable_coverage(true);
+        assert!(
+            both_match
+                .eval_bool(&ctx_for("GET", "/health"))
+                .expect("evaluates"),
+            "a GET to /health matches both conditions"
+        );
+        let report = both_match.coverage_report().expect("coverage report");
+        assert_eq!(report.len(), 1, "one module was compiled");
+        assert_eq!(report[0].path, "coverage test.rego");
+        assert!(
+            report[0].covered.contains(&method_line) && report[0].covered.contains(&path_line),
+            "both comparisons execute when both match: {:?}",
+            report[0]
+        );
+
+        let mut short_circuits = CompiledRego::compile(
+            "coverage test",
+            MODULE,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+        short_circuits.set_enable_coverage(true);
+        assert!(
+            !short_circuits
+                .eval_bool(&ctx_for("POST", "/health"))
+                .expect("evaluates"),
+            "a POST never matches"
+        );
+        let report = short_circuits.coverage_report().expect("coverage report");
+        assert!(
+            report[0].covered.contains(&method_line),
+            "the method comparison still runs and fails: {:?}",
+            report[0]
+        );
+        assert!(
+            report[0].not_covered.contains(&path_line),
+            "the path comparison is never reached once the method check fails: {:?}",
+            report[0]
+        );
+        assert!(
+            report[0].percent() < 100.0,
+            "an unreached line must pull coverage below full: {:?}",
+            report[0]
+        );
+    }
+
+    // --- print() capture ---
+    //
+    // A hand-rolled `tracing::Subscriber` rather than `tracing-subscriber`,
+    // which this crate does not depend on; mirrors
+    // `bundle::proxy_wasm::tests::GuestLogLevelCapture`, the existing
+    // in-crate tracing-capture pattern. Installed via
+    // `tracing::subscriber::with_default` around the one evaluation under
+    // test, with `rebuild_interest_cache` forced afterward so a callsite
+    // whose Interest cached `Never` under an earlier no-subscriber run
+    // cannot stay stuck (see the span-metadata test landmine: a callsite's
+    // Interest is cached process-wide, not per test).
+
+    #[derive(Debug, Default, Clone)]
+    struct CapturedPrint {
+        level: Option<tracing::Level>,
+        site: String,
+        query: String,
+        tenant_id: String,
+        message: String,
+    }
+
+    impl CapturedPrint {
+        fn set(&mut self, name: &str, value: String) {
+            match name {
+                "site" => self.site = value,
+                "query" => self.query = value,
+                "tenant_id" => self.tenant_id = value,
+                "message" => self.message = value,
+                _ => {}
+            }
+        }
+    }
+
+    impl tracing::field::Visit for CapturedPrint {
+        // `tenant_id` is passed as a bare `&str`, which tracing routes
+        // through `record_str`.
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.set(field.name(), value.to_owned());
+        }
+
+        // `site`, `query` (`%`-prefixed) and the format-string `message`
+        // field all route through `record_debug`; the `%` wrapper's
+        // `Debug` impl is defined in terms of the wrapped type's
+        // `Display`, so this renders identically to `record_str` would.
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.set(field.name(), format!("{value:?}"));
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RegoPrintCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedPrint>>>,
+    }
+
+    impl tracing::Subscriber for RegoPrintCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "rego_print"
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != "rego_print" {
+                return;
+            }
+            let mut captured = CapturedPrint {
+                level: Some(*event.metadata().level()),
+                ..Default::default()
+            };
+            event.record(&mut captured);
+            self.events.lock().unwrap().push(captured);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn print_reaches_tracing_at_info_under_rego_print_never_stderr() {
+        const PRINTS_WHEN_CHECKED: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    print("checking method:", input.request.method)
+    input.request.method == "GET"
+}
+"#;
+        let mut policy = CompiledRego::compile(
+            "policy `rego` (print-test)",
+            PRINTS_WHEN_CHECKED,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+
+        let mut ctx = context();
+        crate::cel::context::populate_principal_namespace(
+            &mut ctx,
+            &crate::cel::context::PrincipalView {
+                tenant_id: Some("acme"),
+                ..Default::default()
+            },
+        );
+
+        let capture = RegoPrintCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            assert!(
+                policy.eval_bool(&ctx).expect("evaluates"),
+                "a GET from api.example.com still decides true"
+            );
+        });
+
+        let events = capture.events.lock().expect("capture lock");
+        assert_eq!(
+            events.len(),
+            1,
+            "one print() call must produce exactly one event: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(event.level, Some(tracing::Level::INFO), "{event:?}");
+        assert_eq!(event.site, "policy `rego` (print-test)", "{event:?}");
+        assert_eq!(event.query, "data.sbproxy.allow", "{event:?}");
+        assert_eq!(
+            event.tenant_id, "acme",
+            "the tenant on the evaluated context reaches the event: {event:?}"
+        );
+        assert!(
+            event.message.contains("checking method"),
+            "the print() text reaches the event: {event:?}"
+        );
+    }
+
+    #[test]
+    fn trial_evaluation_prints_are_discarded_not_logged() {
+        // `compile`'s load-time trial (`prove_evaluable`) runs this same
+        // query against an empty input at every boot and reload, whether
+        // or not the policy ever sees real traffic. The print here does
+        // not depend on `input`, so it fires identically on the trial
+        // and on a real evaluation; only the trial's `take_prints()` is
+        // discarded rather than drained through `tracing`. This pins
+        // that split so a future refactor cannot fold the trial into
+        // `drain_prints` and start misattributing boot-time trial prints
+        // as request-scoped `rego_print` events.
+        const ALWAYS_PRINTS: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    print("trial or real, always prints")
+    true
+}
+"#;
+        let capture = RegoPrintCapture::default();
+
+        let mut policy = tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            CompiledRego::compile(
+                "policy `rego` (trial-print-test)",
+                ALWAYS_PRINTS,
+                "data.sbproxy.allow",
+                50,
+                None,
+                false,
+            )
+            .expect("module compiles")
+        });
+        assert!(
+            capture.events.lock().expect("capture lock").is_empty(),
+            "compile's load-time trial must not produce a rego_print event: {:?}",
+            capture.events.lock().expect("capture lock")
+        );
+
+        tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            assert!(
+                policy.eval_bool(&context()).expect("evaluates"),
+                "the rule decides true on a real evaluation too"
+            );
+        });
+        let events = capture.events.lock().expect("capture lock");
+        assert_eq!(
+            events.len(),
+            1,
+            "a real evaluation of the same print() must produce exactly one event: {events:?}"
+        );
+        assert!(
+            events[0].message.contains("trial or real, always prints"),
+            "{:?}",
+            events[0]
+        );
     }
 }

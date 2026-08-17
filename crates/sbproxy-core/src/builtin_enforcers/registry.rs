@@ -200,6 +200,11 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
                     sbproxy_config::BundleRuntime::Javascript => DecisionEngine::JavaScript,
                     sbproxy_config::BundleRuntime::Wasm => DecisionEngine::Wasm,
                     sbproxy_config::BundleRuntime::ProxyWasm => DecisionEngine::ProxyWasm,
+                    // A bundled Rego policy hook (WOR-2482) reports the
+                    // same engine label `policy: rego` already does,
+                    // since it is the same decision language, just
+                    // signed and distributed as a bundle asset.
+                    sbproxy_config::BundleRuntime::Rego => DecisionEngine::Rego,
                 });
             CompiledEnforcer {
                 surface: PolicySurface::Plugin,
@@ -365,6 +370,7 @@ mod tests {
                 DecisionEngine::JavaScript,
             ),
             (sbproxy_config::BundleRuntime::Wasm, DecisionEngine::Wasm),
+            (sbproxy_config::BundleRuntime::Rego, DecisionEngine::Rego),
         ] {
             let metadata = sbproxy_modules::DynamicHookMetadata::new(
                 "test-bundle",

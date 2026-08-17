@@ -1557,6 +1557,7 @@ async fn send_governed(
             hop,
             RedirectRule::SameOriginOnly,
             &CachedSystemResolver,
+            origin_label,
         )
         .map_err(|denied| {
             record_egress_refused(EgressPurpose::AiProvider, denied, "unset", origin_label);
@@ -4394,6 +4395,64 @@ mod tests {
             .find(|s| s.host == "ungated-sighting-test.invalid")
             .expect("ungated sighting must be present in the inventory");
         assert_eq!(sighting.status, "ungated");
+    }
+
+    #[test]
+    fn configured_gate_registry_arms_the_client_and_the_dispatch_is_stamped_denied() {
+        // WOR-2476: proves the seam `sbproxy_core::server::reload_ai_client`
+        // uses to arm the client from a compiled `egress.ai_providers:
+        // { mode: deny_by_default }` block (empty `hosts:`, exactly the
+        // brief's acceptance shape). `sbproxy-ai` cannot depend on
+        // `sbproxy-core` to call `reload_ai_client` itself, so this
+        // reproduces its one-line composition: read the process-wide
+        // `EgressPurpose::AiProvider` gate, attach it via `with_egress`
+        // when present. A real provider dispatch through the resulting
+        // client must be refused, before any I/O, and the refusal must
+        // land in the (cross-crate, publicly readable) egress inventory
+        // as `denied`, not silently dropped.
+        use sbproxy_security::egress::{
+            configured_gate, egress_inventory_snapshot, install_configured_gate, EgressConfig,
+            PurposeAllowlist,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        // Mirrors exactly what `compile_egress_gates` builds for
+        // `egress.ai_providers: { mode: deny_by_default }` with no
+        // `hosts:` (WOR-2476): schemes/ports open, hosts empty, so
+        // every destination is denied on the empty host allowlist
+        // specifically, not on scheme or port.
+        let empty_hosts = PurposeAllowlist {
+            schemes: HashSet::from(["https".to_string(), "http".to_string()]),
+            ports: HashSet::from([443, 80]),
+            ..Default::default()
+        };
+        let deny_all = EgressAuthorizer::new(EgressConfig {
+            purposes: HashMap::from([(EgressPurpose::AiProvider, empty_hosts)]),
+        });
+        install_configured_gate(EgressPurpose::AiProvider, Some(deny_all));
+
+        let mut client = AiClient::new();
+        if let Some(authorizer) = configured_gate(EgressPurpose::AiProvider) {
+            client = client.with_egress(authorizer);
+        }
+
+        let err = client
+            .gate_provider_url(
+                "https://armed-dispatch-test.invalid/v1/chat",
+                "test-provider",
+            )
+            .expect_err("deny_by_default with empty hosts must refuse the dispatch");
+        assert!(err.to_string().contains("UnlistedHost"));
+
+        let snapshot = egress_inventory_snapshot();
+        let sighting = snapshot
+            .iter()
+            .find(|s| s.host == "armed-dispatch-test.invalid")
+            .expect("the denied dispatch must be stamped in the inventory");
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.last_reason, Some("unlisted_host"));
+
+        install_configured_gate(EgressPurpose::AiProvider, None);
     }
 
     /// One-shot loopback fixture that serves `response` verbatim to the

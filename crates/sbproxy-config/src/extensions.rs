@@ -243,6 +243,13 @@ pub enum BundleRuntime {
     Wasm,
     /// WebAssembly using the Proxy-Wasm HTTP filter ABI.
     ProxyWasm,
+    /// Rego evaluated directly on the Regorus interpreter (WOR-2482).
+    ///
+    /// No export, no ABI, no host call surface: a Rego module performs
+    /// no I/O during evaluation, matching `policy: rego`'s own
+    /// constraint. Only `kind: policy` hooks are valid on this
+    /// runtime.
+    Rego,
 }
 
 /// Typed hook exported by a bundle.
@@ -333,6 +340,13 @@ pub struct BundleHook {
     /// through their ABI and must omit this field.
     #[serde(default)]
     pub export: Option<String>,
+    /// Rego rule reference evaluated per request, for example
+    /// `data.sbproxy.allow`. Only valid on `runtime: rego`; every other
+    /// runtime must omit it. Defaults to `data.sbproxy.allow`, matching
+    /// `policy: rego`'s own default, when a `runtime: rego` hook omits
+    /// it (WOR-2482).
+    #[serde(default)]
+    pub query: Option<String>,
     /// Optional Draft 7 JSON Schema for per-attachment configuration.
     #[serde(default)]
     pub config_schema: Option<Value>,
@@ -803,6 +817,7 @@ impl BundleManifest {
                             BundleRuntime::Javascript => "javascript",
                             BundleRuntime::Wasm => "wasm",
                             BundleRuntime::ProxyWasm => "proxy_wasm",
+                            BundleRuntime::Rego => "rego",
                         }
                     ));
                 }
@@ -856,6 +871,12 @@ impl BundleManifest {
                         )))
                     })?;
                     validate_export(export)?;
+                    if hook.query.is_some() {
+                        return invalid(format!(
+                            "hook `{}` declares query, which only applies to runtime rego",
+                            hook.type_name
+                        ));
+                    }
                 }
             }
             BundleRuntime::Wasm => {
@@ -883,6 +904,12 @@ impl BundleManifest {
                     if hook.export.is_some() {
                         return invalid(format!(
                             "envelope WASM hook `{}` must omit export",
+                            hook.type_name
+                        ));
+                    }
+                    if hook.query.is_some() {
+                        return invalid(format!(
+                            "hook `{}` declares query, which only applies to runtime rego",
                             hook.type_name
                         ));
                     }
@@ -920,6 +947,49 @@ impl BundleManifest {
                         && hook.execution.body_mode != BundleBodyMode::Streamed
                     {
                         return invalid("ai_stream_event hooks require body_mode streamed");
+                    }
+                    if hook.query.is_some() {
+                        return invalid(format!(
+                            "hook `{}` declares query, which only applies to runtime rego",
+                            hook.type_name
+                        ));
+                    }
+                }
+            }
+            // WOR-2482: a Rego module performs no I/O and has no
+            // export or ABI, so the contract is narrower than every
+            // other runtime rather than a variant of one of them.
+            BundleRuntime::Rego => {
+                if self.abi.is_some() {
+                    return invalid("runtime rego must omit abi");
+                }
+                if !self.entry.ends_with(".rego") {
+                    return invalid("runtime rego entry must end in .rego");
+                }
+                for hook in &self.hooks {
+                    if hook.kind != BundleHookKind::Policy {
+                        return invalid(format!(
+                            "runtime rego may declare only policy hooks, got a {} hook",
+                            hook_kind_label(hook.kind)
+                        ));
+                    }
+                    if hook.export.is_some() {
+                        return invalid(format!(
+                            "rego hook `{}` must omit export; a Rego module has no \
+                             export, only the query it evaluates",
+                            hook.type_name
+                        ));
+                    }
+                    if hook.execution.body_mode != BundleBodyMode::None {
+                        return invalid(format!(
+                            "rego hook `{}` requires body_mode none; a bundled Rego \
+                             policy evaluates the request line, headers, and its own \
+                             config, never a buffered body",
+                            hook.type_name
+                        ));
+                    }
+                    if let Some(query) = &hook.query {
+                        validate_rego_query(query)?;
                     }
                 }
             }
@@ -1054,6 +1124,21 @@ fn validate_export(export: &str) -> Result<(), BundleManifestError> {
 fn validate_wasm_entry(entry: &str) -> Result<(), BundleManifestError> {
     if !entry.ends_with(".wasm") {
         return invalid("a WebAssembly entry must end in .wasm");
+    }
+    Ok(())
+}
+
+/// Validate a `runtime: rego` hook's declared `query`.
+///
+/// This is a bound on the field, not a Rego syntax check: Regorus
+/// itself refuses a query naming no rule (and every other semantic
+/// fault) when the module compiles, matching how a malformed
+/// `policy: rego` `query` fails at config load rather than here.
+fn validate_rego_query(query: &str) -> Result<(), BundleManifestError> {
+    if query.is_empty() || query.len() > 256 || query.bytes().any(|byte| byte.is_ascii_control()) {
+        return invalid(format!(
+            "query `{query}` must be 1 to 256 bytes with no control characters"
+        ));
     }
     Ok(())
 }
@@ -1331,6 +1416,134 @@ permissions: []
         let error = manifest_error(&yaml);
         assert!(
             error.contains("proxy_wasm may declare proxy_wasm or ai_stream_event hooks"),
+            "{error}"
+        );
+    }
+
+    // --- runtime: rego (WOR-2482) ---
+
+    const REGO_POLICY_MANIFEST: &str = r#"
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: rego-authz
+version: 1.0.0
+runtime: rego
+entry: policy.rego
+hooks:
+  - kind: policy
+    type: rego_authz
+    execution:
+      body_mode: none
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+permissions: []
+"#;
+
+    #[test]
+    fn a_rego_policy_hook_validates() {
+        let manifest = parse_manifest(REGO_POLICY_MANIFEST);
+        assert_eq!(manifest.runtime, BundleRuntime::Rego);
+        assert_eq!(manifest.hooks[0].kind, BundleHookKind::Policy);
+        assert_eq!(manifest.hooks[0].query, None);
+    }
+
+    #[test]
+    fn a_rego_hook_may_declare_a_query() {
+        let yaml = replace_once(
+            REGO_POLICY_MANIFEST,
+            "    type: rego_authz\n",
+            "    type: rego_authz\n    query: data.sbproxy.allow\n",
+        );
+        let manifest = parse_manifest(&yaml);
+        assert_eq!(
+            manifest.hooks[0].query.as_deref(),
+            Some("data.sbproxy.allow")
+        );
+    }
+
+    #[test]
+    fn runtime_rego_requires_an_entry_ending_in_rego() {
+        let yaml = REGO_POLICY_MANIFEST.replace("entry: policy.rego", "entry: policy.js");
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("runtime rego entry must end in .rego"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_rego_must_omit_abi() {
+        let yaml = replace_once(
+            REGO_POLICY_MANIFEST,
+            "entry: policy.rego\n",
+            "entry: policy.rego\nabi: sbproxy-envelope/v1\n",
+        );
+        let error = manifest_error(&yaml);
+        assert!(error.contains("runtime rego must omit abi"), "{error}");
+    }
+
+    #[test]
+    fn a_rego_hook_cannot_declare_export() {
+        let yaml = replace_once(
+            REGO_POLICY_MANIFEST,
+            "    type: rego_authz\n",
+            "    type: rego_authz\n    export: run\n",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("rego hook `rego_authz` must omit export"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rego_hook_requires_body_mode_none() {
+        let yaml = replace_once(
+            REGO_POLICY_MANIFEST,
+            "      body_mode: none",
+            "      body_mode: buffered",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("rego hook `rego_authz` requires body_mode none"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_policy_hooks_are_valid_on_runtime_rego() {
+        let yaml = REGO_POLICY_MANIFEST.replace("kind: policy", "kind: transform");
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("runtime rego may declare only policy hooks"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rego_hook_cannot_declare_capabilities() {
+        let yaml = replace_once(
+            REGO_POLICY_MANIFEST,
+            "    execution:",
+            "    permissions:\n      - net:outbound=https://pricing.example\n    execution:",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("runtime rego has no host call surface"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn query_is_rejected_on_a_non_rego_runtime() {
+        let yaml = AI_ROUTING_WASM_MANIFEST.replace(
+            "    type: cost_quality_router\n",
+            "    type: cost_quality_router\n    query: data.sbproxy.allow\n",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("declares query, which only applies to runtime rego"),
             "{error}"
         );
     }

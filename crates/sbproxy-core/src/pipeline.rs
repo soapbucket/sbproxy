@@ -3708,6 +3708,10 @@ fn default_request_modifier() -> RequestModifierConfig {
         body: None,
         lua_script: None,
         js_script: None,
+        rego_module: None,
+        rego_module_path: None,
+        rego_budget_ms: None,
+        rego_v0: false,
     }
 }
 
@@ -4577,6 +4581,7 @@ mod tests {
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         }
     }
 
@@ -5226,6 +5231,7 @@ origins:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         }
     }
 

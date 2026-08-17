@@ -92,6 +92,18 @@ impl OtlpLogSink {
         let endpoint = options.endpoint.clone();
         let timeout = options.timeout;
 
+        // WOR-2481 (C2 review fix): authorize against `egress.telemetry:`
+        // before building anything, but return `Err` on denial rather
+        // than exiting the process. Unlike the trace and metric
+        // exporters (genuinely boot-only), this sink can be rebuilt from
+        // a live config reload, so a denied endpoint has to become
+        // "log a warning, count it, run without this sink" the same way
+        // an exporter build failure already does below, not a process
+        // exit that would take down an already-running proxy over an
+        // allowlist doing its job. Omitted/allowed stamps the sighting
+        // and returns `Ok`.
+        crate::telemetry::authorize_telemetry_endpoint_or_reject(&endpoint, "logs")?;
+
         // Build the OTLP exporter per the operator's transport choice.
         // The 0.27 OTLP-logs builder API mirrors the trace + metric
         // builders already wired in `telemetry.rs`.
@@ -470,5 +482,51 @@ mod tests {
         );
 
         reset_sink_dispatcher_for_test();
+    }
+
+    /// C2 regression (WOR-2481 review): the log sink is reachable from a
+    /// live config reload (`install_sink_dispatcher_from_config` rebuilds
+    /// it on every reload, not only at boot), so a denied endpoint here
+    /// must not exit the process the way the boot-only trace and metric
+    /// exporters' equivalent check does. Proves `OtlpLogSink::new`
+    /// returns `Err` (this test function returning at all, rather than
+    /// the whole test binary terminating, is itself the "process alive"
+    /// half of the proof) and that the error names the denial, which is
+    /// what lets the caller in `sbproxy_core::server::lifecycle` log a
+    /// warning and skip the sink instead of taking the process down.
+    #[test]
+    fn a_denied_telemetry_endpoint_returns_err_instead_of_exiting_the_process() {
+        use sbproxy_security::egress::{
+            install_configured_gate, EgressAuthorizer, EgressConfig, EgressPurpose,
+            PurposeAllowlist,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        let allow = PurposeAllowlist {
+            hosts: HashSet::from(["otel-collector.example.com".to_string()]),
+            schemes: HashSet::from(["https".to_string(), "http".to_string()]),
+            ports: HashSet::from([4317]),
+            allow_private: false,
+        };
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::Telemetry, allow);
+        install_configured_gate(
+            EgressPurpose::Telemetry,
+            Some(EgressAuthorizer::new(EgressConfig { purposes })),
+        );
+
+        let options = OtlpLogSinkOptions {
+            endpoint: "http://attacker-collector.invalid:4317".to_string(),
+            ..OtlpLogSinkOptions::default()
+        };
+        let err = OtlpLogSink::new(options)
+            .err()
+            .expect("a denied endpoint must return Err, not exit the process");
+        assert!(
+            err.to_string().contains("egress.telemetry"),
+            "error must point at the allowlist that refused it, got: {err}"
+        );
+
+        install_configured_gate(EgressPurpose::Telemetry, None);
     }
 }

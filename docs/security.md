@@ -115,9 +115,10 @@ store is configured, and when that store fails, enforcement degrades to
 per-instance tracking with a metric and a warning rather than silence.
 [ai-gateway.md](ai-gateway.md#budgets).
 
-Every provider endpoint the gateway reaches is recorded with its authorization
-status, allowed, denied, or ungated, and is readable at `GET /api/egress`.
-Outbound dials pass a default-deny, DNS-pinned egress authorizer.
+Every outbound destination the gateway reaches, across every wired egress
+purpose and not just AI providers, is recorded with its authorization status,
+allowed, denied, or ungated, and is readable at `GET /api/egress`. Outbound
+dials pass a default-deny, DNS-pinned egress authorizer.
 
 Serving-path request budgets key by tenant, and a panicking tenant policy now
 denies that one request instead of crashing the process. Neither changes the
@@ -125,9 +126,9 @@ recommendation in [multi-tenant.md](multi-tenant.md): mutually untrusting
 tenants get one process per trust boundary.
 
 Prompt-linked audit records carry salted digests and lengths, never content.
-Security refusals and, when opted in, config changes append to hash-chained,
-signed files that `sbproxy audit verify --channel` checks offline.
-[audit-log.md](audit-log.md).
+Security, config, key-mutation, and admin-action records each append, when
+opted in per channel, to their own hash-chained, signed file that `sbproxy
+audit verify --channel` checks offline. [audit-log.md](audit-log.md).
 
 ## Defaults worth knowing
 

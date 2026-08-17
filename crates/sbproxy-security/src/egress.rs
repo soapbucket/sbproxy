@@ -102,6 +102,10 @@ pub enum EgressPurpose {
     EngineArtifact,
     /// Extension bundle hook outbound call (`net:outbound` grant).
     BundleHook,
+    /// OTLP trace/metric/log exporter endpoint (WOR-2481). Authorized once
+    /// at boot, where the exporter is constructed; config reload does not
+    /// re-verify it.
+    Telemetry,
 }
 
 impl EgressPurpose {
@@ -118,6 +122,7 @@ impl EgressPurpose {
             Self::ModelArtifact => "model_artifact",
             Self::EngineArtifact => "engine_artifact",
             Self::BundleHook => "bundle_hook",
+            Self::Telemetry => "telemetry",
         }
     }
 }
@@ -136,10 +141,12 @@ pub struct PurposeAllowlist {
     pub allow_private: bool,
 }
 
-/// Sketched top-level egress config (`proxy.egress`).
+/// Top-level egress config: one allowlist per purpose.
 ///
-/// Not wired to any config loader in this lane; callers construct it
-/// in tests or later adoption lanes.
+/// `sbproxy_config::compiler::compile_egress_gates` builds one of these
+/// per configured purpose from the operator-facing top-level `egress:`
+/// section (WOR-2476, WOR-2481); tests still construct it directly to
+/// exercise [`EgressAuthorizer`] without a config file.
 #[derive(Debug, Clone, Default)]
 pub struct EgressConfig {
     /// Allowlists keyed by purpose. Missing purpose => default deny.
@@ -570,6 +577,27 @@ pub struct RedirectHop {
 /// [`EgressDenied::RedirectToUnlistedHost`] rather than
 /// [`EgressDenied::UnlistedHost`] so refusals on hop one and hop two
 /// stay distinguishable in metrics. Without one, `rule` decides.
+///
+/// `origin` attributes the sighting this call stamps into
+/// [`record_egress_seen`]'s inventory (WOR-2478 review, M1): every
+/// production caller already carries the same configuration-scoped
+/// attribution it passes to [`record_egress_refused`] on the error path
+/// (a provider name, sink name, or origin id), so this asks for nothing
+/// a caller does not already have in scope. Before this, a redirect
+/// hop's destination was authorized and (on denial) counted in
+/// `sbproxy_egress_refused_total`, but never appeared in `GET
+/// /api/egress` at all: the inventory's own module doc claims "every
+/// outbound destination the gateway reaches," and a hop the initial
+/// dial's host allowlist never sees is a destination the gateway
+/// reaches too. `TooManyRedirects` and `MissingHost` are not stamped:
+/// neither names a real destination host to key an inventory row on.
+// Deliberate: this is the whole hop-authorization decision (auth
+// context, hop position, redirect policy, resolver, and the M1
+// attribution string) as explicit named args on purpose, not a bundled
+// struct, so every one of its ~10 call sites states plainly what it is
+// authorizing rather than assembling a config value that could go
+// stale between hops; only one arg over clippy's default threshold.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_hop(
     authorizer: Option<&EgressAuthorizer>,
     purpose: EgressPurpose,
@@ -578,6 +606,7 @@ pub fn evaluate_hop(
     hop_index: usize,
     rule: RedirectRule,
     resolver: &dyn HostResolver,
+    origin: &str,
 ) -> Result<RedirectHop, EgressDenied> {
     if hop_index > MAX_REDIRECT_HOPS {
         return Err(EgressDenied::TooManyRedirects);
@@ -588,27 +617,60 @@ pub fn evaluate_hop(
     }
     let strip_credentials = is_cross_origin(from, &next);
     match authorizer {
-        Some(auth) => {
-            let dest = auth
-                .authorize(purpose, next.as_str(), resolver)
-                .map_err(|e| match e {
+        Some(auth) => match auth.authorize(purpose, next.as_str(), resolver) {
+            Ok(dest) => {
+                record_egress_seen(
+                    purpose,
+                    next.as_str(),
+                    origin,
+                    EgressSightingStatus::Allowed,
+                    None,
+                );
+                Ok(RedirectHop {
+                    url: dest.url,
+                    pinned_addrs: dest.pinned_addrs,
+                    strip_credentials,
+                })
+            }
+            Err(e) => {
+                let denied = match e {
                     EgressDenied::UnlistedHost => EgressDenied::RedirectToUnlistedHost,
                     other => other,
-                })?;
+                };
+                record_egress_seen(
+                    purpose,
+                    next.as_str(),
+                    origin,
+                    EgressSightingStatus::Denied,
+                    Some(denied),
+                );
+                Err(denied)
+            }
+        },
+        None if strip_credentials && rule == RedirectRule::SameOriginOnly => {
+            record_egress_seen(
+                purpose,
+                next.as_str(),
+                origin,
+                EgressSightingStatus::Denied,
+                Some(EgressDenied::RedirectToUnlistedHost),
+            );
+            Err(EgressDenied::RedirectToUnlistedHost)
+        }
+        None => {
+            record_egress_seen(
+                purpose,
+                next.as_str(),
+                origin,
+                EgressSightingStatus::Ungated,
+                None,
+            );
             Ok(RedirectHop {
-                url: dest.url,
-                pinned_addrs: dest.pinned_addrs,
+                url: next,
+                pinned_addrs: Vec::new(),
                 strip_credentials,
             })
         }
-        None if strip_credentials && rule == RedirectRule::SameOriginOnly => {
-            Err(EgressDenied::RedirectToUnlistedHost)
-        }
-        None => Ok(RedirectHop {
-            url: next,
-            pinned_addrs: Vec::new(),
-            strip_credentials,
-        }),
     }
 }
 
@@ -910,6 +972,70 @@ pub fn egress_inventory_snapshot() -> Vec<EgressSighting> {
     sightings
 }
 
+// --- Configured-gate registry (WOR-2476, WOR-2481) ---
+//
+// The operator-facing top-level `egress:` config section
+// (`sbproxy_config::types::EgressTopLevelConfig`) compiles one
+// [`EgressAuthorizer`] per purpose it configures. `sbproxy-config` has no
+// business owning process-wide mutable state, and the consumers that need
+// the compiled authorizer (`AiClient`, the usage sinks, the model-artifact
+// fetcher, the outbound-credential resolver, the OTLP exporters) are spread
+// across five crates, several of them reached lazily, well past the config
+// compile call site. Rather than thread a parameter through every layer in
+// between, this registry mirrors [`egress_inventory`]'s shape: a
+// process-wide slot behind a free-function API, so any call site that
+// wants the currently configured authorizer for a purpose reads it with no
+// plumbing. `sbproxy_core::server::lifecycle::arm_egress_gates_from_config`
+// installs a fresh value for each purpose (and rebuilds the AI client that
+// reads `AiProvider` back out) at boot and on every successful config
+// reload: `lifecycle::run` and the reload path both call that one function,
+// deliberately, so a `deny_by_default` purpose is armed on a process's very
+// first request rather than only from its first reload onward. `Telemetry`
+// is the one exception, installed once at boot only, since the OTLP
+// exporters are never rebuilt on reload (WOR-2481 tracks adding that).
+
+fn configured_gates() -> &'static std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Install (or clear) the process-wide authorizer configured for `purpose`.
+///
+/// `Some(authorizer)` arms the purpose: every later [`configured_gate`]
+/// read for `purpose` returns it. `None` clears whatever a previous config
+/// installed, so a reload that drops the purpose's `egress.*` sub-block
+/// returns it to the legacy ungated contract instead of pinning the last
+/// configured allowlist forever.
+pub fn install_configured_gate(purpose: EgressPurpose, authorizer: Option<EgressAuthorizer>) {
+    let mut gates = match configured_gates().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match authorizer {
+        Some(authorizer) => {
+            gates.insert(purpose, authorizer);
+        }
+        None => {
+            gates.remove(&purpose);
+        }
+    }
+}
+
+/// Read the process-wide authorizer currently configured for `purpose`.
+///
+/// `None` means the purpose's `egress.*` sub-block is omitted (or has
+/// never been installed), which every consumer treats as the legacy
+/// ungated contract: dispatch proceeds and the sighting is stamped
+/// [`EgressSightingStatus::Ungated`], never `Allowed`.
+pub fn configured_gate(purpose: EgressPurpose) -> Option<EgressAuthorizer> {
+    let gates = match configured_gates().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    gates.get(&purpose).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +1057,14 @@ mod tests {
             inventory.clear();
         }
         egress_inventory_saturated().store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clears every installed configured-gate entry. Callers must hold
+    /// [`test_state_lock`] first, same as [`reset_egress_inventory`].
+    fn reset_configured_gates() {
+        if let Ok(mut gates) = configured_gates().lock() {
+            gates.clear();
+        }
     }
 
     struct MapResolver {
@@ -1287,6 +1421,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect_err("an unconfigured path must not leave the host it was told to call");
         assert_eq!(err, EgressDenied::RedirectToUnlistedHost);
@@ -1304,6 +1439,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect("a same-origin hop is the one redirect an unconfigured path may follow");
         assert_eq!(
@@ -1326,6 +1462,7 @@ mod tests {
             1,
             RedirectRule::CrossOriginAllowed,
             &resolver,
+            "test",
         )
         .expect("artifact downloads redirect to object storage by design");
         assert_eq!(hop.url.as_str(), "https://cdn.example/blob/abc");
@@ -1349,6 +1486,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect_err("an off-allowlist hop must be refused");
         assert_eq!(
@@ -1376,6 +1514,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect("an allowlisted hop authorizes");
         assert_eq!(hop.pinned_addrs, pinned);
@@ -1402,6 +1541,7 @@ mod tests {
             MAX_REDIRECT_HOPS + 1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         );
         assert!(
             matches!(outcome, Err(EgressDenied::TooManyRedirects)),
@@ -1666,5 +1806,42 @@ mod tests {
             !serialized.contains("/oauth/token"),
             "no full URL: {serialized}"
         );
+    }
+
+    #[test]
+    fn configured_gate_round_trips_install_and_clear() {
+        let _guard = test_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_configured_gates();
+
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_none(),
+            "a purpose nothing installed must read back as unconfigured"
+        );
+
+        let mut allow = PurposeAllowlist::default();
+        allow.hosts.insert("sink.example.com".to_string());
+        allow.schemes.insert("https".to_string());
+        allow.ports.insert(443);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::UsageSink, allow);
+        let authorizer = EgressAuthorizer::new(EgressConfig { purposes });
+        install_configured_gate(EgressPurpose::UsageSink, Some(authorizer));
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_some(),
+            "an installed authorizer must read back"
+        );
+        assert!(
+            configured_gate(EgressPurpose::AiProvider).is_none(),
+            "installing one purpose must not arm another"
+        );
+
+        install_configured_gate(EgressPurpose::UsageSink, None);
+        assert!(
+            configured_gate(EgressPurpose::UsageSink).is_none(),
+            "installing None must clear a previously configured purpose, so a reload that \
+             drops the sub-block returns to the legacy ungated contract"
+        );
+
+        reset_configured_gates();
     }
 }

@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Rego module_path policy + Rego response modifier: the file-based
+# policy form and the third scripting engine on the modifier surface,
+# together on one origin.
+#
+# `policies[] type: rego` loads its module from a .rego file on disk
+# (module_path) instead of an inline YAML block scalar; the response
+# modifier tags 5xx responses via a Rego rule, the same way the
+# existing lua_script / js_script response modifiers do.
+#
+# Test the policy module offline before it ever reaches this file:
+#   sbproxy rego test examples/rego-modifier-parity/policy_test.yaml
+#
+# Run:
+#   make run CONFIG=examples/rego-modifier-parity/sb.yml
+#
+# Test:
+#   curl -i -H 'Host: rego.local' http://127.0.0.1:8080/public/status
+#   curl -i -H 'Host: rego.local' http://127.0.0.1:8080/private/status
+#
+# Expected: /public/status is allowed (the second `allow` rule in
+# policy.rego matches any GET under /public/); /private/status is
+# denied 403, since it satisfies neither rule without a `strong`
+# trust tier. A 5xx from the upstream on either path is tagged
+# x-status-bucket: 5xx by the response modifier.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "rego.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: rego
+        # Path resolved relative to the working directory the proxy
+        # is started from, same convention as transforms[] type:
+        # wasm's module_path. Use an absolute path in production.
+        module_path: examples/rego-modifier-parity/policy.rego
+
+    response_modifiers:
+      - rego_module: |
+          package sbproxy
+
+          modify_response := {"set_headers": {"x-status-bucket": "5xx"}} if {
+            input.response.status_code >= 500
+          }

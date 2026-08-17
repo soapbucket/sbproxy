@@ -358,6 +358,31 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.forward_rules[].origin.request_modifiers[].lua_script",
         "sbproxy_core::server::lua_request_modifier",
     ),
+    // WOR-2482: the Rego request-modifier quartet, mirroring the
+    // js_script / lua_script overrides just above. `rego_budget_ms` /
+    // `rego_module` / `rego_v0` are read by the evaluation function
+    // `rego_request_modifier` names, the same pattern the js/lua
+    // entries use (`rego_budget_ms` is also validated at config compile
+    // by `resolve_rego_modifier_module`, but the value that matters at
+    // request time is the one the evaluator reads); `rego_module_path`
+    // is resolved away at config compile, before the runtime ever sees
+    // it, by that same function.
+    stable(
+        "origins.*.forward_rules[].origin.request_modifiers[].rego_budget_ms",
+        "sbproxy_core::server::rego_request_modifier",
+    ),
+    stable(
+        "origins.*.forward_rules[].origin.request_modifiers[].rego_module",
+        "sbproxy_core::server::rego_request_modifier",
+    ),
+    stable(
+        "origins.*.forward_rules[].origin.request_modifiers[].rego_module_path",
+        "sbproxy_config::compiler::resolve_rego_modifier_module",
+    ),
+    stable(
+        "origins.*.forward_rules[].origin.request_modifiers[].rego_v0",
+        "sbproxy_core::server::rego_request_modifier",
+    ),
     unsupported(
         "origins.*.forward_rules[].origin.version",
         "The compiled child origin carries no version label, so the value reached neither \
@@ -551,6 +576,41 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     stable(
         "origins.*.request_modifiers[].lua_script",
         "sbproxy_core::server::lua_request_modifier",
+    ),
+    // WOR-2482: mirrors the forward-rule quartet above. See that
+    // entry's comment for why `rego_module_path` names the
+    // config-compile resolver rather than the runtime evaluator.
+    stable(
+        "origins.*.request_modifiers[].rego_budget_ms",
+        "sbproxy_core::server::rego_request_modifier",
+    ),
+    stable(
+        "origins.*.request_modifiers[].rego_module",
+        "sbproxy_core::server::rego_request_modifier",
+    ),
+    stable(
+        "origins.*.request_modifiers[].rego_module_path",
+        "sbproxy_config::compiler::resolve_rego_modifier_module",
+    ),
+    stable(
+        "origins.*.request_modifiers[].rego_v0",
+        "sbproxy_core::server::rego_request_modifier",
+    ),
+    stable(
+        "origins.*.response_modifiers[].rego_budget_ms",
+        "sbproxy_core::server::rego_response_modifier",
+    ),
+    stable(
+        "origins.*.response_modifiers[].rego_module",
+        "sbproxy_core::server::rego_response_modifier",
+    ),
+    stable(
+        "origins.*.response_modifiers[].rego_module_path",
+        "sbproxy_config::compiler::resolve_rego_modifier_module",
+    ),
+    stable(
+        "origins.*.response_modifiers[].rego_v0",
+        "sbproxy_core::server::rego_response_modifier",
     ),
     stable(
         "origins.*.response_modifiers[].status.text",

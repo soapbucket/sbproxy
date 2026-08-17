@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use jsonschema::JSONSchema;
 use sbproxy_config::{BundleHook, BundleHookKind, BundleManifest};
@@ -7,6 +7,7 @@ use sbproxy_plugin::ExtensionRegistrationSource;
 use thiserror::Error;
 
 use super::proxy_wasm::ProxyWasmRuntime;
+use crate::rego::CompiledRego;
 use crate::wasm::WasmRuntime;
 
 /// Safe source provenance retained by one loaded bundle hook.
@@ -76,6 +77,7 @@ pub struct LoadedBundleHook {
     pub(crate) javascript_source: Option<Arc<str>>,
     pub(crate) wasm_runtime: Option<Arc<WasmRuntime>>,
     pub(crate) proxy_wasm_runtime: Option<Arc<ProxyWasmRuntime>>,
+    pub(crate) compiled_rego: Option<Arc<Mutex<CompiledRego>>>,
     pub(crate) sha256: String,
     pub(crate) config_validator: Option<Arc<JSONSchema>>,
     pub(crate) provenance: BundleProvenance,
@@ -126,6 +128,16 @@ impl LoadedBundleHook {
     /// Return the module compiled once for all filters in a Proxy-Wasm bundle.
     pub(crate) fn prepared_proxy_wasm_runtime(&self) -> Option<&Arc<ProxyWasmRuntime>> {
         self.proxy_wasm_runtime.as_ref()
+    }
+
+    /// Return the Rego engine compiled once for this hook (WOR-2482).
+    ///
+    /// Unlike the JavaScript source and the WASM/Proxy-Wasm runtimes,
+    /// which are one artifact shared by every hook a manifest
+    /// declares, this is per hook: each `runtime: rego` hook may pin
+    /// its own `query`, so each gets its own compiled engine.
+    pub(crate) fn prepared_rego(&self) -> Option<&Arc<Mutex<CompiledRego>>> {
+        self.compiled_rego.as_ref()
     }
 
     /// Return the lowercase SHA-256 digest computed from [`Self::artifact`].

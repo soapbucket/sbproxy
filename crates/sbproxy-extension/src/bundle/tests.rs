@@ -1216,6 +1216,73 @@ fn bundle_v1_digest_is_stable_across_two_computations() {
     load_ok(temp.path());
 }
 
+// --- runtime: rego (WOR-2482) ---
+
+const VALID_REGO: &[u8] =
+    b"package sbproxy\n\ndefault allow := false\n\nallow if {\n    input.request.method == \"GET\"\n}\n";
+
+fn write_rego_bundle(root: &Path, directory: &str, manifest: &str, module: &[u8]) {
+    let bundle = root.join(directory);
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(bundle.join("bundle.yaml"), manifest).unwrap();
+    std::fs::write(bundle.join("policy.rego"), module).unwrap();
+}
+
+fn rego_manifest(name: &str, type_name: &str, digest: Option<&str>) -> String {
+    let digest = digest
+        .map(|value| format!("sha256: {value}\n"))
+        .unwrap_or_default();
+    format!(
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: rego\nentry: policy.rego\n{digest}hooks:\n  - kind: policy\n    type: {type_name}\n    execution:\n      body_mode: none\n"
+    )
+}
+
+#[test]
+fn a_signed_rego_bundle_activates_and_registers_a_policy_hook() {
+    let temp = TempDir::new().unwrap();
+    write_rego_bundle(
+        temp.path(),
+        "rego-authz",
+        &rego_manifest("rego-authz", "rego_authz", None),
+        VALID_REGO,
+    );
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .expect("a valid rego bundle candidate must load");
+    assert!(
+        registry.policy("rego_authz").is_some(),
+        "the bundle's policy hook must register the same way a JS bundle policy hook does"
+    );
+}
+
+#[test]
+fn entry_digest_detects_a_tampered_rego_module() {
+    // Mirrors `bundle_v1_digest_detects_a_tampered_non_entry_file`: a
+    // bundle asset changed after the digest that pinned it was
+    // computed must refuse the candidate, whatever runtime carries it.
+    let temp = TempDir::new().unwrap();
+    let digest = hex::encode(Sha256::digest(VALID_REGO));
+    write_rego_bundle(
+        temp.path(),
+        "rego-authz",
+        &rego_manifest("rego-authz", "rego_authz", Some(&digest)),
+        VALID_REGO,
+    );
+    load_ok(temp.path());
+
+    std::fs::write(
+        temp.path().join("rego-authz/policy.rego"),
+        b"package sbproxy\n\ndefault allow := true\n",
+    )
+    .unwrap();
+
+    let error = load_error(temp.path());
+    assert!(
+        error.to_string().contains("digest does not match"),
+        "{error}"
+    );
+}
+
 // --- net:outbound (WOR-2424) ---
 
 fn outbound_manifest(name: &str, destination: &str) -> String {

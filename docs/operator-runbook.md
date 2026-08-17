@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -275,20 +275,30 @@ An audit emission recorded a non-`ok` outcome. Audit emission carries a 100% SLO
 because durable audit is a compliance commitment, so any occurrence pages.
 
 Know what this alert can and cannot see. The `outcome` label on
-`sbproxy_audit_emit_duration_seconds` takes exactly two values, `ok` and
-`serialize_error`, and the only thing that produces `serialize_error` is
-`serde_json` failing on the audit record itself. Durability failures downstream
-of that still record `ok`. A hash chain append that fails leaves a hole in the
-trail and logs one ERROR line at `target: security_audit` with no metric behind
-it, and a dropped `events:` record increments `sbproxy_events_dropped_total`
-instead. A firing alert therefore means something is badly wrong with the record
-itself, and a quiet alert is not evidence that the audit trail is intact.
+`sbproxy_audit_emit_duration_seconds` takes three values across the four
+`channel` values (`security`, `config`, `key`, `admin`): `ok`,
+`serialize_error` (the record failed to encode as JSON; `admin` never
+reports this one, because an admin-action entry does not go through the
+same JSON-encode-to-tracing step the other three channels use), and
+`chain_error` (a configured chain rejected the append). All three are on
+the metric: a hash chain append failure is not a silent gap. It logs an
+ERROR line at the failing channel's own tracing target
+(`security_audit`, `config_audit`, `key_audit`, or
+`sbproxy::admin::audit`) on the first occurrence and the first after any
+recovery, not one per event, and it folds into `outcome="chain_error"`
+on this histogram, so the alert and the log line point at the same
+failure. A dropped `events:` record is a separate thing and increments
+`sbproxy_events_dropped_total` instead.
 
-**First check.** The audit logs, at the `config_audit`, `security_audit`, and
-`key_audit` targets. If the chain sink is configured, run `sbproxy audit verify`
-against `audit.path`. If `events:` is configured, check
-`sbproxy_events_dropped_total{reason="queue_full"}`, which is the drop this
-alert does not cover.
+**First check.** Which `channel` label fired. Then the audit logs at
+that channel's own target (`security_audit`, `config_audit`,
+`key_audit`, or `sbproxy::admin::audit`) for the matching ERROR line. If
+the outcome was `chain_error`, run `sbproxy audit verify --channel
+<channel>` against the path that channel writes to (`audit.path`,
+`audit.config_path`, `audit.key_path`, or `audit.admin_path`). If
+`events:` is configured, also check
+`sbproxy_events_dropped_total{reason="queue_full"}`, a different drop
+this alert does not cover.
 
 **Resolved when.** The non-`ok` count returns to zero and the chain verifies. A
 chain gap cannot be backfilled once the disk recovers; the process logs that
@@ -304,10 +314,12 @@ events. The alert rule's own description calls it a backlog risk, and that is
 wrong: there is no queue in front of this histogram.
 
 **First check.** The chain sink, if `audit.sink: chain` is configured. That
-append happens inside the measured region, so a slow disk at `audit.path` is the
-first candidate. Otherwise it is the tracing writer behind the `audit_log` sink,
-which for `output.type: file` is the same disk question and for stdout is
-whatever is consuming the stream.
+append happens inside the measured region, so a slow disk at whichever chain
+path the affected `channel` writes to (`audit.path`, `audit.config_path`,
+`audit.key_path`, or `audit.admin_path`) is the first candidate. Otherwise it
+is the tracing writer behind the `audit_log` sink, which for `output.type:
+file` is the same disk question and for stdout is whatever is consuming the
+stream.
 
 **Resolved when.** p99 is back under 5 s. Nothing has to drain first, because
 nothing was buffered.

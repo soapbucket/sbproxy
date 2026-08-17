@@ -122,8 +122,9 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 
 ## Scripting and extensibility
 
-- [plugins.md](plugins.md) - the entry point for extending SBproxy: the four config-level surfaces (CEL, Lua, JavaScript, WASM), extension bundles, the four hook kinds, and the advanced linked-Rust-plugin path.
-- [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
+- [plugins.md](plugins.md) - the entry point for extending SBproxy: the five config-level surfaces (CEL, Rego, Lua, JavaScript, WASM), extension bundles, the four hook kinds, and the advanced linked-Rust-plugin path.
+- [scripting.md](scripting.md) - CEL, Rego, Lua, JavaScript, and WASM scripting reference, including the offline `sbproxy rego test` loop.
+- [opa-rego-policies.md](opa-rego-policies.md) - OPA-compatible policies (Rego): the Regorus interpreter in process, the input document, and when to choose Rego over CEL.
 - [extension-bundles.md](extension-bundles.md) - adding policies, transforms, actions, HTTP filters, and event hooks as loadable bundles, from a local directory or a verified git checkout, without linking a new proxy binary.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
@@ -154,7 +155,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [security.md](security.md) - the security map: what the gateway enforces, what stays with your services, and which gaps are real.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
 - [api-security.md](api-security.md) - API threat classes and the policy configuration for each, from object-level authorization to bot traffic.
-- [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - what the gateway enforces against the OWASP LLM Top 10 (2026) and the gateway-layer control set, with coverage stated as full, partial, or out of scope.
+- [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - the eight gateway-layer controls no published list covers, and a row-by-row OWASP LLM Top 10 (2026) mapping, each claim backed by a named test or signal and every limit paired with its rationale.
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.

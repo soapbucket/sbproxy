@@ -20,7 +20,8 @@ only reach listed hosts or suffixes. Redirects are followed manually
 and every redirect target is checked before the gateway opens the next
 connection. Judge and token-exchange destinations use the shared
 `sbproxy_security::egress` authorizer purposes (`AiJudge`,
-`TokenExchange`) when wired.
+`TokenExchange`). The judge transport is gated by
+`dual_llm_quarantine.egress`, covered in the next section.
 
 ```yaml
 action:
@@ -82,7 +83,20 @@ action:
     endpoint: https://judge.example/v1/chat/completions
     model: judge-model
     timeout: 10s
+    egress:
+      mode: deny_by_default
+      hosts: [judge.example]
 ```
+
+`egress` scopes an allowlist to the judge endpoint alone, in the same
+shape `federated_servers[].egress` uses (purpose `AiJudge`). It is its
+own field rather than a share of the action-level `egress:` block
+above, deliberately: an operator's existing OpenAPI-tool allowlist is
+scoped to their own upstream API, and reusing it here would silently
+start gating the judge endpoint too on upgrade. Omitted, the judge call
+is ungated (allow-all) but every call still lands in the runtime egress
+inventory at `GET /api/egress`, so an operator can see what the judge
+is reaching before deciding to lock it down.
 
 ### Supervised local stdio MCP
 
