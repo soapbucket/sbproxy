@@ -200,6 +200,7 @@ allow if {
 }
 "#;
 
+    #[derive(Debug)]
     struct RegoFixture {
         _directory: TempDir,
         registry: Arc<DynamicBundleRegistry>,
