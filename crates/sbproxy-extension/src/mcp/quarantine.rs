@@ -50,6 +50,15 @@ impl UntrustedToolOutput {
     /// only cross-crate reference was a `sbproxy-modules` test, which
     /// now goes through `from_tool_result_value` too. In-crate tests
     /// still use it directly for the terser call site.
+    ///
+    /// `#[cfg(test)]` (lint-lane fix): every remaining caller, in-crate
+    /// or out, is a test (grepped the whole workspace to confirm), so a
+    /// plain `cargo clippy -p sbproxy-extension --all-targets` lib pass
+    /// sees no non-test caller and reports it dead code. Same mechanism
+    /// as `#757`/`#759` (see the repo's root `CLAUDE.md`): gate the
+    /// helper to match its callers instead of widening visibility back
+    /// out to silence the lint.
+    #[cfg(test)]
     pub(crate) fn from_text_blocks(text_blocks: impl IntoIterator<Item = String>) -> Self {
         Self {
             text_blocks: text_blocks.into_iter().collect(),
