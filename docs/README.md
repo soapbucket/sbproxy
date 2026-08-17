@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -119,6 +119,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [api-security.md](api-security.md) - API threat classes and the policy configuration for each, from object-level authorization to bot traffic.
 - [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - what the gateway enforces against the OWASP LLM Top 10 (2026) and the gateway-layer control set, with coverage stated as full, partial, or out of scope.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
+- [mcp-security-coverage.md](mcp-security-coverage.md) - what the gateway enforces against the OWASP MCP Top 10, with coverage stated as full, partial, or out of gateway scope.
 - [events.md](events.md) - the twelve typed events, the `events:` file and webhook sinks, and the in-process bus.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [policy.md](policy.md) - the policy engine, the `semantic_constraint` policy, and the `request_validator`, `concurrent_limit`, `rate_limit_budget`, `http_framing`, and `a2a` policy reference.

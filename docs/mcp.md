@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -359,6 +359,11 @@ success.
 | `server_info.version` | string | `0.1.0` | Returned in `initialize` responses. |
 | `rbac_policies` | map<string, ToolAccessPolicy> | `{}` | Named tool-access labels referenced by `federated_servers[].rbac`. |
 | `federated_servers` | list | required, non-empty | Upstream MCP servers to aggregate. |
+| `argument_policies` | list | `[]` | CEL or OPA-compatible Rego rules evaluated against the tool-call context (name, server, session, tenant, principal, parsed arguments) after RBAC and JSON-Schema validation, before dispatch. `mode: warn` (default) or `block`. See [mcp-security.md](mcp-security.md#a-permitted-tool-called-with-an-argument-that-should-not-be). |
+| `result_policies` | list | `[]` | Same CEL/Rego shape as `argument_policies`, evaluated against the tool-call result (`mcp.result`) after dispatch and after `content_filters`, before the result reaches the caller. |
+| `content_filters` | object | `{secrets: off, pii: off}` | Secret- and PII-shape detection over tool-call arguments (outbound) and tool-call results, `resources/read`, and `prompts/get` responses (inbound). Each of `secrets` / `pii` is `off` \| `warn` \| `redact` \| `block`. See [mcp-security.md](mcp-security.md#credentials-reaching-a-tool-that-should-not-see-them). |
+| `flow` | object | `{mode: off}` | Deterministic session-flow enforcement (Meta's Rule of Two): `mode` (`off`/`warn`/`block`), `rule` (`two_of_three`/`taint_and_outbound`), `trusted_servers`, `sensitive_servers`, `sensitive_tools`, `outbound_tools`, `taint_reads`. See [mcp-security.md](mcp-security.md#a-session-that-reads-something-untrusted-then-tries-to-leave). |
+| `mcp_audit` | object | `{capture_arguments: false}` | Opt-in redacted, size-bounded verbatim tool-call arguments on `mcp_governance_decision` evidence records. See [events.md](events.md) and [mcp-security.md](mcp-security.md#verbatim-argument-capture). |
 | `guardrails` | list | `[]` | Gateway-level safety checks. |
 | `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalog (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
 | `oauth` | object | unset | RFC 9728 auth discovery (see the OAuth section below and [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)). |
@@ -928,6 +933,8 @@ walks through that same fixture end to end, including a real
 
 ## See also
 
+- [`mcp-security-coverage.md`](mcp-security-coverage.md): the OWASP MCP
+  Top 10 scorecard for the surfaces on this page.
 - [`use-case-mcp-federation.md`](use-case-mcp-federation.md): the
   solution guide: problem, RBAC allowlist, and next steps.
 - [`migration-mcp-rbac.md`](migration-mcp-rbac.md): upgrade

@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2103,9 +2103,14 @@ origins:
 |-------|------|---------|-------------|
 | `mode` | string | `gateway` | MCP operating mode. Other values fail configuration. |
 | `server_info` | object | generated defaults | Name and version returned by MCP `initialize`. |
-| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, and OpenAPI `spec` or `spec_path`. |
+| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
 | `rbac_policies` | map | `{}` | Named tool-access policies referenced by `federated_servers[].rbac`. |
-| `egress` | object | allow all | Default egress policy for OpenAPI-backed REST tools. A server-level `egress` block overrides it. |
+| `argument_policies` | list | `[]` | CEL or OPA-compatible Rego rules evaluated against the tool-call context (name, server, session, tenant, principal, parsed arguments) after RBAC and JSON-Schema validation, before dispatch. `mode: warn` (default) or `block`. |
+| `result_policies` | list | `[]` | Same CEL/Rego shape as `argument_policies`, evaluated against the tool-call result after dispatch and after `content_filters`, before the result reaches the caller. |
+| `content_filters` | object | `{secrets: off, pii: off}` | Secret- and PII-shape detection over tool-call arguments and results, `resources/read`, and `prompts/get` responses. Each of `secrets` / `pii` is `off` \| `warn` \| `redact` \| `block`. |
+| `flow` | object | `{mode: off}` | Deterministic session-flow enforcement (Meta's Rule of Two): `mode` (`off`/`warn`/`block`), `rule` (`two_of_three`/`taint_and_outbound`), `trusted_servers`, `sensitive_servers`, `sensitive_tools`, `outbound_tools`, `taint_reads`. |
+| `mcp_audit` | object | `{capture_arguments: false}` | Opt-in redacted, size-bounded verbatim tool-call arguments on `mcp_governance_decision` evidence records. |
+| `egress` | object | allow all | Default egress policy for OpenAPI-backed REST tools, and, per server, the base MCP connect too. A server-level `egress` block overrides it. |
 | `guardrails` | list | `[]` | Tool allowlist and lethal-trifecta checks applied before `tools/call`. |
 | `progressive_discovery` | bool | false | Advertise `search` and `execute` meta-tools instead of the full catalog. |
 | `oauth` | object | unset | RFC 9728 protected-resource discovery metadata. |

@@ -1,6 +1,11 @@
 # MCP security
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
+
+For a row-by-row scorecard against the OWASP MCP Top 10, coverage stated
+plainly as full, partial, or out of gateway scope, see
+[mcp-security-coverage.md](mcp-security-coverage.md). This page is the
+threat-by-threat narrative behind that table.
 
 MCP moves two things that a language model will act on: the tool definitions it
 advertises, and the tool output it returns. Both arrive from a server you may
@@ -161,6 +166,11 @@ call dispatches:
             }
           mode: block
 ```
+
+An expression can also live in its own file: `path` reads it once at
+config-compile time instead of taking it inline as `source`, mirroring
+`federated_servers[].spec_path`. Exactly one of `source`/`path` is
+required per rule.
 
 The expression's boolean result follows the CEL/Rego convention used
 everywhere else in this gateway: `true` is compliant, `false` is a
@@ -695,6 +705,8 @@ cross-tenant injection was never the intent.
 
 ## Where to go next
 
+- [mcp-security-coverage.md](mcp-security-coverage.md) for the OWASP MCP
+  Top 10 scorecard this page's sections answer to.
 - [mcp.md](mcp.md) for the gateway itself: wire shape, sessions, OAuth, and the
   dual-era transport.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) for the guardrail
