@@ -4777,6 +4777,56 @@ hooks:
     }
 
     #[test]
+    fn rego_bundle_digest_tamper_preserves_the_current_pipeline_pointer() {
+        // WOR-2482: the same verify-then-activate contract
+        // `extension_load_failure_preserves_the_current_pipeline_pointer`
+        // proves for a broken JavaScript export, proved here for a
+        // `.rego` module changed after the digest that pinned it was
+        // computed. Tampering, not a syntax error, is the threat model
+        // "the previous bundle stays active" actually describes.
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let bundle = directory.path().join("bundles").join("rego-tamper-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        let module: &[u8] =
+            b"package sbproxy\n\ndefault allow := false\n\nallow if {\n    input.request.method == \"GET\"\n}\n";
+        let digest = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(module))
+        };
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            format!(
+                "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: rego-tamper-fixture\nversion: 1.0.0\nruntime: rego\nentry: policy.rego\nsha256: {digest}\nhooks:\n  - kind: policy\n    type: rego_tamper_fixture_policy\n    execution:\n      body_mode: none\n"
+            ),
+        )
+        .expect("write bundle manifest");
+        std::fs::write(bundle.join("policy.rego"), module).expect("write valid rego module");
+        let config_path = directory.path().join("sb.yml");
+        let yaml = "proxy: {}\nextensions:\n  bundles_dir: bundles\n";
+        reload_from_config_yaml(config_path.to_str().expect("UTF-8 config path"), yaml)
+            .expect("first candidate should publish");
+        let current = crate::reload::current_pipeline_full();
+
+        // Tamper: change the shipped bytes without updating the pinned
+        // digest, exactly the threat "activate only after verification"
+        // exists to catch.
+        std::fs::write(
+            bundle.join("policy.rego"),
+            b"package sbproxy\n\ndefault allow := true\n",
+        )
+        .expect("replace rego module with tampered bytes");
+        let error = reload_from_config_yaml(config_path.to_str().expect("UTF-8 config path"), yaml)
+            .expect_err("a tampered rego bundle candidate must fail reload");
+        let after_tamper = crate::reload::current_pipeline_full();
+
+        assert!(error.to_string().contains("digest"), "{error:#}");
+        assert!(
+            Arc::ptr_eq(&current, &after_tamper),
+            "the previous bundle must stay active when the tampered candidate is refused"
+        );
+    }
+
+    #[test]
     fn extension_refresh_failure_preserves_the_current_pipeline_pointer() {
         let directory = tempfile::tempdir().expect("temporary config directory");
         let bundle = directory.path().join("bundles").join("refresh-fixture");

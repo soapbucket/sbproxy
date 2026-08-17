@@ -349,7 +349,12 @@ export interface StatsResponse {
   [k: string]: unknown;
 }
 
-export type ExtensionRuntime = "rust" | "javascript" | "wasm" | "proxy_wasm";
+export type ExtensionRuntime =
+  | "rust"
+  | "javascript"
+  | "wasm"
+  | "proxy_wasm"
+  | "rego";
 
 export type ExtensionHookKind =
   | "action"

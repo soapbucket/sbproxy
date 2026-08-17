@@ -99,8 +99,8 @@ permissions: []
 
 - `apiVersion` is `sbproxy.dev/v1alpha1` and `kind` is `Bundle`.
 - `name` is a stable lowercase bundle ID. Each hook `type` is the name used in `sb.yml`.
-- `runtime` is `javascript`, `wasm`, or `proxy_wasm`.
-- `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`.
+- `runtime` is `javascript`, `wasm`, `proxy_wasm`, or `rego`.
+- `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`; `rego` accepts `.rego`.
 - `sha256` pins a digest and `digest_scope` says what that digest is a digest of. The example above omits `digest_scope`, so it means `entry`, the narrower of the two scopes. See [What the digest covers](#what-the-digest-covers).
 - `hooks` declares at least one typed hook. A JavaScript hook names its ES module export. WASM hooks omit `export`.
 - `config_schema` is an optional Draft 7 JSON Schema for one attachment. Defaults are applied before the hook starts, and invalid attachment config refuses the candidate.
@@ -253,6 +253,35 @@ entry: action.wasm
 The artifact is a WASI preview 1 command module with an exported `_start`. On each invocation, sbproxy creates a fresh Wasmtime store, writes the same versioned JSON hook envelope to stdin, runs `_start`, and parses one strict JSON result from stdout. The module receives no filesystem, network, environment, or host-clock access. The compiled module is shared, but guest state is not.
 
 The worked example keeps `action.wat` beside the committed `action.wasm` and rebuilds it with `wat2wasm`. A production build can use any language that emits a compatible WASI preview 1 command module.
+
+## Rego
+
+A Rego bundle manifest uses:
+
+```yaml
+runtime: rego
+entry: policy.rego
+hooks:
+  - kind: policy
+    type: acme_authz
+    execution:
+      body_mode: none
+```
+
+A `runtime: rego` bundle rides the same signing, digest verification, and candidate load-or-refuse flow as every other bundle asset; see [Candidate load and reload](#candidate-load-and-reload). What differs is evaluation: sbproxy compiles the `.rego` module once, at candidate load, on the same [Regorus](https://github.com/microsoft/regorus) interpreter `policy: rego` uses (see [scripting.md](scripting.md)), and proves the pinned query evaluable before the candidate can activate, the same load-time guarantee `entry.js`'s declared exports and `action.wasm`'s module contract already get. A `.rego` module performs no I/O during evaluation, so `runtime: rego` accepts only `kind: policy` hooks, must omit `abi` and `export`, and must declare `execution.body_mode: none`.
+
+`type:` is the same `sb.yml` attachment name any other policy hook uses. The `query` field pins the rule reference evaluated per request (`data.<package>.<rule>`), defaulting to `data.sbproxy.allow` when omitted, matching `policy: rego`'s own default:
+
+```yaml
+hooks:
+  - kind: policy
+    type: acme_authz
+    query: data.sbproxy.allow
+    execution:
+      body_mode: none
+```
+
+The rule reads the same JSON envelope a JavaScript or WASM policy hook reads: `input.request.method`, `input.request.uri`, `input.request.headers`, and `input.config` (the attachment's resolved `vars`, after `config_schema` defaults and `secret_vars` resolution). This is the wire-level request, not the internally resolved `CelContext` `policy: rego` reads from `sb.yml`; a bundle hook never sees trust tier or principal the way a built-in enforcer can. The query must evaluate to a Rego boolean: `true` allows, and `false`, an evaluation error, or a non-boolean result all deny, matching `policy: rego`'s fail-closed posture.
 
 ## Proxy-Wasm HTTP and AI stream hooks
 

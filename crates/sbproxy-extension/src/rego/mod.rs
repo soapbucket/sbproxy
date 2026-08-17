@@ -425,6 +425,39 @@ impl CompiledRego {
         outcome
     }
 
+    /// Evaluate the pinned query against an arbitrary JSON `input`
+    /// document and return the rule's boolean result.
+    ///
+    /// The JSON-input twin of [`Self::eval_bool`], for a caller that
+    /// does not carry a [`CelContext`] (a signed extension bundle's
+    /// Rego policy hook, WOR-2482, whose input is the same JSON
+    /// envelope a JavaScript or WASM bundle policy hook reads, not the
+    /// CEL-context vocabulary `policy: rego` shares with
+    /// `policy: expression`). Stamps the same script metrics and the
+    /// same "non-boolean is an error" contract as [`Self::eval_bool`].
+    ///
+    /// `tenant` attributes any `print()` output from this evaluation;
+    /// pass the empty string when the caller has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `input` cannot be set, the rule does not
+    /// evaluate, or the result is not a boolean.
+    pub fn eval_bool_json(&mut self, input: serde_json::Value, tenant: &str) -> Result<bool> {
+        let start = std::time::Instant::now();
+        let outcome = self.eval_bool_from_value(input, tenant);
+        sbproxy_observe::metrics::record_script_duration("rego", start.elapsed().as_secs_f64());
+        sbproxy_observe::metrics::record_script_invocation(
+            "rego",
+            if outcome.is_ok() {
+                "ok"
+            } else {
+                "runtime_error"
+            },
+        );
+        outcome
+    }
+
     /// Evaluate the query against an arbitrary JSON `input` document and
     /// return the rule's value as JSON.
     ///
@@ -479,15 +512,23 @@ impl CompiledRego {
     }
 
     fn eval_bool_inner(&mut self, ctx: &CelContext) -> Result<bool> {
-        use serde::Deserialize;
         // Feed regorus the tree directly rather than serialising to a
         // string it immediately reparses; the conversion is the only
         // pass over the context this way.
-        let input = regorus::Value::deserialize(context_to_input(ctx))
+        self.eval_bool_from_value(context_to_input(ctx), tenant_from_context(ctx))
+    }
+
+    /// Shared tail of [`Self::eval_bool_inner`] and
+    /// [`Self::eval_bool_json`]: set `input`, evaluate the pinned
+    /// query, drain any `print()` output, and require a boolean
+    /// result.
+    fn eval_bool_from_value(&mut self, input: serde_json::Value, tenant: &str) -> Result<bool> {
+        use serde::Deserialize;
+        let input = regorus::Value::deserialize(input)
             .with_context(|| format!("{}: input document rejected", self.site))?;
         self.engine.set_input(input);
         let result = self.engine.eval_rule(self.query.clone());
-        self.drain_prints(tenant_from_context(ctx));
+        self.drain_prints(tenant);
         let value = result
             .with_context(|| format!("{}: rule `{}` did not evaluate", self.site, self.query))?;
         match value {
@@ -776,6 +817,63 @@ allow := {"reason": "because"}
         .expect("module compiles");
         let error = policy
             .eval_bool(&context())
+            .expect_err("a document is not a verdict");
+        assert!(
+            error.to_string().contains("rather than a boolean"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn eval_bool_json_evaluates_the_pinned_query_against_arbitrary_json() {
+        // The JSON-input twin `RegoPolicyAdapter` (a bundled Rego
+        // policy hook, WOR-2482) calls instead of `eval_bool`: no
+        // `CelContext` involved, just the JSON envelope a bundle hook
+        // already builds.
+        let mut policy = CompiledRego::compile(
+            "bundle `rego-authz` policy `rego_authz`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+        let denied = policy
+            .eval_bool_json(
+                serde_json::json!({"request": {"method": "POST", "path": "/v1/chat"}}),
+                "",
+            )
+            .expect("evaluates");
+        assert!(!denied, "no rule matches a bare POST with no trust_tier");
+
+        let allowed = policy
+            .eval_bool_json(
+                serde_json::json!({"request": {"method": "GET", "path": "/health"}}),
+                "",
+            )
+            .expect("evaluates");
+        assert!(allowed, "GET /health matches the health-check rule");
+    }
+
+    #[test]
+    fn eval_bool_json_rejects_a_non_boolean_rule_the_same_as_eval_bool() {
+        const RETURNS_A_DOCUMENT: &str = r#"
+package sbproxy
+
+allow := {"reason": "because"}
+"#;
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            RETURNS_A_DOCUMENT,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect("module compiles");
+        let error = policy
+            .eval_bool_json(serde_json::json!({}), "")
             .expect_err("a document is not a verdict");
         assert!(
             error.to_string().contains("rather than a boolean"),
