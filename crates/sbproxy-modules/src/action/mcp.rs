@@ -676,13 +676,15 @@ pub enum McpServerApprovalStatus {
     Deprecated,
 }
 
-/// Stable `sbproxy.decision.rule_id` for a `deprecated` server's
-/// warn-level `mcp_governance_decision` event (WOR-2384, MCP09). A
-/// `draft` server's refusal is a simpler, pre-dispatch guardrail (like
-/// `tool_allowlist` or the lethal-trifecta guardrail) and is not wired
-/// to the governance evidence bus, so it carries no rule_id of its
-/// own; only `deprecated`'s event does.
+/// Stable `sbproxy.decision.rule_id` for a registry-approval-status
+/// `mcp_governance_decision` event (WOR-2384, MCP09): a `draft`
+/// server's `tools/call` refusal (verdict `deny`) or a `deprecated`
+/// server's warn-level event (verdict `warn`). Shared by both, the
+/// same way `peer_downgrade` is one rule_id across its own two axes.
 pub const MCP_SERVER_APPROVAL_RULE_ID: &str = "mcp_server_approval";
+/// `sbproxy.decision.reason` / policy-metric label for a `draft`
+/// server's `tools/call` refusal.
+pub const MCP_SERVER_DRAFT_REASON: &str = "server_draft";
 /// `sbproxy.decision.reason` / policy-metric label for a `deprecated`
 /// server's warn-level governance event.
 pub const MCP_SERVER_DEPRECATED_REASON: &str = "mcp_server_deprecated";

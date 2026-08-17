@@ -3062,6 +3062,16 @@ pub(super) async fn handle_mcp_action(
                 .federation
                 .list_resources()
                 .into_iter()
+                // WOR-2384 (MCP09) fix round 1: a `draft` server's
+                // resources are neither advertised nor readable, the
+                // same "hidden from the listing surface" treatment
+                // `tools/list` already gets.
+                .filter(|r| {
+                    !matches!(
+                        mcp.server_status(&r.server_name),
+                        sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+                    )
+                })
                 .map(|r| {
                     let mut entry = serde_json::json!({
                         "uri": r.uri,
@@ -3115,17 +3125,31 @@ pub(super) async fn handle_mcp_action(
                 // to check against), never a way to skip this check
                 // for a URI that does resolve.
                 let resolved = mcp.federation.resolve_resource(uri);
-                let downgrade_refusal = resolved.as_ref().and_then(
+                // WOR-2384 (MCP09) fix round 1: the approval-status
+                // check runs first, at the same pre-dispatch position
+                // as the peer-downgrade check below -- a `draft`
+                // server's resource must never be read regardless of
+                // peer-downgrade outcome. `or_else` means the
+                // peer-downgrade check only runs when approval status
+                // did not already refuse.
+                let refusal = resolved.as_ref().and_then(
                     |resource: &sbproxy_extension::mcp::federation::FederatedResource| {
-                        mcp_peer_downgrade_refusal_for_non_tool_call(
+                        mcp_server_approval_refusal_for_non_tool_call(
                             mcp,
                             ctx,
-                            session,
                             &resource.server_name,
                         )
+                        .or_else(|| {
+                            mcp_peer_downgrade_refusal_for_non_tool_call(
+                                mcp,
+                                ctx,
+                                session,
+                                &resource.server_name,
+                            )
+                        })
                     },
                 );
-                if let Some(message) = downgrade_refusal {
+                if let Some(message) = refusal {
                     JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
                 } else {
                     match mcp.federation.read_resource(uri).await {
@@ -3241,7 +3265,13 @@ pub(super) async fn handle_mcp_action(
                 // dispatch" ordering `resources/read` now makes
                 // explicit too. A downgraded peer is never contacted
                 // for its prompt either.
-                mcp_peer_downgrade_refusal_for_non_tool_call(mcp, ctx, session, &p.server_name)
+                //
+                // WOR-2384 (MCP09) fix round 1: approval status runs
+                // first, same pre-dispatch position, same `or_else`
+                // short-circuit as `resources/read`.
+                mcp_server_approval_refusal_for_non_tool_call(mcp, ctx, &p.server_name).or_else(
+                    || mcp_peer_downgrade_refusal_for_non_tool_call(mcp, ctx, session, &p.server_name),
+                )
             }) {
                 JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
             } else {
@@ -3592,10 +3622,12 @@ pub(super) async fn handle_mcp_action(
                                 &format!("tool '{}' is blocked by tool_allowlist guardrail", name),
                             )
                         } else if let Some(denial) = mcp_server_draft_denial(
+                            ctx,
                             mcp,
                             federated.as_ref(),
                             &name,
-                            ctx.hostname.as_str(),
+                            mcp_session_id.as_deref(),
+                            is_modern,
                             request.id.clone(),
                         ) {
                             denial
@@ -4472,11 +4504,25 @@ fn mcp_lethal_trifecta_denial(
 /// callable. `None` when the tool did not resolve to any federated
 /// server (a separate, unrelated "unknown tool" outcome handled
 /// elsewhere) or when the resolved server's status is not `draft`.
+///
+/// WOR-2384 (MCP09) fix round 1: a `draft` server's `tools/call`
+/// refusal is a security-relevant denial like RBAC and quota, so it
+/// must reach the `mcp_governance_decision` evidence bus the same way
+/// theirs do (verdict `deny`, reason
+/// [`sbproxy_modules::action::mcp::MCP_SERVER_DRAFT_REASON`], rule_id
+/// [`sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID`]), with
+/// the same fail-closed contract: if `mcp_governance_decision` delivery
+/// itself fails under `events.fail_closed`, the caller gets
+/// [`mcp_evidence_unavailable_response`] instead of the plain draft
+/// denial.
+#[allow(clippy::too_many_arguments)]
 fn mcp_server_draft_denial(
+    ctx: &RequestContext,
     mcp: &sbproxy_modules::action::McpAction,
     federated: Option<&sbproxy_extension::mcp::FederatedTool>,
     tool_name: &str,
-    hostname: &str,
+    mcp_session_id: Option<&str>,
+    is_modern: bool,
     request_id: Option<serde_json::Value>,
 ) -> Option<sbproxy_extension::mcp::types::JsonRpcResponse> {
     let server_name = federated?.server_name.as_str();
@@ -4492,15 +4538,80 @@ fn mcp_server_draft_denial(
         server = %server_name,
         "MCP tools/call denied: federated server is not yet approved (status: draft)",
     );
-    sbproxy_observe::metrics::record_policy(hostname, "mcp_server_approval", "deny");
-    Some(sbproxy_extension::mcp::types::JsonRpcResponse::error(
-        request_id,
-        sbproxy_extension::mcp::types::INVALID_PARAMS,
-        &format!(
-            "tool '{}' is served by federated server '{}', which has status 'draft' and is not yet approved for calls",
-            tool_name, server_name
-        ),
-    ))
+    sbproxy_observe::metrics::record_policy(ctx.hostname.as_str(), "mcp_server_approval", "deny");
+    let message = format!(
+        "tool '{}' is served by federated server '{}', which has status 'draft' and is not yet approved for calls",
+        tool_name, server_name
+    );
+    Some(
+        if emit_mcp_governance_evidence(
+            ctx,
+            tool_name,
+            server_name,
+            mcp_session_id,
+            is_modern,
+            None,
+            McpGovernanceVerdict::Deny(sbproxy_modules::action::mcp::MCP_SERVER_DRAFT_REASON),
+            Some(sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID),
+        ) {
+            mcp_evidence_unavailable_response(request_id)
+        } else {
+            sbproxy_extension::mcp::types::JsonRpcResponse::error(
+                request_id,
+                sbproxy_extension::mcp::types::INVALID_PARAMS,
+                &message,
+            )
+        },
+    )
+}
+
+/// WOR-2384 (MCP09) fix round 1: the approval-status equivalent of
+/// [`mcp_peer_downgrade_refusal_for_non_tool_call`], for `resources/list`,
+/// `resources/read`, and `prompts/get` -- MCP surfaces that reach a
+/// federated peer but are not `tools/call`, so (matching the same
+/// carve-out the peer-downgrade check already uses for these methods)
+/// this does not touch the `mcp_governance_decision` evidence bus; that
+/// surface stays scoped to `tools/call` dispatch. `draft` refuses;
+/// `deprecated` logs and counts but still returns `None` (the request
+/// proceeds); `approved` is silent.
+fn mcp_server_approval_refusal_for_non_tool_call(
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+    server_name: &str,
+) -> Option<String> {
+    match mcp.server_status(server_name) {
+        sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft => {
+            tracing::warn!(
+                target: "sbproxy::mcp::server_approval",
+                server = %server_name,
+                tenant = %ctx.tenant_id,
+                "MCP request denied: federated server is not yet approved (status: draft)",
+            );
+            sbproxy_observe::metrics::record_policy(
+                ctx.hostname.as_str(),
+                "mcp_server_approval",
+                "deny",
+            );
+            Some(format!(
+                "federated server '{server_name}' has status 'draft' and is not yet approved for calls"
+            ))
+        }
+        sbproxy_modules::action::mcp::McpServerApprovalStatus::Deprecated => {
+            tracing::warn!(
+                target: "sbproxy::mcp::server_approval",
+                server = %server_name,
+                tenant = %ctx.tenant_id,
+                "MCP request served by a deprecated federated server",
+            );
+            sbproxy_observe::metrics::record_policy(
+                ctx.hostname.as_str(),
+                "mcp_server_approval",
+                "warn",
+            );
+            None
+        }
+        sbproxy_modules::action::mcp::McpServerApprovalStatus::Approved => None,
+    }
 }
 
 /// WOR-1792 / GS: mint upstream Authorization for run-as-user without
@@ -5892,6 +6003,19 @@ fn mcp_progressive_search(
                 sbproxy_extension::mcp::ToolAccessDecision::Allow,
             ),
             None => true,
+        })
+        // WOR-2384 (MCP09) fix round 1: progressive discovery's
+        // `search` meta-tool is a listing surface like `tools/list`,
+        // and previously filtered RBAC/allowlist but not approval
+        // status, so a `draft` server's tool metadata (name,
+        // description, schema) leaked through it even though the tool
+        // was hidden from `tools/list` and its `execute` dispatch was
+        // already refused.
+        .filter(|t| {
+            !matches!(
+                mcp.server_status(&t.server_name),
+                sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+            )
         })
         .filter(|t| {
             q.is_empty()
@@ -8256,6 +8380,75 @@ mod mcp_catalog_snapshot_tests {
                 }
             }
         }
+    }
+
+    /// WOR-2384 (MCP09) fix round 1, item 4: the modern `tools/list`
+    /// branch reads `entry.server_name` off
+    /// `ToolCatalogSnapshot::serialized_modern_tools()`'s entries, a
+    /// different pre-serialized snapshot than the legacy branch's
+    /// `serialized_tools()`, which
+    /// `wor_2384_server_approval_status_gates_tools_list_and_tools_call`
+    /// above only ever exercises through `serialized_tools()` --
+    /// `mcp_handler_exchange` sends no `Mcp-Protocol-Version` header,
+    /// so every scenario in that test resolves to the legacy era.
+    ///
+    /// This proves the modern snapshot's entries carry a real,
+    /// correctly-keyed `server_name` that `mcp.server_status` resolves
+    /// against for a `draft` server, i.e. the exact condition the
+    /// modern branch's `continue` depends on, without needing to drive
+    /// a full modern-era HTTP round trip through `handle_mcp_action`:
+    /// that transport requires `Mcp-Protocol-Version` /  `Mcp-Method`
+    /// headers, an `Accept` negotiation, and `params._meta.protocolVersion`
+    /// / `params._meta.clientCapabilities` in the body (see
+    /// `Modern2026_07_28Codec::decode_http_with_id`), none of which any
+    /// existing test in this crate exercises yet either, and getting
+    /// one subtly wrong without a compiler is a worse outcome than a
+    /// narrower, high-confidence proof of the same filter condition.
+    #[test]
+    fn wor_2384_modern_catalog_snapshot_hides_a_draft_servers_tool() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "modern-draft-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": "modern-draft-server",
+                "status": "draft"
+            }]
+        }))
+        .expect("modern draft-status fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(
+                "modern-draft-tool".to_string(),
+                modern_tool("modern-draft-tool", "modern-draft-server"),
+            )]),
+            None,
+        );
+
+        let catalog = action.federation.tool_catalog_snapshot();
+        let snapshot = catalog.serialized_modern_tools();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.name == "modern-draft-tool")
+            .expect(
+                "the modern snapshot itself must still contain the entry -- only \
+                 the tools/list filter loop hides it, not catalog construction",
+            );
+        assert_eq!(
+            entry.server_name, "modern-draft-server",
+            "modern snapshot entries must carry the real server_name the \
+             modern tools/list branch's draft filter reads"
+        );
+        assert!(
+            matches!(
+                action.server_status(&entry.server_name),
+                sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+            ),
+            "mcp.server_status(&entry.server_name) -- the exact condition \
+             guarding the modern branch's `continue` -- must resolve to Draft \
+             for this entry"
+        );
     }
 
     #[tokio::test]

@@ -3003,14 +3003,19 @@ impl McpFederation {
         // funnels through this one function, so gating here covers
         // every connect site the base (non-`openapi`) MCP path has.
         // `stdio` spawns a local process and is out of scope for a
-        // network egress purpose.
-        if server.transport.as_str() != "stdio" {
-            self.authorize_mcp_upstream_dial(server)?;
-        }
+        // network egress purpose. Fix round 1: the authorized client
+        // (pinned when the destination has verified addresses, shared
+        // otherwise) is what must be dialled with, not `&self.client`
+        // unconditionally -- see `authorize_mcp_upstream_dial`.
+        let dial_client = if server.transport.as_str() != "stdio" {
+            Some(self.authorize_mcp_upstream_dial(server)?)
+        } else {
+            None
+        };
         let result = match server.transport.as_str() {
             "sse" => {
                 send_via_sse(
-                    &self.client,
+                    dial_client.as_ref().unwrap_or(&self.client),
                     &server.url,
                     req,
                     self.max_response_bytes,
@@ -3035,7 +3040,7 @@ impl McpFederation {
             // Default to streamable HTTP for "streamable_http" or unknown.
             _ => {
                 send_request(
-                    &self.client,
+                    dial_client.as_ref().unwrap_or(&self.client),
                     &server.url,
                     req,
                     self.max_response_bytes,
@@ -3053,16 +3058,40 @@ impl McpFederation {
     /// Authorize the base MCP dial itself (`EgressPurpose::McpUpstream`,
     /// WOR-2384 / MCP09) before any connect, mirroring the discipline
     /// `EgressPurpose::OpenApiTool` already applies to `type: openapi`
-    /// REST calls a few methods above. The branch inspected is
-    /// `server.egress_policy.mode` directly, never a collapsed
-    /// `Result`: a server with no `egress:` configured (the
-    /// legacy-compatible default) is stamped `Ungated` in the
-    /// sightings inventory rather than silently counted as "allowed",
-    /// the same wrinkle the AI-provider gate closed for
-    /// `EgressPurpose::AiProvider` (WOR-2476). Callers skip this for
-    /// `stdio` servers: a local process spawn is not a network dial
-    /// and has no `EgressPurpose::McpUpstream` sighting to record.
-    fn authorize_mcp_upstream_dial(&self, server: &McpServerConfig) -> anyhow::Result<()> {
+    /// REST calls a few methods above. Production always passes
+    /// [`SystemHostResolver`]; see
+    /// [`Self::authorize_mcp_upstream_dial_with_resolver`] for the
+    /// resolver-injectable version tests use, the same split
+    /// `call_openapi_tool` / `call_openapi_tool_with_resolver`
+    /// establishes.
+    fn authorize_mcp_upstream_dial(&self, server: &McpServerConfig) -> anyhow::Result<reqwest::Client> {
+        self.authorize_mcp_upstream_dial_with_resolver(server, &SystemHostResolver)
+    }
+
+    /// [`Self::authorize_mcp_upstream_dial`] with an injected resolver
+    /// (WOR-2080), so a test can simulate a DNS answer that changes
+    /// between authorize and dial without live DNS.
+    ///
+    /// The branch inspected is `server.egress_policy.mode` directly,
+    /// never a collapsed `Result`: a server with no `egress:`
+    /// configured (the legacy-compatible default) is stamped `Ungated`
+    /// in the sightings inventory rather than silently counted as
+    /// "allowed", the same wrinkle the AI-provider gate closed for
+    /// `EgressPurpose::AiProvider` (WOR-2476), and the shared
+    /// `self.client` is returned unchanged since there is no pin to
+    /// dial with. An enforced policy authorizes, then hands off to
+    /// [`Self::mcp_upstream_dial_client`] to close the
+    /// resolve-to-connect window (WOR-2080) `openapi_dial_client`
+    /// already closes for `type: openapi`: the returned client, not
+    /// `self.client`, is what a caller must dial with for a pin to
+    /// mean anything. Callers skip this whole function for `stdio`
+    /// servers: a local process spawn is not a network dial and has no
+    /// `EgressPurpose::McpUpstream` sighting to record.
+    fn authorize_mcp_upstream_dial_with_resolver(
+        &self,
+        server: &McpServerConfig,
+        resolver: &dyn HostResolver,
+    ) -> anyhow::Result<reqwest::Client> {
         if !server.egress_policy.mode.is_enforce() {
             record_egress_seen(
                 EgressPurpose::McpUpstream,
@@ -3071,14 +3100,13 @@ impl McpFederation {
                 EgressSightingStatus::Ungated,
                 None,
             );
-            return Ok(());
+            return Ok(self.client.clone());
         }
-        match server.egress_policy.authorize(
-            EgressPurpose::McpUpstream,
-            &server.url,
-            &SystemHostResolver,
-        ) {
-            Ok(_) => {
+        let dest = match server
+            .egress_policy
+            .authorize(EgressPurpose::McpUpstream, &server.url, resolver)
+        {
+            Ok(dest) => {
                 record_egress_seen(
                     EgressPurpose::McpUpstream,
                     &server.url,
@@ -3086,7 +3114,7 @@ impl McpFederation {
                     EgressSightingStatus::Allowed,
                     None,
                 );
-                Ok(())
+                dest
             }
             Err(e) => {
                 record_egress_seen(
@@ -3097,9 +3125,54 @@ impl McpFederation {
                     Some(e),
                 );
                 record_egress_refused(EgressPurpose::McpUpstream, e, "", &server.name);
-                Err(anyhow::anyhow!("egress denied: {e:?}"))
+                return Err(anyhow::anyhow!("egress denied: {e:?}"));
             }
-        }
+        };
+        self.mcp_upstream_dial_client(server, &dest, resolver)
+    }
+
+    /// Build the client for one MCP-upstream dial of `dest` (WOR-2080),
+    /// mirroring `openapi_dial_client` above. A pinned destination gets
+    /// a per-dial client whose resolver override carries exactly the
+    /// verified pin set, so the connector cannot re-resolve the host on
+    /// its own; a rebound DNS answer is refused with the closed
+    /// `DnsPinMismatch` reason before any connect. An unpinned
+    /// destination keeps the shared, re-resolving `self.client`.
+    ///
+    /// Unlike `openapi_dial_client`, this does not disable redirects:
+    /// the base MCP transports (`send_request` / `send_via_sse`) have
+    /// no per-hop re-authorization loop the way the OpenAPI REST path
+    /// does, so disabling redirects here would be a behavior change
+    /// beyond closing the DNS-rebind window, not a defense this change
+    /// adds. A redirect to a *different* host is therefore still
+    /// unauthorized on that hop exactly as before this change; only the
+    /// pinned-host rebind window is closed here.
+    fn mcp_upstream_dial_client(
+        &self,
+        server: &McpServerConfig,
+        dest: &AuthorizedDestination,
+        resolver: &dyn HostResolver,
+    ) -> anyhow::Result<reqwest::Client> {
+        let Some(addrs) = server
+            .egress_policy
+            .verified_dial_addrs(dest, resolver)
+            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?
+        else {
+            return Ok(self.client.clone());
+        };
+        let host = dest
+            .url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("authorized MCP upstream URL lost its host"))?;
+        // Unlike the constructor's shared client, a builder failure
+        // here must not fall back to a default client: a default
+        // client would re-resolve and silently drop the pin defense.
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .resolve_to_addrs(host, &addrs)
+            .build()
+            .map_err(|e| anyhow::anyhow!("pinned MCP upstream client construction failed: {e}"))
     }
 
     /// Test-only: publish a tool registry and its matching version-gate
@@ -7676,6 +7749,115 @@ mod tests {
             .expect("refresh_tools must have run the dial through the mcp_upstream egress gate");
         assert_eq!(sighting.status, "denied");
         assert_eq!(sighting.last_reason, Some("private_address"));
+    }
+
+    /// WOR-2384 (MCP09) fix round 1: mirrors
+    /// `openapi_tool_dials_the_verified_pin_for_a_synthetic_host` below
+    /// -- proves `authorize_mcp_upstream_dial_with_resolver`'s returned
+    /// client is actually usable to dial the verified pin, not just
+    /// that it builds without error. "mcp-pin-dial.invalid" is
+    /// unresolvable by system DNS, so a response from the loopback
+    /// fixture proves the connector dialled the pin override, not a
+    /// live re-resolution.
+    #[tokio::test]
+    async fn mcp_upstream_dial_uses_the_verified_pin_for_a_synthetic_host() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string();
+        let Some((addr, was_hit)) = dial_fixture(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![("mcp-pin-dial.invalid", vec![vec![addr]])]);
+        let server = McpServerConfig {
+            name: "pin-dial-mcp".to_string(),
+            url: format!("http://mcp-pin-dial.invalid:{}/mcp", addr.port()),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                // allow_private so the loopback fixture pins authorize.
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["mcp-pin-dial.invalid".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:pin-dial-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![]);
+
+        let client = fed
+            .authorize_mcp_upstream_dial_with_resolver(&server, &resolver)
+            .expect("pinned client must build for a verified destination");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/list".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let resp = send_request(&client, &server.url, &req, 1 << 20, &[])
+            .await
+            .expect("pinned dial must reach the fixture");
+        assert_eq!(resp.id, Some(json!(1)));
+        assert!(
+            was_hit.load(Ordering::SeqCst),
+            "the pinned fixture must have served the call"
+        );
+    }
+
+    /// WOR-2384 (MCP09) fix round 1: mirrors
+    /// `openapi_tool_refuses_a_dns_answer_that_changed_before_dial`
+    /// below. Authorization pins the first fixture's address; the
+    /// dial-time re-verification answer has been rebound to the second
+    /// fixture. The gate must refuse with the closed `DnsPinMismatch`
+    /// and contact neither address.
+    #[tokio::test]
+    async fn mcp_upstream_dial_refuses_a_dns_answer_that_changed_before_dial() {
+        let Some((pinned_addr, pinned_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let Some((rebound_addr, rebound_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![(
+            "mcp-pin-rebind.invalid",
+            vec![vec![pinned_addr], vec![rebound_addr]],
+        )]);
+        let server = McpServerConfig {
+            name: "rebind-mcp".to_string(),
+            url: format!("http://mcp-pin-rebind.invalid:{}/mcp", pinned_addr.port()),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["mcp-pin-rebind.invalid".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:rebind-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![]);
+
+        let err = fed
+            .authorize_mcp_upstream_dial_with_resolver(&server, &resolver)
+            .expect_err("a rebound DNS answer must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("DnsPinMismatch"),
+            "expected DnsPinMismatch, got: {rendered}"
+        );
+        assert!(
+            !pinned_hit.load(Ordering::SeqCst),
+            "refusal must occur before any connect"
+        );
+        assert!(
+            !rebound_hit.load(Ordering::SeqCst),
+            "the rebound address must never be contacted"
+        );
     }
 
     #[tokio::test]
