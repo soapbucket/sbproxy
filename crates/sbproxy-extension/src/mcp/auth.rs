@@ -302,6 +302,7 @@ async fn send_token_exchange(
             hop,
             RedirectRule::SameOriginOnly,
             &CachedSystemResolver,
+            origin,
         )
         .map_err(|denied| {
             record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, origin);

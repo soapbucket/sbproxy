@@ -312,6 +312,7 @@ impl HttpArtifactTransport {
                 hop,
                 RedirectRule::CrossOriginAllowed,
                 &CachedSystemResolver,
+                origin_label,
             )
             .map_err(|denied| {
                 record_egress_refused(EgressPurpose::ModelArtifact, denied, "unset", origin_label);

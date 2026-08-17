@@ -577,6 +577,20 @@ pub struct RedirectHop {
 /// [`EgressDenied::RedirectToUnlistedHost`] rather than
 /// [`EgressDenied::UnlistedHost`] so refusals on hop one and hop two
 /// stay distinguishable in metrics. Without one, `rule` decides.
+///
+/// `origin` attributes the sighting this call stamps into
+/// [`record_egress_seen`]'s inventory (WOR-2478 review, M1): every
+/// production caller already carries the same configuration-scoped
+/// attribution it passes to [`record_egress_refused`] on the error path
+/// (a provider name, sink name, or origin id), so this asks for nothing
+/// a caller does not already have in scope. Before this, a redirect
+/// hop's destination was authorized and (on denial) counted in
+/// `sbproxy_egress_refused_total`, but never appeared in `GET
+/// /api/egress` at all: the inventory's own module doc claims "every
+/// outbound destination the gateway reaches," and a hop the initial
+/// dial's host allowlist never sees is a destination the gateway
+/// reaches too. `TooManyRedirects` and `MissingHost` are not stamped:
+/// neither names a real destination host to key an inventory row on.
 pub fn evaluate_hop(
     authorizer: Option<&EgressAuthorizer>,
     purpose: EgressPurpose,
@@ -585,6 +599,7 @@ pub fn evaluate_hop(
     hop_index: usize,
     rule: RedirectRule,
     resolver: &dyn HostResolver,
+    origin: &str,
 ) -> Result<RedirectHop, EgressDenied> {
     if hop_index > MAX_REDIRECT_HOPS {
         return Err(EgressDenied::TooManyRedirects);
@@ -595,27 +610,60 @@ pub fn evaluate_hop(
     }
     let strip_credentials = is_cross_origin(from, &next);
     match authorizer {
-        Some(auth) => {
-            let dest = auth
-                .authorize(purpose, next.as_str(), resolver)
-                .map_err(|e| match e {
+        Some(auth) => match auth.authorize(purpose, next.as_str(), resolver) {
+            Ok(dest) => {
+                record_egress_seen(
+                    purpose,
+                    next.as_str(),
+                    origin,
+                    EgressSightingStatus::Allowed,
+                    None,
+                );
+                Ok(RedirectHop {
+                    url: dest.url,
+                    pinned_addrs: dest.pinned_addrs,
+                    strip_credentials,
+                })
+            }
+            Err(e) => {
+                let denied = match e {
                     EgressDenied::UnlistedHost => EgressDenied::RedirectToUnlistedHost,
                     other => other,
-                })?;
+                };
+                record_egress_seen(
+                    purpose,
+                    next.as_str(),
+                    origin,
+                    EgressSightingStatus::Denied,
+                    Some(denied),
+                );
+                Err(denied)
+            }
+        },
+        None if strip_credentials && rule == RedirectRule::SameOriginOnly => {
+            record_egress_seen(
+                purpose,
+                next.as_str(),
+                origin,
+                EgressSightingStatus::Denied,
+                Some(EgressDenied::RedirectToUnlistedHost),
+            );
+            Err(EgressDenied::RedirectToUnlistedHost)
+        }
+        None => {
+            record_egress_seen(
+                purpose,
+                next.as_str(),
+                origin,
+                EgressSightingStatus::Ungated,
+                None,
+            );
             Ok(RedirectHop {
-                url: dest.url,
-                pinned_addrs: dest.pinned_addrs,
+                url: next,
+                pinned_addrs: Vec::new(),
                 strip_credentials,
             })
         }
-        None if strip_credentials && rule == RedirectRule::SameOriginOnly => {
-            Err(EgressDenied::RedirectToUnlistedHost)
-        }
-        None => Ok(RedirectHop {
-            url: next,
-            pinned_addrs: Vec::new(),
-            strip_credentials,
-        }),
     }
 }
 
@@ -1272,6 +1320,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect_err("an unconfigured path must not leave the host it was told to call");
         assert_eq!(err, EgressDenied::RedirectToUnlistedHost);
@@ -1289,6 +1338,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect("a same-origin hop is the one redirect an unconfigured path may follow");
         assert_eq!(
@@ -1311,6 +1361,7 @@ mod tests {
             1,
             RedirectRule::CrossOriginAllowed,
             &resolver,
+            "test",
         )
         .expect("artifact downloads redirect to object storage by design");
         assert_eq!(hop.url.as_str(), "https://cdn.example/blob/abc");
@@ -1334,6 +1385,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect_err("an off-allowlist hop must be refused");
         assert_eq!(
@@ -1361,6 +1413,7 @@ mod tests {
             1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         )
         .expect("an allowlisted hop authorizes");
         assert_eq!(hop.pinned_addrs, pinned);
@@ -1387,6 +1440,7 @@ mod tests {
             MAX_REDIRECT_HOPS + 1,
             RedirectRule::SameOriginOnly,
             &resolver,
+            "test",
         );
         assert!(
             matches!(outcome, Err(EgressDenied::TooManyRedirects)),

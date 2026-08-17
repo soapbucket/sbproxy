@@ -330,6 +330,7 @@ async fn send_sink_post(
             hop,
             RedirectRule::SameOriginOnly,
             &CachedSystemResolver,
+            sink_name,
         ) {
             Ok(next) => next,
             Err(denied) => {

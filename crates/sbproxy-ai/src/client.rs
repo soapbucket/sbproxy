@@ -1557,6 +1557,7 @@ async fn send_governed(
             hop,
             RedirectRule::SameOriginOnly,
             &CachedSystemResolver,
+            origin_label,
         )
         .map_err(|denied| {
             record_egress_refused(EgressPurpose::AiProvider, denied, "unset", origin_label);
@@ -4401,7 +4402,7 @@ mod tests {
         // WOR-2476: proves the seam `sbproxy_core::server::reload_ai_client`
         // uses to arm the client from a compiled `egress.ai_providers:
         // { mode: deny_by_default }` block (empty `hosts:`, exactly the
-        // brief's acceptance shape) — `sbproxy-ai` cannot depend on
+        // brief's acceptance shape). `sbproxy-ai` cannot depend on
         // `sbproxy-core` to call `reload_ai_client` itself, so this
         // reproduces its one-line composition: read the process-wide
         // `EgressPurpose::AiProvider` gate, attach it via `with_egress`
