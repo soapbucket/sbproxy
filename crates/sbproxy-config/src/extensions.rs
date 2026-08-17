@@ -1466,7 +1466,10 @@ permissions: []
     fn runtime_rego_requires_an_entry_ending_in_rego() {
         let yaml = REGO_POLICY_MANIFEST.replace("entry: policy.rego", "entry: policy.js");
         let error = manifest_error(&yaml);
-        assert!(error.contains("runtime rego entry must end in .rego"), "{error}");
+        assert!(
+            error.contains("runtime rego entry must end in .rego"),
+            "{error}"
+        );
     }
 
     #[test]

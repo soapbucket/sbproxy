@@ -92,8 +92,7 @@ pub fn build_rego_policy(
     hook: &LoadedBundleHook,
     config: Value,
 ) -> Result<RegoPolicyAdapter, BundleLoadError> {
-    if hook.manifest().runtime != BundleRuntime::Rego
-        || hook.hook().kind != BundleHookKind::Policy
+    if hook.manifest().runtime != BundleRuntime::Rego || hook.hook().kind != BundleHookKind::Policy
     {
         return Err(BundleLoadError::new(
             "rego",
@@ -312,16 +311,16 @@ allow if {
 "#;
         let fixture = fixture(READS_CONFIG, "");
 
-        let strict = build_rego_policy(fixture.hook(), json!({"mode": "strict"}))
-            .expect("adapter builds");
+        let strict =
+            build_rego_policy(fixture.hook(), json!({"mode": "strict"})).expect("adapter builds");
         let allowed = strict
             .enforce(&request("GET", "/"), &mut ())
             .await
             .expect("evaluates");
         assert!(matches!(allowed, PolicyDecision::Allow));
 
-        let lenient = build_rego_policy(fixture.hook(), json!({"mode": "lenient"}))
-            .expect("adapter builds");
+        let lenient =
+            build_rego_policy(fixture.hook(), json!({"mode": "lenient"})).expect("adapter builds");
         let denied = lenient
             .enforce(&request("GET", "/"), &mut ())
             .await
