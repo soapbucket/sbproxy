@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 

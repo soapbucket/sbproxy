@@ -311,7 +311,7 @@ control from `pii:`, and the docs say so explicitly so the two are not
 mistaken for each other. Rationale: `crates/sbproxy-modules/src/policy/dlp.rs`
 states body scanning is intentionally out of scope for this cut, not a
 speed tradeoff; the `pii:` block already handles request-body redaction
-with the same regex catalogue today, and a stated follow-up extends `dlp`
+with the same regex catalog today, and a stated follow-up extends `dlp`
 to consume the buffered body `RequestValidator` already produces. Until
 that lands, `pii:` is the masking control and `dlp` is the metadata-only
 one, and the two stay separate rather than one doing both jobs partway.

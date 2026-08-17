@@ -1,6 +1,6 @@
 # AI policy plane (CEL)
 
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a

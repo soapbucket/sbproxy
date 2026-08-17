@@ -11,7 +11,7 @@ Two config surfaces accept Rego today, both grep-verified against the compiler:
 | Surface | Key path | Fields |
 |---|---|---|
 | Rego gate policy | `origins.<host>.policies[].type: rego` (`crates/sbproxy-modules/src/compile.rs`) | `module` (required), `query` (default `data.sbproxy.allow`), `deny_status` (default `403`), `deny_message` (default `forbidden by policy`), `budget_ms` (default `50`), `data` (optional JSON object) |
-| AI routing policy | `origins.<host>.action.ai_routing_policy.engine: rego` (only under `action.type: ai_proxy`; `crates/sbproxy-ai/src/ai_routing_policy.rs`) | `source` (required), `query` (default `data.sbproxy.route`), `data`, `budget_ms` (default `50`) |
+| AI routing policy | `origins.<host>.action.ai_routing_policy.engine: rego` (only under `action.type: ai_proxy`; `crates/sbproxy-ai/src/ai_routing_policy.rs`) | `source` (required), `query` (default `data.sbproxy.route`), `data`, `budget_ms` (default `50`), `on_error` (`decline` or `block`, default `decline`), `reason_codes` (allowlist for the routing metric's `reason_code` label; an unlisted code collapses to `other`) |
 
 The first is a plain allow/deny gate, the same job `policy: expression` does in CEL. The second returns a routing plan (which provider and model to send a request to) rather than a boolean, and only fires for gateway-owned AI traffic. This page focuses on the gate policy, since that is the surface an OPA shop is most likely to be replacing. The full field reference, including the failure posture and the base-data override rule, is in [scripting.md §3a](scripting.md#3a-rego-policies). Routing-specific behavior (candidate re-checking, the security override) is in [ai-gateway.md](ai-gateway.md).
 
@@ -25,11 +25,13 @@ Two things carry over from CEL with different consequences in Rego. `input.jwt.c
 
 The policy below gates AI traffic on a `X-Tenant` header, first requiring the header to be present, then checking it against an allow-list kept in `data` so an operator can edit the list without touching the Rego:
 
+<!-- sbproxy-config-excerpt -->
 ```yaml
 origins:
   "ai.local":
     action:
       type: ai_proxy
+      routing: round_robin
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}
