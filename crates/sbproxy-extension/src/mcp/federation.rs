@@ -3064,7 +3064,10 @@ impl McpFederation {
     /// resolver-injectable version tests use, the same split
     /// `call_openapi_tool` / `call_openapi_tool_with_resolver`
     /// establishes.
-    fn authorize_mcp_upstream_dial(&self, server: &McpServerConfig) -> anyhow::Result<reqwest::Client> {
+    fn authorize_mcp_upstream_dial(
+        &self,
+        server: &McpServerConfig,
+    ) -> anyhow::Result<reqwest::Client> {
         self.authorize_mcp_upstream_dial_with_resolver(server, &SystemHostResolver)
     }
 
@@ -3102,32 +3105,33 @@ impl McpFederation {
             );
             return Ok(self.client.clone());
         }
-        let dest = match server
-            .egress_policy
-            .authorize(EgressPurpose::McpUpstream, &server.url, resolver)
-        {
-            Ok(dest) => {
-                record_egress_seen(
-                    EgressPurpose::McpUpstream,
-                    &server.url,
-                    &server.name,
-                    EgressSightingStatus::Allowed,
-                    None,
-                );
-                dest
-            }
-            Err(e) => {
-                record_egress_seen(
-                    EgressPurpose::McpUpstream,
-                    &server.url,
-                    &server.name,
-                    EgressSightingStatus::Denied,
-                    Some(e),
-                );
-                record_egress_refused(EgressPurpose::McpUpstream, e, "", &server.name);
-                return Err(anyhow::anyhow!("egress denied: {e:?}"));
-            }
-        };
+        let dest =
+            match server
+                .egress_policy
+                .authorize(EgressPurpose::McpUpstream, &server.url, resolver)
+            {
+                Ok(dest) => {
+                    record_egress_seen(
+                        EgressPurpose::McpUpstream,
+                        &server.url,
+                        &server.name,
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                    dest
+                }
+                Err(e) => {
+                    record_egress_seen(
+                        EgressPurpose::McpUpstream,
+                        &server.url,
+                        &server.name,
+                        EgressSightingStatus::Denied,
+                        Some(e),
+                    );
+                    record_egress_refused(EgressPurpose::McpUpstream, e, "", &server.name);
+                    return Err(anyhow::anyhow!("egress denied: {e:?}"));
+                }
+            };
         self.mcp_upstream_dial_client(server, &dest, resolver)
     }
 

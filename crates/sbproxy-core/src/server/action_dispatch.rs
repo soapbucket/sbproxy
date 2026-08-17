@@ -3270,7 +3270,14 @@ pub(super) async fn handle_mcp_action(
                 // first, same pre-dispatch position, same `or_else`
                 // short-circuit as `resources/read`.
                 mcp_server_approval_refusal_for_non_tool_call(mcp, ctx, &p.server_name).or_else(
-                    || mcp_peer_downgrade_refusal_for_non_tool_call(mcp, ctx, session, &p.server_name),
+                    || {
+                        mcp_peer_downgrade_refusal_for_non_tool_call(
+                            mcp,
+                            ctx,
+                            session,
+                            &p.server_name,
+                        )
+                    },
                 )
             }) {
                 JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
