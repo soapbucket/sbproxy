@@ -163,6 +163,17 @@ fn federated_name(
 pub struct FederatedTool {
     /// Unique tool name (may be prefixed with server name on conflict).
     pub name: String,
+    /// Original name the upstream advertised, so dispatch reaches it
+    /// with the name it knows (WOR-2384). Equal to `name` when no
+    /// collision (and no `namespace: always`) triggered the prefix.
+    /// Set once at fetch time, before [`Self::advertise_as`] can run,
+    /// and never touched by it -- mirrors [`FederatedPrompt::upstream_name`]
+    /// and [`FederatedResource::upstream_uri`], which solved the same
+    /// problem for their surfaces. Not part of any client-facing
+    /// document (`contract`, `legacy_document`, and the `tools/list`
+    /// serializers below all read `name`, never this field), so the
+    /// unprefixed upstream name never reaches a caller.
+    pub upstream_name: String,
     /// Human-readable description.
     pub description: String,
     /// JSON Schema for the tool's input arguments.
@@ -212,10 +223,12 @@ pub struct FederatedTool {
 impl std::fmt::Debug for FederatedTool {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = bounded_control_free_identifier(&self.name, 96);
+        let upstream_name = bounded_control_free_identifier(&self.upstream_name, 96);
         let server_name = bounded_control_free_identifier(&self.server_name, 96);
         formatter
             .debug_struct("FederatedTool")
             .field("name", &name)
+            .field("upstream_name", &upstream_name)
             .field("server_name", &server_name)
             .field("streaming", &self.streaming)
             .field("has_meta", &self.meta.is_some())
@@ -320,6 +333,7 @@ impl FederatedTool {
         let legacy_document = contract.is_none().then_some(document);
 
         Ok(Self {
+            upstream_name: name.clone(),
             name,
             description,
             input_schema,
@@ -337,6 +351,11 @@ impl FederatedTool {
     /// keep the frozen routing conveniences in lockstep. A malformed
     /// legacy definition has no strict contract, so its raw fallback
     /// is the authoritative source for this rewrite.
+    ///
+    /// Deliberately never touches [`Self::upstream_name`]: that field
+    /// is the whole point of calling this the *advertised* name
+    /// rather than a rename, and it must still name what the upstream
+    /// itself calls the tool after this runs.
     fn advertise_as(&mut self, advertised_name: &str) {
         if let Some(contract) = self.contract.as_ref() {
             self.contract = Some(contract.with_advertised_name(advertised_name));
@@ -2707,12 +2726,23 @@ impl McpFederation {
                 .await;
         }
 
+        // WOR-2384: the upstream never learned the advertised
+        // (possibly server-prefixed) name -- `advertise_as` rewrites
+        // `federated.name`/`contract`/`legacy_document` for clients,
+        // never `upstream_name`, so this is the one field that still
+        // names what the upstream itself calls the tool. Sending
+        // `tool_name` (the advertised name) here always failed
+        // upstream with an unknown-tool error under `namespace:
+        // always` or a collision rename. Mirrors
+        // `get_prompt_from_snapshot`'s `prompt.upstream_name` and
+        // `read_resource_inner`'s `resource.upstream_uri`, which
+        // solved the identical problem for their surfaces.
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/call".to_string(),
             params: Some(merge_trace_context(
                 json!({
-                    "name": tool_name,
+                    "name": federated.upstream_name.as_str(),
                     "arguments": arguments,
                 }),
                 &trace_pairs,
@@ -7940,6 +7970,96 @@ mod tests {
         assert!(
             !captured.contains("_sbproxy_run_as_user"),
             "identity must not appear in tool args on the wire"
+        );
+    }
+
+    /// WOR-2384, a live-verified product bug (test.sbproxy.dev serves
+    /// bare `hello`/`echo` and refuses a prefixed name): `namespace:
+    /// always` (or a collision rename) advertises a server-prefixed
+    /// name to clients, and `resolve_tool` routes lookups by it, but
+    /// the upstream never heard that name -- it only ever advertised
+    /// the bare one. Before `FederatedTool::upstream_name`, dispatch
+    /// sent the advertised name verbatim in `tools/call`'s `"name"`
+    /// field, so every namespaced or collision-renamed MCP-native tool
+    /// failed upstream with "Unknown tool: <prefixed>". Red before the
+    /// fix: the stub below would have recorded `"reports.hello"`, not
+    /// `"hello"`.
+    #[tokio::test]
+    async fn call_tool_sends_the_upstream_name_not_the_advertised_prefixed_name() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_thread = Arc::clone(&seen);
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping upstream tool-name wire test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *seen_thread.lock().unwrap() = req;
+                let body = r#"{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"ok"}]},"id":1}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let server = McpServerConfig {
+            name: "reports".to_string(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::Always,
+            openapi: None,
+            egress_policy: EgressPolicy::default(),
+        };
+        let fed = McpFederation::new(vec![server]);
+
+        // Exactly what `refresh_tools` would have produced for this
+        // tool under `namespace: always`: the upstream advertised
+        // `hello`, `advertise_as("reports.hello")` is what namespaces
+        // it for clients, and `upstream_name` must still read `hello`
+        // afterward.
+        let tool = prepared_tool(
+            json!({
+                "name": "hello",
+                "description": "greet",
+                "inputSchema": {"type": "object", "properties": {}},
+            }),
+            "reports",
+            "reports.hello",
+        );
+        assert_eq!(tool.name, "reports.hello");
+        assert_eq!(tool.upstream_name, "hello");
+        let mut tools = HashMap::new();
+        tools.insert("reports.hello".to_string(), tool);
+        fed.seed_tools_for_test(tools, None);
+
+        fed.call_tool("reports.hello", json!({}))
+            .await
+            .expect("tool call must succeed");
+
+        let captured = seen.lock().unwrap().clone();
+        let body_start = captured
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .expect("captured request has a header/body split");
+        let body: serde_json::Value = serde_json::from_str(&captured[body_start..])
+            .expect("captured upstream request body is JSON");
+        assert_eq!(
+            body["params"]["name"], "hello",
+            "the upstream must see its own bare name, not the advertised one, got:\n{captured}"
         );
     }
 

@@ -846,6 +846,7 @@ mod tests {
         .expect("CodeMode fixture contract");
         FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: description.to_string(),
             input_schema: input_schema.clone(),
             server_name: "test-server".to_string(),
@@ -871,6 +872,7 @@ mod tests {
         .expect("CodeMode fixture contract");
         FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: description.to_string(),
             input_schema: input_schema.clone(),
             server_name: "test-server".to_string(),

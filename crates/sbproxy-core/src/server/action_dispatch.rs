@@ -8806,6 +8806,7 @@ mod mcp_prompts_tests {
         .expect("prompt fixture contract");
         FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: format!("Tool {name}"),
             input_schema,
             server_name: server.to_string(),
@@ -9477,6 +9478,7 @@ mod mcp_catalog_snapshot_tests {
         .expect("snapshot fixture contract");
         FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: "snapshot fixture".to_string(),
             input_schema,
             server_name: server.to_string(),

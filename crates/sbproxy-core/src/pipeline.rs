@@ -3909,6 +3909,7 @@ mod mcp_inject_registry_tests {
         .expect("tenant-scoped tool contract");
         FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: "tenant-scoped fixture".to_string(),
             input_schema,
             server_name: server_name.to_string(),

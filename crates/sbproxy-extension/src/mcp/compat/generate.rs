@@ -210,6 +210,7 @@ mod tests {
     fn tool(name: &str, description: &str) -> FederatedTool {
         FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: description.to_string(),
             input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
             server_name: "upstream".to_string(),

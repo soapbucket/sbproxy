@@ -3826,6 +3826,7 @@ mod tests {
         .expect("injected fixture contract");
         sbproxy_extension::mcp::FederatedTool {
             name: name.to_string(),
+            upstream_name: name.to_string(),
             description: "injected fixture".to_string(),
             input_schema,
             server_name: server.to_string(),

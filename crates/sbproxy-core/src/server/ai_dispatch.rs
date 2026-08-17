@@ -14066,6 +14066,7 @@ origins:
                 tool_name.to_string(),
                 sbproxy_extension::mcp::FederatedTool {
                     name: tool_name.to_string(),
+                    upstream_name: tool_name.to_string(),
                     description: "pinned dispatch fixture".to_string(),
                     input_schema,
                     server_name: "catalog".to_string(),

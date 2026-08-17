@@ -63,11 +63,17 @@ const AUTH: (&str, &str) = ("authorization", "Bearer governance-demo-token");
 // `echo`, `notes` -- regardless of which prefix dialled it, since the
 // upstream itself has no notion of the gateway's namespacing.
 //
-// The base (non-OpenAPI) MCP dispatch path sends the *advertised*
-// (namespaced) name in `tools/call` params (`federation.rs`'s
-// `call_tool_with_policy_cause_and_headers_from_held_tool`), so this
-// mock resolves whichever of "hello", "reports.hello", "crm.hello", ...
-// it receives down to its base name before dispatching.
+// WOR-2384: this mock used to strip whatever prefix a `tools/call`
+// name carried before matching it, which is generous in a way a real
+// upstream never is -- test.sbproxy.dev serves bare `hello`/`echo` and
+// refuses a prefixed name outright. That generosity is what let 10
+// tests here pass while `federation.rs`'s
+// `call_tool_with_policy_cause_and_headers_from_held_tool` sent the
+// *advertised* (namespaced) name in `tools/call` params instead of
+// `FederatedTool::upstream_name`, the name this upstream actually
+// advertised. The mock now matches the real one: only the bare name
+// dispatches, so a regression here fails these tests again instead of
+// hiding behind the stub.
 
 struct MockMcpUpstream {
     port: u16,
@@ -200,13 +206,17 @@ fn handle_conn(
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or_default();
-            let base = raw_name.rsplit('.').next().unwrap_or(raw_name);
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             captured_tool_call_args
                 .lock()
                 .expect("captured args lock")
                 .push(arguments.clone());
-            match base {
+            // WOR-2384: match the bare name only, exactly like the
+            // real test.sbproxy.dev upstream this mock stands in for.
+            // A prefixed name (what the gateway sent before it
+            // forwarded `FederatedTool::upstream_name`) falls through
+            // to the "unknown tool" arm below instead of dispatching.
+            match raw_name {
                 "hello" => {
                     let name = arguments
                         .get("name")
@@ -232,7 +242,7 @@ fn handle_conn(
                 _ => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": {"code": -32602, "message": format!("unknown tool {raw_name}")}
+                    "error": {"code": -32601, "message": format!("Unknown tool: {raw_name}")}
                 }),
             }
         }
