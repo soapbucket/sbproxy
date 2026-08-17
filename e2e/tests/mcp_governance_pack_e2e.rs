@@ -306,15 +306,22 @@ fn advertised(prefix: &str, def: &Value) -> Value {
 /// `block_unlocked: true` blocks it outright rather than merely
 /// reporting it.
 fn write_lockfile(tag: &str) -> PathBuf {
+    write_lockfile_with(
+        tag,
+        &[
+            ("reports", hello_def()),
+            ("reports", echo_def()),
+            ("crm", echo_def()),
+            ("crm", notes_def()),
+            ("legacy", echo_def()),
+        ],
+    )
+}
+
+fn write_lockfile_with(tag: &str, entries: &[(&str, Value)]) -> PathBuf {
     let mut tools = BTreeMap::new();
-    for (prefix, def) in [
-        ("reports", hello_def()),
-        ("reports", echo_def()),
-        ("crm", echo_def()),
-        ("crm", notes_def()),
-        ("legacy", echo_def()),
-    ] {
-        let doc = advertised(prefix, &def);
+    for (prefix, def) in entries {
+        let doc = advertised(prefix, def);
         let name = doc["name"].as_str().expect("advertised name").to_string();
         tools.insert(
             name,
@@ -642,7 +649,22 @@ fn ungranted_tool_is_refused_by_rbac() {
 #[test]
 fn unlocked_tool_is_blocked_by_the_version_gate() {
     let upstream = MockMcpUpstream::start();
-    let lockfile = write_lockfile("unlocked");
+    // No baseline in this lockfile digests to the `hello` contract. That
+    // matters because the version gate follows contracts, not names: an
+    // unlocked name whose contract (name projected out) matches a locked
+    // baseline is treated as a rename of that baseline and served under
+    // it. With `reports.hello` pinned, `crm.hello` is exactly such a
+    // rename and `block_unlocked` never fires; this test needs the
+    // unlocked tool to match nothing, so the gate itself must refuse.
+    let lockfile = write_lockfile_with(
+        "unlocked",
+        &[
+            ("reports", echo_def()),
+            ("crm", echo_def()),
+            ("crm", notes_def()),
+            ("legacy", echo_def()),
+        ],
+    );
     let events = events_path("unlocked");
     let harness =
         ProxyHarness::start_with_yaml(&config_yaml(&upstream.url(), &lockfile, Some(&events)))
