@@ -166,7 +166,7 @@ pub struct FederatedTool {
     /// Original name the upstream advertised, so dispatch reaches it
     /// with the name it knows (WOR-2384). Equal to `name` when no
     /// collision (and no `namespace: always`) triggered the prefix.
-    /// Set once at fetch time, before [`Self::advertise_as`] can run,
+    /// Set once at fetch time, before `advertise_as` can run,
     /// and never touched by it -- mirrors [`FederatedPrompt::upstream_name`]
     /// and [`FederatedResource::upstream_uri`], which solved the same
     /// problem for their surfaces. Not part of any client-facing

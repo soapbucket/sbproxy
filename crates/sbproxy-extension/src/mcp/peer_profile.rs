@@ -32,7 +32,7 @@
 //!   gateway). `false -> true` never triggers a refusal; it only means
 //!   the peer got stricter, which is always safe to accept.
 //!
-//! Both stored fields are **high-water marks**: [`observe`] never lowers
+//! Both stored fields are **high-water marks**: `observe` never lowers
 //! them. A `warn`-mode downgrade is allowed through but does not erase
 //! the peer's best-ever era or strictest-ever auth posture, so the next
 //! weaker contact is flagged again too, for as long as the weaker
@@ -165,7 +165,7 @@ pub struct McpPeerProfile {
     /// When this profile was first recorded.
     pub first_seen: SystemTime,
     /// When this profile was last updated by an *accepted* observation.
-    /// A `block`-mode refusal leaves this untouched (see [`observe`]).
+    /// A `block`-mode refusal leaves this untouched (see `observe`).
     pub last_seen: SystemTime,
 }
 
@@ -249,7 +249,7 @@ pub struct PinMismatch {
 /// contact. Independent of any stored profile and of `downgrade:`: a
 /// pinned protocol never negotiates, so `pinned: None` (i.e.
 /// `protocol: auto`) always succeeds here regardless of what was
-/// observed -- negotiation for `auto` is [`observe`]'s job, not this
+/// observed -- negotiation for `auto` is `observe`'s job, not this
 /// function's.
 pub fn check_pin(pinned: Option<&str>, observed_protocol: &str) -> Result<(), PinMismatch> {
     match pinned {

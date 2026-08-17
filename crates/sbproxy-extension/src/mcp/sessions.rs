@@ -274,7 +274,7 @@ impl SessionStore {
     /// (UUID v4, which satisfies the spec's visible-ASCII requirement
     /// and is not guessable) as [`SessionMint::Minted`] -- or
     /// [`SessionMint::Saturated`] when the store cannot mint one
-    /// (WOR-2384, I3 fix round 2). See [`Self::create_capped`] for the
+    /// (WOR-2384, I3 fix round 2). See `create_capped` for the
     /// exact caps.
     ///
     /// WOR-2384 (MCP10): `tenant_id` is stamped once at mint time and

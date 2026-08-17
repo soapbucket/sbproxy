@@ -3005,7 +3005,7 @@ impl McpAction {
     /// Both categories default to `off`, so with no `content_filters`
     /// block configured this always returns
     /// [`McpContentFilterVerdict::Clean`] without cloning or scanning
-    /// `document` (each [`CompiledMcpContentFilterCategory::scan`]
+    /// `document` (each `CompiledMcpContentFilterCategory::scan`
     /// short-circuits on `mode == Off`).
     pub fn apply_content_filters(
         &self,

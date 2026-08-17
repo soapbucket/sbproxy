@@ -7,7 +7,8 @@
 //! transport (a webhook that drops a batch, a queue that overran) has
 //! no way to tell "nothing happened" from "something happened and we
 //! never heard about it" unless the records themselves carry a counter
-//! it can check for holes. [`next_seq`] is that counter: strictly
+//! it can check for holes. [`next_seq`](crate::evidence_seq::next_seq)
+//! is that counter: strictly
 //! monotonic per tenant, starting at 1, with no gaps under concurrent
 //! callers, so a receiver that sees `1, 2, 4` for a tenant knows exactly
 //! one record is missing without cross-referencing anything else.
@@ -18,18 +19,21 @@
 //! principal, ultimately from a header or a token an untrusted caller
 //! presented), so a process-lifetime map keyed by it is a
 //! memory-exhaustion knob if left unbounded. This registry caps itself
-//! at [`MAX_TRACKED_TENANTS`] distinct tenants, the same bounded-map
+//! at [`MAX_TRACKED_TENANTS`](crate::evidence_seq::MAX_TRACKED_TENANTS)
+//! distinct tenants, the same bounded-map
 //! hygiene `crates/sbproxy-security/src/egress.rs`'s sightings inventory
 //! already applies to a different caller-controlled key space.
 //!
 //! The two hygienes differ in one respect. The sightings inventory can
 //! simply refuse a new key once full, because a sighting nobody records
 //! is still visible everywhere else that call site already logs.
-//! [`next_seq`] cannot do that: it has to return *a* value, because the
+//! [`next_seq`](crate::evidence_seq::next_seq) cannot do that: it
+//! has to return *a* value, because the
 //! call site building the evidence record has no other slot to put in
 //! `sbproxy.evidence.seq`. So a tenant past the cap does not get
 //! refused; it gets routed to a single shared overflow counter (see
-//! [`OVERFLOW_TENANT`]) instead of a dedicated one, and every one of
+//! `OVERFLOW_TENANT`, private to this module) instead of a dedicated
+//! one, and every one of
 //! those lookups ticks
 //! [`crate::metrics::record_evidence_seq_tenant_cap`] so the loss of
 //! per-tenant gaplessness past the cap is itself an observable signal

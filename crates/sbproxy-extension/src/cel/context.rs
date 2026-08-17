@@ -924,7 +924,7 @@ pub struct McpArgumentPolicyView<'a> {
     pub result: Option<&'a serde_json::Value>,
     /// Session-flow data-provenance integrity (WOR-2384, MCP06):
     /// `"trusted"` or `"tainted"`. See
-    /// [`sbproxy_extension::mcp::sessions::SessionIntegrity::as_str`].
+    /// [`SessionIntegrity::as_str`](crate::mcp::sessions::SessionIntegrity::as_str).
     /// Always `"trusted"` when flow enforcement is off, sessions are
     /// disabled, or the session has never read anything.
     pub session_integrity: &'a str,
@@ -967,7 +967,7 @@ pub struct McpArgumentPolicyView<'a> {
 /// - `mcp.principal.sub` / `.team` / `.project` / `.user` - caller
 ///   identity; unset attributes render as `""`
 ///
-/// Reused as-is for Rego: [`sbproxy_extension::rego::CompiledRego`]
+/// Reused as-is for Rego: [`CompiledRego`](crate::rego::CompiledRego)
 /// converts this same [`CelContext`] to `input.mcp.*`, so a CEL rule and
 /// a Rego rule over the same predicate read identical bindings.
 pub fn build_mcp_argument_policy_context(view: &McpArgumentPolicyView<'_>) -> CelContext {
