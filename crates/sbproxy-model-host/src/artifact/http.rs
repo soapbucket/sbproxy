@@ -200,7 +200,7 @@ impl HttpArtifactTransport {
     ///
     /// No egress override is attached; every dial reads the
     /// process-wide `ModelArtifact` registry slot live (see
-    /// [`Self::effective_egress`]). This is the production entry point;
+    /// `effective_egress`). This is the production entry point;
     /// prefer [`Self::with_configured_egress`] only for the doc
     /// signature, since it is now equivalent to this constructor.
     pub fn new() -> Result<Self, ArtifactError> {
@@ -215,7 +215,7 @@ impl HttpArtifactTransport {
     }
 
     /// Attach a fixed egress authorizer, bypassing the live registry
-    /// read [`Self::effective_egress`] would otherwise do for every
+    /// read `effective_egress` would otherwise do for every
     /// dial. Test-only: production construction should read the
     /// registry lazily via `new()` (or `with_configured_egress()`,
     /// identical to it) rather than pin a snapshot here, so a reload

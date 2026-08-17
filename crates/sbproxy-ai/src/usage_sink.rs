@@ -923,7 +923,7 @@ enum ObjectStoreKind {
 /// or propagates to the request hot path.
 ///
 /// `auth_url` (WOR-2476) is resolved once, at construction, via
-/// [`object_store_authorization_url`], and reused for every `record()`
+/// `object_store_authorization_url`, and reused for every `record()`
 /// call rather than recomputed. A sink is built once per config
 /// compile (see [`UsageSinkConfig::build`]) and lives for the process
 /// lifetime, so this assumes an operator's S3 endpoint override
@@ -932,7 +932,7 @@ enum ObjectStoreKind {
 /// piece of process-lifetime config here is. Without this,
 /// `AmazonS3Builder::from_env()`'s full `std::env::vars_os()` scan ran
 /// synchronously on the request-logging hot path for every completed
-/// AI call, duplicating the scan [`object_store_put`]'s builders
+/// AI call, duplicating the scan `object_store_put`'s builders
 /// already do inside the spawned task.
 #[derive(Debug)]
 pub struct ObjectStoreSink {
