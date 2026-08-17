@@ -77,10 +77,18 @@ closes that seam for MCP specifically, reusing the same detector catalogue:
 `secrets` matches API-key and token shapes (`openai_key`, `anthropic_key`,
 `aws_access`, `github_token`, `slack_token`); `pii` matches personal-data shapes
 (`email`, `us_ssn`, `credit_card`, `phone_us`, `ipv4`, `iban`). Both run against
-tool-call arguments on the way out and tool-call results on the way back, before
-either reaches the upstream server or the caller. `redact` replaces a match with
-the same `[REDACTED:<NAME>]` marker `pii:` uses and emits a governance event;
-`block` refuses the call or the result outright. Both default to `off`.
+tool-call arguments on the way out and tool-call results on the way back, and
+against `resources/read` and `prompts/get` results too, before any of them
+reaches the upstream server or the caller. `redact` replaces a match with
+the same `[REDACTED:<NAME>]` marker `pii:` uses and emits a governance event
+on a `tools/call`, or a `security_audit` entry (no `mcp_governance_decision`
+event, the same boundary the peer-downgrade and approval-status checks below
+already draw for these two methods) on a `resources/read` or `prompts/get`;
+`block` refuses the call or the result outright either way. Both default to
+`off`. A tool-call's own captured audit arguments (`mcp_audit.capture_arguments:
+true`) pass through the same redaction before they ever reach the
+`mcp_governance_decision` event, so a shape `content_filters` strips from the
+wire cannot reappear in the evidence trail instead.
 
 **Still yours.** A regex catalogue matches known shapes, not every secret
 format an upstream could mint, and it cannot see a credential the agent already
@@ -339,11 +347,18 @@ matching `outbound_tools` -- the third leg.
         enabled: true
       flow:
         mode: block
-        trusted_servers: [internal-docs]
+        trusted_servers: [internal-docs, customer-db]
         sensitive_servers: [customer-db]
         sensitive_tools: ["db.query_pii"]
         outbound_tools: ["email.*", "slack.*"]
 ```
+
+`customer-db` is internal infrastructure, so it belongs in `trusted_servers`
+too: reading from it should mark `sensitive_touched`, not also taint
+`integrity` the way a genuinely uncontrolled, external source would. The two
+lists answer different questions -- "do I trust what this server tells me"
+and "does this server's data need special handling" -- and a server can
+answer yes to both.
 
 `mode: warn` logs and emits a `mcp_governance_decision` event with verdict
 `warn` but allows the call; `mode: block` refuses it before dispatch with
@@ -358,7 +373,10 @@ that allow, never widen it, and it composes with `lethal_trifecta` and
 `dual_llm_quarantine` above rather than replacing either. Without
 `sessions.enabled: true`, this degrades to single-call scope: with no memory
 across calls, the only thing one call can prove is whether it is itself
-simultaneously every leg the configured rule requires.
+simultaneously every leg the configured rule requires. The modern
+2026-07-28 transport degrades to that same single-call scope today
+regardless of `sessions.enabled`, since outbound federation does not yet
+mint an `Mcp-Session-Id` on that path.
 
 **Two rules, one default.** `flow.rule: two_of_three` (the default) is Rule
 of Two proper, described above. `flow.rule: taint_and_outbound` is a
@@ -384,6 +402,16 @@ labels directly, `mcp.session.integrity` and `mcp.session.sensitive_touched`,
 to compose a policy the two built-in rules do not express, for example
 denying outright the moment both legs are set rather than only gating the
 tools named in `outbound_tools`.
+
+**A rollout escape hatch.** `flow.taint_reads` (default `true`) is the one
+knob that does not gate a leg directly. Set it `false` and the outbound
+check stays live, reading whatever the session's labels currently are, but
+nothing can ever move `integrity` off its `trusted` default: a `tools/call`
+result or `resources/read` from an untrusted server stops tainting. Use it
+to turn the outbound gate on before the read-side tainting it depends on,
+if a deployment needs to see how `outbound_tools` alone behaves first.
+`sensitive_touched` has no equivalent switch; leaving `sensitive_servers`
+and `sensitive_tools` empty already keeps that axis inert.
 
 **Still yours.** This is a deterministic, config-driven approximation of the
 Rule of Two, not a semantic understanding of what a session actually did. It

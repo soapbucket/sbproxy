@@ -3167,7 +3167,7 @@ pub(super) async fn handle_mcp_action(
                     JsonRpcResponse::error(request.id.clone(), INVALID_PARAMS, &message)
                 } else {
                     match mcp.federation.read_resource(uri).await {
-                        Ok(value) => {
+                        Ok(mut value) => {
                             // WOR-2384 (MCP06 fix round 1): a
                             // `resources/read` result enters context the
                             // same way a `tools/call` result does, so it
@@ -3202,7 +3202,34 @@ pub(super) async fn handle_mcp_action(
                                     );
                                 }
                             }
-                            JsonRpcResponse::success(request.id.clone(), value)
+                            // WOR-2384 (MCP01/MCP10, I1 fix round):
+                            // `content_filters` closes the same
+                            // structural hole for `resources/read` that
+                            // it already closes for `tools/call` -- an
+                            // untrusted upstream's resource content
+                            // reaches the caller through this same
+                            // `write_mcp_wire_response` path, so it
+                            // never sees the generic `pii:`/`dlp:`
+                            // response-filter phase either.
+                            let server_name = resolved
+                                .as_ref()
+                                .map(|r| r.server_name.as_str())
+                                .unwrap_or("unknown");
+                            match mcp_content_filter_for_non_tool_call(
+                                mcp,
+                                ctx,
+                                session,
+                                "resources/read",
+                                server_name,
+                                &mut value,
+                            ) {
+                                Some(message) => JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    INTERNAL_ERROR,
+                                    &message,
+                                ),
+                                None => JsonRpcResponse::success(request.id.clone(), value),
+                            }
                         }
                         Err(e) => {
                             if is_modern {
@@ -3353,7 +3380,58 @@ pub(super) async fn handle_mcp_action(
                     .get_prompt_from_snapshot(&prompt_catalog, name, arguments)
                     .await
                 {
-                    Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
+                    Ok(mut value) => {
+                        // WOR-2384 (MCP06, I1 fix round): a `prompts/get`
+                        // result enters context the same way a
+                        // `tools/call` result and a `resources/read`
+                        // result do, so it moves the session's flow
+                        // labels too. Previously missing entirely, which
+                        // meant an unvetted server's prompt tainted
+                        // nothing -- exactly the injection path the
+                        // guardrail exists for. `tool_name: None`,
+                        // state-only, not wired into the
+                        // `mcp_governance_decision` bus: same reasoning
+                        // `resources/read` documents above.
+                        if let Some(prompt) = owner {
+                            let flow_outcome = mcp.flow_record_entry(
+                                mcp_session_id.as_deref(),
+                                None,
+                                &prompt.server_name,
+                            );
+                            if flow_outcome.newly_tainted {
+                                sbproxy_observe::metrics::record_mcp_flow(
+                                    ctx.tenant_id.as_str(),
+                                    sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID,
+                                    "warn",
+                                );
+                            }
+                            if flow_outcome.newly_sensitive {
+                                sbproxy_observe::metrics::record_mcp_flow(
+                                    ctx.tenant_id.as_str(),
+                                    sbproxy_modules::action::mcp::MCP_FLOW_SENSITIVE_RULE_ID,
+                                    "warn",
+                                );
+                            }
+                        }
+                        // WOR-2384 (MCP01/MCP10, I1 fix round): same
+                        // content-filter wiring as `resources/read`
+                        // above.
+                        let server_name =
+                            owner.map(|p| p.server_name.as_str()).unwrap_or("unknown");
+                        match mcp_content_filter_for_non_tool_call(
+                            mcp,
+                            ctx,
+                            session,
+                            "prompts/get",
+                            server_name,
+                            &mut value,
+                        ) {
+                            Some(message) => {
+                                JsonRpcResponse::error(request.id.clone(), INTERNAL_ERROR, &message)
+                            }
+                            None => JsonRpcResponse::success(request.id.clone(), value),
+                        }
+                    }
                     Err(e) => {
                         if is_modern {
                             warn!(failure_class = "upstream", "modern prompts/get failed");
@@ -3708,6 +3786,7 @@ pub(super) async fn handle_mcp_action(
                         // argument_policies, modern schema validation),
                         // captured before any of them can consume it.
                         let governance_tool_arguments = governance_tool_arguments_field(
+                            mcp,
                             mcp.mcp_audit_capture_arguments,
                             &arguments,
                         );
@@ -4251,7 +4330,9 @@ pub(super) async fn handle_mcp_action(
                                             mcp_session_id.as_deref(),
                                             is_modern,
                                             None,
-                                            McpGovernanceVerdict::Warn(rule_id),
+                                            McpGovernanceVerdict::Warn(
+                                                sbproxy_modules::action::mcp::MCP_FLOW_REASON,
+                                            ),
                                             Some(rule_id),
                                             governance_tool_arguments.as_deref(),
                                         ) {
@@ -4292,7 +4373,9 @@ pub(super) async fn handle_mcp_action(
                                             mcp_session_id.as_deref(),
                                             is_modern,
                                             None,
-                                            McpGovernanceVerdict::Deny(rule_id),
+                                            McpGovernanceVerdict::Deny(
+                                                sbproxy_modules::action::mcp::MCP_FLOW_REASON,
+                                            ),
                                             Some(rule_id),
                                             governance_tool_arguments.as_deref(),
                                         ) {
@@ -4920,7 +5003,7 @@ pub(super) async fn handle_mcp_action(
                                         is_modern,
                                         tool_arguments_hash.as_deref(),
                                         McpGovernanceVerdict::Warn(
-                                            sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID,
+                                            sbproxy_modules::action::mcp::MCP_FLOW_REASON,
                                         ),
                                         Some(sbproxy_modules::action::mcp::MCP_FLOW_TAINT_RULE_ID),
                                         None,
@@ -4959,7 +5042,7 @@ pub(super) async fn handle_mcp_action(
                                         is_modern,
                                         tool_arguments_hash.as_deref(),
                                         McpGovernanceVerdict::Warn(
-                                            sbproxy_modules::action::mcp::MCP_FLOW_SENSITIVE_RULE_ID,
+                                            sbproxy_modules::action::mcp::MCP_FLOW_REASON,
                                         ),
                                         Some(sbproxy_modules::action::mcp::MCP_FLOW_SENSITIVE_RULE_ID),
                                         None,
@@ -5810,7 +5893,13 @@ fn bound_mcp_audit_field(value: &str) -> String {
 
 /// WOR-2392: compute the `gen_ai.tool.call.arguments` field for the
 /// `mcp_governance_decision` event, or `None` when
-/// `mcp_audit.capture_arguments` is not configured true.
+/// `mcp_audit.capture_arguments` is not configured true. The one
+/// computed value here is reused, unrecomputed, by every pre-dispatch
+/// denial/warn branch and by the post-dispatch
+/// `emit_mcp_tool_attribution` call -- see the WOR-2392 fix round 1
+/// comment at this function's one call site -- so this is also the one
+/// place that redaction has to be right for every emission branch to
+/// inherit it correctly.
 ///
 /// Pure and independent of the `mcp_audit` tracing target's own
 /// enablement (unlike [`McpAuditCapture`], which only exists when a
@@ -5819,20 +5908,42 @@ fn bound_mcp_audit_field(value: &str) -> String {
 /// this must not silently depend on whether anything is listening on
 /// the `mcp_audit` target too.
 ///
-/// Redacted and size-bounded through [`bound_mcp_audit_field`] -- the
-/// exact same pass `mcp_audit`'s own content fields (and
-/// `sbproxy.tool.arguments_hash`'s input) already go through -- so a
-/// credential or other secret shape planted in a tool-call argument
-/// can never reach this field verbatim, regardless of whether
-/// `redact_secrets` alone would have caught it in the raw JSON text.
+/// WOR-2384 (I4 fix round): the true contract, corrected from this
+/// function's original WOR-2392 doc claim (which named only the
+/// generic secret-scrub floor and stopped there, before
+/// `content_filters` existed). Before that floor, `arguments` is
+/// cloned and run through `mcp`'s configured `content_filters` --
+/// the exact same redaction the live call/result pipeline applies --
+/// so a PII or secret shape an operator configured `content_filters`
+/// to strip from the wire cannot reach this field unstripped just
+/// because it took the audit-capture path instead. This runs
+/// regardless of the resulting verdict: a `block` still redacts the
+/// clone on its way to being discarded (the live dispatch path is what
+/// enforces the actual refusal; this function only ever produces a
+/// string for an evidence field, never a decision), and a `redact`
+/// mutates the clone the same way it would mutate the real document.
+/// `content_filters` left at `off` (both categories, the default)
+/// makes this pass a no-op.
+///
+/// Only *after* that does [`bound_mcp_audit_field`] apply its own
+/// secret-only floor (`sbproxy_observe::redact::redact_secrets`) --
+/// the exact same pass `mcp_audit`'s own content fields (and
+/// `sbproxy.tool.arguments_hash`'s input) already go through. That
+/// floor is what still catches a credential shape when
+/// `content_filters.secrets` is left `off`; it was never going to
+/// catch a PII shape only `content_filters.pii` recognizes, which is
+/// the gap this fix round closes.
 fn governance_tool_arguments_field(
+    mcp: &sbproxy_modules::action::McpAction,
     capture_arguments: bool,
     arguments: &serde_json::Value,
 ) -> Option<String> {
     if !capture_arguments {
         return None;
     }
-    serde_json::to_string(arguments)
+    let mut redacted_arguments = arguments.clone();
+    mcp.apply_content_filters(&mut redacted_arguments);
+    serde_json::to_string(&redacted_arguments)
         .ok()
         .map(|raw| bound_mcp_audit_field(&raw))
 }
@@ -6569,6 +6680,91 @@ fn mcp_peer_downgrade_refusal_for_non_tool_call(
             );
             sbproxy_observe::SecurityAuditEntry::policy_violation(
                 "mcp_peer_downgrade",
+                message.clone(),
+                200,
+                Some(ctx.hostname.to_string()),
+                ctx.client_ip,
+                Some(ctx.request_id.to_string()),
+                Some(session.req_header().method.as_str().to_string()),
+            )
+            .with_tenant_id(ctx.tenant_id.to_string())
+            .emit();
+            Some(message)
+        }
+    }
+}
+
+/// WOR-2384 (MCP01/MCP10, I1 fix round): apply `content_filters` to a
+/// `resources/read` or `prompts/get` result. Mutates `value` in place
+/// for a `redact` hit. `method` is `"resources/read"` or
+/// `"prompts/get"`, for the log line and the refusal message only --
+/// this function does not branch on it.
+///
+/// Mirrors [`mcp_peer_downgrade_refusal_for_non_tool_call`]'s evidence
+/// shape exactly, for the same reason: `tracing::warn!` and a policy
+/// metric on any match, plus `SecurityAuditEntry::policy_violation` on
+/// an actual refusal, but never the `mcp_governance_decision` events
+/// bus, which stays scoped to `tools/call` dispatch.
+///
+/// Returns `Some(message)` when the caller must refuse the whole
+/// result.
+fn mcp_content_filter_for_non_tool_call(
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+    session: &Session,
+    method: &str,
+    server_name: &str,
+    value: &mut serde_json::Value,
+) -> Option<String> {
+    match mcp.apply_content_filters(value) {
+        sbproxy_modules::action::mcp::McpContentFilterVerdict::Clean => None,
+        sbproxy_modules::action::mcp::McpContentFilterVerdict::Applied(hits) => {
+            for hit in &hits {
+                let verdict_label: &'static str = match hit.mode {
+                    sbproxy_modules::action::mcp::McpFilterModeConfig::Redact => "redact",
+                    _ => "warn",
+                };
+                tracing::warn!(
+                    target: "sbproxy::mcp::content_filter",
+                    method = %method,
+                    server = %server_name,
+                    tenant = %ctx.tenant_id,
+                    category = hit.category,
+                    mode = verdict_label,
+                    "MCP content filter matched on a non-tool-call result",
+                );
+                sbproxy_observe::metrics::record_mcp_content_filter(
+                    ctx.tenant_id.as_str(),
+                    hit.category,
+                    verdict_label,
+                );
+            }
+            None
+        }
+        sbproxy_modules::action::mcp::McpContentFilterVerdict::Denied {
+            category,
+            detectors,
+        } => {
+            let message = format!(
+                "{method} result denied by content filter ({category}: {})",
+                detectors.join(",")
+            );
+            tracing::warn!(
+                target: "sbproxy::mcp::content_filter",
+                method = %method,
+                server = %server_name,
+                tenant = %ctx.tenant_id,
+                category,
+                detectors = %detectors.join(","),
+                "MCP non-tool-call result denied by content filter",
+            );
+            sbproxy_observe::metrics::record_mcp_content_filter(
+                ctx.tenant_id.as_str(),
+                category,
+                "deny",
+            );
+            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                "mcp_content_filter_denied",
                 message.clone(),
                 200,
                 Some(ctx.hostname.to_string()),
@@ -7471,26 +7667,42 @@ async fn handle_mcp_session_delete(
             send_error(session, 400, "missing Mcp-Session-Id header").await?;
             Ok(())
         }
-        Some(id) if store.end(id) => {
-            tracing::info!(
-                target: "sbproxy::audit",
-                event = "mcp.session.ended",
-                mcp_server = %mcp.server_name,
-                request_id = %ctx.request_id,
-                "ended MCP session on client DELETE"
-            );
-            let header = pingora_http::ResponseHeader::build(204, Some(0)).map_err(|e| {
-                Error::because(ErrorType::InternalError, "failed to build 204 header", e)
-            })?;
-            session
-                .write_response_header(Box::new(header), true)
-                .await?;
-            Ok(())
-        }
-        Some(_) => {
-            send_error(session, 404, "unknown or expired MCP session").await?;
-            Ok(())
-        }
+        // WOR-2384 (MCP10, C2 fix round): `end()` is tenant-bound, the
+        // same three-way `SessionValidation` shape `validate()` uses.
+        // `TenantMismatch` and `Unknown` write the identical 404 the
+        // wire already saw for an unknown id -- a cross-tenant DELETE
+        // must not be an existence oracle, terminate a session it does
+        // not own, or reset that session's Rule-of-Two flow labels by
+        // forcing a re-`initialize`. Only `TenantMismatch` gets the
+        // audit line; an ordinary unknown/expired id is routine client
+        // behavior with nothing to audit.
+        Some(id) => match store.end(id, ctx.tenant_id.as_str()) {
+            sbproxy_extension::mcp::sessions::SessionValidation::Valid => {
+                tracing::info!(
+                    target: "sbproxy::audit",
+                    event = "mcp.session.ended",
+                    mcp_server = %mcp.server_name,
+                    request_id = %ctx.request_id,
+                    "ended MCP session on client DELETE"
+                );
+                let header = pingora_http::ResponseHeader::build(204, Some(0)).map_err(|e| {
+                    Error::because(ErrorType::InternalError, "failed to build 204 header", e)
+                })?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                Ok(())
+            }
+            sbproxy_extension::mcp::sessions::SessionValidation::TenantMismatch => {
+                emit_mcp_session_tenant_mismatch(ctx, session, &mcp.server_name);
+                send_error(session, 404, "unknown or expired MCP session").await?;
+                Ok(())
+            }
+            sbproxy_extension::mcp::sessions::SessionValidation::Unknown => {
+                send_error(session, 404, "unknown or expired MCP session").await?;
+                Ok(())
+            }
+        },
     }
 }
 
@@ -7647,7 +7859,22 @@ mod mcp_governance_evidence_tests {
         McpGovernanceVerdict, MCP_AUDIT_FIELD_MAX_BYTES,
     };
     use sbproxy_config::types::EventsConfig;
+    use sbproxy_modules::action::McpAction;
     use sbproxy_observe::events::EventType;
+
+    /// A minimal `McpAction`, optionally with `content_filters`
+    /// configured, for [`governance_tool_arguments_field`]'s own tests
+    /// (WOR-2384, I4 fix round). No live upstream needed: these tests
+    /// call the pure function directly, never dispatch.
+    fn content_filter_fixture(content_filters: serde_json::Value) -> McpAction {
+        McpAction::from_config(serde_json::json!({
+            "type": "mcp",
+            "server_info": {"name": "governance-arguments-fixture", "version": "1.0.0"},
+            "federated_servers": [{ "origin": "example.com", "prefix": "srv" }],
+            "content_filters": content_filters
+        }))
+        .expect("governance-arguments content-filter fixture compiles")
+    }
 
     /// WOR-2384: the config-reading half of the fail-closed decision is
     /// a pure function of an [`EventsConfig`], so it is testable without
@@ -7826,8 +8053,9 @@ mod mcp_governance_evidence_tests {
     /// nothing to serialize.
     #[test]
     fn governance_tool_arguments_field_is_none_when_capture_is_disabled() {
+        let action = content_filter_fixture(serde_json::json!({}));
         assert_eq!(
-            governance_tool_arguments_field(false, &serde_json::json!({"city": "sf"})),
+            governance_tool_arguments_field(&action, false, &serde_json::json!({"city": "sf"})),
             None
         );
     }
@@ -7841,11 +8069,12 @@ mod mcp_governance_evidence_tests {
     /// redaction, not truncation-that-happens-to-remove-secrets.
     #[test]
     fn governance_tool_arguments_field_redacts_and_bounds_when_capture_is_enabled() {
+        let action = content_filter_fixture(serde_json::json!({}));
         let planted = serde_json::json!({
             "city": "sf",
             "note": "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc",
         });
-        let captured = governance_tool_arguments_field(true, &planted)
+        let captured = governance_tool_arguments_field(&action, true, &planted)
             .expect("capture_arguments: true must produce Some");
         assert!(
             captured.contains("sf"),
@@ -7859,12 +8088,62 @@ mod mcp_governance_evidence_tests {
         // Size bound: reuses `MCP_AUDIT_FIELD_MAX_BYTES`, the same cap
         // `mcp_audit`'s own content fields already enforce.
         let oversize = serde_json::json!({ "blob": "x".repeat(MCP_AUDIT_FIELD_MAX_BYTES * 2) });
-        let bounded = governance_tool_arguments_field(true, &oversize)
+        let bounded = governance_tool_arguments_field(&action, true, &oversize)
             .expect("capture_arguments: true must produce Some");
         assert!(
             bounded.len() <= MCP_AUDIT_FIELD_MAX_BYTES + "...[truncated]".len(),
             "captured arguments exceeded the mcp_audit content-field bound: {} bytes",
             bounded.len()
+        );
+    }
+
+    /// WOR-2384 (I4 fix round) red-first: `redact_secrets` (the generic
+    /// floor) has no opinion about PII shapes -- an email address is
+    /// not a credential. Before this fix, a planted PII shape survived
+    /// into the captured governance-event arguments verbatim even with
+    /// `content_filters.pii: redact` configured, because the capture
+    /// path never consulted `content_filters` at all. Fails today
+    /// (before `governance_tool_arguments_field` takes `mcp` and runs
+    /// `apply_content_filters` on the clone) because the email survives
+    /// into `captured`.
+    #[test]
+    fn content_filters_redact_reaches_the_captured_governance_arguments() {
+        let action = content_filter_fixture(serde_json::json!({"pii": "redact"}));
+        let planted = serde_json::json!({
+            "city": "sf",
+            "contact": "alice@example.com",
+        });
+        let captured = governance_tool_arguments_field(&action, true, &planted)
+            .expect("capture_arguments: true must produce Some");
+        assert!(
+            captured.contains("sf"),
+            "an unredacted field must still be present: {captured}"
+        );
+        assert!(
+            !captured.contains("alice@example.com"),
+            "a PII shape content_filters.pii redacts elsewhere must not survive into the \
+             captured governance arguments: {captured}"
+        );
+        assert!(
+            captured.contains("REDACTED:EMAIL"),
+            "the capture must carry the same mask convention content_filters uses \
+             elsewhere: {captured}"
+        );
+    }
+
+    /// Companion regression guard: `content_filters` left at `off` (the
+    /// default) must leave the capture exactly as it always did --
+    /// `redact_secrets` is the only floor, and a PII shape it does not
+    /// recognize survives, matching this function's pre-I4 behavior.
+    #[test]
+    fn content_filters_off_leaves_the_secret_scrub_floor_as_the_only_redaction() {
+        let action = content_filter_fixture(serde_json::json!({}));
+        let planted = serde_json::json!({ "contact": "alice@example.com" });
+        let captured = governance_tool_arguments_field(&action, true, &planted)
+            .expect("capture_arguments: true must produce Some");
+        assert!(
+            captured.contains("alice@example.com"),
+            "content_filters off must not change this function's pre-existing behavior: {captured}"
         );
     }
 
@@ -9021,8 +9300,9 @@ mod mcp_request_target_authority_tests {
 #[cfg(test)]
 mod mcp_catalog_snapshot_tests {
     use super::{
-        handle_mcp_action, mcp_catalogue_name_for_snapshot, mcp_modern_rollout_hidden_names,
-        mcp_peer_downgrade_check, mcp_progressive_search, mcp_synthesized_rollout_tool_is_visible,
+        handle_mcp_action, handle_mcp_session_delete, mcp_catalogue_name_for_snapshot,
+        mcp_modern_rollout_hidden_names, mcp_peer_downgrade_check, mcp_progressive_search,
+        mcp_synthesized_rollout_tool_is_visible,
         mcp_synthesized_rollout_tool_is_visible_to_principal, mcp_unblocked_catalog_tools,
         McpPeerDowngradeDecision,
     };
@@ -9320,6 +9600,303 @@ mod mcp_catalog_snapshot_tests {
                 .1,
         )
         .expect("MCP JSON response")
+    }
+
+    /// [`mcp_handler_exchange`], but with an `Mcp-Session-Id` header
+    /// attached -- required by `sessions.enabled: true` on every
+    /// non-`initialize` legacy request. A separate function rather than
+    /// an added parameter so none of `mcp_handler_exchange`'s many
+    /// existing call sites change.
+    async fn mcp_handler_exchange_with_session(
+        action: &McpAction,
+        request: serde_json::Value,
+        session_id: &str,
+    ) -> serde_json::Value {
+        let body = serde_json::to_vec(&request).expect("MCP request JSON");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP downstream fixture");
+        let address = listener.local_addr().expect("MCP downstream address");
+        let session_id = session_id.to_string();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect MCP downstream fixture");
+            let headers = format!(
+                "POST / HTTP/1.1\r\nHost: mcp.test\r\ncontent-type: application/json\r\nmcp-session-id: {session_id}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write MCP request headers");
+            stream
+                .write_all(&body)
+                .await
+                .expect("write MCP request body");
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read MCP response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse MCP downstream request");
+        let mut context = RequestContext::new();
+
+        handle_mcp_action(&mut session, action, &mut context, false)
+            .await
+            .expect("MCP handler response");
+        drop(session);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("MCP response timeout")
+            .expect("MCP downstream task");
+        let response = String::from_utf8(response).expect("MCP HTTP response UTF-8");
+        serde_json::from_str(
+            response
+                .split_once("\r\n\r\n")
+                .expect("MCP HTTP response body")
+                .1,
+        )
+        .expect("MCP JSON response")
+    }
+
+    /// A one-shot upstream that answers exactly one JSON-RPC request
+    /// with a fixed `result` value, then closes. Mirrors
+    /// `sbproxy_extension::mcp::federation`'s own
+    /// `one_shot_initialize_success_server` test fixture, adapted to
+    /// return the origin URL string `federated_servers[].origin` needs
+    /// rather than a `McpServerConfig` (this crate does not depend on
+    /// that type's constructor). Lets a test drive a real
+    /// `resources/read` or `prompts/get` success round trip through
+    /// `handle_mcp_action` without a live MCP server.
+    fn one_shot_mcp_result_server(result: serde_json::Value) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("one-shot MCP stub bind failed: {e}"));
+        let port = listener
+            .local_addr()
+            .expect("one-shot MCP stub address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "result": result,
+                "id": 1,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{port}/mcp")
+    }
+
+    /// WOR-2384 (MCP06, I1 fix round) red-first: fails today because
+    /// `prompts/get`'s success arm never calls `flow_record_entry` at
+    /// all -- an unvetted server's prompt taints nothing, the exact
+    /// injection path the guardrail exists for.
+    #[tokio::test]
+    async fn wor_2384_prompts_get_wires_flow_record_entry() {
+        const SERVER: &str = "i1-prompt-flow-server";
+        const PROMPT_NAME: &str = "i1-prompt-flow-fixture";
+        let origin = one_shot_mcp_result_server(json!({
+            "description": "fixture prompt",
+            "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}]
+        }));
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "i1-prompt-flow-fixture", "version": "1.0.0"},
+            "federated_servers": [{"origin": origin, "prefix": SERVER}],
+            "sessions": {"enabled": true},
+            "flow": {
+                "mode": "warn",
+                "trusted_servers": [],
+                "outbound_tools": ["reports.*"]
+            }
+        }))
+        .expect("i1 prompt-flow fixture compiles");
+        // Marks the federation primed, so `handle_mcp_action`'s
+        // `ensure_ready` does not run a real catalog refresh (which
+        // would consume the one-shot stub's single answer) before the
+        // seeded prompt below is ever read.
+        action.federation.seed_tools_for_test(HashMap::new(), None);
+        action.federation.seed_prompts_for_test(HashMap::from([(
+            PROMPT_NAME.to_string(),
+            sbproxy_extension::mcp::FederatedPrompt {
+                name: PROMPT_NAME.to_string(),
+                upstream_name: PROMPT_NAME.to_string(),
+                title: None,
+                description: None,
+                arguments: None,
+                server_name: SERVER.to_string(),
+                meta: None,
+            },
+        )]));
+
+        let store = action.sessions.as_ref().expect("sessions enabled");
+        let session_id = store.create("acme");
+        assert_eq!(
+            store
+                .flow_labels(&session_id)
+                .expect("live session")
+                .integrity,
+            sbproxy_extension::mcp::sessions::SessionIntegrity::Trusted,
+            "a fresh session must start trusted"
+        );
+
+        let response = mcp_handler_exchange_with_session(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "prompts/get",
+                "params": {"name": PROMPT_NAME}
+            }),
+            &session_id,
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "prompts/get must succeed against the one-shot stub: {response:?}"
+        );
+
+        assert_eq!(
+            store
+                .flow_labels(&session_id)
+                .expect("live session")
+                .integrity,
+            sbproxy_extension::mcp::sessions::SessionIntegrity::Tainted,
+            "a prompts/get result from an untrusted server must taint the session"
+        );
+    }
+
+    /// WOR-2384 (MCP01/MCP10, I1 fix round) red-first: fails today
+    /// because `resources/read`'s result never passes through
+    /// `content_filters` at all -- a planted secret in a resource body
+    /// reaches the caller unfiltered.
+    #[tokio::test]
+    async fn wor_2384_resources_read_is_denied_by_content_filters() {
+        const SERVER: &str = "i1-resource-filter-server";
+        const RESOURCE_URI: &str = "res://i1-resource-filter-fixture/doc";
+        let origin = one_shot_mcp_result_server(json!({
+            "contents": [{
+                "uri": RESOURCE_URI,
+                "mimeType": "text/plain",
+                "text": "key: AKIAIOSFODNN7EXAMPLE"
+            }]
+        }));
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "i1-resource-filter-fixture", "version": "1.0.0"},
+            "federated_servers": [{"origin": origin, "prefix": SERVER}],
+            "content_filters": {"secrets": "block"}
+        }))
+        .expect("i1 resource-filter fixture compiles");
+        action.federation.seed_tools_for_test(HashMap::new(), None);
+        action.federation.seed_resources_for_test(HashMap::from([(
+            RESOURCE_URI.to_string(),
+            sbproxy_extension::mcp::federation::FederatedResource {
+                uri: RESOURCE_URI.to_string(),
+                name: "doc".to_string(),
+                description: None,
+                mime_type: None,
+                server_name: SERVER.to_string(),
+                upstream_uri: RESOURCE_URI.to_string(),
+            },
+        )]));
+
+        let response = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": RESOURCE_URI}
+            }),
+        )
+        .await;
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("resources/read must be denied: {response:?}"));
+        assert!(
+            message.contains("content filter"),
+            "denial must name the content filter: {message}"
+        );
+    }
+
+    /// Regression guard, paired with the denial test above: `secrets:
+    /// warn` must still let a planted secret through resources/read
+    /// unmodified.
+    #[tokio::test]
+    async fn wor_2384_resources_read_passes_through_clean_content_unfiltered() {
+        const SERVER: &str = "i1-resource-clean-server";
+        const RESOURCE_URI: &str = "res://i1-resource-clean-fixture/doc";
+        let origin = one_shot_mcp_result_server(json!({
+            "contents": [{
+                "uri": RESOURCE_URI,
+                "mimeType": "text/plain",
+                "text": "nothing sensitive here"
+            }]
+        }));
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "i1-resource-clean-fixture", "version": "1.0.0"},
+            "federated_servers": [{"origin": origin, "prefix": SERVER}],
+            "content_filters": {"secrets": "block", "pii": "block"}
+        }))
+        .expect("i1 resource-clean fixture compiles");
+        action.federation.seed_tools_for_test(HashMap::new(), None);
+        action.federation.seed_resources_for_test(HashMap::from([(
+            RESOURCE_URI.to_string(),
+            sbproxy_extension::mcp::federation::FederatedResource {
+                uri: RESOURCE_URI.to_string(),
+                name: "doc".to_string(),
+                description: None,
+                mime_type: None,
+                server_name: SERVER.to_string(),
+                upstream_uri: RESOURCE_URI.to_string(),
+            },
+        )]));
+
+        let response = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": RESOURCE_URI}
+            }),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "clean content must not be denied: {response:?}"
+        );
+        assert_eq!(
+            response["result"]["contents"][0]["text"],
+            "nothing sensitive here"
+        );
     }
 
     /// Poll `events_path` (an NDJSON file an `EventEgress::File` sink
@@ -10497,6 +11074,10 @@ mod mcp_catalog_snapshot_tests {
             );
             assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
             assert_eq!(event["data"]["sbproxy.decision.rule_id"], "flow_pair_block");
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"], "session_flow",
+                "M3 fix round: the reason must name the gate, not duplicate the rule_id"
+            );
             assert!(
                 event["data"].get("sbproxy.tool.arguments_hash").is_none(),
                 "a pre-dispatch flow refusal never dispatched, so no arguments were \
@@ -10560,6 +11141,7 @@ mod mcp_catalog_snapshot_tests {
                  observed within 5s",
             );
             assert_eq!(event["data"]["sbproxy.decision.rule_id"], "flow_pair_block");
+            assert_eq!(event["data"]["sbproxy.decision.reason"], "session_flow");
             assert!(
                 event["data"].get("error.type").is_none(),
                 "a warn verdict must not stamp error.type: {event:?}"
@@ -10625,6 +11207,7 @@ mod mcp_catalog_snapshot_tests {
             );
             assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
             assert_eq!(event["data"]["sbproxy.decision.rule_id"], "flow_exfil_block");
+            assert_eq!(event["data"]["sbproxy.decision.reason"], "session_flow");
         }
     }
 
@@ -11314,5 +11897,178 @@ mod mcp_catalog_snapshot_tests {
                  must not itself be flagged: {decision:?}"
             );
         }
+    }
+
+    /// Drive a raw `DELETE / HTTP/1.1` with an `Mcp-Session-Id` header
+    /// through [`handle_mcp_session_delete`] and return the response's
+    /// HTTP status line's status code. Mirrors [`mcp_handler_exchange`]'s
+    /// raw-socket shape but for the DELETE transport, which carries no
+    /// JSON-RPC body to parse.
+    async fn mcp_delete_exchange(
+        action: &McpAction,
+        session_id: &str,
+        ctx: &RequestContext,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP DELETE downstream fixture");
+        let address = listener
+            .local_addr()
+            .expect("MCP DELETE downstream address");
+        let headers = format!(
+            "DELETE / HTTP/1.1\r\nHost: mcp.test\r\nmcp-session-id: {session_id}\r\nconnection: close\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect MCP DELETE downstream fixture");
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write MCP DELETE request");
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read MCP DELETE response");
+            response
+        });
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("accept MCP DELETE downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse MCP DELETE downstream request");
+
+        handle_mcp_session_delete(&mut session, action, ctx)
+            .await
+            .expect("MCP DELETE handler response");
+        drop(session);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("MCP DELETE response timeout")
+            .expect("MCP DELETE downstream task");
+        let response = String::from_utf8(response).expect("MCP DELETE HTTP response UTF-8");
+        let status_line = response.lines().next().expect("MCP DELETE status line");
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("MCP DELETE status line unparsable: {status_line}"))
+    }
+
+    fn session_delete_fixture() -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "session-delete-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": "delete-fixture-server"
+            }],
+            "sessions": {"enabled": true}
+        }))
+        .expect("session-delete fixture compiles")
+    }
+
+    /// WOR-2384 (MCP10, C2 fix round) red-first: a cross-tenant `DELETE`
+    /// must not terminate a session it does not own. Fails today (before
+    /// `end()` is tenant-bound) because any caller who can present the id
+    /// ends the session outright.
+    #[tokio::test]
+    async fn a_cross_tenant_delete_leaves_the_session_alive() {
+        let action = session_delete_fixture();
+        let store = action.sessions.as_ref().expect("sessions enabled");
+        let id = store.create("tenant-a");
+
+        let mut foreign_ctx = RequestContext::new();
+        foreign_ctx.tenant_id = "tenant-b".into();
+        let status = mcp_delete_exchange(&action, &id, &foreign_ctx).await;
+
+        assert_eq!(
+            status, 404,
+            "a cross-tenant DELETE must see the same refusal an unknown id gets"
+        );
+        assert_eq!(
+            store.validate(&id, "tenant-a"),
+            sbproxy_extension::mcp::sessions::SessionValidation::Valid,
+            "the session must still be live for its rightful tenant after a foreign DELETE"
+        );
+    }
+
+    /// WOR-2384 (MCP10, C2 fix round) red-first: a cross-tenant `DELETE`
+    /// must not reset the session's Rule-of-Two flow labels (which ending
+    /// and re-`initialize`-ing the session would do).
+    #[tokio::test]
+    async fn a_cross_tenant_delete_does_not_reset_flow_labels() {
+        let action = session_delete_fixture();
+        let store = action.sessions.as_ref().expect("sessions enabled");
+        let id = store.create("tenant-a");
+        store.taint(&id).expect("live session");
+        store.mark_sensitive_touched(&id).expect("live session");
+
+        let mut foreign_ctx = RequestContext::new();
+        foreign_ctx.tenant_id = "tenant-b".into();
+        mcp_delete_exchange(&action, &id, &foreign_ctx).await;
+
+        let labels = store.flow_labels(&id).expect("session must still exist");
+        assert_eq!(
+            labels.integrity,
+            sbproxy_extension::mcp::sessions::SessionIntegrity::Tainted
+        );
+        assert!(labels.sensitive_touched);
+    }
+
+    /// WOR-2384 (MCP10, C2 fix round) red-first: a cross-tenant `DELETE`
+    /// is an audited `mcp_session_tenant_mismatch` event, not just a
+    /// silent 404.
+    #[tokio::test]
+    async fn a_cross_tenant_delete_is_audited() {
+        let action = session_delete_fixture();
+        let store = action.sessions.as_ref().expect("sessions enabled");
+        let id = store.create("tenant-a");
+
+        let mut foreign_ctx = RequestContext::new();
+        foreign_ctx.tenant_id = "audit-probe-tenant-b".into();
+        mcp_delete_exchange(&action, &id, &foreign_ctx).await;
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("security"),
+            Some("mcp_session_tenant_mismatch"),
+            None,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.tenant_id.as_deref() == Some("audit-probe-tenant-b")),
+            "a cross-tenant DELETE must emit an audited mcp_session_tenant_mismatch event: {events:?}"
+        );
+    }
+
+    /// Regression guard: the rightful tenant's own `DELETE` must still
+    /// work exactly as before this fix round.
+    #[tokio::test]
+    async fn the_rightful_tenants_delete_still_ends_the_session() {
+        let action = session_delete_fixture();
+        let store = action.sessions.as_ref().expect("sessions enabled");
+        let id = store.create("tenant-a");
+
+        let mut ctx = RequestContext::new();
+        ctx.tenant_id = "tenant-a".into();
+        let status = mcp_delete_exchange(&action, &id, &ctx).await;
+
+        assert_eq!(status, 204);
+        assert_eq!(
+            store.validate(&id, "tenant-a"),
+            sbproxy_extension::mcp::sessions::SessionValidation::Unknown,
+            "a successful DELETE must actually end the session"
+        );
     }
 }

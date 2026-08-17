@@ -294,6 +294,18 @@ pub struct McpAuditConfig {
 /// `dual_llm_quarantine`/`token_compaction`/`result_policies[]`
 /// (inbound).
 ///
+/// WOR-2384 (I1 fix round): the same structural hole applies to
+/// `resources/read` and `prompts/get` results, which reach the caller
+/// through the identical `write_mcp_wire_response` path, so both run
+/// through this same block too. Neither reaches the
+/// `mcp_governance_decision` events bus on a match (that surface stays
+/// scoped to `tools/call` dispatch, the boundary `mcp_peer_downgrade`'s
+/// and the server-approval check's non-tool-call refusals already
+/// draw); a `redact` or `warn` hit logs and bumps
+/// `sbproxy_mcp_content_filter_total`, and a `block` additionally
+/// emits a `SecurityAuditEntry::policy_violation` the way those two
+/// checks' own refusals do.
+///
 /// ```yaml
 /// action:
 ///   type: mcp
@@ -1273,6 +1285,18 @@ pub const MCP_CONTENT_FILTER_REASON: &str = "content_filter";
 /// specific rule is carried separately, as `sbproxy.decision.rule_id`.
 pub const MCP_RESULT_POLICY_REASON: &str = "result_policy";
 
+/// `sbproxy.decision.reason` for any `flow` (session-flow / Rule of
+/// Two) verdict, of either polarity (WOR-2384, MCP06; M3 fix round):
+/// names the gate (this one) that produced the event, the same
+/// reason/rule_id split every other WOR-2384 gate in this codebase
+/// uses. `sbproxy.decision.rule_id` carries which of the four flow
+/// signals actually fired -- [`MCP_FLOW_TAINT_RULE_ID`],
+/// [`MCP_FLOW_SENSITIVE_RULE_ID`], [`MCP_FLOW_EXFIL_BLOCK_RULE_ID`], or
+/// [`MCP_FLOW_PAIR_BLOCK_RULE_ID`] -- so a SIEM rule can still
+/// distinguish them; only the reason itself was, before this fix,
+/// duplicating whichever rule_id fired instead of naming the gate.
+pub const MCP_FLOW_REASON: &str = "session_flow";
+
 /// One entry in the gateway-level guardrails list.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1791,11 +1815,21 @@ pub enum McpFlowVerdict {
     /// A violation under `mode: warn`: the call proceeds, but the
     /// caller must log and emit governance evidence with verdict
     /// `warn` and this `rule_id`.
-    Warn { rule_id: &'static str },
+    Warn {
+        /// Which rule tripped: [`MCP_FLOW_EXFIL_BLOCK_RULE_ID`] for the
+        /// default `two_of_three`, [`MCP_FLOW_PAIR_BLOCK_RULE_ID`] for
+        /// the explicit `taint_and_outbound`.
+        rule_id: &'static str,
+    },
     /// A violation under `mode: block`: the caller must refuse the
     /// call before dispatch and emit governance evidence with verdict
     /// `deny` and this `rule_id`.
-    Deny { rule_id: &'static str },
+    Deny {
+        /// Which rule tripped: [`MCP_FLOW_EXFIL_BLOCK_RULE_ID`] for the
+        /// default `two_of_three`, [`MCP_FLOW_PAIR_BLOCK_RULE_ID`] for
+        /// the explicit `taint_and_outbound`.
+        rule_id: &'static str,
+    },
 }
 
 /// Session-flow label transitions caused by one call
@@ -3102,6 +3136,15 @@ impl McpAction {
     /// rule requires (an untrusted-server AND, under `two_of_three`,
     /// sensitive-labeled read, in the same call as the outbound
     /// attempt).
+    ///
+    /// The same single-call degradation applies today, regardless of
+    /// `sessions.enabled`, to a request the modern 2026-07-28 transport
+    /// classified: outbound federation's `Mcp-Session-Id` issuance is
+    /// wired to the legacy streamable-HTTP path only (`handle_mcp_action`'s
+    /// session-mint call site never runs on the modern branch), so
+    /// `mcp_session_id` is always `None` there and every call this gate
+    /// sees on that transport reads cross-call flow labels from a
+    /// session that was never minted.
     pub fn flow_pre_dispatch_check(
         &self,
         session_id: Option<&str>,
@@ -6563,10 +6606,14 @@ allow := false if {
 
     #[test]
     fn sessions_are_isolated_per_session_and_per_tenant() {
+        // M1 fix round: genuinely cross-tenant now (previously both
+        // sessions were minted under the same "acme" tenant, so despite
+        // the test's name this only ever proved cross-*session*
+        // isolation).
         let action = flow_action(pair_rule_flow_cfg(), true);
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let tenant_a_session = store.create("acme");
-        let tenant_b_session = store.create("acme");
+        let tenant_a_session = store.create("tenant-a");
+        let tenant_b_session = store.create("tenant-b");
 
         action.flow_record_entry(Some(&tenant_a_session), Some("fetch_doc"), "untrusted-srv");
 

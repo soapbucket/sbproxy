@@ -2219,6 +2219,39 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_session_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_session_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP session mints that overflowed the per-store session cap and shared the fallback session.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_content_filter_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_content_filter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "category", "verdict"],
+        description: "MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_result_policy_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_result_policy"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "rule", "verdict"],
+        description: "MCP result-policy rule triggers, by tenant, rule name, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_tool_cost_usd_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_tool_cost"),
@@ -3605,6 +3638,12 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     // security-policy outcome for one tenant's tool-call traffic, same
     // reasoning as the argument-policy counter directly above.
     "sbproxy_mcp_flow_total",
+    // WOR-2384 (MCP01/MCP10). A content-filter (secrets/pii) trigger and
+    // a result-policy trigger are both security-policy outcomes for one
+    // tenant's tool-call traffic, same reasoning as the argument-policy
+    // and flow counters directly above.
+    "sbproxy_mcp_content_filter_total",
+    "sbproxy_mcp_result_policy_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
     // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a

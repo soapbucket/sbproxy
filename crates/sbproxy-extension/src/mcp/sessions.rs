@@ -14,8 +14,25 @@
 //! not-yet-touched expired tail.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Ceiling on the number of concurrently-live sessions one
+/// [`SessionStore`] tracks with independently-mutable state (WOR-2384,
+/// I3 fix round). Mirrors `crate::mcp::peer_profile::MAX_TRACKED_PEERS`'s
+/// order of magnitude and reasoning: a session id is minted by this
+/// server, not caller-supplied, but minting itself is driven by
+/// inbound `initialize` requests, so an unbounded map is still a
+/// memory-exhaustion knob for a caller who can afford enough
+/// concurrent connections to keep flooding it.
+pub const MAX_TRACKED_SESSIONS: usize = 4096;
+
+/// The single session every mint past [`MAX_TRACKED_SESSIONS`] shares
+/// (WOR-2384, I3 fix round). A NUL-prefixed sentinel keeps it out of
+/// the UUID-v4 id space [`SessionStore::create`] otherwise returns, so
+/// it can never collide with a real minted id.
+const OVERFLOW_SESSION_ID: &str = "\u{0}sbproxy-mcp-session-overflow";
 
 /// Session-level risk signals used by guardrails that need memory
 /// across multiple MCP requests.
@@ -186,10 +203,21 @@ impl SessionValidation {
     }
 }
 
-/// In-memory session table with a sliding idle TTL.
+/// In-memory session table with a sliding idle TTL, bounded at
+/// [`MAX_TRACKED_SESSIONS`] (WOR-2384, I3 fix round).
 pub struct SessionStore {
     ttl: Duration,
     inner: Mutex<HashMap<String, SessionEntry>>,
+    /// Latches true the first time this store routes a mint to the
+    /// shared overflow session, so the saturation warning logs once
+    /// per store rather than once per flooding call. Per-instance
+    /// (not a process-wide `static`, unlike
+    /// `crate::mcp::peer_profile`'s registry): a hot reload compiles a
+    /// fresh `SessionStore`, and an operator running several `mcp`
+    /// origins has one store per origin, so a process-wide latch would
+    /// silence the warning for every store after the first one to
+    /// saturate.
+    saturated: AtomicBool,
 }
 
 impl SessionStore {
@@ -198,12 +226,16 @@ impl SessionStore {
         Self {
             ttl,
             inner: Mutex::new(HashMap::new()),
+            saturated: AtomicBool::new(false),
         }
     }
 
     /// Create a new session bound to `tenant_id` and return its id
     /// (UUID v4, which satisfies the spec's visible-ASCII requirement
-    /// and is not guessable).
+    /// and is not guessable) -- or, once the store holds
+    /// [`MAX_TRACKED_SESSIONS`] entries, the shared overflow session id
+    /// every mint past the cap returns instead. See
+    /// [`Self::create_capped`] for the overflow behavior.
     ///
     /// WOR-2384 (MCP10): `tenant_id` is stamped once at mint time and
     /// checked by every later [`Self::validate`] call for this id. It
@@ -211,23 +243,88 @@ impl SessionStore {
     /// source every other per-tenant gate in this codebase uses, never
     /// from a caller-mutable header or body field.
     pub fn create(&self, tenant_id: &str) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
+        self.create_capped(tenant_id, MAX_TRACKED_SESSIONS)
+    }
+
+    /// The actual mint-or-overflow logic, parameterized on the cap
+    /// rather than reaching for [`MAX_TRACKED_SESSIONS`] directly.
+    ///
+    /// Split out for the same reason
+    /// `crate::mcp::peer_profile::observe_and_record_capped` is:
+    /// exercising the overflow branch against the real
+    /// [`MAX_TRACKED_SESSIONS`] (4096) would take thousands of real
+    /// mints to reach inside a test.
+    ///
+    /// Below the cap, mints a normal, independently-tracked session
+    /// with the usual trusted/untouched defaults. At the cap, every
+    /// further mint (regardless of tenant) shares one
+    /// [`OVERFLOW_SESSION_ID`] session instead of growing the map
+    /// further. Unlike `peer_profile`'s shared overflow profile (an
+    /// aggregate downgrade-detection signal, safe to merge across
+    /// unrelated callers by construction), an MCP session legitimately
+    /// carries per-client state, so sharing one here is a deliberate
+    /// degradation, not a free one:
+    ///
+    /// - The shared session's flow labels start at their
+    ///   most-restrictive values (`SessionIntegrity::Tainted` +
+    ///   `sensitive_touched: true`) instead of the normal
+    ///   trusted/untouched defaults -- fail closed on the Rule-of-Two
+    ///   guardrail for a session this store can no longer track with
+    ///   dedicated state.
+    /// - Only the tenant that first claims the shared slot can ever
+    ///   [`Self::validate`] it again: every other tenant's mint gets
+    ///   back the *same* session id, but `tenant_id` was already
+    ///   stamped by whichever mint claimed the slot first, so every
+    ///   later tenant's very next request fails the tenant check --
+    ///   the fail-closed direction, since a caller flooding
+    ///   `initialize` to exhaust the registry gets a session that
+    ///   locks it out rather than one that silently under-enforces the
+    ///   flow guardrail or leaks state to an unrelated tenant.
+    fn create_capped(&self, tenant_id: &str, cap: usize) -> String {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         Self::prune(&mut map);
-        map.insert(
-            id.clone(),
-            SessionEntry {
+
+        if map.len() < cap {
+            let id = uuid::Uuid::new_v4().to_string();
+            map.insert(
+                id.clone(),
+                SessionEntry {
+                    expires_at: Instant::now() + self.ttl,
+                    risk: SessionRisk::default(),
+                    flow: FlowLabels::default(),
+                    tool_requirements: None,
+                    tenant_id: tenant_id.to_string(),
+                },
+            );
+            return id;
+        }
+
+        let first_time_this_episode = !map.contains_key(OVERFLOW_SESSION_ID);
+        if first_time_this_episode && !self.saturated.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "sbproxy::mcp::sessions",
+                max_sessions = cap,
+                "mcp session registry is full; new sessions share a fallback session"
+            );
+        }
+        sbproxy_observe::metrics::record_mcp_session_registry_saturated();
+        let entry = map
+            .entry(OVERFLOW_SESSION_ID.to_string())
+            .or_insert_with(|| SessionEntry {
                 expires_at: Instant::now() + self.ttl,
                 risk: SessionRisk::default(),
-                flow: FlowLabels::default(),
+                flow: FlowLabels {
+                    integrity: SessionIntegrity::Tainted,
+                    sensitive_touched: true,
+                },
                 tool_requirements: None,
                 tenant_id: tenant_id.to_string(),
-            },
-        );
-        id
+            });
+        entry.expires_at = Instant::now() + self.ttl;
+        OVERFLOW_SESSION_ID.to_string()
     }
 
     /// Attach the rollout plane's per-session version requirements
@@ -306,15 +403,44 @@ impl SessionStore {
         }
     }
 
-    /// End a session. True when the id named a live session.
-    pub fn end(&self, id: &str) -> bool {
+    /// End a live session, scoped to the tenant that minted it
+    /// (WOR-2384, MCP10). Returns the same three-way
+    /// [`SessionValidation`] [`Self::validate`] does: `Valid` when the
+    /// id named a live session for `tenant_id` (now removed);
+    /// `TenantMismatch` when it named a live session for a *different*
+    /// tenant, left completely untouched -- not removed, TTL not
+    /// renewed, flow labels intact; `Unknown` when it named no live
+    /// session at all.
+    ///
+    /// `TenantMismatch` and `Unknown` are deliberately
+    /// indistinguishable to a caller that only checks `is_valid()`,
+    /// the same existence-oracle guard `validate()` enforces: a
+    /// cross-tenant `DELETE` must not (a) confirm that someone else's
+    /// session id happens to exist by returning a different wire
+    /// response than an unknown id would, (b) terminate that session,
+    /// or (c) reset the Rule-of-Two flow labels it carries -- ending
+    /// and re-minting a session is itself a guardrail reset a
+    /// non-owning tenant must not be able to trigger.
+    pub fn end(&self, id: &str, tenant_id: &str) -> SessionValidation {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match map.remove(id) {
-            Some(entry) => entry.expires_at > Instant::now(),
-            None => false,
+        match map.get(id) {
+            Some(entry) if entry.expires_at > Instant::now() => {
+                let tenant_matches = entry.tenant_id == tenant_id;
+                if tenant_matches {
+                    map.remove(id);
+                    SessionValidation::Valid
+                } else {
+                    SessionValidation::TenantMismatch
+                }
+            }
+            Some(_) => {
+                map.remove(id);
+                SessionValidation::Unknown
+            }
+            None => SessionValidation::Unknown,
         }
     }
 
@@ -449,19 +575,19 @@ mod tests {
         let store = SessionStore::new(Duration::from_secs(60));
         let id = store.create("acme");
         assert!(store.validate(&id, "acme").is_valid());
-        assert!(store.end(&id));
+        assert!(store.end(&id, "acme").is_valid());
         assert!(
             !store.validate(&id, "acme").is_valid(),
             "ended session must not validate"
         );
-        assert!(!store.end(&id), "double end is a miss");
+        assert!(!store.end(&id, "acme").is_valid(), "double end is a miss");
     }
 
     #[test]
     fn unknown_id_is_invalid() {
         let store = SessionStore::new(Duration::from_secs(60));
         assert!(!store.validate("nope", "acme").is_valid());
-        assert!(!store.end("nope"));
+        assert!(!store.end("nope", "acme").is_valid());
     }
 
     #[test]
@@ -778,6 +904,157 @@ mod tests {
         assert_eq!(
             store.validate(&b, "tenant-a"),
             SessionValidation::TenantMismatch
+        );
+    }
+
+    // --- Tenant-bound end() (WOR-2384, C2 fix round) ---
+
+    #[test]
+    fn a_foreign_delete_leaves_the_session_alive() {
+        // The C2 finding: end() used to take a bare id, so a
+        // cross-tenant DELETE could terminate a session it did not
+        // mint. A mismatched end() must be a pure no-op against the
+        // entry -- the rightful tenant must still be able to validate
+        // it afterward.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        assert_eq!(
+            store.end(&id, "tenant-b"),
+            SessionValidation::TenantMismatch
+        );
+        assert_eq!(store.validate(&id, "tenant-a"), SessionValidation::Valid);
+    }
+
+    #[test]
+    fn a_foreign_delete_does_not_reset_the_flow_labels() {
+        // Ending and re-minting a session would silently reset its
+        // Rule-of-Two flow labels -- a remote guardrail reset a
+        // non-owning tenant must not be able to trigger by guessing an
+        // id and calling DELETE.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        store.taint(&id).expect("live session");
+        store.mark_sensitive_touched(&id).expect("live session");
+
+        assert_eq!(
+            store.end(&id, "tenant-b"),
+            SessionValidation::TenantMismatch
+        );
+
+        let labels = store.flow_labels(&id).expect("session must still exist");
+        assert_eq!(labels.integrity, SessionIntegrity::Tainted);
+        assert!(labels.sensitive_touched);
+    }
+
+    #[test]
+    fn a_foreign_delete_is_indistinguishable_from_an_unknown_id() {
+        // No existence oracle: a DELETE from the wrong tenant and a
+        // DELETE for an id that never existed must collapse to the
+        // same `is_valid() == false` a caller checking only the bool
+        // shape would see.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        assert!(!store.end(&id, "tenant-b").is_valid());
+        assert!(!store.end("does-not-exist", "tenant-b").is_valid());
+    }
+
+    #[test]
+    fn the_rightful_tenant_can_still_end_their_own_session() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        assert_eq!(store.end(&id, "tenant-a"), SessionValidation::Valid);
+        assert_eq!(
+            store.validate(&id, "tenant-a"),
+            SessionValidation::Unknown,
+            "a successfully ended session must no longer validate"
+        );
+    }
+
+    // --- Bounded session registry (WOR-2384, I3 fix round) ---
+
+    #[test]
+    fn mints_past_the_cap_share_the_overflow_session_instead_of_growing_unbounded() {
+        // Mirrors `peer_profile`'s and `evidence_seq`'s own overflow
+        // tests: exercises `create_capped` directly against a small
+        // throwaway cap rather than filling the real 4096-entry store.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let cap = 2;
+
+        let a = store.create_capped("tenant-a", cap);
+        let b = store.create_capped("tenant-a", cap);
+        assert_ne!(a, b, "both mints below the cap must get independent ids");
+
+        // The store is now at the cap. A third mint shares the
+        // overflow session rather than getting a third independent id.
+        let c = store.create_capped("tenant-a", cap);
+        assert_eq!(c, "\u{0}sbproxy-mcp-session-overflow");
+        assert_ne!(c, a);
+        assert_ne!(c, b);
+
+        // A fourth mint, even for the same tenant, shares the exact
+        // same overflow session -- the map must not keep growing.
+        let d = store.create_capped("tenant-a", cap);
+        assert_eq!(d, c);
+    }
+
+    #[test]
+    fn the_overflow_session_starts_at_the_flow_guardrails_most_restrictive_labels() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let cap = 1;
+        store.create_capped("tenant-a", cap); // fills the one real slot
+        let overflow_id = store.create_capped("tenant-a", cap);
+
+        let labels = store
+            .flow_labels(&overflow_id)
+            .expect("overflow session is itself a live session");
+        assert_eq!(
+            labels.integrity,
+            SessionIntegrity::Tainted,
+            "an overflow session must fail closed on the integrity leg"
+        );
+        assert!(
+            labels.sensitive_touched,
+            "an overflow session must fail closed on the sensitivity leg"
+        );
+    }
+
+    #[test]
+    fn only_the_first_tenant_to_claim_the_overflow_session_can_validate_it_again() {
+        // Fail-closed direction: cardinality pressure must not let a
+        // second tenant validate a session id it was handed but that
+        // was actually claimed by whichever tenant minted it first.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let cap = 1;
+        store.create_capped("tenant-a", cap); // fills the one real slot
+        let overflow_id = store.create_capped("tenant-a", cap);
+        // A different tenant's mint returns the same id (nothing else
+        // to hand out), but does not reassign the entry's tenant.
+        let same_overflow_id = store.create_capped("tenant-b", cap);
+        assert_eq!(overflow_id, same_overflow_id);
+
+        assert_eq!(
+            store.validate(&overflow_id, "tenant-a"),
+            SessionValidation::Valid,
+            "the tenant that first claimed the overflow slot must still be able to use it"
+        );
+        assert_eq!(
+            store.validate(&overflow_id, "tenant-b"),
+            SessionValidation::TenantMismatch,
+            "a later tenant sharing the overflow slot must not be able to validate it"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_mints_never_grows_the_map_past_the_cap_plus_the_overflow_slot() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let cap = 8;
+        for i in 0..cap * 10 {
+            store.create_capped(&format!("tenant-{i}"), cap);
+        }
+        assert_eq!(
+            store.len(),
+            cap + 1,
+            "cap real sessions plus exactly one shared overflow session, regardless of flood size"
         );
     }
 }

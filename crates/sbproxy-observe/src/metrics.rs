@@ -4357,6 +4357,29 @@ pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static st
         .inc();
 }
 
+/// Record one MCP session mint that overflowed the per-store
+/// `MAX_TRACKED_SESSIONS` cap and shared the fallback overflow session
+/// instead of getting a dedicated one
+/// (`sbproxy_mcp_session_registry_saturated_total`, WOR-2384, I3 fix
+/// round). No labels: the tenant that caused it is exactly the
+/// caller-controlled string the cap exists to bound, so it cannot
+/// appear as a label value without recreating the unbounded
+/// cardinality the cap is closing off -- same reasoning
+/// `record_evidence_seq_tenant_cap` documents for its own cap.
+pub fn record_mcp_session_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_session_registry_saturated_total",
+            "MCP session mints that overflowed the per-store session cap and shared the fallback session",
+        )
+        .expect("mcp session registry saturated counter registers")
+    });
+    counter.inc();
+}
+
 /// Record one `content_filters` category outcome that was not a plain
 /// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
 /// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or
