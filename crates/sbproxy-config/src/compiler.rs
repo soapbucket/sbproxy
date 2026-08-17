@@ -5496,6 +5496,7 @@ egress:
     mode: deny_by_default
     hosts: ["localhost"]
     ports: [4327]
+    allow_private: true
 "#;
         let compiled = compile_config(yaml).expect("config compiles");
         let authorizer = compiled
@@ -5512,7 +5513,10 @@ egress:
                     &SystemHostResolver,
                 )
                 .is_ok(),
-            "an explicit ports: override must authorize the default OTLP endpoint"
+            "an explicit ports: override must authorize the default OTLP endpoint \
+             (allow_private: true is required too, since localhost resolves to a \
+             loopback address and authorize_inner denies PrivateAddress otherwise, \
+             matching docs/configuration.md's own worked example)"
         );
 
         assert_eq!(
