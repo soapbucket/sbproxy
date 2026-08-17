@@ -971,6 +971,37 @@ mod tests {
         );
     }
 
+    /// The catalogue partition is exhaustive by name: every rule in
+    /// [`default_rules`] must be explicitly classified as either a
+    /// credential shape ([`secret_detector_names`]) or personal data
+    /// (the list below). A new detector added to the catalogue fails
+    /// this test until someone decides which side it belongs on --
+    /// without this, a new credential detector would silently land in
+    /// the `pii` complement, and a consumer running
+    /// `secrets: block, pii: off` would stop catching it.
+    #[test]
+    fn every_default_rule_is_classified_as_secret_or_pii() {
+        const PII_DETECTOR_NAMES: &[&str] =
+            &["email", "us_ssn", "credit_card", "phone_us", "ipv4", "iban"];
+        let rules = default_rules();
+        for rule in &rules {
+            let is_secret = secret_detector_names().contains(&rule.name.as_str());
+            let is_pii = PII_DETECTOR_NAMES.contains(&rule.name.as_str());
+            assert!(
+                is_secret ^ is_pii,
+                "detector {:?} must be classified in exactly one of \
+                 secret_detector_names() or the pii list (secret={is_secret}, pii={is_pii}); \
+                 classify it before shipping it",
+                rule.name
+            );
+        }
+        assert_eq!(
+            rules.len(),
+            secret_detector_names().len() + PII_DETECTOR_NAMES.len(),
+            "the two subsets must partition the whole catalogue"
+        );
+    }
+
     #[test]
     fn redact_openai_key_default() {
         let r = defaults();

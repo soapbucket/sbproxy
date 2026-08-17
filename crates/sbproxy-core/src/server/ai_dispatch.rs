@@ -5226,17 +5226,31 @@ pub(super) async fn handle_ai_proxy(
                         "mcp_inject_source",
                         "deny",
                     );
-                    sbproxy_observe::SecurityAuditEntry::policy_violation(
-                        "mcp_inject_source_denied",
-                        "inject_mcp reference resolved to no MCP gateway for this request's tenant",
-                        200,
-                        Some(ctx.hostname.to_string()),
-                        ctx.client_ip,
-                        Some(ctx.request_id.to_string()),
-                        Some(session.req_header().method.as_str().to_string()),
-                    )
-                    .with_tenant_id(ctx.tenant_id.to_string())
-                    .emit();
+                    // Latched per (config revision, tenant, reference): a
+                    // plain typo in a virtual key's `inject_mcp.ref` fires
+                    // this arm on every request through that key, and one
+                    // audit entry per request would evict real violations
+                    // from the bounded security-audit ring. The per-request
+                    // metric above keeps counting so dashboards still see
+                    // the rate; the durable audit record is written once
+                    // per config generation for each distinct reference.
+                    if mcp_inject_denial_first_seen(
+                        &pipeline.config_revision,
+                        ctx.tenant_id.as_str(),
+                        &inject.reference,
+                    ) {
+                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                            "mcp_inject_source_denied",
+                            "inject_mcp reference resolved to no MCP gateway for this request's tenant",
+                            200,
+                            Some(ctx.hostname.to_string()),
+                            ctx.client_ip,
+                            Some(ctx.request_id.to_string()),
+                            Some(session.req_header().method.as_str().to_string()),
+                        )
+                        .with_tenant_id(ctx.tenant_id.to_string())
+                        .emit();
+                    }
                 }
             }
         }
@@ -8987,6 +9001,37 @@ pub(super) async fn handle_ai_proxy(
         );
         Err(Error::new(ErrorType::HTTPStatus(502)))
     }
+}
+
+/// Whether this is the first `inject_mcp` resolution failure seen for
+/// `(config_revision, tenant, reference)` this process.
+///
+/// The caller uses this to write the durable security-audit record once
+/// per config generation instead of once per request: the audit ring is
+/// bounded, and a typo'd reference on a busy virtual key would otherwise
+/// evict real violations with thousands of copies of the same line. The
+/// set is capped; on overflow it is cleared, degrading to one audit
+/// record per `MCP_INJECT_DENIAL_LATCH_CAP` distinct-key floods rather
+/// than growing without bound on attacker-chosen tenant ids.
+fn mcp_inject_denial_first_seen(config_revision: &str, tenant: &str, reference: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const MCP_INJECT_DENIAL_LATCH_CAP: usize = 1024;
+    static SEEN: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(guard) => guard,
+        // A poisoned latch must never suppress an audit record.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.len() >= MCP_INJECT_DENIAL_LATCH_CAP {
+        guard.clear();
+    }
+    guard.insert((
+        config_revision.to_string(),
+        tenant.to_string(),
+        reference.to_string(),
+    ))
 }
 
 fn record_ai_transport_failure(
@@ -20197,5 +20242,35 @@ mod served_model_rewrite_tests {
         let out = rewrite_stream_chunk_model(chunk.clone(), "qwen3-14b");
         // Zero-copy pass-through: same bytes, not a re-serialization.
         assert_eq!(out, chunk);
+    }
+
+    /// The audit record for a bad `inject_mcp` reference is latched per
+    /// (config revision, tenant, reference), so a typo on a busy virtual
+    /// key cannot evict real violations from the bounded audit ring; a
+    /// hot reload (new revision) re-arms it.
+    #[test]
+    fn mcp_inject_denial_audit_latches_per_revision_tenant_and_reference() {
+        use crate::server::ai_dispatch::mcp_inject_denial_first_seen;
+        // Unique key material so this test cannot collide with another
+        // test's entries in the process-wide latch.
+        let rev_a = "rev-latch-test-a";
+        let rev_b = "rev-latch-test-b";
+        assert!(mcp_inject_denial_first_seen(rev_a, "acme", "gw-typo"));
+        assert!(
+            !mcp_inject_denial_first_seen(rev_a, "acme", "gw-typo"),
+            "the same triple must not audit twice in one config generation"
+        );
+        assert!(
+            mcp_inject_denial_first_seen(rev_a, "acme", "other-ref"),
+            "a different reference is a different misconfiguration"
+        );
+        assert!(
+            mcp_inject_denial_first_seen(rev_a, "globex", "gw-typo"),
+            "a different tenant is a different misconfiguration"
+        );
+        assert!(
+            mcp_inject_denial_first_seen(rev_b, "acme", "gw-typo"),
+            "a hot reload re-arms the latch for the same reference"
+        );
     }
 }
