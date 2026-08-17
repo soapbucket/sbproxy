@@ -868,7 +868,9 @@ mod tests {
             let program = cel::Program::compile(source).expect("compiles");
             CelSurface::McpArgumentPolicy
                 .validate("mcp `argument_policies`", source, &program)
-                .unwrap_or_else(|e| panic!("{source} must be a valid mcp argument-policy binding: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("{source} must be a valid mcp argument-policy binding: {e}")
+                });
         }
     }
 

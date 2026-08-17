@@ -976,10 +976,16 @@ pub fn build_mcp_argument_policy_context(view: &McpArgumentPolicyView<'_>) -> Ce
 
     let mut mcp = HashMap::new();
     mcp.insert("tool".to_string(), CelValue::Map(tool));
-    mcp.insert("server".to_string(), CelValue::String(view.server.to_string()));
+    mcp.insert(
+        "server".to_string(),
+        CelValue::String(view.server.to_string()),
+    );
     mcp.insert("session".to_string(), CelValue::Map(session));
     mcp.insert("arguments".to_string(), json_to_cel(view.arguments));
-    mcp.insert("tenant".to_string(), CelValue::String(view.tenant.to_string()));
+    mcp.insert(
+        "tenant".to_string(),
+        CelValue::String(view.tenant.to_string()),
+    );
     mcp.insert("principal".to_string(), CelValue::Map(principal));
 
     ctx.set("mcp", CelValue::Map(mcp));
@@ -2214,11 +2220,11 @@ mod mcp_argument_policy_context_tests {
             (r#"mcp.principal.sub == "alice""#, "principal.sub"),
             (r#"mcp.principal.team == "platform""#, "principal.team"),
             (r#"mcp.principal.project == "proj-x""#, "principal.project"),
-            (r#"mcp.principal.user == "alice@acme.com""#, "principal.user"),
             (
-                r#"mcp.arguments.to == "alice@company.com""#,
-                "arguments.to",
+                r#"mcp.principal.user == "alice@acme.com""#,
+                "principal.user",
             ),
+            (r#"mcp.arguments.to == "alice@company.com""#, "arguments.to"),
             (r#"size(mcp.arguments.cc) == 1"#, "arguments.cc"),
         ] {
             assert!(

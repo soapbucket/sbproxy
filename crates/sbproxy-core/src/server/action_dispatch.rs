@@ -3751,9 +3751,9 @@ pub(super) async fn handle_mcp_action(
                             };
                             let argument_policy_denied = matches!(
                                 argument_policy_verdict,
-                                Some(sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Deny {
-                                    ..
-                                })
+                                Some(
+                                    sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Deny { .. }
+                                )
                             );
                             let quota_error = if denied_by_rbac || argument_policy_denied {
                                 None
@@ -5970,10 +5970,7 @@ fn mcp_governance_event_data(
         fields.insert("sbproxy.tool.arguments_hash".to_string(), hash.into());
     }
     if let Some(verbatim) = arguments_verbatim {
-        fields.insert(
-            "gen_ai.tool.call.arguments".to_string(),
-            verbatim.into(),
-        );
+        fields.insert("gen_ai.tool.call.arguments".to_string(), verbatim.into());
     }
     fields.insert("sbproxy.tool.server".to_string(), server.into());
     fields.insert("sbproxy.tenant.id".to_string(), tenant_id.into());

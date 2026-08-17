@@ -1543,9 +1543,9 @@ fn evaluate_mcp_argument_expr(
     expr: &dyn McpArgumentPolicyExpr,
     ctx: &sbproxy_extension::cel::CelContext,
 ) -> McpArgumentPolicyEngineOutcome {
-    classify_argument_expr_result(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        expr.eval_bool(ctx)
-    })))
+    classify_argument_expr_result(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || expr.eval_bool(ctx),
+    )))
 }
 
 /// Pure classification half of [`evaluate_mcp_argument_expr`].
@@ -2178,8 +2178,7 @@ impl McpAction {
 
         let mut warned: Option<String> = None;
         for rule in &self.argument_policies {
-            if !rule.principals.is_empty()
-                && !rule.principals.iter().any(|s| s.matches(principal))
+            if !rule.principals.is_empty() && !rule.principals.iter().any(|s| s.matches(principal))
             {
                 continue;
             }
@@ -4662,7 +4661,10 @@ allow := false if {
             deny_event["data"]["sbproxy.decision.rule_id"],
             "mcp_server_approval"
         );
-        assert_eq!(deny_event["data"]["sbproxy.registry.status.old"], "approved");
+        assert_eq!(
+            deny_event["data"]["sbproxy.registry.status.old"],
+            "approved"
+        );
         assert_eq!(deny_event["data"]["sbproxy.registry.status.new"], "draft");
 
         // Phase 3: recompile again with the SAME `draft` status. No
@@ -4741,11 +4743,10 @@ allow := false if {
             "an mcp_audit: block with no capture_arguments key must default to false"
         );
 
-        let explicit_false =
-            McpAction::from_config(wor_2392_capture_config(Some(json!({
-                "capture_arguments": false
-            }))))
-            .expect("mcp_audit.capture_arguments: false compiles");
+        let explicit_false = McpAction::from_config(wor_2392_capture_config(Some(json!({
+            "capture_arguments": false
+        }))))
+        .expect("mcp_audit.capture_arguments: false compiles");
         assert!(!explicit_false.mcp_audit_capture_arguments);
     }
 
