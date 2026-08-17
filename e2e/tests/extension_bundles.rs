@@ -785,7 +785,10 @@ fn rego_bundle_policy_fault_refuses_under_the_closed_default() {
     let manifest = rego_fault_manifest("rego-closed-fault", "rego_closed_fault_policy", "closed");
     let files = [
         ("bundles/rego-closed-fault/bundle.yaml", manifest.as_str()),
-        ("bundles/rego-closed-fault/policy.rego", FAULTING_POLICY_REGO),
+        (
+            "bundles/rego-closed-fault/policy.rego",
+            FAULTING_POLICY_REGO,
+        ),
     ];
     let proxy = ProxyHarness::start_with_workspace(
         &proxy_policy_config(&upstream, "rego_closed_fault_policy"),
