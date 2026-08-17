@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-14*
+*Last modified: 2026-08-16*
 
 Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, provider-neutral event hooks, and AI routing decisions without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -270,6 +270,8 @@ hooks:
 
 A `runtime: rego` bundle rides the same signing, digest verification, and candidate load-or-refuse flow as every other bundle asset; see [Candidate load and reload](#candidate-load-and-reload). What differs is evaluation: sbproxy compiles the `.rego` module once, at candidate load, on the same [Regorus](https://github.com/microsoft/regorus) interpreter `policy: rego` uses (see [scripting.md](scripting.md)), and proves the pinned query evaluable before the candidate can activate, the same load-time guarantee `entry.js`'s declared exports and `action.wasm`'s module contract already get. A `.rego` module performs no I/O during evaluation, so `runtime: rego` accepts only `kind: policy` hooks, must omit `abi` and `export`, and must declare `execution.body_mode: none`.
 
+Bundled Rego is v1 only: the manifest has no `rego_v0` flag, so a pre-OPA-1.0 module fails at candidate load with a parse error. This is narrower than the config-inline surfaces: `policy: rego` and the `rego_module`/`rego_module_path` modifier fields both accept `rego_v0: true` for a pasted-in legacy module.
+
 `type:` is the same `sb.yml` attachment name any other policy hook uses. The `query` field pins the rule reference evaluated per request (`data.<package>.<rule>`), defaulting to `data.sbproxy.allow` when omitted, matching `policy: rego`'s own default:
 
 ```yaml
@@ -282,6 +284,10 @@ hooks:
 ```
 
 The rule reads the same JSON envelope a JavaScript or WASM policy hook reads: `input.request.method`, `input.request.uri`, `input.request.headers`, and `input.config` (the attachment's resolved `vars`, after `config_schema` defaults and `secret_vars` resolution). This is the wire-level request, not the internally resolved `CelContext` `policy: rego` reads from `sb.yml`; a bundle hook never sees trust tier or principal the way a built-in enforcer can. The query must evaluate to a Rego boolean: `true` allows, and `false`, an evaluation error, or a non-boolean result all deny, matching `policy: rego`'s fail-closed posture.
+
+A denial is always a fixed `403` with body `forbidden by policy`. `policy: rego`'s `deny_status`/`deny_message` knobs do not apply inside a bundle.
+
+`sbproxy rego test` (see [scripting.md](scripting.md#3a-rego-policies)) is engine-agnostic: it evaluates a fixture's `input` document exactly as authored, so it works as an offline pre-flight for a `.rego` file destined for a bundle just as well as for `policy: rego`. Write the fixture's `input` in the bundle envelope shape above (`input.request.method`, `input.request.uri`, `input.config`), not the `CelContext` shape `policy: rego` fixtures use.
 
 ## Proxy-Wasm HTTP and AI stream hooks
 

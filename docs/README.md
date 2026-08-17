@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-16*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -71,7 +71,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
-- [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
+- [scripting.md](scripting.md) - CEL, Rego, Lua, JavaScript, and WASM scripting reference.
 - [extension-bundles.md](extension-bundles.md) - adding policies, transforms, actions, HTTP filters, and event hooks as loadable bundles, from a local directory or a verified git checkout, without linking a new proxy binary.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.

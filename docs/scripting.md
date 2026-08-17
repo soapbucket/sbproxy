@@ -58,7 +58,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `origins.<host>.response_cache.key_event`, field `source` | Lua or JavaScript | Returns `{vary, skip_lookup, reason}` before the cache lookup; adds dimensions to the cache key |
 | `origins.<host>.response_cache.admit_event`, field `source` | Lua or JavaScript | Returns `{store, ttl_secs, reason}` once the response body is complete; decides whether it is stored |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
-| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, or envelope WASM | Uses a typed, versioned JSON envelope and the hook's `type` name |
+| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` only) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` hook reads `input.request.*` and `input.config` and returns a Rego boolean |
 | `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
 | Extension AI and payment hooks | JavaScript, envelope WASM, or Proxy-Wasm for AI streaming | Receives provider-neutral, credential-free events through versioned contracts |
 
@@ -651,6 +651,66 @@ response_modifiers:
 ```
 
 The queried rule is a fixed name, `data.sbproxy.modify_request` / `data.sbproxy.modify_response`, the same way Lua and JavaScript modifiers call a fixed function name (`modify_request` / `modify_response`) with no config knob to rename it. Unlike `policy: rego`, a module that fails to parse does not refuse the config: the failure posture here matches the Lua/JS modifier row in [§11](#error-behavior), not the `rego` policy row above. See [§7](#7-modifier-reference) for the full modifier field reference.
+
+### Testing Rego policies offline: `sbproxy rego test`
+
+`sbproxy rego test <path>` is the offline `opa test` analogue: it runs one or more YAML fixture files against the module(s) they name and prints a per-module line-coverage summary, without touching `sb.yml` or a running proxy. `<path>` is either one fixture file or a directory, searched recursively for `*_test.yaml` / `*_test.yml` files (OPA's own `*_test.rego` naming convention, in sbproxy's YAML fixture shape).
+
+Every fixture compiles its module through the same engine construction a live `policy: rego` or `ai_routing_policy` uses, so a fixture that passes here behaves identically pasted into config. A fixture's top-level fields mirror `policies[] type: rego` exactly and take the same defaults, so a block copied from a fixture into `policies:`, or the other way around, is the same policy:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `module` | - | Inline Rego source. Mutually exclusive with `module_path` |
+| `module_path` | - | A `.rego` file. Resolved against the fixture file's own directory, not the CLI's working directory, so a fixture can colocate its module beside it regardless of where `sbproxy rego test` runs from |
+| `query` | `data.sbproxy.allow` | The rule reference every case in the file evaluates |
+| `data` | none | Base data the module reads as `data.<key>` |
+| `budget_ms` | `50` | Evaluation budget; must be greater than zero |
+| `rego_v0` | `false` | Parse as pre-OPA-1.0 syntax |
+| `cases` | required | A list of `{name, input, expect}`. `expect` is compared as JSON against the query's actual result; an undefined rule reads as `null` |
+
+A real fixture, testing the `module_path` policy from [examples/rego-modifier-parity](../examples/rego-modifier-parity/):
+
+```yaml
+# examples/rego-modifier-parity/policy_test.yaml
+module_path: policy.rego
+cases:
+  - name: strong trust tier is allowed
+    input:
+      request: { trust_tier: strong, method: GET, path: /private/status }
+    expect: true
+  - name: public GET is allowed regardless of trust tier
+    input:
+      request: { trust_tier: anonymous, method: GET, path: /public/status }
+    expect: true
+  - name: private path with no strong trust tier is denied
+    input:
+      request: { trust_tier: anonymous, method: GET, path: /private/status }
+    expect: false
+  - name: POST to a public path is denied
+    input:
+      request: { trust_tier: anonymous, method: POST, path: /public/status }
+    expect: false
+```
+
+<!-- CAPTURE: sbproxy rego test examples/rego-modifier-parity/policy_test.yaml -->
+
+```text
+PASS examples/rego-modifier-parity/policy_test.yaml :: strong trust tier is allowed
+PASS examples/rego-modifier-parity/policy_test.yaml :: public GET is allowed regardless of trust tier
+PASS examples/rego-modifier-parity/policy_test.yaml :: private path with no strong trust tier is denied
+PASS examples/rego-modifier-parity/policy_test.yaml :: POST to a public path is denied
+coverage: policy.rego 3/3 lines (100.0%)
+4 passed, 0 failed, 0 errored, 100.0% total coverage
+```
+
+<!-- Hand-traced against the CLI's own formatting code, not replayed
+     against a built binary. Run `python3 scripts/check-doc-captures.py
+     --update` (with a built `sbproxy` on the binary path) before
+     merge; the coverage line's `3/3` in particular depends on whether
+     Regorus counts a `default allow := false` line as coverable,
+     which this pass could not confirm without compiling. -->
+
+Exit code `0`. A failing case exits `1` and names what it expected (`FAIL <fixture> :: <case>: expected <value>, got <value>`); `--min-coverage <PCT>` also exits `1` when aggregate coverage across every fixture in the run falls short. A fixture that is itself broken (unreadable, malformed YAML, a `module`/`module_path` conflict, no `cases`, a non-positive `budget_ms`) is recorded against that fixture and exits `2`, without discarding the results of every other fixture in the same run. `--format json` emits one structured object (`schema_version`, `cases`, `coverage`, `errors`, ...) instead of the text lines above, for a CI step that parses the result rather than scrapes it.
 
 ---
 
@@ -1359,6 +1419,7 @@ To see custom scripting and transforms in action, refer to these runnable exampl
 | [`transform-markdown`](../examples/transform-markdown/) | Markdown to HTML conversion. | Use `type: markdown`. | Renders a Markdown response body as HTML via `pulldown-cmark`. |
 | [`transform-template`](../examples/transform-template/) | Dynamic payload rendering. | Use the `template` transform with minijinja (Jinja-style) syntax. | Renders a structured JSON body into a plain-text (or other) summary. |
 | [`variables-template`](../examples/variables-template/) | Origin variable and env var interpolation. | Reference `{{ variables.<name> }}` / `{{ env.<NAME> }}` in modifier fields. | Injects config-defined values into headers sent upstream, resolved once when the config compiles (not per request). |
+| [`rego-modifier-parity`](../examples/rego-modifier-parity/) | A file-based Rego policy plus a Rego response modifier. | Use `policies[] type: rego` with `module_path`, and `response_modifiers[].rego_module`. | A `strong` trust tier or a public `GET` is allowed; everything else is denied 403. Test the module offline first with `sbproxy rego test`. |
 
 ## See also
 

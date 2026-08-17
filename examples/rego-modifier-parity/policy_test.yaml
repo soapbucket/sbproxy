@@ -1,0 +1,24 @@
+# Offline fixture for policy.rego, run with:
+#   sbproxy rego test examples/rego-modifier-parity/policy_test.yaml
+#
+# `module_path` here resolves against THIS file's own directory (not
+# the CLI's working directory), so it is the bare filename even though
+# sb.yml's own module_path for the same file is repo-root-relative.
+module_path: policy.rego
+cases:
+  - name: strong trust tier is allowed
+    input:
+      request: { trust_tier: strong, method: GET, path: /private/status }
+    expect: true
+  - name: public GET is allowed regardless of trust tier
+    input:
+      request: { trust_tier: anonymous, method: GET, path: /public/status }
+    expect: true
+  - name: private path with no strong trust tier is denied
+    input:
+      request: { trust_tier: anonymous, method: GET, path: /private/status }
+    expect: false
+  - name: POST to a public path is denied
+    input:
+      request: { trust_tier: anonymous, method: POST, path: /public/status }
+    expect: false
