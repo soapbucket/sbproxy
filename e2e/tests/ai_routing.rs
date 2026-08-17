@@ -110,7 +110,7 @@ origins:
 /// Two things about this fixture are load bearing.
 ///
 /// The providers are named `openai` and `groq` rather than
-/// `primary`/`secondary`. `provider_supports_surface` keys the surface
+/// `primary`/`secondary`. the surface-capability lookup keys the surface
 /// capability matrix on the provider *name*, not on `provider_type`, so a
 /// provider named `primary` is treated as an unknown provider and gets the
 /// most restrictive answer (chat, models, messages, responses). Audio
