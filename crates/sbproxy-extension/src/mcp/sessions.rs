@@ -79,10 +79,11 @@ impl SessionRisk {
 /// server not on the configured `trusted_servers` list (unlabeled
 /// upstream = untrusted, the fail-closed default). It never reverts to
 /// `Trusted` within the session's lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionIntegrity {
     /// Every tool result the session has read so far came from a
     /// trusted server.
+    #[default]
     Trusted,
     /// At least one tool result came from a server not on the
     /// configured trusted list.
@@ -97,12 +98,6 @@ impl SessionIntegrity {
             Self::Trusted => "trusted",
             Self::Tainted => "tainted",
         }
-    }
-}
-
-impl Default for SessionIntegrity {
-    fn default() -> Self {
-        Self::Trusted
     }
 }
 

@@ -193,6 +193,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
+| `sbproxy_evidence_seq_tenant_cap_total` | Counter | `stable` | `beta` | none | Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter. |
 | `sbproxy_gateway_reconcile_duration_seconds` | Histogram | `stable` | `beta` | `kind` | Gateway API reconcile latency in seconds, by the Kubernetes resource kind that triggered the pass. Answers whether a reconcile is outrunning the resync interval. |
 | `sbproxy_gateway_reconcile_total` | Counter | `stable` | `beta` | `kind`, `result` | Gateway API reconcile attempts, by triggering resource kind and outcome. `kind` is one of GatewayClass, Gateway, HTTPRoute, GRPCRoute, or periodic, so cardinality is bounded by a closed set. |
 | `sbproxy_gateway_status_writes_total` | Counter | `stable` | `beta` | `kind`, `result` | Patches to the `/status` subresource, by resource kind and outcome. A rising error count here is usually RBAC missing the status subresource rather than anything wrong with the reconcile. |
@@ -227,6 +228,12 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_mcp_poison_indicators_total` | Counter | `stable` | `beta` | `field`, `indicator`, `kind` | Static tool-poisoning indicators in advertised MCP tool text, by field and indicator. |
 | `sbproxy_mcp_concealed_text_findings_total` | Counter | `stable` | `beta` | `field`, `class`, `kind` | Advertised MCP tool text carrying characters hidden from a reader, by field and class. |
 | `sbproxy_mcp_tool_compat_verdicts_total` | Counter | `stable` | `beta` | `grade`, `outcome` | Tool-versioning oracle verdicts, by computed grade and outcome. |
+| `sbproxy_mcp_evidence_fail_closed_total` | Counter | `stable` | `beta` | `tenant` | MCP tool calls refused because fail-closed evidence delivery failed, by tenant. |
+| `sbproxy_mcp_argument_policy_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP argument-policy rule triggers, by tenant, rule name, and verdict. |
+| `sbproxy_mcp_flow_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP session-flow enforcement triggers, by tenant, rule id, and verdict. |
+| `sbproxy_mcp_session_registry_saturated_total` | Counter | `stable` | `beta` | none | MCP session mints refused because the session registry was at capacity, globally or for the caller's tenant. |
+| `sbproxy_mcp_content_filter_total` | Counter | `stable` | `beta` | `tenant`, `category`, `verdict` | MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict. |
+| `sbproxy_mcp_result_policy_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP result-policy rule triggers, by tenant, rule name, and verdict. |
 | `sbproxy_mcp_tool_cost_usd_total` | Counter | `stable` | `beta` | `tool`, `server` | MCP tool-call cost in USD, by tool and owning server. |
 | `sbproxy_mcp_tool_dispatch_duration_seconds` | Histogram | `stable` | `beta` | `tool` | MCP tool dispatch duration, by tool name. |
 | `sbproxy_mcp_tool_dispatch_total` | Counter | `stable` | `beta` | `tool`, `result` | MCP tool dispatch attempts, by tool name and outcome. |
