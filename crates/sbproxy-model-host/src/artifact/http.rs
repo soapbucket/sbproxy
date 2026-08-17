@@ -698,7 +698,12 @@ mod tests {
             Some(enforce_model_artifact(&["huggingface.co"])),
         );
 
-        let err = transport
+        // `TransportResponse` (the `Ok` side) carries a
+        // `Pin<Box<dyn Stream<..> + Send>>` and does not implement
+        // `Debug`, so this matches on the whole `Result` rather than
+        // `.expect_err(..)` (which requires `T: Debug` to format the
+        // `Ok` case it panics on).
+        match transport
             .get(TransportRequest {
                 url: "https://evil.example/model.bin".to_string(),
                 offset: 0,
@@ -706,15 +711,17 @@ mod tests {
                 credential: None,
             })
             .await
-            .expect_err("a host outside the allowlist armed after construction must be denied");
-        match &err {
-            ArtifactError::Transport(msg) => {
+        {
+            Ok(_) => {
+                panic!("a host outside the allowlist armed after construction must be denied")
+            }
+            Err(ArtifactError::Transport(msg)) => {
                 assert!(
                     msg.contains("egress denied"),
                     "must be an egress refusal, got: {msg}"
                 );
             }
-            other => panic!("must be an egress refusal, got: {other:?}"),
+            Err(other) => panic!("must be an egress refusal, got: {other:?}"),
         }
 
         sbproxy_security::egress::install_configured_gate(EgressPurpose::ModelArtifact, None);
@@ -740,7 +747,10 @@ mod tests {
             .expect("transport builds")
             .with_egress(enforce_model_artifact(&["huggingface.co"]));
 
-        let err = transport
+        // See the staleness test above for why this matches on the
+        // whole `Result` rather than `.expect_err(..)`: `TransportResponse`
+        // does not implement `Debug`.
+        match transport
             .get(TransportRequest {
                 url: "https://evil.example/model.bin".to_string(),
                 offset: 0,
@@ -748,15 +758,17 @@ mod tests {
                 credential: None,
             })
             .await
-            .expect_err("the fixed override, not the more permissive registry entry, must decide");
-        match &err {
-            ArtifactError::Transport(msg) => {
+        {
+            Ok(_) => panic!(
+                "the fixed override, not the more permissive registry entry, must decide"
+            ),
+            Err(ArtifactError::Transport(msg)) => {
                 assert!(
                     msg.contains("egress denied"),
                     "must be an egress refusal, got: {msg}"
                 );
             }
-            other => panic!("must be an egress refusal, got: {other:?}"),
+            Err(other) => panic!("must be an egress refusal, got: {other:?}"),
         }
 
         sbproxy_security::egress::install_configured_gate(EgressPurpose::ModelArtifact, None);
