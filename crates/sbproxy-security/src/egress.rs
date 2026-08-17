@@ -591,6 +591,13 @@ pub struct RedirectHop {
 /// dial's host allowlist never sees is a destination the gateway
 /// reaches too. `TooManyRedirects` and `MissingHost` are not stamped:
 /// neither names a real destination host to key an inventory row on.
+// Deliberate: this is the whole hop-authorization decision (auth
+// context, hop position, redirect policy, resolver, and the M1
+// attribution string) as explicit named args on purpose, not a bundled
+// struct, so every one of its ~10 call sites states plainly what it is
+// authorizing rather than assembling a config value that could go
+// stale between hops; only one arg over clippy's default threshold.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_hop(
     authorizer: Option<&EgressAuthorizer>,
     purpose: EgressPurpose,
