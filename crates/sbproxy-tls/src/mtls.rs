@@ -319,13 +319,17 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
             && !self.cn_patterns.is_empty()
             && !self.cn_patterns.iter().any(|re| re.is_match(&cn))
         {
+            // The CN is attacker-chosen; the log line and the handshake
+            // error string get the same bounded, control-stripped form the
+            // `security_audit` record uses, never the raw value.
+            let safe_cn = sanitize_rejected_cn(&cn);
             tracing::warn!(
-                cn = %cn,
+                cn = %safe_cn,
                 "mTLS client cert CN does not match allowed_cn_patterns; rejecting handshake"
             );
             record_mtls_rejection_audit("cn_mismatch", &cn);
             return Err(rustls::Error::General(format!(
-                "client certificate CN '{cn}' does not match any allowed_cn_patterns"
+                "client certificate CN '{safe_cn}' does not match any allowed_cn_patterns"
             )));
         }
         outcome
