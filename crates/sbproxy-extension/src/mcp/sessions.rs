@@ -81,46 +81,57 @@ impl Default for SessionIntegrity {
     }
 }
 
-/// Session-level flow-control labels (WOR-2384, MCP06). Two axes,
+/// Session-level flow-control labels (WOR-2384, MCP06; fix round 1:
+/// Meta's Rule of Two proper, FIDES-style integrity AND confidentiality
+/// axes, per the epic's settled decision). Two independent leg signals,
 /// most-restrictive-wins, monotonic within a session's lifetime: once
-/// set to the more restrictive value, a label never moves back.
+/// set, a label never moves back.
 ///
-/// - `integrity`: see [`SessionIntegrity`].
-/// - `exfil_allowed`: whether the session may still call a tool
-///   classified `outbound_tools`. Starts `true`; flips to `false`,
-///   sticky, the moment the session is tainted (mirrors both Meta's
-///   Rule of Two and the compositional-session-taint literature's `φs`
-///   transmission-prohibition bit).
+/// - `integrity`: see [`SessionIntegrity`]. Leg 1 ("touched untrusted
+///   input"). Absent server configuration is fail-closed: an
+///   unlabeled/unlisted server taints.
+/// - `sensitive_touched`: leg 2 ("touched sensitive data"). Starts
+///   `false`; flips to `true`, sticky, the first time the session reads
+///   from a server or tool declared `sensitive` in config. Absent
+///   sensitivity configuration reads default-open (`false` forever),
+///   unlike `integrity` -- naming what is sensitive is an explicit
+///   operator opt-in, not a fail-closed default.
+///
+/// Leg 3 ("externally-visible or state-changing action") is not stored
+/// session state: it is evaluated at the moment of a `tools/call`
+/// against `outbound_tools`, so it has no "touched" history to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowLabels {
     /// Data-provenance integrity of everything the session has read.
     pub integrity: SessionIntegrity,
-    /// Whether the session may still call an outbound-classified tool.
-    pub exfil_allowed: bool,
+    /// Whether the session has read from a server or tool declared
+    /// `sensitive`. Sticky: never reverts to `false`.
+    pub sensitive_touched: bool,
 }
 
 impl Default for FlowLabels {
     fn default() -> Self {
         Self {
             integrity: SessionIntegrity::Trusted,
-            exfil_allowed: true,
+            sensitive_touched: false,
         }
     }
 }
 
-/// Result of [`SessionStore::taint`]: the session's flow labels after
-/// the call, and whether this specific call is the one that caused the
-/// `Trusted` -> `Tainted` transition (as opposed to a session that was
-/// already tainted before this call). Callers use `newly_tainted` to
-/// decide whether to emit a `flow_taint` governance evidence event --
-/// only the transition itself is newsworthy, not every subsequent read
-/// of an already-tainted session.
+/// Result of a flow-label sticky-set operation ([`SessionStore::taint`],
+/// [`SessionStore::mark_sensitive_touched`]): the session's flow labels
+/// after the call, and whether this specific call is the one that
+/// caused the transition (as opposed to a session where that label was
+/// already set). Callers use `transitioned` to decide whether to emit a
+/// governance evidence event for this leg -- only the transition itself
+/// is newsworthy, not every subsequent read that finds the label
+/// already set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlowTaintResult {
+pub struct FlowLabelTransition {
     /// The session's flow labels after this call.
     pub labels: FlowLabels,
-    /// True only on the call that flipped `Trusted` -> `Tainted`.
-    pub newly_tainted: bool,
+    /// True only on the call that caused this label's transition.
+    pub transitioned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -291,13 +302,12 @@ impl SessionStore {
         }
     }
 
-    /// Taint a live session's flow labels (WOR-2384, MCP06):
-    /// `integrity` moves to [`SessionIntegrity::Tainted`] and
-    /// `exfil_allowed` flips to `false`, both sticky -- calling this
+    /// Taint a live session's `integrity` label (WOR-2384, MCP06):
+    /// moves to [`SessionIntegrity::Tainted`], sticky -- calling this
     /// again on an already-tainted session is a no-op beyond refreshing
-    /// the TTL and reports `newly_tainted: false`. `None` for an
-    /// unknown or expired session. Renews the sliding TTL.
-    pub fn taint(&self, id: &str) -> Option<FlowTaintResult> {
+    /// the TTL and reports `transitioned: false`. `None` for an unknown
+    /// or expired session. Renews the sliding TTL.
+    pub fn taint(&self, id: &str) -> Option<FlowLabelTransition> {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -305,12 +315,41 @@ impl SessionStore {
         match map.get_mut(id) {
             Some(entry) if entry.expires_at > Instant::now() => {
                 entry.expires_at = Instant::now() + self.ttl;
-                let newly_tainted = entry.flow.integrity == SessionIntegrity::Trusted;
+                let transitioned = entry.flow.integrity == SessionIntegrity::Trusted;
                 entry.flow.integrity = SessionIntegrity::Tainted;
-                entry.flow.exfil_allowed = false;
-                Some(FlowTaintResult {
+                Some(FlowLabelTransition {
                     labels: entry.flow,
-                    newly_tainted,
+                    transitioned,
+                })
+            }
+            Some(_) => {
+                map.remove(id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Mark a live session's `sensitive_touched` label `true` (WOR-2384,
+    /// MCP06 fix round 1): sticky -- calling this again on a session
+    /// that has already touched sensitive data is a no-op beyond
+    /// refreshing the TTL and reports `transitioned: false`. `None` for
+    /// an unknown or expired session. Renews the sliding TTL. Uses the
+    /// same lock and the same per-session entry `taint` does, so the two
+    /// labels can never observe a torn intermediate state.
+    pub fn mark_sensitive_touched(&self, id: &str) -> Option<FlowLabelTransition> {
+        let mut map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match map.get_mut(id) {
+            Some(entry) if entry.expires_at > Instant::now() => {
+                entry.expires_at = Instant::now() + self.ttl;
+                let transitioned = !entry.flow.sensitive_touched;
+                entry.flow.sensitive_touched = true;
+                Some(FlowLabelTransition {
+                    labels: entry.flow,
+                    transitioned,
                 })
             }
             Some(_) => {
@@ -442,36 +481,58 @@ mod tests {
         assert!(store.tool_requirements("nope").is_none());
     }
 
-    // --- Session flow labels (WOR-2384, MCP06) ---
+    // --- Session flow labels (WOR-2384, MCP06; fix round 1: Rule of
+    // Two's confidentiality axis) ---
 
     #[test]
-    fn flow_labels_default_to_trusted_and_exfil_allowed() {
+    fn flow_labels_default_to_trusted_and_not_sensitive_touched() {
         let store = SessionStore::new(Duration::from_secs(60));
         let id = store.create();
         let labels = store.flow_labels(&id).expect("live session");
         assert_eq!(labels.integrity, SessionIntegrity::Trusted);
-        assert!(labels.exfil_allowed);
+        assert!(!labels.sensitive_touched);
     }
 
     #[test]
-    fn taint_flips_integrity_and_exfil_allowed_and_reports_the_transition() {
+    fn taint_flips_integrity_and_reports_the_transition() {
         let store = SessionStore::new(Duration::from_secs(60));
         let id = store.create();
 
         let first = store.taint(&id).expect("live session");
         assert_eq!(first.labels.integrity, SessionIntegrity::Tainted);
-        assert!(!first.labels.exfil_allowed);
         assert!(
-            first.newly_tainted,
+            first.transitioned,
             "the first taint call must report the transition"
         );
 
         let second = store.taint(&id).expect("live session");
         assert_eq!(second.labels.integrity, SessionIntegrity::Tainted);
-        assert!(!second.labels.exfil_allowed);
         assert!(
-            !second.newly_tainted,
+            !second.transitioned,
             "a session already tainted must not report a transition again"
+        );
+    }
+
+    #[test]
+    fn mark_sensitive_touched_flips_the_label_and_reports_the_transition() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create();
+
+        let first = store.mark_sensitive_touched(&id).expect("live session");
+        assert!(first.labels.sensitive_touched);
+        assert!(
+            first.transitioned,
+            "the first mark call must report the transition"
+        );
+        // Marking sensitivity must never taint integrity; the two axes
+        // are independent.
+        assert_eq!(first.labels.integrity, SessionIntegrity::Trusted);
+
+        let second = store.mark_sensitive_touched(&id).expect("live session");
+        assert!(second.labels.sensitive_touched);
+        assert!(
+            !second.transitioned,
+            "a session that already touched sensitive data must not report a transition again"
         );
     }
 
@@ -487,8 +548,35 @@ mod tests {
         for _ in 0..3 {
             let labels = store.flow_labels(&id).expect("live session");
             assert_eq!(labels.integrity, SessionIntegrity::Tainted);
-            assert!(!labels.exfil_allowed);
         }
+    }
+
+    #[test]
+    fn sensitive_touched_is_sticky_across_later_reads() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create();
+        store.mark_sensitive_touched(&id).expect("live session");
+
+        for _ in 0..3 {
+            let labels = store.flow_labels(&id).expect("live session");
+            assert!(labels.sensitive_touched);
+        }
+    }
+
+    #[test]
+    fn the_two_axes_accumulate_independently() {
+        // Neither label's sticky-set can regress or interfere with the
+        // other: a session that touches sensitive data first, then is
+        // tainted, ends up with both flipped, not just the last one
+        // applied.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create();
+        store.mark_sensitive_touched(&id).expect("live session");
+        store.taint(&id).expect("live session");
+
+        let labels = store.flow_labels(&id).expect("live session");
+        assert_eq!(labels.integrity, SessionIntegrity::Tainted);
+        assert!(labels.sensitive_touched);
     }
 
     #[test]
@@ -503,20 +591,34 @@ mod tests {
     }
 
     #[test]
-    fn two_sessions_taint_independently() {
+    fn mark_sensitive_touched_on_unknown_or_expired_session_is_a_miss() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        assert!(store.mark_sensitive_touched("nope").is_none());
+
+        let short = SessionStore::new(Duration::from_millis(10));
+        let id = short.create();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(short.mark_sensitive_touched(&id).is_none());
+    }
+
+    #[test]
+    fn two_sessions_taint_and_touch_independently() {
         // Stands in for the per-tenant isolation guarantee: nothing in
         // this store keys on tenant, only on session id, so two
         // sessions (however owned) never observe each other's flow
-        // state.
+        // state, on either axis.
         let store = SessionStore::new(Duration::from_secs(60));
         let tenant_a_session = store.create();
         let tenant_b_session = store.create();
 
         store.taint(&tenant_a_session).expect("live session");
+        store
+            .mark_sensitive_touched(&tenant_a_session)
+            .expect("live session");
 
         let a_labels = store.flow_labels(&tenant_a_session).expect("live session");
         assert_eq!(a_labels.integrity, SessionIntegrity::Tainted);
-        assert!(!a_labels.exfil_allowed);
+        assert!(a_labels.sensitive_touched);
 
         let b_labels = store.flow_labels(&tenant_b_session).expect("live session");
         assert_eq!(
@@ -524,6 +626,9 @@ mod tests {
             SessionIntegrity::Trusted,
             "tainting one session must never taint another"
         );
-        assert!(b_labels.exfil_allowed);
+        assert!(
+            !b_labels.sensitive_touched,
+            "marking one session sensitive-touched must never mark another"
+        );
     }
 }

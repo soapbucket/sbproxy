@@ -275,18 +275,23 @@ fully control (a federated server nobody has vetted, a search result, a
 document another tenant uploaded), and the same session then calls a tool
 that sends data somewhere external or changes state. If the read carried
 injected instructions, the outbound call is how they leave. This is Meta's
-Rule of Two, collapsed to the two signals a gateway can observe
-deterministically at the dispatch seam: at most two of {touched untrusted
-input, touched sensitive data, took an externally visible or state-changing
-action} in one session; the third is the violation.
+Rule of Two: at most two of {touched untrusted input, touched sensitive
+data, took an externally visible or state-changing action} in one session;
+the third is the violation.
 
-**What the gateway does.** `flow` tracks two session-scoped labels,
-most-restrictive-wins and never lowering within a session: `integrity`
-(`trusted` -> `tainted`) and `exfil_allowed` (`true` -> sticky `false`). A
-`tools/call` result from a server outside `trusted_servers` taints the
-session; a tainted session's `exfil_allowed` flips `false`; a later call to
-a tool matching `outbound_tools` while `exfil_allowed` is `false` is the
-violation.
+**What the gateway does.** `flow` tracks two session-scoped labels the
+gateway can observe deterministically at the dispatch seam, most-restrictive-
+wins and never lowering within a session: `integrity` (`trusted` ->
+`tainted`, leg 1: touched untrusted input) and `sensitive_touched` (`false`
+-> sticky `true`, leg 2: touched sensitive data). Leg 3 (the externally
+visible or state-changing action) is not stored; it is evaluated fresh at
+each `tools/call` against `outbound_tools`. A `tools/call` result (or a
+`resources/read`) from a server outside `trusted_servers` taints the
+session; one from a server in `sensitive_servers`, or a `tools/call` for a
+tool matching `sensitive_tools`, sets `sensitive_touched`. The default rule,
+`two_of_three`, is Rule of Two itself: the violation is a session that is
+BOTH tainted AND has touched sensitive data, then attempts a call to a tool
+matching `outbound_tools` -- the third leg.
 
 <!-- sbproxy-config-excerpt -->
 ```yaml
@@ -295,42 +300,69 @@ violation.
       flow:
         mode: block
         trusted_servers: [internal-docs]
+        sensitive_servers: [customer-db]
+        sensitive_tools: ["db.query_pii"]
         outbound_tools: ["email.*", "slack.*"]
 ```
 
 `mode: warn` logs and emits a `mcp_governance_decision` event with verdict
 `warn` but allows the call; `mode: block` refuses it before dispatch with
-verdict `deny`. `mode: off` (the default) tracks nothing at all. Both active
-modes carry `sbproxy.decision.rule_id` of `flow_taint` (the read that
-tainted the session) or `flow_exfil_block` (the outbound call the taint then
-blocked), so a SIEM can tell which half of the sequence it is looking at.
-This runs after RBAC, per-tool quota, and `argument_policies[]` have already
-allowed the call, so it can only narrow that allow, never widen it, and it
-composes with `lethal_trifecta` and `dual_llm_quarantine` above rather than
-replacing either. Without `sessions.enabled: true`, this degrades to
-single-call scope: with no memory across calls, the only thing one call can
-prove is whether it is itself both a read from an untrusted server and an
-outbound call.
+verdict `deny`. `mode: off` (the default) tracks nothing at all. Every
+transition and violation carries its own `sbproxy.decision.rule_id`, so a
+SIEM can tell exactly which leg (or leg combination) it is looking at:
+`flow_taint` (a session newly tainted), `flow_sensitive_touched` (a session
+newly touched sensitive data), and `flow_exfil_block` (all three legs, under
+the default `rule: two_of_three`). This runs after RBAC, per-tool quota, and
+`argument_policies[]` have already allowed the call, so it can only narrow
+that allow, never widen it, and it composes with `lethal_trifecta` and
+`dual_llm_quarantine` above rather than replacing either. Without
+`sessions.enabled: true`, this degrades to single-call scope: with no memory
+across calls, the only thing one call can prove is whether it is itself
+simultaneously every leg the configured rule requires.
+
+**Two rules, one default.** `flow.rule: two_of_three` (the default) is Rule
+of Two proper, described above. `flow.rule: taint_and_outbound` is a
+strictly stricter, explicit opt-in: the violation is tainted AND outbound,
+with sensitivity never considered, so a session that has read anything
+untrusted at all is gated the moment it tries an outbound call, and its
+evidence carries `rule_id: flow_pair_block` instead. Reach for it when the
+operating posture is "any untrusted read plus any outbound call is worth
+refusing," and `sensitive_servers`/`sensitive_tools` are more configuration
+than the deployment wants to maintain.
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      flow:
+        mode: block
+        rule: taint_and_outbound
+        trusted_servers: [internal-docs]
+        outbound_tools: ["email.*", "slack.*"]
+```
 
 A custom CEL or Rego rule under `argument_policies[]` can read the same
-labels directly, `mcp.session.integrity` and `mcp.session.exfil_allowed`, to
-compose a tighter policy than the built-in gate, for example denying
-outright the moment a session is tainted rather than only gating the tools
-named in `outbound_tools`.
+labels directly, `mcp.session.integrity` and `mcp.session.sensitive_touched`,
+to compose a policy the two built-in rules do not express, for example
+denying outright the moment both legs are set rather than only gating the
+tools named in `outbound_tools`.
 
 **Still yours.** This is a deterministic, config-driven approximation of the
 Rule of Two, not a semantic understanding of what a session actually did. It
-has real false positives: a session that reads one untrusted paragraph for
-unrelated reasons and later, coincidentally, sends an unrelated email is
-blocked exactly the same as one that is actually exfiltrating. The
-literature proposing this class of control is explicit about the same
-tradeoff, and the honest framing carries over here: this constrains the
-blast radius of a session that might be compromised, it does not detect
-whether one actually is. Naming which servers are `trusted_servers` and
-which tools are `outbound_tools` is the operator's judgment call, not
-something the gateway can infer from a catalog; an empty `trusted_servers`
-list (the default) trusts nothing, and an empty `outbound_tools` list (also
-the default) makes the gate a no-op regardless of `mode`.
+has real false positives: a session that reads one untrusted, sensitive
+paragraph for unrelated reasons and later, coincidentally, sends an
+unrelated email is blocked exactly the same as one that is actually
+exfiltrating. The literature proposing this class of control is explicit
+about the same tradeoff, and the honest framing carries over here: this
+constrains the blast radius of a session that might be compromised, it does
+not detect whether one actually is. Naming which servers are
+`trusted_servers`, which are `sensitive_servers`, and which tools are
+`outbound_tools` is the operator's judgment call, not something the gateway
+can infer from a catalog. The two axes default in opposite directions on
+purpose: an empty `trusted_servers` list trusts nothing (fail closed, since
+an unlabeled upstream is exactly the untrusted case this control exists
+for), while an empty `sensitive_servers`/`sensitive_tools` reads
+default-open (nothing is sensitive until an operator says so, since a
+gateway cannot know what data a deployment considers sensitive). An empty
+`outbound_tools` list makes the gate a no-op regardless of `mode` or `rule`.
 
 ## Untrusted or unexpected upstream servers
 

@@ -921,12 +921,13 @@ pub struct McpArgumentPolicyView<'a> {
     /// Always `"trusted"` when flow enforcement is off, sessions are
     /// disabled, or the session has never read anything.
     pub session_integrity: &'a str,
-    /// Session-flow exfiltration-allowed label (WOR-2384, MCP06): `true`
-    /// until the session is tainted, then sticky `false`. A custom rule
-    /// composes with the built-in Rule-of-Two flow gate by reading this
-    /// directly, e.g. to deny outright rather than only gate
-    /// `outbound_tools`-classified tools.
-    pub session_exfil_allowed: bool,
+    /// Session-flow confidentiality label (WOR-2384, MCP06 fix round 1):
+    /// `false` until the session reads from a server or tool declared
+    /// `sensitive`, then sticky `true`. A custom rule composes with the
+    /// built-in Rule-of-Two flow gate by reading this directly alongside
+    /// `session_integrity`, e.g. to deny outright the moment both legs
+    /// are set rather than only gate `outbound_tools`-classified tools.
+    pub session_sensitive_touched: bool,
 }
 
 /// Build the `mcp` CEL/Rego namespace for one tool call (WOR-2384,
@@ -946,8 +947,9 @@ pub struct McpArgumentPolicyView<'a> {
 /// - `mcp.session.id` - MCP session id, `""` when sessions are disabled
 /// - `mcp.session.integrity` - session-flow integrity (WOR-2384, MCP06):
 ///   `"trusted"` or `"tainted"`
-/// - `mcp.session.exfil_allowed` - session-flow exfiltration-allowed
-///   label (WOR-2384, MCP06): `true` until the session is tainted
+/// - `mcp.session.sensitive_touched` - session-flow confidentiality label
+///   (WOR-2384, MCP06 fix round 1): `false` until the session reads
+///   sensitive data, then sticky `true`
 /// - `mcp.arguments` - the parsed call arguments (map, or `null`/scalar
 ///   if the caller supplied something other than an object)
 /// - `mcp.tenant` - host-derived tenant id
@@ -976,8 +978,8 @@ pub fn build_mcp_argument_policy_context(view: &McpArgumentPolicyView<'_>) -> Ce
         CelValue::String(view.session_integrity.to_string()),
     );
     session.insert(
-        "exfil_allowed".to_string(),
-        CelValue::Bool(view.session_exfil_allowed),
+        "sensitive_touched".to_string(),
+        CelValue::Bool(view.session_sensitive_touched),
     );
 
     let mut principal = HashMap::new();
@@ -2234,7 +2236,7 @@ mod mcp_argument_policy_context_tests {
             principal_user: Some("alice@acme.com"),
             arguments: &arguments,
             session_integrity: "tainted",
-            session_exfil_allowed: false,
+            session_sensitive_touched: true,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         let engine = CelEngine::new();
@@ -2243,7 +2245,10 @@ mod mcp_argument_policy_context_tests {
             (r#"mcp.server == "gh""#, "server"),
             (r#"mcp.session.id == "sess-1""#, "session.id"),
             (r#"mcp.session.integrity == "tainted""#, "session.integrity"),
-            (r#"mcp.session.exfil_allowed == false"#, "session.exfil_allowed"),
+            (
+                r#"mcp.session.sensitive_touched == true"#,
+                "session.sensitive_touched",
+            ),
             (r#"mcp.tenant == "acme""#, "tenant"),
             (r#"mcp.principal.sub == "alice""#, "principal.sub"),
             (r#"mcp.principal.team == "platform""#, "principal.team"),
@@ -2276,7 +2281,7 @@ mod mcp_argument_policy_context_tests {
             principal_user: None,
             arguments: &arguments,
             session_integrity: "trusted",
-            session_exfil_allowed: true,
+            session_sensitive_touched: false,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         let engine = CelEngine::new();
@@ -2290,7 +2295,7 @@ mod mcp_argument_policy_context_tests {
             .eval_bool_source(r#"mcp.session.integrity == "trusted""#, &ctx)
             .unwrap_or(false));
         assert!(engine
-            .eval_bool_source(r#"mcp.session.exfil_allowed == true"#, &ctx)
+            .eval_bool_source(r#"mcp.session.sensitive_touched == false"#, &ctx)
             .unwrap_or(false));
     }
 
@@ -2310,7 +2315,7 @@ mod mcp_argument_policy_context_tests {
             principal_user: None,
             arguments: &arguments,
             session_integrity: "trusted",
-            session_exfil_allowed: true,
+            session_sensitive_touched: false,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         assert!(!ctx.variables.contains_key("request"));

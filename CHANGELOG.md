@@ -97,26 +97,37 @@ the next version cut.
   JSON-Schema check modern-era calls already had.
 
 - **Deterministic session-flow enforcement gates a session that read
-  something untrusted, then tries to leave.** An `mcp` action's `flow`
-  block tracks two session-scoped, most-restrictive-wins labels that
-  never lower within a session: `integrity` (`trusted` -> `tainted`)
-  and `exfil_allowed` (`true` -> sticky `false`). A `tools/call` result
-  from a server outside `flow.trusted_servers` taints the session
-  (unlabeled upstream is untrusted, fail closed); a tainted session's
-  `exfil_allowed` flips `false`; a later call to a tool matching
-  `flow.outbound_tools` while `exfil_allowed` is `false` is the
-  violation. `flow.mode: warn` logs and emits a `mcp_governance_decision`
-  event with verdict `warn`; `mode: block` refuses the call before
-  dispatch with verdict `deny`; `mode: off` (the default) tracks
-  nothing. Both carry `sbproxy.decision.rule_id` of `flow_taint` or
-  `flow_exfil_block`. Runs after RBAC, per-tool quota, and
-  `argument_policies[]` have already allowed the call, and composes with
-  (rather than replaces) `lethal_trifecta` and `dual_llm_quarantine`.
-  Without `sessions.enabled: true`, this degrades to single-call scope,
-  the same fallback `lethal_trifecta` uses. The labels are also exposed
-  on the `mcp` CEL/Rego namespace as `mcp.session.integrity` and
-  `mcp.session.exfil_allowed`, so a custom `argument_policies[]` rule
-  can compose a tighter policy on top.
+  something untrusted and sensitive, then tries to leave (Meta's Rule of
+  Two).** An `mcp` action's `flow` block tracks two session-scoped,
+  most-restrictive-wins labels that never lower within a session:
+  `integrity` (`trusted` -> `tainted`, leg 1) and `sensitive_touched`
+  (`false` -> sticky `true`, leg 2). Leg 3 (an externally visible or
+  state-changing action) is evaluated fresh at each `tools/call` against
+  `flow.outbound_tools`, not stored. A `tools/call` result (or
+  `resources/read`) from a server outside `flow.trusted_servers` taints
+  the session (unlabeled upstream is untrusted, fail closed); one from a
+  server in `flow.sensitive_servers`, or a `tools/call` for a tool
+  matching `flow.sensitive_tools`, sets `sensitive_touched` (absent
+  sensitivity config reads default-open, unlike `integrity`). The
+  default rule, `flow.rule: two_of_three`, is Rule of Two itself: the
+  violation is a session with both legs tripped attempting an outbound
+  call; the explicit `flow.rule: taint_and_outbound` reproduces a
+  strictly stricter pair rule (tainted + outbound, sensitivity not
+  considered) for an operator who wants that instead.
+  `flow.mode: warn` logs and emits a `mcp_governance_decision` event
+  with verdict `warn`; `mode: block` refuses the call before dispatch
+  with verdict `deny`; `mode: off` (the default) tracks nothing. Every
+  transition and violation carries its own `sbproxy.decision.rule_id`:
+  `flow_taint`, `flow_sensitive_touched`, `flow_exfil_block` (the
+  default rule), or `flow_pair_block` (the explicit rule). Runs after
+  RBAC, per-tool quota, and `argument_policies[]` have already allowed
+  the call, and composes with (rather than replaces) `lethal_trifecta`
+  and `dual_llm_quarantine`. Without `sessions.enabled: true`, this
+  degrades to single-call scope, the same fallback `lethal_trifecta`
+  uses. The labels are also exposed on the `mcp` CEL/Rego namespace as
+  `mcp.session.integrity` and `mcp.session.sensitive_touched`, so a
+  custom `argument_policies[]` rule can compose a policy the two
+  built-in rules do not express.
 
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint

@@ -4359,10 +4359,17 @@ pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static st
 
 /// Record one session-flow enforcement outcome that was not a plain
 /// allow, on `sbproxy_mcp_flow_total{tenant, rule, verdict}` (WOR-2384,
-/// MCP06). `rule` is one of the closed set `"flow_taint"` (a session
-/// newly tainted) or `"flow_exfil_block"` (an outbound-tool call while
-/// `exfil_allowed == false`). `verdict` is
-/// `"warn"` or `"deny"`; a compliant call is not recorded here,
+/// MCP06; fix round 1 added the confidentiality-axis and pair-rule
+/// values). `rule` is one of the closed set: `"flow_taint"` (a session
+/// newly tainted -- leg 1) or `"flow_sensitive_touched"` (a session
+/// newly touched sensitive-labeled data -- leg 2), both always recorded
+/// with `verdict = "warn"` since the read that caused either transition
+/// was itself permitted; `"flow_exfil_block"` (an outbound-tool call
+/// while the default `rule: two_of_three` is satisfied -- both legs 1
+/// and 2) or `"flow_pair_block"` (an outbound-tool call while the
+/// explicit `rule: taint_and_outbound` is satisfied -- leg 1 alone),
+/// either recorded with `verdict = "warn"` or `"deny"` depending on
+/// `flow.mode`. A compliant call is not recorded here,
 /// matching the sibling `mcp_rbac` / `mcp_quota` / `mcp_peer_downgrade`
 /// / `mcp_argument_policy` triggers, which also only ever record a
 /// triggered outcome.
@@ -7147,6 +7154,35 @@ mod tests {
             }),
             "sbproxy_mcp_flow_total did not register or did not carry \
              the tenant/rule/verdict labels: {counted:?}"
+        );
+    }
+
+    /// The full rule vocabulary WOR-2384 fix round 1 added
+    /// (`flow_sensitive_touched`, `flow_pair_block`) is recorded the
+    /// same way the pre-existing `flow_exfil_block` rule already was.
+    #[test]
+    fn mcp_flow_records_the_confidentiality_axis_and_pair_rule_labels() {
+        record_mcp_flow("acme", "flow_sensitive_touched", "warn");
+        record_mcp_flow("acme", "flow_pair_block", "deny");
+
+        let counted = gathered_series("sbproxy_mcp_flow_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=flow_sensitive_touched")
+                    && labels.contains("verdict=warn")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_flow_total did not carry flow_sensitive_touched: {counted:?}"
+        );
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=flow_pair_block")
+                    && labels.contains("verdict=deny")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_flow_total did not carry flow_pair_block: {counted:?}"
         );
     }
 }
