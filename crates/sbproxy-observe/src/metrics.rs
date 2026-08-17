@@ -5863,6 +5863,20 @@ mod tests {
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
+            // Load bearing (WOR-2486 fix round 2). `record_circuit_breaker_transition`'s
+            // `tracing::warn!` callsite registers its `Interest` against
+            // whatever subscriber is active the first time this process
+            // ever evaluates it, and that decision is cached process-wide,
+            // not per test. If no subscriber (or one this event is not
+            // enabled under) was active earlier in this same test binary,
+            // the callsite caches `Interest::never()` and the freshly
+            // installed subscriber above never sees the event at all, even
+            // though `with_default` genuinely made it the active one. This
+            // is the same landmine `request_path_spans_carry_their_name_and_no_credential_shaped_field`
+            // documents in `telemetry.rs`: rebuilding the cache here forces
+            // every known callsite to re-check `enabled()`/`register_callsite`
+            // against the subscriber this closure just installed.
+            tracing::callsite::rebuild_interest_cache();
             record_circuit_breaker_transition(
                 "breaker-transition.example.com",
                 "closed",
