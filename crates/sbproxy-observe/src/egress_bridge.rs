@@ -9,8 +9,9 @@
 //! purpose already shares, `record_egress_refused`, cannot call
 //! [`crate::event_sink::publish_proxy_event`] directly. It calls a
 //! function pointer instead, installed once at boot with
-//! [`sbproxy_security::egress::install_egress_refused_hook`]; [`bridge`]
-//! is the function that pointer names.
+//! [`sbproxy_security::egress::install_egress_refused_hook`];
+//! [`bridge`](crate::egress_bridge::bridge) is the function that
+//! pointer names.
 //!
 //! One seam closes five egress purposes at once: DNS-rebind and SSRF
 //! attempts (`ai_provider`, `mcp_upstream`, `openapi_tool`), credential
