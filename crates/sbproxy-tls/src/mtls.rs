@@ -303,6 +303,15 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
         // discriminator; anything else collapses to `other`.
         let label = classify_mtls_outcome(&outcome);
         sbproxy_observe::metrics::record_mtls_handshake(label);
+        // WOR-2486: a chain-validation rejection is metric-only before
+        // this line. The handshake fails closed either way (the
+        // connection never reaches a request), so the miss was forensic
+        // completeness rather than a live control gap; this closes it
+        // with the same `security_audit` shape every other credential
+        // rejection uses.
+        if label != "ok" {
+            record_mtls_rejection_audit(label, &cn);
+        }
         // WOR-1155: even when CA-chain validation passes, enforce the CN
         // allowlist. A cert signed by the configured CA whose CN matches
         // none of the operator's patterns is rejected at the handshake.
@@ -314,6 +323,7 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
                 cn = %cn,
                 "mTLS client cert CN does not match allowed_cn_patterns; rejecting handshake"
             );
+            record_mtls_rejection_audit("cn_mismatch", &cn);
             return Err(rustls::Error::General(format!(
                 "client certificate CN '{cn}' does not match any allowed_cn_patterns"
             )));
@@ -375,6 +385,52 @@ fn classify_mtls_outcome(
         Err(InvalidCertificate(CertificateError::Revoked)) => "revoked",
         Err(_) => "other",
     }
+}
+
+/// Emit a `security_audit` record for one rejected mTLS handshake
+/// (WOR-2486).
+///
+/// `reason` is [`classify_mtls_outcome`]'s label for a chain-validation
+/// rejection, or `"cn_mismatch"` for the separate allowlist check just
+/// below it; both are closed, bounded vocabularies. `cn` is the
+/// certificate's own claimed Common Name, attacker-controlled on an
+/// untrusted cert, so it goes in the free-form `auth_type` slot
+/// alongside the reason rather than a structured field a SIEM rule
+/// would key on.
+///
+/// This callback runs below `RequestContext`: no tenant, hostname, or
+/// request id has been resolved yet, so this record correlates on
+/// nothing but its own timestamp. That is a real gap, not an oversight;
+/// closing it needs plumbing a per-connection identity down into
+/// `rustls::server::danger::ClientCertVerifier`, which is out of scope
+/// for wiring the rejection itself.
+fn record_mtls_rejection_audit(reason: &str, cn: &str) {
+    sbproxy_observe::SecurityAuditEntry::auth_failure(
+        "auth_mtls_rejected",
+        mtls_rejection_auth_type(reason, cn),
+        // 495 is nginx's de facto "SSL Certificate Error" convention.
+        // There is no real HTTP status here: the handshake fails before
+        // any request exists, so nothing this status describes was ever
+        // sent. It is the closest bounded label to "the connection
+        // never reached HTTP" that the field's u16 type accepts.
+        495,
+        None,
+        None,
+        None,
+        None,
+    )
+    .emit();
+}
+
+/// The `auth_type` string [`record_mtls_rejection_audit`] carries.
+///
+/// Split out so the format is testable without a tracing subscriber:
+/// `reason` and `cn` land in one field because `SecurityAuditEntry`
+/// only gives an mTLS rejection the same two-field shape every other
+/// `auth_failure` gets (`event_type` plus `reason`), and there is no
+/// third slot to give the certificate's own claimed identity.
+fn mtls_rejection_auth_type(reason: &str, cn: &str) -> String {
+    format!("mtls:{reason} cn={cn}")
 }
 
 /// Parse an end-entity DER into `ClientCertInfo`. Returns `None` when
@@ -568,6 +624,36 @@ mod tests {
         let got = cache.get(&digest).expect("hit");
         assert_eq!(got.common_name, info.common_name);
         assert_eq!(got.subject_alt_names, info.subject_alt_names);
+    }
+
+    // --- WOR-2486: mTLS rejection reaches security_audit ---
+
+    /// Red-first: before this wiring, a rejected mTLS handshake produced
+    /// only `sbproxy_mtls_handshake_total{result}` and a `tracing::warn!`
+    /// line, neither of which is a structured, SIEM-consumable record.
+    /// Pins the field the record's `reason` carries.
+    #[test]
+    fn mtls_rejection_auth_type_names_the_reason_and_cn() {
+        assert_eq!(
+            mtls_rejection_auth_type("untrusted_issuer", "attacker.example"),
+            "mtls:untrusted_issuer cn=attacker.example"
+        );
+        assert_eq!(
+            mtls_rejection_auth_type("cn_mismatch", "wrong-cn.example"),
+            "mtls:cn_mismatch cn=wrong-cn.example"
+        );
+    }
+
+    /// Every [`classify_mtls_outcome`] rejection label, plus the CN
+    /// mismatch this module raises separately, must format without
+    /// panicking: a malformed reason string reaching a real
+    /// `SecurityAuditEntry::auth_failure` call would fail the handshake
+    /// path itself, not just the audit trail.
+    #[test]
+    fn record_mtls_rejection_audit_does_not_panic_for_any_reason() {
+        for reason in ["untrusted_issuer", "expired", "revoked", "other", "cn_mismatch"] {
+            record_mtls_rejection_audit(reason, "test.example.com");
+        }
     }
 
     #[test]
