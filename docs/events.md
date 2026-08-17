@@ -48,7 +48,7 @@ Three of the ten wired events are worth being explicit about, because "wired" do
 
 ## Decision-audit: the other eighteen
 
-Eleven of the twelve typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-log) and the generated [decision-records.md](decision-records.md).
+Eleven of the twelve typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
