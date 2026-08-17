@@ -9071,9 +9071,7 @@ mod mcp_catalog_snapshot_tests {
                     && event["data"]["sbproxy.decision.verdict"] == "deny"
             })
             .await
-            .expect(
-                "a draft-server mcp_governance_decision deny event was not observed within 5s",
-            );
+            .expect("a draft-server mcp_governance_decision deny event was not observed within 5s");
             assert_eq!(
                 event["data"]["sbproxy.decision.rule_id"],
                 "mcp_server_approval"
@@ -9246,8 +9244,8 @@ mod mcp_catalog_snapshot_tests {
     /// `resources/list` (hidden), `resources/read` (refused),
     /// `prompts/get` (refused), `prompts/list` (hidden).
     #[tokio::test]
-    async fn wor_2384_draft_server_hides_resources_list_and_refuses_resources_read_and_prompts_get(
-    ) {
+    async fn wor_2384_draft_server_hides_resources_list_and_refuses_resources_read_and_prompts_get()
+    {
         const SERVER: &str = "draft-non-tool-server";
         const RESOURCE_URI: &str = "res://draft-non-tool-fixture/doc";
         const PROMPT_NAME: &str = "wor2384-draft-non-tool-prompt";
