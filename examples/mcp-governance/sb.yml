@@ -194,7 +194,9 @@ origins:
         - name: no-path-traversal-in-message-rego
           when: mcp.tool.name == "crm.echo"
           engine: rego
-          path: policies/no-path-traversal-in-message.rego
+          # Resolved relative to the proxy's working directory, like every
+          # other module path. Use an absolute path in production.
+          path: examples/mcp-governance/policies/no-path-traversal-in-message.rego
           mode: block
 
       # Meta's Rule of Two. `crm` is untrusted (taints integrity) and
