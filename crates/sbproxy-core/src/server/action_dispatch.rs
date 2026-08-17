@@ -6129,12 +6129,21 @@ fn mcp_audit_field_boundary(value: &str, max_bytes: usize) -> usize {
 /// Whole-branch review addendum: `value` is bounded to
 /// [`MCP_AUDIT_FIELD_MAX_BYTES`] plus
 /// [`MCP_AUDIT_FIELD_PRE_REDACT_MARGIN_BYTES`] BEFORE `redact_secrets`
-/// runs, not after. This is correct, not merely faster: nothing past
-/// the final truncation point below is ever emitted in the field this
-/// function returns, so redacting bytes this function is going to
-/// discard anyway buys no coverage -- only cost proportional to a
-/// caller-controlled document's full size, regardless of how small
-/// the field that actually ships is. `redact_secrets`'s own output can
+/// runs, not after, so the redaction pass costs the capped field size
+/// rather than the caller-controlled document's full size. The margin
+/// is what keeps that honest-enough rather than exact: redaction can
+/// SHRINK its input (a long credential becomes a short marker), so
+/// with no margin, bytes just past the cap could have entered the
+/// final window under the old redact-everything order. The residual
+/// this accepts, deliberately: if redaction shrinks the pre-bounded
+/// prefix by more than the margin, (a) content the old order would
+/// have emitted is now absent, and (b) a secret straddling the
+/// pre-bound cut reaches `redact_secrets` truncated, may not match a
+/// detector, and its tail fragment can land inside the emitted
+/// window. That needs over a kibibyte of marker-shrink in an 8 KiB
+/// prefix plus a credential sitting exactly on the cut; the field is
+/// an audit capture, not the wire, and the same document's live
+/// dispatch path was already filtered in full. `redact_secrets`'s own output can
 /// still be longer or shorter than its input (a matched credential is
 /// replaced with a `[REDACTED:...]` marker of a different length), so
 /// the final truncation below still has to run on `redact_secrets`'s
@@ -7244,50 +7253,13 @@ fn mcp_content_filter_for_non_tool_call(
 ///   code), so nothing live currently depends on the scrub; it runs
 ///   anyway so a future caller cannot turn this event into a leak
 ///   channel just by handing it richer text.
+/// Build the `mcp_governance_decision` payload (whole-branch review,
+/// item 4 generalized the original `tools/call`-only form): `method`
+/// lands in `mcp.method.name`, and `tool_name` is `None` for a method
+/// that never names a tool (`resources/read`, `prompts/get`) --
+/// `gen_ai.tool.name` is then simply absent from the payload rather
+/// than carrying an empty string.
 #[allow(clippy::too_many_arguments)] // pure builder; kept free of RequestContext so the semconv shape is unit-testable on its own
-fn mcp_governance_event_data(
-    tool_name: &str,
-    server: &str,
-    request_id: &str,
-    mcp_session_id: Option<&str>,
-    protocol_version: &str,
-    tenant_id: &str,
-    route: &str,
-    verdict: McpGovernanceVerdict<'_>,
-    redact_state: Option<&sbproxy_observe::logging::OpRedactState>,
-    arguments_hash: Option<&str>,
-    seq: u64,
-    rule_id: Option<&str>,
-    arguments_verbatim: Option<&str>,
-) -> serde_json::Value {
-    mcp_governance_event_data_for_method(
-        "tools/call",
-        Some(tool_name),
-        server,
-        request_id,
-        mcp_session_id,
-        protocol_version,
-        tenant_id,
-        route,
-        verdict,
-        redact_state,
-        arguments_hash,
-        seq,
-        rule_id,
-        arguments_verbatim,
-    )
-}
-
-/// Generalized form of [`mcp_governance_event_data`] (whole-branch
-/// review, item 4): `method` replaces the value this function's
-/// original, `tools/call`-only form hardcoded into `mcp.method.name`,
-/// and `tool_name` is `None` for a method that never names a tool
-/// (`resources/read`, `prompts/get`) -- `gen_ai.tool.name` is then
-/// simply absent from the payload rather than carrying an empty
-/// string. [`mcp_governance_event_data`] is a thin wrapper over this
-/// that keeps its own signature, and every one of its existing
-/// callers, completely unchanged.
-#[allow(clippy::too_many_arguments)]
 fn mcp_governance_event_data_for_method(
     method: &str,
     tool_name: Option<&str>,
@@ -8327,8 +8299,8 @@ mod mcp_audit_redaction_tests {
 #[cfg(test)]
 mod mcp_governance_evidence_tests {
     use super::{
-        governance_tool_arguments_field, mcp_governance_event_data, mcp_governance_fail_closed,
-        McpGovernanceVerdict, MCP_AUDIT_FIELD_MAX_BYTES,
+        governance_tool_arguments_field, mcp_governance_event_data_for_method,
+        mcp_governance_fail_closed, McpGovernanceVerdict, MCP_AUDIT_FIELD_MAX_BYTES,
     };
     use sbproxy_config::types::EventsConfig;
     use sbproxy_modules::action::McpAction;
@@ -8390,8 +8362,9 @@ mod mcp_governance_evidence_tests {
     /// old key.
     #[test]
     fn field_names_are_pinned_to_the_semconv_and_sbproxy_schema() {
-        let data = mcp_governance_event_data(
-            "search",
+        let data = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             Some("sess-1"),
@@ -8439,7 +8412,7 @@ mod mcp_governance_evidence_tests {
         );
 
         // WOR-2384 fix round 2: the field-name pins above cover the
-        // `data` payload `mcp_governance_event_data` builds, but that
+        // `data` payload `mcp_governance_event_data_for_method` builds, but that
         // payload is only ever shipped inside a `ProxyEvent` envelope
         // whose own `event_type` field is a *different* piece of
         // serialization, driven by `EventType`'s own `Serialize` impl
@@ -8477,8 +8450,9 @@ mod mcp_governance_evidence_tests {
     /// (below) proving it off by default at the config level.
     #[test]
     fn verbatim_arguments_appear_only_when_the_caller_supplies_them() {
-        let without = mcp_governance_event_data(
-            "search",
+        let without = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8497,8 +8471,9 @@ mod mcp_governance_evidence_tests {
             "the field must be absent (not null) when the caller passes None: {without:?}"
         );
 
-        let with = mcp_governance_event_data(
-            "search",
+        let with = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8623,8 +8598,9 @@ mod mcp_governance_evidence_tests {
     /// `mcp.session.id` when the call carried none.
     #[test]
     fn deny_carries_error_type_and_reason_and_omits_absent_optionals() {
-        let data = mcp_governance_event_data(
-            "search",
+        let data = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8657,8 +8633,9 @@ mod mcp_governance_evidence_tests {
     fn a_planted_secret_in_the_denial_reason_never_survives_into_the_event() {
         let planted =
             "tool output quarantined (dual_llm) near Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc";
-        let data = mcp_governance_event_data(
-            "search",
+        let data = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8695,8 +8672,9 @@ mod mcp_governance_evidence_tests {
     /// values, not the same constant reused for both.
     #[test]
     fn rule_id_appears_only_when_the_caller_supplies_one() {
-        let without = mcp_governance_event_data(
-            "search",
+        let without = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8712,8 +8690,9 @@ mod mcp_governance_evidence_tests {
         );
         assert!(without.get("sbproxy.decision.rule_id").is_none());
 
-        let downgrade = mcp_governance_event_data(
-            "search",
+        let downgrade = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8729,8 +8708,9 @@ mod mcp_governance_evidence_tests {
         );
         assert_eq!(downgrade["sbproxy.decision.rule_id"], "peer_downgrade");
 
-        let pin_mismatch = mcp_governance_event_data(
-            "search",
+        let pin_mismatch = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,
@@ -8759,8 +8739,9 @@ mod mcp_governance_evidence_tests {
     /// `error.type`, since the call was not refused.
     #[test]
     fn warn_verdict_carries_a_reason_but_no_error_type() {
-        let data = mcp_governance_event_data(
-            "search",
+        let data = mcp_governance_event_data_for_method(
+            "tools/call",
+            Some("search"),
             "acme-server",
             "req-123",
             None,

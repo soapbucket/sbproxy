@@ -469,6 +469,18 @@ impl SessionStore {
         }
     }
 
+    /// The entry's current expiry instant, for tests that need to
+    /// prove a code path did or did not renew the TTL without racing
+    /// wall-clock sleeps against the TTL itself.
+    #[cfg(test)]
+    fn expires_at_for_test(&self, id: &str) -> Option<Instant> {
+        let map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(id).map(|entry| entry.expires_at)
+    }
+
     /// End a live session, scoped to the tenant that minted it
     /// (WOR-2384, MCP10). Returns the same three-way
     /// [`SessionValidation`] [`Self::validate`] does: `Valid` when the
@@ -943,21 +955,36 @@ mod tests {
         // attacker keep someone else's session alive by polling it)
         // nor deletes it (which would let an attacker end another
         // tenant's session by guessing its id).
-        let store = SessionStore::new(Duration::from_millis(60));
+        // Deterministic on purpose: an earlier form of this test raced
+        // 50ms of sleeps against a 60ms TTL and went red under parallel
+        // suite load. The renewal claim is proven by reading the
+        // entry's expiry directly instead of sleeping toward it.
+        let store = SessionStore::new(Duration::from_secs(60));
         let id = store
             .create("tenant-a")
             .minted()
             .expect("mint below the cap");
-        std::thread::sleep(Duration::from_millis(30));
+        let minted_expiry = store
+            .expires_at_for_test(&id)
+            .expect("entry exists after mint");
         assert_eq!(
             store.validate(&id, "tenant-b"),
             SessionValidation::TenantMismatch
         );
-        // Still valid for the rightful tenant well past the original
-        // TTL window, because the mismatch attempt above did not renew
-        // it -- but it also must not have evicted the entry outright.
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(store.validate(&id, "tenant-a"), SessionValidation::Valid);
+        assert_eq!(
+            store.expires_at_for_test(&id),
+            Some(minted_expiry),
+            "a wrong-tenant probe must not renew the TTL"
+        );
+        assert_eq!(
+            store.validate(&id, "tenant-a"),
+            SessionValidation::Valid,
+            "and it must not have evicted the entry either"
+        );
+        assert!(
+            store.expires_at_for_test(&id).expect("still tracked") > minted_expiry,
+            "the rightful tenant's touch is what renews"
+        );
     }
 
     #[test]

@@ -725,7 +725,22 @@ scoped to throughout this page -- and counted on
 existing session: one already minted keeps working and renewing its TTL on
 every request exactly as before, and every other tenant's headroom is
 unaffected; only the establishment of a *new* session, for a tenant or a
-registry that is already full, is refused.
+registry that is already full, is refused. The arithmetic is worth
+stating plainly: 4096 global divided by 256 per tenant means sixteen
+tenants can hold full sub-caps at once, so the global cap is a
+deployment-sizing fact, not a per-tenant isolation guarantee.
+
+The peer-profile registry that backs downgrade detection carries the
+same shape of bound, with the same caps (256 pairs per tenant, 4096
+globally), because a tracked profile is likewise memory an unbounded
+peer set could exhaust. A federated call whose `(tenant, peer)` pair
+cannot be tracked gets no downgrade baseline, and a control that cannot
+observe cannot enforce: under `downgrade: block` that call is refused
+fail-closed with rule id `peer_profile_saturated` and a
+`mcp_governance_decision` record; under `warn` (the default) it is
+served, logged once per tenant, and counted on
+`sbproxy_mcp_peer_registry_saturated_total` either way. Pairs already
+tracked keep enforcing normally while the registry is saturated.
 
 And a tool-call *result* can carry another tenant's data through an upstream
 that itself mixes tenants; `content_filters` (see "Credentials reaching a tool

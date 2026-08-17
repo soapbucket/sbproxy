@@ -401,7 +401,10 @@ fn warned_tenants() -> &'static Mutex<HashSet<String>> {
 /// (registry capacity is a fact regardless of `downgrade:` policy, so
 /// the counter reflects every occurrence), and logs a `tracing::warn!`
 /// line the first time this specific tenant hits it (see
-/// [`warned_tenants`]).
+/// [`warned_tenants`]). The latch never re-arms within a process: a
+/// second saturation episode for the same tenant after the first has
+/// cleared is silent in logs and visible only on the counter -- alert
+/// on the metric, not the log line.
 fn report_peer_registry_saturation(tenant_id: &str, cap: usize, scope: &'static str) {
     let mut warned = warned_tenants().lock();
     let already_warned = warned.contains(tenant_id);

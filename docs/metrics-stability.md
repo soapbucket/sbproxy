@@ -232,6 +232,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_mcp_argument_policy_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP argument-policy rule triggers, by tenant, rule name, and verdict. |
 | `sbproxy_mcp_flow_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP session-flow enforcement triggers, by tenant, rule id, and verdict. |
 | `sbproxy_mcp_session_registry_saturated_total` | Counter | `stable` | `beta` | none | MCP session mints refused because the session registry was at capacity, globally or for the caller's tenant. |
+| `sbproxy_mcp_peer_registry_saturated_total` | Counter | `stable` | `beta` | none | MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant. |
 | `sbproxy_mcp_content_filter_total` | Counter | `stable` | `beta` | `tenant`, `category`, `verdict` | MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict. |
 | `sbproxy_mcp_result_policy_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP result-policy rule triggers, by tenant, rule name, and verdict. |
 | `sbproxy_mcp_tool_cost_usd_total` | Counter | `stable` | `beta` | `tool`, `server` | MCP tool-call cost in USD, by tool and owning server. |
