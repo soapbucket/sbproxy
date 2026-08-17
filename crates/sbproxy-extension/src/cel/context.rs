@@ -915,6 +915,13 @@ pub struct McpArgumentPolicyView<'a> {
     /// than reading a default -- which fails this surface closed, per
     /// the module's evaluation-error posture.
     pub arguments: &'a serde_json::Value,
+    /// Parsed `tools/call` result document, for the `result_policies[]`
+    /// surface (WOR-2384, MCP01/MCP10). Bound as `mcp.result`. `None`
+    /// (the value every `argument_policies[]` call site passes, since
+    /// an argument policy runs before dispatch and no result exists
+    /// yet) binds `mcp.result` to CEL `null`, matching `mcp.arguments`'
+    /// own no-value convention.
+    pub result: Option<&'a serde_json::Value>,
     /// Session-flow data-provenance integrity (WOR-2384, MCP06):
     /// `"trusted"` or `"tainted"`. See
     /// [`sbproxy_extension::mcp::sessions::SessionIntegrity::as_str`].
@@ -952,6 +959,10 @@ pub struct McpArgumentPolicyView<'a> {
 ///   sensitive data, then sticky `true`
 /// - `mcp.arguments` - the parsed call arguments (map, or `null`/scalar
 ///   if the caller supplied something other than an object)
+/// - `mcp.result` - the parsed `tools/call` result document
+///   (WOR-2384, MCP01/MCP10's `result_policies[]` surface); `null`
+///   when the caller has no result to bind (every `argument_policies[]`
+///   evaluation, which runs before dispatch)
 /// - `mcp.tenant` - host-derived tenant id
 /// - `mcp.principal.sub` / `.team` / `.project` / `.user` - caller
 ///   identity; unset attributes render as `""`
@@ -1008,6 +1019,10 @@ pub fn build_mcp_argument_policy_context(view: &McpArgumentPolicyView<'_>) -> Ce
     );
     mcp.insert("session".to_string(), CelValue::Map(session));
     mcp.insert("arguments".to_string(), json_to_cel(view.arguments));
+    mcp.insert(
+        "result".to_string(),
+        view.result.map(json_to_cel).unwrap_or(CelValue::Null),
+    );
     mcp.insert(
         "tenant".to_string(),
         CelValue::String(view.tenant.to_string()),
@@ -2235,6 +2250,7 @@ mod mcp_argument_policy_context_tests {
             principal_project: Some("proj-x"),
             principal_user: Some("alice@acme.com"),
             arguments: &arguments,
+            result: None,
             session_integrity: "tainted",
             session_sensitive_touched: true,
         };
@@ -2280,6 +2296,7 @@ mod mcp_argument_policy_context_tests {
             principal_project: None,
             principal_user: None,
             arguments: &arguments,
+            result: None,
             session_integrity: "trusted",
             session_sensitive_touched: false,
         };
@@ -2314,10 +2331,67 @@ mod mcp_argument_policy_context_tests {
             principal_project: None,
             principal_user: None,
             arguments: &arguments,
+            result: None,
             session_integrity: "trusted",
             session_sensitive_touched: false,
         };
         let ctx = build_mcp_argument_policy_context(&view);
         assert!(!ctx.variables.contains_key("request"));
+    }
+
+    #[test]
+    fn a_missing_result_binds_as_null() {
+        // Every `argument_policies[]` evaluation passes `result: None`
+        // (WOR-2384, MCP01/MCP10): an argument policy runs before
+        // dispatch, so no result exists yet.
+        let arguments = serde_json::json!({});
+        let view = McpArgumentPolicyView {
+            tool_name: "search",
+            server: "gh",
+            session_id: None,
+            tenant: "acme",
+            principal_sub: "anon",
+            principal_team: None,
+            principal_project: None,
+            principal_user: None,
+            arguments: &arguments,
+            result: None,
+            session_integrity: "trusted",
+            session_sensitive_touched: false,
+        };
+        let ctx = build_mcp_argument_policy_context(&view);
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source("mcp.result == null", &ctx)
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn a_supplied_result_reads_back_for_the_result_policies_surface() {
+        // WOR-2384, MCP01/MCP10: the binding `result_policies[]` exists
+        // to inspect.
+        let arguments = serde_json::json!({});
+        let result = serde_json::json!({
+            "content": [{"type": "text", "text": "the secret is sk-live-abc"}]
+        });
+        let view = McpArgumentPolicyView {
+            tool_name: "fetch_doc",
+            server: "gh",
+            session_id: None,
+            tenant: "acme",
+            principal_sub: "anon",
+            principal_team: None,
+            principal_project: None,
+            principal_user: None,
+            arguments: &arguments,
+            result: Some(&result),
+            session_integrity: "trusted",
+            session_sensitive_touched: false,
+        };
+        let ctx = build_mcp_argument_policy_context(&view);
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"mcp.result.content[0].text.contains("secret")"#, &ctx)
+            .unwrap_or(false));
     }
 }

@@ -4357,6 +4357,62 @@ pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static st
         .inc();
 }
 
+/// Record one `content_filters` category outcome that was not a plain
+/// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
+/// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or
+/// `"pii"`; `verdict` is `"warn"`, `"redact"`, or `"deny"`. A category
+/// that matched nothing (or is `off`) is not recorded here, matching
+/// the sibling `mcp_argument_policy` / `mcp_flow` triggers, which also
+/// only ever record a triggered outcome.
+///
+/// `category` is a fixed, closed-vocabulary string (not operator-
+/// supplied), so cardinality here is bounded by this crate rather than
+/// by config.
+pub fn record_mcp_content_filter(tenant: &str, category: &'static str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_content_filter_total",
+            "MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict",
+            &["tenant", "category", "verdict"],
+        )
+        .expect("mcp content filter counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[tenant.as_str(), category, verdict])
+        .inc();
+}
+
+/// Record one `result_policies[]` rule outcome that was not a plain
+/// allow, on `sbproxy_mcp_result_policy_total{tenant, rule, verdict}`
+/// (WOR-2384, MCP01/MCP10). `verdict` is `"warn"` or `"deny"`. Mirrors
+/// [`record_mcp_argument_policy`] exactly, for the result-side surface.
+///
+/// `rule` is the operator-configured rule name, so cardinality here is
+/// bounded by config, the same reasoning `record_mcp_argument_policy`
+/// documents.
+pub fn record_mcp_result_policy(tenant: &str, rule: &str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_result_policy_total",
+            "MCP result-policy rule triggers, by tenant, rule name, and verdict",
+            &["tenant", "rule", "verdict"],
+        )
+        .expect("mcp result policy counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    let rule = sanitize_label("rule", rule);
+    counter
+        .with_label_values(&[tenant.as_str(), rule.as_str(), verdict])
+        .inc();
+}
+
 /// Record one session-flow enforcement outcome that was not a plain
 /// allow, on `sbproxy_mcp_flow_total{tenant, rule, verdict}` (WOR-2384,
 /// MCP06; fix round 1 added the confidentiality-axis and pair-rule

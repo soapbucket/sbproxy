@@ -122,6 +122,19 @@ pub enum CelSurface {
     /// argument policy runs at the MCP dispatch seam, not the HTTP
     /// request phase, so `request.*` here is a typo to refuse at load.
     McpArgumentPolicy,
+    /// An `mcp` action's `result_policies[]` entry (WOR-2384,
+    /// MCP01/MCP10).
+    ///
+    /// Shares [`Self::McpArgumentPolicy`]'s single-namespace shape and
+    /// every one of its bindings (tool name, server, session, tenant,
+    /// principal, the parsed call arguments), plus one more:
+    /// `mcp.result`, the tool-call result document a result policy
+    /// exists to inspect. A distinct variant rather than reusing
+    /// `McpArgumentPolicy` outright so a diagnostic names the surface
+    /// an operator actually configured (`result_policies[]`, not
+    /// `argument_policies[]`) and so `mcp.result` cannot leak into an
+    /// argument policy, which runs before any result exists to bind.
+    McpResultPolicy,
 }
 
 /// Bindings shared by every site that starts from `build_request_context`.
@@ -151,6 +164,7 @@ impl CelSurface {
             Self::AiPolicy => "ai_policy `expression`",
             Self::AiRouting => "ai_routing_policy `expression`",
             Self::McpArgumentPolicy => "mcp `argument_policies`",
+            Self::McpResultPolicy => "mcp `result_policies`",
         }
     }
 
@@ -233,6 +247,21 @@ impl CelSurface {
                 "mcp.tenant",
                 "mcp.tool",
             ],
+            // Same bindings as `McpArgumentPolicy`, plus `mcp.result`:
+            // the parsed `tools/call` result document a result policy
+            // exists to inspect. Both surfaces are built by
+            // `context::build_mcp_argument_policy_context`, which
+            // binds `mcp.result` to CEL `null` when the caller (an
+            // argument policy) has no result yet.
+            Self::McpResultPolicy => vec![
+                "mcp.arguments",
+                "mcp.principal",
+                "mcp.result",
+                "mcp.server",
+                "mcp.session",
+                "mcp.tenant",
+                "mcp.tool",
+            ],
             // custom_log builds its own JSON context rather than using
             // the shared builders, which is why its shape is unlike the
             // rest. It is the only site with `attribution` and the only
@@ -276,6 +305,7 @@ impl CelSurface {
                 | Self::AiPolicy
                 | Self::AiRouting
                 | Self::McpArgumentPolicy
+                | Self::McpResultPolicy
         )
     }
 
@@ -885,6 +915,54 @@ mod tests {
             .validate("mcp `argument_policies`", source, &program)
             .expect_err("mcp argument policies do not populate request.*");
         assert!(error.contains("mcp `argument_policies`"), "{error}");
+        assert!(error.contains("mcp.tool"), "{error}");
+    }
+
+    #[test]
+    fn mcp_result_policy_accepts_the_result_binding_the_argument_surface_refuses() {
+        // WOR-2384 (MCP01/MCP10): `mcp.result` is the one binding that
+        // distinguishes `result_policies[]` from `argument_policies[]`;
+        // everything else in the tool-call vocabulary is shared.
+        let source = r#"mcp.result.content[0].text.contains("secret")"#;
+        let program = cel::Program::compile(source).expect("compiles");
+        CelSurface::McpResultPolicy
+            .validate("mcp `result_policies`", source, &program)
+            .expect("mcp.result must be available to a result policy");
+
+        let error = CelSurface::McpArgumentPolicy
+            .validate("mcp `argument_policies`", source, &program)
+            .expect_err("an argument policy runs before any result exists");
+        assert!(error.contains("mcp `argument_policies`"), "{error}");
+        assert!(error.contains("mcp.result"), "{error}");
+    }
+
+    #[test]
+    fn mcp_result_policy_shares_the_argument_policy_tool_call_bindings() {
+        for source in [
+            r#"mcp.tool.name == "send_email""#,
+            r#"mcp.arguments.to.endsWith("@company.com")"#,
+            r#"mcp.principal.team == "platform""#,
+            r#"mcp.server == "gh""#,
+            r#"mcp.session.id != """#,
+            r#"mcp.tenant == "acme""#,
+        ] {
+            let program = cel::Program::compile(source).expect("compiles");
+            CelSurface::McpResultPolicy
+                .validate("mcp `result_policies`", source, &program)
+                .unwrap_or_else(|e| {
+                    panic!("{source} must be a valid mcp result-policy binding: {e}")
+                });
+        }
+    }
+
+    #[test]
+    fn mcp_result_policy_refuses_a_request_shaped_binding() {
+        let source = r#"request.method == "POST""#;
+        let program = cel::Program::compile(source).expect("compiles");
+        let error = CelSurface::McpResultPolicy
+            .validate("mcp `result_policies`", source, &program)
+            .expect_err("mcp result policies do not populate request.*");
+        assert!(error.contains("mcp `result_policies`"), "{error}");
         assert!(error.contains("mcp.tool"), "{error}");
     }
 }

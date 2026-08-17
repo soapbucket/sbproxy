@@ -2664,16 +2664,30 @@ pub(super) async fn handle_mcp_action(
                         .await?;
                         return Ok(());
                     }
-                    Some(id) if !store.validate(id) => {
-                        send_error(
-                            session,
-                            404,
-                            "unknown or expired MCP session; re-initialize",
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    Some(id) => mcp_session_id = Some(id.to_string()),
+                    Some(id) => match store.validate(id, ctx.tenant_id.as_str()) {
+                        sbproxy_extension::mcp::sessions::SessionValidation::Valid => {
+                            mcp_session_id = Some(id.to_string());
+                        }
+                        sbproxy_extension::mcp::sessions::SessionValidation::TenantMismatch => {
+                            emit_mcp_session_tenant_mismatch(ctx, session, &mcp.server_name);
+                            send_error(
+                                session,
+                                404,
+                                "unknown or expired MCP session; re-initialize",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        sbproxy_extension::mcp::sessions::SessionValidation::Unknown => {
+                            send_error(
+                                session,
+                                404,
+                                "unknown or expired MCP session; re-initialize",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    },
                 }
             }
         }
@@ -2778,7 +2792,7 @@ pub(super) async fn handle_mcp_action(
             // enabled. The id rides back on the Mcp-Session-Id
             // response header, per the streamable HTTP transport.
             if let Some(store) = mcp.sessions.as_deref() {
-                issued_session = Some(store.create());
+                issued_session = Some(store.create(ctx.tenant_id.as_str()));
                 // Rollout plane, session rung: requirements declared
                 // once at initialize apply to every later request on
                 // this session.
@@ -4305,6 +4319,134 @@ pub(super) async fn handle_mcp_action(
                                     }
                                 }
 
+                                // WOR-2384 (MCP01/MCP10): `content_filters`
+                                // over the outbound tool-call arguments --
+                                // the last pre-dispatch gate, after every
+                                // other check above (RBAC, argument
+                                // policies, quota, deprecated-server,
+                                // peer-downgrade, session flow) has already
+                                // allowed the call. Structural monotonicity
+                                // continues: this can only narrow that
+                                // allow, never widen it. A `redact` hit
+                                // mutates `arguments` in place, so the
+                                // (possibly redacted) document is what
+                                // actually reaches the upstream tool --
+                                // this closes half of MCP01's gap (secret
+                                // exposure via tool arguments on the way
+                                // out), the result-side half is closed
+                                // below, after dispatch.
+                                match mcp.apply_content_filters(&mut arguments) {
+                                    sbproxy_modules::action::mcp::McpContentFilterVerdict::Clean => {}
+                                    sbproxy_modules::action::mcp::McpContentFilterVerdict::Applied(hits) => {
+                                        for hit in &hits {
+                                            let verdict_label: &'static str = match hit.mode {
+                                                sbproxy_modules::action::mcp::McpFilterModeConfig::Redact => "redact",
+                                                _ => "warn",
+                                            };
+                                            let rule_id = format!(
+                                                "{}:{}:{}",
+                                                hit.category,
+                                                verdict_label,
+                                                hit.detectors.join(","),
+                                            );
+                                            tracing::warn!(
+                                                target: "sbproxy::mcp::content_filter",
+                                                tool = %name,
+                                                server = %governed_server,
+                                                tenant = %ctx.tenant_id,
+                                                category = hit.category,
+                                                mode = verdict_label,
+                                                "MCP tools/call argument content filter matched",
+                                            );
+                                            sbproxy_observe::metrics::record_mcp_content_filter(
+                                                ctx.tenant_id.as_str(),
+                                                hit.category,
+                                                verdict_label,
+                                            );
+                                            if emit_mcp_governance_evidence(
+                                                ctx,
+                                                &name,
+                                                governed_server,
+                                                mcp_session_id.as_deref(),
+                                                is_modern,
+                                                None,
+                                                McpGovernanceVerdict::Warn(
+                                                    sbproxy_modules::action::mcp::MCP_CONTENT_FILTER_REASON,
+                                                ),
+                                                Some(rule_id.as_str()),
+                                                governance_tool_arguments.as_deref(),
+                                            ) {
+                                                let response = mcp_evidence_unavailable_response(
+                                                    request.id.clone(),
+                                                );
+                                                return write_mcp_application_response(
+                                                    session,
+                                                    &response,
+                                                    &request_id,
+                                                    &rpc_method,
+                                                    modern_server.as_ref(),
+                                                    None,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                    sbproxy_modules::action::mcp::McpContentFilterVerdict::Denied {
+                                        category,
+                                        detectors,
+                                    } => {
+                                        tracing::warn!(
+                                            target: "sbproxy::mcp::content_filter",
+                                            tool = %name,
+                                            server = %governed_server,
+                                            tenant = %ctx.tenant_id,
+                                            category,
+                                            detectors = %detectors.join(","),
+                                            "MCP tools/call arguments denied by content filter",
+                                        );
+                                        sbproxy_observe::metrics::record_mcp_content_filter(
+                                            ctx.tenant_id.as_str(),
+                                            category,
+                                            "deny",
+                                        );
+                                        let rule_id =
+                                            format!("{category}:block:{}", detectors.join(","));
+                                        let response = if emit_mcp_governance_evidence(
+                                            ctx,
+                                            &name,
+                                            governed_server,
+                                            mcp_session_id.as_deref(),
+                                            is_modern,
+                                            None,
+                                            McpGovernanceVerdict::Deny(
+                                                sbproxy_modules::action::mcp::MCP_CONTENT_FILTER_REASON,
+                                            ),
+                                            Some(rule_id.as_str()),
+                                            governance_tool_arguments.as_deref(),
+                                        ) {
+                                            mcp_evidence_unavailable_response(request.id.clone())
+                                        } else {
+                                            JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                INVALID_PARAMS,
+                                                &format!(
+                                                    "tool '{}' arguments denied by content filter ({category})",
+                                                    name,
+                                                ),
+                                            )
+                                        };
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
                                 // Per-server timeout. The
                                 // dispatcher inside `call_tool` shares one
                                 // reqwest::Client across upstreams; the
@@ -4390,6 +4532,16 @@ pub(super) async fn handle_mcp_action(
                                     delegation: None,
                                 };
                                 let mut upstream_headers: Vec<(String, String)> = Vec::new();
+                                // WOR-2384 (MCP01/MCP10): `result_policies[]`
+                                // (evaluated after dispatch, once a result
+                                // exists) binds this call's own arguments as
+                                // `mcp.arguments` alongside `mcp.result`, so
+                                // a rule can correlate what was requested
+                                // with what came back. `outbound_arguments`
+                                // below moves `arguments`, so capture a
+                                // clone here first.
+                                let result_policy_arguments = arguments.clone();
+
                                 let outbound_arguments = if run_as_user {
                                     let Some(auth_cfg) = federated
                                         .as_ref()
@@ -4892,7 +5044,262 @@ pub(super) async fn handle_mcp_action(
                                     )
                                 } else {
                                     match outcome {
-                                        Ok(value) => {
+                                        Ok(mut value) => {
+                                            // WOR-2384 (MCP01/MCP10): the
+                                            // result-side half of the two
+                                            // content gates that close
+                                            // MCP01/MCP10's structural hole
+                                            // (a tool RESULT flowing back to
+                                            // the caller previously bypassed
+                                            // every generic response-
+                                            // filtering mechanism entirely --
+                                            // `write_mcp_wire_response` never
+                                            // reaches Pingora's
+                                            // `response_filter` phase).
+                                            // `content_filters` runs first,
+                                            // and before compaction below:
+                                            // compaction can truncate a
+                                            // matched span, which would
+                                            // otherwise let a secret evade
+                                            // the detector by being cut off
+                                            // mid-string. A `redact` hit
+                                            // mutates `value` in place; a
+                                            // `block` hit refuses the whole
+                                            // result before it ever enters
+                                            // the session/context.
+                                            let content_filter_deny = match mcp
+                                                .apply_content_filters(&mut value)
+                                            {
+                                                sbproxy_modules::action::mcp::McpContentFilterVerdict::Clean => None,
+                                                sbproxy_modules::action::mcp::McpContentFilterVerdict::Applied(hits) => {
+                                                    for hit in &hits {
+                                                        let verdict_label: &'static str = match hit.mode {
+                                                            sbproxy_modules::action::mcp::McpFilterModeConfig::Redact => "redact",
+                                                            _ => "warn",
+                                                        };
+                                                        let rule_id = format!(
+                                                            "{}:{}:{}",
+                                                            hit.category,
+                                                            verdict_label,
+                                                            hit.detectors.join(","),
+                                                        );
+                                                        tracing::warn!(
+                                                            target: "sbproxy::mcp::content_filter",
+                                                            tool = %name,
+                                                            server = %governed_server,
+                                                            tenant = %ctx.tenant_id,
+                                                            category = hit.category,
+                                                            mode = verdict_label,
+                                                            "MCP tools/call result content filter matched",
+                                                        );
+                                                        sbproxy_observe::metrics::record_mcp_content_filter(
+                                                            ctx.tenant_id.as_str(),
+                                                            hit.category,
+                                                            verdict_label,
+                                                        );
+                                                        if emit_mcp_governance_evidence(
+                                                            ctx,
+                                                            &name,
+                                                            governed_server,
+                                                            mcp_session_id.as_deref(),
+                                                            is_modern,
+                                                            tool_arguments_hash.as_deref(),
+                                                            McpGovernanceVerdict::Warn(
+                                                                sbproxy_modules::action::mcp::MCP_CONTENT_FILTER_REASON,
+                                                            ),
+                                                            Some(rule_id.as_str()),
+                                                            None,
+                                                        ) {
+                                                            return write_mcp_application_response(
+                                                                session,
+                                                                &mcp_evidence_unavailable_response(request.id.clone()),
+                                                                &request_id,
+                                                                &rpc_method,
+                                                                modern_server.as_ref(),
+                                                                None,
+                                                            )
+                                                            .await;
+                                                        }
+                                                    }
+                                                    None
+                                                }
+                                                sbproxy_modules::action::mcp::McpContentFilterVerdict::Denied {
+                                                    category,
+                                                    detectors,
+                                                } => {
+                                                    tracing::warn!(
+                                                        target: "sbproxy::mcp::content_filter",
+                                                        tool = %name,
+                                                        server = %governed_server,
+                                                        tenant = %ctx.tenant_id,
+                                                        category,
+                                                        detectors = %detectors.join(","),
+                                                        "MCP tools/call result denied by content filter",
+                                                    );
+                                                    sbproxy_observe::metrics::record_mcp_content_filter(
+                                                        ctx.tenant_id.as_str(),
+                                                        category,
+                                                        "deny",
+                                                    );
+                                                    let rule_id = format!(
+                                                        "{category}:block:{}",
+                                                        detectors.join(","),
+                                                    );
+                                                    Some(if emit_mcp_governance_evidence(
+                                                        ctx,
+                                                        &name,
+                                                        governed_server,
+                                                        mcp_session_id.as_deref(),
+                                                        is_modern,
+                                                        tool_arguments_hash.as_deref(),
+                                                        McpGovernanceVerdict::Deny(
+                                                            sbproxy_modules::action::mcp::MCP_CONTENT_FILTER_REASON,
+                                                        ),
+                                                        Some(rule_id.as_str()),
+                                                        None,
+                                                    ) {
+                                                        mcp_evidence_unavailable_response(request.id.clone())
+                                                    } else {
+                                                        JsonRpcResponse::error(
+                                                            request.id.clone(),
+                                                            INTERNAL_ERROR,
+                                                            &format!(
+                                                                "tool result denied by content filter ({category})"
+                                                            ),
+                                                        )
+                                                    })
+                                                }
+                                            };
+                                            if let Some(response) = content_filter_deny {
+                                                return write_mcp_application_response(
+                                                    session,
+                                                    &response,
+                                                    &request_id,
+                                                    &rpc_method,
+                                                    modern_server.as_ref(),
+                                                    None,
+                                                )
+                                                .await;
+                                            }
+
+                                            // WOR-2384 (MCP01/MCP10):
+                                            // `result_policies[]`, evaluated
+                                            // on the (possibly content-
+                                            // filtered) result document,
+                                            // after content filters and
+                                            // before the result is compacted
+                                            // or served. Same structural
+                                            // monotonicity as every other
+                                            // pre/post-dispatch gate in this
+                                            // function: this can only narrow
+                                            // what has already been allowed,
+                                            // never widen it -- a
+                                            // `result_policies[]` rule cannot
+                                            // un-deny a content-filter block
+                                            // above, and both run before the
+                                            // result ever reaches the
+                                            // session/context or the caller.
+                                            let result_policy_response = match mcp
+                                                .evaluate_result_policies(
+                                                    &ctx.principal,
+                                                    &name,
+                                                    governed_server,
+                                                    ctx.tenant_id.as_str(),
+                                                    mcp_session_id.as_deref(),
+                                                    &result_policy_arguments,
+                                                    &value,
+                                                ) {
+                                                sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Allow => None,
+                                                sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Warn { rule_name } => {
+                                                    tracing::warn!(
+                                                        target: "sbproxy::mcp::result_policy",
+                                                        tool = %name,
+                                                        server = %governed_server,
+                                                        tenant = %ctx.tenant_id,
+                                                        rule = %rule_name,
+                                                        "MCP tools/call result policy observed a violation (warn mode: allowed)",
+                                                    );
+                                                    sbproxy_observe::metrics::record_mcp_result_policy(
+                                                        ctx.tenant_id.as_str(),
+                                                        &rule_name,
+                                                        "warn",
+                                                    );
+                                                    if emit_mcp_governance_evidence(
+                                                        ctx,
+                                                        &name,
+                                                        governed_server,
+                                                        mcp_session_id.as_deref(),
+                                                        is_modern,
+                                                        tool_arguments_hash.as_deref(),
+                                                        McpGovernanceVerdict::Warn(
+                                                            sbproxy_modules::action::mcp::MCP_RESULT_POLICY_REASON,
+                                                        ),
+                                                        Some(rule_name.as_str()),
+                                                        None,
+                                                    ) {
+                                                        Some(mcp_evidence_unavailable_response(request.id.clone()))
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                                sbproxy_modules::action::mcp::McpArgumentPolicyVerdict::Deny { rule_name, panicked } => {
+                                                    tracing::warn!(
+                                                        target: "sbproxy::mcp::result_policy",
+                                                        tool = %name,
+                                                        server = %governed_server,
+                                                        tenant = %ctx.tenant_id,
+                                                        rule = %rule_name,
+                                                        panicked = %panicked,
+                                                        "MCP tools/call result denied by result policy",
+                                                    );
+                                                    sbproxy_observe::metrics::record_mcp_result_policy(
+                                                        ctx.tenant_id.as_str(),
+                                                        &rule_name,
+                                                        "deny",
+                                                    );
+                                                    if panicked {
+                                                        sbproxy_observe::metrics::record_policy_panic(
+                                                            "mcp_result_policy",
+                                                        );
+                                                    }
+                                                    Some(if emit_mcp_governance_evidence(
+                                                        ctx,
+                                                        &name,
+                                                        governed_server,
+                                                        mcp_session_id.as_deref(),
+                                                        is_modern,
+                                                        tool_arguments_hash.as_deref(),
+                                                        McpGovernanceVerdict::Deny(
+                                                            sbproxy_modules::action::mcp::MCP_RESULT_POLICY_REASON,
+                                                        ),
+                                                        Some(rule_name.as_str()),
+                                                        None,
+                                                    ) {
+                                                        mcp_evidence_unavailable_response(request.id.clone())
+                                                    } else {
+                                                        JsonRpcResponse::error(
+                                                            request.id.clone(),
+                                                            INVALID_PARAMS,
+                                                            &format!(
+                                                                "tool '{}' result is denied by result policy '{}'",
+                                                                name, rule_name,
+                                                            ),
+                                                        )
+                                                    })
+                                                }
+                                            };
+                                            if let Some(response) = result_policy_response {
+                                                return write_mcp_application_response(
+                                                    session,
+                                                    &response,
+                                                    &request_id,
+                                                    &rpc_method,
+                                                    modern_server.as_ref(),
+                                                    None,
+                                                )
+                                                .await;
+                                            }
+
                                             sbproxy_observe::metrics::record_policy(
                                                 ctx.hostname.as_str(),
                                                 "mcp_rbac",
@@ -6416,6 +6823,40 @@ pub(super) fn record_mcp_modern_refusal(
     status
 }
 
+/// WOR-2384 (MCP10): audit a session id presented by a tenant other
+/// than the one it was minted for.
+///
+/// Distinct from an ordinary unknown/expired session, which gets no
+/// audit line at all -- that is routine client behavior, reconnecting
+/// after a restart or an idle timeout. A tenant mismatch is a signal
+/// worth its own audited event: either a caller is guessing or
+/// replaying session ids, or something upstream is misrouting a
+/// session across a tenant boundary. The wire response stays the
+/// generic 404 `SessionStore::validate` already produced for either
+/// case (unknown or mismatched) -- this only adds an audit trail
+/// behind that response, never a different one on it.
+fn emit_mcp_session_tenant_mismatch(ctx: &RequestContext, session: &Session, server_name: &str) {
+    let origin_label = ctx.hostname.to_string();
+    sbproxy_observe::metrics::record_policy(&origin_label, "mcp_session_tenant", "deny");
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "mcp_session_tenant_mismatch",
+        "mcp session id presented by a tenant other than the one it was minted for",
+        404,
+        Some(origin_label),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(session.req_header().method.as_str().to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .emit();
+    tracing::warn!(
+        target: "sbproxy::mcp::session",
+        mcp_server = %server_name,
+        tenant = %ctx.tenant_id,
+        "MCP session id presented by a tenant other than the one it was minted for"
+    );
+}
+
 /// Closed reason label for a modern transport-trust refusal, so a SIEM rule
 /// can route on the failure mode rather than parse a sentence.
 pub(super) fn mcp_modern_rejection_reason(
@@ -6926,16 +7367,28 @@ async fn handle_mcp_server_stream(
                 .await?;
                 return Ok(());
             }
-            Some(id) if !store.validate(id) => {
-                send_error(
-                    session,
-                    404,
-                    "unknown or expired MCP session; re-initialize",
-                )
-                .await?;
-                return Ok(());
-            }
-            Some(_) => {}
+            Some(id) => match store.validate(id, ctx.tenant_id.as_str()) {
+                sbproxy_extension::mcp::sessions::SessionValidation::Valid => {}
+                sbproxy_extension::mcp::sessions::SessionValidation::TenantMismatch => {
+                    emit_mcp_session_tenant_mismatch(ctx, session, &mcp.server_name);
+                    send_error(
+                        session,
+                        404,
+                        "unknown or expired MCP session; re-initialize",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                sbproxy_extension::mcp::sessions::SessionValidation::Unknown => {
+                    send_error(
+                        session,
+                        404,
+                        "unknown or expired MCP session; re-initialize",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
         }
     }
 

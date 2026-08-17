@@ -62,10 +62,31 @@ origins:
 `default_allow: false` is the setting that matters. A caller matching no rule is
 refused, so adding a tool upstream does not silently widen access.
 
-**Still yours.** The gateway cannot see a credential the agent already holds and
-chooses to type into a tool argument. If your agent has a long-lived secret in
-its context, no proxy can unsee that. Scope credentials down and keep them out
-of the model's reach in the first place.
+An MCP origin's responses are written directly, outside the generic HTTP
+`response_filter` phase the `pii:`/`dlp:` policy blocks are wired to, so those
+controls never see a tool-call argument or result on their own. `content_filters`
+closes that seam for MCP specifically, reusing the same detector catalogue:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      content_filters:
+        secrets: redact
+        pii: warn
+```
+
+`secrets` matches API-key and token shapes (`openai_key`, `anthropic_key`,
+`aws_access`, `github_token`, `slack_token`); `pii` matches personal-data shapes
+(`email`, `us_ssn`, `credit_card`, `phone_us`, `ipv4`, `iban`). Both run against
+tool-call arguments on the way out and tool-call results on the way back, before
+either reaches the upstream server or the caller. `redact` replaces a match with
+the same `[REDACTED:<NAME>]` marker `pii:` uses and emits a governance event;
+`block` refuses the call or the result outright. Both default to `off`.
+
+**Still yours.** A regex catalogue matches known shapes, not every secret
+format an upstream could mint, and it cannot see a credential the agent already
+holds and chooses to type into a tool argument as ordinary-looking text. If your
+agent has a long-lived secret in its context, no proxy can unsee that. Scope
+credentials down and keep them out of the model's reach in the first place.
 
 ## Access widening quietly over time
 
@@ -152,6 +173,25 @@ tenant, team, or project.
 Rego you give it against `mcp.tool.name`, `mcp.server`, `mcp.session.id`,
 `mcp.arguments`, `mcp.tenant`, and `mcp.principal.{sub,team,project,user}`; it
 has no opinion about which arguments matter for your tools.
+
+`result_policies[]` is the same mechanism pointed the other direction: a rule
+evaluated against the tool-call *result*, after dispatch and after
+`content_filters`, before the result enters the session or reaches the caller.
+The vocabulary is identical plus one binding, `mcp.result`, so a rule can
+correlate what was asked for with what came back:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      result_policies:
+        - name: no-internal-hostnames-in-result
+          engine: cel
+          source: '!mcp.result.content[0].text.contains("internal.corp")'
+          mode: block
+```
+
+Same polarity, same `mode: warn`/`block` split, same fail-closed posture on an
+expression that cannot be evaluated, same monotonic ordering: a result policy
+can only narrow what `content_filters` already allowed through, never widen it.
 
 ## A tool definition changing after you approved it
 
@@ -570,21 +610,42 @@ traverses it.
 
 ## Context crossing a boundary it should not
 
-**What goes wrong.** One tenant's catalog, tools, or context reaches another
-tenant's agent.
+**What goes wrong.** One tenant's catalog, tools, session state, or result
+content reaches another tenant's agent.
 
 **What the gateway does.** MCP catalogs are tenant-scoped. A key policy naming
 an MCP gateway resolves only within the request route's tenant, so a reference
 that crosses a tenant boundary resolves to nothing rather than to someone else's
 catalog. Two tenants may run gateways with the same `server_info.name` without
-seeing each other's tools.
+seeing each other's tools. A cross-tenant reference is no longer only quiet in
+the logs either: it emits a `mcp_inject_source_denied` audit event (readable
+through `GET /api/audit/events` or the `security_audit` tracing target) alongside
+the existing `warn!` line, so a misconfigured or probed reference is
+SIEM-visible rather than something you have to know to grep for.
 
-**Worth checking on an existing config.** This scoping is newer than the
-feature. A reference that crosses tenants now yields a successful request with
-an empty tool array, which is quiet. Give the MCP origin the same `tenant_id` as
-the `ai_proxy` origin whose keys name it, and grep for
-`inject_mcp references an unknown MCP gateway` to find one. Details in
-[key-management.md](key-management.md).
+`sessions.enabled` state is bound to the tenant that minted it: a session id is
+stamped with its tenant at `initialize` and every later request presenting it
+is checked against that tenant, not just against existence and expiry. A
+session id guessed or replayed by a different tenant is refused (the same
+generic "unknown or expired" response a stranger gets, so the refusal itself
+does not confirm the id belongs to someone) and audited as
+`mcp_session_tenant_mismatch`. This was already an isolation invariant in
+practice -- session ids were opaque per-deployment UUIDs before -- so turning
+it on cannot change behavior for an existing legitimate config.
+
+And a tool-call *result* can carry another tenant's data through an upstream
+that itself mixes tenants; `content_filters` (see "Credentials reaching a tool
+that should not see them" above) and `result_policies[]` (see "A permitted tool
+called with an argument that should not be") both run against the result
+document specifically, so a shape a detector recognizes, or a rule an operator
+writes against `mcp.result`, is caught before that document ever enters the
+session or reaches the caller.
+
+**Still yours.** `content_filters` is shape-based and `result_policies[]` is
+whatever an operator writes; neither one understands your data model well
+enough to know, unprompted, that a given field is another tenant's. Give the
+MCP origin the same `tenant_id` as the `ai_proxy` origin whose keys name it if
+cross-tenant injection was never the intent.
 
 ## Where to go next
 

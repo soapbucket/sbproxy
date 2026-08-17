@@ -145,6 +145,45 @@ struct SessionEntry {
     /// `_meta.tool_requirements` (the rollout plane's session rung).
     /// `Arc` so reads hand back a cheap clone under the lock.
     tool_requirements: Option<std::sync::Arc<HashMap<String, String>>>,
+    /// The tenant a session was minted for (WOR-2384, MCP10). Stamped
+    /// once at [`SessionStore::create`] and never mutated; checked by
+    /// [`SessionStore::validate`] so a session id guessed or replayed
+    /// by a different tenant is invalid, not merely undocumented.
+    tenant_id: String,
+}
+
+/// Outcome of [`SessionStore::validate`] (WOR-2384, MCP10).
+///
+/// A three-way result rather than a plain bool so the caller can tell
+/// "no such session" apart from "this session exists, but not for the
+/// tenant that presented it" -- the latter is a security-relevant
+/// event worth its own audit line, even though both cases return the
+/// same generic 404 to the wire (a validating server must not reveal
+/// that a differently-owned session id happens to exist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionValidation {
+    /// The id names a live session minted for the presenting tenant.
+    /// The sliding TTL was renewed.
+    Valid,
+    /// The id names no live session (never minted, ended, or expired).
+    /// Indistinguishable on the wire from [`Self::TenantMismatch`] by
+    /// design.
+    Unknown,
+    /// The id names a live session, but it was minted for a different
+    /// tenant than the one presenting it now. The TTL is *not*
+    /// renewed and the entry is *not* removed -- the session stays
+    /// live for its rightful tenant.
+    TenantMismatch,
+}
+
+impl SessionValidation {
+    /// True only for [`Self::Valid`]. Convenience for call sites that
+    /// only need the old bool shape (e.g. deciding whether to accept
+    /// the id for the rest of the request) without caring which
+    /// refusal reason applied.
+    pub fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
 }
 
 /// In-memory session table with a sliding idle TTL.
@@ -162,10 +201,16 @@ impl SessionStore {
         }
     }
 
-    /// Create a new session and return its id (UUID v4, which
-    /// satisfies the spec's visible-ASCII requirement and is not
-    /// guessable).
-    pub fn create(&self) -> String {
+    /// Create a new session bound to `tenant_id` and return its id
+    /// (UUID v4, which satisfies the spec's visible-ASCII requirement
+    /// and is not guessable).
+    ///
+    /// WOR-2384 (MCP10): `tenant_id` is stamped once at mint time and
+    /// checked by every later [`Self::validate`] call for this id. It
+    /// must come from the request's route-derived tenant, the same
+    /// source every other per-tenant gate in this codebase uses, never
+    /// from a caller-mutable header or body field.
+    pub fn create(&self, tenant_id: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut map = match self.inner.lock() {
             Ok(g) => g,
@@ -179,6 +224,7 @@ impl SessionStore {
                 risk: SessionRisk::default(),
                 flow: FlowLabels::default(),
                 tool_requirements: None,
+                tenant_id: tenant_id.to_string(),
             },
         );
         id
@@ -227,23 +273,36 @@ impl SessionStore {
         }
     }
 
-    /// True when the id names a live session. A successful check
-    /// renews the sliding TTL.
-    pub fn validate(&self, id: &str) -> bool {
+    /// Validate a live session id against the tenant presenting it
+    /// (WOR-2384, MCP10). A successful [`SessionValidation::Valid`]
+    /// renews the sliding TTL; [`SessionValidation::TenantMismatch`]
+    /// does neither -- the mismatched caller gets no side effect on
+    /// the session at all, and the entry stays live for its rightful
+    /// tenant.
+    ///
+    /// This is an isolation invariant, not a policy: it is always
+    /// enforced, with no warn mode, because a session id was already
+    /// an opaque per-deployment UUID before this method existed --
+    /// binding it to the tenant that minted it cannot break an
+    /// existing legitimate config.
+    pub fn validate(&self, id: &str, tenant_id: &str) -> SessionValidation {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         match map.get_mut(id) {
             Some(entry) if entry.expires_at > Instant::now() => {
+                if entry.tenant_id != tenant_id {
+                    return SessionValidation::TenantMismatch;
+                }
                 entry.expires_at = Instant::now() + self.ttl;
-                true
+                SessionValidation::Valid
             }
             Some(_) => {
                 map.remove(id);
-                false
+                SessionValidation::Unknown
             }
-            None => false,
+            None => SessionValidation::Unknown,
         }
     }
 
@@ -388,44 +447,50 @@ mod tests {
     #[test]
     fn create_then_validate_then_end() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
-        assert!(store.validate(&id));
+        let id = store.create("acme");
+        assert!(store.validate(&id, "acme").is_valid());
         assert!(store.end(&id));
-        assert!(!store.validate(&id), "ended session must not validate");
+        assert!(
+            !store.validate(&id, "acme").is_valid(),
+            "ended session must not validate"
+        );
         assert!(!store.end(&id), "double end is a miss");
     }
 
     #[test]
     fn unknown_id_is_invalid() {
         let store = SessionStore::new(Duration::from_secs(60));
-        assert!(!store.validate("nope"));
+        assert!(!store.validate("nope", "acme").is_valid());
         assert!(!store.end("nope"));
     }
 
     #[test]
     fn expired_session_is_invalid_and_pruned() {
         let store = SessionStore::new(Duration::from_millis(10));
-        let id = store.create();
+        let id = store.create("acme");
         std::thread::sleep(Duration::from_millis(30));
-        assert!(!store.validate(&id));
+        assert!(!store.validate(&id, "acme").is_valid());
         assert!(store.is_empty(), "expired entries must be pruned");
     }
 
     #[test]
     fn validate_renews_the_sliding_ttl() {
         let store = SessionStore::new(Duration::from_millis(80));
-        let id = store.create();
+        let id = store.create("acme");
         for _ in 0..4 {
             std::thread::sleep(Duration::from_millis(40));
-            assert!(store.validate(&id), "touches inside the ttl must renew");
+            assert!(
+                store.validate(&id, "acme").is_valid(),
+                "touches inside the ttl must renew"
+            );
         }
     }
 
     #[test]
     fn ids_are_unique_and_ascii() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let a = store.create();
-        let b = store.create();
+        let a = store.create("acme");
+        let b = store.create("acme");
         assert_ne!(a, b);
         assert!(a.is_ascii());
         assert_eq!(store.len(), 2);
@@ -434,7 +499,7 @@ mod tests {
     #[test]
     fn risk_accumulates_within_one_live_session() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
         let first = store
             .record_risk(
                 &id,
@@ -463,7 +528,7 @@ mod tests {
     #[test]
     fn tool_requirements_roundtrip() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
         assert!(store.tool_requirements(&id).is_none());
         let reqs = std::collections::HashMap::from([("search".to_string(), "^1".to_string())]);
         assert!(store.set_tool_requirements(&id, reqs.clone()));
@@ -487,7 +552,7 @@ mod tests {
     #[test]
     fn flow_labels_default_to_trusted_and_not_sensitive_touched() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
         let labels = store.flow_labels(&id).expect("live session");
         assert_eq!(labels.integrity, SessionIntegrity::Trusted);
         assert!(!labels.sensitive_touched);
@@ -496,7 +561,7 @@ mod tests {
     #[test]
     fn taint_flips_integrity_and_reports_the_transition() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
 
         let first = store.taint(&id).expect("live session");
         assert_eq!(first.labels.integrity, SessionIntegrity::Tainted);
@@ -516,7 +581,7 @@ mod tests {
     #[test]
     fn mark_sensitive_touched_flips_the_label_and_reports_the_transition() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
 
         let first = store.mark_sensitive_touched(&id).expect("live session");
         assert!(first.labels.sensitive_touched);
@@ -539,7 +604,7 @@ mod tests {
     #[test]
     fn taint_is_sticky_across_later_reads() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
         store.taint(&id).expect("live session");
 
         // Reading the labels several more times must never observe a
@@ -554,7 +619,7 @@ mod tests {
     #[test]
     fn sensitive_touched_is_sticky_across_later_reads() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
         store.mark_sensitive_touched(&id).expect("live session");
 
         for _ in 0..3 {
@@ -570,7 +635,7 @@ mod tests {
         // tainted, ends up with both flipped, not just the last one
         // applied.
         let store = SessionStore::new(Duration::from_secs(60));
-        let id = store.create();
+        let id = store.create("acme");
         store.mark_sensitive_touched(&id).expect("live session");
         store.taint(&id).expect("live session");
 
@@ -585,7 +650,7 @@ mod tests {
         assert!(store.taint("nope").is_none());
 
         let short = SessionStore::new(Duration::from_millis(10));
-        let id = short.create();
+        let id = short.create("acme");
         std::thread::sleep(Duration::from_millis(30));
         assert!(short.taint(&id).is_none());
     }
@@ -596,20 +661,22 @@ mod tests {
         assert!(store.mark_sensitive_touched("nope").is_none());
 
         let short = SessionStore::new(Duration::from_millis(10));
-        let id = short.create();
+        let id = short.create("acme");
         std::thread::sleep(Duration::from_millis(30));
         assert!(short.mark_sensitive_touched(&id).is_none());
     }
 
     #[test]
     fn two_sessions_taint_and_touch_independently() {
-        // Stands in for the per-tenant isolation guarantee: nothing in
-        // this store keys on tenant, only on session id, so two
-        // sessions (however owned) never observe each other's flow
-        // state, on either axis.
+        // Flow-label isolation is keyed on session id, not tenant: two
+        // sessions, even two owned by the very same tenant, never
+        // observe each other's flow state on either axis. Tenant
+        // isolation of *who may present which session id at all* is
+        // covered separately by the `validate` tenant-binding tests
+        // below.
         let store = SessionStore::new(Duration::from_secs(60));
-        let tenant_a_session = store.create();
-        let tenant_b_session = store.create();
+        let tenant_a_session = store.create("acme");
+        let tenant_b_session = store.create("acme");
 
         store.taint(&tenant_a_session).expect("live session");
         store
@@ -629,6 +696,88 @@ mod tests {
         assert!(
             !b_labels.sensitive_touched,
             "marking one session sensitive-touched must never mark another"
+        );
+    }
+
+    // --- Tenant-bound sessions (WOR-2384, MCP10) ---
+
+    #[test]
+    fn a_session_validates_only_for_the_tenant_it_was_minted_for() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        assert_eq!(store.validate(&id, "tenant-a"), SessionValidation::Valid);
+    }
+
+    #[test]
+    fn a_session_presented_by_a_different_tenant_is_rejected() {
+        // This is the adversarial case the mint-time binding exists to
+        // close: tenant B guesses or replays tenant A's session id.
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        assert_eq!(
+            store.validate(&id, "tenant-b"),
+            SessionValidation::TenantMismatch,
+            "a session minted for tenant-a must be invalid when presented by tenant-b"
+        );
+    }
+
+    #[test]
+    fn tenant_mismatch_and_unknown_id_are_indistinguishable_on_is_valid() {
+        // The wire-visible refusal must not leak "this session exists,
+        // just not for you" versus "this session never existed" --
+        // both collapse to `is_valid() == false` for a caller that only
+        // wants the pass/fail bit (the generic 404 both cases map to
+        // at the HTTP boundary).
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create("tenant-a");
+        assert!(!store.validate(&id, "tenant-b").is_valid());
+        assert!(!store.validate("does-not-exist", "tenant-b").is_valid());
+    }
+
+    #[test]
+    fn a_tenant_mismatch_does_not_renew_the_ttl_or_evict_the_session() {
+        // A wrong-tenant probe must be a pure no-op against the entry:
+        // it neither extends the session's life (which would let an
+        // attacker keep someone else's session alive by polling it)
+        // nor deletes it (which would let an attacker end another
+        // tenant's session by guessing its id).
+        let store = SessionStore::new(Duration::from_millis(60));
+        let id = store.create("tenant-a");
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            store.validate(&id, "tenant-b"),
+            SessionValidation::TenantMismatch
+        );
+        // Still valid for the rightful tenant well past the original
+        // TTL window, because the mismatch attempt above did not renew
+        // it -- but it also must not have evicted the entry outright.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(store.validate(&id, "tenant-a"), SessionValidation::Valid);
+    }
+
+    #[test]
+    fn an_unknown_id_stays_unknown_regardless_of_tenant() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        assert_eq!(
+            store.validate("nope", "any-tenant"),
+            SessionValidation::Unknown
+        );
+    }
+
+    #[test]
+    fn two_tenants_each_validate_only_their_own_session() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let a = store.create("tenant-a");
+        let b = store.create("tenant-b");
+        assert_eq!(store.validate(&a, "tenant-a"), SessionValidation::Valid);
+        assert_eq!(
+            store.validate(&a, "tenant-b"),
+            SessionValidation::TenantMismatch
+        );
+        assert_eq!(store.validate(&b, "tenant-b"), SessionValidation::Valid);
+        assert_eq!(
+            store.validate(&b, "tenant-a"),
+            SessionValidation::TenantMismatch
         );
     }
 }

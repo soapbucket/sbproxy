@@ -674,6 +674,25 @@ fn compile_rule(rule: &PiiRule) -> anyhow::Result<CompiledRule> {
     })
 }
 
+/// Detector names from [`default_rules`] that shape-match credentials
+/// (API keys, tokens) rather than personal data.
+///
+/// Split out so a consumer that wants an independent `secrets:` vs
+/// `pii:` control (e.g. the MCP gateway's `content_filters` block,
+/// WOR-2384 MCP01/MCP10) can partition the one shared catalogue into
+/// two subsets without forking the regex definitions. The complement
+/// of this set within [`default_rules`]'s names is the "pii" subset:
+/// `email`, `us_ssn`, `credit_card`, `phone_us`, `ipv4`, `iban`.
+pub fn secret_detector_names() -> &'static [&'static str] {
+    &[
+        "openai_key",
+        "anthropic_key",
+        "aws_access",
+        "github_token",
+        "slack_token",
+    ]
+}
+
 /// Default detector catalogue: returns the built-in PII / secrets
 /// regex rules. Useful for downstream policies (DLP) that want to
 /// reuse the catalogue without going through the full Redactor
@@ -930,6 +949,26 @@ mod tests {
         let r = defaults();
         let out = r.redact("Server 192.168.1.100 is offline.");
         assert_eq!(out, "Server [REDACTED:IP] is offline.");
+    }
+
+    #[test]
+    fn secret_detector_names_are_a_proper_subset_of_default_rules() {
+        // WOR-2384 (MCP01/MCP10): every name in the secrets subset must
+        // actually exist in the shared catalogue, and at least one
+        // default-rule name (e.g. `email`) must fall outside it so the
+        // "pii" complement is non-empty.
+        let all: std::collections::HashSet<&str> =
+            default_rules().iter().map(|r| r.name.as_str()).collect();
+        for name in secret_detector_names() {
+            assert!(
+                all.contains(name),
+                "secret_detector_names() names {name:?}, which is not in default_rules()"
+            );
+        }
+        assert!(
+            !secret_detector_names().contains(&"email"),
+            "email is personal data, not a credential shape"
+        );
     }
 
     #[test]

@@ -113,6 +113,21 @@ pub struct McpActionConfig {
     /// [`McpArgumentPolicyConfig`].
     #[serde(default)]
     pub argument_policies: Vec<McpArgumentPolicyConfig>,
+    /// Secret- and PII-shape detection over tool-call arguments
+    /// (outbound) and tool-call results (inbound) (WOR-2384,
+    /// MCP01/MCP10). Both `secrets` and `pii` default to `off`. See
+    /// [`McpContentFilterConfig`].
+    #[serde(default)]
+    pub content_filters: McpContentFilterConfig,
+    /// Result-level `tools/call` authorization rules (WOR-2384,
+    /// MCP01/MCP10), evaluated against the tool-call result document
+    /// after dispatch and after `content_filters`, before the result
+    /// enters the session/context or reaches the caller. Same CEL/Rego
+    /// shape as [`Self::argument_policies`]; see
+    /// [`McpArgumentPolicyConfig`] and the module docs' `mcp.result`
+    /// binding.
+    #[serde(default)]
+    pub result_policies: Vec<McpArgumentPolicyConfig>,
     /// Deterministic session flow enforcement (WOR-2384, MCP06): a
     /// two-label (integrity / exfil-allowed) session guardrail that
     /// taints a session the first time it reads a `tools/call` result
@@ -258,6 +273,75 @@ pub struct McpAuditConfig {
     /// the full tradeoff.
     #[serde(default)]
     pub capture_arguments: bool,
+}
+
+/// `content_filters:` block (WOR-2384, MCP01/MCP10): secret- and
+/// PII-shape detection over tool-call arguments (outbound) and
+/// tool-call results (inbound).
+///
+/// This closes a structural hole rather than adding a new detector: an
+/// `mcp`-typed origin's responses are written directly from inside
+/// `handle_mcp_action`'s `request_filter` short-circuit and never reach
+/// Pingora's `response_filter`/`response_body_filter` phases, so the
+/// generic `pii:`/`dlp:` HTTP-phase controls never see a tool-call
+/// argument or result -- confirmed by grepping `handle_mcp_action` for
+/// `response_modifiers`/`pii`/`dlp`/`redact` and finding zero hits.
+/// This block reuses the exact same detector catalogue those controls
+/// share (`sbproxy_security::pii::default_rules()`, the regex/validator
+/// set already used by `pii:`, `dlp:`, and the CLI's secret-scanning
+/// path) at the one seam that actually sees MCP tool-call content:
+/// `handle_mcp_action`, alongside `argument_policies[]` (outbound) and
+/// `dual_llm_quarantine`/`token_compaction`/`result_policies[]`
+/// (inbound).
+///
+/// ```yaml
+/// action:
+///   type: mcp
+///   content_filters:
+///     secrets: redact
+///     pii: warn
+/// ```
+///
+/// Both fields default to `off`: adding this block with neither field
+/// set changes nothing, matching this epic's warn-by-default-or-
+/// narrower rule for every new MCP gate.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpContentFilterConfig {
+    /// Credential/API-key shape detection: `openai_key`,
+    /// `anthropic_key`, `aws_access`, `github_token`, `slack_token`
+    /// (see [`sbproxy_security::pii::secret_detector_names`]). Off by
+    /// default.
+    #[serde(default)]
+    pub secrets: McpFilterModeConfig,
+    /// Personal-data shape detection: `email`, `us_ssn`, `credit_card`,
+    /// `phone_us`, `ipv4`, `iban` (the complement of the secrets subset
+    /// within `sbproxy_security::pii::default_rules()`). Off by
+    /// default.
+    #[serde(default)]
+    pub pii: McpFilterModeConfig,
+}
+
+/// `content_filters.secrets` / `content_filters.pii` mode (WOR-2384,
+/// MCP01/MCP10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFilterModeConfig {
+    /// Detection is disabled for this category. The default.
+    #[default]
+    Off,
+    /// Log a match and emit governance evidence with verdict `warn`;
+    /// the call/result proceeds byte-identical -- no mutation, no
+    /// refusal.
+    Warn,
+    /// Replace each matched span with the shared `[REDACTED:<NAME>]`
+    /// mask convention (`sbproxy_security::pii::PiiRedactor`, the same
+    /// convention `pii:`/`dlp:` already use) and emit governance
+    /// evidence with verdict `warn`; the call/result proceeds with the
+    /// redacted document.
+    Redact,
+    /// Refuse the call/result outright and emit governance evidence
+    /// with verdict `deny`.
+    Block,
 }
 
 /// One `argument_policies[]` entry (WOR-2384, MCP05): a CEL or Rego
@@ -1176,6 +1260,19 @@ fn emit_server_status_changed_event(
 /// `MCP_SERVER_APPROVAL_RULE_ID` and the peer-downgrade rule ids use.
 pub const MCP_ARGUMENT_POLICY_REASON: &str = "argument_policy";
 
+/// `sbproxy.decision.reason` for a `content_filters` verdict of any
+/// polarity (WOR-2384, MCP01/MCP10): names the gate (this one) that
+/// produced the event. `sbproxy.decision.rule_id` carries the specific
+/// category and detector names that matched (see
+/// [`McpContentFilterHit`]).
+pub const MCP_CONTENT_FILTER_REASON: &str = "content_filter";
+
+/// `sbproxy.decision.reason` for a `result_policies[]` verdict of
+/// either polarity (WOR-2384, MCP01/MCP10), mirroring
+/// [`MCP_ARGUMENT_POLICY_REASON`] for the result-side surface. The
+/// specific rule is carried separately, as `sbproxy.decision.rule_id`.
+pub const MCP_RESULT_POLICY_REASON: &str = "result_policy";
+
 /// One entry in the gateway-level guardrails list.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1512,6 +1609,19 @@ pub struct McpAction {
     /// Compiled session-flow guardrail (WOR-2384, MCP06). `None` when
     /// `flow.mode` is `off` (the default). See [`McpFlowConfig`].
     flow: Option<CompiledMcpFlow>,
+    /// Compiled `content_filters` (WOR-2384, MCP01/MCP10): secret- and
+    /// PII-shape detection over tool-call arguments and results. Both
+    /// categories default to `off`; see [`Self::apply_content_filters`].
+    content_filters: CompiledMcpContentFilters,
+    /// Compiled `result_policies[]` (WOR-2384, MCP01/MCP10), in
+    /// declaration order. Empty (the default) means
+    /// `evaluate_result_policies` always returns
+    /// [`McpArgumentPolicyVerdict::Allow`] without building a CEL/Rego
+    /// context. Same shape and evaluation contract as
+    /// [`Self::argument_policies`], but runs against the tool-call
+    /// *result* document after dispatch rather than the arguments
+    /// before it -- see [`McpAction::evaluate_result_policies`].
+    pub result_policies: Vec<CompiledMcpArgumentPolicy>,
     /// `mcp_audit.capture_arguments` (WOR-2392). When true, a
     /// dispatched `tools/call`'s `mcp_governance_decision` event
     /// carries the redacted, size-bounded verbatim call arguments
@@ -1969,6 +2079,226 @@ pub enum McpArgumentPolicyVerdict {
     },
 }
 
+/// PII-shape detector names `content_filters.pii` owns (WOR-2384,
+/// MCP01/MCP10): the complement of
+/// [`sbproxy_security::pii::secret_detector_names`] within
+/// [`sbproxy_security::pii::default_rules`].
+const MCP_CONTENT_FILTER_PII_DETECTORS: &[&str] =
+    &["email", "us_ssn", "credit_card", "phone_us", "ipv4", "iban"];
+
+/// One compiled `content_filters.secrets` or `content_filters.pii`
+/// category (WOR-2384, MCP01/MCP10). Built once at config-compile time
+/// from the subset of [`sbproxy_security::pii::default_rules`] this
+/// category owns.
+#[derive(Debug)]
+struct CompiledMcpContentFilterCategory {
+    mode: McpFilterModeConfig,
+    /// `(detector_name, single-rule redactor)`, one redactor per
+    /// individual detector. Detection runs each of these separately
+    /// (against a clone of the document) rather than a hand-rolled
+    /// second regex pass, so a match is attributed to the exact shape
+    /// that fired without risking drift from
+    /// [`sbproxy_security::pii::PiiRedactor`]'s own validator-aware
+    /// matching (e.g. the Luhn check on `credit_card`).
+    detectors: Vec<(&'static str, sbproxy_security::pii::PiiRedactor)>,
+    /// Every detector in this category combined into one redactor,
+    /// used for the actual mutation in `redact` mode.
+    combined: sbproxy_security::pii::PiiRedactor,
+}
+
+fn compile_mcp_content_filter_category(
+    mode: McpFilterModeConfig,
+    names: &'static [&'static str],
+) -> CompiledMcpContentFilterCategory {
+    let all_rules = sbproxy_security::pii::default_rules();
+    let mut category_rules: Vec<sbproxy_security::pii::PiiRule> = Vec::with_capacity(names.len());
+    let mut detectors: Vec<(&'static str, sbproxy_security::pii::PiiRedactor)> =
+        Vec::with_capacity(names.len());
+    for &name in names {
+        let Some(rule) = all_rules.iter().find(|r| r.name == name).cloned() else {
+            continue;
+        };
+        let solo =
+            sbproxy_security::pii::PiiRedactor::from_config(&sbproxy_security::pii::PiiConfig {
+                enabled: true,
+                defaults: false,
+                redact_request: true,
+                redact_response: false,
+                rules: vec![rule.clone()],
+            })
+            .expect("a single default content-filter rule always compiles");
+        detectors.push((name, solo));
+        category_rules.push(rule);
+    }
+    let combined =
+        sbproxy_security::pii::PiiRedactor::from_config(&sbproxy_security::pii::PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: true,
+            redact_response: false,
+            rules: category_rules,
+        })
+        .expect("the default content-filter rule set always compiles");
+    CompiledMcpContentFilterCategory {
+        mode,
+        detectors,
+        combined,
+    }
+}
+
+impl CompiledMcpContentFilterCategory {
+    /// Detector names (in this category's declared order) that match
+    /// anywhere in `document`. Empty when `mode` is `off` or nothing
+    /// matched. Does not mutate `document`.
+    fn scan(&self, document: &serde_json::Value) -> Vec<String> {
+        if self.mode == McpFilterModeConfig::Off {
+            return Vec::new();
+        }
+        self.detectors
+            .iter()
+            .filter_map(|(name, redactor)| {
+                let mut probe = document.clone();
+                redactor.redact_json(&mut probe);
+                (probe != *document).then(|| (*name).to_string())
+            })
+            .collect()
+    }
+
+    /// Mutate `document` in place, replacing every matched span across
+    /// every detector in this category with the shared mask
+    /// convention.
+    fn redact(&self, document: &mut serde_json::Value) {
+        self.combined.redact_json(document);
+    }
+}
+
+/// Compiled `content_filters` state for one [`McpAction`] (WOR-2384,
+/// MCP01/MCP10).
+#[derive(Debug)]
+struct CompiledMcpContentFilters {
+    secrets: CompiledMcpContentFilterCategory,
+    pii: CompiledMcpContentFilterCategory,
+}
+
+fn compile_mcp_content_filters(cfg: &McpContentFilterConfig) -> CompiledMcpContentFilters {
+    CompiledMcpContentFilters {
+        secrets: compile_mcp_content_filter_category(
+            cfg.secrets,
+            sbproxy_security::pii::secret_detector_names(),
+        ),
+        pii: compile_mcp_content_filter_category(cfg.pii, MCP_CONTENT_FILTER_PII_DETECTORS),
+    }
+}
+
+/// One category's outcome from [`McpAction::apply_content_filters`]
+/// that was not a plain miss (WOR-2384, MCP01/MCP10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpContentFilterHit {
+    /// `"secrets"` or `"pii"`.
+    pub category: &'static str,
+    /// The mode that produced this hit. Always [`McpFilterModeConfig::Warn`]
+    /// or [`McpFilterModeConfig::Redact`]; a [`McpFilterModeConfig::Block`]
+    /// hit short-circuits straight to [`McpContentFilterVerdict::Denied`]
+    /// instead, and an `off` category is never scanned.
+    pub mode: McpFilterModeConfig,
+    /// Detector names that matched, in this category's declared order.
+    pub detectors: Vec<String>,
+}
+
+/// Verdict from [`McpAction::apply_content_filters`] (WOR-2384,
+/// MCP01/MCP10).
+///
+/// Evaluation order is always `secrets` then `pii`; monotonic, per this
+/// epic's structural rule: a `block` in either category ends
+/// evaluation immediately, so a category evaluated later can never
+/// un-deny what an earlier one refused. A `redact` in one category does
+/// not prevent the other category's own mode from also applying --
+/// both run to completion unless something denies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpContentFilterVerdict {
+    /// Neither category matched, or both are `off`. The document is
+    /// unchanged.
+    Clean,
+    /// At least one category matched under `warn` or `redact`, and
+    /// neither denied. Any `redact` hit already mutated the document
+    /// this verdict was produced from; the caller does not need to
+    /// apply anything further.
+    Applied(Vec<McpContentFilterHit>),
+    /// A category matched under `block`. The caller must discard the
+    /// whole call/result regardless of any partial mutation an earlier
+    /// `redact` category may already have applied to the document --
+    /// that mutation must never reach the client.
+    Denied {
+        /// `"secrets"` or `"pii"`.
+        category: &'static str,
+        /// Detector names that triggered the refusal.
+        detectors: Vec<String>,
+    },
+}
+
+/// Compile one `result_policies[]` entry (WOR-2384, MCP01/MCP10).
+/// Structurally identical to [`compile_mcp_argument_policy`] (same
+/// config shape, same [`CompiledMcpArgumentPolicy`] output type); the
+/// only difference is the CEL surface a malformed expression is
+/// reported against, so an operator sees `result_policies[...]` in the
+/// error rather than `argument_policies[...]`. Kept as its own function
+/// rather than a parameter on `compile_mcp_argument_policy` so neither
+/// existing, already-tested call site has to change.
+fn compile_mcp_result_policy(
+    cfg: &McpArgumentPolicyConfig,
+) -> anyhow::Result<CompiledMcpArgumentPolicy> {
+    anyhow::ensure!(
+        !cfg.name.trim().is_empty(),
+        "mcp action: result_policies[].name must not be empty"
+    );
+    let source = match (&cfg.source, &cfg.path) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "mcp action: result_policies[{}] sets both source and path; pick one",
+            cfg.name
+        ),
+        (Some(source), None) => source.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "mcp action: result_policies[{}] reading path '{path}': {e}",
+                cfg.name
+            )
+        })?,
+        (None, None) => anyhow::bail!(
+            "mcp action: result_policies[{}] needs source or path",
+            cfg.name
+        ),
+    };
+
+    let site = format!("mcp result_policies[{}]", cfg.name);
+    let when = cfg
+        .when
+        .as_ref()
+        .map(|expr| {
+            CompiledCel::compile(CelSurface::McpResultPolicy, format!("{site} `when`"), expr)
+        })
+        .transpose()?;
+
+    let expr: Box<dyn McpArgumentPolicyExpr> = match cfg.engine {
+        McpArgumentPolicyEngineConfig::Cel => Box::new(CompiledCel::compile(
+            CelSurface::McpResultPolicy,
+            site,
+            &source,
+        )?),
+        McpArgumentPolicyEngineConfig::Rego => {
+            let compiled = CompiledRego::compile(site, &source, "data.sbproxy.allow", 50, None)?;
+            Box::new(RegoArgumentExpr(Mutex::new(compiled)))
+        }
+    };
+
+    Ok(CompiledMcpArgumentPolicy {
+        name: cfg.name.clone(),
+        when,
+        expr,
+        mode: cfg.mode,
+        principals: cfg.principals.clone(),
+    })
+}
+
 impl McpAction {
     /// Compile an `McpAction` from a generic JSON config value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
@@ -2404,6 +2734,22 @@ impl McpAction {
         // WOR-2384 (MCP06): `None` for `mode: off`, the default.
         let flow = compile_mcp_flow(&cfg.flow);
 
+        // WOR-2384 (MCP01/MCP10): compiled once regardless of whether
+        // either mode is `off` -- the compiled category itself carries
+        // `mode` and short-circuits its own scan when `off`, so there
+        // is exactly one code path to keep correct rather than an
+        // `Option` wrapper duplicating that branch at every call site.
+        let content_filters = compile_mcp_content_filters(&cfg.content_filters);
+
+        // WOR-2384 (MCP01/MCP10): same reasoning as `argument_policies`
+        // above -- compiled once so a malformed rule is a config-load
+        // error, not a per-request one.
+        let result_policies = cfg
+            .result_policies
+            .iter()
+            .map(compile_mcp_result_policy)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         Ok(Self {
             mode: cfg.mode,
             server_name,
@@ -2433,6 +2779,8 @@ impl McpAction {
             usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
             argument_policies,
             flow,
+            content_filters,
+            result_policies,
             mcp_audit_capture_arguments: cfg.mcp_audit.capture_arguments,
         })
     }
@@ -2503,6 +2851,169 @@ impl McpAction {
                 // failure mode, and the main expression below has its
                 // own fail-closed posture for a genuine evaluation
                 // fault.
+                if matches!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        when.eval_bool(&ctx)
+                    })),
+                    Ok(Ok(false))
+                ) {
+                    continue;
+                }
+            }
+            match evaluate_mcp_argument_expr(rule.expr.as_ref(), &ctx) {
+                McpArgumentPolicyEngineOutcome::Compliant => continue,
+                McpArgumentPolicyEngineOutcome::Violation => match rule.mode {
+                    McpArgumentPolicyModeConfig::Block => {
+                        return McpArgumentPolicyVerdict::Deny {
+                            rule_name: rule.name.clone(),
+                            panicked: false,
+                        };
+                    }
+                    McpArgumentPolicyModeConfig::Warn => {
+                        if warned.is_none() {
+                            warned = Some(rule.name.clone());
+                        }
+                    }
+                },
+                McpArgumentPolicyEngineOutcome::Error => {
+                    return McpArgumentPolicyVerdict::Deny {
+                        rule_name: rule.name.clone(),
+                        panicked: false,
+                    };
+                }
+                McpArgumentPolicyEngineOutcome::Panicked => {
+                    return McpArgumentPolicyVerdict::Deny {
+                        rule_name: rule.name.clone(),
+                        panicked: true,
+                    };
+                }
+            }
+        }
+        match warned {
+            Some(rule_name) => McpArgumentPolicyVerdict::Warn { rule_name },
+            None => McpArgumentPolicyVerdict::Allow,
+        }
+    }
+
+    /// Run `content_filters.secrets` then `content_filters.pii`
+    /// against `document` -- a tool-call arguments document (outbound)
+    /// or a tool-call result document (inbound) -- mutating it in
+    /// place for any category in `redact` mode that matches (WOR-2384,
+    /// MCP01/MCP10).
+    ///
+    /// Both categories default to `off`, so with no `content_filters`
+    /// block configured this always returns
+    /// [`McpContentFilterVerdict::Clean`] without cloning or scanning
+    /// `document` (each [`CompiledMcpContentFilterCategory::scan`]
+    /// short-circuits on `mode == Off`).
+    pub fn apply_content_filters(
+        &self,
+        document: &mut serde_json::Value,
+    ) -> McpContentFilterVerdict {
+        let mut hits = Vec::new();
+        for (category, filter) in [
+            ("secrets", &self.content_filters.secrets),
+            ("pii", &self.content_filters.pii),
+        ] {
+            if filter.mode == McpFilterModeConfig::Off {
+                continue;
+            }
+            let detectors = filter.scan(document);
+            if detectors.is_empty() {
+                continue;
+            }
+            match filter.mode {
+                McpFilterModeConfig::Off => {
+                    // Unreachable: `filter.scan` returns empty for
+                    // `Off` above, and the `continue` before it skips
+                    // this arm entirely -- kept as an explicit arm
+                    // rather than a wildcard so a future fifth mode
+                    // added to `McpFilterModeConfig` fails to compile
+                    // here instead of silently falling through.
+                    continue;
+                }
+                McpFilterModeConfig::Block => {
+                    return McpContentFilterVerdict::Denied {
+                        category,
+                        detectors,
+                    };
+                }
+                McpFilterModeConfig::Redact => {
+                    filter.redact(document);
+                    hits.push(McpContentFilterHit {
+                        category,
+                        mode: McpFilterModeConfig::Redact,
+                        detectors,
+                    });
+                }
+                McpFilterModeConfig::Warn => {
+                    hits.push(McpContentFilterHit {
+                        category,
+                        mode: McpFilterModeConfig::Warn,
+                        detectors,
+                    });
+                }
+            }
+        }
+        if hits.is_empty() {
+            McpContentFilterVerdict::Clean
+        } else {
+            McpContentFilterVerdict::Applied(hits)
+        }
+    }
+
+    /// Evaluate `result_policies[]` against one `tools/call` result
+    /// (WOR-2384, MCP01/MCP10). Structurally identical to
+    /// [`Self::evaluate_argument_policies`] (same verdict type, same
+    /// per-rule `when`/`principals`/`mode` semantics), evaluated
+    /// against the same `mcp` CEL/Rego context plus one more binding,
+    /// `mcp.result`, bound to `result`.
+    ///
+    /// Call this after dispatch and after `content_filters`, on
+    /// whatever document `apply_content_filters` produced (redacted or
+    /// not), so a rule written against `mcp.result` sees what the
+    /// content filter already stripped rather than the raw upstream
+    /// bytes.
+    #[allow(clippy::too_many_arguments)] // mirrors `evaluate_argument_policies`, plus `result`
+    pub fn evaluate_result_policies(
+        &self,
+        principal: &sbproxy_plugin::Principal,
+        tool_name: &str,
+        server: &str,
+        tenant: &str,
+        session_id: Option<&str>,
+        arguments: &serde_json::Value,
+        result: &serde_json::Value,
+    ) -> McpArgumentPolicyVerdict {
+        if self.result_policies.is_empty() {
+            return McpArgumentPolicyVerdict::Allow;
+        }
+
+        let flow_labels = self.current_flow_labels(session_id);
+
+        let view = sbproxy_extension::cel::context::McpArgumentPolicyView {
+            tool_name,
+            server,
+            session_id,
+            tenant,
+            principal_sub: principal.sub.as_str(),
+            principal_team: principal.attrs.team.as_deref(),
+            principal_project: principal.attrs.project.as_deref(),
+            principal_user: principal.attrs.user.as_deref(),
+            arguments,
+            result: Some(result),
+            session_integrity: flow_labels.integrity.as_str(),
+            session_sensitive_touched: flow_labels.sensitive_touched,
+        };
+        let ctx = sbproxy_extension::cel::context::build_mcp_argument_policy_context(&view);
+
+        let mut warned: Option<String> = None;
+        for rule in &self.result_policies {
+            if !rule.principals.is_empty() && !rule.principals.iter().any(|s| s.matches(principal))
+            {
+                continue;
+            }
+            if let Some(when) = &rule.when {
                 if matches!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         when.eval_bool(&ctx)
@@ -4993,6 +5504,360 @@ allow := false if {
         );
     }
 
+    // --- Content filters (WOR-2384, MCP01/MCP10) ---
+
+    fn content_filter_action(content_filters: serde_json::Value) -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "server_info": {"name": "content-filter-fixture", "version": "1.0.0"},
+            "federated_servers": [{ "origin": "example.com", "prefix": "srv" }],
+            "content_filters": content_filters
+        }))
+        .expect("content-filter fixture compiles")
+    }
+
+    #[test]
+    fn off_by_default_is_a_byte_identical_passthrough() {
+        // WOR-2384 red-first regression guard: with no `content_filters`
+        // block at all, a planted secret must pass through completely
+        // unexamined -- this is the pre-existing behavior the epic's
+        // warn-by-default-or-narrower rule requires stay unchanged.
+        let action = content_filter_action(json!({}));
+        let original = json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let mut document = original.clone();
+        let verdict = action.apply_content_filters(&mut document);
+        assert_eq!(verdict, McpContentFilterVerdict::Clean);
+        assert_eq!(document, original, "off mode must not touch the document");
+    }
+
+    #[test]
+    fn a_planted_secret_is_redacted_in_redact_mode() {
+        // WOR-2384 red-first: fails today because `content_filters` (and
+        // `apply_content_filters`) do not exist yet. This is WOR-2385's
+        // proving test: a planted API key in a tool result is redacted
+        // before reaching the caller.
+        let action = content_filter_action(json!({"secrets": "redact"}));
+        let mut document =
+            json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let verdict = action.apply_content_filters(&mut document);
+        assert_eq!(
+            verdict,
+            McpContentFilterVerdict::Applied(vec![McpContentFilterHit {
+                category: "secrets",
+                mode: McpFilterModeConfig::Redact,
+                detectors: vec!["aws_access".to_string()],
+            }])
+        );
+        let text = document["content"][0]["text"].as_str().expect("text");
+        assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "got {text}");
+        assert!(text.contains("[REDACTED:APIKEY]"), "got {text}");
+    }
+
+    #[test]
+    fn block_mode_denies_and_never_mutates_the_document() {
+        let action = content_filter_action(json!({"secrets": "block"}));
+        let original = json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let mut document = original.clone();
+        let verdict = action.apply_content_filters(&mut document);
+        assert_eq!(
+            verdict,
+            McpContentFilterVerdict::Denied {
+                category: "secrets",
+                detectors: vec!["aws_access".to_string()],
+            }
+        );
+        assert_eq!(
+            document, original,
+            "a denied document must not be mutated -- the caller discards it outright"
+        );
+    }
+
+    #[test]
+    fn warn_mode_reports_the_hit_without_mutating() {
+        let action = content_filter_action(json!({"secrets": "warn"}));
+        let original = json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let mut document = original.clone();
+        let verdict = action.apply_content_filters(&mut document);
+        assert_eq!(
+            verdict,
+            McpContentFilterVerdict::Applied(vec![McpContentFilterHit {
+                category: "secrets",
+                mode: McpFilterModeConfig::Warn,
+                detectors: vec!["aws_access".to_string()],
+            }])
+        );
+        assert_eq!(document, original, "warn mode must not mutate the document");
+    }
+
+    #[test]
+    fn pii_and_secrets_are_independent_categories() {
+        let action = content_filter_action(json!({"pii": "redact"}));
+        // A secret shape with no PII opt-in must pass through, even
+        // though `secrets` and `pii` share the same underlying detector
+        // catalogue and code path.
+        let mut secret_only = json!({"text": "AKIAIOSFODNN7EXAMPLE"});
+        assert_eq!(
+            action.apply_content_filters(&mut secret_only),
+            McpContentFilterVerdict::Clean
+        );
+
+        let mut pii_only = json!({"text": "contact alice@example.com"});
+        let verdict = action.apply_content_filters(&mut pii_only);
+        assert_eq!(
+            verdict,
+            McpContentFilterVerdict::Applied(vec![McpContentFilterHit {
+                category: "pii",
+                mode: McpFilterModeConfig::Redact,
+                detectors: vec!["email".to_string()],
+            }])
+        );
+        assert_eq!(pii_only["text"], "contact [REDACTED:EMAIL]");
+    }
+
+    #[test]
+    fn a_secrets_block_denies_before_pii_is_ever_consulted() {
+        // Monotonic ordering: secrets is evaluated before pii, and a
+        // block ends evaluation immediately -- a later category's
+        // (weaker) mode can never un-deny it. This document also
+        // carries a PII shape (an email) that `pii: redact` would
+        // otherwise have mutated; the denial must short-circuit before
+        // that happens.
+        let action = content_filter_action(json!({"secrets": "block", "pii": "redact"}));
+        let original = json!({
+            "text": "key AKIAIOSFODNN7EXAMPLE belongs to alice@example.com"
+        });
+        let mut document = original.clone();
+        let verdict = action.apply_content_filters(&mut document);
+        assert_eq!(
+            verdict,
+            McpContentFilterVerdict::Denied {
+                category: "secrets",
+                detectors: vec!["aws_access".to_string()],
+            }
+        );
+        assert_eq!(
+            document, original,
+            "a secrets block must short-circuit before pii ever redacts"
+        );
+    }
+
+    #[test]
+    fn both_categories_apply_independently_when_neither_blocks() {
+        let action = content_filter_action(json!({"secrets": "redact", "pii": "warn"}));
+        let mut document = json!({
+            "text": "key AKIAIOSFODNN7EXAMPLE belongs to alice@example.com"
+        });
+        let verdict = action.apply_content_filters(&mut document);
+        assert_eq!(
+            verdict,
+            McpContentFilterVerdict::Applied(vec![
+                McpContentFilterHit {
+                    category: "secrets",
+                    mode: McpFilterModeConfig::Redact,
+                    detectors: vec!["aws_access".to_string()],
+                },
+                McpContentFilterHit {
+                    category: "pii",
+                    mode: McpFilterModeConfig::Warn,
+                    detectors: vec!["email".to_string()],
+                },
+            ])
+        );
+        let text = document["text"].as_str().expect("text");
+        assert!(
+            text.contains("[REDACTED:APIKEY]"),
+            "secrets redact must have applied: {text}"
+        );
+        assert!(
+            text.contains("alice@example.com"),
+            "pii warn must not mutate: {text}"
+        );
+    }
+
+    #[test]
+    fn a_clean_document_produces_no_hits_regardless_of_mode() {
+        let action = content_filter_action(json!({"secrets": "block", "pii": "block"}));
+        let mut document = json!({"text": "nothing sensitive here"});
+        assert_eq!(
+            action.apply_content_filters(&mut document),
+            McpContentFilterVerdict::Clean
+        );
+    }
+
+    // --- Result policies (WOR-2384, MCP01/MCP10) ---
+
+    fn result_policy_action(policies: serde_json::Value) -> McpAction {
+        McpAction::from_config(json!({
+            "type": "mcp",
+            "server_info": {"name": "result-policy-fixture", "version": "1.0.0"},
+            "federated_servers": [{ "origin": "example.com", "prefix": "srv" }],
+            "result_policies": policies
+        }))
+        .expect("result-policy fixture compiles")
+    }
+
+    #[test]
+    fn empty_result_policies_always_allows() {
+        let action = result_policy_action(json!([]));
+        let verdict = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+            &json!({"content": [{"type": "text", "text": "anything"}]}),
+        );
+        assert_eq!(verdict, McpArgumentPolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn a_cel_rule_denies_a_result_document_in_block_mode() {
+        // WOR-2384 red-first: fails today because `result_policies[]`
+        // (and `evaluate_result_policies`) do not exist yet.
+        let action = result_policy_action(json!([{
+            "name": "no-internal-hostnames-in-result",
+            "engine": "cel",
+            "source": "!mcp.result.content[0].text.contains(\"internal.corp\")",
+            "mode": "block"
+        }]));
+        let verdict = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+            &json!({"content": [{"type": "text", "text": "see http://db.internal.corp/"}]}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "no-internal-hostnames-in-result".to_string(),
+                panicked: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_compliant_result_is_allowed_in_block_mode() {
+        let action = result_policy_action(json!([{
+            "name": "no-internal-hostnames-in-result",
+            "engine": "cel",
+            "source": "!mcp.result.content[0].text.contains(\"internal.corp\")",
+            "mode": "block"
+        }]));
+        let verdict = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+            &json!({"content": [{"type": "text", "text": "see https://docs.example.com/"}]}),
+        );
+        assert_eq!(verdict, McpArgumentPolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn warn_mode_names_the_result_rule_but_does_not_deny() {
+        let action = result_policy_action(json!([{
+            "name": "no-internal-hostnames-in-result",
+            "engine": "cel",
+            "source": "!mcp.result.content[0].text.contains(\"internal.corp\")",
+            "mode": "warn"
+        }]));
+        let verdict = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+            &json!({"content": [{"type": "text", "text": "see http://db.internal.corp/"}]}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Warn {
+                rule_name: "no-internal-hostnames-in-result".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_rego_result_rule_over_the_same_predicate_agrees_with_cel() {
+        const MODULE: &str = r#"
+package sbproxy
+
+default allow := true
+
+allow := false if {
+    contains(input.mcp.result.content[0].text, "internal.corp")
+}
+"#;
+        let action = result_policy_action(json!([{
+            "name": "no-internal-hostnames-rego",
+            "engine": "rego",
+            "source": MODULE,
+            "mode": "block"
+        }]));
+        let denied = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+            &json!({"content": [{"type": "text", "text": "see http://db.internal.corp/"}]}),
+        );
+        assert_eq!(
+            denied,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "no-internal-hostnames-rego".to_string(),
+                panicked: false,
+            }
+        );
+        let allowed = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({}),
+            &json!({"content": [{"type": "text", "text": "see https://docs.example.com/"}]}),
+        );
+        assert_eq!(allowed, McpArgumentPolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn a_result_rule_can_also_read_the_call_arguments_that_produced_it() {
+        // `mcp.arguments` is bound alongside `mcp.result`, so a rule can
+        // correlate what was asked for with what came back (e.g. deny a
+        // result unless it echoes the requested `doc_id`).
+        let action = result_policy_action(json!([{
+            "name": "result-must-echo-requested-id",
+            "engine": "cel",
+            "source": "mcp.result.id == mcp.arguments.doc_id",
+            "mode": "block"
+        }]));
+        let verdict = action.evaluate_result_policies(
+            &principal_for("acme"),
+            "fetch_doc",
+            "srv",
+            "acme",
+            None,
+            &json!({"doc_id": "doc-42"}),
+            &json!({"id": "doc-99"}),
+        );
+        assert_eq!(
+            verdict,
+            McpArgumentPolicyVerdict::Deny {
+                rule_name: "result-must-echo-requested-id".to_string(),
+                panicked: false,
+            }
+        );
+    }
+
     // --- Registry-change visibility (WOR-2392) ---
 
     fn wor_2392_status_config(status: Option<&str>) -> serde_json::Value {
@@ -5271,7 +6136,11 @@ allow := false if {
         // confidentiality axis, since round 1's shipped pair-trip
         // denied on taint + outbound alone, with no sensitivity check.
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let outcome =
             action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv");
         assert!(outcome.newly_tainted);
@@ -5289,7 +6158,11 @@ allow := false if {
     #[test]
     fn two_legs_sensitive_and_outbound_without_taint_pass_under_the_default_rule() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let outcome = action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -5310,7 +6183,11 @@ allow := false if {
     #[test]
     fn two_legs_taint_and_sensitive_without_an_outbound_call_pass_under_the_default_rule() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let outcome = action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -5332,7 +6209,11 @@ allow := false if {
     #[test]
     fn all_three_legs_trip_the_default_rule_in_block_mode() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
 
         let verdict =
@@ -5356,7 +6237,11 @@ allow := false if {
             }),
             true,
         );
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
 
         let verdict =
@@ -5385,7 +6270,11 @@ allow := false if {
             }),
             true,
         );
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let outcome =
             action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv");
         assert!(outcome.newly_tainted);
@@ -5403,7 +6292,11 @@ allow := false if {
     #[test]
     fn the_explicit_pair_rule_restores_taint_and_outbound_only_behavior() {
         let action = flow_action(pair_rule_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         // No sensitivity setup at all in `pair_rule_flow_cfg` -- taint
         // alone must still trip under the explicit `taint_and_outbound`
         // rule.
@@ -5422,7 +6315,11 @@ allow := false if {
     #[test]
     fn an_untainted_session_may_still_call_outbound_tools() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let verdict =
             action.flow_pre_dispatch_check(Some(&session_id), "send_email", "trusted-srv");
         assert_eq!(verdict, McpFlowVerdict::Allow);
@@ -5431,7 +6328,11 @@ allow := false if {
     #[test]
     fn trusted_server_reads_never_taint_or_mark_sensitive() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let outcome =
             action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "trusted-srv");
         assert!(!outcome.newly_tainted);
@@ -5448,7 +6349,11 @@ allow := false if {
     #[test]
     fn taint_is_sticky_across_a_later_trusted_read_under_the_pair_rule() {
         let action = flow_action(pair_rule_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         assert!(
             action
                 .flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv")
@@ -5476,7 +6381,11 @@ allow := false if {
     #[test]
     fn a_second_untrusted_read_is_not_reported_as_a_new_transition() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         assert!(
             action
                 .flow_record_entry(Some(&session_id), Some("fetch_doc"), "untrusted-srv")
@@ -5493,7 +6402,11 @@ allow := false if {
     #[test]
     fn a_second_sensitive_read_is_not_reported_as_a_new_transition() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         assert!(
             action
                 .flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-trusted-srv")
@@ -5518,7 +6431,11 @@ allow := false if {
             }),
             true,
         );
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         // Served by a *trusted* server (no taint), but the tool itself
         // is declared sensitive.
         let outcome =
@@ -5541,7 +6458,11 @@ allow := false if {
             }),
             true,
         );
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         // `tool_name: None` (a `resources/read`): even though
         // `untrusted-srv` taints, `sensitive_tools` has nothing to
         // match against without a tool name, and `untrusted-srv` is not
@@ -5554,7 +6475,11 @@ allow := false if {
     #[test]
     fn mode_off_is_a_no_op_even_when_flow_would_otherwise_trip() {
         let action = flow_action(json!({}), true); // mode omitted -> off
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         let outcome = action.flow_record_entry(
             Some(&session_id),
             Some("fetch_doc"),
@@ -5570,7 +6495,11 @@ allow := false if {
     #[test]
     fn a_tool_not_matching_outbound_tools_is_never_gated() {
         let action = flow_action(two_of_three_flow_cfg(), true);
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
         action.flow_record_entry(Some(&session_id), Some("fetch_doc"), "sensitive-untrusted-srv");
         let verdict = action.flow_pre_dispatch_check(Some(&session_id), "read_file", "trusted-srv");
         assert_eq!(
@@ -5636,8 +6565,8 @@ allow := false if {
     fn sessions_are_isolated_per_session_and_per_tenant() {
         let action = flow_action(pair_rule_flow_cfg(), true);
         let store = action.sessions.as_ref().expect("sessions enabled");
-        let tenant_a_session = store.create();
-        let tenant_b_session = store.create();
+        let tenant_a_session = store.create("acme");
+        let tenant_b_session = store.create("acme");
 
         action.flow_record_entry(Some(&tenant_a_session), Some("fetch_doc"), "untrusted-srv");
 
@@ -5683,7 +6612,11 @@ allow := false if {
             }]
         }))
         .expect("flow + argument_policies fixture compiles");
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
 
         let allow = action.evaluate_argument_policies(
             &principal_for("acme"),
@@ -5753,7 +6686,11 @@ allow := false if {
             }]
         }))
         .expect("flow + rego argument_policies fixture compiles");
-        let session_id = action.sessions.as_ref().expect("sessions enabled").create();
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("acme");
 
         let allow = action.evaluate_argument_policies(
             &principal_for("acme"),

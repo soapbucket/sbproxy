@@ -5174,11 +5174,44 @@ pub(super) async fn handle_ai_proxy(
                     ));
                 }
                 None => {
+                    // WOR-2384 (MCP10): this `None` covers two cases the
+                    // registry cannot distinguish from here -- a plain
+                    // typo (the reference names no MCP gateway at all)
+                    // and a cross-tenant reference (the reference exists,
+                    // but under a different tenant than this request's
+                    // route-derived one; `McpInjectRegistry::get` looks
+                    // up the tenant's own sub-map first, so a match under
+                    // another tenant is invisible from here by
+                    // construction). Both were previously only a `warn!`
+                    // log line, which is not durable and not
+                    // SIEM-visible unless an operator happens to be
+                    // tailing this exact target. Promoted to an audited
+                    // event so a misconfigured (or maliciously probed)
+                    // cross-tenant reference is not a silent miss --
+                    // the empty-catalog behavior itself (the request
+                    // still succeeds, with no tools injected) is
+                    // unchanged.
                     warn!(
                         mcp_ref = %inject.reference,
                         tenant = %ctx.tenant_id,
                         "AI proxy: inject_mcp references an unknown MCP gateway in the route tenant; no tools injected"
                     );
+                    sbproxy_observe::metrics::record_policy(
+                        ctx.hostname.as_str(),
+                        "mcp_inject_source",
+                        "deny",
+                    );
+                    sbproxy_observe::SecurityAuditEntry::policy_violation(
+                        "mcp_inject_source_denied",
+                        "inject_mcp reference resolved to no MCP gateway for this request's tenant",
+                        200,
+                        Some(ctx.hostname.to_string()),
+                        ctx.client_ip,
+                        Some(ctx.request_id.to_string()),
+                        Some(session.req_header().method.as_str().to_string()),
+                    )
+                    .with_tenant_id(ctx.tenant_id.to_string())
+                    .emit();
                 }
             }
         }
@@ -13994,6 +14027,98 @@ origins:
             body["tools"],
             serde_json::json!([]),
             "an empty governed MCP result must replace, never preserve, caller tools"
+        );
+    }
+
+    /// WOR-2384 (MCP10) red-first: the pipeline's MCP inject source is
+    /// compiled under `tenant-a`; issuing the same `inject_mcp.ref`
+    /// under a route resolved to `tenant-b` must resolve to no source
+    /// (this half was already true before this ticket -- see
+    /// `mcp_inject_registry_tests::task_5b_mcp_inject_lookup_fails_closed_outside_its_tenant_or_name`
+    /// in `pipeline.rs`) and, new in this ticket, must promote that
+    /// miss from a `warn!`-only log line to a durable, SIEM-visible
+    /// audit event. The request itself still succeeds with no tools
+    /// injected -- the empty-catalog behavior is unchanged.
+    #[tokio::test]
+    async fn task_5b_cross_tenant_mcp_inject_reference_is_denied_and_audited() {
+        let pipeline = pipeline_with_mcp_inject_tool("catalog.allowed");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "virtual_keys": [{
+                "key": "tenant-a-key",
+                "key_id": "tenant-a-key-id",
+                "inject_mcp": {"ref": "task-5b-pinned-dispatch"}
+            }]
+        }))
+        .expect("AI proxy config");
+        let request = serde_json::json!({
+            "model": "fixture-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        session
+            .req_header_mut()
+            .insert_header("authorization", "Bearer tenant-a-key")
+            .expect("authorization header");
+        let mut context = crate::context::RequestContext::new();
+        // The pipeline's MCP inject source is registered under
+        // `tenant-a` (see `pipeline_with_mcp_inject_tool`); this
+        // request's route resolves to `tenant-b` instead.
+        context.tenant_id = "tenant-b".into();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("AI request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "a cross-tenant inject_mcp reference must not fail the request: {response:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body: serde_json::Value = serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body");
+        assert!(
+            body.get("tools").is_none() || body["tools"] == serde_json::json!([]),
+            "a cross-tenant reference must inject no tools: {body}"
+        );
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("security"),
+            Some("mcp_inject_source_denied"),
+            None,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.tenant_id.as_deref() == Some("tenant-b")),
+            "the cross-tenant inject_mcp miss must be an audited event, not only a log line: {events:?}"
         );
     }
 
