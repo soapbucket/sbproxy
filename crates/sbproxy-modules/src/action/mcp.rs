@@ -880,9 +880,12 @@ pub struct McpAction {
     pub tool_output_judge: Option<Arc<dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge>>,
     /// Per-tool USD price map for cost attribution (WOR-1644).
     pub tool_pricing: HashMap<String, f64>,
-    /// Built usage sinks for MCP tool-call attribution (WOR-1644),
-    /// shared across requests. Empty when none are configured.
-    pub usage_sinks: Vec<Arc<dyn sbproxy_ai::usage_sink::UsageSink>>,
+    /// Usage-sink configs for MCP tool-call attribution (WOR-1644).
+    /// Built lazily by [`Self::usage_sinks`] rather than here at parse
+    /// time; see that method's doc for why (WOR-2476 review, I2).
+    usage_sinks_config: Vec<sbproxy_ai::usage_sink::UsageSinkConfig>,
+    /// Lazily built usage sinks; see [`Self::usage_sinks`].
+    usage_sinks_built: std::sync::OnceLock<Vec<Arc<dyn sbproxy_ai::usage_sink::UsageSink>>>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -1377,8 +1380,31 @@ impl McpAction {
             dual_llm_quarantine,
             tool_output_judge,
             tool_pricing: cfg.tool_pricing,
-            usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
+            // WOR-2476 review (I2): built lazily by `usage_sinks()`, not
+            // here. See that method's doc for why building eagerly, at
+            // parse time, read the egress configured-gate registry one
+            // reload too early.
+            usage_sinks_config: cfg.usage_sinks,
+            usage_sinks_built: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Built usage sinks for MCP tool-call attribution (WOR-1644), built
+    /// once on first use rather than at parse time (WOR-2476 review,
+    /// I2). `from_parsed` runs as part of compiling the pipeline
+    /// (`CompiledPipeline::from_config_at`); `reload_compiled_config_
+    /// locked` builds that pipeline before `arm_egress_gates_from_config`
+    /// installs this reload's authorizers into `sbproxy_security::
+    /// egress`'s registry (see that function's own doc for the exact
+    /// two-caller ordering). Building here, eagerly, would have read the
+    /// PREVIOUS reload's registry state -- one generation stale, the
+    /// same class of bug the boot-arming fix closed for `AiClient`, just
+    /// on the reload axis instead of the boot axis. Mirrors
+    /// `sbproxy_ai::handler::AiHandlerConfig::usage_sinks`'s laziness
+    /// exactly, for the same reason.
+    pub fn usage_sinks(&self) -> &[Arc<dyn sbproxy_ai::usage_sink::UsageSink>] {
+        self.usage_sinks_built
+            .get_or_init(|| sbproxy_ai::usage_sink::build_sinks(&self.usage_sinks_config))
     }
 
     /// USD cost for one call of `tool`, from the price map (WOR-1644).
@@ -3157,5 +3183,108 @@ mod tests {
             },
             "a judge endpoint outside the egress allowlist must be refused before connect"
         );
+    }
+
+    #[test]
+    fn usage_sinks_are_built_lazily_from_the_registry_state_at_first_use_not_at_parse_time() {
+        // WOR-2476 review (I2): `from_parsed` used to build the sinks
+        // eagerly, at parse time, via `sbproxy_ai::usage_sink::build_sinks`.
+        // `reload_compiled_config_locked` builds the pipeline (which
+        // parses every action, including this one) BEFORE
+        // `arm_egress_gates_from_config` installs the reload's
+        // authorizers into `sbproxy_security::egress`'s registry, so an
+        // eagerly-built sink was always armed with the PREVIOUS reload's
+        // registry state, one generation stale. Reproduces exactly that
+        // ordering: parse the action (nothing installed in the registry
+        // yet), install a `deny_by_default` `UsageSink` authorizer
+        // afterward, then call `usage_sinks()` for the first time and
+        // confirm the sink it lazily builds is armed with the CURRENT
+        // registry, not whatever (nothing) was live when `from_config`
+        // ran.
+        use sbproxy_security::egress::{
+            install_configured_gate, EgressAuthorizer, EgressConfig, EgressPurpose,
+            PurposeAllowlist,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        install_configured_gate(EgressPurpose::UsageSink, None);
+        install_configured_gate(EgressPurpose::Webhook, None);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "usage_sinks": [
+                { "type": "webhook", "url": "https://evil.example/ingest" }
+            ],
+            "federated_servers": [{ "origin": "example.com" }]
+        }))
+        .expect("compile");
+
+        // Installed AFTER parsing, simulating a reload that armed
+        // `egress.usage_sinks:` between this action's compile and the
+        // first tool call that would use its sinks. `WebhookSink`
+        // authorizes under `EgressPurpose::Webhook` specifically (see
+        // `sbproxy_config::compiler::compile_egress_purpose`'s doc for
+        // why `usage_sinks:` arms both purposes from one allowlist).
+        let allow = PurposeAllowlist {
+            hosts: HashSet::from(["collector.example.com".to_string()]),
+            schemes: HashSet::from(["https".to_string(), "http".to_string()]),
+            ports: HashSet::from([443, 80]),
+            allow_private: false,
+        };
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::Webhook, allow);
+        install_configured_gate(
+            EgressPurpose::Webhook,
+            Some(EgressAuthorizer::new(EgressConfig { purposes })),
+        );
+
+        // First call to `usage_sinks()` builds lazily, right now, so it
+        // must see the authorizer just installed rather than the
+        // registry's empty state at parse time. `record()` on a denied
+        // sink returns without panicking rather than reaching
+        // `tokio::spawn` (no ambient runtime in this plain #[test]),
+        // which is itself part of the proof: an eagerly-built, ungated
+        // sink would attempt the real dispatch here and panic.
+        let sinks = action.usage_sinks();
+        assert_eq!(sinks.len(), 1, "one webhook usage sink was configured");
+        let event = sbproxy_ai::usage_sink::LlmUsageEvent {
+            provider: "mcp".to_string(),
+            model: "example.com".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+            latency_ms: 1,
+            status: 200,
+            key_id: None,
+            tenant_id: None,
+            project: None,
+            user: None,
+            team: None,
+            tags: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            request_id: None,
+            session_id: None,
+            tag: None,
+            priority: None,
+            engine_version: None,
+            agent_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
+            workflow_id: None,
+            logical_model: None,
+            served_model: None,
+        };
+        sinks[0].record(&event);
+
+        let denied = sbproxy_security::egress::egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.purpose == EgressPurpose::Webhook.as_label() && s.host == "evil.example")
+            .expect("the denied dispatch must be stamped in the inventory");
+        assert_eq!(denied.status, "denied");
+
+        install_configured_gate(EgressPurpose::UsageSink, None);
+        install_configured_gate(EgressPurpose::Webhook, None);
     }
 }

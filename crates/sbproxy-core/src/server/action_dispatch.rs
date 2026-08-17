@@ -4592,8 +4592,10 @@ fn emit_mcp_tool_attribution(
     // configuration, and dropping the record here would decide it for them.
     record_billable_tool_call(ctx, tool_name, server);
 
-    // Usage-sink row: only build it when a sink is listening.
-    if mcp.usage_sinks.is_empty() {
+    // Usage-sink row: only build it when a sink is listening. Lazily
+    // built on first call (WOR-2476 review, I2); see
+    // `McpAction::usage_sinks`'s doc for why.
+    if mcp.usage_sinks().is_empty() {
         return;
     }
     let event = sbproxy_ai::usage_sink::LlmUsageEvent {
@@ -4645,7 +4647,7 @@ fn emit_mcp_tool_attribution(
         logical_model: None,
         served_model: None,
     };
-    for sink in &mcp.usage_sinks {
+    for sink in mcp.usage_sinks() {
         sink.record(&event);
     }
 }
