@@ -2867,6 +2867,7 @@ impl McpAction {
             principal_project: principal.attrs.project.as_deref(),
             principal_user: principal.attrs.user.as_deref(),
             arguments,
+            result: None,
             session_integrity: flow_labels.integrity.as_str(),
             session_sensitive_touched: flow_labels.sensitive_touched,
         };
@@ -5513,6 +5514,9 @@ allow := false if {
                 principal_project: None,
                 principal_user: None,
                 arguments: &json!({}),
+                result: None,
+                session_integrity: "trusted",
+                session_sensitive_touched: false,
             },
         );
         let outcome = evaluate_mcp_argument_expr(&PanickingExpr, &ctx);

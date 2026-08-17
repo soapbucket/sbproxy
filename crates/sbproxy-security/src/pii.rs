@@ -957,8 +957,8 @@ mod tests {
         // actually exist in the shared catalogue, and at least one
         // default-rule name (e.g. `email`) must fall outside it so the
         // "pii" complement is non-empty.
-        let all: std::collections::HashSet<&str> =
-            default_rules().iter().map(|r| r.name.as_str()).collect();
+        let rules = default_rules();
+        let all: std::collections::HashSet<&str> = rules.iter().map(|r| r.name.as_str()).collect();
         for name in secret_detector_names() {
             assert!(
                 all.contains(name),
