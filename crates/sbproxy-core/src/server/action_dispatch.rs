@@ -7253,6 +7253,7 @@ fn mcp_content_filter_for_non_tool_call(
 ///   code), so nothing live currently depends on the scrub; it runs
 ///   anyway so a future caller cannot turn this event into a leak
 ///   channel just by handing it richer text.
+///
 /// Build the `mcp_governance_decision` payload (whole-branch review,
 /// item 4 generalized the original `tools/call`-only form): `method`
 /// lands in `mcp.method.name`, and `tool_name` is `None` for a method
