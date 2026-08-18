@@ -1388,7 +1388,7 @@ fn owasp_pack_preview(
 /// sub-block naming every enabled item's canonical name, official
 /// OWASP title, resolved state, and reason - the same rows
 /// `GET /admin/owasp-api-pack` returns for the live compiled origin.
-/// See [`owasp_pack_preview`].
+/// See `owasp_pack_preview`.
 pub fn render_text(report: &PlanReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

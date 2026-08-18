@@ -4,7 +4,7 @@
 //!
 //! `owasp_api_top10` is not a real [`crate::snapshot::CompiledOrigin`]
 //! policy. It is a directive read and consumed by
-//! [`expand_owasp_pack`], called from `compiler::compile_origin` before
+//! `expand_owasp_pack`, called from `compiler::compile_origin` before
 //! the origin's `policies:` list is handed to the module crate. The
 //! entry is removed from that list during expansion, so it never
 //! reaches `Policy::from_config`'s type-string match arms; only the
@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Each of the ten OWASP API Security Top 10 (2023) items gets one row
-//! in [`ITEM_TABLE`]. A row's [`ItemRow::pieces`] list holds zero or
+//! in `ITEM_TABLE`. A row's `ItemRow::pieces` list holds zero or
 //! more independently-backing-off synthesized policies: `api1` and
 //! `api5` synthesize one apiece (sharing a single `object_authz` entry
 //! when both are enabled), and `api8` synthesizes two
@@ -37,7 +37,7 @@
 //! `response_phase_gated` (WOR-2491 review round, M1): it only takes
 //! effect in Pingora's response-phase filter, which an origin whose
 //! action responds entirely inside the request phase (`static`,
-//! `mock`, and friends - see [`action_runs_response_phase`]) never
+//! `mock`, and friends - see `action_runs_response_phase`) never
 //! reaches, so it is not synthesized there and the gap is named in the
 //! reason instead of claimed. `http_framing` runs at request phase
 //! unconditionally and stays ungated.
@@ -45,7 +45,7 @@
 //! `api7` has an empty `pieces` list but is not `NotCovered`: its
 //! control (the proxy's outbound SSRF guard) already runs
 //! unconditionally outside the policy chain, so
-//! [`ItemRow::already_enforced_reason`] reports
+//! `ItemRow::already_enforced_reason` reports
 //! [`PackItemState::Enforced`] with nothing added to `policies` - the
 //! reason is explicit that this covers only sbproxy's own outbound
 //! dials, not the backend application's own server-side URL fetching
@@ -62,18 +62,18 @@
 //! `sbproxy-modules::policy::object_authz::ObjectAuthzPolicy::decide` -
 //! the enumeration counter is only populated *inside* the `object_rules`
 //! match loop, so it stays inert without at least one operator-authored
-//! rule; see [`synth_object_authz`]'s doc comment). The state names what
+//! rule; see `synth_object_authz`'s doc comment). The state names what
 //! is missing, not whether the free fallback happens to be blocking or
 //! auditing - and here there is no free fallback yet, only a slot ready
 //! for one the moment an operator adds rules.
 //!
 //! `api3` and `api9` do not fit the `ItemRow`/`SynthPiece` table shape
-//! at all, so [`expand_owasp_pack`] special-cases both before it ever
-//! consults [`ITEM_TABLE`] for them (their table rows exist only so
+//! at all, so `expand_owasp_pack` special-cases both before it ever
+//! consults `ITEM_TABLE` for them (their table rows exist only so
 //! every [`PackItem`] variant still has one, per that invariant, and
 //! are marked unused in their own fields):
 //!
-//! - `api3` ([`expand_api3_entry`]) splits into a request half that
+//! - `api3` (`expand_api3_entry`) splits into a request half that
 //!   synthesizes nothing (`openapi_validation` and `request_validator`
 //!   both require operator-supplied content - a spec or a schema - with
 //!   no universal default, the same structural gap as `api1`'s
@@ -88,7 +88,7 @@
 //!   *transform* layer, where `JsonProjectionTransform`
 //!   (`sbproxy-modules::transform::json`) already strips named fields
 //!   from buffered response bodies via `response_body_filter`.
-//! - `api9` ([`expand_api9_entry`]) sets the origin-level
+//! - `api9` (`expand_api9_entry`) sets the origin-level
 //!   `expose_openapi` boolean (`RawOriginConfig::expose_openapi`,
 //!   confirmed origin-scoped at `types.rs:7580-7585`, not
 //!   server-level) directly, since that field is not a `type:` entry
@@ -99,7 +99,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 /// One of the ten OWASP API Security Top 10 (2023) risk items this pack
-/// can address. Every variant has a row in [`ITEM_TABLE`], even when
+/// can address. Every variant has a row in `ITEM_TABLE`, even when
 /// that row has no synthesis wired yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -127,7 +127,7 @@ pub enum PackItem {
 }
 
 impl PackItem {
-    /// Every item, in ascending OWASP numbering order. [`expand_owasp_pack`]
+    /// Every item, in ascending OWASP numbering order. `expand_owasp_pack`
     /// walks enabled items in this order so the resulting
     /// [`PackManifest`] has a stable, deterministic entry order
     /// regardless of the order the operator wrote `enable: [...]` in.
@@ -363,7 +363,7 @@ pub struct PackManifest {
     /// value the manifest admin endpoint and `sbproxy plan` surface
     /// per origin. A `per_item.<name>.posture` override changes what
     /// that one item's synthesized JSON carries (see
-    /// [`synth_object_authz`]) without changing this field; this is
+    /// `synth_object_authz`) without changing this field; this is
     /// the pack-wide default, not a per-item resolved value.
     pub posture: PackPosture,
 }
@@ -432,7 +432,7 @@ struct RawPerItem {
     posture: Option<String>,
     /// `api3`-only: field names to strip from JSON response bodies via
     /// a synthesized `json_projection` transform (see
-    /// [`expand_api3_entry`]). Rejected on any other item; rejected if
+    /// `expand_api3_entry`). Rejected on any other item; rejected if
     /// present but empty (omit the key instead - an empty list is not
     /// the same request as "strip nothing").
     #[serde(default)]
@@ -502,7 +502,7 @@ struct PieceSynthesis {
     reason: String,
 }
 
-/// One independently-backing-off policy inside an [`ItemRow`]. Most
+/// One independently-backing-off policy inside an `ItemRow`. Most
 /// items have exactly one piece; `api8` has two, so an operator who
 /// authors just one of the underlying policy types still gets the
 /// pack's coverage for the rest, with the manifest reason naming
@@ -531,7 +531,7 @@ struct SynthPiece {
     /// True when this piece's policy only takes effect during
     /// response-phase processing (WOR-2491 review round, M1): today
     /// only `api8`'s `security_headers` piece. See
-    /// [`action_runs_response_phase`] for which action types reach
+    /// `action_runs_response_phase` for which action types reach
     /// that phase; every other piece leaves this `false`.
     response_phase_gated: bool,
     /// Synthesizes this one policy entry.
@@ -587,7 +587,7 @@ fn action_runs_response_phase(action_type: &str) -> bool {
 /// One row of the per-item expansion table.
 ///
 /// `pieces` is empty for items with no synthesis target at all.
-/// [`ItemRow::already_enforced_reason`] distinguishes "genuinely
+/// `ItemRow::already_enforced_reason` distinguishes "genuinely
 /// nothing to add, and nothing is covered" (`api2`, `api3`, `api6`,
 /// `api9`, `api10` in this pack version: [`PackItemState::NotCovered`],
 /// `uncovered_reason` explains the gap) from "genuinely nothing to add,
@@ -675,7 +675,7 @@ fn synth_object_authz(posture: PackPosture) -> PieceSynthesis {
 /// join). `function_rules` is explicitly empty: real BFLA coverage
 /// needs an operator-authored rule naming the privileged path, method
 /// set, and required role, which this pack cannot infer. `posture`
-/// threads into `test_mode` for consistency with [`synth_object_authz`],
+/// threads into `test_mode` for consistency with `synth_object_authz`,
 /// though with `function_rules` empty `decide()`'s BFLA loop never
 /// runs either way, so `test_mode` has no observable effect until an
 /// operator adds a rule.
@@ -1214,7 +1214,7 @@ fn expand_api9_entry(was_already_true: bool) -> PackManifestEntry {
     }
 }
 
-/// The `api1` piece: shared with `api5`, see [`synth_object_authz`].
+/// The `api1` piece: shared with `api5`, see `synth_object_authz`.
 const API1_PIECES: [SynthPiece; 1] = [SynthPiece {
     backoff_types: &["object_authz", "bola"],
     operator_backoff_reason: "origin already authors an object_authz/bola policy; the pack \
@@ -1256,7 +1256,7 @@ const API5_PIECES: [SynthPiece; 1] = [SynthPiece {
 /// `security_headers` is `response_phase_gated: true` (WOR-2491
 /// review round, M1): it only takes effect in Pingora's response
 /// filter, so it is not synthesized on an origin whose action never
-/// reaches that filter (see [`action_runs_response_phase`]).
+/// reaches that filter (see `action_runs_response_phase`).
 /// `http_framing` runs at request phase instead, via the
 /// `check_policies` enforcer registry every origin goes through
 /// before any action dispatch decision, independent of action type -
@@ -1401,7 +1401,7 @@ const ITEM_TABLE: [ItemRow; 10] = [
 ];
 
 /// Looks up an item's table row. Every [`PackItem`] variant has exactly
-/// one row in [`ITEM_TABLE`], so this only returns `None` if a future
+/// one row in `ITEM_TABLE`, so this only returns `None` if a future
 /// edit adds a variant without adding its row; callers turn that into
 /// an `anyhow` error rather than a panic.
 fn item_row(item: PackItem) -> Option<&'static ItemRow> {
@@ -1423,7 +1423,7 @@ fn parse_item_or_bail(hostname: &str, raw: &str, context: &str) -> anyhow::Resul
 
 /// Resolves the `enable:` value into a validated, deduplicated list of
 /// items, in the order the operator wrote them (order does not matter
-/// downstream: [`expand_owasp_pack`] walks [`PackItem::ALL`] order).
+/// downstream: `expand_owasp_pack` walks [`PackItem::ALL`] order).
 fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>> {
     match raw {
         RawEnable::All(word) => {
@@ -1460,7 +1460,7 @@ fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>
 /// only), and removes the pseudo-policy entry itself so it never
 /// reaches `sbproxy-modules::compile.rs`'s type-string match arms.
 /// Also flips `*expose_openapi` to `true` when `api9` is enabled and
-/// it was not already (see [`expand_api9_entry`]).
+/// it was not already (see `expand_api9_entry`).
 ///
 /// `action_type` is the origin's action's own `type:` string (`""`
 /// when absent or not yet known, which resolves the same as any other
@@ -1470,7 +1470,7 @@ fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>
 /// which only runs for actions that dial a real upstream peer, so an
 /// action handled entirely in the request phase (`static`, `mock`,
 /// and friends) gets the reason named instead of a claim nothing
-/// enforces. See [`action_runs_response_phase`].
+/// enforces. See `action_runs_response_phase`.
 ///
 /// Returns `Ok(None)` when the origin has no `owasp_api_top10` entry -
 /// `transforms` and `*expose_openapi` are left untouched in that case.
