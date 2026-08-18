@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -383,6 +383,7 @@ proxy:
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
 | `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, or Redis. |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
+| `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Not supported. Setting it fails config load. See [messenger_settings](#messenger_settings). |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honored. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
@@ -866,6 +867,46 @@ snapshots, and backups as prompt data. Deleted and expired pages are reusable,
 but redb may keep the file at its high-water allocation instead of shrinking it
 immediately. Use explicit Redis or mesh state for traffic that can move between
 processes.
+
+### config_history
+
+`proxy.config_history` opens a durable, content-addressed ring of every
+config this proxy applies, kept as plain files on local disk. Disabled by
+default, like every other opt-in `proxy`-level block; an existing deployment
+does not start writing config revisions anywhere until you turn it on.
+
+```yaml
+proxy:
+  config_history:
+    enabled: true
+    dir: /var/lib/sbproxy/config-history
+    keep: 20
+    keep_rejected: 10
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. |
+| `dir` | string | `/var/lib/sbproxy/config-history` | Directory the ring lives in. |
+| `keep` | int | `20` | Applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1. |
+| `keep_rejected` | int | `10` | Rejected-candidate entries the ring retains for operator inspection. |
+
+Each entry stores the pre-resolution config bytes: exactly what was read off
+disk, git, or the config authority, before `${VAR}` and
+`vault://`/`secret://` references were resolved. A secret never lands in a
+stored entry, the same guarantee
+[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) makes for
+the live editor. Stored documents are zstd-compressed; `zstdcat` reads one
+directly off disk while the process is stopped.
+
+The directory is a one-process durability boundary, not shared fleet state,
+the same as [`compression_state`](#compression_state): a config authority
+publish can never repoint or clear it.
+
+For what the ring records today, and what it deliberately does not do yet,
+see [operator-runbook.md](operator-runbook.md#config-history-ring). The
+admin routes that read it back are documented in
+[admin-api-reference.md](admin-api-reference.md#get-adminconfighistory).
 
 ### messenger_settings
 
