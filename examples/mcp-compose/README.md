@@ -133,7 +133,7 @@ refused the call rather than serving it with no evidence behind it.
   (CEL, per-call skip)
 - `${steps.<name>.status}` interpolation reading a prior step's
   outcome
-- `response.lua`, run over `input = {args, steps}`, indexing into a
+- `response.lua`, run over `ctx = {args, steps}`, indexing into a
   step's result array natively where `${}` cannot
 - `rbac_policies` default-deny gating a `type: local` tool the same
   way it gates a federated one

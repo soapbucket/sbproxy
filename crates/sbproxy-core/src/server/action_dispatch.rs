@@ -13877,21 +13877,70 @@ mod mcp_catalog_snapshot_tests {
         })
     }
 
-    /// Pins the `steps` handler's `response.template` placeholder:
-    /// WOR-2489 Task 4's scope is the DAG executor itself, so a
-    /// completed DAG with `response: {template: ...}` configured must
-    /// still fail with a named internal error, now pointing at Task 5
-    /// -- the same "name the gap, fail loudly" pattern earlier tasks
-    /// used for their own gaps. Before this task, this same shape
-    /// failed for an unrelated reason (`steps` had no executor at
-    /// all, WOR-2489 Task 4); now the DAG runs to completion and it is
-    /// specifically the shaping step that is still unimplemented.
+    // --- `type: local` response shaping (WOR-2489 Task 5) ---
+    //
+    // Continues the section above: `steps_response_shaping_fixture`
+    // builds a one-step DAG that always completes successfully, so
+    // every test below is entirely about what the `response:` engine
+    // does with the real, completed `steps_context` -- not about
+    // whether the DAG itself runs (Task 4 already proved that).
+
+    /// Red-first: `response.template` must actually shape the final
+    /// result -- interpolating `${args.*}` and `${steps.<name>.*}`
+    /// against a JSON document parsed from the stored template string
+    /// -- through the full DAG executor and JSON-RPC dispatch. Before
+    /// this task, this exact shape failed with a named "no shaping
+    /// engine yet" internal error (WOR-2489 Task 4's placeholder).
     #[tokio::test]
-    async fn wor_2489_steps_response_template_returns_a_clear_task_5_error() {
-        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+    async fn wor_2489_steps_response_template_shapes_the_final_result() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
         let action = McpAction::from_config(steps_response_shaping_fixture(
             addr,
-            json!({"template": "fixed"}),
+            json!({
+                "template": "{\"greeting\": \"hi ${args.name}\", \"answer\": \"${steps.only.body.value}\", \"code\": \"${steps.only.status}\"}"
+            }),
+        ))
+        .expect("template response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {"name": "ada"}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+        assert_eq!(call["result"]["isError"], json!(false));
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(
+            document,
+            json!({"greeting": "hi ada", "answer": 42, "code": 200}),
+            "template shaping must splice typed values from args and steps, got: {document:?}"
+        );
+    }
+
+    /// Red-first: `response.template` referencing a path absent from
+    /// both `args` and `steps` must fail the call closed with a clean
+    /// JSON-RPC error -- never an empty-string splice, mirroring
+    /// `${}`'s existing fail-closed rule for `url`/`body` fields.
+    #[tokio::test]
+    async fn wor_2489_steps_response_template_missing_path_fails_closed() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"template": "{\"x\": \"${steps.only.body.nonexistent}\"}"}),
         ))
         .expect("template response-shaping DAG fixture compiles");
         action
@@ -13912,18 +13961,62 @@ mod mcp_catalog_snapshot_tests {
         .await;
         let message = call["error"]["message"]
             .as_str()
-            .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
-        assert!(message.contains("WOR-2489 Task 5"), "{message}");
-        assert!(message.contains("response.template"), "{message}");
+            .unwrap_or_else(|| panic!("expected a clean JSON-RPC error, got: {call:?}"));
+        assert!(
+            message.contains("does not resolve against the call arguments"),
+            "a missing template path must fail closed with a named reason, got: {message}"
+        );
     }
 
-    /// Same pin as above, for `response.js`.
+    /// Red-first: `response.js` runs the QuickJS sandbox over a real
+    /// `ctx = {args, steps}` binding and its completion value becomes
+    /// the tool result -- a bare expression, matching
+    /// `sbproxy-core::decision_script::evaluate`'s own entry
+    /// convention, not a named-function call.
     #[tokio::test]
-    async fn wor_2489_steps_response_js_returns_a_clear_task_5_error() {
-        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
-        let action =
-            McpAction::from_config(steps_response_shaping_fixture(addr, json!({"js": "1"})))
-                .expect("js response-shaping DAG fixture compiles");
+    async fn wor_2489_steps_response_js_shapes_the_final_result() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"js": "({greeting: 'hi ' + ctx.args.name, answer: ctx.steps.only.body.value})"}),
+        ))
+        .expect("js response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {"name": "ada"}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(document, json!({"greeting": "hi ada", "answer": 42}));
+    }
+
+    /// Red-first: a `response.js` script that throws must fail the
+    /// whole tool call closed -- a clean JSON-RPC error, never a
+    /// partial or default result.
+    #[tokio::test]
+    async fn wor_2489_steps_response_js_throw_fails_the_call_closed() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"js": "(() => { throw new Error('shaping refuses'); })()"}),
+        ))
+        .expect("js response-shaping DAG fixture compiles");
         action
             .federation
             .refresh_tools()
@@ -13942,18 +14035,103 @@ mod mcp_catalog_snapshot_tests {
         .await;
         let message = call["error"]["message"]
             .as_str()
-            .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
-        assert!(message.contains("WOR-2489 Task 5"), "{message}");
-        assert!(message.contains("response.js"), "{message}");
+            .unwrap_or_else(|| panic!("expected a clean JSON-RPC error, got: {call:?}"));
+        assert!(
+            message.contains("response.js failed"),
+            "a throwing script must fail closed and name the field, got: {message}"
+        );
     }
 
-    /// Same pin as above, for `response.lua`.
+    /// Red-first: a `response.js` busy loop must be killed by the
+    /// QuickJS engine's own CPU-budget watchdog (mirroring
+    /// `sbproxy-extension::js`'s own `while (true) {}` timeout test
+    /// idiom) and fail the call closed well within the process's
+    /// default 100ms budget -- not hang the request.
     #[tokio::test]
-    async fn wor_2489_steps_response_lua_returns_a_clear_task_5_error() {
-        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
-        let action =
-            McpAction::from_config(steps_response_shaping_fixture(addr, json!({"lua": "1"})))
-                .expect("lua response-shaping DAG fixture compiles");
+    async fn wor_2489_steps_response_js_busy_loop_is_killed_by_the_watchdog() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"js": "(() => { while (true) {} })()"}),
+        ))
+        .expect("js response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let started = std::time::Instant::now();
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the watchdog must kill the busy loop well within its budget, took {:?}",
+            started.elapsed()
+        );
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a clean JSON-RPC error, got: {call:?}"));
+        assert!(
+            message.contains("response.js failed"),
+            "a watchdog-killed script must fail closed and name the field, got: {message}"
+        );
+    }
+
+    /// Red-first: `response.lua` runs the Luau sandbox over the same
+    /// real `ctx = {args, steps}` binding, with an explicit top-level
+    /// `return` (Lua has no implicit last-expression value).
+    #[tokio::test]
+    async fn wor_2489_steps_response_lua_shapes_the_final_result() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"lua": "return {greeting = 'hi ' .. ctx.args.name, answer = ctx.steps.only.body.value}"}),
+        ))
+        .expect("lua response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {"name": "ada"}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(document, json!({"greeting": "hi ada", "answer": 42}));
+    }
+
+    /// Red-first: a `response.lua` script that errors (rather than
+    /// returning) must fail the whole tool call closed.
+    #[tokio::test]
+    async fn wor_2489_steps_response_lua_error_fails_the_call_closed() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"lua": "error('shaping refuses')"}),
+        ))
+        .expect("lua response-shaping DAG fixture compiles");
         action
             .federation
             .refresh_tools()
@@ -13972,9 +14150,109 @@ mod mcp_catalog_snapshot_tests {
         .await;
         let message = call["error"]["message"]
             .as_str()
-            .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
-        assert!(message.contains("WOR-2489 Task 5"), "{message}");
-        assert!(message.contains("response.lua"), "{message}");
+            .unwrap_or_else(|| panic!("expected a clean JSON-RPC error, got: {call:?}"));
+        assert!(
+            message.contains("response.lua failed"),
+            "an erroring script must fail closed and name the field, got: {message}"
+        );
+    }
+
+    /// Red-first: a `response.lua` busy loop must be killed by the
+    /// Luau engine's own wall-clock watchdog (mirroring
+    /// `sbproxy-extension::lua`'s own `while true do end` timeout test
+    /// idiom) and fail the call closed quickly, not hang the request.
+    #[tokio::test]
+    async fn wor_2489_steps_response_lua_busy_loop_is_killed_by_the_watchdog() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"lua": "while true do end"}),
+        ))
+        .expect("lua response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let started = std::time::Instant::now();
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the watchdog must kill the busy loop well within its budget, took {:?}",
+            started.elapsed()
+        );
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a clean JSON-RPC error, got: {call:?}"));
+        assert!(
+            message.contains("response.lua failed"),
+            "a watchdog-killed script must fail closed and name the field, got: {message}"
+        );
+    }
+
+    /// Red-first: `response:` shaping is also honored on a standalone
+    /// (non-`steps`) `http` local tool -- the call's own `{status,
+    /// headers, body}` document is exposed under `steps.<tool_name>`,
+    /// the same `ctx = {args, steps}` vocabulary a `steps` DAG binds,
+    /// so an operator who has learned one has learned the other.
+    #[tokio::test]
+    async fn wor_2489_http_local_tool_response_shaping_binds_steps_by_tool_name() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-http-response-shaping-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "http-response-shaping-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "a single http call with response shaping",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "http": {"method": "GET", "url": format!("http://{addr}/")},
+                    "response": {
+                        "template": "{\"doubled\": \"${steps.fetch.body.value}\"}"
+                    }
+                }]
+            }]
+        }))
+        .expect("http response-shaping tool fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(document, json!({"doubled": 42}));
     }
 
     /// Red-first: a DAG declared out of dependency order (`second`

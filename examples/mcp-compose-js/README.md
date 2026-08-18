@@ -6,7 +6,7 @@ Identical to [`examples/mcp-compose`](../mcp-compose/): the same
 two-step DAG against `test.sbproxy.dev`'s `hello`/`echo` tools, the
 same `condition`, the same RBAC and evidence config. The only
 difference is `response.js` instead of `response.lua`, to show that
-both response-shaping engines bind the same `input = {args, steps}`
+both response-shaping engines bind the same `ctx = {args, steps}`
 context. Read that example's README first; this page only calls out
 what's different.
 
@@ -14,9 +14,9 @@ what's different.
 
 ```js
 (() => {
-  const greeting = input.steps.hello.body.result.content[0].text;
+  const greeting = ctx.steps.hello.body.result.content[0].text;
   const result = { greeting };
-  const echo = input.steps.echo;
+  const echo = ctx.steps.echo;
   if (echo && echo.body) {
     result.echoed = echo.body.result.content[0].text;
   }
@@ -53,7 +53,7 @@ Same calls, same outcomes as the Call section of
 
 ## What this exercises
 
-- `response.js` over `input = {args, steps}`, the JavaScript twin of
+- `response.js` over `ctx = {args, steps}`, the JavaScript twin of
   `response.lua`
 - The QuickJS sandbox's expression-evaluation entry convention
 - Everything the What this exercises section of

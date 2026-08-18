@@ -151,9 +151,9 @@ origins:
                 response:
                   lua: |
                     -- Luau tables are 1-indexed, unlike the JS sandbox.
-                    local greeting = input.steps.hello.body.result.content[1].text
+                    local greeting = ctx.steps.hello.body.result.content[1].text
                     local result = { greeting = greeting }
-                    local echo = input.steps.echo
+                    local echo = ctx.steps.echo
                     if echo ~= nil and echo.body ~= nil then
                       result.echoed = echo.body.result.content[1].text
                     end

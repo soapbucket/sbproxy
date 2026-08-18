@@ -1079,6 +1079,15 @@ pub struct McpLocalToolConfig {
     /// response from their outputs. See [`McpLocalStepsConfig`].
     #[serde(default)]
     pub steps: Option<McpLocalStepsConfig>,
+    /// Shapes a standalone `http` handler's response from
+    /// `template`/`js`/`lua` (WOR-2489 Task 5). Only valid alongside
+    /// `http`: a `steps` handler configures its own response shaping
+    /// under `steps.response` instead, and `static` never calls out so
+    /// there is nothing to shape. Omitted means `http`'s own `{status,
+    /// headers, body}` document is returned unshaped, exactly as
+    /// before this field existed.
+    #[serde(default)]
+    pub response: Option<McpLocalResponseConfig>,
 }
 
 /// One HTTP call: the shared shape for a tool's `http` handler and a
@@ -1168,22 +1177,43 @@ pub struct McpLocalStepConfig {
     pub retry: Option<super::RetryConfig>,
 }
 
-/// How a `steps` handler shapes its final response (WOR-2489). Exactly
-/// one field is set; declaring zero or more than one is a
-/// config-compile error. No `cel:` variant: CEL only returns a scalar,
-/// and a response shape needs a document -- the same reasoning
-/// `sbproxy-config`'s cache-decision script config (`key_event` /
-/// `admit_event`) already applies by refusing a `cel` engine there.
+/// How a `steps` handler (or an `http` handler that opts in via
+/// [`McpLocalToolConfig::response`]) shapes its final response
+/// (WOR-2489). Exactly one field is set; declaring zero or more than
+/// one is a config-compile error. No `cel:` variant: CEL only returns
+/// a scalar, and a response shape needs a document -- the same
+/// reasoning `sbproxy-config`'s cache-decision script config
+/// (`key_event` / `admit_event`) already applies by refusing a `cel`
+/// engine there.
+///
+/// `js`/`lua` bind the identical entry convention that
+/// cache-decision script (`sbproxy-core::decision_script::evaluate`)
+/// already uses: a single `ctx` global set to `{"args": <call
+/// arguments>, "steps": <step outputs so far>}` before the script
+/// runs, and the script's own completion value -- a bare expression in
+/// JS, an explicit top-level `return` in Lua -- is the shaped
+/// document. This is deliberately *not* the `modify_json(data, ctx)`
+/// named-function convention `sbproxy-modules::transform`'s
+/// `JsJsonTransform`/`LuaJsonTransform` use: those exist to mutate an
+/// existing document in place, and a response-shaping script has no
+/// existing document to mutate, only a context to read and a document
+/// to produce -- exactly `decision_script`'s shape, not `transform`'s
+/// (WOR-2489 Task 5).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpLocalResponseConfig {
-    /// A template string interpolated against step outputs.
+    /// A JSON document (as literal text) interpolated against `{args,
+    /// steps}` with the same `${...}` engine a `body:` field uses:
+    /// parsed as JSON first, then every string leaf run through
+    /// [`mcp_interpolate::interpolate_json_tree`] (WOR-2489 Task 5).
     #[serde(default)]
     pub template: Option<String>,
-    /// A JavaScript expression (QuickJS) producing the response.
+    /// A JavaScript expression (QuickJS) producing the response. See
+    /// this struct's doc comment for the `ctx` binding.
     #[serde(default)]
     pub js: Option<String>,
-    /// A Lua expression (Luau) producing the response.
+    /// A Lua expression (Luau) producing the response. See this
+    /// struct's doc comment for the `ctx` binding.
     #[serde(default)]
     pub lua: Option<String>,
 }
@@ -2629,8 +2659,12 @@ impl std::fmt::Debug for CompiledLocalMcpTool {
 pub(crate) enum CompiledLocalToolHandler {
     /// Always returns this value.
     Static(serde_json::Value),
-    /// Makes one HTTP call.
-    Http(CompiledLocalHttpCall),
+    /// Makes one HTTP call, optionally shaping the response (WOR-2489
+    /// Task 5, [`McpLocalToolConfig::response`]).
+    Http {
+        call: CompiledLocalHttpCall,
+        response: Option<CompiledLocalResponseShaping>,
+    },
     /// Runs a step DAG.
     Steps(CompiledLocalSteps),
 }
@@ -2639,7 +2673,11 @@ impl std::fmt::Debug for CompiledLocalToolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Static(value) => f.debug_tuple("Static").field(value).finish(),
-            Self::Http(call) => f.debug_tuple("Http").field(call).finish(),
+            Self::Http { call, response } => f
+                .debug_struct("Http")
+                .field("call", call)
+                .field("response", response)
+                .finish(),
             Self::Steps(steps) => f.debug_tuple("Steps").field(steps).finish(),
         }
     }
@@ -2800,11 +2838,31 @@ fn compile_local_tool(
     }
 
     let handler = match (&tool.r#static, &tool.http, &tool.steps) {
-        (Some(value), None, None) => CompiledLocalToolHandler::Static(value.clone()),
+        (Some(value), None, None) => {
+            anyhow::ensure!(
+                tool.response.is_none(),
+                "{site}: response: is only valid alongside http (a static value never calls out, \
+                 so there is nothing to shape)"
+            );
+            CompiledLocalToolHandler::Static(value.clone())
+        }
         (None, Some(http), None) => {
-            CompiledLocalToolHandler::Http(compile_local_http_call(&site, http)?)
+            let response = tool
+                .response
+                .as_ref()
+                .map(|r| compile_local_response(&site, r))
+                .transpose()?;
+            CompiledLocalToolHandler::Http {
+                call: compile_local_http_call(&site, http)?,
+                response,
+            }
         }
         (None, None, Some(steps)) => {
+            anyhow::ensure!(
+                tool.response.is_none(),
+                "{site}: response: at the tool level is only valid alongside http; a steps \
+                 handler configures its own response shaping under `steps.response` instead"
+            );
             CompiledLocalToolHandler::Steps(compile_local_steps(&site, steps)?)
         }
         (None, None, None) => {
@@ -3146,15 +3204,21 @@ fn local_http_dial_client(
 /// Execute one `http` handler: interpolate `url`/`headers`/`body`
 /// against the call's arguments, authorize and DNS-pin the dial
 /// (WOR-2080), send with `retry`/`timeout` honored, and shape the
-/// response into an MCP tool-result document.
+/// response into an MCP tool-result document -- either the plain
+/// `{status, headers, body}` document (no `response:` configured) or,
+/// when one is, [`shape_local_response`] (WOR-2489 Task 5).
 async fn execute_local_http_call(
     server: &CompiledLocalMcpServer,
+    tool_name: &str,
     call: &CompiledLocalHttpCall,
+    response: Option<&CompiledLocalResponseShaping>,
     arguments: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     execute_local_http_call_with_resolver(
         server,
+        tool_name,
         call,
+        response,
         arguments,
         &sbproxy_security::egress::SystemHostResolver,
     )
@@ -3168,17 +3232,45 @@ async fn execute_local_http_call(
 /// [`sbproxy_security::egress::SystemHostResolver`].
 async fn execute_local_http_call_with_resolver(
     server: &CompiledLocalMcpServer,
+    tool_name: &str,
     call: &CompiledLocalHttpCall,
+    response: Option<&CompiledLocalResponseShaping>,
     arguments: &serde_json::Value,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<serde_json::Value> {
     let context = mcp_interpolate::args_context(arguments);
     let (status, document) =
         run_local_http_call_with_resolver(server, call, &context, resolver).await?;
-    Ok(serde_json::json!({
-        "content": [{"type": "text", "text": document.to_string()}],
-        "isError": !status.is_success(),
-    }))
+    let Some(response_cfg) = response else {
+        return Ok(serde_json::json!({
+            "content": [{"type": "text", "text": document.to_string()}],
+            "isError": !status.is_success(),
+        }));
+    };
+    // Response shaping only ever runs over a completed call: a
+    // non-2xx status fails the whole tool call closed here, the same
+    // rule a `steps` DAG step with no `continue_on_error` already
+    // applies (WOR-2489 Task 4's `run_local_step_with_resolver`) --
+    // applied at the single-call layer too, so "shape a result" means
+    // the same thing everywhere `response:` is offered. Without
+    // `response:` configured (the branch above), a non-2xx status is
+    // never a failure here, unchanged from Task 3.
+    anyhow::ensure!(
+        status.is_success(),
+        "mcp: local tool '{tool_name}' on server '{}' returned non-success status {}; response \
+         shaping did not run",
+        server.name,
+        status.as_u16()
+    );
+    let mut steps_context = serde_json::Map::with_capacity(1);
+    steps_context.insert(tool_name.to_string(), document);
+    shape_local_response(
+        &server.name,
+        tool_name,
+        response_cfg,
+        arguments,
+        &steps_context,
+    )
 }
 
 /// The shared half of [`execute_local_http_call_with_resolver`]:
@@ -3527,6 +3619,108 @@ fn local_steps_topological_order(steps: &[CompiledLocalStep]) -> Vec<usize> {
     order
 }
 
+// --- Response shaping (WOR-2489 Task 5) ---
+//
+// One shared function, [`shape_local_response`], serves both callers:
+// a `steps` DAG's final response (over the full `steps_context` map
+// [`run_local_steps_dag`] built as it ran) and a standalone `http`
+// handler that opts into shaping (over a single-entry map keyed by its
+// own tool name, built by [`execute_local_http_call_with_resolver`]).
+// Both bind the identical `ctx = {"args": ..., "steps": ...}`
+// vocabulary, so an operator who has learned one has learned the
+// other.
+
+/// Shape a completed call's response from `template`/`js`/`lua`
+/// (WOR-2489 Task 5), returning the final MCP tool-result document
+/// (`{"content": [...], "isError": false}` -- shaping never produces
+/// `isError: true`; a script that wants the call to read as failed
+/// throws instead, which this function surfaces as `Err`, the same
+/// "tool-call error, never a partial result" outcome a syntax error or
+/// a watchdog-killed busy loop produces).
+///
+/// `js`/`lua` bind a single `ctx` global (matching
+/// `sbproxy-core::decision_script::evaluate`'s own `{"ctx": ...}` cache
+/// -decision-script convention, which
+/// [`McpLocalResponseConfig`]'s doc comment already points at) and run
+/// the script's completion value as the result: a bare expression in
+/// JS (`JsEngine::execute`), an explicit top-level `return` in Lua
+/// (`LuaEngine::execute`). Neither engine gets a wrapping timeout here
+/// -- each already enforces its own CPU-budget watchdog
+/// (`proxy.scripting.{javascript,lua}.sandbox`), and a script that
+/// exceeds it is killed and surfaces as `Err` through the same path a
+/// thrown exception does, exactly matching this task's "watchdogs and
+/// timeouts exactly as the existing engines configure them" binding.
+/// `template` runs the same `${...}` engine a `body:` field already
+/// uses ([`mcp_interpolate::interpolate_json_tree`]): the stored string
+/// is parsed as JSON first (a parse failure is a tool-call error, not a
+/// config-compile error -- `template`/`js`/`lua` are all stored as
+/// opaque strings at compile time, WOR-2489 Task 1), then every string
+/// leaf is interpolated against `ctx`, fail-closed on any unresolved
+/// `${...}` path exactly like a `body:` field.
+fn shape_local_response(
+    server_name: &str,
+    tool_name: &str,
+    response_cfg: &CompiledLocalResponseShaping,
+    arguments: &serde_json::Value,
+    steps_context: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let ctx = serde_json::json!({
+        "args": arguments,
+        "steps": serde_json::Value::Object(steps_context.clone()),
+    });
+
+    let shaped = match response_cfg {
+        CompiledLocalResponseShaping::Template(template) => {
+            let parsed: serde_json::Value = serde_json::from_str(template).map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' \
+                     response.template is not valid JSON: {e}"
+                )
+            })?;
+            mcp_interpolate::interpolate_json_tree(&parsed, &ctx).map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.template: {e}"
+                )
+            })?
+        }
+        CompiledLocalResponseShaping::Js(script) => {
+            let mut globals = HashMap::with_capacity(1);
+            globals.insert("ctx".to_string(), ctx);
+            let engine = sbproxy_extension::js::JsEngine::new().map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.js: \
+                     engine unavailable: {e}"
+                )
+            })?;
+            engine.execute(script, globals).map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.js failed: {e}"
+                )
+            })?
+        }
+        CompiledLocalResponseShaping::Lua(script) => {
+            let mut globals = HashMap::with_capacity(1);
+            globals.insert("ctx".to_string(), ctx);
+            let engine = sbproxy_extension::lua::LuaEngine::new().map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.lua: \
+                     engine unavailable: {e}"
+                )
+            })?;
+            engine.execute(script, globals).map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.lua failed: {e}"
+                )
+            })?
+        }
+    };
+
+    Ok(serde_json::json!({
+        "content": [{"type": "text", "text": shaped.to_string()}],
+        "isError": false,
+    }))
+}
+
 /// Run one DAG step's HTTP call and decide whether it counts as
 /// complete. Unlike a standalone `http` tool (which never turns a
 /// non-2xx response into an `Err`), a `steps` DAG step does: a
@@ -3662,28 +3856,15 @@ async fn run_local_steps_dag(
     }
 
     match &steps_cfg.response {
-        // WOR-2489 Task 5 shapes a `steps` handler's response from
-        // `template`/`js`/`lua`; this task's scope is the DAG executor
-        // only. Mirrors the exact "name the gap, fail loudly" pattern
-        // Task 3 used for this same handler's placeholder.
-        Some(CompiledLocalResponseShaping::Template(_)) => Err(anyhow::anyhow!(
-            "mcp: local tool '{tool_name}' on server '{}' configures `steps.response.template`, \
-             which has no shaping engine yet (WOR-2489 Task 5); omit `response:` to get the \
-             last completed step's own result",
-            server.name
-        )),
-        Some(CompiledLocalResponseShaping::Js(_)) => Err(anyhow::anyhow!(
-            "mcp: local tool '{tool_name}' on server '{}' configures `steps.response.js`, \
-             which has no shaping engine yet (WOR-2489 Task 5); omit `response:` to get the \
-             last completed step's own result",
-            server.name
-        )),
-        Some(CompiledLocalResponseShaping::Lua(_)) => Err(anyhow::anyhow!(
-            "mcp: local tool '{tool_name}' on server '{}' configures `steps.response.lua`, \
-             which has no shaping engine yet (WOR-2489 Task 5); omit `response:` to get the \
-             last completed step's own result",
-            server.name
-        )),
+        // WOR-2489 Task 5: shape the final response from `template`/
+        // `js`/`lua` over the completed `steps_context` map.
+        Some(response_cfg) => shape_local_response(
+            &server.name,
+            tool_name,
+            response_cfg,
+            arguments,
+            &steps_context,
+        ),
         // No shaping configured: the default is the last step (in
         // execution order) that actually completed, returned exactly
         // as its own `http` call would have been (WOR-2489 Task 4).
@@ -3817,8 +3998,9 @@ impl McpAction {
 
         match &tool.handler {
             CompiledLocalToolHandler::Static(value) => Ok(local_static_tool_result(value)),
-            CompiledLocalToolHandler::Http(call) => {
-                execute_local_http_call(server, call, &arguments).await
+            CompiledLocalToolHandler::Http { call, response } => {
+                execute_local_http_call(server, tool_name, call, response.as_ref(), &arguments)
+                    .await
             }
             CompiledLocalToolHandler::Steps(steps_cfg) => {
                 let condition_ctx = self.local_step_condition_context(
@@ -9233,15 +9415,24 @@ allow := false if {
             CompiledLocalToolHandler::Static(v) => assert_eq!(v, json!({"ok": true})),
             other => panic!("expected Static, got {other:?}"),
         }
-        match CompiledLocalToolHandler::Http(CompiledLocalHttpCall {
-            method: "GET".to_string(),
-            url: "https://api.example.com/c".to_string(),
-            headers: BTreeMap::new(),
-            body: None,
-            retry: None,
-            timeout: None,
-        }) {
-            CompiledLocalToolHandler::Http(call) => assert_eq!(call.method, "GET"),
+        let http_handler = CompiledLocalToolHandler::Http {
+            call: CompiledLocalHttpCall {
+                method: "GET".to_string(),
+                url: "https://api.example.com/c".to_string(),
+                headers: BTreeMap::new(),
+                body: None,
+                retry: None,
+                timeout: None,
+            },
+            response: Some(CompiledLocalResponseShaping::Template(
+                "{\"ok\": \"${args.ok}\"}".to_string(),
+            )),
+        };
+        match http_handler {
+            CompiledLocalToolHandler::Http { call, response } => {
+                assert_eq!(call.method, "GET");
+                assert!(response.is_some());
+            }
             other => panic!("expected Http, got {other:?}"),
         }
         match CompiledLocalResponseShaping::Js("1 + 1".to_string()) {

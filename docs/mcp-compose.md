@@ -97,6 +97,20 @@ http:
 numeric status code, default `[connect_error, timeout]`), and
 `backoff_ms` (default `100`, doubled per attempt, capped at 5s).
 
+A tool with an `http` handler can also set its own `response:`
+(sibling of `http:`, not nested inside it) to shape the call's result
+with the same `template`/`js`/`lua` engines a `steps` handler's
+`response:` uses -- see [Response shaping](#response-shaping) below.
+The call's own `{status, headers, body}` document is bound under
+`steps.<tool name>` in that case, so a single-call `http` tool and a
+`steps` DAG bind the identical `ctx = {args, steps}` vocabulary.
+Shaping only runs over a completed (2xx) call; a non-2xx response
+fails the tool call closed instead of running `response:` against it,
+the same rule a `steps` DAG step with no `continue_on_error` already
+applies. Omit `response:` to keep today's behavior: the plain
+`{status, headers, body}` document, `isError` set from the HTTP
+status.
+
 ### `steps`
 
 Runs a dependency-ordered DAG of HTTP calls, then shapes one response
@@ -315,12 +329,13 @@ returning a partial response from whichever steps happened to finish.
 
 ## Response shaping
 
-A `steps` handler's `response:` is exactly one of `template`, `js`, or
-`lua`; declaring more than one is a config-compile error. All three
+A `steps` handler's `response:` (or an `http` handler's own opt-in
+`response:`, see [above](#http)) is exactly one of `template`, `js`,
+or `lua`; declaring more than one is a config-compile error. All three
 read the same context: the call's arguments and every step's
-outcome, bound as `input = {args, steps}` in the script engines
-(`input.args.<name>`, `input.steps.<name>.status`,
-`input.steps.<name>.body`), and as the `${args...}` / `${steps...}`
+outcome, bound as `ctx = {args, steps}` in the script engines
+(`ctx.args.<name>`, `ctx.steps.<name>.status`,
+`ctx.steps.<name>.body`), and as the `${args...}` / `${steps...}`
 vocabulary above in a template.
 
 A script that throws, a template with an unresolved path, or a
@@ -345,34 +360,40 @@ need to reshape rather than pass through.
 
 ### `js`
 
-QuickJS, the same sandbox `js_json` transforms and `response_cache`'s
-`admit_event`/`key_event` scripts already run in (see
-[scripting.md](scripting.md#5-javascript-scripting)). The script is
-evaluated as a single expression: a script with branches wraps itself
-in an immediately invoked function so the whole thing still evaluates
-to one value. Arrays and `content[]` blocks index from 0.
+QuickJS, the same sandbox `response_cache`'s `admit_event`/`key_event`
+JavaScript scripts already run in (see
+[scripting.md](scripting.md#5-javascript-scripting)) -- and the same
+entry convention: a single `ctx` global, no function to define. The
+script is evaluated as a single expression: a script with branches
+wraps itself in an immediately invoked function so the whole thing
+still evaluates to one value. This is deliberately not the
+`modify_json(data, ctx)` named-function convention `js_json`
+transforms use -- shaping has no existing document to mutate, only a
+context to read and a document to produce. Arrays and `content[]`
+blocks index from 0.
 
 ```yaml
 response:
   js: |
     (() => {
-      const body = input.steps.enrich.body;
-      return { vendor: body.name, sku: input.args.id };
+      const body = ctx.steps.enrich.body;
+      return { vendor: body.name, sku: ctx.args.id };
     })()
 ```
 
 ### `lua`
 
-Luau, the same sandbox request/response modifiers and `js_json`'s
-sibling `lua_json` transform use (see
+Luau, the same sandbox `response_cache`'s Lua `admit_event`/`key_event`
+scripts already run in (see
 [scripting.md](scripting.md#4-lua-scripting)). The script's top-level
-`return` value is the tool result, the same convention
-`response_cache`'s Lua `key_event`/`admit_event` scripts use. Luau
-tables index from 1, not 0.
+`return` value is the tool result, the same `ctx`-global, no-function
+convention `key_event`/`admit_event` use -- not the
+`modify_json(data, ctx)` named-function convention `lua_json` (or the
+request/response modifiers) use. Luau tables index from 1, not 0.
 
 ```lua
-local body = input.steps.enrich.body
-return { vendor = body.name, sku = input.args.id }
+local body = ctx.steps.enrich.body
+return { vendor = body.name, sku = ctx.args.id }
 ```
 
 ## Governance inheritance
