@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -46,11 +46,12 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `response_modifiers[].lua_script` | Lua | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `response_modifiers[].js_script` | JavaScript | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `response_modifiers[].rego_module` (+ `rego_module_path`, `rego_v0`) | Rego | The `data.sbproxy.modify_response` rule returns `{"set_headers": {...}}`, applied to the response |
+| `transforms[] type: lua`, field `script` | Lua | Defines `transform(body, ctx)` over the raw body string |
 | `transforms[] type: lua_json`, field `script` | Lua | Defines `modify_json(data, ctx)`; return value replaces the JSON response body |
 | `transforms[] type: javascript`, field `script` | JavaScript | Defines `transform(body, ctx)` over the raw body string |
 | `transforms[] type: js_json`, field `script` | JavaScript | Defines `modify_json(data, ctx)` over the parsed JSON body |
 | `transforms[] type: cel`, field `headers` | CEL | Sets, appends, and removes response headers from CEL |
-| `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
+| `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout; `request_context: true` also carries `ctx` on an environment variable (costs the transform its response-cache eligibility, see section 6) |
 | `policies[] type: rego`, fields `module` or `module_path` + `query` (+ optional `data`, `rego_v0`) | Rego | The queried rule returns bool; `false` or any fault denies with `deny_status` / `deny_message`; `data` is a JSON object the rule reads as `data.<key>` |
 | `forward_rules[].rules[].when` | CEL | Boolean predicate over the arriving request; an evaluation error means the rule does not match |
 | `observability.log.custom_fields[]` with `engine: lua` or `engine: js` | Lua or JavaScript | Returns the value of one operator-defined access-log field |
@@ -817,9 +818,9 @@ local ok, t = pcall(json_decode, maybe_json)
 
 These are the only host helpers. There is no logging, crypto, UUID, or time module in the Lua sandbox; if you need hashing, UUIDs, or timestamps, use CEL (`sha256`, `uuid_v4`, `now`) or do the work upstream.
 
-### 4.4 JSON transformation
+### 4.4 Body transformation
 
-The `lua_json` transform parses a JSON response body, hands it to `modify_json(data, ctx)`, and replaces the body with whatever the function returns.
+Body transforms come in two shapes. `type: lua` runs `transform(body, ctx)` over the raw body string, so it works on any body, JSON or not. `type: lua_json` parses the body as JSON first and runs `modify_json(data, ctx)` over the parsed value; reach for it when the body is JSON and the script wants a parsed table instead of a string to `json_decode` itself.
 
 ```yaml
 origins:
@@ -828,6 +829,11 @@ origins:
       type: proxy
       url: https://test.sbproxy.dev
     transforms:
+      - type: lua
+        script: |
+          function transform(body, ctx)
+            return string.upper(body)
+          end
       - type: lua_json
         script: |
           function modify_json(data, ctx)
@@ -838,7 +844,7 @@ origins:
           end
 ```
 
-A legacy format is also supported: a script with no `modify_json` function runs with the parsed body bound to a `body` global, and the script's return value replaces the body.
+Both accept a legacy format too: a script with no `transform` (or `modify_json`) function runs directly, with the body bound to a `body` global (the raw string for `lua`, the parsed value for `lua_json`), and the script's return value replaces the body.
 
 ### 4.5 Lua examples
 
@@ -1036,7 +1042,7 @@ WASM modules run in `wasmtime` against the WASI preview-1 ABI. The host pipes th
 
 WASM is currently exposed as a body transform (`type: wasm`), not as a request/response modifier. Use it when you need to mutate the response body in a language that does not have a first-class engine here (Rust, TinyGo, AssemblyScript, Zig, etc.) or when you want stronger isolation than CEL or Lua provide.
 
-Because the contract is raw bytes on stdin, WASM modules do not receive the `ctx` context the Lua and JavaScript surfaces get: there is no JSON envelope to carry `principal` or `request.tls`, and inventing one would break every deployed module that parses its body off stdin. If a module needs caller identity or fingerprint data, gate the transform with a CEL policy or stamp the needed value into a header with a Lua/JS modifier ahead of it.
+Because the contract is raw bytes on stdin, a WASM module does not receive the `ctx` context the Lua and JavaScript surfaces get by default: there is no JSON envelope to carry `principal` or `request.tls`, and putting one on stdin would break every deployed module that parses its body off stdin unmodified. If a module needs caller identity or fingerprint data, three options exist, in order of preference: gate the transform with a CEL policy, stamp the needed value into a header with a Lua/JS modifier ahead of it, or set `request_context: true` (below) if the module itself needs to branch on it.
 
 ```yaml
 origins:
@@ -1063,12 +1069,26 @@ Sandbox tunables:
 | `timeout_ms` | 1000 | Hard wall-clock cap per invocation. Enforced via wasmtime's epoch interruption. |
 | `max_memory_pages` | 256 | Linear-memory cap in 64 KiB pages. 256 = 16 MiB. |
 | `max_fuel` | 1,000,000,000 | Deterministic, instruction-granular cap on one invocation, complementing `timeout_ms`. |
+| `request_context` | `false` | Opt-in per-request `ctx`, described below. Costs the transform its response-cache eligibility. |
 
-There is no filesystem access, no network access, no environment variables, and no clock skew the host can observe.
+There is no filesystem access, no network access, and no clock skew the host can observe. There are no environment variables either, with one narrow, opt-in exception described in [6.1](#61-request_context-opting-a-module-into-ctx): `request_context: true`.
 
 There is also no `allowed_hosts:`. The key used to be accepted here and was never enforced, which is the wrong shape for something that reads as a security boundary: modules get no sockets at all, so an allowlist had nothing to sit in front of. It is refused at config compile now, with an error saying so. If a host callout ever lands, the key comes back as an enforced one. Until then, keep the reaching on the proxy side: gate the origin with an `expression` policy, or route the callout through an origin the proxy controls.
 
 The full authoring guide is in [wasm-development.md](wasm-development.md), with hello-world Rust and TinyGo modules in `examples/wasm/`.
+
+### 6.1 `request_context`: opting a module into `ctx`
+
+Setting `request_context: true` on a `wasm` transform hands its module the same `ctx` JSON document (`principal`, `request.aipref`, `request.tls`) that Lua and JavaScript body transforms get, described in [4.2](#42-context-tables). Nothing changes about stdin: the response body still arrives there, byte for byte, exactly as it does today. The context rides a separate channel instead, a WASI environment variable named `SBPROXY_REQUEST_CONTEXT` holding the JSON document as a string. A module reads it the way it would read any other environment variable in its language (`std::env::var` in Rust, `os.Getenv` in TinyGo).
+
+```yaml
+transforms:
+  - type: wasm
+    module_path: /etc/sbproxy/modules/redact-by-role.wasm
+    request_context: true
+```
+
+This is deliberately opt-in and off by default, for two reasons. First, cheapest: a module that has never heard of `SBPROXY_REQUEST_CONTEXT` keeps compiling and running unmodified; nothing about its stdin bytes or observable behavior changes. Second, and the one to plan around: `request_context: true` makes the transform request-dependent, the same as `lua_json`, `javascript`, and `js_json` already are, and the config compiler refuses to combine a request-dependent transform with `response_cache` on the same origin, because a per-requester `ctx` baked into a shared cache entry would leak one caller's context to every other caller. Leave `request_context` unset (or `false`) to keep a `wasm` transform eligible for `response_cache`; the flag is a trade an operator makes deliberately, per transform, not a default cost every module pays.
 
 ---
 

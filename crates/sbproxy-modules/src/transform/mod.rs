@@ -126,6 +126,9 @@ pub enum Transform {
     Markdown(MarkdownTransform),
     /// Manipulate CSS (inject rules, remove selectors, minify).
     Css(CssTransform),
+    /// Lua-based raw-body transform. Calls a user-defined Lua function
+    /// with the raw body string, returning the modified string.
+    Lua(LuaTransform),
     /// Lua-based JSON transform. Executes a Lua script that receives the
     /// JSON body and returns a modified version.
     LuaJson(LuaJsonTransform),
@@ -203,6 +206,7 @@ impl Transform {
             Self::HtmlToMarkdown(_) => "html_to_markdown",
             Self::Markdown(_) => "markdown",
             Self::Css(_) => "css",
+            Self::Lua(_) => "lua",
             Self::LuaJson(_) => "lua_json",
             Self::JavaScript(_) => "javascript",
             Self::JsJson(_) => "js_json",
@@ -235,6 +239,15 @@ impl Transform {
     /// from it. `Plugin` is conservatively dependent: the guest is
     /// arbitrary out-of-tree code with no purity declaration, even
     /// though the context it receives today is empty.
+    ///
+    /// `Wasm` is the one variant whose answer is not a constant of the
+    /// type: a wasm transform is dependent only when its own
+    /// `request_context: true` flag is set (WOR-2493 item 5). That flag
+    /// is a deliberate cacheability trade an operator opts into per
+    /// transform, not a property of the `wasm` type itself, so the
+    /// cached-origin refusal in `sbproxy-core`'s pipeline compiler
+    /// (which walks every origin's compiled transforms and checks this
+    /// method) only fires for the modules that asked for `ctx`.
     pub fn request_dependent(&self) -> bool {
         match self {
             Self::HtmlToMarkdown(_)
@@ -242,10 +255,12 @@ impl Transform {
             | Self::JsonEnvelope(_)
             | Self::CelScript(_)
             | Self::A2aAgentCardRewrite(_)
+            | Self::Lua(_)
             | Self::LuaJson(_)
             | Self::JavaScript(_)
             | Self::JsJson(_)
             | Self::Plugin(_) => true,
+            Self::Wasm(t) => t.request_context,
             Self::Json(_)
             | Self::JsonProjection(_)
             | Self::JsonSchema(_)
@@ -261,7 +276,6 @@ impl Transform {
             | Self::OptimizeHtml(_)
             | Self::Markdown(_)
             | Self::Css(_)
-            | Self::Wasm(_)
             | Self::Boilerplate(_)
             | Self::Noop => false,
         }
@@ -286,6 +300,7 @@ impl Transform {
             Self::HtmlToMarkdown(t) => t.apply(body),
             Self::Markdown(t) => t.apply(body),
             Self::Css(t) => t.apply(body),
+            Self::Lua(t) => t.apply(body),
             Self::LuaJson(t) => t.apply(body),
             Self::JavaScript(t) => t.apply(body),
             Self::JsJson(t) => t.apply(body),
@@ -439,6 +454,7 @@ impl std::fmt::Debug for Transform {
             Self::HtmlToMarkdown(t) => f.debug_tuple("HtmlToMarkdown").field(t).finish(),
             Self::Markdown(t) => f.debug_tuple("Markdown").field(t).finish(),
             Self::Css(t) => f.debug_tuple("Css").field(t).finish(),
+            Self::Lua(t) => f.debug_tuple("Lua").field(t).finish(),
             Self::LuaJson(t) => f.debug_tuple("LuaJson").field(t).finish(),
             Self::JavaScript(t) => f.debug_tuple("JavaScript").field(t).finish(),
             Self::JsJson(t) => f.debug_tuple("JsJson").field(t).finish(),
@@ -625,6 +641,106 @@ impl CompiledTransform {
             return Ok(());
         }
         self.transform.apply(body, content_type)
+    }
+}
+
+// --- LuaTransform ---
+
+/// Lua-based raw-body transform. Calls a user-defined Lua function
+/// with the raw body string, returning the modified string.
+///
+/// Unlike [`LuaJsonTransform`], this transform never parses the body as
+/// JSON: the raw bytes go in and the raw bytes come back out, exactly
+/// the contract [`JavaScriptTransform`] gives JavaScript authors. Reach
+/// for `lua_json` when the body is JSON and the script wants a parsed
+/// value; reach for this transform for anything else (plain text, XML,
+/// CSV, or bodies that only happen to be JSON some of the time).
+///
+/// Two script formats are supported, mirroring the Lua invocation
+/// shape `lua_json` uses ([`LuaJsonTransform::apply_with_context`]):
+/// **function format** (script defines `transform(body, ctx)`, tried
+/// first) and **global format** (legacy: no `transform` function, the
+/// script runs with the raw body string bound to a `body` global and
+/// its return value replaces the body).
+///
+/// Example script:
+/// ```lua
+/// function transform(body, ctx)
+///   return string.upper(body)
+/// end
+/// ```
+#[derive(Debug)]
+pub struct LuaTransform {
+    /// Lua source code executed against the raw body string.
+    pub script: String,
+    /// Name of the entrypoint function (defaults to `transform`).
+    pub function_name: Option<String>,
+}
+
+impl LuaTransform {
+    /// Build a LuaTransform from a generic JSON config value.
+    pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
+        #[derive(Deserialize)]
+        struct Config {
+            script: String,
+            function_name: Option<String>,
+        }
+        let cfg: Config = serde_json::from_value(value)?;
+        Ok(Self {
+            script: cfg.script,
+            function_name: cfg.function_name,
+        })
+    }
+
+    /// Apply the Lua script to the raw body string.
+    pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
+        self.apply_with_context(body, serde_json::json!({}))
+    }
+
+    /// Apply the Lua script with a caller-supplied per-request context.
+    ///
+    /// A script error, whether from the function-format call or the
+    /// global-format fallback, propagates as `Err` rather than being
+    /// swallowed: the body-buffer pipeline's `failure_posture` decides
+    /// whether that fails the response closed or logs and continues,
+    /// the same as every other scripted transform (WOR-168's
+    /// transform-error surface). This method never silently leaves the
+    /// body unmodified on a script error.
+    pub fn apply_with_context(
+        &self,
+        body: &mut BytesMut,
+        ctx: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let input = String::from_utf8_lossy(body).to_string();
+        let engine = sbproxy_extension::lua::LuaEngine::new()?;
+        let func = self.function_name.as_deref().unwrap_or("transform");
+
+        let result = match engine.call_function(
+            &self.script,
+            func,
+            vec![serde_json::Value::String(input.clone()), ctx],
+        ) {
+            Ok(r) => r,
+            Err(_) => {
+                // Fall back to global format: the raw body string as a
+                // `body` global, mirroring LuaJsonTransform's fallback
+                // but without the JSON parse that would defeat the
+                // point of a raw-body transform.
+                let engine = sbproxy_extension::lua::LuaEngine::new()?;
+                let mut globals = std::collections::HashMap::new();
+                globals.insert("body".to_string(), serde_json::Value::String(input));
+                engine.execute(&self.script, globals)?
+            }
+        };
+
+        let output = match result {
+            serde_json::Value::String(s) => s,
+            other => serde_json::to_string(&other)?,
+        };
+
+        body.clear();
+        body.extend_from_slice(output.as_bytes());
+        Ok(())
     }
 }
 
@@ -840,18 +956,40 @@ impl JsJsonTransform {
 /// the underlying [`sbproxy_extension::wasm::WasmConfig`]; defaults
 /// are 16 MiB / 1 s.
 ///
+/// By default the module receives nothing but the body: no `ctx`, no
+/// `principal`, no TLS fingerprint. Setting `request_context: true`
+/// opts a module into the same per-request `ctx` the Lua and
+/// JavaScript transforms get (WOR-2493 item 5), carried as a
+/// JSON-encoded `SBPROXY_REQUEST_CONTEXT` WASI environment variable
+/// rather than on stdin, so a module that does not ask for it keeps
+/// seeing byte-identical stdin. Opting in has a real cost: the
+/// transform becomes request-dependent
+/// ([`Transform::request_dependent`]), so it cannot be combined with
+/// `response_cache` on the same origin, the same trade-off `lua_json`,
+/// `javascript`, and `js_json` already make unconditionally.
+///
 /// Example config:
 /// ```yaml
 /// transforms:
 ///   - type: wasm
 ///     module_path: /opt/sbproxy/wasm/echo.wasm
 ///     timeout_ms: 500
+///     request_context: true
 /// ```
 #[derive(Debug)]
 pub struct WasmTransform {
     /// Display name used in metrics + logs (defaults to the module
     /// file stem when `module_path` is set, otherwise "inline").
     pub name: String,
+    /// When `true`, [`Transform::request_dependent`] reports this
+    /// transform as request-dependent and the response-filter
+    /// dispatcher (`apply_transform_with_ctx` in `sbproxy-core`) calls
+    /// [`Self::apply_with_context`] instead of [`Self::apply`], handing
+    /// the module the same `ctx` JSON blob Lua/JS scripts get, carried
+    /// over a `SBPROXY_REQUEST_CONTEXT` WASI environment variable.
+    /// Defaults to `false`, which keeps today's stdin-only contract and
+    /// cacheability exactly as they were before this field existed.
+    pub request_context: bool,
     /// Pre-compiled module + sandbox config. Compilation happens once
     /// at config-load time; per-request we only pay for instantiation
     /// and execution.
@@ -888,6 +1026,20 @@ impl WasmTransform {
              module can reach, keep the reaching on the proxy side: gate the origin with an \
              `expression` policy, or route the callout through an origin the proxy controls."
         );
+        // `request_context` lives on the transform, not on the shared
+        // `WasmConfig` the extension/bundle/action Wasm surfaces also
+        // deserialize: it is a `wasm`-transform-only cacheability
+        // opt-in (WOR-2493 item 5), not a runtime sandbox knob. Parsed
+        // with its own small struct rather than `value.get(...).as_bool()`
+        // so an authored non-bool value (e.g. a string) is a config
+        // error instead of silently defaulting to `false`.
+        #[derive(Deserialize)]
+        struct RequestContextFlag {
+            #[serde(default)]
+            request_context: bool,
+        }
+        let RequestContextFlag { request_context } = serde_json::from_value(value.clone())?;
+
         let cfg: sbproxy_extension::wasm::WasmConfig = serde_json::from_value(value)?;
         if cfg.module_path.is_none() && cfg.module_bytes.is_none() {
             anyhow::bail!("wasm transform requires either module_path or module_bytes");
@@ -900,18 +1052,59 @@ impl WasmTransform {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "inline".to_string());
         let runtime = sbproxy_extension::wasm::WasmRuntime::new(cfg)?;
-        Ok(Self { name, runtime })
+        Ok(Self {
+            name,
+            request_context,
+            runtime,
+        })
     }
 
     /// Apply the WASM transform: feed `body` into the module's stdin,
-    /// replace `body` with whatever the module wrote to stdout.
+    /// replace `body` with whatever the module wrote to stdout. Never
+    /// sets the `SBPROXY_REQUEST_CONTEXT` environment variable,
+    /// regardless of `request_context`; this is the path every module
+    /// ran through before that flag existed, and it stays
+    /// byte-identical whether or not the flag is set on this
+    /// transform. Callers that need to honor `request_context` use
+    /// [`Self::apply_with_context`] instead.
     pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
         let output = self.runtime.execute("transform", body)?;
         body.clear();
         body.extend_from_slice(&output);
         Ok(())
     }
+
+    /// Apply the WASM transform with a caller-supplied per-request
+    /// context, JSON-encoded onto a `SBPROXY_REQUEST_CONTEXT`
+    /// environment variable for this invocation only. `stdin` still
+    /// carries only the raw body; the context rides a separate WASI
+    /// channel so it cannot corrupt a module's expected input framing.
+    ///
+    /// Only the ctx-arm dispatcher in `sbproxy-core` calls this, and
+    /// only when `request_context` is `true`; see
+    /// [`Transform::request_dependent`] for why the split matters for
+    /// caching.
+    pub fn apply_with_context(
+        &self,
+        body: &mut BytesMut,
+        ctx: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let ctx_json = serde_json::to_string(&ctx)?;
+        let output = self.runtime.execute_with_env(
+            "transform",
+            body,
+            &[(WASM_REQUEST_CONTEXT_ENV.to_string(), ctx_json)],
+        )?;
+        body.clear();
+        body.extend_from_slice(&output);
+        Ok(())
+    }
 }
+
+/// Name of the WASI environment variable a `request_context: true` wasm
+/// transform carries the JSON-encoded per-request `ctx` blob on. See
+/// [`WasmTransform::apply_with_context`].
+const WASM_REQUEST_CONTEXT_ENV: &str = "SBPROXY_REQUEST_CONTEXT";
 
 #[cfg(test)]
 mod tests {
@@ -934,9 +1127,21 @@ mod tests {
                 {"op": "set", "name": "x-test", "value_expr": "'v'"}
             ]}),
             serde_json::json!({"type": "a2a_agent_card_rewrite"}),
+            serde_json::json!({"type": "lua", "script": "function transform(b, c) return b end"}),
             serde_json::json!({"type": "lua_json", "script": "function modify_json(d, c) return d end"}),
             serde_json::json!({"type": "javascript", "script": "export function transform(b) { return b; }"}),
             serde_json::json!({"type": "js_json", "script": "export function modify_json(d) { return d; }"}),
+            // WOR-2493 item 5: `request_context: true` is a per-transform
+            // opt-in, not a property of the `wasm` type, so only the
+            // module that asked for ctx is dependent. `module_bytes` is
+            // the minimal valid WASM module (an 8-byte header: `\0asm`
+            // + version 1, no sections); compiling it never requires
+            // calling `_start`, which this test never does.
+            serde_json::json!({
+                "type": "wasm",
+                "module_bytes": [0, 97, 115, 109, 1, 0, 0, 0],
+                "request_context": true
+            }),
         ];
         for config in dependent {
             let name = config["type"].as_str().unwrap().to_owned();
@@ -952,6 +1157,12 @@ mod tests {
             serde_json::json!({"type": "noop"}),
             serde_json::json!({"type": "payload_limit", "max_size": 1024}),
             serde_json::json!({"type": "boilerplate"}),
+            // Same module as above, `request_context` left at its
+            // `false` default: the split is on the flag, not the type.
+            serde_json::json!({
+                "type": "wasm",
+                "module_bytes": [0, 97, 115, 109, 1, 0, 0, 0]
+            }),
         ];
         for config in independent {
             let name = config["type"].as_str().unwrap().to_owned();
@@ -1312,6 +1523,151 @@ mod tests {
             script: "this is not valid lua !!!".to_string(),
         };
         let mut body = BytesMut::from(&b"{}"[..]);
+        assert!(t.apply(&mut body).is_err());
+    }
+
+    // --- LuaTransform tests ---
+
+    #[test]
+    fn lua_transform_type() {
+        let t = Transform::Lua(LuaTransform {
+            script: "function transform(b, c) return b end".to_string(),
+            function_name: None,
+        });
+        assert_eq!(t.transform_type(), "lua");
+    }
+
+    #[test]
+    fn lua_transform_is_request_dependent() {
+        let t = Transform::Lua(LuaTransform {
+            script: "function transform(b, c) return b end".to_string(),
+            function_name: None,
+        });
+        assert!(t.request_dependent());
+    }
+
+    #[test]
+    fn lua_from_config() {
+        let t = LuaTransform::from_config(serde_json::json!({
+            "script": "function transform(b, c) return b end"
+        }))
+        .unwrap();
+        assert_eq!(t.script, "function transform(b, c) return b end");
+        assert!(t.function_name.is_none());
+    }
+
+    #[test]
+    fn lua_from_config_with_function_name() {
+        let t = LuaTransform::from_config(serde_json::json!({
+            "script": "function process(b, c) return string.upper(b) end",
+            "function_name": "process"
+        }))
+        .unwrap();
+        assert_eq!(t.function_name.as_deref(), Some("process"));
+    }
+
+    #[test]
+    fn lua_from_config_missing_script_errors() {
+        let result = LuaTransform::from_config(serde_json::json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lua_apply_transforms_non_json_body() {
+        // The point of this transform over `lua_json`: the body never
+        // gets parsed as JSON, so a script can rewrite plain text, CSV,
+        // XML, or any other non-JSON payload. `lua_json` cannot do
+        // this at all -- its `apply_with_context` starts with
+        // `serde_json::from_slice(body)?`, which errors before the
+        // script ever runs (see `lua_json_apply_invalid_json_body_errors`
+        // above). This body is deliberately not valid JSON.
+        let t = LuaTransform::from_config(serde_json::json!({
+            "script": "function transform(body, ctx) return string.upper(body) end"
+        }))
+        .unwrap();
+        let mut body = BytesMut::from(&b"name,age\nalice,30"[..]);
+        t.apply(&mut body).unwrap();
+        assert_eq!(&body[..], b"NAME,AGE\nALICE,30");
+    }
+
+    #[test]
+    fn lua_apply_with_context_exposes_request_aipref() {
+        let t = LuaTransform::from_config(serde_json::json!({
+            "script": r#"
+                function transform(body, ctx)
+                  return json_encode({
+                    body = body,
+                    train = ctx.request.aipref.train,
+                    search = ctx.request.aipref.search,
+                    ai_input = ctx.request.aipref.ai_input
+                  })
+                end
+            "#
+        }))
+        .unwrap();
+        let ctx = serde_json::json!({
+            "request": {
+                "aipref": {
+                    "train": false,
+                    "search": true,
+                    "ai_input": false
+                }
+            }
+        });
+        let mut body = BytesMut::from(&b"plain text, not json"[..]);
+
+        t.apply_with_context(&mut body, ctx).unwrap();
+
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["body"], "plain text, not json");
+        assert_eq!(result["train"], false);
+        assert_eq!(result["search"], true);
+        assert_eq!(result["ai_input"], false);
+    }
+
+    #[test]
+    fn lua_apply_with_custom_function_name() {
+        let t = LuaTransform::from_config(serde_json::json!({
+            "script": "function process(body, ctx) return body .. '!' end",
+            "function_name": "process"
+        }))
+        .unwrap();
+        let mut body = BytesMut::from(&b"hello"[..]);
+        t.apply(&mut body).unwrap();
+        assert_eq!(&body[..], b"hello!");
+    }
+
+    #[test]
+    fn lua_apply_global_format_fallback_on_non_json_body() {
+        // No `transform` function: the legacy global format runs the
+        // script directly with the raw body string bound to `body`,
+        // mirroring the fallback `lua_json` uses for JSON bodies
+        // (`lua_json_apply_returns_new_value` and the legacy-format
+        // note on `LuaJsonTransform::apply_with_context`), but without
+        // ever parsing the body as JSON.
+        let t = LuaTransform {
+            script: "return string.upper(body)".to_string(),
+            function_name: None,
+        };
+        let mut body = BytesMut::from(&b"still not json"[..]);
+        t.apply(&mut body).unwrap();
+        assert_eq!(&body[..], b"STILL NOT JSON");
+    }
+
+    #[test]
+    fn lua_apply_bad_script_errors() {
+        // A genuine engine error (neither a `transform` function nor
+        // valid top-level Lua) must propagate as `Err`, not be
+        // swallowed: the body-buffer pipeline's `failure_posture`
+        // decides whether that fails the response closed or logs and
+        // continues (WOR-168's transform-error surface). Silently
+        // leaving the body untouched here would hide a broken script
+        // behind a 200.
+        let t = LuaTransform {
+            script: "this is not valid lua !!!".to_string(),
+            function_name: None,
+        };
+        let mut body = BytesMut::from(&b"hello"[..]);
         assert!(t.apply(&mut body).is_err());
     }
 
@@ -1843,5 +2199,150 @@ mod tests {
             error.to_string().contains("module_path"),
             "unrelated configs must keep their own error: '{error}'"
         );
+    }
+
+    // --- WasmTransform `request_context` (WOR-2493 item 5) ---
+    //
+    // `echo.wasm` copies stdin to stdout; it never touches its
+    // environment, so it proves the ctx channel does not corrupt the
+    // body contract either way. `env_echo.wasm` ignores stdin and
+    // prints its first WASI environment variable's raw `KEY=VALUE`
+    // bytes to stdout (empty output when none is set); it proves the
+    // ctx JSON blob actually reaches the guest, and only when
+    // `request_context: true` asks for it. Both are hand-written WAT
+    // (see the `.wat` sources beside the `.wasm` files in `testdata/`)
+    // so this crate does not need a wasm32-wasi toolchain to build its
+    // tests.
+    const ECHO_WASM: &[u8] = include_bytes!("testdata/echo.wasm");
+    const ENV_ECHO_WASM: &[u8] = include_bytes!("testdata/env_echo.wasm");
+
+    #[test]
+    fn wasm_request_context_defaults_to_false() {
+        let t = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ECHO_WASM.to_vec(),
+        }))
+        .unwrap();
+        assert!(!t.request_context);
+        assert!(
+            !Transform::Wasm(t).request_dependent(),
+            "a wasm transform must stay cacheable unless it opts into request_context"
+        );
+    }
+
+    #[test]
+    fn wasm_request_context_true_is_parsed_and_makes_the_transform_dependent() {
+        let t = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ECHO_WASM.to_vec(),
+            "request_context": true,
+        }))
+        .unwrap();
+        assert!(t.request_context);
+        assert!(
+            Transform::Wasm(t).request_dependent(),
+            "request_context: true is a deliberate cacheability trade"
+        );
+    }
+
+    #[test]
+    fn wasm_request_context_non_bool_is_a_config_error() {
+        // A typo'd `request_context: "yes"` must be refused at config
+        // compile, not silently coerced to `false` and admitted with
+        // the operator believing ctx is wired up.
+        let error = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ECHO_WASM.to_vec(),
+            "request_context": "yes",
+        }))
+        .expect_err("a non-bool request_context must fail to parse");
+        // The exact wording is serde's, not ours; just confirm the
+        // field name is retrievable for whoever reads the error.
+        let _ = error;
+    }
+
+    #[test]
+    fn wasm_apply_without_context_stdin_is_byte_identical_to_today() {
+        // Ctx-off leg, red-first: `apply()` is the path the wildcard
+        // dispatch arm in sbproxy-core's `apply_transform_with_ctx`
+        // calls for every wasm transform that does not opt into
+        // `request_context`, and this method is untouched by this
+        // change. It must keep producing exactly what it produced
+        // before `request_context` existed.
+        let t = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ECHO_WASM.to_vec(),
+        }))
+        .unwrap();
+        let mut body = BytesMut::from(&b"hello, sbproxy wasm"[..]);
+        t.apply(&mut body).unwrap();
+        assert_eq!(&body[..], b"hello, sbproxy wasm");
+    }
+
+    #[test]
+    fn wasm_apply_without_context_sets_no_env_var() {
+        // Same claim, from the guest's point of view: a module that
+        // reads its own environment sees nothing at all when
+        // `request_context` is unset, which proves `apply()` never
+        // reaches `WasmRuntime::execute_with_env`.
+        let t = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ENV_ECHO_WASM.to_vec(),
+        }))
+        .unwrap();
+        let mut body = BytesMut::from(&b"ignored by env_echo"[..]);
+        t.apply(&mut body).unwrap();
+        assert!(
+            body.is_empty(),
+            "no request_context means no env var, so env_echo has nothing to print"
+        );
+    }
+
+    #[test]
+    fn wasm_apply_with_context_delivers_ctx_to_the_guest_env() {
+        // Ctx-on leg, red-first: this is the thing a ctx-off wasm
+        // transform cannot do today. A non-empty, ctx-shaped result
+        // proves the JSON blob reached the guest over the environment
+        // channel, not stdin (`body` here is a decoy the module never
+        // reads).
+        let t = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ENV_ECHO_WASM.to_vec(),
+            "request_context": true,
+        }))
+        .unwrap();
+        let ctx = serde_json::json!({
+            "request": { "aipref": { "train": false } }
+        });
+        let mut body = BytesMut::from(&b"ignored by env_echo"[..]);
+
+        t.apply_with_context(&mut body, ctx).unwrap();
+
+        let output = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            output,
+            "SBPROXY_REQUEST_CONTEXT={\"request\":{\"aipref\":{\"train\":false}}}"
+        );
+    }
+
+    #[test]
+    fn wasm_apply_with_context_leaves_stdin_untouched() {
+        // The ctx channel must not corrupt the body contract: a module
+        // that never asks about ctx and just echoes stdin still gets
+        // exactly the body bytes, even when `request_context: true`
+        // routes the call through `apply_with_context` and sets the
+        // env var alongside it.
+        let t = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_bytes": ECHO_WASM.to_vec(),
+            "request_context": true,
+        }))
+        .unwrap();
+        let ctx = serde_json::json!({"request": {"aipref": {"train": true}}});
+        let mut body = BytesMut::from(&b"the body, unchanged"[..]);
+
+        t.apply_with_context(&mut body, ctx).unwrap();
+
+        assert_eq!(&body[..], b"the body, unchanged");
     }
 }

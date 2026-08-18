@@ -2356,9 +2356,18 @@ impl McpFederation {
     /// emitted module is reproducible across calls. Operators that
     /// depend on byte-stability for Etag computation can hash the
     /// returned string.
+    ///
+    /// This raw entry point covers every federated tool with no
+    /// registry-approval-status filtering: `McpFederation` does not
+    /// own that data (it lives on the `McpAction` that wraps this
+    /// federation), so it cannot apply the `draft`-hides-tools rule
+    /// `tools/list` enforces on its own. [`Self::codemode_ts_cached`],
+    /// the method the `/.well-known/mcp/codemode.ts` HTTP endpoint
+    /// actually calls, takes a visibility predicate for exactly this
+    /// reason (WOR-2484).
     pub fn codemode_ts(&self, callback_base_url: &str) -> String {
         let catalog = self.tool_catalog.load_full();
-        codemode_ts_for_catalog(&catalog, callback_base_url)
+        codemode_ts_for_catalog(&catalog, callback_base_url, &|_| true)
     }
 
     /// Call a tool, routing to the correct upstream server.
@@ -3443,14 +3452,39 @@ impl McpFederation {
     /// Codemode.ts module + strong ETag for the current visible generation
     /// and callback base (WOR-1640). Re-emits and re-hashes only when
     /// either changes; a warm cache hit is a lock-free load.
-    pub fn codemode_ts_cached(&self, callback_base: &str) -> (Arc<String>, String) {
+    ///
+    /// `is_server_visible` mirrors the approval-status check `tools/list`
+    /// and `resources/list` apply at their own call sites (WOR-2384,
+    /// MCP09): the caller answers `false` for a `draft` server so its
+    /// tools never reach the emitted module, closing the gap where this
+    /// method used to render the full, unfiltered registry regardless of
+    /// draft status (WOR-2484). Approval status lives on the `McpAction`
+    /// that owns this federation, not on `McpFederation` itself, hence
+    /// the predicate rather than a type this crate cannot name.
+    ///
+    /// The predicate is deliberately left out of the cache key: registry
+    /// approval status is immutable config data for the lifetime of one
+    /// `McpFederation` instance (an operator changes it only by editing
+    /// config, which rebuilds the whole `McpAction`, and therefore this
+    /// federation, from scratch), so the predicate's answer for a given
+    /// server name cannot change without also producing a brand-new,
+    /// cold-cached federation to answer it.
+    pub fn codemode_ts_cached(
+        &self,
+        callback_base: &str,
+        is_server_visible: impl Fn(&str) -> bool,
+    ) -> (Arc<String>, String) {
         let catalog = self.tool_catalog.load_full();
         let generation = catalog.codemode_generation;
         let current = self.codemode_cache.load_full();
         if current.generation == generation && current.callback_base == callback_base {
             return (Arc::clone(&current.module), current.etag.clone());
         }
-        let module = Arc::new(codemode_ts_for_catalog(&catalog, callback_base));
+        let module = Arc::new(codemode_ts_for_catalog(
+            &catalog,
+            callback_base,
+            &is_server_visible,
+        ));
         let digest = <sha2::Sha256 as sha2::Digest>::digest(module.as_bytes());
         let etag = format!("\"{}\"", hex::encode(digest));
         // Do not cache an old module under a later state generation
@@ -4091,11 +4125,25 @@ fn classify_auth_required_from_error(e: &anyhow::Error) -> Option<bool> {
 /// cache uses this rather than calling back through `McpFederation`,
 /// which would otherwise permit a refresh between its generation read
 /// and its tool read.
-fn codemode_ts_for_catalog(catalog: &ToolCatalogState, callback_base_url: &str) -> String {
+///
+/// `is_server_visible` is the same shape of predicate `tools/list` and
+/// `resources/list` apply at their call sites in `action_dispatch.rs`
+/// (WOR-2384, MCP09): a `false` answer hides every tool the named
+/// server owns from the emitted module, the same "not advertised"
+/// treatment those two surfaces already give a `draft` server
+/// (WOR-2484). This function stays agnostic of what the predicate
+/// tests -- registry approval status is a `sbproxy-modules` concept
+/// this crate cannot name without an upward dependency.
+fn codemode_ts_for_catalog(
+    catalog: &ToolCatalogState,
+    callback_base_url: &str,
+    is_server_visible: &dyn Fn(&str) -> bool,
+) -> String {
     let mut tools: Vec<&FederatedTool> = catalog
         .tools
         .values()
         .filter(|tool| !catalog.version_blocked.contains_key(&tool.name))
+        .filter(|tool| is_server_visible(&tool.server_name))
         .collect();
     tools.sort_by(|a, b| a.codemode_name().cmp(b.codemode_name()));
     super::codemode_ts::emit_codemode_ts_refs(tools, callback_base_url)
@@ -5640,7 +5688,7 @@ mod tests {
         let legacy_snapshot = federation.serialized_tools();
         let modern_snapshot = federation.serialized_modern_tools();
         let (codemode_snapshot, codemode_etag) =
-            federation.codemode_ts_cached("https://gateway.example");
+            federation.codemode_ts_cached("https://gateway.example", |_| true);
 
         federation
             .refresh_tools()
@@ -5659,7 +5707,7 @@ mod tests {
             &federation.serialized_modern_tools()
         ));
         let (codemode_after, codemode_etag_after) =
-            federation.codemode_ts_cached("https://gateway.example");
+            federation.codemode_ts_cached("https://gateway.example", |_| true);
         assert!(Arc::ptr_eq(&codemode_snapshot, &codemode_after));
         assert_eq!(codemode_etag, codemode_etag_after);
         assert!(federation
@@ -6593,13 +6641,13 @@ mod tests {
     async fn codemode_cache_hits_on_same_generation_and_base() {
         let fed = std::sync::Arc::new(McpFederation::new(vec![]));
         fed.refresh_tools().await.unwrap();
-        let (m1, e1) = fed.codemode_ts_cached("http://gw.test");
-        let (m2, e2) = fed.codemode_ts_cached("http://gw.test");
+        let (m1, e1) = fed.codemode_ts_cached("http://gw.test", |_| true);
+        let (m2, e2) = fed.codemode_ts_cached("http://gw.test", |_| true);
         assert!(std::sync::Arc::ptr_eq(&m1, &m2));
         assert_eq!(e1, e2);
         assert!(e1.starts_with('"') && e1.ends_with('"'));
         // A different callback base misses the cache.
-        let (m3, _) = fed.codemode_ts_cached("http://other.test");
+        let (m3, _) = fed.codemode_ts_cached("http://other.test", |_| true);
         assert!(!std::sync::Arc::ptr_eq(&m1, &m3));
     }
 
@@ -7477,7 +7525,8 @@ mod tests {
             ]),
             None,
         );
-        let (before, before_etag) = federation.codemode_ts_cached("https://gateway.example");
+        let (before, before_etag) =
+            federation.codemode_ts_cached("https://gateway.example", |_| true);
         assert!(before.contains("['allowed']:"));
         assert!(before.contains("['refused']:"));
 
@@ -7485,7 +7534,8 @@ mod tests {
             "refused".to_string(),
             "version policy refuses this tool".to_string(),
         )]));
-        let (after, after_etag) = federation.codemode_ts_cached("https://gateway.example");
+        let (after, after_etag) =
+            federation.codemode_ts_cached("https://gateway.example", |_| true);
 
         assert!(after.contains("['allowed']:"));
         assert!(

@@ -1467,7 +1467,7 @@ action:
 
 ### websocket
 
-Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs.
+Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline and then relays bytes transparently once the upstream answers `101`; it does not inspect frames after that point. See [websocket.md](websocket.md) for upgrade semantics and which of the two fields below are actually enforced today.
 
 ```yaml
 origins:
@@ -1482,8 +1482,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend WebSocket URL (ws:// or wss://) |
-| `subprotocols` | list | | Supported WebSocket subprotocols |
-| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB) |
+| `subprotocols` | list | | Subprotocols this origin is meant to support. Accepted by config; not currently read anywhere the gateway negotiates or filters on `Sec-WebSocket-Protocol`. |
+| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB). Accepted by config; not currently enforced, frames larger than this pass through unmodified. |
 
 ### grpc
 

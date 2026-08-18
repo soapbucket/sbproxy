@@ -31,7 +31,7 @@ use crate::transform::{
     CssTransform, DiscardTransform, EncodingTransform, FormatConvertTransform,
     HtmlToMarkdownTransform, HtmlTransform, JavaScriptTransform, JsJsonTransform,
     JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform, JsonTransform,
-    LuaJsonTransform, MarkdownTransform, NormalizeTransform, OptimizeHtmlTransform,
+    LuaJsonTransform, LuaTransform, MarkdownTransform, NormalizeTransform, OptimizeHtmlTransform,
     PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform, TemplateTransform,
     Transform, WasmTransform,
 };
@@ -445,6 +445,7 @@ fn compile_transform_with_optional_registry(
             config.clone(),
         )?)),
         "css" => Ok(Transform::Css(CssTransform::from_config(config.clone())?)),
+        "lua" => Ok(Transform::Lua(LuaTransform::from_config(config.clone())?)),
         "lua_json" => Ok(Transform::LuaJson(LuaJsonTransform::from_config(
             config.clone(),
         )?)),
@@ -1685,6 +1686,20 @@ hooks:
         let json = serde_json::json!({"type": "sse_chunking"});
         let transform = compile_transform(&json).unwrap();
         assert_eq!(transform.transform_type(), "sse_chunking");
+    }
+
+    #[test]
+    fn compile_transform_lua() {
+        let json = serde_json::json!({
+            "type": "lua",
+            "script": "function transform(body, ctx) return string.upper(body) end"
+        });
+        let transform = compile_transform(&json).unwrap();
+        assert_eq!(transform.transform_type(), "lua");
+        assert!(
+            transform.request_dependent(),
+            "lua must be request-dependent"
+        );
     }
 
     #[test]

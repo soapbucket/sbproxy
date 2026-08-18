@@ -17,6 +17,11 @@
 //! On top of those it detects **object-id enumeration**: one principal
 //! touching many distinct object ids inside a short window (sequential
 //! id scanning), which is the signature of a BOLA fuzzing sweep.
+//! Enumeration does not require an [`ObjectRule`] to be configured. When
+//! a rule's `object_param` matches, its captured value is the object id;
+//! otherwise the detector falls back to an id-shaped path-segment
+//! heuristic (a purely numeric segment or a canonical UUID) so the
+//! anomaly still fires in the common zero-`object_rules` case.
 //!
 //! The caller identity (owner + roles) is resolved by the enforcer from
 //! the verified auth subject (`ctx.auth_result`) or from trusted request
@@ -120,6 +125,15 @@ pub struct FunctionRule {
 }
 
 /// Enumeration-anomaly configuration.
+///
+/// Works with or without [`ObjectAuthzConfig::object_rules`]. When a
+/// configured rule's `object_param` captures a value for the request,
+/// that value is the object id counted for the sweep. When no rule is
+/// configured, or none matches the request, the last id-shaped path
+/// segment (a numeric run or a canonical UUID) is used instead, so
+/// `enabled: true` on its own is enough to catch a BOLA fuzzing sweep
+/// against a bare `/orders/{id}`-shaped API with no declared ownership
+/// rules.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnumerationConfig {
     /// Master switch. Off by default.
@@ -150,6 +164,44 @@ fn default_max_distinct() -> usize {
 
 fn default_window_secs() -> u64 {
     60
+}
+
+/// The enumeration fallback signal used when no `object_rules` match
+/// gives the detector an explicit object id: the last path segment that
+/// looks like an object id, either a purely numeric run (`42`,
+/// `100042`) or a canonical 36-character UUID
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, any hex case). Returns
+/// `None` when the path has no such segment, so paths like `/health` or
+/// `/tenants/acme/orders` never feed the counter.
+///
+/// This is a heuristic, not a schema: it is scoped to the two id shapes
+/// real REST APIs overwhelmingly use, deliberately at the cost of
+/// missing custom id formats (slugs, short hashes) that a declared
+/// `object_rules` entry would still catch precisely.
+fn id_shaped_segment(path: &str) -> Option<String> {
+    path.trim_start_matches('/')
+        .split('/')
+        .rev()
+        .find(|segment| is_id_shaped(segment))
+        .map(|segment| segment.to_string())
+}
+
+fn is_id_shaped(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+    segment.bytes().all(|b| b.is_ascii_digit()) || is_uuid_like(segment)
+}
+
+fn is_uuid_like(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => *b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    })
 }
 
 /// Raw deserialized config for the `object_authz` policy.
@@ -382,9 +434,15 @@ impl ObjectAuthzPolicy {
             }
         }
 
-        // Enumeration: per-principal distinct object-id velocity.
+        // Enumeration: per-principal distinct object-id velocity. A
+        // rule-captured id (above) is the most precise signal and wins
+        // when present. Enumeration detection does not otherwise depend
+        // on rule matching: with no `object_rules` configured, or none
+        // matching this path, fall back to the id-shaped path-segment
+        // heuristic so `enumeration.enabled` still observes traffic in
+        // the common zero-config case.
         if self.enumeration.enabled {
-            if let Some(obj_id) = enumeration_hit {
+            if let Some(obj_id) = enumeration_hit.or_else(|| id_shaped_segment(path)) {
                 let key = principal.owner.clone().unwrap_or_default();
                 if self.record_and_check_enumeration(&key, &obj_id) {
                     return Some(Violation {
@@ -687,6 +745,105 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(p.decide(&caller, "GET", "/tenants/tenant-a/orders/1"), None);
         }
+    }
+
+    #[test]
+    fn enumeration_trips_without_object_rules_via_id_heuristic() {
+        // WOR-2491 regression: with zero `object_rules` configured (the
+        // common zero-config case, and the OWASP pack's api1 default)
+        // the detector must still observe traffic instead of staying
+        // inert. Before the fix, the counter was only ever populated
+        // inside the `object_rules` match loop, so this never fired.
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 3, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for id in 1..=3 {
+            assert_eq!(
+                p.decide(&caller, "GET", &format!("/orders/{id}")),
+                None,
+                "id {id} should pass"
+            );
+        }
+        let v = p
+            .decide(&caller, "GET", "/orders/4")
+            .expect("violation: enumeration must fire without object_rules");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn enumeration_heuristic_matches_uuid_shaped_ids() {
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for id in [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ] {
+            assert_eq!(p.decide(&caller, "GET", &format!("/resources/{id}")), None);
+        }
+        let v = p
+            .decide(
+                &caller,
+                "GET",
+                "/resources/33333333-3333-3333-3333-333333333333",
+            )
+            .expect("violation");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn enumeration_heuristic_ignores_paths_with_no_id_shaped_segment() {
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for path in ["/health", "/tenants/acme/orders", "/v1/status"] {
+            for _ in 0..5 {
+                assert_eq!(p.decide(&caller, "GET", path), None, "path {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn enumeration_heuristic_applies_when_configured_rules_do_not_match() {
+        // Rules exist, and their own scoped counting stays pinned by
+        // `enumeration_trips_after_threshold` above, but a request that
+        // matches none of them still feeds the heuristic: enumeration
+        // detection does not depend on rule matching.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/tenants/{owner}/orders/{id}", "owner_param": "owner", "object_param": "id" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for id in 1..=2 {
+            assert_eq!(
+                p.decide(&caller, "GET", &format!("/unmatched/{id}")),
+                None,
+                "id {id} should pass"
+            );
+        }
+        let v = p.decide(&caller, "GET", "/unmatched/3").expect("violation");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn id_shaped_segment_finds_last_numeric_or_uuid_segment() {
+        assert_eq!(
+            id_shaped_segment("/tenants/acme/orders/42"),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            id_shaped_segment("/resources/11111111-1111-1111-1111-111111111111"),
+            Some("11111111-1111-1111-1111-111111111111".to_string())
+        );
+        assert_eq!(id_shaped_segment("/tenants/acme/orders"), None);
+        assert_eq!(id_shaped_segment("/health"), None);
+        // Not a valid UUID shape (wrong length): no id-shaped segment.
+        assert_eq!(id_shaped_segment("/things/not-a-uuid-1234"), None);
     }
 
     #[test]
