@@ -5443,7 +5443,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

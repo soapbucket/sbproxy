@@ -29,14 +29,24 @@
 //! - **Ruleless heuristic.** Only when `object_rules` is empty
 //!   entirely does the detector fall back to guessing: a request whose
 //!   trailing path segment is id-shaped (a purely numeric segment or a
-//!   canonical UUID) has its whole normalized path counted as one
-//!   object. This fallback requires an identified caller
-//!   (`principal.owner.is_some()`); anonymous traffic is never
+//!   canonical UUID) has its whole path (as received, minus leading
+//!   slashes; no percent-decoding or slash-collapsing is applied)
+//!   counted as one object. This fallback requires an identified
+//!   caller (`principal.owner.is_some()`); anonymous traffic is never
 //!   attributable to one principal, so it is never counted, no matter
 //!   how many distinct ids it touches. And because the id shape and
 //!   the path-to-object mapping are both guesses rather than a
 //!   declared contract, a heuristic trip is reported for audit only:
-//!   it never blocks, regardless of `test_mode`.
+//!   it never blocks, regardless of `test_mode`. To keep the audit
+//!   feed proportionate, a tripped detect-only principal is audited
+//!   once per window: repeat hits inside the same tripped window are
+//!   suppressed and counted, and the count rides along on the next
+//!   emitted violation.
+//!
+//! Enumeration state is keyed by `(tenant, owner)`, never by the owner
+//! string alone, so two tenants whose principals share an id string
+//! never share a budget and one tenant's sweep cannot trip another
+//! tenant's caller.
 //!
 //! The caller identity (owner + roles) is resolved by the enforcer from
 //! the verified auth subject (`ctx.auth_result`) or from trusted request
@@ -54,18 +64,25 @@ use serde::Deserialize;
 /// Hard cap on the number of principals tracked for enumeration so a
 /// flood of distinct principals (`principal.owner` is caller-controlled
 /// input) cannot grow the map without bound. An existing principal
-/// always keeps updating its own state, cap or no cap: past this many
-/// live principals, only a *new* principal is refused a tracking slot
-/// (see `ObjectAuthzPolicy::record_and_check_enumeration`), logged and
-/// best-effort-skipped rather than counted, the same honest shape
-/// `sbproxy_extension::mcp::peer_profile`'s bounded peer registry uses
-/// (that module also increments a dedicated Prometheus counter on
-/// saturation; this one does not yet, see
-/// `report_enumeration_tracker_saturated`'s own doc comment for why).
-/// Either way this replaces the old behavior of wiping every
+/// always keeps updating its own state, cap or no cap. When the map is
+/// at capacity and a *new* principal arrives, entries whose tumbling
+/// window has already expired are swept first (see
+/// `ObjectAuthzPolicy::record_and_check_enumeration`), so the cap counts
+/// genuinely live windows; only when every slot is a live window is the
+/// new principal refused a slot, counted on
+/// `sbproxy_object_authz_enumeration_tracker_saturated_total`, warned
+/// about once per window, and best-effort-skipped rather than counted,
+/// the same honest shape `sbproxy_extension::mcp::peer_profile`'s
+/// bounded peer registry uses (absence of a slot is never treated as a
+/// trip). Either way this replaces the old behavior of wiping every
 /// principal's state, including principals with nothing to do with the
 /// flood, the instant the map got full.
 const MAX_TRACKED_PRINCIPALS: usize = 50_000;
+
+/// Tenant label used to scope the enumeration tracker when the
+/// enforcer resolves no tenant, matching the `__default__` label
+/// single-tenant traffic reports on every other tenant-scoped surface.
+const DEFAULT_TENANT: &str = "__default__";
 
 /// Where the enforcer reads the caller's owner identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -196,11 +213,16 @@ fn default_window_secs() -> u64 {
 }
 
 /// The enumeration fallback signal used in the zero-`object_rules`
-/// case: `Some(the whole normalized path)` when the request's *actual
-/// trailing* path segment looks like an object id, either a purely
-/// numeric run (`42`, `100042`) or a canonical 36-character UUID
-/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, any hex case); `None`
-/// otherwise.
+/// case: `Some(the whole path, minus leading slashes)` when the
+/// request's *actual trailing* path segment looks like an object id,
+/// either a purely numeric run (`42`, `100042`) or a canonical
+/// 36-character UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, any hex
+/// case); `None` otherwise. The path is used as received: no
+/// percent-decoding, no `//` collapsing, no case folding, so
+/// `/Orders/1` and `/orders/1` count as distinct objects and a
+/// percent-encoded trailing id (`%31`) does not register as id-shaped.
+/// Both are accepted imprecision in a detect-only heuristic, and both
+/// only widen or narrow a signal that already cannot block.
 ///
 /// Two properties that are load-bearing, not incidental:
 ///
@@ -345,6 +367,11 @@ pub struct Principal {
     pub owner: Option<String>,
     /// Roles the caller holds (from the trusted role header).
     pub roles: Vec<String>,
+    /// Tenant the request resolved to, used to scope the enumeration
+    /// tracker so two tenants whose principals share an id string never
+    /// share a budget. An empty string is treated as the `__default__`
+    /// tenant label, matching the rest of the tenant-scoped surfaces.
+    pub tenant: String,
 }
 
 /// Compiled `object_authz` policy.
@@ -354,16 +381,24 @@ pub struct ObjectAuthzPolicy {
     object_rules: Vec<CompiledObjectRule>,
     function_rules: Vec<CompiledFunctionRule>,
     enumeration: EnumerationConfig,
-    /// Per-principal enumeration counter state, keyed by the owner
-    /// identity. Never holds a `""` (anonymous) key: `decide` only
-    /// calls into enumeration tracking for an identified caller.
-    /// Bounded to `MAX_TRACKED_PRINCIPALS` live principals; see
-    /// `record_and_check_enumeration` for what happens past that cap.
-    tracker: Mutex<HashMap<String, EnumerationWindow>>,
-    /// Set once this process has logged the enumeration-tracker
-    /// saturation warning, so a sustained flood of distinct principals
-    /// logs it once rather than once per refused request.
-    enumeration_saturation_warned: std::sync::atomic::AtomicBool,
+    /// Per-principal enumeration counter state, keyed by
+    /// `(tenant, owner)` so tenants never share a budget. Never holds
+    /// an anonymous (empty-owner) key: `decide` builds the key from
+    /// the owner identity itself, so an unidentified caller cannot be
+    /// keyed in. Bounded to `max_tracked_principals` live entries; see
+    /// `record_and_check_enumeration` for the expiry sweep that keeps
+    /// "live" true and for what happens past that cap.
+    tracker: Mutex<HashMap<(String, String), EnumerationWindow>>,
+    /// When the enumeration-tracker saturation warning last fired, so
+    /// a sustained flood of distinct principals re-warns once per
+    /// window rather than once per refused request (and rather than
+    /// once per policy instance, which hid every episode after the
+    /// first).
+    saturation_last_warned: Mutex<Option<Instant>>,
+    /// Capacity of `tracker`. Always `MAX_TRACKED_PRINCIPALS` in
+    /// production; a field rather than the const so tests can exercise
+    /// the at-capacity sweep without minting 50,000 entries.
+    max_tracked_principals: usize,
 }
 
 /// One principal's bounded enumeration-counter state.
@@ -406,6 +441,15 @@ struct EnumerationWindow {
     /// rest of the window, even for ids it already fetched
     /// successfully."
     tripped: bool,
+    /// Detect-only repeat hits since the last *emitted* violation. A
+    /// tripped detect-only principal is audited once per window, not
+    /// once per request (the request is allowed through, so nothing
+    /// else throttles the emission); the repeats land here and the
+    /// count rides along on the next emitted violation. Deliberately
+    /// survives a window rollover: it is "since the last emission",
+    /// not "this window". Never incremented for rule-derived hits,
+    /// which block and therefore keep their per-request audit record.
+    suppressed_repeats: u64,
 }
 
 impl EnumerationWindow {
@@ -414,8 +458,34 @@ impl EnumerationWindow {
             window_start: now,
             ids: HashSet::new(),
             tripped: false,
+            suppressed_repeats: 0,
         }
     }
+}
+
+/// What [`ObjectAuthzPolicy::record_and_check_enumeration`] observed
+/// for one request.
+enum EnumerationOutcome {
+    /// The distinct-id count is under the threshold, or the id repeats
+    /// one already counted. Nothing to report.
+    UnderThreshold,
+    /// This request pushed the distinct count past `max_distinct`: the
+    /// first trip of the current window. Carries the detect-only
+    /// repeat hits suppressed since the last emitted violation so the
+    /// caller can put the count in this emission.
+    Tripped { suppressed_since_last_emission: u64 },
+    /// The window is already tripped and the hit is rule-derived. The
+    /// caller must keep returning a violation: rule-derived hits block,
+    /// so the client pays for each one and each refusal is audited.
+    StillTripped,
+    /// The window is already tripped, the hit is detect-only, and this
+    /// repeat was counted into `suppressed_repeats` instead of being
+    /// emitted. The caller reports nothing.
+    SuppressedRepeat,
+    /// No tracking slot: the map is at capacity with only live windows
+    /// even after the expiry sweep. The request is not counted;
+    /// absence of a slot is never treated as a trip.
+    Saturated,
 }
 
 struct CompiledObjectRule {
@@ -496,7 +566,8 @@ impl ObjectAuthzPolicy {
             function_rules,
             enumeration: config.enumeration,
             tracker: Mutex::new(HashMap::new()),
-            enumeration_saturation_warned: std::sync::atomic::AtomicBool::new(false),
+            saturation_last_warned: Mutex::new(None),
+            max_tracked_principals: MAX_TRACKED_PRINCIPALS,
         })
     }
 
@@ -515,6 +586,20 @@ impl ObjectAuthzPolicy {
     /// violation found, or `None` to allow. BOLA is checked before
     /// enumeration before BFLA so the most object-specific denial wins.
     pub fn decide(&self, principal: &Principal, method: &str, path: &str) -> Option<Violation> {
+        self.decide_at(principal, method, path, Instant::now())
+    }
+
+    /// [`Self::decide`] with an explicit clock, so tests can advance
+    /// time across tumbling-window boundaries and capacity sweeps.
+    /// Production always enters through `decide`, which passes
+    /// `Instant::now()`.
+    fn decide_at(
+        &self,
+        principal: &Principal,
+        method: &str,
+        path: &str,
+        now: Instant,
+    ) -> Option<Violation> {
         let path = path.split('?').next().unwrap_or(path);
 
         // BOLA: a matched ownership rule's owner segment must equal the
@@ -551,9 +636,15 @@ impl ObjectAuthzPolicy {
                 }
                 Some(_) => {}
             }
-            if let Some(obj_param) = &rule.object_param {
-                if let Some(obj_id) = bindings.get(obj_param) {
-                    enumeration_hit = Some(obj_id.clone());
+            // First matching rule with an `object_param` wins, matching
+            // the first-match convention the BOLA and BFLA checks use;
+            // a later rule that also matches must not silently replace
+            // the id an earlier rule already captured.
+            if enumeration_hit.is_none() {
+                if let Some(obj_param) = &rule.object_param {
+                    if let Some(obj_id) = bindings.get(obj_param) {
+                        enumeration_hit = Some(obj_id.clone());
+                    }
                 }
             }
         }
@@ -584,26 +675,53 @@ impl ObjectAuthzPolicy {
                     None
                 }
             });
-            if let Some(obj_id) = obj_id {
-                let key = principal.owner.clone().unwrap_or_default();
-                if self.record_and_check_enumeration(&key, &obj_id) {
-                    let detect_only = !rule_derived;
-                    let suffix = if detect_only {
-                        " (ruleless path-shape heuristic; reported for audit only, not blocked)"
-                    } else {
-                        ""
-                    };
-                    return Some(Violation {
+            // An owner-less principal is never keyed into the tracker.
+            // Both sources already imply an identified caller (a matched
+            // ownership rule refuses an anonymous caller as BOLA above,
+            // and the heuristic checks `owner.is_some()`), but this
+            // binding makes that structural rather than incidental: the
+            // key is built from the owner itself, so a future edit to
+            // either source cannot reintroduce a shared `""` bucket
+            // where N innocent anonymous callers look like one attacker.
+            if let (Some(obj_id), Some(owner)) = (obj_id, principal.owner.as_deref()) {
+                let tenant = if principal.tenant.is_empty() {
+                    DEFAULT_TENANT
+                } else {
+                    principal.tenant.as_str()
+                };
+                let violation = |suppressed: u64| {
+                    let mut message = format!(
+                        "caller '{}' touched more than {} distinct object ids within {}s",
+                        owner, self.enumeration.max_distinct, self.enumeration.window_secs
+                    );
+                    if !rule_derived {
+                        message.push_str(
+                            " (ruleless path-shape heuristic; reported for audit only, not blocked)",
+                        );
+                    }
+                    if suppressed > 0 {
+                        message.push_str(&format!(
+                            "; {suppressed} repeat hit(s) since the last audited violation were suppressed from the audit feed"
+                        ));
+                    }
+                    Violation {
                         kind: ViolationKind::Enumeration,
-                        message: format!(
-                            "caller '{}' touched more than {} distinct object ids within {}s{}",
-                            key,
-                            self.enumeration.max_distinct,
-                            self.enumeration.window_secs,
-                            suffix
-                        ),
-                        detect_only,
-                    });
+                        message,
+                        detect_only: !rule_derived,
+                    }
+                };
+                match self.record_and_check_enumeration(tenant, owner, &obj_id, rule_derived, now) {
+                    EnumerationOutcome::UnderThreshold
+                    | EnumerationOutcome::SuppressedRepeat
+                    | EnumerationOutcome::Saturated => {}
+                    EnumerationOutcome::Tripped {
+                        suppressed_since_last_emission,
+                    } => {
+                        return Some(violation(suppressed_since_last_emission));
+                    }
+                    EnumerationOutcome::StillTripped => {
+                        return Some(violation(0));
+                    }
                 }
             }
         }
@@ -632,58 +750,93 @@ impl ObjectAuthzPolicy {
         None
     }
 
-    /// Record an object-id access for `key` and return true when it
-    /// pushes the distinct count within the current window past
-    /// `max_distinct`.
+    /// Record an object-id access for `(tenant, owner)` and report
+    /// where that leaves the principal's window: under threshold,
+    /// freshly tripped, still tripped, a suppressed detect-only
+    /// repeat, or refused a slot entirely.
     ///
-    /// O(1) amortized: no full-history scan runs on any call, and the
-    /// lock is held only long enough to touch one `EnumerationWindow`
-    /// whose own state is bounded to `max_distinct` entries, so the
-    /// work done under the lock cannot grow with how much traffic `key`
-    /// has generated. See `EnumerationWindow`'s own doc comment for the
-    /// tumbling-window trade this makes to get there.
+    /// O(1) amortized on every path but one: no full-history scan runs
+    /// on any call, and the lock is held only long enough to touch one
+    /// `EnumerationWindow` whose own state is bounded to `max_distinct`
+    /// entries, so the work done under the lock cannot grow with how
+    /// much traffic the principal generated. See `EnumerationWindow`'s
+    /// own doc comment for the tumbling-window trade this makes to get
+    /// there.
     ///
-    /// Tracking itself is capacity-bounded at `MAX_TRACKED_PRINCIPALS`
-    /// live principals: an already-tracked `key` always gets to update
-    /// its own state, cap or no cap, but a *new* principal past the cap
-    /// gets no slot at all. That principal's request is then simply not
-    /// counted (`false`, best-effort: absence of a slot is never treated
-    /// as a trip), the same shape `sbproxy_extension::mcp::peer_profile`'s
-    /// `ObservationVerdict::Saturated` uses: a saturated pair gets no
-    /// baseline rather than a fabricated one from a shared bucket.
-    /// Every other principal's own tracked state is completely
-    /// unaffected -- unlike the old behavior of wiping the whole map,
-    /// this cannot turn one flood of new principals into a
-    /// detection-gap for principals that had nothing to do with it.
-    fn record_and_check_enumeration(&self, key: &str, object_id: &str) -> bool {
-        let now = Instant::now();
+    /// The exception is the at-capacity boundary. Tracking is bounded
+    /// at `max_tracked_principals` entries: an already-tracked
+    /// principal always gets to update its own state, cap or no cap,
+    /// but when a *new* principal arrives at a full map, entries whose
+    /// tumbling window has already expired are swept first (one O(n)
+    /// `retain`, paid only on this boundary case), and the new
+    /// principal is admitted into a freed slot. The sweep never
+    /// touches a window that is still current, so no live principal's
+    /// state is ever wiped by another principal's flood, and the map
+    /// self-heals within one window the way the pre-cap code did.
+    /// Only when every slot holds a genuinely live window is the new
+    /// principal refused: its request is then simply not counted
+    /// (best-effort; absence of a slot is never treated as a trip),
+    /// the same shape `sbproxy_extension::mcp::peer_profile`'s
+    /// `ObservationVerdict::Saturated` uses, with each refusal counted
+    /// on `sbproxy_object_authz_enumeration_tracker_saturated_total`.
+    fn record_and_check_enumeration(
+        &self,
+        tenant: &str,
+        owner: &str,
+        object_id: &str,
+        rule_derived: bool,
+        now: Instant,
+    ) -> EnumerationOutcome {
         let window = Duration::from_secs(self.enumeration.window_secs.max(1));
+        let key = (tenant.to_string(), owner.to_string());
         let mut tracker = self.tracker.lock();
 
-        if !tracker.contains_key(key) && tracker.len() >= MAX_TRACKED_PRINCIPALS {
-            drop(tracker);
-            self.report_enumeration_tracker_saturated();
-            return false;
+        if !tracker.contains_key(&key) && tracker.len() >= self.max_tracked_principals {
+            // Sweep expired windows before refusing: an entry whose
+            // window already rolled over holds no signal (its next
+            // touch would reset it anyway), so evicting it cannot lose
+            // a live count. Only refuse when the map is still full of
+            // current windows afterward.
+            tracker.retain(|_, w| now.duration_since(w.window_start) <= window);
+            if tracker.len() >= self.max_tracked_principals {
+                drop(tracker);
+                self.report_enumeration_tracker_saturated(now);
+                return EnumerationOutcome::Saturated;
+            }
         }
 
         let entry = tracker
-            .entry(key.to_string())
+            .entry(key)
             .or_insert_with(|| EnumerationWindow::new(now));
 
         if now.duration_since(entry.window_start) > window {
             entry.window_start = now;
             entry.ids.clear();
             entry.tripped = false;
+            // `suppressed_repeats` deliberately survives the rollover:
+            // it counts "since the last emission", not "this window",
+            // so the tally lands in the next emitted violation instead
+            // of vanishing at the boundary.
         }
 
         if entry.tripped {
-            return true;
+            if rule_derived {
+                // Rule-derived hits block, so every request is refused,
+                // audited, and paid for by the client. No suppression.
+                return EnumerationOutcome::StillTripped;
+            }
+            // Detect-only hits are allowed through, so per-request
+            // emission would hand a tripped client an unthrottled
+            // signed-audit amplifier. Count the repeat for the next
+            // emission instead.
+            entry.suppressed_repeats = entry.suppressed_repeats.saturating_add(1);
+            return EnumerationOutcome::SuppressedRepeat;
         }
 
         if entry.ids.contains(object_id) {
             // A repeat of an already-counted id never trips the sweep
             // on its own, and never needs to touch the set again.
-            return false;
+            return EnumerationOutcome::UnderThreshold;
         }
 
         entry.ids.insert(object_id.to_string());
@@ -694,43 +847,45 @@ impl ObjectAuthzPolicy {
             // of the window for no further purpose.
             entry.ids.clear();
             entry.ids.shrink_to_fit();
-            return true;
+            return EnumerationOutcome::Tripped {
+                suppressed_since_last_emission: std::mem::take(&mut entry.suppressed_repeats),
+            };
         }
-        false
+        EnumerationOutcome::UnderThreshold
     }
 
-    /// Log the enumeration tracker's capacity being reached, once per
-    /// policy instance rather than once per refused request so a
-    /// sustained flood does not spam the log. Every occurrence still
-    /// reaches an operator: unlike a per-key latch, this is a single
-    /// `AtomicBool` on the policy itself, deliberately coarser than
-    /// `sbproxy_extension::mcp::peer_profile`'s per-tenant latch,
-    /// because there is no tenant dimension here to key it on -- a
-    /// second, later saturation episode after the first log line is
-    /// silent, which is the same trade that module's own doc comment
-    /// makes for its per-tenant version.
-    ///
-    /// A dedicated `stable` Prometheus counter alongside this log line
-    /// (mirroring `record_mcp_peer_registry_saturated`) is the natural
-    /// next step, but adding one correctly means also updating the
-    /// generated `docs/metrics-stability.md` catalog and satisfying
-    /// `sbproxy-capability`'s writer-resolution drift guard, neither of
-    /// which this change can verify without `cargo run`/`cargo test`
-    /// outside this fix's cargo carve-out -- left as explicit follow-up
-    /// rather than shipped unverified.
-    fn report_enumeration_tracker_saturated(&self) {
-        use std::sync::atomic::Ordering;
-        if self
-            .enumeration_saturation_warned
-            .swap(true, Ordering::Relaxed)
-        {
-            return;
+    /// Report one refused tracking slot: count it on
+    /// `sbproxy_object_authz_enumeration_tracker_saturated_total`
+    /// (every refusal, so an operator can alert on the episode and see
+    /// its size) and re-warn at most once per enumeration window
+    /// (recurring, so an operator who missed the first line, or whose
+    /// log retention rotated it away, still learns the detector is
+    /// refusing new principals; bounded, so a sustained flood cannot
+    /// spam the log).
+    fn report_enumeration_tracker_saturated(&self, now: Instant) {
+        sbproxy_observe::metrics::record_object_authz_tracker_saturated();
+        if self.should_emit_saturation_warn(now) {
+            tracing::warn!(
+                target: "sbproxy::policy::object_authz",
+                cap = self.max_tracked_principals,
+                "object_authz enumeration tracker is full of live windows; new principals get no enumeration baseline until existing windows expire"
+            );
         }
-        tracing::warn!(
-            target: "sbproxy::policy::object_authz",
-            cap = MAX_TRACKED_PRINCIPALS,
-            "object_authz enumeration tracker is full; new principals get no enumeration baseline until it drains"
-        );
+    }
+
+    /// Whether the saturation warn is due: true on the first refusal
+    /// and again once per enumeration window for as long as refusals
+    /// keep happening.
+    fn should_emit_saturation_warn(&self, now: Instant) -> bool {
+        let window = Duration::from_secs(self.enumeration.window_secs.max(1));
+        let mut last = self.saturation_last_warned.lock();
+        match *last {
+            Some(prev) if now.duration_since(prev) < window => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
     }
 }
 
@@ -841,6 +996,15 @@ mod tests {
         Principal {
             owner: owner.map(String::from),
             roles: roles.iter().map(|r| r.to_string()).collect(),
+            tenant: String::new(),
+        }
+    }
+
+    fn tenant_principal(tenant: &str, owner: &str) -> Principal {
+        Principal {
+            owner: Some(owner.to_string()),
+            roles: Vec::new(),
+            tenant: tenant.to_string(),
         }
     }
 
@@ -1194,5 +1358,341 @@ mod tests {
         // This is the safer BFLA default: `/admin/**` also gates `/admin`.
         assert!(pat.match_path("/admin").is_some());
         assert!(pat.match_path("/public/x").is_none());
+    }
+
+    #[test]
+    fn tracker_at_capacity_evicts_expired_windows_and_admits_new_principals() {
+        // Review Blocker (v1.13 phase 2): the tracker never evicted, so
+        // once `max_tracked_principals` distinct principals had ever
+        // been seen, enumeration detection was dead for every new
+        // principal for the life of the policy instance. At capacity,
+        // entries whose tumbling window already expired must be swept
+        // so a new principal is tracked again.
+        let mut p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        p.max_tracked_principals = 3;
+        let t0 = Instant::now();
+        // Fill the map to capacity with principals whose windows will
+        // have expired by t1.
+        for owner in ["a", "b", "c"] {
+            assert_eq!(
+                p.decide_at(&principal(Some(owner), &[]), "GET", "/orders/1", t0),
+                None
+            );
+        }
+        assert_eq!(p.tracker.lock().len(), 3);
+        // One window later, a brand-new principal must be admitted (the
+        // expired windows are swept) and must be able to trip the sweep.
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            p.decide_at(&principal(Some("d"), &[]), "GET", "/orders/1", t1),
+            None,
+            "a new principal must get a tracking slot once stale windows expired"
+        );
+        let v = p
+            .decide_at(&principal(Some("d"), &[]), "GET", "/orders/2", t1)
+            .expect("the newly admitted principal's sweep must trip");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn tracker_capacity_sweep_never_wipes_live_windows() {
+        let mut p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        p.max_tracked_principals = 3;
+        let t0 = Instant::now();
+        // Two principals whose windows will be expired at t1...
+        for owner in ["a", "b"] {
+            assert_eq!(
+                p.decide_at(&principal(Some(owner), &[]), "GET", "/orders/1", t0),
+                None
+            );
+        }
+        // ...and one whose window is still live at t1.
+        let t_mid = t0 + Duration::from_secs(30);
+        assert_eq!(
+            p.decide_at(&principal(Some("c"), &[]), "GET", "/orders/1", t_mid),
+            None
+        );
+        // A new principal arriving at a full map forces the sweep.
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            p.decide_at(&principal(Some("d"), &[]), "GET", "/orders/1", t1),
+            None
+        );
+        // The live window survived the sweep with its count intact: a
+        // second distinct id inside c's window still trips.
+        let v = p
+            .decide_at(&principal(Some("c"), &[]), "GET", "/orders/2", t1)
+            .expect("a live window must survive the capacity sweep");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+        // And the admitted principal is genuinely tracked too.
+        let v = p
+            .decide_at(&principal(Some("d"), &[]), "GET", "/orders/2", t1)
+            .expect("the admitted principal must be tracked");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn a_new_principal_at_a_live_capacity_is_skipped_not_tripped() {
+        let mut p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        p.max_tracked_principals = 2;
+        let t0 = Instant::now();
+        for owner in ["a", "b"] {
+            assert_eq!(
+                p.decide_at(&principal(Some(owner), &[]), "GET", "/orders/1", t0),
+                None
+            );
+        }
+        // Map full of genuinely live windows: the new principal is
+        // refused a slot, never fabricated into a trip, and existing
+        // state is untouched.
+        for id in 1..=5 {
+            assert_eq!(
+                p.decide_at(
+                    &principal(Some("c"), &[]),
+                    "GET",
+                    &format!("/orders/{id}"),
+                    t0
+                ),
+                None,
+                "an untracked principal is best-effort skipped, never tripped"
+            );
+        }
+        assert_eq!(p.tracker.lock().len(), 2);
+        // Existing principals still update their own state at the cap.
+        let v = p
+            .decide_at(&principal(Some("a"), &[]), "GET", "/orders/2", t0)
+            .expect("a tracked principal still trips at capacity");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn enumeration_budgets_are_scoped_per_tenant() {
+        // Review Major (v1.13 phase 2): the tracker key carried no
+        // tenant identity, so tenant A's user "42" and tenant B's user
+        // "42" shared one window, and A tripping the budget handed B's
+        // unrelated caller a 403 for the rest of the window. Two
+        // tenants with the same principal string must never share a
+        // budget.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/tenants/{owner}/orders/{id}", "owner_param": "owner", "object_param": "id" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let a = tenant_principal("tenant-a", "42");
+        let b = tenant_principal("tenant-b", "42");
+        for id in 1..=2 {
+            assert_eq!(
+                p.decide(&a, "GET", &format!("/tenants/42/orders/{id}")),
+                None
+            );
+        }
+        let v = p
+            .decide(&a, "GET", "/tenants/42/orders/3")
+            .expect("tenant A trips its own budget");
+        assert!(!v.detect_only);
+        // Tenant B's same-named caller has its own untouched budget.
+        for id in [10, 11] {
+            assert_eq!(
+                p.decide(&b, "GET", &format!("/tenants/42/orders/{id}")),
+                None,
+                "tenant B must not share tenant A's enumeration budget"
+            );
+        }
+    }
+
+    #[test]
+    fn tumbling_window_rollover_resets_the_count_and_clears_the_trip() {
+        // Review Major (v1.13 phase 2): the rollover branch (reset
+        // window_start, clear ids, clear tripped) had zero coverage
+        // because the clock was not injectable. A tripped window must
+        // re-arm at the boundary, and an untripped window must restart
+        // its distinct count.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/tenants/{owner}/orders/{id}", "owner_param": "owner", "object_param": "id" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        let path = |id: u32| format!("/tenants/tenant-a/orders/{id}");
+        let t0 = Instant::now();
+        for id in 1..=2 {
+            assert_eq!(p.decide_at(&caller, "GET", &path(id), t0), None);
+        }
+        let v = p
+            .decide_at(&caller, "GET", &path(3), t0)
+            .expect("third distinct id trips");
+        assert!(!v.detect_only);
+        // Still tripped late in the same window, even for a repeat id.
+        assert!(p
+            .decide_at(&caller, "GET", &path(1), t0 + Duration::from_secs(59))
+            .is_some());
+        // One window later the trip is cleared and counting restarts.
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            p.decide_at(&caller, "GET", &path(4), t1),
+            None,
+            "rollover must clear the tripped latch"
+        );
+        assert_eq!(
+            p.decide_at(&caller, "GET", &path(5), t1),
+            None,
+            "rollover must reset the distinct count"
+        );
+        // The fresh window's own budget still enforces.
+        assert!(p.decide_at(&caller, "GET", &path(6), t1).is_some());
+
+        // An untripped window also restarts its count at the boundary:
+        // two ids in the first window plus two in the second must not
+        // read as four.
+        let caller2 = principal(Some("tenant-b"), &[]);
+        let path2 = |id: u32| format!("/tenants/tenant-b/orders/{id}");
+        for id in 1..=2 {
+            assert_eq!(p.decide_at(&caller2, "GET", &path2(id), t0), None);
+        }
+        for id in 3..=4 {
+            assert_eq!(
+                p.decide_at(&caller2, "GET", &path2(id), t1),
+                None,
+                "an untripped window's count must not leak across the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_only_trip_is_audited_once_per_window_and_repeats_ride_the_next_emission() {
+        // Review Major (v1.13 phase 2): a tripped detect-only principal
+        // emitted one signed audit record per request with no
+        // backpressure (the request is allowed through, so nothing
+        // throttles the client). After the window's first detect-only
+        // violation, repeats must be suppressed and counted, with the
+        // count landing in the next emitted violation.
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        let t0 = Instant::now();
+        assert_eq!(p.decide_at(&caller, "GET", "/orders/1", t0), None);
+        let first = p
+            .decide_at(&caller, "GET", "/orders/2", t0)
+            .expect("second distinct id trips the heuristic");
+        assert!(first.detect_only);
+        assert!(!first.message.contains("suppressed"));
+        // Repeat hits inside the tripped window are allowed through
+        // anyway; they must not each mint a fresh audit record.
+        for id in 3..=5 {
+            assert_eq!(
+                p.decide_at(&caller, "GET", &format!("/orders/{id}"), t0),
+                None,
+                "repeat detect-only hits must be suppressed, not re-emitted"
+            );
+        }
+        // The next emitted violation carries the suppressed count.
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(p.decide_at(&caller, "GET", "/orders/10", t1), None);
+        let second = p
+            .decide_at(&caller, "GET", "/orders/11", t1)
+            .expect("the next window's sweep trips again");
+        assert!(second.detect_only);
+        assert!(
+            second.message.contains("3 repeat hit(s)"),
+            "the suppressed-repeat count must land in the next emission, got: {}",
+            second.message
+        );
+    }
+
+    #[test]
+    fn an_owner_less_principal_is_never_keyed_into_the_tracker() {
+        // Review Major (v1.13 phase 2): the pre-fix key construction
+        // fell back to `""` for a missing owner. Through `decide` that
+        // bucket was already unreachable (a matched ownership rule
+        // refuses an anonymous caller as BOLA before counting, and the
+        // heuristic requires an owner), so this is a structural pin
+        // rather than a behavior change: whatever path produces an
+        // object id, the key is built from the owner itself, and an
+        // anonymous caller leaves no tracker entry on either path.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/tenants/{owner}/orders/{id}", "owner_param": "owner", "object_param": "id" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let anonymous = principal(None, &[]);
+        for id in 1..=5 {
+            let v = p
+                .decide(&anonymous, "GET", &format!("/tenants/tenant-a/orders/{id}"))
+                .expect("anonymous caller on an owned scope is refused as BOLA");
+            assert_eq!(v.kind, ViolationKind::Bola);
+        }
+        assert!(
+            p.tracker.lock().is_empty(),
+            "an owner-less principal must never occupy a tracker slot"
+        );
+
+        // Same property on the ruleless heuristic path.
+        let p2 = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        for id in 1..=5 {
+            assert_eq!(p2.decide(&anonymous, "GET", &format!("/orders/{id}")), None);
+        }
+        assert!(p2.tracker.lock().is_empty());
+    }
+
+    #[test]
+    fn first_matching_rules_object_param_wins_for_enumeration() {
+        // Review finding: with two rules matching one path, the LAST
+        // rule's `object_param` silently won, unlike the first-match
+        // convention the other checks use. Under last-wins the constant
+        // trailing segment below would collapse a real sweep across
+        // `{id}` into one "distinct" id and never trip.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/x/{owner}/{id}/detail", "owner_param": "owner", "object_param": "id" },
+                { "path": "/x/{owner}/*/{tail}", "owner_param": "owner", "object_param": "tail" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let caller = principal(Some("u1"), &[]);
+        for id in 1..=2 {
+            assert_eq!(
+                p.decide(&caller, "GET", &format!("/x/u1/{id}/detail")),
+                None
+            );
+        }
+        let v = p
+            .decide(&caller, "GET", "/x/u1/3/detail")
+            .expect("the first matching rule's object_param is the one counted");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+        assert!(!v.detect_only);
+    }
+
+    #[test]
+    fn saturation_warn_is_rate_limited_but_recurring() {
+        // Review Major (v1.13 phase 2): the saturation warn was a
+        // one-shot AtomicBool per policy instance, so every episode
+        // after the first was silent. It must recur once per window
+        // for as long as refusals continue.
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "window_secs": 60 }
+        }));
+        let t0 = Instant::now();
+        assert!(p.should_emit_saturation_warn(t0), "first refusal warns");
+        assert!(
+            !p.should_emit_saturation_warn(t0 + Duration::from_secs(1)),
+            "the same window stays quiet"
+        );
+        assert!(!p.should_emit_saturation_warn(t0 + Duration::from_secs(59)));
+        assert!(
+            p.should_emit_saturation_warn(t0 + Duration::from_secs(120)),
+            "a later episode re-warns"
+        );
     }
 }

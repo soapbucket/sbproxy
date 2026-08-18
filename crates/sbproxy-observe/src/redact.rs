@@ -62,11 +62,20 @@ static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// their own: a 32-hex Slack signing secret, a Google `GOCSPX-...`
 /// client secret (its hyphen breaks `RE_AWS_SECRET`'s base64 run), and
 /// a raw cluster master key all sail past the shape patterns above.
-/// Matched by key, like `api_key` and `password`. Groups: key,
-/// separator, value; see [`keyed_credential_replacement`].
+/// Matched by key, like `api_key` and `password`, but the separator
+/// must contain a real `:` or `=`: a key name that merely PRECEDES
+/// other text is not an assignment. Without that, the access log's
+/// `"principal_kind":"virtual_key","api_key_id":"..."` matched as
+/// `virtual_key` + separator `"` + value `,"api_key_id":...`, and the
+/// mask swallowed the rest of the JSON line (a v1.13 pre-release
+/// regression caught by the governed_key_policy e2e). The value run
+/// stops at quotes and commas for the same reason: a credential never
+/// contains them, and JSON structure must survive redaction.
+/// Groups: key, separator, value; see
+/// [`keyed_credential_replacement`].
 static RE_CREDENTIAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(session[_-]?token|master[_-]?key|signing[_-]?key|shared[_-]?key|virtual[_-]?key|challenge[_-]?binding[_-]?key|signing[_-]?secret|client[_-]?secret)(["'\s:=]+)(\S{4,})"#,
+        r#"(?i)\b(session[_-]?token|master[_-]?key|signing[_-]?key|shared[_-]?key|virtual[_-]?key|challenge[_-]?binding[_-]?key|signing[_-]?secret|client[_-]?secret)(["'\s]*[:=]["'\s]*)([^\s"',;]{4,})"#,
     )
     .expect("valid regex")
 });
@@ -77,7 +86,7 @@ static RE_CREDENTIAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// ("token count", "token budget"), so this one requires an explicit
 /// `:` or `=` separator rather than matching across a bare space.
 static RE_BARE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(token)(["'\s]*[:=]["'\s]*)(\S{4,})"#).expect("valid regex")
+    Regex::new(r#"(?i)\b(token)(["'\s]*[:=]["'\s]*)([^\s"',;]{4,})"#).expect("valid regex")
 });
 
 /// Generic `password = "..."` / `password: ...` patterns.
@@ -154,13 +163,12 @@ fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
     {
         caps[0].to_string()
     } else {
-        // Same normalization and same deliberate separator consumption
-        // as the password path: an inline credential is not meant to
-        // survive a GET-edit-PUT round trip.
-        format!(
-            "{}=[REDACTED]",
-            caps[1].to_ascii_lowercase().replace('-', "_")
-        )
+        // The separator survives verbatim: these keys appear inside
+        // JSON log lines (`"virtual_key":"..."`), where consuming the
+        // quote-colon-quote run corrupts the line for every consumer
+        // downstream. Masking only the value keeps the credential out
+        // and the structure intact in every format at once.
+        format!("{}{}[REDACTED]", &caps[1], &caps[2])
     }
 }
 
@@ -660,6 +668,33 @@ mod tests {
                 "a reference must not be reported as a secret: {input}"
             );
         }
+    }
+
+    /// v1.13 pre-release regression, caught by the governed_key_policy
+    /// e2e: the widened credential-key pattern treated the access log's
+    /// `"principal_kind":"virtual_key"` as an assignment and masked the
+    /// rest of the JSON line, `api_key_id` included. A key name that
+    /// merely precedes other text is not an assignment, and a masked
+    /// value must never swallow JSON structure.
+    #[test]
+    fn a_json_field_value_naming_a_key_kind_is_not_an_assignment() {
+        let line =
+            r#"{"principal_kind":"virtual_key","api_key_id":"e395a57ccae195f9","status":200}"#;
+        let out = redact_secrets(line);
+        assert_eq!(out, line, "no assignment, nothing to mask");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("line stays valid JSON");
+        assert_eq!(parsed["api_key_id"], "e395a57ccae195f9");
+    }
+
+    /// The real assignment forms still mask, and the mask stops at the
+    /// JSON string terminator instead of eating the next field.
+    #[test]
+    fn a_real_credential_assignment_masks_only_its_value() {
+        let out = redact_secrets(r#"{"virtual_key":"abcd1234secretvalue","next_field":"stays"}"#);
+        assert!(!out.contains("abcd1234secretvalue"), "got: {out}");
+        assert!(out.contains(r#""next_field":"stays""#), "got: {out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(parsed["next_field"], "stays");
     }
 
     #[test]

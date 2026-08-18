@@ -10,6 +10,220 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.13.0] - 2026-08-18
+
+### Security
+
+- **h2 updated to 0.4.16.** RUSTSEC-2026-0258 (low severity): h2 0.4.15
+  could queue empty DATA frames without bound on streams the peer never
+  drains. The 0.4.16 patch bounds the queue. Lockfile-only change; no
+  SBproxy behavior differs beyond the fix itself.
+
+### Added
+
+- **A `federated_servers[]` entry can be `type: local`: tools the
+  gateway serves itself, declared entirely in config.** A local tool is
+  one of three handlers: a fixed value, one HTTP call, or a
+  dependency-ordered DAG of HTTP calls under `steps:`, connected by a
+  `${args}` / `${steps}` interpolation language and shaped into one
+  response with a `template`, JavaScript, or Lua script. DAG steps run
+  in deterministic topological order with per-step CEL `condition`
+  gating, per-step retry, `continue_on_error`, and a whole-tool-call
+  budget (`steps.timeout`, default 30 seconds, capped at 5 minutes).
+  Every outbound step dial goes through the server's own
+  deny-by-default egress gate, and a failed step, a throwing script, or
+  a template referencing a missing path fails the tool call closed
+  through the normal JSON-RPC error path, never a partial result.
+  Because local tools publish into the same registry federation does,
+  the whole existing governance surface applies with no new wiring:
+  RBAC, approval status (a `draft` local server is hidden and refused
+  like any other), versioning, argument and result policies, content
+  filters, session-flow enforcement, and evidence records.
+  [mcp-compose.md](docs/mcp-compose.md) is the field reference;
+  [`examples/mcp-local-tools`](examples/mcp-local-tools/),
+  [`examples/mcp-compose`](examples/mcp-compose/), and
+  [`examples/mcp-compose-js`](examples/mcp-compose-js/) are the
+  runnable shapes.
+
+- **`proxy.config_history` keeps a durable ring of every applied
+  config, surfaced end to end.** Off by default. When enabled, every
+  config this proxy applies (from disk, git, or the config authority)
+  is recorded as a content-addressed, zstd-compressed entry holding the
+  pre-resolution bytes: a `${VAR}` or `vault://` / `secret://`
+  reference never resolves into a stored entry. `keep` bounds the ring,
+  and eviction persists the shrunk index before unlinking any blob, so
+  a crash mid-eviction can never leave an index naming a blob that is
+  gone; a host crash that truncates `index.json`, all the way to zero
+  bytes, is repaired on the next open rather than bricking the ring.
+  Read it back with `GET /admin/config/history` and
+  `GET /admin/config/history/{digest}`, with `sbproxy config history`
+  and `sbproxy config show`, or in the admin console's config panel;
+  `sbproxy_config_history_entries` and `sbproxy_config_revision_info`
+  report the ring on the metrics surface. The admin route and CLI mask
+  a literal secret an operator typed into the YAML as `[REDACTED]`, the
+  same pass `GET /admin/config` applies; the ring file underneath keeps
+  the original bytes, because a rollback needs them, and the
+  owner-only directory permissions (`0700`/`0600`) are the real
+  boundary on that file. Two honest limits: changing this block takes a
+  restart, not a hot reload, and `keep_rejected` is accepted for
+  forward compatibility but nothing writes rejected candidates yet in
+  this release. See
+  [configuration.md](docs/configuration.md#config_history) and the
+  [config-history example](examples/config-history/).
+
+- **Raw-body Lua transforms, and per-request context for WASM
+  transforms.** A `type: lua` transform mirrors the JavaScript raw
+  transform's contract: the body is a string in and a string out, never
+  parsed as JSON, so a script can rewrite plain text, XML, CSV, or any
+  non-JSON payload, the thing `lua_json` cannot do. It uses the same
+  two-tier invocation as `lua_json`: a `transform(body, ctx)` function
+  when defined, otherwise legacy top-level code with `body` bound as a
+  global. Separately, a `type: wasm` transform can set
+  `request_context: true` to receive the same `ctx` document Lua and
+  JavaScript transforms get (principal, aipref, TLS fingerprint) as a
+  JSON-encoded `SBPROXY_REQUEST_CONTEXT` WASI environment variable,
+  scoped to that invocation; stdin is untouched either way. Both new
+  shapes are request-dependent (WASM only when the flag is set), so the
+  config compiler's existing refusal of a request-dependent transform
+  on a response-cached origin covers them too, and a ctx-off WASM
+  transform keeps its cacheability exactly as before. See
+  [scripting.md](docs/scripting.md) and
+  [wasm-development.md](docs/wasm-development.md).
+
+- **PII and secret detections carry bounded position spans.** A
+  detection record previously said only "email detected," with no way
+  to say where or whether it was one match or a thousand. The PII
+  guardrail's decision-audit records, the `dlp` policy's deny reason,
+  and MCP `content_filters` logging now carry a bounded list of match
+  spans plus a dropped count, using one shared capped span type across
+  all three surfaces. Wiring the MCP spans also fixed a real ordering
+  bug: `secrets` and `pii` were scanned in sequence against the same
+  live document, so a `secrets: redact` hit shifted offsets before
+  `pii` scanned; both categories now scan one snapshot taken before
+  either mutates anything.
+
+- **`policies: [{type: owasp_api_top10}]` expands into the OWASP API
+  Security Top 10 controls the proxy can honestly cover.** A
+  compile-time expander synthesizes concrete policy entries per item,
+  backing off per piece when the origin already authors an overlapping
+  policy, and surfaces a five-state manifest (`enforced`,
+  `report_only`, `already_enforced`, `needs_operator_input`,
+  `not_covered`) three ways: `GET /admin/owasp-api-pack`,
+  `sbproxy plan`, and validation errors naming the knob that completes
+  a parked item. The posture is safe by default: `report_only` unless
+  `posture: enforce`, and api4's rate pieces synthesize only when the
+  operator declares `per_item.api4.rps`, because blind IP-keyed budgets
+  behind an undeclared load balancer collapse every client onto one
+  budget. api2, api6, and api10 are named `not_covered` with reasons
+  rather than pretended at. See
+  [owasp-api-top10.md](docs/owasp-api-top10.md) and the
+  `owasp-api-top10` and `owasp-api-selective` examples.
+
+### Changed, and worth checking before you upgrade
+
+- **The `dlp` policy now scans request bodies.** It documented body
+  scanning and only ever saw the URI and headers; the enforcer received
+  the buffered body and never read it. It now scans request bodies by
+  default, capped at the first 16 KiB, the same bound the injection
+  policy uses. An origin carrying a `dlp` policy starts matching on
+  body content the moment you upgrade, so traffic that only ever
+  tripped on a header can now trip on a payload: check what your
+  patterns match before deploying. Response-side scanning is
+  structurally out of the policy phase's reach and stays with
+  transforms; [api-security.md](docs/api-security.md) now states
+  exactly what each direction covers.
+
+- **The AI PII guardrail's knobs all do something, or refuse.**
+  `action: log` was a silent no-op; it now logs the detection (pattern
+  type only, never the matched text) and allows the request.
+  `action: mask` and `redact_response: true` cannot work under the
+  current guardrail signature, so both are now refused at config load
+  with an error naming the limitation, instead of being accepted and
+  ignored. A config carrying either stops loading on upgrade; the
+  refusal is the honest state until per-entity actions land.
+
+- **Enumeration detection fires without `object_rules`.** The
+  `object_authz` policy's `enumeration.enabled: true` never counted
+  anything unless a declared ownership rule captured an object id,
+  which contradicted its documentation as a standalone anomaly
+  detector. With no `object_rules` configured it now falls back to a
+  path heuristic: a request whose trailing path segment is id-shaped (a
+  numeric run or a canonical UUID) counts the whole normalized path as
+  the object, so a sweep across `/orders/1` through `/orders/500` trips
+  while `/reports/2026/08/` browsing does not. The heuristic counts
+  identified callers only (an anonymous flood is never attributed to a
+  shared bucket), does constant bounded work per request under a capped
+  tumbling window, and its hits are always detect-only: audited to the
+  security log and `sbproxy_object_authz_violations_total`, never
+  blocking, because both the id shape and the path-to-object mapping
+  are guesses. Rule-scoped enumeration, BOLA, and BFLA are unchanged
+  and stay fully enforceable, and any configured `object_rules` scope
+  detection exactly as before. If you run with `enumeration.enabled`
+  and no rules, expect violation records to start appearing on traffic
+  that previously counted nothing. See
+  [object-authz.md](docs/object-authz.md).
+
+- **`$${...}` is now an escape everywhere the config's `${VAR}`
+  environment interpolation runs.** The MCP composition docs define
+  `$${VAR}` as rendering a literal `${VAR}`, but the pre-parse layer
+  spliced the live environment value first, which could bake a secret
+  into the compiled config. The escape is honored end to end now: an
+  even run of dollars never substitutes. A config that relied on
+  `$${VAR}` splicing a value (none of the shipped examples did) reads
+  differently after upgrading.
+
+- **Displayed credential masking covers more key names.** The pass that
+  masks secrets in `GET /admin/config`, config-history views, and log
+  output now recognizes session tokens, signing and client secrets, and
+  the product's own key-name families (`master_key`, `signing_key`,
+  `virtual_key`, and relatives), and masks only the value while
+  preserving the surrounding structure, so JSON log lines survive
+  redaction intact. Operators diffing displayed config against disk
+  will see more `[REDACTED]` than 1.12 showed.
+
+### Fixed
+
+- **`codemode.ts` no longer advertises `draft` servers.** The
+  TypeScript module served at `GET /.well-known/mcp/codemode.ts`
+  rendered the full federation catalog with no approval-status
+  filtering, so a `draft` server's tool names and descriptions leaked
+  even though `tools/list` and `tools/call` already hid and refused it.
+  It now uses the same visibility predicate as `tools/list`;
+  `deprecated` servers are unaffected. One caveat is still true and now
+  documented rather than conflated with this gap: the module is served
+  ahead of per-caller authentication and cached per catalog, not per
+  principal, so `rbac_policies` scoping does not reach it. See
+  [cloudflare-code-mode.md](docs/cloudflare-code-mode.md).
+
+- **The shipped examples demonstrate what they claim, on camera.** A
+  live replay of the example cassettes against the release binary found
+  recordings whose payoff commands printed nothing, and two examples
+  that could never fire at all. The `sri` example hooked a policy that
+  runs in the upstream response phase to a `type: static` origin that
+  phase never reaches; it now proxies to a local fixture and the
+  violation metric demonstrably increments. The `websocket-proxy`
+  example's client could not read a frame over 125 bytes (no RFC 6455
+  extended-length decoding); it now speaks full frame lengths and
+  demonstrates the oversized-frame cap the README promised.
+  `pii-redaction` recorded against a fixture that never echoed bodies,
+  so there was nothing to redact; it records against a local echoing
+  fixture now. The recording harness probes the admin port (admin bind
+  failure is non-fatal, so a stale occupant silently blanked every
+  admin payoff), starts each example's fixture itself, and parses the
+  `admin:` block by its own indentation instead of grabbing the first
+  `port:` anywhere in the file. All affected cassettes are re-recorded
+  and frame-verified showing real output.
+
+- **Trace and metric exporters answer to a reload, not just to boot.**
+  The egress inventory's boot-time authorization never re-checked the
+  boot-built OTLP exporters after a hot reload, so a config that newly
+  denies the running telemetry endpoint silently kept exporting; and a
+  denied telemetry endpoint stamped the sightings inventory but never
+  reached the `egress_refused` counter or the event feed, unlike every
+  other purpose. A reload whose config denies a running exporter's
+  endpoint is now refused naming the conflict, and telemetry denials
+  publish through the same refused-event bridge as everything else.
+
 ## [1.12.0] - 2026-08-17
 
 ### Added
