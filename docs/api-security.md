@@ -241,9 +241,15 @@ field carries a key, matching against a list you supply as `passwords`,
 `dlp` handles the regulated-data case, and it has two limits worth knowing
 before you plan around it.
 
-It scans **requests only**. Setting `direction: response` or `both` is accepted
-and then warned about at load, and the scan still runs on the request side.
-So `dlp` catches regulated data on the way in, not on the way out.
+It scans **requests only** - the URI, the headers, and (on by default, capped
+at 16 KiB) the buffered body, which is where most of the shapes in the example
+above actually show up. Setting `direction: response` or `both` is accepted
+and then warned about at load; the request-side scan still runs regardless.
+That is not a scheduling gap that a future release closes: `dlp` runs through
+the same request-only policy-enforcement phase every built-in policy shares,
+so scanning a response would need a different phase entirely, the one the
+response transforms already run in. So `dlp` catches regulated data on the
+way in, not on the way out.
 
 Its actions are `tag` and `block`, not redact. `tag` marks the request for
 downstream handling and lets it through; `block` refuses it. Redact-and-continue

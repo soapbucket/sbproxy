@@ -4,10 +4,13 @@
 //! Lifts the body of the `Policy::Dlp(p)` arm that lived in
 //! `crate::server::check_policies` into a
 //! [`sbproxy_plugin::PolicyEnforcer`] impl. Scans the URI path +
-//! query string and the request headers against the configured
-//! detector set; on a hit, either denies (Block action) or stamps
-//! a trust header on the request context for the upstream to see
-//! (Tag action).
+//! query string, the request headers, and (by default) the buffered
+//! request body against the configured detector set; on a hit,
+//! either denies (Block action) or stamps a trust header on the
+//! request context for the upstream to see (Tag action). The body is
+//! already sitting in `req.body()` courtesy of `PolicyEnforcer`'s
+//! signature, so this enforcer needs no extra buffering step to
+//! reach it; see `DlpPolicy::scan_request`'s doc comment.
 //!
 //! Per-deny-reason label: `"dlp"`. Single denial shape (`403
 //! Forbidden`).
@@ -51,7 +54,7 @@ impl PolicyEnforcer for DlpEnforcer {
             }
         };
         let path_and_query = req.uri().to_string();
-        let scan = policy.scan(&path_and_query, req.headers());
+        let scan = policy.scan_request(&path_and_query, req.headers(), req.body());
         if let DlpScanResult::Hit {
             detectors,
             spans,
