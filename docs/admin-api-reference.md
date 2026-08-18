@@ -957,6 +957,24 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
+Every one of the eleven wired egress purposes below goes through the same
+authorizer and lands in the same inventory and, on denial, the same
+event:
+
+```mermaid
+flowchart TD
+    A["Egress call site: AI provider, judge, MCP upstream,\nOpenAPI tool, token exchange, webhook, usage sink,\nmodel/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
+    B -->|no authorizer armed for this purpose| C[ungated]
+    B -->|authorizer armed| D{Destination allowed?}
+    D -->|yes| E[allowed]
+    D -->|no| F[denied]
+    C --> G["GET /api/egress inventory (allowed_count)"]
+    E --> G
+    F --> H["GET /api/egress inventory (denied_count, last_reason)"]
+    F --> I[sbproxy_egress_refused_total metric]
+    I --> J["egress_refused event, if an events: sink is configured"]
+```
+
 ```json
 {
   "schema_version": 1,

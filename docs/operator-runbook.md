@@ -627,6 +627,25 @@ or directly off disk: entries are plain, zstd-compressed files under
 stopped. See [configuration.md](configuration.md#config_history) for the
 block's fields and defaults.
 
+Six different entry paths can trigger a config apply, and all of them
+funnel into the same reload transaction and the same ring entry:
+
+```mermaid
+flowchart TD
+    Boot[Boot] --> Transaction
+    Watcher[File watcher] --> Transaction
+    SIGHUP --> Transaction
+    Admin["POST /admin/reload"] --> Transaction
+    Poller["source: git refresh poller"] --> Transaction
+    Authority[Config authority publish path] --> Transaction
+    Transaction["One reload transaction\n(reload_compiled_config_locked)"] --> Compile{Compile succeeds?}
+    Compile -->|no| Keep[Previous config keeps serving]
+    Compile -->|yes| Publish[Hot-swap the running config]
+    Publish --> Ring[Config history ring records the entry]
+    Ring -->|no subsystem came up degraded| Clean[applied, clean]
+    Ring -->|a subsystem came up degraded| Degraded["applied, degraded: subsystems named"]
+```
+
 What it does not do yet: nothing here promotes an entry to last-known-good,
 nothing reads the `lkg` pointer to decide anything, and nothing reapplies a
 prior entry. The ring is a durable audit trail an operator can inspect by
