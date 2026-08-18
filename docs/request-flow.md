@@ -1,6 +1,6 @@
 # Request flow
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 Every request SBproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,
@@ -142,7 +142,9 @@ Action dispatch is where the traffic-type branch happens; see
 [section 6](#6-upstream-selection-and-the-traffic-type-branch) below for
 what differs by branch. Built-in action types are enum variants matched
 here: `proxy`, `load_balancer`, `ai_proxy`, `static`, `mock`, `redirect`,
-`echo`, `beacon`, `noop`, `websocket`, `grpc`, and more. A third-party
+`echo`, `beacon`, `noop`, `websocket`, `grpc`, `graphql`, `storage`,
+`a2a`, and `mcp`; the complete catalog with a paragraph on each is
+[features.md's action reference](features.md#6-reference-every-action-type). A third-party
 action plugin (`Plugin(Box<dyn ActionHandler>)`) pays one indirect call
 here instead of hitting the branch-predicted match; see
 [plugins.md](plugins.md).
@@ -211,16 +213,17 @@ see [cache-reserve.md](cache-reserve.md) and [degradation.md](degradation.md).
 ## 9. Logging and the typed event bus
 
 Metrics emission, the structured access log, and event publication close
-out the pipeline. `ProxyEvent` has twelve variants; ten of them ship a
-production emitter in the OSS binary today: `request_started`,
+out the pipeline. `ProxyEvent` has thirteen variants; eleven of them
+ship a production emitter in the OSS binary today: `request_started`,
 `request_completed`, `request_error` (the `request_events:` lane),
 `auth_denied`, `policy_denied`, `config_reloaded`, `egress_refused`
 (the `events:` lane, bridged from the security, config, and egress
-audit records), and `provider_selected`, `budget_exceeded`,
-`guardrail_triggered` (verdict-level: a provider fallback, a budget
-cap denial, or a guardrail block, never a per-request or per-chunk
-line). `cache_hit` and `cache_miss` are the two enum variants left
-unwired on purpose: firing on every cacheable request would put an
+audit records), `mcp_governance_decision` (every MCP `tools/call`
+decision, allowed or refused), and `provider_selected`,
+`budget_exceeded`, `guardrail_triggered` (verdict-level: a provider
+fallback, a budget cap denial, or a guardrail block, never a
+per-request or per-chunk line). `cache_hit` and `cache_miss` are the
+two enum variants left unwired on purpose: firing on every cacheable request would put an
 NDJSON line on every configured `events:` sink per cache lookup. Cache
 admission already reports through `DecisionEvent::CacheAdmit`/`CacheKey`
 and the access log's `cache_status` column; naming either in
@@ -240,7 +243,7 @@ and the access log's `cache_status` column; naming either in
 | Inspect/mutate an AI guardrail or tool call | AI origin call | `ai_guardrail_*`/`ai_tool_call` hooks | [ai-guardrail-mesh.md](ai-guardrail-mesh.md) |
 | Reshape a response | `response_body_filter` | A transform, or a scripting transform (CEL/Lua/JS/WASM) | [transforms.md](transforms.md) |
 | Detect anomalous behavior after the fact | `response_filter` | `AnomalyDetectorHook` (Rust trait) | [plugins.md](plugins.md) |
-| React to a lifecycle event | `logging` (mostly) | Typed event bus (5 of 11 variants emitted) | [events.md](events.md) |
+| React to a lifecycle event | `logging` (mostly) | Typed event bus (11 of 13 variants emitted) | [events.md](events.md) |
 
 ## Who reads this page for what
 

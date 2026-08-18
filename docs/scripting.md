@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -61,6 +61,10 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
 | `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` only) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` hook reads `input.request.*` and `input.config` and returns a Rego boolean |
 | `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
+| `mcp` action `federated_servers[].argument_policies[]` / `result_policies[]` | CEL or Rego | Allow/deny over one tool call's `mcp.*` context, before dispatch (arguments) and after it (result); see the context note below the table |
+| `federated_servers[] type: local`, step `condition` | CEL | Boolean gate per DAG step, same `mcp.*` vocabulary as the argument policies; an expression that fails to evaluate fails the tool call closed ([mcp-compose.md](mcp-compose.md)) |
+| `federated_servers[] type: local`, `response:` | Template, JavaScript, or Lua | Shapes the tool result from `ctx = {args, steps}`, in the same sandboxes the response-cache events run in ([mcp-compose.md](mcp-compose.md)) |
+| `tool_versioning` per-version `adapter` | JavaScript | Adapts a caller pinned to an old tool version onto the current contract ([tool-versioning.md](tool-versioning.md)) |
 | Extension AI and payment hooks | JavaScript, envelope WASM, or Proxy-Wasm for AI streaming | Receives provider-neutral, credential-free events through versioned contracts |
 
 Two AI-gateway surfaces are deliberately not free-form scripting: the `ai_policy` block is a single CEL expression over gateway-computed signals ([ai-policy-cel.md](ai-policy-cel.md)), and guardrails are typed `guardrails: input:` / `output:` blocks (`injection`, `pii`, `jailbreak`, `toxicity`, `schema`, ...) documented in [ai-gateway.md](ai-gateway.md).

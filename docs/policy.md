@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -36,7 +36,7 @@ If you are deciding which policy stops which threat, start with the group headin
 - `sri`: enforces Subresource Integrity on scripts the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
 - `content_digest`: verifies an inbound body against its RFC 9530 `Content-Digest` header. [content-digest.md](content-digest.md).
 - `page_shield`: watches for third-party script drift on pages the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
-- `dlp`: scans request URI and headers for regulated-data shapes and tags or blocks; it does not scan bodies or redact. [api-security.md](api-security.md#data-leaving-that-should-not).
+- `dlp`: scans the request URI, headers, and (on by default, capped at 16 KiB) the buffered request body for regulated-data shapes and tags or blocks. Requests only, and it detects rather than masks. [api-security.md](api-security.md#data-leaving-that-should-not).
 - `exposed_credentials` (alias `leaked_credentials`): detects a known-leaked basic-auth password and tags or blocks. [exposed-credentials.md](exposed-credentials.md).
 
 **AI-specific.** Policies with no equivalent in an ordinary API gateway.
@@ -50,6 +50,8 @@ If you are deciding which policy stops which threat, start with the group headin
 - `expression`: a CEL boolean predicate; `false` denies. [This page](#calling-it) has a worked example; [scripting.md](scripting.md) has the full surface. Often paired with the headless-browser score from [headless-detection.md](headless-detection.md).
 - `rego`: a Rego/OPA module evaluated against the same request context as `expression`, for teams that already have Rego. [scripting.md](scripting.md#3a-rego-policies).
 - `assertion` (alias `response_assertion`): an observational CEL check against the response; a false assertion is logged and never blocks traffic. [scripting.md](scripting.md#response-assertions).
+
+**One pack, not a twenty-eighth type.** `owasp_api_top10` is a policy-pack entry the compiler expands into concrete types from the groups above (`object_authz`, `rate_limiting`, `ddos_protection`, `request_limit`, `concurrent_limit`, `security_headers`, `http_framing`, and a `json_projection` transform) before any policy parses. It backs off per item when the origin already authors that type, and reports every enabled item in a five-state manifest (`enforced`, `report_only`, `needs_operator_input`, `operator_authored`, `not_covered`) at plan time and at `GET /admin/owasp-api-pack`. [owasp-api-top10.md](owasp-api-top10.md).
 
 ## Calling it
 

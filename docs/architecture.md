@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -202,6 +202,44 @@ short-circuits the rest and writes the error response immediately. The pipeline 
 implemented as a sequence of `ProxyHttp` callbacks; the per-request work happens inside
 those callbacks rather than in a separate dispatcher.
 
+The full path, from listener to access log. Every box is a stage this section names; the
+action-dispatch branches are the fifteen action types cataloged in
+[features.md](features.md#6-reference-every-action-type):
+
+```mermaid
+flowchart TD
+    L["Listener accept\n(HTTP/1.1 + HTTP/2, TLS termination,\nSNI cert selection, mTLS verify)"] --> RF["request_filter opens:\ntrace context, ACME HTTP-01,\n/health + /metrics short-circuit"]
+    RF --> HM["Hostname match to a compiled origin\n(bloom filter + hash map, wildcard suffixes)"]
+    HM --> PRE["Force-SSL, allowed methods, CORS preflight"]
+    PRE --> BOT["Bot + agent identity resolution\n(Web Bot Auth, identity hooks,\nforward-confirmed rDNS)"]
+    BOT --> AUTH["Authentication\n(api_key, jwt, oidc, digest,\nforward_auth, bot_auth, cap, ...)"]
+    AUTH -->|deny| ERR["Error response,\npipeline short-circuits"]
+    AUTH --> POL["Request policy chain\n(rate limits, WAF, CSRF, DDoS,\nobject_authz, DLP, CEL/Rego, ...)"]
+    POL -->|deny| ERR
+    POL --> CACHE{"Response cache lookup"}
+    CACHE -->|hit| RESP
+    CACHE -->|miss| FWD["on_request callbacks,\nforward-rule match"]
+    FWD --> ACT{"Action dispatch"}
+    ACT -->|"proxy / load_balancer"| UP["upstream_peer: target selection\nupstream_request_filter: rewrites,\ntracing headers"]
+    UP --> ORIGIN["HTTP origin"]
+    ACT -->|ai_proxy| AI["AI gateway dispatch:\nguardrails, budgets, provider routing,\nsemantic cache, model host"]
+    ACT -->|"mcp / a2a"| AGENT["MCP federation + local tools,\nA2A envelope enforcement"]
+    ACT -->|"websocket / grpc / graphql / storage"| PROTO["Protocol actions"]
+    ACT -->|"static / redirect / echo / mock / beacon / noop"| LOCAL["Local response,\nno upstream"]
+    ACT -->|payment-gated origin| PAY["402 challenge and settlement,\nthen the origin"]
+    ORIGIN --> RESP["response_filter\n(security headers, response modifiers,\nrate-limit headers, anomaly hooks,\non_response callbacks)"]
+    AI --> RESP
+    AGENT --> RESP
+    PROTO --> RESP
+    LOCAL --> RESP
+    PAY --> RESP
+    RESP --> RBF["response_body_filter\n(transform chain incl. CEL/Lua/JS/WASM,\nresponse cache write, fallback body swap)"]
+    RBF --> LOG["logging\n(metrics, access log,\ntyped events, metering)"]
+    LOG --> DONE["Response returned"]
+```
+
+The exact stage order inside those callbacks:
+
 ```
 request_filter:
   1.  Trace context extract (W3C / B3)
@@ -241,9 +279,12 @@ logging:
 
 Action types dispatched inside `request_filter` step 15 (or via `upstream_peer` for
 `proxy` actions): `proxy`, `load_balancer`, `ai_proxy`, `static`, `mock`, `redirect`,
-`echo`, `beacon`, `noop`, `websocket`, `grpc`. Built-in actions are enum variants; the
-compiler turns the dispatch site into a branch-predicted match. Third-party plugins use
-`Plugin(Box<dyn ActionHandler>)` and pay one indirect call per request.
+`echo`, `beacon`, `noop`, `websocket`, `grpc`, `graphql`, `storage`, `a2a`, and `mcp`,
+the complete set of match arms in `sbproxy-modules/src/compile.rs`.
+[features.md](features.md#6-reference-every-action-type) catalogs what each one does.
+Built-in actions are enum variants; the compiler turns the dispatch site into a
+branch-predicted match. Third-party plugins use `Plugin(Box<dyn ActionHandler>)` and pay
+one indirect call per request.
 
 ---
 
@@ -335,6 +376,27 @@ enum Action {
     Plugin(Box<dyn ActionHandler>), // third-party
 }
 ```
+
+### Signal hooks (identity, classification, anomaly)
+
+Alongside the four handler kinds, `sbproxy-plugin` exposes three narrower seams for
+embedders, registered by a function call at startup rather than through `inventory`
+(`crates/sbproxy-plugin/src/identity.rs`):
+
+- `IdentityResolverHook` (`register_identity_hook`) runs inside agent-identity
+  resolution in `request_filter`, between Web Bot Auth verification and
+  forward-confirmed rDNS. Hooks run in registration order; the first to return a
+  verdict wins, and `None` falls through to the next resolver step.
+- `MlClassifierHook` (`register_ml_classifier_hook`) is a defined seam for an
+  embedder-supplied traffic classifier. Nothing in the OSS pipeline calls it today;
+  do not depend on it firing until an embedder wires it in.
+- `AnomalyDetectorHook` (`register_anomaly_hook`) dispatches in `response_filter`,
+  once per request, after the identity, fingerprint, and rate signals are populated.
+  The OSS pipeline forwards verdicts to whatever sink the hook wires and does not act
+  on them itself.
+
+OSS builds register none of the three. [request-flow.md](request-flow.md) shows their
+exact pipeline placement next to every other attachment point.
 
 ### Thread safety
 

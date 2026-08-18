@@ -1,9 +1,9 @@
 # SBproxy Features Hub
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
-This document breaks down SBproxy's capabilities into five core domains: **API**, **AI**, **MCP**, **A2A**, and **Agent**. For each area, you'll find a discussion of what the codebase does and links to the relevant deep-dive documentation and runnable examples.
+This document breaks down SBproxy's capabilities into five core domains: **API**, **AI**, **MCP**, **A2A**, and **Agent**. For each area, you'll find a discussion of what the codebase does and links to the relevant deep-dive documentation and runnable examples. Three reference sections close the page: [every action type](#6-reference-every-action-type), [every policy type](#7-reference-every-policy-type), and [every place a script or plugin attaches](#8-reference-where-custom-logic-attaches).
 
 ---
 
@@ -45,7 +45,7 @@ Dynamically emit OpenAPI specs for your routes, and validate incoming traffic ag
 
 ## 2. AI: Advanced Model Gateway
 
-The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway capable of routing requests to 72 native providers and over 200 models.
+The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway routing requests across a 72-provider catalog (66 entries speak the OpenAI wire shape; Anthropic, Gemini, and Bedrock get in-tree protocol translation; 3 are custom-shape entries) and over 200 models.
 
 ### Provider Integration & Model Routing
 Send standard chat completion requests to the proxy, and it routes them based on the model name. You can configure multiple providers and utilize fallback chains to ensure high availability.
@@ -124,3 +124,52 @@ Agents can operate autonomously, which means they can rack up costs or aggressiv
 Serve content formatted specifically for LLM consumption. SBproxy can dynamically strip heavy HTML, inject markdown, or serve `llms.txt` files to optimize the context window for visiting agents.
 * **Docs:** [Content for Agents](content-for-agents.md)
 * **Examples:** [Markdown for Agents](../examples/markdown-for-agents/), [Transform HTML to Markdown](../examples/transform-html-to-markdown/), [Robots LLMs txt](../examples/robots-llms-txt/)
+
+---
+
+## 6. Reference: every action type
+
+An origin's `action:` decides what serves the request, and forward rules can pick a different action per matched rule. These fifteen types are the complete set the config compiler accepts, mirrored from its dispatch table; any other `type:` string is a linked plugin, an extension-bundle hook, or a config error. [architecture.md](architecture.md#3-request-pipeline) shows where dispatch happens in the pipeline; [request-flow.md](request-flow.md) walks everything around it.
+
+* **`proxy`** reverse-proxies to a single upstream URL. It carries the classic knobs: base-path stripping, query preservation, `Host` and SNI overrides, forwarding-header controls, retries with backoff, DNS-based service discovery for upstreams whose IPs churn, and IP pinning for reaching a backend without traversing its public CDN entry. Docs: [routing.md](routing.md), [configuration.md](configuration.md).
+* **`load_balancer`** spreads traffic across a target pool: eight algorithms (round-robin, weighted random, least connections, IP/URI/header/cookie hash, and ketama-style `ring_hash`), five named custom strategies (`first-healthy`, `gpu-aware`, `lora`, `lora-aware`, `bandit`), three health layers (active probes, passive outlier ejection, per-target circuit breakers), and blue-green and canary deployment modes with backup targets and priority tiers. Docs: [routing.md](routing.md), [routing-strategies.md](routing-strategies.md).
+* **`static`** serves a fixed response straight from config: status, body, content type, extra headers. Maintenance pages, stubs, well-known files.
+* **`redirect`** issues HTTP redirects (301, 302, 307, 308), including bulk source-to-destination lists compiled at load time into an O(1) path lookup. Docs: [bulk-redirects.md](bulk-redirects.md).
+* **`echo`** reflects the request back as JSON: method, path, headers, body. The debugging and smoke-test action.
+* **`mock`** returns a configured JSON document, for standing up an API's shape before the real upstream exists.
+* **`beacon`** answers with a one-pixel transparent GIF, so an analytics or tracking pixel needs no upstream at all.
+* **`noop`** accepts the request and returns an empty 200. A placeholder for scaffolding a config before its real action lands.
+* **`websocket`** proxies WebSocket upgrades, with subprotocol negotiation, message-size limits, and host override; auth and policies run before the upgrade like on any other action. Docs: [websocket.md](websocket.md).
+* **`grpc`** passes gRPC through on HTTP/2, with opt-in gRPC-Web translation for browser clients and descriptor-driven REST-to-gRPC transcoding routes. Docs: [routing.md](routing.md).
+* **`graphql`** proxies GraphQL with a query-depth cap, an introspection toggle, and optional query validation before anything reaches the upstream. Docs: [routing.md](routing.md).
+* **`storage`** serves objects from S3, Google Cloud Storage, Azure Blob, or a local directory. Example: [Storage Action](../examples/storage-action/).
+* **`ai_proxy`** is the AI gateway in one action: the OpenAI-compatible surface, the 72-provider catalog, model aliases, LLM-aware routing, guardrails, budgets, semantic caching, and local model hosting. Section 2 above tours it; [ai-gateway.md](ai-gateway.md) is the reference.
+* **`mcp`** is the MCP gateway: federates real MCP servers, OpenAPI-derived tools, and config-defined local tools behind one endpoint, with RBAC, tool versioning, quotas, and content filters. Section 3 above tours it; [mcp.md](mcp.md) and [mcp-compose.md](mcp-compose.md) are the references.
+* **`a2a`** proxies agent-to-agent JSON-RPC with envelope trust rules, delegation-depth caps, cycle detection, and caller and callee lists. Docs: [a2a-gateway.md](a2a-gateway.md).
+
+## 7. Reference: every policy type
+
+[policy.md](policy.md) is the catalog, with a one-line job description for each of the twenty-seven `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
+
+* **Rate, volume, and budget:** `rate_limiting`, `rate_limit_budget`, `concurrent_limit`, `request_limit`, `ddos`, `ip_filter`, `agent_budget`.
+* **Identity and access:** `object_authz` (BOLA and BFLA enforcement, plus enumeration detection), `agent_class`, `a2a`, `csrf`, `security_headers`.
+* **Content, validation, and DLP:** `request_validator`, `openapi_validation`, `waf`, `http_framing`, `sri`, `content_digest`, `page_shield`, `dlp`, `exposed_credentials`.
+* **AI-specific:** `ai_crawl_control`, `prompt_injection_v2`, `semantic_constraint`.
+* **Scripting-driven:** `expression` (CEL), `rego`, `assertion`.
+* **Packs:** `owasp_api_top10` is not a twenty-eighth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
+
+Authentication is a separate axis, configured on an origin's `auth:` block rather than in `policies:`: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `oidc`, `bot_auth` (Web Bot Auth), and `cap`, plus mTLS client verification at the listener. The Authentication section above links the docs and examples.
+
+## 8. Reference: where custom logic attaches
+
+Five engines run operator-supplied logic, all loaded from config and all hot-reloadable. The per-site contract (what the script receives, what it may return, the sandbox limits) is in [scripting.md](scripting.md); the pipeline placement of every attachment point is in [request-flow.md](request-flow.md).
+
+| Engine | Available at |
+|---|---|
+| **CEL** | `expression` and `assertion` policies; rate-limit bucket keys and WAF persistent-block keys; forward-rule `when:` predicates; access-log custom fields; the `cel` response transform; the AI policy plane (`ai_policy.expression`); MCP argument and result policies; MCP local-tool step conditions |
+| **Rego** | `rego` policies; request and response modifiers; MCP argument and result policies; extension-bundle policy hooks with `runtime: rego` |
+| **Lua** | Request and response modifiers (returned headers); `lua` raw-body and `lua_json` transforms; WAF custom rules; access-log custom fields; response-cache key and admit events; MCP local-tool response shaping |
+| **JavaScript** | Request and response modifiers (returned headers); `javascript` and `js_json` transforms; WAF custom rules; access-log custom fields; response-cache key and admit events; extension bundles (JS or TypeScript); MCP tool-version adapters; MCP local-tool response shaping |
+| **WASM** | The `wasm` body transform (WASI preview 1, with opt-in per-request context); envelope-WASM extension-bundle hooks, including `ai_routing`; Proxy-Wasm HTTP filter chains via `origins.<host>.filters[]` |
+
+Beyond inline scripts, an extension bundle packages logic as a versioned directory (JavaScript, TypeScript, or compiled WASM) loaded from disk or from a digest-pinned git source, with no rebuild and no partial loads: auth, policy, action, and transform hooks in the core pipeline, plus AI guardrail, tool-call, and routing hooks, Proxy-Wasm streaming filters, and payment lifecycle hooks. [plugins.md](plugins.md) is the map of all of it; [extension-bundles.md](extension-bundles.md) is the reference. Organizations that build their own binary can also compile logic in directly; that path and its costs are covered in [plugins.md](plugins.md) and [architecture.md](architecture.md#4-plugin-system).

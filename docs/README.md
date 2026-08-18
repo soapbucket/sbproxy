@@ -22,7 +22,7 @@ SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI m
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
-- [features.md](features.md) - tour of every feature with copy-paste configs.
+- [features.md](features.md) - tour of every feature by domain, plus reference catalogs of every action type, every policy type, and every scripting attachment point.
 - [admin.md](admin.md) - the admin server: enable it, TLS, the built-in web UI, and the control-plane endpoints (keys, config, metrics, logs, prompts).
 - [admin-api-guide.md](admin-api-guide.md) - task-oriented admin API walkthrough: login/CSRF, roles, and a curl cookbook.
 - [admin-ui.md](admin-ui.md) - the built-in admin dashboard, page by page: what each view shows, mutates, and calls.
