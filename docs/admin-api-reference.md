@@ -775,6 +775,8 @@ published generation. Loaded hooks without an attachment are `unconsumed`.
 candidate construction did not finish. See the
 [extension bundle runbook](operator-runbook.md#extension-bundles).
 
+![The running /api/extensions inventory for a loaded bundle, then sbproxy doctor showing the same bundle as a stopped candidate, then a broken manifest staying visible as a bounded failed record](assets/extension-inventory.gif)
+
 ### `GET /api/openapi.json`, `GET /api/openapi.yaml`
 
 The live pipeline's emitted OpenAPI 3.0 document. The proxy renders
