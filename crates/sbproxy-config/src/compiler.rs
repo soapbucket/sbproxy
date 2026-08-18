@@ -4818,6 +4818,7 @@ proxy:
         // default syntax, so this form was never access-log vocabulary
         // and its v1.12 shell-default treatment is preserved.
         assert_eq!(interpolate_env_vars("${method:-GET}"), "GET");
+    }
 
     // v1.13.0 phase-2 review: the WOR-2489 carve-out must be scoped to
     // the MCP local-tool vocabulary (an `args.` or `steps.` root), not
