@@ -83,7 +83,7 @@ Beyond plain HTTP `proxy`, dedicated actions route other transports through the 
 - **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 - **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream, including a 64 KiB validated-body limit and whole-batch rejection. Runnable at [`examples/graphql-gateway/`](../examples/graphql-gateway/).
 
-Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql). WebSocket also has its own dedicated page, [websocket.md](websocket.md), covering upgrade semantics and honest limits in more depth than the field table alone.
+Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql). WebSocket and GraphQL also have their own dedicated pages, [websocket.md](websocket.md) and [graphql.md](graphql.md), covering upgrade semantics, validation placement, and honest limits in more depth than the field tables alone.
 
 ## Routing AI traffic
 

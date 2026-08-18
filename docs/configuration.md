@@ -5894,11 +5894,13 @@ Runnable configs for both halves are in [`examples/config-authority/`](../exampl
 
 No authority can set these paths, in either merge mode:
 
-`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `source`
+`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `proxy.compression_state`, `proxy.config_history`, `source`
 
 Presence of one of them anywhere in a payload rejects the whole payload, at publish time on the authority and again at merge time on the subscriber. Not the changed keys, the whole thing: a partial apply of a configuration is a configuration nobody wrote.
 
 The reason is recovery. If a fleet-wide push could rewrite `proxy.admin`, the first bad push would take away the port you would use to undo it. If it could rewrite `proxy.config_authority`, it could point every node at a different authority, permanently. And `proxy.tls` and `proxy.secrets` are per-node material that a central document has no business knowing.
+
+The last three before `source` are about local storage and the audit trail. `proxy.compression_state` and `proxy.config_history` both name directories on the node's own disk, which only the process owner can choose. `proxy.config_history` is also the durable record of every configuration this subscriber has applied: an authority that could redirect or disable that ring could cover its own tracks.
 
 ### Authority: `proxy.config_authority.publish`
 
