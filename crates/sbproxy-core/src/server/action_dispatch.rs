@@ -4570,6 +4570,8 @@ pub(super) async fn handle_mcp_action(
                                                 tenant = %ctx.tenant_id,
                                                 category = hit.category,
                                                 mode = verdict_label,
+                                                span_count = hit.spans.len(),
+                                                spans_dropped = hit.spans_dropped,
                                                 "MCP tools/call argument content filter matched",
                                             );
                                             sbproxy_observe::metrics::record_mcp_content_filter(
@@ -4608,6 +4610,8 @@ pub(super) async fn handle_mcp_action(
                                     sbproxy_modules::action::mcp::McpContentFilterVerdict::Denied {
                                         category,
                                         detectors,
+                                        spans,
+                                        spans_dropped,
                                     } => {
                                         tracing::warn!(
                                             target: "sbproxy::mcp::content_filter",
@@ -4616,6 +4620,8 @@ pub(super) async fn handle_mcp_action(
                                             tenant = %ctx.tenant_id,
                                             category,
                                             detectors = %detectors.join(","),
+                                            span_count = spans.len(),
+                                            spans_dropped,
                                             "MCP tools/call arguments denied by content filter",
                                         );
                                         sbproxy_observe::metrics::record_mcp_content_filter(
@@ -5349,6 +5355,8 @@ pub(super) async fn handle_mcp_action(
                                                             tenant = %ctx.tenant_id,
                                                             category = hit.category,
                                                             mode = verdict_label,
+                                                            span_count = hit.spans.len(),
+                                                            spans_dropped = hit.spans_dropped,
                                                             "MCP tools/call result content filter matched",
                                                         );
                                                         sbproxy_observe::metrics::record_mcp_content_filter(
@@ -5385,6 +5393,8 @@ pub(super) async fn handle_mcp_action(
                                                 sbproxy_modules::action::mcp::McpContentFilterVerdict::Denied {
                                                     category,
                                                     detectors,
+                                                    spans,
+                                                    spans_dropped,
                                                 } => {
                                                     tracing::warn!(
                                                         target: "sbproxy::mcp::content_filter",
@@ -5393,6 +5403,8 @@ pub(super) async fn handle_mcp_action(
                                                         tenant = %ctx.tenant_id,
                                                         category,
                                                         detectors = %detectors.join(","),
+                                                        span_count = spans.len(),
+                                                        spans_dropped,
                                                         "MCP tools/call result denied by content filter",
                                                     );
                                                     sbproxy_observe::metrics::record_mcp_content_filter(
@@ -7139,6 +7151,8 @@ fn mcp_content_filter_for_non_tool_call(
                     tenant = %ctx.tenant_id,
                     category = hit.category,
                     mode = verdict_label,
+                    span_count = hit.spans.len(),
+                    spans_dropped = hit.spans_dropped,
                     "MCP content filter matched on a non-tool-call result",
                 );
                 sbproxy_observe::metrics::record_mcp_content_filter(
@@ -7166,6 +7180,8 @@ fn mcp_content_filter_for_non_tool_call(
         sbproxy_modules::action::mcp::McpContentFilterVerdict::Denied {
             category,
             detectors,
+            spans,
+            spans_dropped,
         } => {
             let message = format!(
                 "{method} result denied by content filter ({category}: {})",
@@ -7178,6 +7194,8 @@ fn mcp_content_filter_for_non_tool_call(
                 tenant = %ctx.tenant_id,
                 category,
                 detectors = %detectors.join(","),
+                span_count = spans.len(),
+                spans_dropped,
                 "MCP non-tool-call result denied by content filter",
             );
             sbproxy_observe::metrics::record_mcp_content_filter(

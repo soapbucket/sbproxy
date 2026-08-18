@@ -4,6 +4,8 @@ use regex::Regex;
 use serde::Deserialize;
 use std::sync::LazyLock;
 
+use sbproxy_security::span::{cap_spans, DetectionSpan};
+
 use super::GuardrailBlock;
 
 /// Action to take when PII is detected.
@@ -82,6 +84,36 @@ impl PiiGuardrail {
             }
         }
         None
+    }
+
+    /// Bounded detection spans (WOR-2492 item 6): entity type, byte
+    /// offset, and byte length for every match of every configured
+    /// pattern, over the SCANNED (pre-redaction) `content` -- never the
+    /// matched text itself, so a decision record built from this cannot
+    /// carry the value it flagged. Capped at
+    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`]; call sites that
+    /// need the drop count read the second element of the returned pair.
+    ///
+    /// Independent of [`Self::check`]'s action/threshold logic: this
+    /// scans every configured pattern rather than stopping at the first
+    /// one that matches, because a caller building an audit record wants
+    /// the full picture a block reason alone does not carry.
+    pub fn detect_spans(&self, content: &str) -> (Vec<DetectionSpan>, usize) {
+        let mut found = Vec::new();
+        for pattern_type in &self.patterns {
+            let re: &Regex = match pattern_type.as_str() {
+                "email" => &EMAIL_RE,
+                "phone" => &PHONE_RE,
+                "ssn" => &SSN_RE,
+                "credit_card" => &CREDIT_CARD_RE,
+                "api_key" => &API_KEY_RE,
+                _ => continue,
+            };
+            for m in re.find_iter(content) {
+                found.push(DetectionSpan::new(pattern_type.clone(), m.start(), m.len()));
+            }
+        }
+        cap_spans(found)
     }
 }
 
@@ -189,5 +221,69 @@ mod tests {
         let json = serde_json::json!({"type": "pii"});
         let guard: PiiGuardrail = serde_json::from_value(json).unwrap();
         assert_eq!(guard.patterns.len(), 4);
+    }
+
+    // --- detect_spans (WOR-2492 item 6) ---
+
+    #[test]
+    fn detect_spans_reports_type_offset_and_len() {
+        let guard = blocking_guard(vec!["email"]);
+        let content = "Send to user@example.com please";
+        let (spans, dropped) = guard.detect_spans(content);
+        assert_eq!(dropped, 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "email");
+        let matched = &content[spans[0].offset..spans[0].offset + spans[0].len];
+        assert_eq!(matched, "user@example.com");
+    }
+
+    #[test]
+    fn detect_spans_covers_every_configured_pattern_not_just_the_first_match() {
+        let guard = blocking_guard(vec!["email", "phone"]);
+        let content = "Email user@example.com or call 555-123-4567";
+        let (spans, dropped) = guard.detect_spans(content);
+        assert_eq!(dropped, 0);
+        let types: Vec<&str> = spans.iter().map(|s| s.entity_type.as_str()).collect();
+        assert!(types.contains(&"email"));
+        assert!(types.contains(&"phone"));
+    }
+
+    /// Red-first: the 33rd span is dropped, and the drop is a count,
+    /// not silence.
+    #[test]
+    fn spans_past_the_cap_are_dropped_with_a_count() {
+        let guard = blocking_guard(vec!["email"]);
+        let mut content = String::new();
+        for i in 0..40 {
+            content.push_str(&format!("user{i}@example.com "));
+        }
+        let (spans, dropped) = guard.detect_spans(&content);
+        assert_eq!(spans.len(), 32);
+        assert_eq!(dropped, 8);
+    }
+
+    /// Privacy rule: a span is a position, never the matched value.
+    /// Plant a distinctive secret and assert it never appears in the
+    /// spans' debug output.
+    #[test]
+    fn spans_never_carry_the_matched_text() {
+        let guard = blocking_guard(vec!["email"]);
+        let planted = "definitely-not-a-real-address@example.com";
+        let content = format!("leak check: {planted}");
+        let (spans, _dropped) = guard.detect_spans(&content);
+        assert!(!spans.is_empty());
+        let debug = format!("{spans:?}");
+        assert!(
+            !debug.contains(planted),
+            "detection spans must never carry the matched text, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn detect_spans_on_clean_text_is_empty() {
+        let guard = blocking_guard(vec!["email", "phone", "ssn", "credit_card"]);
+        let (spans, dropped) = guard.detect_spans("Hello, how are you today?");
+        assert!(spans.is_empty());
+        assert_eq!(dropped, 0);
     }
 }

@@ -14,6 +14,7 @@ pub mod hostfilter;
 pub mod ip;
 pub mod pii;
 pub mod sealed_record;
+pub mod span;
 pub mod ssrf;
 
 #[cfg(feature = "agent-class")]
@@ -51,4 +52,5 @@ pub use sealed_record::{
     KEY_FP_LEN as SEAL_KEY_FP_LEN, MIN_KEY_MATERIAL_BYTES as SEAL_MIN_KEY_MATERIAL_BYTES,
     SALT_LEN as SEAL_SALT_LEN,
 };
+pub use span::{cap_spans, DetectionSpan, MAX_DETECTION_SPANS};
 pub use ssrf::{validate_url, validate_url_resolved, validate_url_with_allowlist, ResolvedUrl};

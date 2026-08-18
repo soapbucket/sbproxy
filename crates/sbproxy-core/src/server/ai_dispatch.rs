@@ -2895,6 +2895,52 @@ async fn evaluate_ai_input_guardrails(
             0,
         ),
     };
+    // WOR-2492 item 6: bounded detection spans for a `pii` block, over
+    // the same text the guardrail pipeline actually evaluated -- NOT
+    // `extract_prompt_text(body)`, which also folds in `system`, tool
+    // call arguments, and other fields the pipeline's own text checks
+    // never see. `message_text` is the identical extraction
+    // `pipeline.check_input` runs internally (see its doc comment);
+    // `extract_input_text` is what a non-chat surface's
+    // `check_input_text` path scans instead, when there are no
+    // `messages` to derive text from. Re-derived here rather than
+    // threaded out of `_inner` so the many internal return paths there
+    // stay free of this concern too, matching why this whole function
+    // records instead of the call sites.
+    //
+    // Gated on `guardrail == Some("pii")` before doing any of that
+    // extraction work: every other guardrail name (jailbreak, toxicity,
+    // schema, ...) is at least as common a block reason, and none of
+    // them has positional detail to compute, so this must not cost the
+    // common case a message re-parse.
+    let (spans, spans_dropped) = if outcome == sbproxy_observe::decision::DecisionOutcome::Deny
+        && guardrail == Some("pii")
+    {
+        let messages: Vec<sbproxy_ai::Message> = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let content = if messages.is_empty() {
+            sbproxy_ai::handler::extract_input_text(surface, body).unwrap_or_default()
+        } else {
+            sbproxy_ai::guardrails::message_text(&messages)
+        };
+        pii_guardrail_spans(
+            guardrail_pipeline
+                .map(|p| p.input.iter())
+                .into_iter()
+                .flatten(),
+            guardrail,
+            &content,
+        )
+    } else {
+        (Vec::new(), 0)
+    };
     record_guardrail_decision(
         ctx,
         sbproxy_observe::decision::DecisionEvent::AiGuardrailInput,
@@ -2902,8 +2948,79 @@ async fn evaluate_ai_input_guardrails(
         guardrail,
         flagged,
         stage.label(),
+        &spans,
+        spans_dropped,
     );
     decision
+}
+
+/// Bounded detection spans for a `pii` guardrail block (WOR-2492 item
+/// 6). Only the `pii` guardrail carries positional detail, so every
+/// other guardrail name returns empty, and so does a `pii` name whose
+/// guardrail is not actually present in `guardrails` -- a mesh-fused or
+/// external-guardrail block can share the `pii` name without this
+/// crate's `PiiGuardrail` having produced it, and this degrades to no
+/// spans rather than guessing at a position nothing here computed.
+fn pii_guardrail_spans<'a>(
+    guardrails: impl Iterator<Item = &'a sbproxy_ai::guardrails::Guardrail>,
+    guardrail_name: Option<&str>,
+    content: &str,
+) -> (Vec<sbproxy_security::span::DetectionSpan>, usize) {
+    if guardrail_name != Some("pii") {
+        return (Vec::new(), 0);
+    }
+    for g in guardrails {
+        if let sbproxy_ai::guardrails::Guardrail::Pii(pii) = g {
+            return pii.detect_spans(content);
+        }
+    }
+    (Vec::new(), 0)
+}
+
+#[cfg(test)]
+mod pii_guardrail_spans_tests {
+    use super::pii_guardrail_spans;
+    use sbproxy_ai::guardrails::{Guardrail, PiiAction, PiiGuardrail};
+
+    fn pii_pipeline_guardrail() -> Guardrail {
+        Guardrail::Pii(PiiGuardrail {
+            patterns: vec!["email".to_string()],
+            action: PiiAction::Block,
+        })
+    }
+
+    #[test]
+    fn non_pii_guardrail_name_returns_no_spans() {
+        let guardrails = vec![pii_pipeline_guardrail()];
+        let (spans, dropped) =
+            pii_guardrail_spans(guardrails.iter(), Some("jailbreak"), "user@example.com");
+        assert!(spans.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn pii_guardrail_name_with_no_pipeline_match_returns_no_spans() {
+        // The pipeline has no `Guardrail::Pii` at all -- e.g. the block
+        // came from a mesh-fused or external guardrail that happens to
+        // share the `pii` name.
+        let guardrails: Vec<Guardrail> = Vec::new();
+        let (spans, dropped) =
+            pii_guardrail_spans(guardrails.iter(), Some("pii"), "user@example.com");
+        assert!(spans.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn pii_guardrail_name_finds_the_configured_guardrail_and_returns_its_spans() {
+        let guardrails = vec![pii_pipeline_guardrail()];
+        let content = "contact user@example.com please";
+        let (spans, dropped) = pii_guardrail_spans(guardrails.iter(), Some("pii"), content);
+        assert_eq!(dropped, 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "email");
+        let matched = &content[spans[0].offset..spans[0].offset + spans[0].len];
+        assert_eq!(matched, "user@example.com");
+    }
 }
 
 /// Record one AI guardrail decision on the family and the audit feed.
@@ -2914,6 +3031,12 @@ async fn evaluate_ai_input_guardrails(
 /// the reason rather than as a field: it distinguishes two records for
 /// one request, which is a thing a human reads, while the field set is
 /// what a rule selects on.
+// Eight arguments: `spans`/`spans_dropped` (WOR-2492 item 6) add a
+// bounded-detail pair to a function that already needed six. Bundling
+// them into a struct would move two values that are almost always
+// empty behind a name that says nothing at either of this function's
+// two call sites.
+#[allow(clippy::too_many_arguments)]
 fn record_guardrail_decision(
     ctx: &RequestContext,
     event: sbproxy_observe::decision::DecisionEvent,
@@ -2921,6 +3044,8 @@ fn record_guardrail_decision(
     guardrail: Option<&str>,
     flagged_count: usize,
     stage: &str,
+    spans: &[sbproxy_security::span::DetectionSpan],
+    spans_dropped: usize,
 ) {
     use sbproxy_observe::decision::DecisionEngine;
 
@@ -2954,6 +3079,8 @@ fn record_guardrail_decision(
                         "stage": stage,
                         "guardrail": guardrail,
                         "flagged_count": flagged_count,
+                        "spans": spans,
+                        "spans_dropped": spans_dropped,
                     }),
                 )
             },
@@ -2984,7 +3111,12 @@ fn record_guardrail_decision(
         &origin_id,
         &ctx.tenant_id,
         &reason,
-        sbproxy_observe::decision::DecisionDetails::guardrail(guardrail, flagged_count),
+        sbproxy_observe::decision::DecisionDetails::guardrail(
+            guardrail,
+            flagged_count,
+            spans,
+            spans_dropped,
+        ),
     );
 }
 
@@ -9650,6 +9782,28 @@ async fn ai_output_guardrail_block(
         ),
         None => (sbproxy_observe::decision::DecisionOutcome::Allow, None),
     };
+    // WOR-2492 item 6: as the input funnel, bounded detection spans for
+    // a `pii` block over the same output text the guardrail evaluated
+    // (`check_output_bytes` hands the PII guardrail the decoded body
+    // untransformed; only the classifier/schema guards see a narrowed
+    // "canonical subject"). An undecodable (non-UTF-8) body yields no
+    // spans rather than panicking; the block itself already tolerates
+    // that case in `ai_output_guardrail_block_inner`. Gated on
+    // `name == Some("pii")` first so every other output guardrail block
+    // does not pay for a UTF-8 decode it has no use for.
+    let (spans, spans_dropped) =
+        if outcome == sbproxy_observe::decision::DecisionOutcome::Deny && name == Some("pii") {
+            match std::str::from_utf8(body) {
+                Ok(content) => pii_guardrail_spans(
+                    builtin.map(|p| p.output.iter()).into_iter().flatten(),
+                    name,
+                    content,
+                ),
+                Err(_) => (Vec::new(), 0),
+            }
+        } else {
+            (Vec::new(), 0)
+        };
     record_guardrail_decision(
         ctx,
         sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
@@ -9657,6 +9811,8 @@ async fn ai_output_guardrail_block(
         name,
         0,
         "output",
+        &spans,
+        spans_dropped,
     );
     block
 }

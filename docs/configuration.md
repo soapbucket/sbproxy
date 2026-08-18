@@ -2994,6 +2994,8 @@ policies:
 
 The scan covers the request URI (path + query) and request headers; auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. Body scanning is on the roadmap; the existing `pii:` block on `ai_proxy` origins handles request-body redaction with the same regex catalog today.
 
+Every hit also carries bounded detection spans: an entity type plus a byte offset and length into the scanned URI or header text for each match, never the matched value itself, capped at 32 spans across the whole scan. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
+
 ### prompt_injection_v2
 
 Successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. When `detector` is omitted, a complete verified local model pair selects `inprocess`; when both artifacts are absent, SBproxy logs the resolved paths once and selects `heuristic-v1`. Partial or invalid artifacts fail startup rather than silently downgrading.

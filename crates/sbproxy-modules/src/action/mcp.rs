@@ -82,6 +82,7 @@ use sbproxy_extension::mcp::{
     ToolAccessPolicy, ToolQuotaStore, ToolVersioningGate, VersioningMode,
 };
 use sbproxy_extension::rego::CompiledRego;
+use sbproxy_security::span::{cap_spans, DetectionSpan};
 use serde::Deserialize;
 
 // --- Wire format ---
@@ -2231,22 +2232,70 @@ fn compile_mcp_content_filter_category(
     }
 }
 
+/// Recursively walk `value`'s string leaves and record a
+/// [`DetectionSpan`] for every match `redactor` finds, attributed to
+/// `entity_type` (WOR-2492 item 6).
+///
+/// Offsets are relative to the individual string leaf they were found
+/// in, not to the document as a whole -- a whole-document offset would
+/// be meaningless once JSON escaping and structural characters are
+/// factored in, and the leaf itself is exactly what
+/// [`sbproxy_security::pii::PiiRedactor::redact_json`] operates on one
+/// string at a time. Object keys are not scanned, matching `redact_json`.
+fn collect_json_spans(
+    value: &serde_json::Value,
+    entity_type: &'static str,
+    redactor: &sbproxy_security::pii::PiiRedactor,
+    out: &mut Vec<DetectionSpan>,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            for (offset, len) in redactor.find_spans(s) {
+                out.push(DetectionSpan::new(entity_type, offset, len));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_json_spans(v, entity_type, redactor, out);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for v in obj.values() {
+                collect_json_spans(v, entity_type, redactor, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl CompiledMcpContentFilterCategory {
     /// Detector names (in this category's declared order) that match
-    /// anywhere in `document`. Empty when `mode` is `off` or nothing
+    /// anywhere in `document`, plus their bounded detection spans
+    /// (WOR-2492 item 6). Empty when `mode` is `off` or nothing
     /// matched. Does not mutate `document`.
-    fn scan(&self, document: &serde_json::Value) -> Vec<String> {
+    ///
+    /// Each span is an entity type plus a byte offset and length into
+    /// the JSON string leaf it was found in -- never the matched text,
+    /// so this cannot become a second place a secret or PII value
+    /// leaks from. Spans are capped at
+    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`] across the whole
+    /// category, so a pathological document cannot bloat a record.
+    fn scan(&self, document: &serde_json::Value) -> (Vec<String>, Vec<DetectionSpan>, usize) {
         if self.mode == McpFilterModeConfig::Off {
-            return Vec::new();
+            return (Vec::new(), Vec::new(), 0);
         }
-        self.detectors
-            .iter()
-            .filter_map(|(name, redactor)| {
-                let mut probe = document.clone();
-                redactor.redact_json(&mut probe);
-                (probe != *document).then(|| (*name).to_string())
-            })
-            .collect()
+        let mut names = Vec::new();
+        let mut all_spans = Vec::new();
+        for (name, redactor) in &self.detectors {
+            let mut leaf_spans = Vec::new();
+            collect_json_spans(document, name, redactor, &mut leaf_spans);
+            if !leaf_spans.is_empty() {
+                names.push((*name).to_string());
+                all_spans.extend(leaf_spans);
+            }
+        }
+        let (spans, spans_dropped) = cap_spans(all_spans);
+        (names, spans, spans_dropped)
     }
 
     /// Mutate `document` in place, replacing every matched span across
@@ -2288,6 +2337,14 @@ pub struct McpContentFilterHit {
     pub mode: McpFilterModeConfig,
     /// Detector names that matched, in this category's declared order.
     pub detectors: Vec<String>,
+    /// Bounded detection spans (WOR-2492 item 6): entity type, byte
+    /// offset, and byte length for every match this category found,
+    /// over the SCANNED (pre-redaction) document. Never the matched
+    /// text. Capped at [`sbproxy_security::span::MAX_DETECTION_SPANS`];
+    /// see `spans_dropped` for the count past the cap.
+    pub spans: Vec<DetectionSpan>,
+    /// Count of matches past the span cap.
+    pub spans_dropped: usize,
 }
 
 /// Verdict from [`McpAction::apply_content_filters`] (WOR-2384,
@@ -2318,6 +2375,15 @@ pub enum McpContentFilterVerdict {
         category: &'static str,
         /// Detector names that triggered the refusal.
         detectors: Vec<String>,
+        /// Bounded detection spans (WOR-2492 item 6): entity type, byte
+        /// offset, and byte length for every match that triggered the
+        /// refusal, over the SCANNED (pre-redaction) document. Never
+        /// the matched text. Capped at
+        /// [`sbproxy_security::span::MAX_DETECTION_SPANS`]; see
+        /// `spans_dropped` for the count past the cap.
+        spans: Vec<DetectionSpan>,
+        /// Count of matches past the span cap.
+        spans_dropped: usize,
     },
 }
 
@@ -3007,11 +3073,23 @@ impl McpAction {
     /// [`McpContentFilterVerdict::Clean`] without cloning or scanning
     /// `document` (each `CompiledMcpContentFilterCategory::scan`
     /// short-circuits on `mode == Off`).
+    ///
+    /// Detection (WOR-2492 item 6) always scans a snapshot of
+    /// `document` taken before this call mutated anything, never the
+    /// live `document` a `redact` hit is progressively rewriting.
+    /// `secrets` runs before `pii`, and a `secrets: redact` mutation
+    /// shortens or lengthens the live document; scanning that
+    /// already-mutated text for `pii` would report spans in a
+    /// different coordinate system than the `secrets` spans in the
+    /// same verdict. The snapshot is taken lazily, only once, on the
+    /// first category that is not `off`, so the documented zero-clone
+    /// behavior above still holds when nothing is configured.
     pub fn apply_content_filters(
         &self,
         document: &mut serde_json::Value,
     ) -> McpContentFilterVerdict {
         let mut hits = Vec::new();
+        let mut scanned_snapshot: Option<serde_json::Value> = None;
         for (category, filter) in [
             ("secrets", &self.content_filters.secrets),
             ("pii", &self.content_filters.pii),
@@ -3019,7 +3097,8 @@ impl McpAction {
             if filter.mode == McpFilterModeConfig::Off {
                 continue;
             }
-            let detectors = filter.scan(document);
+            let snapshot = scanned_snapshot.get_or_insert_with(|| document.clone());
+            let (detectors, spans, spans_dropped) = filter.scan(snapshot);
             if detectors.is_empty() {
                 continue;
             }
@@ -3037,6 +3116,8 @@ impl McpAction {
                     return McpContentFilterVerdict::Denied {
                         category,
                         detectors,
+                        spans,
+                        spans_dropped,
                     };
                 }
                 McpFilterModeConfig::Redact => {
@@ -3045,6 +3126,8 @@ impl McpAction {
                         category,
                         mode: McpFilterModeConfig::Redact,
                         detectors,
+                        spans,
+                        spans_dropped,
                     });
                 }
                 McpFilterModeConfig::Warn => {
@@ -3052,6 +3135,8 @@ impl McpAction {
                         category,
                         mode: McpFilterModeConfig::Warn,
                         detectors,
+                        spans,
+                        spans_dropped,
                     });
                 }
             }
@@ -5649,6 +5734,22 @@ allow := false if {
         .expect("content-filter fixture compiles")
     }
 
+    /// Assert `spans` is exactly one span of `entity_type` whose
+    /// `(offset, len)` slices `matched` back out of `leaf` (WOR-2492
+    /// item 6). Deriving the expected offset from the leaf rather than
+    /// hardcoding it keeps these tests honest about what the span
+    /// actually points at.
+    fn assert_single_span(spans: &[DetectionSpan], leaf: &str, entity_type: &str, matched: &str) {
+        assert_eq!(spans.len(), 1, "expected exactly one span, got {spans:?}");
+        assert_eq!(spans[0].entity_type, entity_type);
+        let (offset, len) = (spans[0].offset, spans[0].len);
+        assert_eq!(
+            &leaf[offset..offset + len],
+            matched,
+            "span ({offset}, {len}) into {leaf:?} did not slice out {matched:?}"
+        );
+    }
+
     #[test]
     fn off_by_default_is_a_byte_identical_passthrough() {
         // WOR-2384 red-first regression guard: with no `content_filters`
@@ -5670,17 +5771,19 @@ allow := false if {
         // proving test: a planted API key in a tool result is redacted
         // before reaching the caller.
         let action = content_filter_action(json!({"secrets": "redact"}));
-        let mut document =
-            json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let leaf = "key: AKIAIOSFODNN7EXAMPLE";
+        let mut document = json!({"content": [{"type": "text", "text": leaf}]});
         let verdict = action.apply_content_filters(&mut document);
-        assert_eq!(
-            verdict,
-            McpContentFilterVerdict::Applied(vec![McpContentFilterHit {
-                category: "secrets",
-                mode: McpFilterModeConfig::Redact,
-                detectors: vec!["aws_access".to_string()],
-            }])
-        );
+        let hits = match verdict {
+            McpContentFilterVerdict::Applied(hits) => hits,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "secrets");
+        assert_eq!(hits[0].mode, McpFilterModeConfig::Redact);
+        assert_eq!(hits[0].detectors, vec!["aws_access".to_string()]);
+        assert_eq!(hits[0].spans_dropped, 0);
+        assert_single_span(&hits[0].spans, leaf, "aws_access", "AKIAIOSFODNN7EXAMPLE");
         let text = document["content"][0]["text"].as_str().expect("text");
         assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "got {text}");
         assert!(text.contains("[REDACTED:APIKEY]"), "got {text}");
@@ -5689,16 +5792,24 @@ allow := false if {
     #[test]
     fn block_mode_denies_and_never_mutates_the_document() {
         let action = content_filter_action(json!({"secrets": "block"}));
-        let original = json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let leaf = "key: AKIAIOSFODNN7EXAMPLE";
+        let original = json!({"content": [{"type": "text", "text": leaf}]});
         let mut document = original.clone();
         let verdict = action.apply_content_filters(&mut document);
-        assert_eq!(
-            verdict,
+        match verdict {
             McpContentFilterVerdict::Denied {
-                category: "secrets",
-                detectors: vec!["aws_access".to_string()],
+                category,
+                detectors,
+                spans,
+                spans_dropped,
+            } => {
+                assert_eq!(category, "secrets");
+                assert_eq!(detectors, vec!["aws_access".to_string()]);
+                assert_eq!(spans_dropped, 0);
+                assert_single_span(&spans, leaf, "aws_access", "AKIAIOSFODNN7EXAMPLE");
             }
-        );
+            other => panic!("expected Denied, got {other:?}"),
+        }
         assert_eq!(
             document, original,
             "a denied document must not be mutated -- the caller discards it outright"
@@ -5708,17 +5819,19 @@ allow := false if {
     #[test]
     fn warn_mode_reports_the_hit_without_mutating() {
         let action = content_filter_action(json!({"secrets": "warn"}));
-        let original = json!({"content": [{"type": "text", "text": "key: AKIAIOSFODNN7EXAMPLE"}]});
+        let leaf = "key: AKIAIOSFODNN7EXAMPLE";
+        let original = json!({"content": [{"type": "text", "text": leaf}]});
         let mut document = original.clone();
         let verdict = action.apply_content_filters(&mut document);
-        assert_eq!(
-            verdict,
-            McpContentFilterVerdict::Applied(vec![McpContentFilterHit {
-                category: "secrets",
-                mode: McpFilterModeConfig::Warn,
-                detectors: vec!["aws_access".to_string()],
-            }])
-        );
+        let hits = match verdict {
+            McpContentFilterVerdict::Applied(hits) => hits,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "secrets");
+        assert_eq!(hits[0].mode, McpFilterModeConfig::Warn);
+        assert_eq!(hits[0].detectors, vec!["aws_access".to_string()]);
+        assert_single_span(&hits[0].spans, leaf, "aws_access", "AKIAIOSFODNN7EXAMPLE");
         assert_eq!(document, original, "warn mode must not mutate the document");
     }
 
@@ -5734,16 +5847,18 @@ allow := false if {
             McpContentFilterVerdict::Clean
         );
 
-        let mut pii_only = json!({"text": "contact alice@example.com"});
+        let pii_leaf = "contact alice@example.com";
+        let mut pii_only = json!({"text": pii_leaf});
         let verdict = action.apply_content_filters(&mut pii_only);
-        assert_eq!(
-            verdict,
-            McpContentFilterVerdict::Applied(vec![McpContentFilterHit {
-                category: "pii",
-                mode: McpFilterModeConfig::Redact,
-                detectors: vec!["email".to_string()],
-            }])
-        );
+        let hits = match verdict {
+            McpContentFilterVerdict::Applied(hits) => hits,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "pii");
+        assert_eq!(hits[0].mode, McpFilterModeConfig::Redact);
+        assert_eq!(hits[0].detectors, vec!["email".to_string()]);
+        assert_single_span(&hits[0].spans, pii_leaf, "email", "alice@example.com");
         assert_eq!(pii_only["text"], "contact [REDACTED:EMAIL]");
     }
 
@@ -5756,18 +5871,23 @@ allow := false if {
         // otherwise have mutated; the denial must short-circuit before
         // that happens.
         let action = content_filter_action(json!({"secrets": "block", "pii": "redact"}));
-        let original = json!({
-            "text": "key AKIAIOSFODNN7EXAMPLE belongs to alice@example.com"
-        });
+        let leaf = "key AKIAIOSFODNN7EXAMPLE belongs to alice@example.com";
+        let original = json!({ "text": leaf });
         let mut document = original.clone();
         let verdict = action.apply_content_filters(&mut document);
-        assert_eq!(
-            verdict,
+        match verdict {
             McpContentFilterVerdict::Denied {
-                category: "secrets",
-                detectors: vec!["aws_access".to_string()],
+                category,
+                detectors,
+                spans,
+                ..
+            } => {
+                assert_eq!(category, "secrets");
+                assert_eq!(detectors, vec!["aws_access".to_string()]);
+                assert_single_span(&spans, leaf, "aws_access", "AKIAIOSFODNN7EXAMPLE");
             }
-        );
+            other => panic!("expected Denied, got {other:?}"),
+        }
         assert_eq!(
             document, original,
             "a secrets block must short-circuit before pii ever redacts"
@@ -5777,25 +5897,33 @@ allow := false if {
     #[test]
     fn both_categories_apply_independently_when_neither_blocks() {
         let action = content_filter_action(json!({"secrets": "redact", "pii": "warn"}));
-        let mut document = json!({
-            "text": "key AKIAIOSFODNN7EXAMPLE belongs to alice@example.com"
-        });
+        let original_leaf = "key AKIAIOSFODNN7EXAMPLE belongs to alice@example.com";
+        let mut document = json!({ "text": original_leaf });
         let verdict = action.apply_content_filters(&mut document);
-        assert_eq!(
-            verdict,
-            McpContentFilterVerdict::Applied(vec![
-                McpContentFilterHit {
-                    category: "secrets",
-                    mode: McpFilterModeConfig::Redact,
-                    detectors: vec!["aws_access".to_string()],
-                },
-                McpContentFilterHit {
-                    category: "pii",
-                    mode: McpFilterModeConfig::Warn,
-                    detectors: vec!["email".to_string()],
-                },
-            ])
+        let hits = match verdict {
+            McpContentFilterVerdict::Applied(hits) => hits,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].category, "secrets");
+        assert_eq!(hits[0].mode, McpFilterModeConfig::Redact);
+        assert_eq!(hits[0].detectors, vec!["aws_access".to_string()]);
+        assert_single_span(
+            &hits[0].spans,
+            original_leaf,
+            "aws_access",
+            "AKIAIOSFODNN7EXAMPLE",
         );
+        assert_eq!(hits[1].category, "pii");
+        assert_eq!(hits[1].mode, McpFilterModeConfig::Warn);
+        assert_eq!(hits[1].detectors, vec!["email".to_string()]);
+        // Regression guard: `secrets` already redacted the document by
+        // the time `pii` is scanned (`[REDACTED:APIKEY]` is 2 bytes
+        // shorter than `AKIAIOSFODNN7EXAMPLE`). If `pii` scanned the
+        // live, already-mutated document instead of the pre-mutation
+        // snapshot, this span's offset would land 2 bytes short of
+        // `alice@example.com` in `original_leaf`.
+        assert_single_span(&hits[1].spans, original_leaf, "email", "alice@example.com");
         let text = document["text"].as_str().expect("text");
         assert!(
             text.contains("[REDACTED:APIKEY]"),
@@ -5814,6 +5942,53 @@ allow := false if {
         assert_eq!(
             action.apply_content_filters(&mut document),
             McpContentFilterVerdict::Clean
+        );
+    }
+
+    // --- Detection spans, bounded (WOR-2492 item 6) ---
+
+    /// Red-first: the 33rd span is dropped, and the drop is a count,
+    /// not silence.
+    #[test]
+    fn spans_past_the_cap_are_dropped_with_a_count() {
+        let action = content_filter_action(json!({"pii": "warn"}));
+        let addresses: Vec<String> = (0..40).map(|i| format!("user{i}@example.com")).collect();
+        let mut document = json!({"text": addresses.join(" ")});
+        let verdict = action.apply_content_filters(&mut document);
+        let hits = match verdict {
+            McpContentFilterVerdict::Applied(hits) => hits,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].spans.len(), 32);
+        assert_eq!(hits[0].spans_dropped, 8);
+    }
+
+    /// Privacy rule: a detection span is a position, never the matched
+    /// value, on either `Applied` or `Denied`.
+    #[test]
+    fn spans_never_carry_the_matched_value() {
+        let planted = "AKIAIOSFODNN7EXAMPLE";
+        let mut applied_doc = json!({"text": format!("leak check: {planted}")});
+        let applied = content_filter_action(json!({"secrets": "warn"}))
+            .apply_content_filters(&mut applied_doc);
+        let hits = match applied {
+            McpContentFilterVerdict::Applied(hits) => hits,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        let debug = format!("{hits:?}");
+        assert!(
+            !debug.contains(planted),
+            "Applied hit must never carry the matched value, got: {debug}"
+        );
+
+        let mut denied_doc = json!({"text": format!("leak check: {planted}")});
+        let denied = content_filter_action(json!({"secrets": "block"}))
+            .apply_content_filters(&mut denied_doc);
+        let debug = format!("{denied:?}");
+        assert!(
+            !debug.contains(planted),
+            "Denied verdict must never carry the matched value, got: {debug}"
         );
     }
 
