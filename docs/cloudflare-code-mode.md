@@ -1,5 +1,5 @@
 # Cloudflare Code Mode
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code
@@ -103,6 +103,15 @@ carries a strong `ETag` (the SHA-256 of the emitted bytes) and
 `If-None-Match` matches gets a `304 Not Modified` with no body.
 Emission and hashing are cached against the registry generation, so
 the ETag stays stable until the tool catalog changes.
+
+A `draft` federated server's tools are excluded from the emitted
+module, the same treatment `tools/list` gives them (see
+[mcp-security-coverage.md](mcp-security-coverage.md)'s MCP09 row).
+This endpoint runs ahead of per-caller authentication and its module
+is cached per catalogue, not per principal, so `rbac_policies`
+scoping is not applied here: every caller receives the same module,
+listing every non-`draft` tool regardless of which tools an RBAC rule
+would let that caller actually call.
 
 ## References
 
