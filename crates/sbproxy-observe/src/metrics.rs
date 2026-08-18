@@ -2513,6 +2513,86 @@ pub fn set_config_source_revision_info(sha: &str) {
     *current = Some(sha.to_string());
 }
 
+// --- config history (revision ring) metrics ---------------------------
+//
+// `sbproxy-core`'s `ConfigHistoryRecorder` wraps the durable,
+// content-addressed ring of every config this process has applied. These
+// two families make the ring's own state visible without reading its
+// admin routes: which revision is current, and how many entries the ring
+// is carrying.
+
+/// Publish the ring's current entry on
+/// `sbproxy_config_revision_info{revision,digest,provenance}`.
+///
+/// An info-style gauge, the same idiom as
+/// [`set_config_source_revision_info`]: the value is always `1` and the
+/// revision, digest, and provenance travel as labels. `revision` only
+/// grows and `digest` changes on every distinct document the ring
+/// records, so left unmanaged this would mint one series per revision a
+/// process has ever applied over its lifetime. The previous label set is
+/// removed before the new one is set, so a long-lived node exports one
+/// series, not a history of them; the ring itself is where the history
+/// lives.
+///
+/// `provenance` is a closed string naming where the revision's document
+/// came from (`local` or `git`, matching `sbproxy_config::BaseOrigin`'s
+/// variants); `digest` is the ring's bounded lowercase-hex SHA-256, and
+/// `revision` is the ring's monotonic counter rendered as a string.
+/// Callers are expected to pass values already shaped this way rather
+/// than raw, unbounded strings.
+pub fn set_config_revision_info(revision: u64, digest: &str, provenance: &str) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::{Mutex, OnceLock};
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    static CURRENT: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_config_revision_info",
+            "Current entry in the config revision ring; always 1, the revision/digest/provenance are the labels",
+            &["revision", "digest", "provenance"],
+        )
+        .expect("config revision info gauge registers")
+    });
+    let revision = revision.to_string();
+    let mut current = CURRENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let unchanged = current
+        .as_ref()
+        .is_some_and(|(r, d, p)| r == &revision && d == digest && p == provenance);
+    if unchanged {
+        return;
+    }
+    if let Some((prev_revision, prev_digest, prev_provenance)) = current.as_ref() {
+        let _ = gauge.remove_label_values(&[prev_revision, prev_digest, prev_provenance]);
+    }
+    gauge
+        .with_label_values(&[revision.as_str(), digest, provenance])
+        .set(1);
+    *current = Some((revision, digest.to_string(), provenance.to_string()));
+}
+
+/// Publish the config revision ring's current entry count on
+/// `sbproxy_config_history_entries`.
+///
+/// Set at recorder construction from the ring's existing on-disk state
+/// (so a restart reports the truth before the first reload), and again
+/// after every successful append, so this always mirrors what the ring
+/// itself holds rather than a count of events this process has seen.
+pub fn set_config_history_entries(count: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_config_history_entries",
+            "Entries currently held in the config revision ring",
+        )
+        .expect("config history entries gauge registers")
+    });
+    gauge.set(count);
+}
+
 /// Count one config-revision announcement on
 /// `sbproxy_config_authority_announce_total{result}`.
 ///
@@ -7248,6 +7328,84 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The reset half of the info-gauge idiom: `set_config_revision_info`
+    /// must leave exactly one series behind, not one per revision it has
+    /// ever been called with.
+    ///
+    /// A red version of this test (no `remove_label_values` call before
+    /// the second `with_label_values`) would show two series after the
+    /// second update, one per revision; that failure mode is exactly what
+    /// happened to the eight `stable` metrics this registry's module doc
+    /// describes, except here it would be silent cardinality growth
+    /// instead of a flat zero.
+    #[test]
+    fn config_revision_info_gauge_carries_exactly_one_series_after_two_records() {
+        set_config_revision_info(1, "aaaa1111aaaa1111", "local");
+        let first = gathered_series("sbproxy_config_revision_info");
+        assert_eq!(
+            first.len(),
+            1,
+            "the first record must publish exactly one series: {first:?}"
+        );
+        assert!(
+            first[0].0.contains("revision=1")
+                && first[0].0.contains("provenance=local")
+                && first[0].0.contains("digest=aaaa1111aaaa1111"),
+            "the first series did not carry the expected labels: {first:?}"
+        );
+        assert_eq!(first[0].1, 1.0);
+
+        set_config_revision_info(2, "bbbb2222bbbb2222", "git");
+        let second = gathered_series("sbproxy_config_revision_info");
+        assert_eq!(
+            second.len(),
+            1,
+            "a second record must remove the first revision's series rather than \
+             adding a second one: {second:?}"
+        );
+        assert!(
+            second[0].0.contains("revision=2")
+                && second[0].0.contains("provenance=git")
+                && second[0].0.contains("digest=bbbb2222bbbb2222"),
+            "the second series did not carry the new labels: {second:?}"
+        );
+
+        // A repeat of the same revision/digest/provenance is a no-op, not
+        // a third series and not a needless remove-then-set cycle.
+        set_config_revision_info(2, "bbbb2222bbbb2222", "git");
+        assert_eq!(gathered_series("sbproxy_config_revision_info").len(), 1);
+    }
+
+    /// `sbproxy_config_history_entries` is a plain gauge: it just tracks
+    /// whatever count it was last told, growing and shrinking with it.
+    #[test]
+    fn config_history_entries_gauge_tracks_the_count() {
+        set_config_history_entries(0);
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(0.0)
+        );
+
+        set_config_history_entries(5);
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(5.0)
+        );
+
+        set_config_history_entries(2);
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(2.0),
+            "the gauge must track a count that shrinks, not just one that grows"
+        );
     }
 
     /// Both halves of the key-store degradation pair, in one test on

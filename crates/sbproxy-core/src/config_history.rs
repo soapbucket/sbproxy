@@ -46,7 +46,8 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwapOption;
 use sbproxy_config::{
-    AppendMetadata, ConfigHistoryConfig, RevisionEntry, RevisionStore, RevisionStoreError,
+    AppendMetadata, BaseOrigin, ConfigHistoryConfig, RevisionEntry, RevisionStore,
+    RevisionStoreError,
 };
 
 /// The process-owned config revision ring.
@@ -91,6 +92,7 @@ impl ConfigHistoryRecorder {
         let store = RevisionStore::open(&history.dir, history.keep, None).map_err(|error| {
             anyhow::anyhow!("open config history store '{}': {error}", history.dir)
         })?;
+        Self::publish_metrics(&store);
         Ok(Some(Self {
             store: Mutex::new(store),
             keep_rejected: history.keep_rejected,
@@ -131,6 +133,32 @@ impl ConfigHistoryRecorder {
             tracing::error!(
                 error = %error,
                 "config history: failed to record an applied config revision"
+            );
+            return;
+        }
+        Self::publish_metrics(&store);
+    }
+
+    /// Publish `sbproxy_config_revision_info` and
+    /// `sbproxy_config_history_entries` from `store`'s current state.
+    ///
+    /// Called both at construction, against the freshly opened store
+    /// before it moves into `Self::store` (so a restart reports the
+    /// truth before the first reload), and after every successful
+    /// [`Self::record`]. `sbproxy_config_history_entries` is set
+    /// unconditionally; [`sbproxy_observe::metrics::set_config_revision_info`]
+    /// only when the ring carries at least one entry, since an empty ring
+    /// has no revision to report and no "unset" value stands in for one.
+    fn publish_metrics(store: &RevisionStore) {
+        let entries = store.entries();
+        sbproxy_observe::metrics::set_config_history_entries(
+            i64::try_from(entries.len()).unwrap_or(i64::MAX),
+        );
+        if let Some(last) = entries.last() {
+            sbproxy_observe::metrics::set_config_revision_info(
+                last.revision,
+                &last.digest,
+                provenance_label(&last.provenance),
             );
         }
     }
@@ -219,6 +247,19 @@ impl ConfigHistoryRecorder {
         let content_text = std::str::from_utf8(content).ok()?;
         let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(content_text).ok()?;
         Some(sbproxy_config::plan(&baseline, &proposed).max_blast_radius)
+    }
+}
+
+/// The closed label [`sbproxy_observe::metrics::set_config_revision_info`]
+/// carries for `provenance`: `"local"` or `"git"`. Deliberately coarser
+/// than [`BaseOrigin`] itself, which carries the repository, reference,
+/// and resolved commit for the `Git` variant; those are exactly the
+/// unbounded strings a metric label must never carry; the digest and
+/// revision already say which document this is.
+fn provenance_label(provenance: &BaseOrigin) -> &'static str {
+    match provenance {
+        BaseOrigin::Local => "local",
+        BaseOrigin::Git { .. } => "git",
     }
 }
 
@@ -414,6 +455,182 @@ mod tests {
         assert!(
             recorder.lkg().is_none(),
             "recording three applied revisions must not mint a last-known-good pointer"
+        );
+    }
+
+    /// Every label of a gathered Prometheus family, as `name=value` pairs
+    /// joined by commas, one entry per series, with the series value
+    /// appended.
+    ///
+    /// A local copy of the helper `sbproxy-observe`'s own metric tests
+    /// use (`crates/sbproxy-observe/src/metrics.rs`); `prometheus::gather()`
+    /// reads the same process-global registry regardless of which crate
+    /// registered the family, so the same shape works here.
+    fn gathered_series(family_name: &str) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for family in prometheus::gather() {
+            if family.name() != family_name {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                let value = match family.get_field_type() {
+                    prometheus::proto::MetricType::COUNTER => metric.get_counter().value(),
+                    prometheus::proto::MetricType::GAUGE => metric.get_gauge().value(),
+                    other => {
+                        unreachable!("{family_name} is a {other:?}, not a counter or a gauge")
+                    }
+                };
+                out.push((labels.join(","), value));
+            }
+        }
+        out
+    }
+
+    /// `record` must publish the newly recorded entry onto
+    /// `sbproxy_config_revision_info`, and a second record with different
+    /// provenance must replace that series rather than add a second one:
+    /// the reset half of the info-gauge idiom, exercised through the real
+    /// hookup rather than the metric function directly.
+    #[test]
+    fn record_publishes_the_revision_info_gauge_as_a_single_series() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let recorder = recorder_at(temp.path());
+
+        recorder.record(b"origins: {}\n# one\n", metadata("a"));
+        let first = recorder.entries().first().cloned().expect("one entry");
+        let series = gathered_series("sbproxy_config_revision_info");
+        assert_eq!(
+            series.len(),
+            1,
+            "one recorded entry must publish exactly one series: {series:?}"
+        );
+        assert!(
+            series[0]
+                .0
+                .contains(&format!("revision={}", first.revision))
+                && series[0].0.contains(&format!("digest={}", first.digest))
+                && series[0].0.contains("provenance=local"),
+            "the recorded entry's labels were not published: {series:?}"
+        );
+
+        let git_metadata = AppendMetadata {
+            provenance: BaseOrigin::Git {
+                repo: "https://example.invalid/repo".to_string(),
+                reference: "main".to_string(),
+                commit: "deadbeef".to_string(),
+            },
+            blast_radius: None,
+            secrets_fingerprint: None,
+            actor: Some("b".to_string()),
+            applied_at: 2,
+            degraded: Vec::new(),
+        };
+        recorder.record(b"origins: {}\n# two\n", git_metadata);
+        let second = recorder.entries().last().cloned().expect("two entries");
+        let series = gathered_series("sbproxy_config_revision_info");
+        assert_eq!(
+            series.len(),
+            1,
+            "a second record must remove the first entry's series rather than \
+             adding a second one: {series:?}"
+        );
+        assert!(
+            series[0]
+                .0
+                .contains(&format!("revision={}", second.revision))
+                && series[0].0.contains(&format!("digest={}", second.digest))
+                && series[0].0.contains("provenance=git"),
+            "the second record's labels were not published: {series:?}"
+        );
+    }
+
+    /// `record` must publish the ring's current entry count onto
+    /// `sbproxy_config_history_entries` after every successful append,
+    /// and leave it alone across a skipped byte-identical repeat.
+    #[test]
+    fn record_publishes_the_history_entries_gauge_matching_the_ring_count() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let recorder = recorder_at(temp.path());
+
+        recorder.record(b"origins: {}\n# one\n", metadata("a"));
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(1.0)
+        );
+
+        recorder.record(b"origins: {}\n# two\n", metadata("b"));
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(2.0)
+        );
+
+        // A byte-identical repeat is a skipped append and must not move
+        // the gauge either.
+        recorder.record(b"origins: {}\n# two\n", metadata("c"));
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(2.0),
+            "a skipped byte-identical record must not change the entries gauge"
+        );
+    }
+
+    /// A restart must report the ring's real state before the first
+    /// reload: `from_config` publishes both gauges from the store it just
+    /// opened, not only `record` does.
+    ///
+    /// Both gauges are forced to a value the real ring does not carry
+    /// before the reopen, so the assertions below cannot pass on state
+    /// left over from the first recorder; only a fresh publish at
+    /// construction can correct them.
+    #[test]
+    fn from_config_publishes_existing_ring_state_at_construction() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+
+        {
+            let recorder = recorder_at(temp.path());
+            recorder.record(b"origins: {}\n# one\n", metadata("a"));
+            recorder.record(b"origins: {}\n# two\n", metadata("b"));
+            recorder.record(b"origins: {}\n# three\n", metadata("c"));
+        }
+
+        sbproxy_observe::metrics::set_config_history_entries(999);
+        sbproxy_observe::metrics::set_config_revision_info(999, "not-a-real-digest", "git");
+
+        let recorder = recorder_at(temp.path());
+        let entries = recorder.entries();
+        assert_eq!(
+            entries.len(),
+            3,
+            "the reopened ring must see the prior process's entries"
+        );
+        let last = entries.last().expect("three entries were recorded");
+
+        assert_eq!(
+            gathered_series("sbproxy_config_history_entries")
+                .last()
+                .map(|(_, value)| *value),
+            Some(3.0),
+            "construction must publish the ring's real entry count, not the forced value"
+        );
+        let series = gathered_series("sbproxy_config_revision_info");
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert!(
+            series[0].0.contains(&format!("revision={}", last.revision))
+                && series[0].0.contains(&format!("digest={}", last.digest))
+                && series[0].0.contains("provenance=local"),
+            "construction must publish the ring's real last entry, not the forced \
+             fixture: {series:?}"
         );
     }
 }
