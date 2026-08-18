@@ -2,6 +2,8 @@
 # Regenerate with: scripts/record-tapes.sh pii-redaction
 #
 # CONFIG: examples/pii-redaction/sb.yml
+# FIXTURE: examples/pii-redaction/fixture.py
+# FIXTURE_PORT: 8098
 
 Output "docs/assets/pii-redaction.gif"
 

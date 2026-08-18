@@ -98,6 +98,46 @@ def strip_comment(line):
     return line
 
 
+FIXTURE_RUN_LINE = re.compile(r"^python3\s+(\S+\.py)(?:\s+\S+)?\s*&$")
+# Matches the origin action's `url:` / `base_url:` line pointing at the
+# fixture, e.g. `url: http://127.0.0.1:8097` or
+# `base_url: "http://127.0.0.1:8098/anything"`. Scoped to those keys (and
+# not searched against the header) so a port mentioned in a Test: curl
+# example above the YAML body is never mistaken for the fixture's port.
+FIXTURE_PORT_HINT = re.compile(r"^\s*(?:base_url|url):.*127\.0\.0\.1:(\d+)")
+
+
+def extract_fixture(hdr, name, sb_text):
+    """Find a `python3 <script> &` background-fixture line in the header.
+
+    Examples that proxy to a local upstream (rather than test.sbproxy.dev)
+    document starting it first in their Run: section, e.g. `python3
+    fixture.py &`. When present, this returns the fixture's repo-root-
+    relative path and (if discoverable) the port it listens on, so the
+    generated tape can carry `# FIXTURE:` / `# FIXTURE_PORT:` directives
+    for scripts/record-tapes.sh.
+    """
+    for line in hdr:
+        m = FIXTURE_RUN_LINE.match(strip_comment(line).strip())
+        if m:
+            raw = m.group(1)
+            # Some examples document the fixture as `python3 fixture.py &`
+            # (run from inside the example directory, alongside `sbproxy
+            # serve -f sb.yml`); others as `python3 examples/<name>/fixture.py &`
+            # (already repo-root-relative, alongside `make run CONFIG=...`).
+            # record-tapes.sh always runs from the repo root, so normalize
+            # to that.
+            script = raw if raw.startswith("examples/") else f"examples/{name}/{raw}"
+            port = None
+            for body_line in sb_text.splitlines():
+                port_match = FIXTURE_PORT_HINT.match(body_line)
+                if port_match:
+                    port = port_match.group(1)
+                    break
+            return script, port
+    return None, None
+
+
 def extract_commands(hdr, max_cmds=2):
     """Pull up to max_cmds runnable command units from the Test: block."""
     # Find the Test: marker.
@@ -199,7 +239,7 @@ def is_ai(sb_text):
     return "type: ai_proxy" in sb_text
 
 
-def tape_for(name, cmds, is_ai_example):
+def tape_for(name, cmds, is_ai_example, fixture=None, fixture_port=None):
     height = 340 + 130 * min(len(cmds), 2)
     sleep = "3.5s" if is_ai_example else "1.6s"
     lines = [
@@ -207,6 +247,12 @@ def tape_for(name, cmds, is_ai_example):
         f"# Regenerate with: scripts/record-tapes.sh {name}",
         "#",
         f"# CONFIG: examples/{name}/sb.yml",
+    ]
+    if fixture:
+        lines.append(f"# FIXTURE: {fixture}")
+        if fixture_port:
+            lines.append(f"# FIXTURE_PORT: {fixture_port}")
+    lines += [
         "",
         f'Output "docs/assets/{name}.gif"',
         "",
@@ -317,7 +363,8 @@ def main():
         if not cmds:
             skip.append((name, "no Test: curl block"))
             continue
-        desired[name] = tape_for(name, cmds, is_ai(sb_text))
+        fixture, fixture_port = extract_fixture(hdr, name, sb_text)
+        desired[name] = tape_for(name, cmds, is_ai(sb_text), fixture, fixture_port)
 
     stale_scope = set(existing) if not args.only else selected
     stale = sorted((set(existing) & stale_scope) - set(desired))

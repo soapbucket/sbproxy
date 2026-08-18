@@ -1,14 +1,17 @@
 # Subresource Integrity (SRI) inspection
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 ![Subresource Integrity (SRI) inspection](../../docs/assets/sri.gif)
 
-Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` responses, inspects every `<script src="https://...">` and `<link rel="stylesheet" href="https://...">` pointing at an external origin, and checks for an `integrity="..."` attribute that uses one of the configured algorithms (`sha384` or `sha512` here). Missing or mismatched references are logged at warn level and counted in the `sbproxy_policy_triggers_total{policy_type="sri"}` metric. The proxy does not modify the body; SRI is a browser-side mechanism and the proxy's value is alerting an operator that a page is missing integrity coverage. Same-origin references and inline scripts are skipped per the SRI spec. The origin lives on `127.0.0.1:8080` behind the `sri.local` Host header and is served by a `static` action containing one violating `<link>` and one compliant `<script>`.
+Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` responses, inspects every `<script src="https://...">` and `<link rel="stylesheet" href="https://...">` pointing at an external origin, and checks for an `integrity="..."` attribute that uses one of the configured algorithms (`sha384` or `sha512` here). Missing or mismatched references are logged at warn level and counted in the `sbproxy_policy_triggers_total{policy_type="sri"}` metric. The proxy does not modify the body; SRI is a browser-side mechanism and the proxy's value is alerting an operator that a page is missing integrity coverage. Same-origin references and inline scripts are skipped per the SRI spec. The origin lives on `127.0.0.1:8080` behind the `sri.local` Host header and proxies to a small local fixture (`fixture.py`) serving one violating `<link>` and one compliant `<script>`. The scan hooks into Pingora's upstream `response_filter`, which only runs for a genuinely proxied (`type: proxy`) origin, so the example cannot use a `static` action here.
 
 ## Run
 
 ```bash
+# The upstream must be up first so it can serve the HTML sri.local proxies to.
+python3 fixture.py &
+
 sbproxy serve -f sb.yml
 ```
 
@@ -38,9 +41,8 @@ content-type: text/html
 ```
 
 ```bash
-# Inspect the violation counter. It is served on the main data-plane
-# port too (no admin listener required):
-$ curl -s http://127.0.0.1:8080/metrics | grep sbproxy_policy_triggers_total
+# Inspect the violation counter (admin API, basic auth):
+$ curl -s -u admin:changeme http://127.0.0.1:9091/metrics | grep sbproxy_policy_triggers_total
 sbproxy_policy_triggers_total{origin="sri.local",policy_type="sri",action="violation",agent_id="",agent_class=""} 1
 ```
 
@@ -49,23 +51,13 @@ sbproxy_policy_triggers_total{origin="sri.local",policy_type="sri",action="viola
 # WARN sbproxy_core::server::proxy_http: sri: subresource missing or weak integrity attribute hostname="sri.local" tag="link" url="https://cdn.example.com/theme.css" reason=MissingIntegrity
 ```
 
-## Known limitation
-
-The response-body SRI scan hooks into Pingora's upstream `response_filter`,
-which only runs for proxied (`type: proxy`) origins. A `static` action (used
-here so the example runs offline) never passes through that filter, so on
-the current build **neither the warning nor the metric above actually fires**
-for this config. The response body itself is still served byte-for-byte as
-written above. To see the scan fire today, point `sri.local` at a `type:
-proxy` origin serving the same HTML instead of `type: static`.
-
 ## What this exercises
 
 - `sri` policy with `enforce: true` and the `sha384` / `sha512` algorithm allowlist
 - Detection of missing `integrity` on cross-origin `<script>` and `<link rel="stylesheet">` tags
 - Observation-only behaviour: the response body is unchanged and the response is not blocked
 - Metrics integration via `sbproxy_policy_triggers_total{policy_type="sri"}`
-- `static` action emitting an inline HTML body so the example runs offline
+- A `type: proxy` origin, required because the scan hooks into Pingora's upstream `response_filter`, which a `static` action never reaches
 
 ## See also
 

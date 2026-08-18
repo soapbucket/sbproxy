@@ -11,6 +11,8 @@
 # the first verify would show `broken` instead of `ok`.
 #
 # CONFIG: examples/metering-verify/sb.yml
+# FIXTURE: examples/metering-verify/bin/upstream.py
+# FIXTURE_PORT: 8099
 
 Output "docs/assets/metering-verify.gif"
 

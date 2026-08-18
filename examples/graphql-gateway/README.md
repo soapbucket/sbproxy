@@ -38,7 +38,7 @@ $ curl -i -H 'Host: graphql.local' -H 'Content-Type: application/json' \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":"GraphQL request validation failed","detail":"invalid GraphQL query: query parse error: Parse error at 1:18\nUnexpected end of input\nExpected }\n"}
+{"detail":"invalid GraphQL query: query parse error: Parse error at 1:18\nUnexpected end of input\nExpected }\n","error":"GraphQL request validation failed"}
 ```
 
 **Introspection disabled.** `allow_introspection: false` rejects a `__schema` selection, including nested or aliased ones.
@@ -50,7 +50,7 @@ $ curl -i -H 'Host: graphql.local' -H 'Content-Type: application/json' \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":"GraphQL request validation failed","detail":"GraphQL introspection is disabled"}
+{"detail":"GraphQL introspection is disabled","error":"GraphQL request validation failed"}
 ```
 
 **Depth exceeded.** `max_depth: 5` on a query that nests six levels deep.
@@ -62,7 +62,7 @@ $ curl -i -H 'Host: graphql.local' -H 'Content-Type: application/json' \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":"GraphQL request validation failed","detail":"GraphQL query depth 6 exceeds configured maximum 5"}
+{"detail":"GraphQL query depth 6 exceeds configured maximum 5","error":"GraphQL request validation failed"}
 ```
 
 **Batch rejected.** A batched POST body is a JSON array of query envelopes. One bad entry fails the whole batch; nothing partially executes.
@@ -74,7 +74,7 @@ $ curl -i -H 'Host: graphql.local' -H 'Content-Type: application/json' \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":"GraphQL request validation failed","detail":"GraphQL batch entry 1: JSON body must contain a string query field"}
+{"detail":"GraphQL batch entry 1: JSON body must contain a string query field","error":"GraphQL request validation failed"}
 ```
 
 **Persisted-query-only envelope refused.** Apollo-style automatic persisted queries send `extensions.persistedQuery` with no `query` field on the wire, expecting the server to resolve the hash server-side. Validation here works against the literal request body, so a persisted-query-only envelope has no `query` string to check and is refused the same way a missing field would be anywhere else in this action. Send the full query text on first use (most persisted-query clients do this automatically) if you turn any validation control on.
@@ -86,7 +86,7 @@ $ curl -i -H 'Host: graphql.local' -H 'Content-Type: application/json' \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":"GraphQL request validation failed","detail":"JSON body must contain a string query field"}
+{"detail":"JSON body must contain a string query field","error":"GraphQL request validation failed"}
 ```
 
 **Oversized body.** A validated request has to be replayed byte-for-byte to the upstream after validation, and the replay buffer is a fixed 64 KiB. A body over that limit is rejected before it is even parsed.
@@ -102,7 +102,7 @@ content-type: application/json
 {"error":"validated GraphQL request body exceeds the 64 KiB replay limit"}
 ```
 
-That one comes back as a bare `413`, not the `{"error":"GraphQL request validation failed",...}` shape the others use, because it is caught earlier, before a route or upstream is even resolved.
+That one comes back as a bare `413`, not the `{"detail":...,"error":"GraphQL request validation failed"}` shape the others use, because it is caught earlier, before a route or upstream is even resolved.
 
 ## Which refusals need the fixture running
 
