@@ -35,6 +35,43 @@ def encode_frame(payload: bytes, opcode: int = 0x1) -> bytes:
     return header + mask + masked
 
 
+def recv_exact(sock: socket.socket, count: int) -> bytes:
+    """Read exactly `count` bytes, looping over recv() as needed.
+
+    A single recv() call is not guaranteed to return everything
+    requested, especially for a payload larger than one TCP segment.
+    """
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def decode_frame(sock: socket.socket) -> bytes:
+    """Read one WebSocket frame and return its payload.
+
+    Handles the 7-bit, 16-bit (126), and 64-bit (127) length encodings
+    from RFC 6455 6.2, unlike a raw `header[1] & 0x7F` read, which
+    treats 126/127 as if they were the literal payload length and
+    misreads any frame whose payload is 126 bytes or larger.
+    """
+    header = recv_exact(sock, 2)
+    length = header[1] & 0x7F
+    if length == 126:
+        length = int.from_bytes(recv_exact(sock, 2), "big")
+    elif length == 127:
+        length = int.from_bytes(recv_exact(sock, 8), "big")
+    masked = header[1] & 0x80
+    mask = recv_exact(sock, 4) if masked else b""
+    payload = recv_exact(sock, length)
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return payload
+
+
 def main() -> None:
     args = [a for a in sys.argv[1:] if a != "--no-token"]
     send_token = "--no-token" not in sys.argv
@@ -62,10 +99,18 @@ def main() -> None:
             return
         print()
         sock.sendall(encode_frame(message.encode()))
-        header = sock.recv(2)
-        length = header[1] & 0x7F
-        payload = sock.recv(length) if length else b""
-        print(f"received: {payload.decode(errors='replace')}")
+        payload = decode_frame(sock)
+        text = payload.decode(errors="replace")
+        if len(payload) > 200:
+            # A frame this size is unreadable dumped whole; show enough to
+            # confirm the round trip (the fixture's "echo: " prefix, the
+            # byte count, and both ends of the payload) instead.
+            print(
+                f"received: {len(payload)} bytes, starts {text[:30]!r}, "
+                f"ends {text[-30:]!r}"
+            )
+        else:
+            print(f"received: {text}")
         sock.sendall(encode_frame(b"", opcode=0x8))
 
 

@@ -2,6 +2,8 @@
 # Regenerate with: scripts/record-tapes.sh sri
 #
 # CONFIG: examples/sri/sb.yml
+# FIXTURE: examples/sri/fixture.py
+# FIXTURE_PORT: 8097
 
 Output "docs/assets/sri.gif"
 

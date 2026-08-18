@@ -2,6 +2,8 @@
 # Regenerate with: scripts/record-tapes.sh multi-tenant-saas
 #
 # CONFIG: examples/multi-tenant-saas/sb.yml
+# FIXTURE: examples/multi-tenant-saas/fixture.py
+# FIXTURE_PORT: 18080
 
 Output "docs/assets/multi-tenant-saas.gif"
 

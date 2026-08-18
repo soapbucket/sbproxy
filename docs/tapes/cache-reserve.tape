@@ -2,6 +2,8 @@
 # Regenerate with: scripts/record-tapes.sh cache-reserve
 #
 # CONFIG: examples/cache-reserve/sb.yml
+# FIXTURE: examples/cache-reserve/fixture.py
+# FIXTURE_PORT: 18090
 
 Output "docs/assets/cache-reserve.gif"
 

@@ -2,6 +2,7 @@
 # Regenerate with: scripts/record-tapes.sh routing-strategies
 #
 # CONFIG: examples/routing-strategies/sb.yml
+# FIXTURE: examples/routing-strategies/fixture.py
 
 Output "docs/assets/routing-strategies.gif"
 

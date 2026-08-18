@@ -889,15 +889,26 @@ proxy:
 | `enabled` | bool | `false` | Master switch. |
 | `dir` | string | `/var/lib/sbproxy/config-history` | Directory the ring lives in. |
 | `keep` | int | `20` | Applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1. |
-| `keep_rejected` | int | `10` | Rejected-candidate entries the ring retains for operator inspection. |
+| `keep_rejected` | int | `10` | Reserved for rejected-candidate retention. Accepted and stored for forward compatibility, but nothing writes to the ring's `rejected/` directory yet in this release, so this field has no observable effect today; a config that fails to apply is not recorded anywhere. Wiring the writer is a later change. |
 
 Each entry stores the pre-resolution config bytes: exactly what was read off
 disk, git, or the config authority, before `${VAR}` and
-`vault://`/`secret://` references were resolved. A secret never lands in a
-stored entry, the same guarantee
-[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) makes for
-the live editor. Stored documents are zstd-compressed; `zstdcat` reads one
-directly off disk while the process is stopped.
+`vault://`/`secret://` references were resolved, compressed with zstd.
+`zstdcat` reads one directly off disk while the process is stopped.
+
+That guarantee is about *resolution*, not about what an operator typed. A
+`${VAR}` or `vault://`/`secret://` reference never resolves into a stored
+entry, but a literal secret pasted directly into the YAML (an inline API
+key, a password field) is not a reference and stores exactly as written,
+the same way it sits in the config file on disk today. The ring directory
+is filesystem-scoped and owner-only (`0700` directory, `0600` files) --
+that permission boundary is what actually protects a literal secret at
+rest, the same as the config file itself. `GET /admin/config/history/{digest}`
+and `sbproxy config show` mask a literal secret as `[REDACTED]` before
+either ever leaves the process, the same redaction pass
+[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies,
+but that is display redaction: the ring file underneath still holds the
+original bytes, because a rollback needs them.
 
 The directory is a one-process durability boundary, not shared fleet state,
 the same as [`compression_state`](#compression_state): a config authority

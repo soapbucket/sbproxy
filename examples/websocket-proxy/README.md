@@ -60,6 +60,15 @@ received: echo: hello through the gateway
 
 `python3 client.py "hi" --no-token` reproduces the 401 above end to end, including the frame layer never getting used.
 
+**Oversized frame: `max_message_size` does not bound frame size.** This origin sets `max_message_size: 65536`. Send an 80,000-byte text frame anyway, well past that ceiling, and it round-trips unmodified: the gateway never counts frame payload bytes, so nothing rejects it or closes the connection. `client.py` prints a summary instead of the raw 80,000 bytes for anything over 200 bytes received.
+
+```bash
+$ python3 client.py "$(python3 -c "print('x' * 80000, end='')")" | tail -1
+received: 80006 bytes, starts 'echo: xxxxxxxxxxxxxxxxxxxxxxxx', ends 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+```
+
+80,006 bytes back is the fixture's 6-byte `echo: ` prefix plus the full 80,000-byte payload, confirming nothing was truncated, rejected, or otherwise touched by `max_message_size`. Fixing this is tracked separately; the field stays in the config schema and in this demo because it documents the gap honestly rather than removing the knob and losing the paper trail.
+
 **Failure mode: a non-upgrade request to a `websocket` origin.** The action does not check whether the request carries `Upgrade: websocket` before deciding where to send it. `type: websocket` just means "proxy this Host to a `ws://`/`wss://` target." A plain GET with a valid token still passes auth and gets proxied to the same upstream, byte for byte, as a normal HTTP request:
 
 ```bash
@@ -79,7 +88,7 @@ That `400` is `fixture.py`'s own response, not the gateway's. A real WebSocket s
 
 **After the `101` response**, the connection is a transparent byte pipe with no per-frame inspection. Two fields on this action look like they should change that and currently do not:
 
-- `max_message_size` (this example sets `65536`) is accepted by config parsing but is not enforced anywhere in the current build. An 80,000-byte text frame passes through unmodified over this same config; nothing in the gateway counts frame payload bytes or closes the connection for exceeding the configured limit.
+- `max_message_size` (this example sets `65536`) is accepted by config parsing but is not enforced anywhere in the current build. The oversized-frame check above sends an 80,000-byte text frame over this same config and it passes through unmodified; nothing in the gateway counts frame payload bytes or closes the connection for exceeding the configured limit.
 - `subprotocols` is likewise accepted but not read anywhere the codebase negotiates or filters on `Sec-WebSocket-Protocol`. Whatever the client and the real upstream negotiate between themselves is what happens; the gateway is not a party to it.
 
 Anything after the handshake, policy enforcement, PII redaction, payload inspection, per-message rate limiting, is out of scope for this action today. If you need control over what flows after the upgrade, that has to live in the WebSocket backend itself.

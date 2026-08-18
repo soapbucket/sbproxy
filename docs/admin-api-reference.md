@@ -957,6 +957,24 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
+Every one of the eleven wired egress purposes below goes through the same
+authorizer and lands in the same inventory and, on denial, the same
+event:
+
+```mermaid
+flowchart TD
+    A["Egress call site: AI provider, judge, MCP upstream,\nOpenAPI tool, token exchange, webhook, usage sink,\nmodel/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
+    B -->|no authorizer armed for this purpose| C[ungated]
+    B -->|authorizer armed| D{Destination allowed?}
+    D -->|yes| E[allowed]
+    D -->|no| F[denied]
+    C --> G["GET /api/egress inventory (allowed_count)"]
+    E --> G
+    F --> H["GET /api/egress inventory (denied_count, last_reason)"]
+    F --> I[sbproxy_egress_refused_total metric]
+    I --> J["egress_refused event, if an events: sink is configured"]
+```
+
 ```json
 {
   "schema_version": 1,
@@ -1699,9 +1717,9 @@ ring does and does not do yet.
 
 ### `GET /admin/config/history/{digest}`
 
-One ring entry in full, by its content digest: the entry's metadata, the
-stored pre-resolution YAML, and the rendered `plan()` diff against the
-config currently running.
+One ring entry in full, by its content digest: the entry's metadata, a
+secret-redacted view of the stored pre-resolution YAML, and the rendered
+`plan()` diff against the config currently running, redacted the same way.
 
 ```json
 {
@@ -1723,8 +1741,8 @@ config currently running.
 | Field | Type | Description |
 |---|---|---|
 | `entry` | object | Same shape as one element of `entries[]` in [`GET /admin/config/history`](#get-adminconfighistory). |
-| `document` | string | The stored pre-resolution YAML, byte-for-byte. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. |
-| `plan_text` | string | The same terraform-style text diff `sbproxy plan` renders by default, computed between this revision and the config running now. |
+| `document` | string | A secret-redacted view of the stored pre-resolution YAML. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. A literal secret an operator typed directly into the file (an inline API key, a password field) is masked as `[REDACTED]`, the same redaction pass [`GET /admin/config`](#get-put-adminconfig) applies. This is display redaction only: the ring file on disk still holds the original bytes (a rollback needs them), protected by the ring directory's owner-only filesystem permissions (`0700`/`0600`), not by this response. |
+| `plan_text` | string | The same terraform-style text diff `sbproxy plan` renders by default, computed between this revision and the config running now, then redacted the same way `document` is. |
 
 Read-only operators may call this.
 

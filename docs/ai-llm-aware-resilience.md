@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -11,6 +11,31 @@ request that would only fail again is sent to a fallback instead.
 
 This is an opt-in addition to the failover loop. Without a `retry_policy`
 the default status-code retry set is unchanged.
+
+One request can touch provider selection, failure classification, the
+circuit breaker, and a fallback all in the same attempt loop. The gate
+worth calling out: a class beyond the default retryable set only gets
+another attempt when `routing: fallback_chain` is set, or on a
+content-policy refusal with `content_policy_fallback: true`. Outside
+those two cases, every request is exactly one attempt, `retry_policy` or
+not.
+
+```mermaid
+flowchart TD
+    A["Routing strategy selects a provider\n(healthy, breaker closed, not outlier-ejected)"] --> B{Any provider eligible?}
+    B -->|none eligible| C[Fall back to the unfiltered provider list]
+    B -->|yes| D[Dispatch the request]
+    C --> D
+    D --> E{Response}
+    E -->|2xx| F[Return the response]
+    E -->|failure| G[Classify the failure cause]
+    G --> H[Circuit breaker and outlier detector record the outcome]
+    H --> I{"fallback_chain routing,\nor a content-policy refusal\nwith content_policy_fallback"}
+    I -->|no| J["Return the error or refusal\n(one attempt only)"]
+    I -->|yes| K{Cause retryable and attempts remain?}
+    K -->|yes, next provider| A
+    K -->|no| J
+```
 
 ## Failure classification
 
