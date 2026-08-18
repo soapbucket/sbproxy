@@ -9085,7 +9085,10 @@ origins:
         assert_eq!(api4["state"], "needs_operator_input");
         assert_eq!(api4["synthesized"].as_array().unwrap().len(), 2);
         assert!(
-            api4["reason"].as_str().unwrap().contains("per_item.api4.rps"),
+            api4["reason"]
+                .as_str()
+                .unwrap()
+                .contains("per_item.api4.rps"),
             "the api4 row must name the knob that completes it, got: {api4}"
         );
 
