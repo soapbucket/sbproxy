@@ -146,12 +146,29 @@ fn placeholder_is_env_reference(var_name: &str) -> bool {
 /// output), which `scan_yaml_hazards` reports after parsing. A
 /// placeholder whose name is not a possible environment variable name
 /// (see [`placeholder_is_env_reference`]) is not touched at all.
+///
+/// `$$` escapes: `$${VAR}` is never substituted (docs/mcp-compose.md
+/// documents it as rendering the literal text `${VAR}`). This pass
+/// consumes `$` in pairs, greedily from the left, so an odd run leaves
+/// a live placeholder (`$$${VAR}` is one escaped pair, then a real
+/// substitution) -- the same rule the MCP engine's scanner applies. The
+/// pass strips nothing: the `$$` bytes stay in the output for the
+/// runtime consumer that owns the unescape.
 fn interpolate_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '$' {
+            if chars.peek() == Some(&'$') {
+                // `$$` escape: consume the pair so a `${` right after
+                // it never opens a placeholder here, but emit the
+                // bytes untouched -- the downstream consumer (the MCP
+                // local-tool engine) owns the unescape.
+                chars.next();
+                result.push_str("$$");
+                continue;
+            }
             if chars.peek() == Some(&'{') {
                 chars.next(); // consume '{'
                 let mut var_name = String::new();
@@ -232,11 +249,26 @@ fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
             let tail = &rest[start..];
             match tail.find('}') {
                 Some(end) => {
+                    // `$${...}` is the documented escape: the
+                    // placeholder never opens, so it is not an
+                    // unresolved reference. An odd-length `$` run
+                    // before the placeholder's own `$` escapes it;
+                    // an even run leaves it live (`$$${VAR}` is one
+                    // escaped pair, then a real reference) -- the
+                    // same pair-parity rule `interpolate_env_vars`
+                    // and the MCP engine's scanner apply.
+                    let escaping_dollars = rest[..start]
+                        .chars()
+                        .rev()
+                        .take_while(|&c| c == '$')
+                        .count();
+                    let escaped = escaping_dollars % 2 == 1;
                     // A placeholder in the MCP local-tool vocabulary
                     // (`${args.id}`, `${steps.x.y}`) is left for its
                     // own consumer and never reported here; every
-                    // other name is an unresolved env reference.
-                    if placeholder_is_env_reference(&tail[2..end]) {
+                    // other unescaped name is an unresolved env
+                    // reference.
+                    if !escaped && placeholder_is_env_reference(&tail[2..end]) {
                         out.push(&tail[..=end]);
                     }
                     rest = &tail[end + 1..];
@@ -4760,6 +4792,71 @@ origins:
         let refs = unresolved_env_references(yaml);
         assert_eq!(refs.len(), 1, "got: {refs:?}");
         assert!(refs[0].contains("${secret.OPENAI_KEY}"), "got: {refs:?}");
+    }
+
+    // docs/mcp-compose.md documents `$$` as the escape that renders a
+    // literal `${...}` at MCP call time. The pre-parse env layer must
+    // honor it: before this fix, `$${OPENAI_API_KEY}` had the live
+    // value spliced into the config text at compile time -- the exact
+    // leak the escape exists to prevent. The env layer strips nothing;
+    // the MCP engine (mcp_interpolate.rs) owns the `$$` unescape.
+    #[test]
+    fn escaped_placeholder_survives_env_interpolation() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "OPENAI_API_KEY",
+            Some("sk-live-splice-would-leak"),
+        )]);
+        // `$${...}`: escaped. Byte-for-byte untouched, value never read.
+        assert_eq!(
+            interpolate_env_vars("$${OPENAI_API_KEY}"),
+            "$${OPENAI_API_KEY}"
+        );
+        // `$$$...`: one escaped `$` pair, then a LIVE placeholder --
+        // the same greedy pair-parity rule the MCP engine's scanner
+        // applies.
+        assert_eq!(
+            interpolate_env_vars("$$${OPENAI_API_KEY}"),
+            "$$sk-live-splice-would-leak"
+        );
+        // `$$` not followed by `{` stays what it always was.
+        assert_eq!(interpolate_env_vars("cost: $$5"), "cost: $$5");
+    }
+
+    // The escape must also silence the hazard scan (an escaped
+    // placeholder never opens, so there is nothing unresolved), and the
+    // untouched bytes must reach the compiled config for the runtime
+    // consumer to unescape.
+    #[test]
+    fn escaped_placeholder_reaches_the_compiled_config_and_is_not_reported() {
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("OPENAI_API_KEY", Some("sk-live-splice-would-leak")),
+            ("SBPROXY_TEST_UNSET_ESCAPED", None),
+        ]);
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "key=$${OPENAI_API_KEY} other=$${SBPROXY_TEST_UNSET_ESCAPED}"
+"#;
+        // Neither the set-variable nor the unset-variable escape is an
+        // unresolved reference, so a config authority does not refuse
+        // the bundle over the escape.
+        assert_eq!(
+            unresolved_env_references(yaml),
+            Vec::<String>::new(),
+            "escaped placeholders are not env references"
+        );
+        let compiled = compile_config(yaml).expect("escaped placeholders compile");
+        assert_eq!(
+            compiled.origins[0].action_config["body"],
+            serde_json::json!("key=$${OPENAI_API_KEY} other=$${SBPROXY_TEST_UNSET_ESCAPED}"),
+            "the escape bytes reach the compiled config untouched"
+        );
     }
 
     // WOR-1817: custom YAML tags are stripped by the parser, so
