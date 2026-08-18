@@ -7,22 +7,22 @@
 //!
 //! # Lifecycle
 //!
-//! [`ConfigHistoryRecorder::from_config`] opens the ring named by
-//! `proxy.config_history` once, at boot. [`install_config_history_recorder`]
-//! publishes it into a process-wide slot as [`ConfigHistoryState::Open`];
+//! [`ConfigHistoryRecorder::from_config`](crate::config_history::ConfigHistoryRecorder::from_config) opens the ring named by
+//! `proxy.config_history` once, at boot. [`install_config_history_recorder`](crate::config_history::install_config_history_recorder)
+//! publishes it into a process-wide slot as [`ConfigHistoryState::Open`](crate::config_history::ConfigHistoryState::Open);
 //! the reload transaction in `crate::server::lifecycle` appends to it
-//! through [`current_config_history_recorder`], and the admin history
+//! through [`current_config_history_recorder`](crate::config_history::current_config_history_recorder), and the admin history
 //! routes (`GET /admin/config/history` and its `/{digest}` sibling)
-//! read [`current_config_history_state`] directly so they can tell all
+//! read [`current_config_history_state`](crate::config_history::current_config_history_state) directly so they can tell all
 //! three states apart. A block that is absent or carries `enabled:
 //! false` means `from_config` returns `None`, nothing is ever
 //! installed, and the slot stays at its default
-//! [`ConfigHistoryState::Disabled`]: recording is opt-in, and an
+//! [`ConfigHistoryState::Disabled`](crate::config_history::ConfigHistoryState::Disabled): recording is opt-in, and an
 //! operator who never opted in pays nothing for it. A block that is
 //! enabled but whose store fails to open (an unwritable directory, or a
 //! ring shape [`sbproxy_config::RevisionStore::open`] refuses to
-//! repair) moves the slot to [`ConfigHistoryState::Failed`] instead:
-//! the boot itself still succeeds (see [`ConfigHistoryRecorder::from_config`]'s
+//! repair) moves the slot to [`ConfigHistoryState::Failed`](crate::config_history::ConfigHistoryState::Failed) instead:
+//! the boot itself still succeeds (see [`ConfigHistoryRecorder::from_config`](crate::config_history::ConfigHistoryRecorder::from_config)'s
 //! own documentation for why), but the admin routes surface that
 //! failure explicitly rather than answering as though the operator
 //! never turned the feature on.
