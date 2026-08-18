@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# WebSocket proxy with an auth gate on the upgrade request.
+#
+# `type: websocket` proxies `ws://`/`wss://` upstreams. The action
+# itself does not parse WebSocket frames; the gateway forwards the
+# HTTP Upgrade request through the same auth/policy/transform pipeline
+# as any other origin, and once the upstream answers 101 the
+# connection becomes a transparent byte pipe in both directions.
+#
+# `bearer` auth here shows that a policy applied to the origin runs
+# before the upgrade completes: a request without a valid token never
+# reaches the WebSocket backend.
+#
+# No live public WebSocket endpoint ships with this repo, so fixture.py
+# stands in for one: a stdlib-only RFC 6455 handshake + echo server.
+#
+# Run:
+#   python3 fixture.py &
+#   make run CONFIG=examples/websocket-proxy/sb.yml
+#
+# Test: see README.md for the full walkthrough (handshake, auth gate,
+# and the failure mode for a non-upgrade request).
+
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo upstream runs on loopback: the SSRF guard
+  # refuses private/loopback upstream addresses unless allowlisted. A
+  # production config pointing at a real WebSocket backend does not
+  # need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+origins:
+  "ws.local":
+    action:
+      type: websocket
+      url: ws://127.0.0.1:8100
+      max_message_size: 65536
+
+    authentication:
+      type: bearer
+      tokens:
+        - svc-token-alpha
