@@ -989,6 +989,157 @@ pub struct CompressionStateRuntimeConfig {
     pub local_path: Option<String>,
 }
 
+// --- Config history (WOR-2456) ---
+
+/// Default directory for the durable config-revision ring. See
+/// [`ConfigHistoryConfig::dir`].
+fn default_config_history_dir() -> String {
+    "/var/lib/sbproxy/config-history".to_string()
+}
+
+/// Default number of applied entries the ring retains. See
+/// [`ConfigHistoryConfig::keep`].
+const fn default_config_history_keep() -> usize {
+    20
+}
+
+/// Default number of rejected entries the ring retains. See
+/// [`ConfigHistoryConfig::keep_rejected`].
+const fn default_config_history_keep_rejected() -> usize {
+    10
+}
+
+/// Durable last-known-good config history (WOR-2456): every config this
+/// proxy applies is kept as a content-addressed entry on local disk, so a
+/// rollback can restore a prior revision without depending on git history
+/// or any other external system being reachable at the moment it is
+/// needed.
+///
+/// Disabled by default. An example elsewhere may show `enabled: true`,
+/// but that is the example, not this build's shipping default; every
+/// other opt-in proxy-level block in this schema defaults the same way.
+///
+/// Once enabled, the block names process-owned local storage, which is
+/// why [`crate::config_merge::AUTHORITY_DENIED_PATHS`] carries
+/// `proxy.config_history` for the same reason it carries
+/// `proxy.compression_state`: the ring's directory is a fact about this
+/// machine, not something a fleet-wide authority document should be able
+/// to repoint.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigHistoryConfig {
+    /// Master switch. Disabled by default so an existing deployment does
+    /// not start writing config revisions to local disk without an
+    /// explicit opt-in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory the revision ring lives in. Defaults to
+    /// `/var/lib/sbproxy/config-history`.
+    #[serde(default = "default_config_history_dir")]
+    pub dir: String,
+    /// Number of applied entries the ring retains, beyond whichever
+    /// entry the last-known-good pointer names (that entry is never
+    /// evicted). Must be at least 1; see [`Self::validate`]. Defaults to
+    /// 20.
+    #[serde(default = "default_config_history_keep")]
+    pub keep: usize,
+    /// Number of rejected entries the ring retains for operator
+    /// inspection. Defaults to 10.
+    #[serde(default = "default_config_history_keep_rejected")]
+    pub keep_rejected: usize,
+}
+
+impl Default for ConfigHistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_config_history_dir(),
+            keep: default_config_history_keep(),
+            keep_rejected: default_config_history_keep_rejected(),
+        }
+    }
+}
+
+impl ConfigHistoryConfig {
+    /// Rejects a `keep` below 1.
+    ///
+    /// A ring that retains zero applied entries could never hold a
+    /// rollback target, which defeats the point of the block.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.keep < 1 {
+            return Err(format!(
+                "proxy.config_history.keep must be at least 1, got {}",
+                self.keep
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_history_tests {
+    use super::*;
+
+    #[test]
+    fn config_history_disabled_by_default() {
+        let cfg = ConfigHistoryConfig::default();
+        assert!(
+            !cfg.enabled,
+            "the ticket's YAML shows enabled: true as an example, not the shipping default"
+        );
+        assert_eq!(cfg.dir, "/var/lib/sbproxy/config-history");
+        assert_eq!(cfg.keep, 20);
+        assert_eq!(cfg.keep_rejected, 10);
+    }
+
+    #[test]
+    fn config_history_validate_rejects_keep_below_one() {
+        let cfg = ConfigHistoryConfig {
+            keep: 0,
+            ..ConfigHistoryConfig::default()
+        };
+        let error = cfg.validate().expect_err("keep of 0 must be rejected");
+        assert!(error.contains("proxy.config_history.keep"), "{error}");
+    }
+
+    #[test]
+    fn config_history_validate_accepts_keep_of_one() {
+        let cfg = ConfigHistoryConfig {
+            keep: 1,
+            ..ConfigHistoryConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn proxy_block_accepts_config_history_subblock() {
+        let yaml = r#"
+http_bind_port: 8080
+config_history:
+  enabled: true
+  dir: /var/lib/sbproxy/config-history
+  keep: 20
+  keep_rejected: 10
+"#;
+        let cfg: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let history = cfg.config_history.expect("config_history block");
+        assert!(history.enabled);
+        assert_eq!(history.dir, "/var/lib/sbproxy/config-history");
+        assert_eq!(history.keep, 20);
+        assert_eq!(history.keep_rejected, 10);
+    }
+
+    #[test]
+    fn config_history_absent_by_default_on_the_proxy_block() {
+        let cfg: ProxyServerConfig = serde_yaml::from_str("http_bind_port: 8080\n").unwrap();
+        assert!(cfg.config_history.is_none());
+    }
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -1120,6 +1271,13 @@ pub struct ProxyServerConfig {
     /// Process-owned path configuration for durable Local compression state.
     #[serde(default)]
     pub compression_state: Option<CompressionStateRuntimeConfig>,
+    /// Durable last-known-good config history (WOR-2456): the ring of
+    /// every config this proxy has applied, kept on local disk so a
+    /// rollback has somewhere to restore from. Absent (the default)
+    /// keeps the proxy's existing behavior exactly; no ring is written.
+    /// See [`ConfigHistoryConfig`].
+    #[serde(default)]
+    pub config_history: Option<ConfigHistoryConfig>,
     /// Shared message bus. Not supported in this build: setting it fails
     /// config compile (WOR-2166). The block still parses so the failure is
     /// an explanatory diagnostic rather than an unknown-key error, and so
@@ -1840,6 +1998,7 @@ impl Default for ProxyServerConfig {
             cache_reserve: None,
             response_cache_store: None,
             compression_state: None,
+            config_history: None,
             messenger_settings: None,
             ai_providers_file: None,
             device_parser_file: None,
