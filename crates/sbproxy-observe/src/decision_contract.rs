@@ -116,14 +116,29 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
     },
     FieldContract {
         event: DecisionEvent::AiGuardrailInput,
-        fields: &["guardrail", "flagged_count"],
+        fields: &[
+            "guardrail",
+            "flagged_count",
+            "guardrail_spans",
+            "guardrail_spans_dropped",
+        ],
         note: "`guardrail` names the one that blocked and is absent on an allow, because no \
                single guardrail owns a decision they all passed. `flagged_count` carries the \
-               near-miss signal on both, which is what makes an allow record worth storing.",
+               near-miss signal on both, which is what makes an allow record worth storing. \
+               `guardrail_spans` (WOR-2492) is the deciding guardrail's bounded detection \
+               positions -- entity type, byte offset, byte length -- over the scanned \
+               pre-redaction text; never the matched value, and only the `pii` guardrail \
+               populates it today. Capped at 32 spans per record; `guardrail_spans_dropped` \
+               is the count past the cap.",
     },
     FieldContract {
         event: DecisionEvent::AiGuardrailOutput,
-        fields: &["guardrail", "flagged_count"],
+        fields: &[
+            "guardrail",
+            "flagged_count",
+            "guardrail_spans",
+            "guardrail_spans_dropped",
+        ],
         note: "As the input event. Not published for a non-2xx response, because the \
                evaluator returns before inspecting one and a record there would claim an \
                allow no guardrail issued.",
@@ -342,6 +357,8 @@ mod tests {
             tool_server: Some("a".into()),
             guardrail: Some("a".into()),
             flagged_count: Some(0),
+            guardrail_spans: vec![sbproxy_security::span::DetectionSpan::new("a", 0, 1)],
+            guardrail_spans_dropped: Some(0),
         };
         let wire = serde_json::to_value(&populated).expect("serializes");
         let object = wire.as_object().expect("detail is an object");

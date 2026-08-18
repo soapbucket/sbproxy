@@ -657,15 +657,34 @@ fn fingerprint_digest_of(fingerprint: &ClusterRestartFingerprint) -> String {
 }
 
 /// Read a bounded file. `Ok(None)` means it does not exist yet.
+///
+/// An existing file that is zero-length is read as `Ok(Some(vec![]))`
+/// rather than refused outright as [`RevisionStoreError::Corrupt`]: a
+/// host crash can leave `index.json` truncated to exactly zero bytes
+/// (the rename in [`write_atomically`] lands, but the `File::create`
+/// that starts a from-scratch write on some filesystems can itself be
+/// the last thing durable before a crash), and that is a truncation
+/// like any other, not a distinct failure mode. Feeding empty bytes to
+/// [`RevisionStore::open`]'s existing `serde_json::from_slice` call
+/// fails to parse exactly the way a half-written file does, so it
+/// takes the same repair-and-reinitialize path already documented
+/// there, rather than bricking the ring (`open` returning `Err` here is
+/// what moves `sbproxy-core`'s process-wide config-history slot to its
+/// `Failed` state, which 503s every history route until someone
+/// deletes the file by hand). A zero-length *blob* still fails
+/// downstream, in [`RevisionStore::read_blob`]'s `zstd::decode_all`
+/// call: there is no valid zstd frame in zero bytes, so that path
+/// errors too, just with a less specific message than this function
+/// used to give it directly.
 fn read_bounded(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>, RevisionStoreError> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum {
+    if !metadata.is_file() || metadata.len() > maximum {
         return Err(RevisionStoreError::Corrupt(format!(
-            "{} is empty, not a regular file, or larger than {maximum} bytes",
+            "{} is not a regular file, or is larger than {maximum} bytes",
             path.display()
         )));
     }
@@ -866,6 +885,79 @@ mod tests {
         let on_disk = std::fs::read(&index_path).expect("read repaired index");
         serde_json::from_slice::<serde_json::Value>(&on_disk)
             .expect("repaired index is valid json");
+    }
+
+    /// A host crash can leave `index.json` truncated all the way down
+    /// to zero bytes, not just to a half-written fragment: the case the
+    /// test above covers. Before this test's fix, a zero-length file
+    /// took a different path than a truncated-but-nonempty one --
+    /// `read_bounded` refused it outright as `Corrupt` -- so `open`
+    /// returned `Err` instead of repairing, which bricks the ring
+    /// (`sbproxy-core`'s process-wide slot moves to its `Failed` state
+    /// and every history route 503s) until an operator deletes the file
+    /// by hand.
+    #[test]
+    fn a_zero_byte_index_is_repaired_on_the_first_open_exactly_like_a_truncated_one() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut store = store(temp.path(), 10);
+            store
+                .append(b"origins: {}\n", metadata(1_000))
+                .expect("append");
+        }
+        let index_path = temp.path().join(INDEX_FILE);
+        assert!(
+            std::fs::metadata(&index_path).expect("index exists").len() > 0,
+            "the fixture must start non-empty so truncating it to zero is a real change",
+        );
+        std::fs::write(&index_path, []).expect("truncate index to zero bytes");
+        assert_eq!(
+            std::fs::metadata(&index_path)
+                .expect("index still exists")
+                .len(),
+            0
+        );
+
+        // The repair must be the effect of `open` itself: no other store
+        // call happens before this assertion.
+        let reopened = RevisionStore::open(temp.path(), 10, None)
+            .expect("a zero-byte index must be repaired, not refused");
+        assert!(
+            reopened.entries().is_empty(),
+            "a zero-byte index is reinitialized to an empty ring rather than refused",
+        );
+
+        // And the repair was persisted immediately, so a second open
+        // finds valid JSON rather than repairing again.
+        let on_disk = std::fs::read(&index_path).expect("read repaired index");
+        assert!(
+            !on_disk.is_empty(),
+            "the repair must have written something"
+        );
+        serde_json::from_slice::<serde_json::Value>(&on_disk)
+            .expect("repaired index is valid json");
+    }
+
+    /// The other half of `read_bounded`'s zero-length change: a blob
+    /// still errors on zero bytes, just one step further downstream
+    /// than before (there is no valid zstd frame in zero bytes, so
+    /// `zstd::decode_all` is what refuses it now, not `read_bounded`
+    /// itself). A blob silently "succeeding" with empty content would
+    /// be far worse than either error shape: it would hand a caller an
+    /// empty document instead of failing loudly.
+    #[test]
+    fn a_zero_byte_blob_still_fails_to_read_rather_than_succeeding_silently() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = store(temp.path(), 10);
+        let entry = store.append(b"origins: {}\n", metadata(1)).expect("append");
+        let blob = blob_path(temp.path(), &entry.digest);
+        std::fs::write(&blob, []).expect("truncate blob to zero bytes");
+
+        let result = store.read_blob(&entry.digest);
+        assert!(
+            result.is_err(),
+            "a zero-byte blob must still fail to read, not decode to empty content: {result:?}",
+        );
     }
 
     #[test]

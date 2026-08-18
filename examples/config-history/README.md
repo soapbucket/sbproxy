@@ -141,7 +141,9 @@ The tail of the output is the part to look at:
             X-Demo-Var: "${DEMO_VAR}"
 ```
 
-`${DEMO_VAR}` comes back exactly as written, unresolved. Nobody exported it, so if this document were ever re-applied the header value would still read `${DEMO_VAR}` literally. That is the point: the ring stores what was on disk before `${VAR}` / `vault://` / `secret://` interpolation ran, never what a request handler resolved those references to. A config that never carried a resolved secret to begin with cannot leak one out of the ring later, the same guarantee `GET /admin/config` makes for the live editor.
+`${DEMO_VAR}` comes back exactly as written, unresolved. Nobody exported it, so if this document were ever re-applied the header value would still read `${DEMO_VAR}` literally. That is the point: the ring stores what was on disk before `${VAR}` / `vault://` / `secret://` interpolation ran, never what a request handler resolved those references to.
+
+That is a guarantee about *resolution*, not about what an operator typed. A reference like `${DEMO_VAR}` never resolves into a stored entry, but a literal secret pasted directly into the YAML (an inline API key, a password field) is not a reference, and it stores exactly as written, the same as it sits in the file on disk. `config show` and `GET /admin/config/history/{digest}` mask a literal secret as `[REDACTED]` before either ever leaves the process, the same redaction `GET /admin/config` applies to the live editor -- but that is display redaction. The ring file underneath still holds the original bytes (a rollback needs them); the ring directory's owner-only permissions (`0700`/`0600`) are what actually protect a secret at rest there, the same as the config file itself.
 
 The same document is available with its full envelope, including a diff against the config running now:
 

@@ -6,11 +6,21 @@
 //! a trusted request header; roles come from a trusted role header. A
 //! violation is reported to the security audit log and the
 //! `sbproxy_object_authz_violations_total` metric, then blocked with a
-//! generic 403 (or allowed through when the policy is in `test_mode`).
+//! generic 403 (or allowed through when the policy is in `test_mode`,
+//! or when the violation itself is marked `detect_only` -- see below).
 //!
 //! The client-facing 403 is intentionally generic so the response does
 //! not leak which scope owns the object; the OWASP risk tag and the
 //! detailed reason go to the audit log only.
+//!
+//! A `detect_only` violation (currently: an enumeration hit produced by
+//! `object_authz`'s ruleless path-shape heuristic rather than a
+//! declared rule) is always audited and always allowed through,
+//! regardless of `test_mode`: `test_mode` is an operator opt-in to
+//! observe-without-enforcing for the whole policy, while `detect_only`
+//! is the policy itself saying a particular hit is not trustworthy
+//! enough to ever refuse traffic on, no matter how the operator has
+//! configured enforcement.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -120,7 +130,12 @@ impl PolicyEnforcer for ObjectAuthzEnforcer {
                 .with_api_key_id(ctx.accountable_key_id())
                 .emit();
 
-                if policy.test_mode() {
+                if policy.test_mode() || violation.detect_only {
+                    // `test_mode` is an operator-wide observe-only
+                    // toggle; `detect_only` is per-violation and set by
+                    // the policy itself for hits it does not consider
+                    // trustworthy enough to block on (see this file's
+                    // module doc). Either one is enough to allow.
                     Box::pin(async move { Ok(PolicyDecision::Allow) })
                 } else {
                     ctx.deny_policy_type = Some("object_authz");

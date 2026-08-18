@@ -680,6 +680,60 @@ async fn an_unresolved_variable_in_the_merged_document_is_refused() {
     assert!(serves("unresolved-candidate.test"));
 }
 
+/// WOR-2489 review: a dotted `${...}` placeholder (`${args.user_id}`)
+/// is MCP local-tool interpolation vocabulary, not an env reference --
+/// no POSIX environment variable name contains a dot. A bundle carrying
+/// a `type: local` tool whose `http.url` uses one must be delivered,
+/// not refused by the unresolved-reference gate the test above pins for
+/// genuine `${VAR}` misses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dotted_local_tool_placeholder_is_delivered_not_refused() {
+    let _serial = SERIAL.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let (mut subscriber, stub) =
+        applied_baseline(dir, "dotted-local.test", "dotted-authority.test").await;
+
+    stub.serve(
+        sign(
+            6,
+            BundleMode::Overlay,
+            r#"
+origins:
+  "dotted-candidate.test":
+    action:
+      type: mcp
+      mode: gateway
+      server_info: {name: dotted-bundle-fixture, version: "1.0.0"}
+      federated_servers:
+        - type: local
+          origin: local.internal
+          prefix: dotted-local
+          egress: {mode: enforce, hosts: [api.internal]}
+          tools:
+            - name: fetch
+              description: dotted placeholder fixture
+              input_schema: {type: object, properties: {}}
+              http:
+                method: GET
+                url: "https://api.internal/items/${args.user_id}"
+"#,
+        )
+        .to_json()
+        .expect("encode"),
+    );
+
+    assert_eq!(
+        subscriber.poll_once().await,
+        CycleResult::Applied,
+        "a dotted placeholder is not an unresolved env reference and must not refuse the bundle",
+    );
+    assert!(
+        serves("dotted-candidate.test"),
+        "the config-authority subscriber must deliver the local-tool origin",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replayed_lower_revision_is_refused_after_a_restart() {
     let _serial = SERIAL.lock().await;

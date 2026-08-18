@@ -7,7 +7,12 @@
 # resolved. This config carries an unresolved ${DEMO_VAR} on purpose:
 # nobody exports it, so it demonstrates that the stored copy never
 # carries a resolved secret, the same guarantee the live config editor
-# makes.
+# makes -- that is a guarantee about resolution, not about what an
+# operator typed. A literal secret pasted directly into a config (not
+# this one) stores exactly as written, protected only by the ring
+# directory's owner-only filesystem permissions; the admin routes and
+# `config show` mask it as [REDACTED] on display, but the ring file
+# underneath keeps the original bytes, because a rollback needs them.
 #
 # Restart-required to enable: proxy.config_history.enabled has to be
 # true at boot for the ring recorder to be built at all. This config

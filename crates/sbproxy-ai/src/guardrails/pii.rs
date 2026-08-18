@@ -1,22 +1,62 @@
 //! PII detection guardrail - email, phone, SSN, credit card patterns.
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{de, Deserialize};
 use std::sync::LazyLock;
+
+use sbproxy_security::span::{cap_spans, DetectionSpan};
 
 use super::GuardrailBlock;
 
 /// Action to take when PII is detected.
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+///
+/// `check` (below) is the only entry point every caller uses, and its
+/// signature is `fn check(&self, content: &str) -> Option<GuardrailBlock>`:
+/// allow or block, nothing else. That is why `Mask` cannot be
+/// deserialized from config (see the `Deserialize` impl) - there is no
+/// return path for rewritten content, so accepting `action: mask`
+/// would silently behave like an unlogged allow, which is exactly the
+/// dead-knob trap this type used to set. `Log` does not have that
+/// problem: allow-and-log needs no return value beyond `None`.
+#[derive(Debug, Clone, Default)]
 pub enum PiiAction {
     /// Reject the request with an error response (default).
     #[default]
     Block,
     /// Replace detected PII with mask characters and continue.
+    ///
+    /// Reachable only by constructing a [`PiiGuardrail`] directly in
+    /// Rust (tests do this); config deserialization refuses it. See
+    /// the type-level doc comment.
     Mask,
-    /// Log the detection event but allow the request through unchanged.
+    /// Log the detection event, structured and bounded (the pattern
+    /// type only, never the matched text or the surrounding content),
+    /// and allow the request through unchanged.
     Log,
+}
+
+impl<'de> Deserialize<'de> for PiiAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "block" => Ok(PiiAction::Block),
+            "log" => Ok(PiiAction::Log),
+            "mask" => Err(de::Error::custom(
+                "pii guardrail action \"mask\" is refused at config load: `PiiGuardrail::check` \
+                 can only allow or block, it has no path to return rewritten content, so \
+                 `action: mask` has always silently behaved like an unlogged allow rather than \
+                 masking anything. Use `action: block` to refuse the request, or `action: log` \
+                 to allow it while emitting a structured, bounded detection event. Body-level \
+                 masking exists today via the AI guardrail mesh's `redact_on_flag` \
+                 (docs/ai-guardrail-mesh.md) or the `pii:` JSON-body redactor's \
+                 `redact_request`, neither of which goes through this per-pattern action.",
+            )),
+            other => Err(de::Error::unknown_variant(other, &["block", "log"])),
+        }
+    }
 }
 
 /// Detects PII patterns in content.
@@ -76,12 +116,59 @@ impl PiiGuardrail {
                         name: "pii".to_string(),
                         reason: format!("PII detected: {pattern_type}"),
                     }),
-                    // Mask and Log actions do not block the request.
-                    PiiAction::Mask | PiiAction::Log => None,
+                    PiiAction::Log => {
+                        // Structured and bounded: the pattern type only,
+                        // never `content` (which carries the match itself
+                        // and, in the common case, a great deal of
+                        // surrounding prompt/response text besides).
+                        tracing::info!(
+                            target: "sbproxy::pii_guardrail::audit",
+                            guardrail = "pii",
+                            action = "log",
+                            pattern_type = pattern_type.as_str(),
+                            "pii guardrail: detected {pattern_type}; action=log, request allowed"
+                        );
+                        None
+                    }
+                    // Unreachable via config (see the `Deserialize` impl);
+                    // a directly constructed `Mask` guardrail still has no
+                    // way to return rewritten content through this
+                    // signature, so it remains a no-op, same as today.
+                    PiiAction::Mask => None,
                 };
             }
         }
         None
+    }
+
+    /// Bounded detection spans (WOR-2492 item 6): entity type, byte
+    /// offset, and byte length for every match of every configured
+    /// pattern, over the SCANNED (pre-redaction) `content` -- never the
+    /// matched text itself, so a decision record built from this cannot
+    /// carry the value it flagged. Capped at
+    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`]; call sites that
+    /// need the drop count read the second element of the returned pair.
+    ///
+    /// Independent of [`Self::check`]'s action/threshold logic: this
+    /// scans every configured pattern rather than stopping at the first
+    /// one that matches, because a caller building an audit record wants
+    /// the full picture a block reason alone does not carry.
+    pub fn detect_spans(&self, content: &str) -> (Vec<DetectionSpan>, usize) {
+        let mut found = Vec::new();
+        for pattern_type in &self.patterns {
+            let re: &Regex = match pattern_type.as_str() {
+                "email" => &EMAIL_RE,
+                "phone" => &PHONE_RE,
+                "ssn" => &SSN_RE,
+                "credit_card" => &CREDIT_CARD_RE,
+                "api_key" => &API_KEY_RE,
+                _ => continue,
+            };
+            for m in re.find_iter(content) {
+                found.push(DetectionSpan::new(pattern_type.clone(), m.start(), m.len()));
+            }
+        }
+        cap_spans(found)
     }
 }
 
@@ -189,5 +276,218 @@ mod tests {
         let json = serde_json::json!({"type": "pii"});
         let guard: PiiGuardrail = serde_json::from_value(json).unwrap();
         assert_eq!(guard.patterns.len(), 4);
+    }
+
+    // --- detect_spans (WOR-2492 item 6) ---
+
+    #[test]
+    fn detect_spans_reports_type_offset_and_len() {
+        let guard = blocking_guard(vec!["email"]);
+        let content = "Send to user@example.com please";
+        let (spans, dropped) = guard.detect_spans(content);
+        assert_eq!(dropped, 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "email");
+        let matched = &content[spans[0].offset..spans[0].offset + spans[0].len];
+        assert_eq!(matched, "user@example.com");
+    }
+
+    #[test]
+    fn detect_spans_covers_every_configured_pattern_not_just_the_first_match() {
+        let guard = blocking_guard(vec!["email", "phone"]);
+        let content = "Email user@example.com or call 555-123-4567";
+        let (spans, dropped) = guard.detect_spans(content);
+        assert_eq!(dropped, 0);
+        let types: Vec<&str> = spans.iter().map(|s| s.entity_type.as_str()).collect();
+        assert!(types.contains(&"email"));
+        assert!(types.contains(&"phone"));
+    }
+
+    /// Red-first: the 33rd span is dropped, and the drop is a count,
+    /// not silence.
+    #[test]
+    fn spans_past_the_cap_are_dropped_with_a_count() {
+        let guard = blocking_guard(vec!["email"]);
+        let mut content = String::new();
+        for i in 0..40 {
+            content.push_str(&format!("user{i}@example.com "));
+        }
+        let (spans, dropped) = guard.detect_spans(&content);
+        assert_eq!(spans.len(), 32);
+        assert_eq!(dropped, 8);
+    }
+
+    /// Privacy rule: a span is a position, never the matched value.
+    /// Plant a distinctive secret and assert it never appears in the
+    /// spans' debug output.
+    #[test]
+    fn spans_never_carry_the_matched_text() {
+        let guard = blocking_guard(vec!["email"]);
+        let planted = "definitely-not-a-real-address@example.com";
+        let content = format!("leak check: {planted}");
+        let (spans, _dropped) = guard.detect_spans(&content);
+        assert!(!spans.is_empty());
+        let debug = format!("{spans:?}");
+        assert!(
+            !debug.contains(planted),
+            "detection spans must never carry the matched text, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn detect_spans_on_clean_text_is_empty() {
+        let guard = blocking_guard(vec!["email", "phone", "ssn", "credit_card"]);
+        let (spans, dropped) = guard.detect_spans("Hello, how are you today?");
+        assert!(spans.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    // --- WOR-2489: dead-knob wiring ---
+
+    #[test]
+    fn mask_action_is_refused_at_config_load() {
+        let err = serde_json::from_value::<PiiGuardrail>(serde_json::json!({
+            "patterns": ["email"],
+            "action": "mask",
+        }))
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("mask"),
+            "error should name the refused action: {message}"
+        );
+        assert!(
+            message.contains("no path to return rewritten content"),
+            "error should explain why, not just reject the value: {message}"
+        );
+    }
+
+    #[test]
+    fn block_and_log_still_deserialize() {
+        let block: PiiGuardrail = serde_json::from_value(serde_json::json!({
+            "patterns": ["email"],
+            "action": "block",
+        }))
+        .unwrap();
+        assert!(matches!(block.action, PiiAction::Block));
+
+        let log: PiiGuardrail = serde_json::from_value(serde_json::json!({
+            "patterns": ["email"],
+            "action": "log",
+        }))
+        .unwrap();
+        assert!(matches!(log.action, PiiAction::Log));
+    }
+
+    #[test]
+    fn unrecognised_action_is_a_plain_unknown_variant_error() {
+        let err = serde_json::from_value::<PiiGuardrail>(serde_json::json!({
+            "patterns": ["email"],
+            "action": "redact",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("redact"));
+    }
+
+    // --- Log action: structured, bounded logging ---
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Debug, Default, Clone)]
+    struct CapturedEvent {
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    struct MapVisitor<'a> {
+        out: &'a mut HashMap<String, String>,
+    }
+
+    impl Visit for MapVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.out
+                .insert(field.name().to_string(), format!("{:?}", value));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.out.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut fields = HashMap::new();
+            event.record(&mut MapVisitor { out: &mut fields });
+            self.events
+                .lock()
+                .expect("capture mutex poisoned")
+                .push(CapturedEvent { fields });
+        }
+    }
+
+    #[test]
+    fn log_action_emits_one_structured_event_and_never_the_matched_text() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        let guard = PiiGuardrail {
+            patterns: vec!["email".to_string()],
+            action: PiiAction::Log,
+        };
+        let content = "reach me at alice@example.com please";
+        let result = tracing::subscriber::with_default(subscriber, || guard.check(content));
+
+        assert!(result.is_none(), "log action must allow the request");
+
+        let events = layer.events.lock().expect("capture mutex poisoned").clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one detection event, got {events:?}"
+        );
+        let fields = &events[0].fields;
+        assert_eq!(
+            fields.get("pattern_type").map(String::as_str),
+            Some("email")
+        );
+        assert_eq!(fields.get("guardrail").map(String::as_str), Some("pii"));
+        assert_eq!(fields.get("action").map(String::as_str), Some("log"));
+        for (name, value) in fields {
+            assert!(
+                !value.contains("alice@example.com"),
+                "logged event must never carry the matched PII value; field {name:?} held {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_action_emits_nothing_on_clean_content() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        let guard = PiiGuardrail {
+            patterns: vec!["email".to_string()],
+            action: PiiAction::Log,
+        };
+        let result =
+            tracing::subscriber::with_default(subscriber, || guard.check("nothing sensitive"));
+        assert!(result.is_none());
+        assert!(layer
+            .events
+            .lock()
+            .expect("capture mutex poisoned")
+            .is_empty());
     }
 }

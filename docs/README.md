@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -58,6 +58,7 @@ SBproxy's traditional reverse-proxy pillar: routing, load balancing, transforms,
 
 - [api-gateway.md](api-gateway.md) - the entry point for the traditional reverse-proxy pillar: routing, auth, rate limiting, WAF, load balancing, protocols, and OpenAPI, independent of any AI functionality. Start here if you're replacing Nginx, Envoy, or Kong.
 - [routing.md](routing.md) - the hub for how a request gets matched to an upstream: hostname matching, forward rules, load balancing algorithms, protocol-specific actions (GraphQL, gRPC, gRPC-Web, WebSocket), and failover.
+- [websocket.md](websocket.md) - the `websocket` action: config keys, upgrade semantics, what runs before the upgrade, and which of `subprotocols` / `max_message_size` are actually enforced.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
 - [transforms.md](transforms.md) - what a transform is, the common transform fields, chaining and order, and one section per shipped transform kind (JSON shaping, text/encoding, HTML/Markdown, scripting transforms, WASM, agent content-shaping).
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
@@ -98,6 +99,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 
 - [mcp-and-agents.md](mcp-and-agents.md) - the map across MCP (tool calling) and A2A (agent-to-agent) traffic: which doc covers which layer.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
+- [mcp-compose.md](mcp-compose.md) - `type: local` servers: config-declared tools (static, HTTP, or a step DAG), the interpolation vocabulary, DAG semantics, and template/JS/Lua response shaping.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - MCP gateway guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
 - [mcp-security-coverage.md](mcp-security-coverage.md) - see [Security](#security).

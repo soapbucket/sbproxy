@@ -159,18 +159,6 @@ jobs:
           # comment above.
           cache-on-failure: true
 
-      # sccache caches individual compiled objects, keyed per rustc
-      # invocation, in the GitHub Actions cache backend, and it writes
-      # each one through as the object finishes rather than saving once
-      # at job end. That is mid-build persistence, which rust-cache
-      # above cannot give: rust-cache (even with cache-on-failure) only
-      # saves ~/.cargo and target/ once, after the job's steps finish
-      # running one way or another. sccache's cache survives a run that
-      # gets cancelled mid-compile, so a retry can pick up from the
-      # object that was still building when the previous attempt ran
-      # out of time, not just from whatever the last completed job saved.
-      - name: set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
 
       # The binary pulls in sbproxy-classifier-proto / sbproxy-classifiers,
       # whose build scripts run prost/tonic codegen and need `protoc` on
@@ -215,17 +203,14 @@ jobs:
         # comment on the aarch64-unknown-linux-gnu entry above).
         # CARGO_BUILD_JOBS is per matrix leg too, not workflow-wide: only
         # aarch64-unknown-linux-gnu needs the parallelism cap.
-        # RUSTC_WRAPPER/SCCACHE_GHA_ENABLED route this build's rustc
-        # invocations through the sccache server set up above. The
-        # workflow-wide `env:` sets CARGO_INCREMENTAL: 0, so there is no
-        # incremental state here for sccache to interact with; sccache
-        # only passes incremental requests through uncached when
-        # CARGO_INCREMENTAL is on, which it never is in this job.
+        # sccache was deliberately REMOVED from this job: the binary
+        # embeds the git SHA, and a compile cache keyed without it can
+        # serve an object carrying a stale revision into a release
+        # artifact, which the embedded-rev release check exists to
+        # prevent. rust-cache's cache-on-failure banking stays.
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
           CARGO_BUILD_JOBS: ${{ matrix.build_jobs }}
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
       # Contract: linux binaries must not require a glibc newer than the

@@ -1931,13 +1931,24 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
 /// not open, and additionally `404` with `{"error":"unknown digest"}`
 /// when the slot is open but no entry in the ring names `digest`.
 ///
-/// `document` is returned byte for byte as the ring stored it: the raw
-/// text read before `${VAR}` / `vault://` / `secret://` interpolation
-/// ran, never resolved here or anywhere upstream of here. `plan_text`
-/// treats the stored document as the rollback candidate and the
-/// currently running config as the baseline, so it reads as "what
-/// would change if this were applied now", the question an operator
-/// browsing history is actually asking.
+/// `document` and `plan_text` are redacted the same way `GET
+/// /admin/config` and `GET /admin/config/effective` redact their own
+/// bodies ([`sbproxy_observe::redact::redact_secrets`]), before either
+/// ever leaves this handler. Pre-resolution storage only guarantees a
+/// `${VAR}` / `vault://` / `secret://` reference is never resolved into
+/// the ring; it says nothing about a literal secret an operator typed
+/// directly into the YAML (an inline API key, a password field), and
+/// without this pass that literal would come back verbatim to any
+/// admin-authenticated reader for as long as the entry stays in the
+/// ring. The ring FILE itself is untouched: `recorder.read_blob` above
+/// returns the original bytes, `config_history_plan_text` diffs the
+/// original (redacting first could corrupt the YAML a real secret
+/// happens to sit inside), and only the two fields this handler builds
+/// the response from are redacted, after both are computed. Rollback
+/// needs the original bytes, and the ring directory's owner-only
+/// (`0700` directory, `0600` file) permissions are the real access
+/// boundary on them, not this response -- see
+/// `docs/configuration.md#config_history`.
 fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'static str, String) {
     let recorder = match config_history_open_recorder() {
         Ok(recorder) => recorder,
@@ -1969,6 +1980,10 @@ fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'sta
     };
     let document = String::from_utf8_lossy(&document_bytes).into_owned();
     let plan_text = config_history_plan_text(state, &document);
+    // Redact for display only, after both are computed from the
+    // original bytes above. See the handler doc comment for why.
+    let document = sbproxy_observe::redact::redact_secrets(&document);
+    let plan_text = sbproxy_observe::redact::redact_secrets(&plan_text);
     let body = serde_json::json!({
         "entry": config_history_entry_json(&entry),
         "document": document,
@@ -6987,6 +7002,65 @@ mod tests {
             plan_text.contains("restart"),
             "changing http_bind_port is a restart-class change: {plan_text}"
         );
+    }
+
+    /// The counterpart to the test above, which used content with no
+    /// secret-shaped token in it (proving redaction is a no-op there).
+    /// This one plants a literal secret -- a value an operator typed
+    /// directly into the file, not a `${VAR}` / `vault://` reference --
+    /// and proves three things at once: the route's `document` masks
+    /// it, `plan_text` does not carry it either, and the ring's own
+    /// stored blob still holds the original bytes untouched, because
+    /// only the display route redacts.
+    #[test]
+    fn config_history_detail_redacts_a_literal_secret_while_the_ring_file_keeps_the_original() {
+        let _guard = config_layer_guard();
+        let history_dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(history_dir.path());
+        // A well-known AWS documentation example access key ID (never a
+        // real credential), shaped exactly like `RE_AWS_ACCESS` in
+        // `sbproxy_observe::redact` (`AKIA` + 16 alphanumeric chars).
+        let stored = "ai:\n  api_key_literal: AKIAIOSFODNN7EXAMPLE\n";
+        recorder.record(stored.as_bytes(), history_metadata("operator"));
+        let digest = recorder.entries().last().expect("one entry").digest.clone();
+
+        let (_dir, state) = owned_config_state("proxy:\n  http_bind_port: 8080\n");
+
+        let (status, _, body) = handle_config_history_detail(&state, &digest);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let document = parsed["document"].as_str().expect("document is a string");
+        assert!(
+            !document.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the planted secret must not survive the route unredacted: {document}"
+        );
+        assert!(
+            document.contains("AKIA[REDACTED]"),
+            "expected the AWS-key-shape redaction marker: {document}"
+        );
+
+        let plan_text = parsed["plan_text"].as_str().expect("plan_text is a string");
+        assert!(
+            !plan_text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the planted secret must not survive the plan diff unredacted either: {plan_text}"
+        );
+
+        // The ring FILE itself is untouched: read the blob directly,
+        // the same call the handler made before redacting, and confirm
+        // the original bytes -- the ones a rollback needs -- are still
+        // there. Redaction happens once, on the way out of the
+        // handler; it never mutates what `record` persisted.
+        let ring_bytes = recorder
+            .read_blob(&digest)
+            .expect("the ring's own copy is still readable");
+        assert_eq!(
+            String::from_utf8_lossy(&ring_bytes),
+            stored,
+            "the ring file must keep the original bytes; only the display route redacts"
+        );
+
+        crate::config_history::clear_config_history_recorder();
     }
 
     #[test]

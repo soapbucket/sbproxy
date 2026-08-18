@@ -949,6 +949,20 @@ pub struct DecisionDetails {
     /// allow record shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flagged_count: Option<usize>,
+    /// Bounded detection spans (WOR-2492 item 6): entity type, byte
+    /// offset, and byte length for every match the deciding guardrail
+    /// found, over the SCANNED (pre-redaction) text. Never the matched
+    /// value -- a span is a position, not the PII or secret it flagged,
+    /// so this field cannot become a second place the value leaks from.
+    /// Absent when the deciding guardrail carries no positional
+    /// detail. Capped at
+    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`]; see
+    /// `guardrail_spans_dropped` for the count past the cap.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub guardrail_spans: Vec<sbproxy_security::span::DetectionSpan>,
+    /// Count of matches past the span cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_spans_dropped: Option<usize>,
     /// Deliberately the method and not the subject. A resolved principal
     /// is the one field on this path that is attacker-influenced and
     /// frequently personal, and `DecisionDetails` is the half of the
@@ -1040,12 +1054,27 @@ impl DecisionDetails {
     /// allow because no single guardrail owns a decision they all
     /// passed. `flagged_count` carries the near-miss signal either way,
     /// which is what makes an allow record worth storing at all.
-    pub fn guardrail(guardrail: Option<&str>, flagged_count: usize) -> Self {
+    ///
+    /// `spans`/`spans_dropped` (WOR-2492 item 6) are the deciding
+    /// guardrail's bounded detection positions, when it has any --
+    /// today only the `pii` guardrail does. Empty for every other
+    /// guardrail and for an allow with no positional guardrail behind
+    /// it, which is why this takes the already-capped pair rather than
+    /// an uncapped source: the cap is enforced once, at the detector,
+    /// not re-derived here.
+    pub fn guardrail(
+        guardrail: Option<&str>,
+        flagged_count: usize,
+        spans: &[sbproxy_security::span::DetectionSpan],
+        spans_dropped: usize,
+    ) -> Self {
         Self {
             guardrail: guardrail
                 .filter(|name| !name.is_empty())
                 .map(ToOwned::to_owned),
             flagged_count: Some(flagged_count),
+            guardrail_spans: spans.to_vec(),
+            guardrail_spans_dropped: (spans_dropped > 0).then_some(spans_dropped),
             ..Self::default()
         }
     }
@@ -1185,6 +1214,8 @@ impl DecisionDetails {
             tool_server,
             guardrail,
             flagged_count,
+            guardrail_spans,
+            guardrail_spans_dropped,
             auth_type,
             policy_id,
             policy_surface,
@@ -1205,6 +1236,8 @@ impl DecisionDetails {
             && tool_server.is_none()
             && guardrail.is_none()
             && flagged_count.is_none()
+            && guardrail_spans.is_empty()
+            && guardrail_spans_dropped.is_none()
             && auth_type.is_none()
             && policy_id.is_none()
             && policy_surface.is_none()
@@ -1464,7 +1497,7 @@ mod tests {
             None,
             None,
         )
-        .with_details(DecisionDetails::guardrail(Some("jailbreak"), 0));
+        .with_details(DecisionDetails::guardrail(Some("jailbreak"), 0, &[], 0));
         assert!(
             !audit.details.is_empty(),
             "a guardrail name is real detail, not absence"
@@ -1474,6 +1507,53 @@ mod tests {
             .get("unmapped")
             .expect("guardrail detail has to reach the record, not just the struct");
         assert_eq!(unmapped["guardrail"], "jailbreak");
+    }
+
+    /// WOR-2492 item 6: a PII guardrail's detection spans carry
+    /// `{entity_type, offset, len}` through to the OCSF record, and
+    /// never the matched value.
+    #[test]
+    fn a_guardrail_span_detail_reaches_the_ocsf_record_without_the_matched_text() {
+        let planted = "definitely-not-a-real-address@example.test";
+        let spans = vec![sbproxy_security::span::DetectionSpan::new("email", 12, 5)];
+        let audit = DecisionAudit::new(
+            uuid::Uuid::new_v4(),
+            "req-guardrail-spans",
+            DecisionEvent::AiGuardrailInput,
+            DecisionEngine::BuiltIn,
+            DecisionOutcome::Deny,
+            "api.example.test",
+            "acme-corp",
+            chrono::Utc::now(),
+            "initial guardrail pii blocked the request",
+            None,
+            None,
+        )
+        .with_details(DecisionDetails::guardrail(Some("pii"), 0, &spans, 3));
+        let ocsf = audit.to_ocsf();
+        let unmapped = ocsf
+            .get("unmapped")
+            .expect("guardrail span detail has to reach the record");
+        assert_eq!(unmapped["guardrail_spans"][0]["entity_type"], "email");
+        assert_eq!(unmapped["guardrail_spans"][0]["offset"], 12);
+        assert_eq!(unmapped["guardrail_spans"][0]["len"], 5);
+        assert_eq!(unmapped["guardrail_spans_dropped"], 3);
+        let rendered = serde_json::to_string(&ocsf).expect("ocsf serializes");
+        assert!(
+            !rendered.contains(planted),
+            "a decision record must never carry the matched value, got: {rendered}"
+        );
+    }
+
+    /// Red-first: an allow with no positional guardrail behind it
+    /// carries no spans field at all, not an empty array -- consistent
+    /// with every other optional detail on this type.
+    #[test]
+    fn guardrail_detail_with_no_spans_omits_the_field() {
+        let details = DecisionDetails::guardrail(None, 2, &[], 0);
+        let wire = serde_json::to_value(&details).expect("serializes");
+        assert!(wire.get("guardrail_spans").is_none());
+        assert!(wire.get("guardrail_spans_dropped").is_none());
     }
 
     /// Same regression, for `ai_failure()` and `ai_close()` specifically,

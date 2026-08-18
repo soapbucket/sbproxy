@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# GraphQL gateway with fail-closed request validation.
+#
+# `type: graphql` proxies to a single GraphQL HTTP endpoint. With every
+# field left at its default the action is a transparent proxy and never
+# parses the request. Setting any one of `validate_queries: true`,
+# `max_depth` above zero, or `allow_introspection: false` switches the
+# action into fail-closed parsing: it parses the query with a real
+# GraphQL grammar, rejects what it does not like with a 400 before the
+# request reaches the upstream, and forwards the exact validated bytes
+# when the query passes.
+#
+# No live public GraphQL endpoint is bundled with this repo, so
+# fixture.py stands in for one: a stdlib-only HTTP server that answers
+# every POST with a fixed GraphQL-shaped response.
+#
+# Run:
+#   python3 fixture.py &
+#   make run CONFIG=examples/graphql-gateway/sb.yml
+#
+# Test: see README.md for the full walkthrough (passing query, plus
+# every refusal this action enforces).
+
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo upstream runs on loopback: the SSRF guard
+  # refuses private/loopback upstream addresses unless allowlisted. A
+  # production config pointing at a real GraphQL backend does not need
+  # this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+origins:
+  "graphql.local":
+    action:
+      type: graphql
+      url: http://127.0.0.1:8099/graphql
+      max_depth: 5
+      allow_introspection: false
+      validate_queries: true

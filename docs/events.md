@@ -1,10 +1,31 @@
 # SBproxy events
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of thirteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
+
+Most facts take one path only: `provider_selected` and the rest of the
+typed events with no audit-channel counterpart publish straight to
+`events:` and nowhere else. An auth denial is the illustrative exception,
+because it is the one fact wired into all three mechanisms at once:
+
+```mermaid
+flowchart TD
+    A[Auth denial occurs] --> B[security_audit entry]
+    B -->|bridged| C[auth_denied typed event]
+    C --> D["events: sink (file or webhook)"]
+    B -->|audit.sink: chain| E[Hash-chained, Ed25519-signed file]
+    A --> F["decision-audit 'auth' record, a separate emission"]
+    F --> G[observability.log.decision_audit sink]
+```
+
+Treat this as a worked example, not a universal map: most typed events
+(`request_completed`, `provider_selected`, `budget_exceeded`,
+`guardrail_triggered`, `mcp_governance_decision`, and the rest) publish
+directly with no audit-channel or decision-audit record behind them at
+all.
 
 ## The typed proxy events
 

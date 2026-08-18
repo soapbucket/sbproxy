@@ -1,5 +1,5 @@
 # object_authz policy
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-17*
 
 The `object_authz` policy enforces object- and function-level authorization at the gateway, catching the two top OWASP API risks: BOLA (API1:2023, Broken Object Level Authorization) and BFLA (API5:2023, Broken Function Level Authorization). Alias: `bola`.
 
@@ -74,7 +74,12 @@ For an `object_rule`, the policy parses the matched path against the template, e
 
 For a `function_rule`, the policy checks the request's `method` is in the rule's set and the caller's roles include `require_role`. A missing role is the same fixed 403 (or an allow under `test_mode`).
 
-For `enumeration`, the policy keeps a per-principal sliding window of distinct object ids (the `object_param` captures). When `max_distinct` is exceeded inside `window_secs`, every subsequent request from that principal is blocked for the rest of the window. The tracker is bounded at 50,000 principals; a flood that exceeds the cap clears the map (brief detection gap, not a correctness problem).
+For `enumeration`, the policy keeps a per-principal counter of distinct object ids, reset at `window_secs` boundaries (a tumbling window: bounded, constant work per request, rather than a continuously sliding one that would grow with traffic). Its object-id source depends entirely on `object_rules`, and the two never mix on one origin:
+
+* **Rules configured.** Only a matched rule's `object_param` capture counts. A request that matches no rule counts nothing, even if some other rule exists for a different path -- the rules define the scope.
+* **No rules configured at all.** `enumeration.enabled` on its own falls back to a heuristic: a request whose *trailing* path segment is numeric or a canonical UUID has its whole path counted as one object (`/orders/1/items/1` and `/orders/2/items/1` are different objects; `/tenants/42/orders` does not count, because its last segment, `orders`, is not id-shaped). This fallback requires an identified caller -- an unattributed request is never counted, because collapsing every anonymous client into one bucket would make N innocent callers look like one attacker and let a real attacker hide in the noise -- and a trip it reports is audit-only: it is logged and counted on `sbproxy_object_authz_violations_total` but never blocks, regardless of `test_mode`, because a path-shape guess is not a declared rule and both the id boundary and the caller-to-id mapping can be wrong (a paginated report path or a map-tile fetcher can look identical to a sweep).
+
+When `max_distinct` is exceeded inside `window_secs`, every subsequent request from that principal is blocked for the rest of the window (rule-scoped hits only; a heuristic hit never blocks, as above). The tracker is bounded at 50,000 live principals; past that cap, a new principal gets no tracking slot and its requests are not counted -- an existing principal's own state is never affected by another principal's flood.
 
 ## Calling it
 

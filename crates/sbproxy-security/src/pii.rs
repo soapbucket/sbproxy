@@ -424,6 +424,48 @@ impl PiiRedactor {
         current
     }
 
+    /// Non-mutating match positions: `(byte_offset, byte_len)` for every
+    /// match across every rule in this redactor, in match order. Applies
+    /// the same validator (e.g. Luhn on `credit_card`) and anchored
+    /// prefilter fast path [`Self::redact`] does, so "did this redactor
+    /// match" and "where did it match" never disagree.
+    ///
+    /// Positions only (WOR-2492 item 6): the matched substring is never
+    /// returned, so a caller building a detection record from this
+    /// cannot turn the record into a second place the match leaks from.
+    pub fn find_spans(&self, input: &str) -> Vec<(usize, usize)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+
+        for rule in &self.inner.unanchored_rules {
+            collect_rule_spans(rule, input, &mut out);
+        }
+
+        if let Some(prefilter) = &self.inner.prefilter {
+            let mut hits = vec![false; self.inner.anchored_rules.len()];
+            let mut any_hit = false;
+            for m in prefilter.find_overlapping_iter(input) {
+                hits[m.pattern().as_usize()] = true;
+                any_hit = true;
+            }
+            if any_hit {
+                for (i, rule) in self.inner.anchored_rules.iter().enumerate() {
+                    if hits[i] {
+                        collect_rule_spans(rule, input, &mut out);
+                    }
+                }
+            }
+        } else {
+            for rule in &self.inner.anchored_rules {
+                collect_rule_spans(rule, input, &mut out);
+            }
+        }
+
+        out
+    }
+
     /// Recursively walk a [`serde_json::Value`] and redact every
     /// string leaf in place. Object keys are not redacted (they are
     /// schema-defined names like `prompt`/`messages`).
@@ -606,6 +648,26 @@ fn apply_rule_with_capture<'a>(
     match result {
         Cow::Borrowed(_) => input,
         Cow::Owned(s) => Cow::Owned(s),
+    }
+}
+
+/// Validator-aware match collector behind [`PiiRedactor::find_spans`].
+/// Mirrors [`apply_rule`]'s matched-then-validated logic exactly, just
+/// recording `(start, len)` instead of replacing.
+fn collect_rule_spans(rule: &CompiledRule, input: &str, out: &mut Vec<(usize, usize)>) {
+    for caps in rule.regex.captures_iter(input) {
+        // Group 0 (the whole match) is always present on a yielded
+        // `Captures`; the `if let` is a defensive skip rather than an
+        // assert, so a hypothetical future regex crate change that
+        // violated the invariant would drop the match instead of
+        // panicking the request path.
+        let Some(m) = caps.get(0) else { continue };
+        if let Some(v) = rule.validator {
+            if !run_validator(v, m.as_str()) {
+                continue;
+            }
+        }
+        out.push((m.start(), m.len()));
     }
 }
 
@@ -853,6 +915,44 @@ mod tests {
 
     fn defaults() -> PiiRedactor {
         PiiRedactor::defaults()
+    }
+
+    // --- find_spans (WOR-2492 item 6): positions, never text ---
+
+    #[test]
+    fn find_spans_reports_offset_and_len_matching_redact() {
+        let r = defaults();
+        let input = "Email me at alice@example.com please.";
+        let spans = r.find_spans(input);
+        assert_eq!(spans.len(), 1);
+        let (offset, len) = spans[0];
+        assert_eq!(&input[offset..offset + len], "alice@example.com");
+    }
+
+    #[test]
+    fn find_spans_never_returns_the_matched_text() {
+        // Structural: the return type is `(usize, usize)`, so there is
+        // no field to accidentally carry the match. This test locks
+        // that shape in so a future change cannot widen it back out.
+        let r = defaults();
+        let spans: Vec<(usize, usize)> = r.find_spans("alice@example.com");
+        assert_eq!(spans, vec![(0, "alice@example.com".len())]);
+    }
+
+    #[test]
+    fn find_spans_applies_the_luhn_validator_like_redact_does() {
+        let r = defaults();
+        // Fails Luhn: redact() leaves it alone, find_spans() must
+        // agree and report no match either.
+        let bad_card = "Card 1234-5678-9012-3456 stored.";
+        assert!(r.find_spans(bad_card).is_empty());
+        assert_eq!(r.redact(bad_card), bad_card);
+    }
+
+    #[test]
+    fn find_spans_on_clean_text_is_empty() {
+        let r = defaults();
+        assert!(r.find_spans("nothing sensitive here").is_empty());
     }
 
     // --- Legacy log-time helper tests (preserve old behaviour) ---

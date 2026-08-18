@@ -18,6 +18,26 @@
 //! touching many distinct object ids inside a short window (sequential
 //! id scanning), which is the signature of a BOLA fuzzing sweep.
 //!
+//! Enumeration has two independent sources, and they never mix on one
+//! origin:
+//!
+//! - **Rule-scoped.** When [`ObjectAuthzConfig::object_rules`] is
+//!   non-empty, only a matched rule's `object_param` capture ever
+//!   counts. A request that matches no configured rule is invisible to
+//!   enumeration, exactly as if the check were absent for that path;
+//!   the rules define the scope, full stop.
+//! - **Ruleless heuristic.** Only when `object_rules` is empty
+//!   entirely does the detector fall back to guessing: a request whose
+//!   trailing path segment is id-shaped (a purely numeric segment or a
+//!   canonical UUID) has its whole normalized path counted as one
+//!   object. This fallback requires an identified caller
+//!   (`principal.owner.is_some()`); anonymous traffic is never
+//!   attributable to one principal, so it is never counted, no matter
+//!   how many distinct ids it touches. And because the id shape and
+//!   the path-to-object mapping are both guesses rather than a
+//!   declared contract, a heuristic trip is reported for audit only:
+//!   it never blocks, regardless of `test_mode`.
+//!
 //! The caller identity (owner + roles) is resolved by the enforcer from
 //! the verified auth subject (`ctx.auth_result`) or from trusted request
 //! headers, and handed to [`ObjectAuthzPolicy::decide`]. Reading the
@@ -25,16 +45,26 @@
 //! layer sets it; the default and recommended source is the verified
 //! subject.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Deserialize;
 
 /// Hard cap on the number of principals tracked for enumeration so a
-/// flood of distinct principals cannot grow the map without bound. When
-/// exceeded, the tracker is cleared (the window is short, so the loss is
-/// a brief detection gap, not a correctness problem).
+/// flood of distinct principals (`principal.owner` is caller-controlled
+/// input) cannot grow the map without bound. An existing principal
+/// always keeps updating its own state, cap or no cap: past this many
+/// live principals, only a *new* principal is refused a tracking slot
+/// (see `ObjectAuthzPolicy::record_and_check_enumeration`), logged and
+/// best-effort-skipped rather than counted, the same honest shape
+/// `sbproxy_extension::mcp::peer_profile`'s bounded peer registry uses
+/// (that module also increments a dedicated Prometheus counter on
+/// saturation; this one does not yet, see
+/// `report_enumeration_tracker_saturated`'s own doc comment for why).
+/// Either way this replaces the old behavior of wiping every
+/// principal's state, including principals with nothing to do with the
+/// flood, the instant the map got full.
 const MAX_TRACKED_PRINCIPALS: usize = 50_000;
 
 /// Where the enforcer reads the caller's owner identity.
@@ -120,6 +150,14 @@ pub struct FunctionRule {
 }
 
 /// Enumeration-anomaly configuration.
+///
+/// Works with or without [`ObjectAuthzConfig::object_rules`], but the
+/// two never combine: with rules configured, only a matched rule's
+/// `object_param` capture counts (an unmatched path counts nothing).
+/// With no rules configured at all, `enabled: true` on its own catches
+/// a sweep via a path-shape heuristic instead -- see the module docs
+/// for the identity and blocking caveats that apply only to that
+/// fallback.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnumerationConfig {
     /// Master switch. Off by default.
@@ -129,7 +167,12 @@ pub struct EnumerationConfig {
     /// the anomaly.
     #[serde(default = "default_max_distinct")]
     pub max_distinct: usize,
-    /// Sliding window length in seconds.
+    /// Window length in seconds. Counting resets at fixed `window_secs`
+    /// boundaries per principal (a tumbling window, not a continuously
+    /// sliding one): the per-principal counter state is bounded by
+    /// `max_distinct`, not by how much traffic arrived, so this trades a
+    /// small amount of boundary precision for work-per-request that
+    /// never grows with traffic volume.
     #[serde(default = "default_window_secs")]
     pub window_secs: u64,
 }
@@ -150,6 +193,68 @@ fn default_max_distinct() -> usize {
 
 fn default_window_secs() -> u64 {
     60
+}
+
+/// The enumeration fallback signal used in the zero-`object_rules`
+/// case: `Some(the whole normalized path)` when the request's *actual
+/// trailing* path segment looks like an object id, either a purely
+/// numeric run (`42`, `100042`) or a canonical 36-character UUID
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, any hex case); `None`
+/// otherwise.
+///
+/// Two properties that are load-bearing, not incidental:
+///
+/// - **The object key is the full path, not the matched segment.**
+///   `/orders/1/items/1` and `/orders/2/items/1` share a trailing `1`
+///   but are different objects; counting the segment value alone would
+///   collapse a real sweep across `orders` into "one distinct id" and
+///   make it invisible. Counting the full path keeps them distinct.
+/// - **Only the trailing segment is checked**, not "any segment
+///   scanning from the end." `/tenants/42/orders` does not count: its
+///   last segment is `orders`, a collection listing, not an object
+///   fetch, even though `42` earlier in the path is id-shaped. This
+///   also means a directory-style path (`/reports/2026/08/` -- trailing
+///   empty segment) never counts.
+///
+/// This is a heuristic, not a schema, and it has a known, accepted
+/// false-positive class: `/tiles/12/2345/6789` or `/reports/2026/08/17`
+/// end in an id-shaped segment and mint one heuristic "object" per
+/// request even under normal browsing or map-tile traffic, since the
+/// heuristic cannot tell "the id varies because it is a sweep" from
+/// "the id varies because that is the resource." A declared
+/// `object_rules` entry does not have this problem, because it names
+/// the object segment explicitly rather than guessing from shape; the
+/// heuristic exists only for the case where no such rule exists at all.
+/// Callers must treat a heuristic hit as audit-only for this reason --
+/// see `Violation::detect_only`.
+fn heuristic_object_key(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let last = trimmed.rsplit('/').next().unwrap_or("");
+    if !is_id_shaped(last) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_id_shaped(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+    segment.bytes().all(|b| b.is_ascii_digit()) || is_uuid_like(segment)
+}
+
+fn is_uuid_like(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => *b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    })
 }
 
 /// Raw deserialized config for the `object_authz` policy.
@@ -220,6 +325,15 @@ pub struct Violation {
     pub kind: ViolationKind,
     /// Detailed reason for the audit log (not returned to the client).
     pub message: String,
+    /// True only for an enumeration violation produced by the ruleless
+    /// path-shape heuristic (see the module docs). The enforcer must
+    /// never block on a `detect_only` violation, regardless of
+    /// `test_mode`: it is still reported to the audit log and the
+    /// violation metric, but the request always proceeds, because a
+    /// heuristic id match is not a declared rule and is not trustworthy
+    /// enough to refuse traffic on. BOLA, BFLA, and rule-scoped
+    /// enumeration violations are never `detect_only`.
+    pub detect_only: bool,
 }
 
 /// The caller identity the enforcer resolves and hands to [`decide`].
@@ -240,9 +354,68 @@ pub struct ObjectAuthzPolicy {
     object_rules: Vec<CompiledObjectRule>,
     function_rules: Vec<CompiledFunctionRule>,
     enumeration: EnumerationConfig,
-    /// Per-principal sliding window of (time, object_id) for enumeration
-    /// detection. Keyed by the owner identity (or `""` when anonymous).
-    tracker: Mutex<HashMap<String, VecDeque<(Instant, String)>>>,
+    /// Per-principal enumeration counter state, keyed by the owner
+    /// identity. Never holds a `""` (anonymous) key: `decide` only
+    /// calls into enumeration tracking for an identified caller.
+    /// Bounded to `MAX_TRACKED_PRINCIPALS` live principals; see
+    /// `record_and_check_enumeration` for what happens past that cap.
+    tracker: Mutex<HashMap<String, EnumerationWindow>>,
+    /// Set once this process has logged the enumeration-tracker
+    /// saturation warning, so a sustained flood of distinct principals
+    /// logs it once rather than once per refused request.
+    enumeration_saturation_warned: std::sync::atomic::AtomicBool,
+}
+
+/// One principal's bounded enumeration-counter state.
+///
+/// Deliberately not a precise sliding-window log of every access: the
+/// old implementation stored a `(time, object_id)` entry per request and
+/// rebuilt a fresh `HashSet` from the whole in-window history on every
+/// single call to recompute the distinct count, which is `O(requests
+/// seen so far in the window)` of work, under one global lock, on
+/// exactly the traffic the check exists to police -- a burst of N
+/// requests from one principal did `O(N^2)` total work. It also had no
+/// bound on memory *per principal*: a principal re-fetching the same id
+/// a million times in one window grew the deque to a million entries
+/// even though the distinct count never left 1.
+///
+/// This version bounds both. `ids` never holds more than `max_distinct`
+/// entries (there is never a reason to remember more: once that many
+/// distinct ids are seen, the sweep has already tripped, and `tripped`
+/// latches the fact instead), and the window is tumbling rather than
+/// continuously sliding: it resets to empty when more than
+/// `window_secs` have elapsed since `window_start`, rather than expiring
+/// each id individually. Insert and check are O(1) amortized (bounded
+/// `HashSet` operations, never a full-history scan), and the map entry
+/// this locks to update is a fixed, config-bounded size regardless of
+/// how much traffic that principal generated -- the trade is a small
+/// amount of window-boundary precision for work-per-request that cannot
+/// grow with traffic volume, which is the "detection is best-effort"
+/// trade this whole tracker already makes.
+struct EnumerationWindow {
+    /// When the current window began.
+    window_start: Instant,
+    /// Distinct object ids seen in the current window so far, capped at
+    /// `max_distinct` entries.
+    ids: HashSet<String>,
+    /// Once `ids` would exceed `max_distinct`, this latches `true` and
+    /// `ids` is cleared (its membership no longer matters: every
+    /// request is tripped for the rest of the window regardless of
+    /// which id it names), mirroring the old sliding-window behavior of
+    /// "every subsequent request from that principal is blocked for the
+    /// rest of the window, even for ids it already fetched
+    /// successfully."
+    tripped: bool,
+}
+
+impl EnumerationWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            ids: HashSet::new(),
+            tripped: false,
+        }
+    }
 }
 
 struct CompiledObjectRule {
@@ -323,6 +496,7 @@ impl ObjectAuthzPolicy {
             function_rules,
             enumeration: config.enumeration,
             tracker: Mutex::new(HashMap::new()),
+            enumeration_saturation_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -362,6 +536,7 @@ impl ObjectAuthzPolicy {
                             "object scope '{}' requires an identified caller but none was resolved",
                             path_owner
                         ),
+                        detect_only: false,
                     });
                 }
                 Some(owner) if owner != path_owner => {
@@ -371,6 +546,7 @@ impl ObjectAuthzPolicy {
                             "caller '{}' accessed object scope owned by '{}'",
                             owner, path_owner
                         ),
+                        detect_only: false,
                     });
                 }
                 Some(_) => {}
@@ -383,16 +559,50 @@ impl ObjectAuthzPolicy {
         }
 
         // Enumeration: per-principal distinct object-id velocity.
+        //
+        // Rule-scoped: a rule-captured id (above) is the only signal
+        // used when `object_rules` is non-empty. A request that matched
+        // no rule counts nothing here, even though a rule exists for a
+        // *different* path -- the configured rules define the scope,
+        // and widening that scope with a guess would count traffic the
+        // operator never opted into for this origin.
+        //
+        // Ruleless heuristic: only when `object_rules` is empty at all
+        // does a request get a second chance, via `heuristic_object_key`.
+        // That fallback additionally requires an identified caller:
+        // without one, distinct anonymous clients would collapse into
+        // the same "" bucket, where N innocent callers making one
+        // request each look identical to one attacker making N (and can
+        // just as easily mask a real attacker sharing the bucket's
+        // noise). Identity is the prerequisite, not a nice-to-have.
         if self.enumeration.enabled {
-            if let Some(obj_id) = enumeration_hit {
+            let rule_derived = enumeration_hit.is_some();
+            let obj_id = enumeration_hit.or_else(|| {
+                if self.object_rules.is_empty() && principal.owner.is_some() {
+                    heuristic_object_key(path)
+                } else {
+                    None
+                }
+            });
+            if let Some(obj_id) = obj_id {
                 let key = principal.owner.clone().unwrap_or_default();
                 if self.record_and_check_enumeration(&key, &obj_id) {
+                    let detect_only = !rule_derived;
+                    let suffix = if detect_only {
+                        " (ruleless path-shape heuristic; reported for audit only, not blocked)"
+                    } else {
+                        ""
+                    };
                     return Some(Violation {
                         kind: ViolationKind::Enumeration,
                         message: format!(
-                            "caller '{}' touched more than {} distinct object ids within {}s",
-                            key, self.enumeration.max_distinct, self.enumeration.window_secs
+                            "caller '{}' touched more than {} distinct object ids within {}s{}",
+                            key,
+                            self.enumeration.max_distinct,
+                            self.enumeration.window_secs,
+                            suffix
                         ),
+                        detect_only,
                     });
                 }
             }
@@ -414,6 +624,7 @@ impl ObjectAuthzPolicy {
                         "operation requires role '{}' which the caller does not hold",
                         rule.require_role
                     ),
+                    detect_only: false,
                 });
             }
         }
@@ -421,35 +632,105 @@ impl ObjectAuthzPolicy {
         None
     }
 
-    /// Record an object-id access for `key` and return true when the
-    /// distinct count within the window exceeds the threshold.
+    /// Record an object-id access for `key` and return true when it
+    /// pushes the distinct count within the current window past
+    /// `max_distinct`.
+    ///
+    /// O(1) amortized: no full-history scan runs on any call, and the
+    /// lock is held only long enough to touch one `EnumerationWindow`
+    /// whose own state is bounded to `max_distinct` entries, so the
+    /// work done under the lock cannot grow with how much traffic `key`
+    /// has generated. See `EnumerationWindow`'s own doc comment for the
+    /// tumbling-window trade this makes to get there.
+    ///
+    /// Tracking itself is capacity-bounded at `MAX_TRACKED_PRINCIPALS`
+    /// live principals: an already-tracked `key` always gets to update
+    /// its own state, cap or no cap, but a *new* principal past the cap
+    /// gets no slot at all. That principal's request is then simply not
+    /// counted (`false`, best-effort: absence of a slot is never treated
+    /// as a trip), the same shape `sbproxy_extension::mcp::peer_profile`'s
+    /// `ObservationVerdict::Saturated` uses: a saturated pair gets no
+    /// baseline rather than a fabricated one from a shared bucket.
+    /// Every other principal's own tracked state is completely
+    /// unaffected -- unlike the old behavior of wiping the whole map,
+    /// this cannot turn one flood of new principals into a
+    /// detection-gap for principals that had nothing to do with it.
     fn record_and_check_enumeration(&self, key: &str, object_id: &str) -> bool {
         let now = Instant::now();
-        let window = Duration::from_secs(self.enumeration.window_secs);
+        let window = Duration::from_secs(self.enumeration.window_secs.max(1));
         let mut tracker = self.tracker.lock();
 
-        if tracker.len() > MAX_TRACKED_PRINCIPALS && !tracker.contains_key(key) {
-            // Short window, so dropping the map is a brief detection gap,
-            // not a correctness issue. Avoids unbounded growth under a
-            // flood of distinct principals.
-            tracker.clear();
+        if !tracker.contains_key(key) && tracker.len() >= MAX_TRACKED_PRINCIPALS {
+            drop(tracker);
+            self.report_enumeration_tracker_saturated();
+            return false;
         }
 
-        let entry = tracker.entry(key.to_string()).or_default();
-        entry.push_back((now, object_id.to_string()));
-        while let Some((t, _)) = entry.front() {
-            if now.duration_since(*t) > window {
-                entry.pop_front();
-            } else {
-                break;
-            }
+        let entry = tracker
+            .entry(key.to_string())
+            .or_insert_with(|| EnumerationWindow::new(now));
+
+        if now.duration_since(entry.window_start) > window {
+            entry.window_start = now;
+            entry.ids.clear();
+            entry.tripped = false;
         }
 
-        let mut seen = std::collections::HashSet::new();
-        for (_, id) in entry.iter() {
-            seen.insert(id.as_str());
+        if entry.tripped {
+            return true;
         }
-        seen.len() > self.enumeration.max_distinct
+
+        if entry.ids.contains(object_id) {
+            // A repeat of an already-counted id never trips the sweep
+            // on its own, and never needs to touch the set again.
+            return false;
+        }
+
+        entry.ids.insert(object_id.to_string());
+        if entry.ids.len() > self.enumeration.max_distinct {
+            entry.tripped = true;
+            // Membership no longer matters while tripped; free it now
+            // instead of carrying `max_distinct` strings for the rest
+            // of the window for no further purpose.
+            entry.ids.clear();
+            entry.ids.shrink_to_fit();
+            return true;
+        }
+        false
+    }
+
+    /// Log the enumeration tracker's capacity being reached, once per
+    /// policy instance rather than once per refused request so a
+    /// sustained flood does not spam the log. Every occurrence still
+    /// reaches an operator: unlike a per-key latch, this is a single
+    /// `AtomicBool` on the policy itself, deliberately coarser than
+    /// `sbproxy_extension::mcp::peer_profile`'s per-tenant latch,
+    /// because there is no tenant dimension here to key it on -- a
+    /// second, later saturation episode after the first log line is
+    /// silent, which is the same trade that module's own doc comment
+    /// makes for its per-tenant version.
+    ///
+    /// A dedicated `stable` Prometheus counter alongside this log line
+    /// (mirroring `record_mcp_peer_registry_saturated`) is the natural
+    /// next step, but adding one correctly means also updating the
+    /// generated `docs/metrics-stability.md` catalog and satisfying
+    /// `sbproxy-capability`'s writer-resolution drift guard, neither of
+    /// which this change can verify without `cargo run`/`cargo test`
+    /// outside this fix's cargo carve-out -- left as explicit follow-up
+    /// rather than shipped unverified.
+    fn report_enumeration_tracker_saturated(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .enumeration_saturation_warned
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        tracing::warn!(
+            target: "sbproxy::policy::object_authz",
+            cap = MAX_TRACKED_PRINCIPALS,
+            "object_authz enumeration tracker is full; new principals get no enumeration baseline until it drains"
+        );
     }
 }
 
@@ -668,11 +949,16 @@ mod tests {
                 "id {id} should pass"
             );
         }
-        // The fourth distinct id trips the sweep detector.
+        // The fourth distinct id trips the sweep detector. Rule-derived,
+        // so this must be enforceable, never `detect_only`.
         let v = p
             .decide(&caller, "GET", "/tenants/tenant-a/orders/4")
             .expect("violation");
         assert_eq!(v.kind, ViolationKind::Enumeration);
+        assert!(
+            !v.detect_only,
+            "rule-scoped enumeration must stay enforceable"
+        );
     }
 
     #[test]
@@ -687,6 +973,206 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(p.decide(&caller, "GET", "/tenants/tenant-a/orders/1"), None);
         }
+    }
+
+    #[test]
+    fn enumeration_sticky_trip_covers_new_ids_for_rest_of_window() {
+        // Once tripped, every subsequent request stays blocked for the
+        // rest of the window, even for an id never seen before -- the
+        // bounded tracker latches `tripped` rather than re-deriving the
+        // distinct count each time.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/tenants/{owner}/orders/{id}", "owner_param": "owner", "object_param": "id" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        assert_eq!(p.decide(&caller, "GET", "/tenants/tenant-a/orders/1"), None);
+        let first_trip = p
+            .decide(&caller, "GET", "/tenants/tenant-a/orders/2")
+            .expect("violation");
+        assert_eq!(first_trip.kind, ViolationKind::Enumeration);
+        // A brand-new id, never seen before, still trips while the
+        // window's sticky flag is set.
+        let still_tripped = p
+            .decide(&caller, "GET", "/tenants/tenant-a/orders/999")
+            .expect("violation");
+        assert_eq!(still_tripped.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn enumeration_trips_without_object_rules_via_id_heuristic() {
+        // WOR-2491 regression: with zero `object_rules` configured (the
+        // common zero-config case, and the OWASP pack's api1 default)
+        // the detector must still observe traffic instead of staying
+        // inert. Before the fix, the counter was only ever populated
+        // inside the `object_rules` match loop, so this never fired.
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 3, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for id in 1..=3 {
+            assert_eq!(
+                p.decide(&caller, "GET", &format!("/orders/{id}")),
+                None,
+                "id {id} should pass"
+            );
+        }
+        let v = p
+            .decide(&caller, "GET", "/orders/4")
+            .expect("violation: enumeration must fire without object_rules");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+        // A heuristic id is a guess, not a declared rule: it is reported
+        // for audit but must never be the reason a request is blocked.
+        assert!(v.detect_only, "ruleless heuristic hits must be detect_only");
+    }
+
+    #[test]
+    fn enumeration_heuristic_matches_uuid_shaped_ids() {
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for id in [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ] {
+            assert_eq!(p.decide(&caller, "GET", &format!("/resources/{id}")), None);
+        }
+        let v = p
+            .decide(
+                &caller,
+                "GET",
+                "/resources/33333333-3333-3333-3333-333333333333",
+            )
+            .expect("violation");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+        assert!(v.detect_only);
+    }
+
+    #[test]
+    fn enumeration_heuristic_ignores_paths_with_no_id_shaped_segment() {
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for path in ["/health", "/tenants/acme/orders", "/v1/status"] {
+            for _ in 0..5 {
+                assert_eq!(p.decide(&caller, "GET", path), None, "path {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn enumeration_heuristic_skips_anonymous_callers() {
+        // Review finding: without a resolved principal, the heuristic
+        // must not count at all -- not "count under a shared blank
+        // bucket." An unattributed caller collapsing into one "" key
+        // would let N innocent anonymous clients making one request
+        // each look like one attacker making N, and would just as
+        // easily let a real attacker hide in that shared bucket's
+        // noise. Identity is the prerequisite: no owner, no count, ever,
+        // no matter how many distinct id-shaped requests arrive.
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let anonymous = principal(None, &[]);
+        for id in 1..=50 {
+            assert_eq!(
+                p.decide(&anonymous, "GET", &format!("/orders/{id}")),
+                None,
+                "anonymous id {id} must never trip enumeration"
+            );
+        }
+    }
+
+    #[test]
+    fn enumeration_heuristic_does_not_apply_when_object_rules_configured() {
+        // Review finding: pre-fix (v1.12) behavior for a configured
+        // origin was that counting was scoped entirely to declared
+        // rules. The ruleless heuristic must stay scoped to the
+        // zero-`object_rules` case: once any object_rules exist, a
+        // request matching none of them counts nothing, even though it
+        // is id-shaped and the caller is identified.
+        let p = policy(serde_json::json!({
+            "object_rules": [
+                { "path": "/tenants/{owner}/orders/{id}", "owner_param": "owner", "object_param": "id" }
+            ],
+            "enumeration": { "enabled": true, "max_distinct": 1, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for id in 1..=50 {
+            assert_eq!(
+                p.decide(&caller, "GET", &format!("/unmatched/{id}")),
+                None,
+                "unmatched-path id {id} must not feed the heuristic when rules exist"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_object_key_counts_the_full_path_not_the_trailing_value() {
+        // Review finding: counting only the last id-shaped segment's
+        // value collapses a real sweep. `/orders/1/items/1` and
+        // `/orders/2/items/1` share a trailing `1` but are different
+        // objects; the recorded key must be the whole path so they are
+        // counted as two distinct objects, not one.
+        assert_ne!(
+            heuristic_object_key("/orders/1/items/1"),
+            heuristic_object_key("/orders/2/items/1"),
+        );
+        assert_eq!(
+            heuristic_object_key("/orders/1/items/1"),
+            Some("orders/1/items/1".to_string())
+        );
+    }
+
+    #[test]
+    fn enumeration_heuristic_full_path_key_catches_shared_trailing_segment_sweep() {
+        // The behavioral version of the unit test above: a sweep across
+        // `/orders/{n}/items/1` must trip even though every request
+        // shares the same trailing segment.
+        let p = policy(serde_json::json!({
+            "enumeration": { "enabled": true, "max_distinct": 2, "window_secs": 60 }
+        }));
+        let caller = principal(Some("tenant-a"), &[]);
+        for order in 1..=2 {
+            assert_eq!(
+                p.decide(&caller, "GET", &format!("/orders/{order}/items/1")),
+                None
+            );
+        }
+        let v = p
+            .decide(&caller, "GET", "/orders/3/items/1")
+            .expect("violation: full-path key must count distinct orders");
+        assert_eq!(v.kind, ViolationKind::Enumeration);
+    }
+
+    #[test]
+    fn heuristic_object_key_requires_the_trailing_segment_itself() {
+        // Only the request's actual last segment is checked, not "any
+        // segment scanning from the end." A collection path under an
+        // id-shaped parent (`/tenants/42/orders`) is not an object
+        // fetch and must not count.
+        assert_eq!(heuristic_object_key("/tenants/42/orders"), None);
+        assert_eq!(heuristic_object_key("/tenants/acme/orders"), None);
+        assert_eq!(heuristic_object_key("/health"), None);
+        // Trailing-slash directory browsing: the last split segment is
+        // empty, which is never id-shaped.
+        assert_eq!(heuristic_object_key("/reports/2026/08/"), None);
+        // Numeric and UUID trailing segments both count, keyed by the
+        // full path.
+        assert_eq!(
+            heuristic_object_key("/tenants/acme/orders/42"),
+            Some("tenants/acme/orders/42".to_string())
+        );
+        assert_eq!(
+            heuristic_object_key("/resources/11111111-1111-1111-1111-111111111111"),
+            Some("resources/11111111-1111-1111-1111-111111111111".to_string())
+        );
+        // Not a valid UUID shape (wrong length): no id-shaped segment.
+        assert_eq!(heuristic_object_key("/things/not-a-uuid-1234"), None);
     }
 
     #[test]

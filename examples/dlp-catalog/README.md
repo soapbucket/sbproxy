@@ -4,7 +4,7 @@
 
 ![DLP catalog](../../docs/assets/dlp-catalog.gif)
 
-The `dlp` policy scans the request URI and headers for matches against the configured detector set, then either tags the upstream request with a `dlp-detection` header (`action: tag`, default) or rejects with 403 (`action: block`). Detectors come from the built-in regex catalogue (AWS keys, GitHub tokens, Slack tokens, IBANs, etc.) with optional inline `rules:` layered on top. This example ships two origins. `api.local` blocks on AWS, GitHub, Slack, or IBAN matches. `tag.local` enables every default detector (empty `detectors: []`) and adds a custom `internal_ticket` rule that redacts `TICKET-NNNNNN` strings.
+The `dlp` policy scans the request URI, headers, and (on by default, capped at 16 KiB via `body_max_bytes`) the buffered body for matches against the configured detector set, then either tags the upstream request with a `dlp-detection` header (`action: tag`, default) or rejects with 403 (`action: block`). Detectors come from the built-in regex catalogue (AWS keys, GitHub tokens, Slack tokens, IBANs, etc.) with optional inline `rules:` layered on top. This example ships two origins. `api.local` blocks on AWS, GitHub, Slack, or IBAN matches. `tag.local` enables every default detector (empty `detectors: []`) and adds a custom `internal_ticket` rule that redacts `TICKET-NNNNNN` strings. Scanning is request-side only; `dlp` has no response-scanning phase.
 
 ## Run
 

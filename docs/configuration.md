@@ -889,15 +889,26 @@ proxy:
 | `enabled` | bool | `false` | Master switch. |
 | `dir` | string | `/var/lib/sbproxy/config-history` | Directory the ring lives in. |
 | `keep` | int | `20` | Applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1. |
-| `keep_rejected` | int | `10` | Rejected-candidate entries the ring retains for operator inspection. |
+| `keep_rejected` | int | `10` | Reserved for rejected-candidate retention. Accepted and stored for forward compatibility, but nothing writes to the ring's `rejected/` directory yet in this release, so this field has no observable effect today; a config that fails to apply is not recorded anywhere. Wiring the writer is a later change. |
 
 Each entry stores the pre-resolution config bytes: exactly what was read off
 disk, git, or the config authority, before `${VAR}` and
-`vault://`/`secret://` references were resolved. A secret never lands in a
-stored entry, the same guarantee
-[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) makes for
-the live editor. Stored documents are zstd-compressed; `zstdcat` reads one
-directly off disk while the process is stopped.
+`vault://`/`secret://` references were resolved, compressed with zstd.
+`zstdcat` reads one directly off disk while the process is stopped.
+
+That guarantee is about *resolution*, not about what an operator typed. A
+`${VAR}` or `vault://`/`secret://` reference never resolves into a stored
+entry, but a literal secret pasted directly into the YAML (an inline API
+key, a password field) is not a reference and stores exactly as written,
+the same way it sits in the config file on disk today. The ring directory
+is filesystem-scoped and owner-only (`0700` directory, `0600` files) --
+that permission boundary is what actually protects a literal secret at
+rest, the same as the config file itself. `GET /admin/config/history/{digest}`
+and `sbproxy config show` mask a literal secret as `[REDACTED]` before
+either ever leaves the process, the same redaction pass
+[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies,
+but that is display redaction: the ring file underneath still holds the
+original bytes, because a rollback needs them.
 
 The directory is a one-process durability boundary, not shared fleet state,
 the same as [`compression_state`](#compression_state): a config authority
@@ -1467,7 +1478,7 @@ action:
 
 ### websocket
 
-Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs.
+Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline and then relays bytes transparently once the upstream answers `101`; it does not inspect frames after that point. See [websocket.md](websocket.md) for upgrade semantics and which of the two fields below are actually enforced today.
 
 ```yaml
 origins:
@@ -1482,8 +1493,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend WebSocket URL (ws:// or wss://) |
-| `subprotocols` | list | | Supported WebSocket subprotocols |
-| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB) |
+| `subprotocols` | list | | Subprotocols this origin is meant to support. Accepted by config; not currently read anywhere the gateway negotiates or filters on `Sec-WebSocket-Protocol`. |
+| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB). Accepted by config; not currently enforced, frames larger than this pass through unmodified. |
 
 ### grpc
 
@@ -2199,7 +2210,7 @@ origins:
 |-------|------|---------|-------------|
 | `mode` | string | `gateway` | MCP operating mode. Other values fail configuration. |
 | `server_info` | object | generated defaults | Name and version returned by MCP `initialize`. |
-| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
+| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers, or `type: local` servers whose tools are declared entirely in config. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, local `tools[]` (a `static`, `http`, or `steps` handler per tool; see [mcp-compose.md](mcp-compose.md)), `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
 | `rbac_policies` | map | `{}` | Named tool-access policies referenced by `federated_servers[].rbac`. |
 | `argument_policies` | list | `[]` | CEL or OPA-compatible Rego rules evaluated against the tool-call context (name, server, session, tenant, principal, parsed arguments) after RBAC and JSON-Schema validation, before dispatch. `mode: warn` (default) or `block`. |
 | `result_policies` | list | `[]` | Same CEL/Rego shape as `argument_policies`, evaluated against the tool-call result after dispatch and after `content_filters`, before the result reaches the caller. |
@@ -2222,7 +2233,9 @@ origins:
 | `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
 
 See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
-versioning, and cost attribution.
+versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
+`type: local` servers: config-declared tools, HTTP and step-DAG handlers,
+and response shaping.
 
 ### noop
 
@@ -2993,6 +3006,8 @@ policies:
 | `rules` | list | `[]` | Custom regex rules layered on top of the catalog. Same shape as the `pii.rules` block on `ai_proxy` origins. |
 
 The scan covers the request URI (path + query) and request headers; auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. Body scanning is on the roadmap; the existing `pii:` block on `ai_proxy` origins handles request-body redaction with the same regex catalog today.
+
+Every hit also carries bounded detection spans: an entity type plus a byte offset and length into the scanned URI or header text for each match, never the matched value itself, capped at 32 spans across the whole scan. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
 
 ### prompt_injection_v2
 

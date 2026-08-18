@@ -10121,15 +10121,26 @@ fn handle_config_show(args: &ConfigShowArgs) -> anyhow::Result<i32> {
     };
     match args.format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&detail)?),
-        OutputFormat::Text => {
-            let document = detail
-                .get("document")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            print!("{document}");
-        }
+        OutputFormat::Text => print!("{}", config_show_document_text(&detail)),
     }
     Ok(0)
+}
+
+/// The `--format text` rendering of `GET /admin/config/history/{digest}`'s
+/// response: the `document` field, verbatim, and nothing else. The admin
+/// route redacts `document` (and `plan_text`) before it ever serializes
+/// a response -- see `sbproxy_core::admin::handle_config_history_detail`
+/// -- so there is nothing left for the CLI to redact here; this
+/// function does no transformation of its own precisely so a test can
+/// assert that fact, rather than only asserting the server-side JSON
+/// shape. `--format json` above takes the same already-redacted `detail`
+/// value through `serde_json::to_string_pretty` with no extra field
+/// access, so it carries the identical guarantee.
+fn config_show_document_text(detail: &serde_json::Value) -> &str {
+    detail
+        .get("document")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
 }
 
 /// `${VAR}` interpolation matching the config compiler: a set variable
@@ -14283,6 +14294,41 @@ hooks:
             msg.contains("required") || msg.contains("REVISION"),
             "expected a missing-argument message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn config_show_displays_whatever_the_server_sent_verbatim_including_redaction() {
+        // The admin route is the one that redacts (see admin.rs's
+        // `config_history_detail_redacts_a_literal_secret_while_the_ring_file_keeps_the_original`);
+        // this proves the CLI's own display path -- both --format text
+        // and --format json -- has no separate transformation that
+        // could show the planted secret even if it somehow arrived
+        // unredacted, because there is no transformation to get wrong:
+        // both paths print exactly what the server sent.
+        let detail = serde_json::json!({
+            "entry": {
+                "revision": 1,
+                "digest": "abc123",
+                "provenance": "local_file",
+                "state": "applied",
+                "applied_at": "2026-01-01T00:00:00.000Z",
+                "actor": "",
+                "blast_radius": serde_json::Value::Null,
+                "degraded": [],
+            },
+            "document": "ai:\n  api_key_literal: AKIA[REDACTED]\n",
+            "plan_text": "",
+        });
+
+        assert_eq!(
+            config_show_document_text(&detail),
+            "ai:\n  api_key_literal: AKIA[REDACTED]\n"
+        );
+        assert!(!config_show_document_text(&detail).contains("AKIAIOSFODNN7EXAMPLE"));
+
+        let pretty = serde_json::to_string_pretty(&detail).expect("serializes");
+        assert!(pretty.contains("AKIA[REDACTED]"), "{pretty}");
+        assert!(!pretty.contains("AKIAIOSFODNN7EXAMPLE"), "{pretty}");
     }
 
     #[test]
