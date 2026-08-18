@@ -1536,14 +1536,41 @@ fn record_join(
             if incoming.identity_epoch == known.identity_epoch
                 && incoming.boot_epoch == known.boot_epoch
             {
-                let current_is_alive_at_same_address = peers
+                let current_entry_is_alive_at_same_address = peers
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .get_by_node_id(node_id)
-                    .is_some_and(|entry| {
+                    .map(|entry| {
                         matches!(entry.state, PeerState::Alive) && entry.addr == gossip_addr
                     });
-                return current_is_alive_at_same_address.then_some(false);
+                match current_entry_is_alive_at_same_address {
+                    // Steady-state re-advertisement from a live peer:
+                    // nothing changed, nothing to rebroadcast.
+                    Some(true) => return Some(false),
+                    // The entry is still in the table in a non-Alive
+                    // state or at a different address. A captured join
+                    // datagram from a boot that has since died must not
+                    // resurrect it; a live peer that was falsely
+                    // declared Suspect or Dead recovers through the
+                    // incarnation refutation path instead, which keeps
+                    // working while the entry exists because its
+                    // authenticated Ping/Ack traffic still passes the
+                    // source-address check.
+                    Some(false) => return None,
+                    // The dead-peer GC removed the entry. From that
+                    // point the peer's Ping/Ack traffic is dropped (no
+                    // entry to match the source address against), so a
+                    // live process that was falsely declared Dead can
+                    // never advertise a higher boot epoch (one is only
+                    // reserved at process start) and this
+                    // freshness-checked join is its only way back into
+                    // the cluster. Fall through and readmit it. A
+                    // replayed capture of the join is only valid for
+                    // the proof TTL, and a corpse readmitted inside
+                    // that window fails its next probe and is removed
+                    // again by the normal Suspect/Dead sweep.
+                    None => {}
+                }
             }
         }
     }
@@ -2323,6 +2350,85 @@ mod tests {
             .clone();
         assert!(matches!(entry.state, PeerState::Alive));
         assert_eq!(entry.incarnation, 8);
+    }
+
+    #[test]
+    fn same_boot_epoch_join_readmits_peer_after_dead_gc() {
+        // Regression: a live peer falsely declared Dead (e.g. a CI CPU
+        // stall delaying its ACKs past the suspect timeout) and then
+        // removed by the dead-peer GC keeps advertising the same
+        // identity epoch and boot epoch, because a process only
+        // reserves a new boot epoch on restart. Once the table entry is
+        // gone, its authenticated Ping/Ack traffic is dropped (no entry
+        // for the source-address check), so this join is its only way
+        // back into the cluster. Rejecting it makes a false Dead
+        // declaration terminal for the process lifetime.
+        let peers = Arc::new(RwLock::new(PeerTable::default()));
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+        let authenticated = Arc::new(RwLock::new(HashMap::from([(
+            "worker-a".to_string(),
+            AuthenticatedPeerRecord {
+                certificate_fingerprint: "certificate-a".to_string(),
+                identity_epoch: 1,
+                boot_epoch: 1,
+            },
+        )])));
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                JoinAdvertisement {
+                    node_id: "worker-a",
+                    gossip_addr: "127.0.0.1:12000",
+                    transport_addr: Some("127.0.0.1:13000"),
+                },
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-a".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 1,
+                }),
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            Some(true),
+            "a same-boot join after dead-peer GC must readmit the live peer"
+        );
+        let entry = peers
+            .read()
+            .unwrap()
+            .get_by_node_id("worker-a")
+            .unwrap()
+            .clone();
+        assert!(matches!(entry.state, PeerState::Alive));
+        // Steady-state re-advertisement from the now-Alive peer stays a
+        // no-op so repeated joins do not trigger rebroadcast storms.
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                JoinAdvertisement {
+                    node_id: "worker-a",
+                    gossip_addr: "127.0.0.1:12000",
+                    transport_addr: Some("127.0.0.1:13000"),
+                },
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-a".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 1,
+                }),
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            Some(false)
+        );
     }
 
     #[test]
