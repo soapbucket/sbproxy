@@ -4,6 +4,8 @@ import {
   api,
   asList,
   ApiError,
+  type ConfigHistoryDetail,
+  type ConfigHistoryEntry,
   type ConfigWriteConflict,
   type EffectiveConfigResponse,
   type TargetHealth,
@@ -18,11 +20,18 @@ import {
 import { applyEdits, PatchError } from "../lib/config-patch";
 import { authorityLabel, conflictsByPath } from "../lib/config-form";
 import { buildForm } from "../lib/config-schema";
+import {
+  blastRadiusLabel,
+  blastRadiusTone,
+  degradedSummary,
+  historyStateTone,
+  isConfigHistoryDisabled,
+} from "../lib/config-history";
 import ConfigForm from "../components/ConfigForm.vue";
 import { parse as parseYaml } from "yaml";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
-import { formatMs } from "../lib/format";
+import { formatMs, formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -34,6 +43,7 @@ const targetsReq = useAsync(() => api.targets());
 
 const effective = useAsync(() => api.effectiveConfig());
 const configSchema = useAsync(() => api.configSchema());
+const configHistory = useAsync(() => api.configHistory());
 
 function refresh() {
   openapi.run();
@@ -41,6 +51,7 @@ function refresh() {
   targetsReq.run();
   effective.run();
   configSchema.run();
+  configHistory.run();
   loadConfig();
 }
 onMounted(refresh);
@@ -340,6 +351,55 @@ async function reload() {
     reloadBusy.value = false;
   }
 }
+
+// ---- config history (WOR-2456/2457) ----
+//
+// The applied/good/failed/reverted timeline behind the LKG rollback
+// store. Opt-in (proxy.config_history.enabled), so a 404 here is read
+// through isConfigHistoryDisabled rather than surfaced as an error: the
+// common case is a node that never turned the feature on.
+const historyEntries = computed<ConfigHistoryEntry[]>(
+  () => configHistory.data.value?.entries ?? [],
+);
+const historyLineage = computed(() => configHistory.data.value?.lineage);
+const historyLkgRevision = computed(() => configHistory.data.value?.lkg_revision ?? null);
+const historyDisabled = computed(() => isConfigHistoryDisabled(configHistory.error.value));
+
+// Selecting a row loads its detail (document + rendered plan diff) on
+// demand rather than up front: the plan render is a diff against the
+// live config, computed server-side per digest, and most rows in a long
+// history are never opened.
+const selectedDigest = ref<string | null>(null);
+const historyDetail = ref<ConfigHistoryDetail | null>(null);
+const historyDetailLoading = ref(false);
+const historyDetailError = ref<ApiError | null>(null);
+
+function selectHistoryEntry(entry: ConfigHistoryEntry) {
+  if (selectedDigest.value === entry.digest) {
+    selectedDigest.value = null;
+    historyDetail.value = null;
+    historyDetailError.value = null;
+    return;
+  }
+  selectedDigest.value = entry.digest;
+  void loadHistoryDetail(entry);
+}
+
+// Split from selectHistoryEntry so the detail row's retry button re-fetches
+// instead of toggling the row shut: retry calls this directly, a row click
+// goes through the toggle above.
+async function loadHistoryDetail(entry: ConfigHistoryEntry) {
+  historyDetail.value = null;
+  historyDetailError.value = null;
+  historyDetailLoading.value = true;
+  try {
+    historyDetail.value = await api.configHistoryEntry(entry.digest);
+  } catch (e) {
+    historyDetailError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+  } finally {
+    historyDetailLoading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -495,6 +555,89 @@ async function reload() {
     </div>
   </section>
 
+  <!-- Config history -->
+  <section class="section">
+    <div class="section__head">
+      <h2>Config history</h2>
+      <span class="sb-faint sb-mono" v-if="historyLineage">
+        lineage {{ shortId(historyLineage) }}
+      </span>
+      <span class="sb-faint sb-mono" v-if="historyLkgRevision !== null">
+        lkg rev {{ historyLkgRevision }}
+      </span>
+      <button class="sb-btn sb-btn--sm" :disabled="configHistory.loading.value" @click="configHistory.run">
+        {{ configHistory.loading.value ? "Loading..." : "Refresh" }}
+      </button>
+    </div>
+    <EmptyState
+      v-if="historyDisabled"
+      message="Config history is not enabled on this node. Set proxy.config_history.enabled to turn on the applied/good/failed/reverted timeline behind rollback."
+    />
+    <ErrorState
+      v-else-if="configHistory.error.value"
+      :error="configHistory.error.value"
+      @retry="configHistory.run"
+    />
+    <EmptyState v-else-if="!historyEntries.length && !configHistory.loading.value" message="No config history recorded yet." />
+    <div class="table-wrap" v-else>
+      <table class="sb-table">
+        <thead>
+          <tr>
+            <th>Revision</th>
+            <th>State</th>
+            <th>Blast radius</th>
+            <th>Provenance</th>
+            <th>Applied</th>
+            <th>Actor</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template v-for="entry in historyEntries" :key="entry.digest">
+            <tr
+              class="history-row"
+              :class="{ 'history-row--active': selectedDigest === entry.digest }"
+              @click="selectHistoryEntry(entry)"
+            >
+              <td class="sb-mono">{{ entry.revision }}</td>
+              <td>
+                <StatusBadge :label="entry.state" :tone="historyStateTone(entry.state)" />
+                <StatusBadge v-if="entry.degraded.length" label="degraded" tone="warn" />
+                <div v-if="entry.degraded.length" class="sb-faint history-degraded">
+                  {{ degradedSummary(entry.degraded) }}
+                </div>
+              </td>
+              <td>
+                <StatusBadge
+                  :label="blastRadiusLabel(entry.blast_radius)"
+                  :tone="blastRadiusTone(entry.blast_radius)"
+                />
+              </td>
+              <td class="sb-mono">{{ entry.provenance }}</td>
+              <td class="sb-muted" :title="entry.applied_at">{{ formatTime(entry.applied_at) }}</td>
+              <td class="sb-mono">{{ entry.actor || "n/a" }}</td>
+            </tr>
+            <tr v-if="selectedDigest === entry.digest" class="history-detail-row">
+              <td colspan="6">
+                <div class="history-detail">
+                  <p v-if="historyDetailLoading" class="sb-faint">Loading plan...</p>
+                  <ErrorState
+                    v-else-if="historyDetailError"
+                    :error="historyDetailError"
+                    @retry="loadHistoryDetail(entry)"
+                  />
+                  <template v-else-if="historyDetail">
+                    <p class="sb-faint sb-mono">digest {{ entry.digest }}</p>
+                    <pre class="sb-code">{{ historyDetail.plan_text }}</pre>
+                  </template>
+                </div>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
   <!-- Drift -->
   <section class="section">
     <div class="section__head">
@@ -645,6 +788,29 @@ async function reload() {
   border: 1px solid var(--sb-border);
   border-radius: var(--sb-radius);
   overflow-x: auto;
+}
+.history-row {
+  cursor: pointer;
+}
+.history-row:hover {
+  background: var(--sb-surface-hover);
+}
+.history-row--active {
+  background: var(--sb-surface-hover);
+}
+.history-degraded {
+  font-size: 0.78rem;
+  margin-top: 2px;
+}
+.history-detail-row td {
+  padding: 0;
+}
+.history-detail {
+  padding: var(--sb-space-4);
+  border-top: 1px dashed var(--sb-border);
+}
+.history-detail .sb-code {
+  margin-top: var(--sb-space-2);
 }
 .method {
   display: inline-block;

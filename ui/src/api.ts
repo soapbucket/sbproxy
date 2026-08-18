@@ -1452,6 +1452,48 @@ export interface ConfigDoc {
   yaml?: string;
 }
 
+/// One config revision in the durable history ring (WOR-2456/2457).
+/// `blast_radius` compares this entry to the one before it, so the
+/// first entry in a lineage always carries `null`. `degraded` names the
+/// subsystems that did not pick up this revision cleanly; an empty
+/// array means the revision applied everywhere.
+export type ConfigHistoryState = "applied" | "good" | "failed" | "reverted";
+export type ConfigHistoryBlastRadius =
+  | "hitless"
+  | "reload"
+  | "restart"
+  | "breaking";
+
+export interface ConfigHistoryEntry {
+  revision: number;
+  digest: string;
+  provenance: string;
+  state: ConfigHistoryState;
+  applied_at: string;
+  actor: string;
+  blast_radius: ConfigHistoryBlastRadius | null;
+  degraded: string[];
+}
+
+/** GET /admin/config/history. Entries arrive newest first. 404s with
+ *  `{"error":"config history is not enabled"}` when
+ *  proxy.config_history.enabled is off or the store is absent. */
+export interface ConfigHistoryResponse {
+  lineage: string;
+  lkg_revision: number | null;
+  entries: ConfigHistoryEntry[];
+}
+
+/** GET /admin/config/history/{digest}. `document` is the stored
+ *  pre-resolution YAML; `plan_text` is the rendered plan() diff against
+ *  the running config. 404s the same way as the list route, plus for an
+ *  unknown digest. */
+export interface ConfigHistoryDetail {
+  entry: ConfigHistoryEntry;
+  document: string;
+  plan_text: string;
+}
+
 export interface AuditRow {
   timestamp?: string;
   action?: string;
@@ -2741,6 +2783,16 @@ export const api = {
   // The config JSON Schema, generated from the running binary's own types.
   // Around 300KB, so it is fetched once per page load and not per edit.
   configSchema: () => getJson<Record<string, unknown>>("/admin/config/schema"),
+
+  // Durable config revision history (WOR-2456/2457): the applied/good/
+  // failed/reverted timeline behind the LKG rollback store. Opt-in, so a
+  // 404 here commonly means proxy.config_history.enabled is off rather
+  // than a real failure.
+  configHistory: () => getJson<ConfigHistoryResponse>("/admin/config/history"),
+  configHistoryEntry: (digest: string) =>
+    getJson<ConfigHistoryDetail>(
+      `/admin/config/history/${encodeURIComponent(digest)}`,
+    ),
 
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),
