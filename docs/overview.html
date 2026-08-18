@@ -19,11 +19,13 @@
     color: var(--ink);
     font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   }
-  main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
+  main { max-width: 50rem; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
   h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 0.5rem; }
-  h2 { font-size: 1.35rem; margin: 3rem 0 0.75rem; }
-  h3 { font-size: 1.05rem; margin: 2rem 0 0.5rem; }
+  h2 { font-size: 1.4rem; margin: 3rem 0 0.75rem; }
+  h3 { font-size: 1.08rem; margin: 2rem 0 0.5rem; }
   p { margin: 0 0 1rem; }
+  ul { margin: 0 0 1rem; padding-left: 1.3rem; }
+  li { margin-bottom: 0.35rem; }
   a { color: var(--blue); text-decoration: none; }
   a:hover { text-decoration: underline; }
   .lede { font-size: 1.15rem; color: var(--muted); margin-bottom: 2rem; }
@@ -41,9 +43,10 @@
     line-height: 1.5;
   }
   pre code { background: none; padding: 0; }
-  table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; font-size: 0.95rem; }
-  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; font-size: 0.93rem; }
+  th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
   th { font-weight: 600; }
+  .tablewrap { overflow-x: auto; }
   .diagram { margin: 1.5rem 0 2rem; }
   .flow { display: flex; flex-direction: column; gap: 0; align-items: stretch; }
   .stage {
@@ -89,6 +92,16 @@
     color: var(--muted);
     margin: 1rem 0 1.5rem;
   }
+  .toc {
+    border: 1.5px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0 2rem;
+    font-size: 0.95rem;
+    columns: 2;
+    column-gap: 2rem;
+  }
+  .toc a { display: block; padding: 0.12rem 0; }
   footer {
     margin-top: 4rem;
     padding-top: 1.5rem;
@@ -96,6 +109,7 @@
     color: var(--muted);
     font-size: 0.9rem;
   }
+  @media (max-width: 640px) { .toc { columns: 1; } }
 </style>
 </head>
 <body>
@@ -130,7 +144,24 @@ class, buy the specialist. SBproxy is for the boundary itself: every class
 crosses it through the same pipeline, the same policy engine, and the same
 evidence stream.</p>
 
-<h2>The request path</h2>
+<nav class="toc">
+  <a href="#request-path">The request path</a>
+  <a href="#apis">APIs</a>
+  <a href="#mcp">MCP servers</a>
+  <a href="#models">Models</a>
+  <a href="#agents">Agents</a>
+  <a href="#crawlers">Crawlers</a>
+  <a href="#actions">Every action type</a>
+  <a href="#policies">Every policy type</a>
+  <a href="#scripting">Where custom logic attaches</a>
+  <a href="#evidence">Evidence</a>
+  <a href="#operations">Operating it</a>
+  <a href="#settlement">Metering and settlement</a>
+  <a href="#comparison">The comparison, condensed</a>
+  <a href="#start">Where to start</a>
+</nav>
+
+<h2 id="request-path">The request path</h2>
 
 <p>Every request, whatever its class, walks the same pipeline. Policies and
 transforms attach per origin, so a hostname serving an OpenAI-compatible
@@ -138,11 +169,11 @@ endpoint and a hostname proxying a legacy REST API run different policy
 chains through identical machinery.</p>
 
 <div class="diagram flow">
-  <div class="stage"><b>Listener</b><span>HTTP/1.1, HTTP/2, WebSocket, gRPC, GraphQL; TLS and mTLS</span></div>
+  <div class="stage"><b>Listener</b><span>HTTP/1.1, HTTP/2, WebSocket, gRPC, GraphQL; TLS and mTLS with ACME certificate management</span></div>
   <div class="down">&#8595;</div>
-  <div class="stage"><b>Authentication</b><span>API keys, JWT, OIDC, basic, mTLS identity, bot auth, CAP tokens, virtual keys</span></div>
+  <div class="stage"><b>Authentication</b><span>api_key, basic, bearer, JWT, digest, OIDC, forward_auth, Web Bot Auth, CAP tokens, virtual keys, mTLS identity</span></div>
   <div class="down">&#8595;</div>
-  <div class="stage"><b>Request policies</b><span>rate and concurrency limits, WAF, object authorization, DLP, injection screens, CEL and Rego rules, the OWASP API pack</span></div>
+  <div class="stage"><b>Request policies</b><span>rate and concurrency limits, WAF, object authorization, DLP, injection screens, request validation, CEL and Rego rules, the OWASP API pack</span></div>
   <div class="down">&#8595;</div>
   <div class="stage"><b>Action dispatch</b><span>the origin's configured action decides what this hostname is</span></div>
   <div class="fan">
@@ -150,12 +181,12 @@ chains through identical machinery.</p>
     <div class="stage"><b>ai_proxy</b><span>model gateway</span></div>
     <div class="stage"><b>mcp</b><span>tool gateway</span></div>
     <div class="stage"><b>a2a</b><span>agent peer</span></div>
-    <div class="stage"><b>static, storage, redirect, more</b><span>eleven others</span></div>
+    <div class="stage"><b>eleven more</b><span>load_balancer, static, storage, redirect, websocket, grpc, graphql, echo, mock, beacon, noop</span></div>
   </div>
   <div class="down">&#8595;</div>
-  <div class="stage"><b>Response phase</b><span>transforms (JSON projection, Lua, JavaScript, WASM), guardrails on model output, content filters on tool results, SRI and body policies</span></div>
+  <div class="stage"><b>Response phase</b><span>transforms (JSON projection, Lua, JavaScript, WASM), guardrails on model output, content filters on tool results, SRI and body policies, response caching</span></div>
   <div class="down">&#8595;</div>
-  <div class="stage"><b>Evidence</b><span>access log, structured events, decision-audit records with gapless sequence numbers, metrics</span></div>
+  <div class="stage"><b>Evidence</b><span>access log, structured events, decision-audit records with gapless sequence numbers, metrics, OTLP export</span></div>
 </div>
 
 <p>The last box is the one we would defend in an argument. Most gateways log
@@ -167,42 +198,73 @@ allowed on March 3rd, "we have Grafana" is not an answer. A signed, gapless
 decision trail is. The full field contract is in
 <a href="decision-records.md">decision-records.md</a>.</p>
 
-<h2>APIs</h2>
+<h2 id="apis">APIs</h2>
 
-<p>The API half of SBproxy is a working reverse proxy: routing by hostname,
-load balancing with five strategies, health checks, circuit breaking,
-response caching with four backends, compression, CORS, redirects, and a
-transform layer that can reshape requests and responses in CEL, Lua,
-JavaScript, or WASM. If you have used any modern proxy, this part will feel
-familiar, and that is deliberate.</p>
+<p>The API half of SBproxy is a working reverse proxy, and most of a config
+reads like one: origins keyed by hostname, forward rules with CEL
+predicates picking actions per path, retries with backoff, DNS-based
+service discovery, and header rewriting in both directions. If you have
+used any modern proxy, this part will feel familiar, and that is
+deliberate.</p>
 
-<p>Where we diverge from the field is enforcement posture. Every API
+<h3>Routing and resilience</h3>
+
+<p>The <code>load_balancer</code> action spreads traffic with eight
+algorithms (round-robin, weighted random, least connections, IP, URI,
+header, and cookie hash, and ketama-style ring hash) plus five named
+custom strategies, including GPU-aware and LoRA-aware placement for model
+backends and a bandit strategy that learns from outcomes. Health is three
+layers deep: active probes, passive outlier ejection, and per-target
+circuit breakers, with blue-green and canary modes, backup targets, and
+priority tiers on top. Response caching runs on four backends (memory,
+file, memcached, Redis) with optional AES-256-GCM encryption at rest and a
+cache-reserve tier. <a href="routing.md">routing.md</a> and
+<a href="routing-strategies.md">routing-strategies.md</a> cover it;
+<a href="../examples/routing-strategies/">routing-strategies</a> and
+<a href="../examples/cache-reserve/">cache-reserve</a> run it.</p>
+
+<h3>Security posture</h3>
+
+<p>Where we diverge from the field is enforcement honesty. Every API
 security vendor publishes a mapping document explaining how you could
-configure their product against the OWASP API Security Top 10. We got tired
-of reading those, so <code>type: owasp_api_top10</code> is a policy you
-enable by name. The compiler expands it into concrete policy entries, backs
-off wherever you already wrote an overlapping policy by hand, and then
-tells you the truth in a five-state manifest: which items are enforced,
-which are report-only, which need one operator decision it refuses to guess
-(rate budgets behind an undeclared load balancer, for one), and which three
-of the ten no proxy can honestly claim. <code>sbproxy plan</code> and
-<code>GET /admin/owasp-api-pack</code> both show the manifest, so
-"enable: all" can never silently mean "enabled: some."</p>
+configure their product against the OWASP API Security Top 10. We got
+tired of reading those, so <code>type: owasp_api_top10</code> is a policy
+you enable by name. The compiler expands it into concrete policy entries,
+backs off wherever you already wrote an overlapping policy by hand, and
+then tells you the truth in a five-state manifest: which items are
+enforced, which are report-only, which need one operator decision it
+refuses to guess (rate budgets behind an undeclared load balancer, for
+one), and which three of the ten no proxy can honestly claim.
+<code>sbproxy plan</code> and <code>GET /admin/owasp-api-pack</code> both
+show the manifest, so "enable: all" can never silently mean
+"enabled: some."</p>
 
-<p>Alongside the pack: object-level authorization with enumeration
-detection (a caller sweeping <code>/orders/1</code> through
-<code>/orders/500</code> trips a tenant-scoped, constant-work detector), a
-DLP policy that scans URI, headers, and request bodies with match positions
-in the audit trail, and request validation against your OpenAPI spec.
-Start with <a href="api-security.md">api-security.md</a>, or the
-<a href="../examples/owasp-api-top10/">owasp-api-top10</a> and
-<a href="../examples/object-authz/">object-authz</a> examples.</p>
+<p>The rest of the API security surface, each usable alone or via the
+pack:</p>
+
+<ul>
+  <li><b>Object authorization</b> (<code>object_authz</code>): BOLA and
+  BFLA enforcement from declared ownership rules, plus enumeration
+  detection. A caller sweeping <code>/orders/1</code> through
+  <code>/orders/500</code> trips a tenant-scoped, constant-work detector
+  even with no rules configured, audit-only until you declare ownership.
+  <a href="object-authz.md">object-authz.md</a></li>
+  <li><b>DLP</b>: pattern scanning across URI, headers, and request bodies
+  (16 KiB cap, on by default), with match positions in the audit trail and
+  never the matched text. <a href="api-security.md">api-security.md</a></li>
+  <li><b>WAF</b> with custom rules in Lua or JavaScript, persistent blocks
+  keyed by CEL expressions, and exposed-credential checks.</li>
+  <li><b>Validation</b>: request shape rules, OpenAPI-spec validation
+  against your published contract, HTTP framing hardening (dual
+  content-length and TE refusals), CSRF, SRI, content digests, and
+  security headers.</li>
+</ul>
 
 <p class="concede">What we concede: we are not a CDN and do not want to be.
 No edge PoPs, no image optimization, no per-plugin marketplace. Front us
 with one if you need one.</p>
 
-<h2>MCP servers</h2>
+<h2 id="mcp">MCP servers</h2>
 
 <p>MCP is where the market is strangest right now. Composition products
 (StackOne, superglue, the Arazzo spec) can merge several API calls into one
@@ -211,140 +273,328 @@ products can approve and deny tools, but compose nothing. Nobody was
 shipping both, which struck us as odd, because the whole point of putting an
 MCP gateway in front of agents is that every step should be governed.</p>
 
-<p>So SBproxy's MCP action does both jobs through one catalog. Federation
-turns upstream MCP servers and OpenAPI specs into a governed tool list:
-RBAC by principal, argument policies in CEL or Rego, quotas, session-flow
-enforcement, content filters on results, tool versioning with lockfile
-digests so an upstream cannot swap a tool's contract under your agents, and
-draft or deprecated status per server. Composition
-(<code>federated_servers[].type: local</code>) lets you declare a tool
-entirely in config: a fixed value, a single HTTP call, or a
-dependency-ordered DAG of calls with CEL step conditions, per-step retry,
-and a response shaped by a template, JavaScript, or Lua. Because composed
-tools publish into the same catalog, every governance gate applies to them
-with no extra wiring, per step, egress-gated, fail-closed.</p>
+<h3>Federation, governed</h3>
 
-<p>You can also point an MCP client at the proxy's own admin surface and
-operate it conversationally; that is the
-<a href="../examples/admin-mcp/">admin-mcp</a> example. For composition,
-read <a href="mcp-compose.md">mcp-compose.md</a> and run
-<a href="../examples/mcp-compose/">mcp-compose</a> or its JavaScript twin
-<a href="../examples/mcp-compose-js/">mcp-compose-js</a>. The governance
-model is in <a href="mcp.md">mcp.md</a> and
-<a href="mcp-security-coverage.md">mcp-security-coverage.md</a>.</p>
+<p>The <code>mcp</code> action federates three kinds of tool sources behind
+one endpoint: real upstream MCP servers, OpenAPI specs converted
+one-operation-per-tool, and local tools declared entirely in config. All
+three publish into one catalog, and the governance gates key on the
+catalog, so they apply identically regardless of where a tool came
+from:</p>
+
+<div class="tablewrap"><table>
+  <tr><th>Gate</th><th>What it decides</th></tr>
+  <tr><td>RBAC</td><td>Which principals see and may call which tools; default deny, per-tenant labels.</td></tr>
+  <tr><td>Approval status</td><td>A <code>draft</code> server's tools are invisible and refused everywhere, including the served TypeScript code-mode module; <code>deprecated</code> warns.</td></tr>
+  <tr><td>Tool versioning</td><td>Lockfile digests pin each tool's contract. An upstream that swaps a tool's schema under your agents trips the version gate instead of silently changing behavior.</td></tr>
+  <tr><td>Argument and result policies</td><td>CEL or Rego over call arguments and results, per tool.</td></tr>
+  <tr><td>Quotas and flow</td><td>Call budgets per principal, and session-flow taint rules (a tool that read untrusted content can be barred from calling outbound tools afterward).</td></tr>
+  <tr><td>Content filters</td><td>Secret and PII screening on arguments and results, with warn, redact, and block modes.</td></tr>
+  <tr><td>Evidence</td><td>A decision record per governance decision, gapless sequence numbers per session.</td></tr>
+</table></div>
+
+<h3>Composition</h3>
+
+<p>Composition (<code>federated_servers[].type: local</code>) lets you
+declare a tool in config: a fixed value, a single HTTP call, or a
+dependency-ordered DAG of calls under <code>steps:</code>, wired together
+with <code>${args.x}</code> and <code>${steps.name.body.x}</code>
+interpolation that fails closed on any missing path. Steps carry CEL
+conditions, per-step retry, and <code>continue_on_error</code>; the whole
+call runs under a budget (30 seconds default, five minutes cap); every
+outbound dial goes through the server's mandatory deny-by-default egress
+allowlist; and the final response is shaped by a template, JavaScript, or
+Lua, in the same sandboxes with the same watchdogs the rest of the proxy
+uses. Because composed tools publish into the same catalog, every gate in
+the table above applies to them per step, with no extra wiring.</p>
+
+<p>Two more MCP surfaces worth knowing: the proxy's own admin API is
+exposable as an MCP server, so you can operate the gateway
+conversationally from any MCP client
+(<a href="../examples/admin-mcp/">admin-mcp</a>,
+<a href="admin-mcp.md">admin-mcp.md</a>), and agents that prefer writing
+code to calling tools can fetch a generated TypeScript module of the
+catalog (<a href="cloudflare-code-mode.md">cloudflare-code-mode.md</a>).
+Read <a href="mcp.md">mcp.md</a> for federation,
+<a href="mcp-compose.md">mcp-compose.md</a> for composition, and
+<a href="mcp-security-coverage.md">mcp-security-coverage.md</a> for the
+threat-by-threat coverage table. Runnable:
+<a href="../examples/mcp-compose/">mcp-compose</a>,
+<a href="../examples/mcp-compose-js/">mcp-compose-js</a>,
+<a href="../examples/mcp-local-tools/">mcp-local-tools</a>.</p>
 
 <p class="concede">What we concede: stdio-only MCP servers are proxied
 through a supervised bridge rather than natively, and the composition
 engine runs steps sequentially in this release. Both are stated in the
 docs rather than discovered in production.</p>
 
-<h2>Models</h2>
+<h2 id="models">Models</h2>
 
 <p>The model gateway (<code>action: ai_proxy</code>) presents one
-OpenAI-compatible endpoint and routes behind it: multiple providers,
-weighted groups, cascade and race strategies, cost-optimized and
-outcome-aware routing, and local serving through llama.cpp hosts the proxy
-itself supervises as a cluster. Budgets meter tokens and dollars per key,
-per tenant, and per agent, with hard cutoffs. Guardrails screen prompts and
-outputs for PII, secrets, and injection, and when one blocks, the decision
-record carries bounded match positions so you can see what tripped without
-the log itself becoming the leak.</p>
+OpenAI-compatible endpoint and routes behind it across a 72-provider
+catalog, from the hosted majors through Bedrock and OpenRouter down to
+llama.cpp hosts the proxy itself supervises as a local cluster with
+GPU-aware placement. Model aliases decouple the name your clients send
+from what serves it, so swapping providers is a config edit rather than a
+client rollout.</p>
+
+<h3>Routing that reads the traffic</h3>
+
+<p>Routing strategies go well past round-robin: cascade (try cheap, fall
+through to strong on refusal or low confidence), race (first useful answer
+wins), cost-optimized, outcome-aware (routes on measured quality of prior
+answers), classifier-driven (an ONNX classifier picks the lane), and
+LLM-aware resilience that understands provider-specific failure modes
+rather than treating every 429 alike. Shadow routing mirrors traffic to a
+candidate model without serving its answers, for evaluation before
+cutover. <a href="ai-gateway.md">ai-gateway.md</a> is the reference;
+<a href="../examples/ai-cascade-routing/">ai-cascade-routing</a>,
+<a href="../examples/ai-race/">ai-race</a>, and
+<a href="../examples/ai-shadow/">ai-shadow</a> run the shapes.</p>
+
+<h3>Spend, safety, and context</h3>
+
+<ul>
+  <li><b>Budgets and keys</b>: virtual keys with per-key policy and
+  attribution, token and dollar budgets per key, tenant, and agent, hard
+  cutoffs, predictive budget alerts, and a reconcilable usage ledger with
+  Stripe meter export.
+  (<a href="../examples/ai-virtual-keys/">ai-virtual-keys</a>,
+  <a href="ai-usage-ledger.md">ai-usage-ledger.md</a>)</li>
+  <li><b>Guardrails</b>: PII, secrets, and prompt-injection screening on
+  input and output, streaming-aware, with external guardrail services and
+  a mesh mode that fuses verdicts. When a guardrail blocks, the decision
+  record carries bounded match positions so you can see what tripped
+  without the log becoming the leak.
+  (<a href="../examples/ai-guardrails/">ai-guardrails</a>)</li>
+  <li><b>Context engineering</b>: semantic caching keyed on deterministic
+  request features, context compression backed by Redis or mesh peers,
+  RAG wiring for local retrieval, and hosted prompt templates.
+  (<a href="ai-context-compression.md">ai-context-compression.md</a>)</li>
+</ul>
 
 <p>LiteLLM is the honest comparison here, and if your problem is "call any
 of ninety providers from Python," it is the right tool. Our bet is that the
 provider list matters less than what wraps it: a gateway that treats a
-model call like any other governed boundary crossing, with the same
-policy engine, evidence trail, and settlement machinery as the rest of your
-traffic. Virtual keys with per-key policy, spend that reconciles into a
-usage ledger, and guardrail decisions that land in the same SIEM feed as
-your WAF blocks.</p>
+model call like any other governed boundary crossing, with the same policy
+engine, evidence trail, and settlement machinery as the rest of your
+traffic.</p>
 
-<p>Start at <a href="ai-gateway.md">ai-gateway.md</a>, then the
-<a href="../examples/ai-gateway-quickstart/">ai-gateway-quickstart</a>,
-<a href="../examples/ai-multi-provider/">ai-multi-provider</a>, and
-<a href="../examples/ai-local-serving/">ai-local-serving</a> examples.</p>
-
-<h2>Agents</h2>
+<h2 id="agents">Agents</h2>
 
 <p>Agent-to-agent traffic is the newest class and the one with the least
 settled tooling anywhere. SBproxy's position: an agent is a caller whose
 identity should be established cryptographically, not inferred from a
-user-agent string. The trust-tier model classifies every caller into one of
-four tiers, where the <code>signed</code> tier is earned only through
-verifiable mechanisms (CAP tokens, Web Bot Auth signatures, known-agent
-verification), and policy can key on the tier. The A2A action proxies
-agent-card exchanges and rewrites the card so your internal topology never
-leaks, serves the well-known card path, and applies prompt-injection
-screening to agent payloads.</p>
+user-agent string.</p>
+
+<p>The trust-tier model classifies every caller into one of four ordered
+tiers, and the <code>signed</code> tier is earned only through verifiable
+mechanisms: CAP tokens (capability tokens with verdict-mapped responses,
+401 with a license challenge, 403 by refusal code, 429 with rate headers),
+Web Bot Auth HTTP-signature verification, or known-agent verification by
+reverse DNS. Policy can key on the tier, so "browsers get the site,
+unsigned bots get a challenge, signed agents get the API" is three config
+lines rather than a WAF science project.
+<a href="trust-tiers.md">trust-tiers.md</a> and
+<a href="cap.md">cap.md</a> are the references.</p>
+
+<p>The <code>a2a</code> action proxies agent-to-agent JSON-RPC with the
+skepticism the protocol deserves: envelope trust rules, delegation-depth
+caps, cycle detection, caller and callee allowlists, prompt-injection
+screening on agent payloads
+(<a href="../examples/a2a-prompt-injection/">a2a-prompt-injection</a>),
+and agent-card handling that serves the well-known card path and rewrites
+the card so your internal topology never leaks. Agent skills give a
+declared agent a scoped capability set, and agent budgets meter what an
+agent may spend across every origin it touches
+(<a href="agent-skills.md">agent-skills.md</a>,
+<a href="agent-budget.md">agent-budget.md</a>).</p>
 
 <p>There is no incumbent to compare against here; API gateways treat agent
 traffic as generic HTTP, and the agent frameworks assume you trust your
-peer. We think the boundary deserves the same skepticism it gives everything
-else. See <a href="a2a-gateway.md">a2a-gateway.md</a> and the
+peer. We think the boundary deserves the same skepticism it gives
+everything else. See <a href="a2a-gateway.md">a2a-gateway.md</a> and the
 <a href="../examples/a2a-protocol/">a2a-protocol</a> example.</p>
 
-<h2>Crawlers</h2>
+<h2 id="crawlers">Crawlers</h2>
 
 <p>AI crawlers are the class most sites handle with a blunt instrument:
-block them all or let them all in. SBproxy detects them (headless-browser
-TLS fingerprinting, reverse-DNS agent verification, declared-agent
-signatures), reads and serves content preferences, and then gives you a
-third option beyond allow and deny: price it. Crawl control can serve
-different tiers to different agents, meter what they read, and settle
-through x402 payment challenges, so a scraper that wants your content at
-scale pays for it instead of being an abuse problem.</p>
+block them all or let them all in. SBproxy detects them with mechanisms
+that do not trust the user-agent string (headless-browser TLS
+fingerprinting, reverse-DNS agent verification, declared-agent
+signatures), reads and serves content preferences
+(<a href="content-for-agents.md">content-for-agents.md</a>), and then
+gives you a third option beyond allow and deny: price it.</p>
 
-<p>Cloudflare will block crawlers at the edge, and robots.txt will ask them
-nicely. Charging them requires the detection, the metering, and the
-settlement to sit in one data plane, which is the case we built. See
-<a href="ai-crawl-control.md">ai-crawl-control.md</a>,
-<a href="content-for-agents.md">content-for-agents.md</a>, and the
-<a href="../examples/ai-crawl-tiered/">ai-crawl-tiered</a> example.</p>
+<p>Crawl control serves different content tiers to different agents,
+meters what each one reads, and settles through x402 payment challenges,
+so a scraper that wants your content at scale pays for it instead of being
+an abuse problem. The tiered example
+(<a href="../examples/ai-crawl-tiered/">ai-crawl-tiered</a>) shows a free
+tier, a metered tier, and a refusal tier running side by side on one
+origin. Cloudflare will block crawlers at the edge, and robots.txt will
+ask them nicely; charging them requires the detection, the metering, and
+the settlement to sit in one data plane, which is the case we built.
+<a href="ai-crawl-control.md">ai-crawl-control.md</a> is the
+reference.</p>
 
-<h2>The parts shared by all five</h2>
+<h2 id="actions">Every action type</h2>
 
-<table>
-  <tr>
-    <th>Surface</th>
-    <th>What it gives every class</th>
-  </tr>
-  <tr>
-    <td>Policy engine</td>
-    <td>27 built-in policy types plus CEL, Rego, Lua, JavaScript, and WASM
-    for custom rules. One vocabulary across API, MCP, model, agent, and
-    crawler traffic. <a href="policy.md">policy.md</a></td>
-  </tr>
-  <tr>
-    <td>Evidence</td>
-    <td>Access logs, structured events, decision-audit records with gapless
-    sequencing, and Prometheus metrics with a stability contract. OTLP
-    export is itself egress-gated, because telemetry that can leak the
-    prompts it audits is a finding, not a feature.
-    <a href="observability.md">observability.md</a></td>
-  </tr>
-  <tr>
-    <td>Config</td>
-    <td>One YAML file, validated with refusals that name the knob, a plan
-    command that previews enforcement before you apply, durable config
-    history with redacted display, and hot reload for nearly everything.
-    <a href="configuration.md">configuration.md</a></td>
-  </tr>
-  <tr>
-    <td>Settlement</td>
-    <td>x402 payment challenges, usage metering, a reconcilable ledger, and
-    Stripe meter export. Billing for machine callers is a proxy concern
-    now, whether the caller is a crawler or an agent.
-    <a href="402-challenge.md">402-challenge.md</a></td>
-  </tr>
-  <tr>
-    <td>Extension</td>
-    <td>Configuration first: CEL for conditions, Lua and JavaScript for
-    transforms and shaping, WASM for compiled logic, all sandboxed with
-    watchdogs. <a href="scripting.md">scripting.md</a></td>
-  </tr>
-</table>
+<p>An origin's <code>action:</code> decides what serves the request. These
+fifteen are the complete set the config compiler accepts; anything else is
+a linked plugin, an extension-bundle hook, or a config error.</p>
 
-<h2>Where to start</h2>
+<div class="tablewrap"><table>
+  <tr><th>Action</th><th>What it does</th></tr>
+  <tr><td><code>proxy</code></td><td>Reverse proxy to one upstream: base-path stripping, Host and SNI overrides, retries with backoff, DNS service discovery, IP pinning.</td></tr>
+  <tr><td><code>load_balancer</code></td><td>Target pools with eight algorithms plus five custom strategies, three health layers, circuit breakers, blue-green and canary modes.</td></tr>
+  <tr><td><code>ai_proxy</code></td><td>The model gateway: OpenAI-compatible surface, 72 providers, aliasing, routing strategies, guardrails, budgets, semantic caching, local hosting.</td></tr>
+  <tr><td><code>mcp</code></td><td>The tool gateway: federated MCP servers, OpenAPI-derived tools, config-defined local tools, all governed through one catalog.</td></tr>
+  <tr><td><code>a2a</code></td><td>Agent-to-agent JSON-RPC with envelope trust, delegation caps, cycle detection, and agent-card rewriting.</td></tr>
+  <tr><td><code>websocket</code></td><td>WebSocket proxying with subprotocol negotiation; auth and policies run before the upgrade.</td></tr>
+  <tr><td><code>grpc</code></td><td>gRPC passthrough on HTTP/2, gRPC-Web translation, descriptor-driven REST transcoding.</td></tr>
+  <tr><td><code>graphql</code></td><td>GraphQL proxying with query-depth caps, an introspection toggle, and pre-upstream validation.</td></tr>
+  <tr><td><code>storage</code></td><td>Serves objects from S3, GCS, Azure Blob, or a local directory, with range requests and index files.</td></tr>
+  <tr><td><code>static</code></td><td>A fixed response from config: status, body, content type, headers.</td></tr>
+  <tr><td><code>redirect</code></td><td>301/302/307/308, including bulk lists compiled to O(1) lookups.</td></tr>
+  <tr><td><code>echo</code></td><td>Reflects the request back as JSON. The smoke-test action.</td></tr>
+  <tr><td><code>mock</code></td><td>Returns a configured JSON document; an API's shape before the upstream exists.</td></tr>
+  <tr><td><code>beacon</code></td><td>A one-pixel GIF, for tracking pixels with no upstream.</td></tr>
+  <tr><td><code>noop</code></td><td>Accepts and returns an empty 200. Scaffolding.</td></tr>
+</table></div>
+
+<p><a href="features.md">features.md</a> carries the same catalog with
+deeper links; <a href="architecture.md">architecture.md</a> shows where
+dispatch sits in the pipeline.</p>
+
+<h2 id="policies">Every policy type</h2>
+
+<p>Twenty-seven policy types share the <code>policies:</code> list and one
+enforcement pipeline. Grouped by the job you are hiring for:</p>
+
+<div class="tablewrap"><table>
+  <tr><th>Group</th><th>Types</th></tr>
+  <tr><td>Rate, volume, and budget</td><td><code>rate_limiting</code>, <code>rate_limit_budget</code>, <code>concurrent_limit</code>, <code>request_limit</code>, <code>ddos</code>, <code>ip_filter</code>, <code>agent_budget</code></td></tr>
+  <tr><td>Identity and access</td><td><code>object_authz</code>, <code>agent_class</code>, <code>a2a</code>, <code>csrf</code>, <code>security_headers</code></td></tr>
+  <tr><td>Content, validation, and DLP</td><td><code>request_validator</code>, <code>openapi_validation</code>, <code>waf</code>, <code>http_framing</code>, <code>sri</code>, <code>content_digest</code>, <code>page_shield</code>, <code>dlp</code>, <code>exposed_credentials</code></td></tr>
+  <tr><td>AI-specific</td><td><code>ai_crawl_control</code>, <code>prompt_injection_v2</code>, <code>semantic_constraint</code></td></tr>
+  <tr><td>Scripting-driven</td><td><code>expression</code> (CEL), <code>rego</code>, <code>assertion</code></td></tr>
+  <tr><td>Packs</td><td><code>owasp_api_top10</code> is not a twenty-eighth type; the compiler expands it into entries from the groups above and reports every item in the five-state manifest.</td></tr>
+</table></div>
+
+<p>Authentication is a separate axis on an origin's <code>auth:</code>
+block: <code>api_key</code>, <code>basic_auth</code>, <code>bearer</code>,
+<code>jwt</code>, <code>digest</code>, <code>forward_auth</code>,
+<code>oidc</code>, <code>bot_auth</code>, and <code>cap</code>, plus mTLS
+client verification at the listener. <a href="policy.md">policy.md</a> has
+a one-line job description and a doc link for every policy type.</p>
+
+<h2 id="scripting">Where custom logic attaches</h2>
+
+<p>Five engines run operator-supplied logic, all loaded from config, all
+sandboxed with watchdogs, all hot-reloadable. The extension story is
+configuration: nothing here requires building a binary.</p>
+
+<div class="tablewrap"><table>
+  <tr><th>Engine</th><th>Available at</th></tr>
+  <tr><td><b>CEL</b></td><td><code>expression</code> and <code>assertion</code> policies; rate-limit bucket keys and WAF persistent-block keys; forward-rule <code>when:</code> predicates; access-log custom fields; the <code>cel</code> response transform; the AI policy plane; MCP argument and result policies; MCP local-tool step conditions</td></tr>
+  <tr><td><b>Rego</b></td><td><code>rego</code> policies; request and response modifiers; MCP argument and result policies; extension-bundle policy hooks</td></tr>
+  <tr><td><b>Lua</b></td><td>Request and response modifiers; <code>lua</code> raw-body and <code>lua_json</code> transforms; WAF custom rules; access-log custom fields; response-cache key and admit events; MCP local-tool response shaping</td></tr>
+  <tr><td><b>JavaScript</b></td><td>Request and response modifiers; <code>javascript</code> and <code>js_json</code> transforms; WAF custom rules; access-log custom fields; response-cache events; extension bundles (JS or TypeScript); MCP tool-version adapters; MCP local-tool response shaping</td></tr>
+  <tr><td><b>WASM</b></td><td>The <code>wasm</code> body transform (WASI preview 1, opt-in per-request context); envelope-WASM extension-bundle hooks including AI routing; Proxy-Wasm HTTP filter chains</td></tr>
+</table></div>
+
+<p>Beyond inline scripts, an extension bundle packages logic as a
+versioned directory (JavaScript, TypeScript, or compiled WASM) loaded from
+disk or a digest-pinned git source: auth, policy, action, and transform
+hooks in the core pipeline, plus AI guardrail, tool-call, and routing
+hooks, and payment lifecycle hooks.
+<a href="scripting.md">scripting.md</a> carries the per-site contracts;
+<a href="plugins.md">plugins.md</a> and
+<a href="extension-bundles.md">extension-bundles.md</a> map the rest.</p>
+
+<h2 id="evidence">Evidence</h2>
+
+<p>Four surfaces, one principle: the record of what the proxy decided
+should be usable by someone who does not run the proxy.</p>
+
+<ul>
+  <li><b>Decision-audit records</b>: one per governance decision, gapless
+  sequence numbers, a versioned field contract
+  (<a href="decision-records.md">decision-records.md</a>), match positions
+  instead of matched text, and honest disposition (a detect-only hit never
+  claims the 403 it did not return).</li>
+  <li><b>Structured events</b>: thirteen event kinds on an internal bus
+  with SIEM egress (<a href="events.md">events.md</a>), covering
+  everything from guardrail triggers to refused egress dials.</li>
+  <li><b>Metrics</b>: Prometheus families under a published stability
+  contract (<a href="metrics-stability.md">metrics-stability.md</a>), so a
+  dashboard you build today does not break on upgrade; Grafana dashboards
+  and alert rules ship in the repo.</li>
+  <li><b>Access log and OTLP</b>: structured JSON access logs with custom
+  fields in CEL, Lua, or JavaScript, and OpenTelemetry export for traces,
+  metrics, and logs. The OTLP exporters themselves pass through the
+  proxy's egress gate and are re-verified on reload, because telemetry
+  that can leak the prompts it audits is a finding, not a feature.
+  (<a href="observability.md">observability.md</a>)</li>
+</ul>
+
+<h2 id="operations">Operating it</h2>
+
+<p>One YAML file drives everything, and the tooling around that file is
+where day-two actually lives:</p>
+
+<ul>
+  <li><b>Validation that names the knob</b>: <code>sbproxy validate</code>
+  refuses bad configs with the field path and the fix, and a knob that
+  cannot work in this release is refused at load rather than accepted and
+  ignored. Dead switches are how outages hide.</li>
+  <li><b>Plan before apply</b>: <code>sbproxy plan</code> previews what a
+  config will enforce, including the OWASP pack manifest, before traffic
+  sees it.</li>
+  <li><b>Config history</b>: a durable, content-addressed ring of every
+  applied config, browsable from the CLI
+  (<code>sbproxy config history</code>, <code>config show</code>), the
+  admin API, and the console, with secrets masked in every displayed view.
+  (<a href="configuration.md">configuration.md</a>)</li>
+  <li><b>Admin surface three ways</b>: a JSON API
+  (<a href="admin-api-reference.md">admin-api-reference.md</a>), an
+  embedded web console (<a href="admin-ui.md">admin-ui.md</a>), and the
+  same API served as MCP tools for conversational operations.</li>
+  <li><b>Hot reload</b> for nearly everything, with the config authority
+  model for fleets: a subscriber applies signed config bundles and refuses
+  a bundle whose references do not resolve.
+  (<a href="config-authority-drills.md">config-authority-drills.md</a>)</li>
+  <li><b>Kubernetes</b>: a native operator with CRDs and a reconcile loop,
+  alongside plain Docker and systemd deployment.
+  (<a href="operator-runbook.md">operator-runbook.md</a>)</li>
+</ul>
+
+<h2 id="settlement">Metering and settlement</h2>
+
+<p>Billing machine callers is a proxy concern now, whether the caller is a
+crawler reading your content or an agent spending tokens. SBproxy meters
+usage per key, tenant, and agent, keeps a reconcilable ledger (SQLite,
+with durable payment nonces so a settled request is served exactly once
+and a replay is refused), issues x402 payment challenges, and exports
+usage to Stripe meters. The
+<a href="402-challenge.md">402-challenge.md</a> walkthrough drives a
+payment end to end;
+<a href="../examples/ai-usage-ledger/">ai-usage-ledger</a> shows the
+reconciliation report an operator actually reads.</p>
+
+<h2 id="comparison">The comparison, condensed</h2>
+
+<div class="tablewrap"><table>
+  <tr><th>Class</th><th>The specialist</th><th>What they win</th><th>What we bring instead</th></tr>
+  <tr><td>APIs</td><td>Kong, edge CDNs</td><td>Plugin ecosystem, PoPs</td><td>Enforcement honesty: the OWASP pack's five-state manifest, BOLA enforcement with enumeration detection, DLP with positions in the audit trail.</td></tr>
+  <tr><td>MCP</td><td>StackOne, superglue (compose); MCP gateways (govern)</td><td>Deeper connector catalogs</td><td>The only place composition and per-step governance are the same feature, through one catalog with versioning and evidence.</td></tr>
+  <tr><td>Models</td><td>LiteLLM</td><td>Provider breadth</td><td>The model call as a governed boundary crossing: budgets, guardrails with span evidence, virtual keys, and settlement in the same pipeline as everything else.</td></tr>
+  <tr><td>Agents</td><td>None settled</td><td></td><td>Cryptographic trust tiers, A2A envelope skepticism, agent budgets, card rewriting. We think this class deserves a gateway before the incumbents notice it exists.</td></tr>
+  <tr><td>Crawlers</td><td>Cloudflare crawl control</td><td>Edge-scale blocking</td><td>The third option: detect, tier, meter, and charge, with settlement in the same data plane as the detection.</td></tr>
+</table></div>
+
+<h2 id="start">Where to start</h2>
 
 <pre><code>curl -fsSL https://download.sbproxy.dev | sh
 sbproxy validate sb.yml
