@@ -158,6 +158,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [security.md](security.md) - the security map: what the gateway enforces, what stays with your services, and which gaps are real.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
 - [api-security.md](api-security.md) - API threat classes and the policy configuration for each, from object-level authorization to bot traffic.
+- [owasp-api-top10.md](owasp-api-top10.md) - the `owasp_api_top10` policy pack: what each of the ten OWASP API Security Top 10 (2023) items synthesizes, its default posture and why, the report_only-to-enforce path, what an operator still has to supply, and the honest not-covered items.
 - [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - the eight gateway-layer controls no published list covers, and a row-by-row OWASP LLM Top 10 (2026) mapping, each claim backed by a named test or signal and every limit paired with its rationale.
 - [mcp-security-coverage.md](mcp-security-coverage.md) - a row-by-row OWASP MCP Top 10 mapping, coverage stated as full, partial, or out of gateway scope, each claim backed by a named test or config example.
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).

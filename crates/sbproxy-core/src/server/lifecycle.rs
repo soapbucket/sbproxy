@@ -5993,6 +5993,7 @@ origins:
                     },
                 },
             }),
+            owasp_pack_manifest: None,
         };
 
         let compiled = CompiledConfig {

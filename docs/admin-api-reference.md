@@ -27,7 +27,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
 - [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
-- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level
+- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
 - [Cache admin](#cache-admin) - response cache and key-policy cache
 - [Cluster control plane](#cluster-control-plane) - status, deployments, enrollment, replicated state
@@ -1549,6 +1549,65 @@ overwritten.
 | `200` | The effective document was assembled. |
 | `500` | The merge failed, so the node is serving whatever it last applied. Body carries `code: effective_config_unavailable` and the layers. |
 | `503` | The admin server has no `config_path` wired. |
+
+---
+
+### `GET /admin/owasp-api-pack`
+
+Per-origin outcome of expanding each origin's `owasp_api_top10` policy
+pack entry (see [configuration.md](configuration.md#owasp_api_top10-pack)
+and [owasp-api-top10.md](owasp-api-top10.md)), read straight off the
+live compiled pipeline. The same per-item rows also render in `sbproxy
+plan`'s text output for a proposed config carrying the pack.
+
+An origin with no `owasp_api_top10` policy is absent from `origins`
+entirely. A config with no pack anywhere returns `200 {"origins":{}}`.
+
+```json
+{
+  "origins": {
+    "api.example.com": {
+      "enabled": ["api1", "api4"],
+      "posture": "report_only",
+      "items": [
+        {
+          "item": "api1",
+          "title": "Broken Object Level Authorization",
+          "state": "needs_operator_input",
+          "reason": "synthesized object_authz with empty object_rules...",
+          "synthesized": ["object_authz"]
+        },
+        {
+          "item": "api4",
+          "title": "Unrestricted Resource Consumption",
+          "state": "needs_operator_input",
+          "reason": "request_limit: synthesized... rate_limiting: NOT synthesized...",
+          "synthesized": ["request_limit", "concurrent_limit"]
+        }
+      ]
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `origins.<hostname>.enabled` | array of strings | Item ids named in `enable` (or all ten, for `enable: all`), in `api1`..`api10` order. |
+| `origins.<hostname>.posture` | string | The pack-wide `posture` this origin's entry declared (`enforce` or `report_only`; `report_only` when omitted). A `per_item.<item>.posture` override changes what that one item's synthesized JSON carries, not this field. |
+| `origins.<hostname>.items[]` | array of objects | One row per enabled item, in `api1`..`api10` order. Never a silent no-op: `enable: all` always produces ten rows. |
+| `items[].item` | string | The item's canonical id, `api1`..`api10`. |
+| `items[].title` | string | The item's official OWASP API Security Top 10 (2023) title, verbatim. |
+| `items[].state` | string | `enforced`, `report_only`, `needs_operator_input`, `operator_authored`, or `not_covered`. See [owasp-api-top10.md](owasp-api-top10.md#the-states-briefly) for what each means. |
+| `items[].reason` | string | One sentence or more, safe to show an operator verbatim. |
+| `items[].synthesized` | array of strings | Config `type` strings the pack added to this origin's `policies:` or `transforms:` for this item. Empty when the pack added nothing (an operator back-off, a `not_covered` item, or a gap named in `reason`). |
+
+Read-only operators may call this; it has no write path.
+
+| Status | When |
+|---|---|
+| `200` | Always, once authenticated. |
+| `401` | Missing or invalid credentials. |
+| `405` | Any method other than `GET`. |
 
 ---
 

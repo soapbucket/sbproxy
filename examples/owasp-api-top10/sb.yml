@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The OWASP API Top 10 policy pack, enable: all.
+#
+# `type: owasp_api_top10` is a pseudo-policy: the compiler reads it,
+# expands it into real synthesized policies (object_authz, request_limit,
+# rate_limiting, concurrent_limit, ddos_protection, security_headers,
+# http_framing), flips the origin's own expose_openapi flag, and removes
+# the pseudo-entry before anything else sees it. `enable: all` turns on
+# all ten OWASP API Security Top 10 (2023) items; with no `posture:` set,
+# the pack-wide default is report_only. Four items enforce regardless of
+# that default anyway, because their controls have no report-only knob
+# (request_limit, rate_limiting, concurrent_limit, ddos_protection,
+# security_headers, http_framing) or run outside the policy chain
+# entirely (the SSRF guard). See README.md for the full walkthrough and
+# docs/owasp-api-top10.md for what every item does and does not cover.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Test (see README.md for the full sequence and expected output):
+#   curl -i -H 'Host: owasp-pack.local' http://127.0.0.1:8080/get
+#   curl -i -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+origins:
+  "owasp-pack.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: owasp_api_top10
+        enable: all

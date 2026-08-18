@@ -225,6 +225,12 @@ pub struct CompiledOrigin {
     /// tenant-scope (or proxy-scope) PII pass at config-load. `None`
     /// keeps the origin inheriting whatever the parent scope decided.
     pub observability: Option<crate::types::OriginObservabilityConfig>,
+    /// WOR-2491: per-item outcome of expanding this origin's
+    /// `owasp_api_top10` pack entry, computed by
+    /// `owasp_api_pack::expand_owasp_pack` in `compiler::compile_origin`.
+    /// `None` means the origin had no `owasp_api_top10` policy. See
+    /// [`crate::owasp_api_pack::PackManifest`].
+    pub owasp_pack_manifest: Option<crate::owasp_api_pack::PackManifest>,
 }
 
 /// Per-purpose egress authorizers compiled once from the top-level

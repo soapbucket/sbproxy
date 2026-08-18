@@ -855,6 +855,7 @@ mod tests {
                 outbound_web_bot_auth: false,
                 observability: None,
                 attestation: None,
+                owasp_pack_manifest: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

@@ -3245,6 +3245,48 @@ policies:
 | `expression` | string | required | CEL expression evaluated for its truth value |
 | `name` | string | "assertion" | Human-readable name attached to assertion log entries |
 
+### owasp_api_top10 (pack)
+
+Not one of the twenty-seven policy types above. `owasp_api_top10` is a
+pseudo-policy: the compiler reads it before any policy is compiled,
+expands it into the real synthesized policies and transforms named
+below, and removes this entry so it never reaches a policy module's own
+parser. See [owasp-api-top10.md](owasp-api-top10.md) for what every
+`api1`..`api10` item synthesizes and why, and
+[api-security.md](api-security.md#the-owasp_api_top10-pack) for the
+same coverage configured by hand.
+
+```yaml
+policies:
+  - type: owasp_api_top10
+    enable: all                # or a list: [api1, api4, api5, api7, api8]
+    posture: report_only       # pack-wide default; also the default when omitted
+    per_item:
+      api1:
+        posture: enforce
+      api3:
+        response_exclude_fields: [ssn, internal_notes]
+      api4:
+        rps: 50                # confirm proxy.trusted_proxies first; see below
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable` | `"all"` or list | required | `"all"` turns on all ten items; a list names a subset by id (`api1`..`api10`, case-insensitive). Duplicates and unknown ids fail at compile time with the accepted list. |
+| `posture` | string | `report_only` | Pack-wide default: `enforce` or `report_only`. Threads into a synthesized policy's own report-only knob when one exists. Only `api1`/`api5`'s shared `object_authz` entry has one today; every other synthesized policy in this pack enforces (or, for `security_headers`, injects) regardless of posture. |
+| `per_item.<item>.posture` | string | pack-wide `posture` | Overrides posture for one enabled item. Refused if `<item>` is not also named in `enable`. |
+| `per_item.api3.response_exclude_fields` | list of strings | unset | `api3`-only. Field names to strip from the **top level** of JSON *object* response bodies (an array body, or a nested field, is out of scope); supplying this synthesizes a `json_projection` transform with `failure_posture: closed`. Refused on any other item, and refused if given as an empty list. |
+| `per_item.api4.rps` | number | unset | `api4`-only. Requests-per-second budget for the pack's `rate_limiting` and `ddos_protection` pieces; supplying it is what synthesizes both. Both key on caller IP by default - confirm `proxy.trusted_proxies` covers any load balancer in front of this origin before setting this, or every real client collapses to one shared budget. Refused on any other item, and refused if not a positive number. |
+
+The origin already authoring a policy of the type an item would
+synthesize backs that item off entirely (state `operator_authored` in
+the manifest); an origin authoring `object_authz` itself, for example,
+gets no `api1`/`api5` synthesis on top of it. The resolved outcome for
+every enabled item, including the ones with no synthesis wired, is
+available at `GET /admin/owasp-api-pack`
+([admin-api-reference.md](admin-api-reference.md#get-adminowasp-api-pack))
+and in `sbproxy plan`'s text output.
+
 ---
 
 ## Transforms

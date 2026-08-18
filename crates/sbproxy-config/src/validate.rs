@@ -141,7 +141,14 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "noop",
 ];
 
-/// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`.
+/// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`,
+/// plus `owasp_api_top10` (WOR-2491): a pseudo-policy consumed and
+/// removed by `sbproxy_config::owasp_api_pack::expand_owasp_pack`
+/// before an origin's policies ever reach `compile_policy`'s
+/// type-string match arms. It compiles cleanly as a real origin
+/// policy entry, so this plan-time list treats it as one; leaving it
+/// out would flag every config that uses the pack with a spurious
+/// `unknown-policy-type` error.
 pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "rego",
     "rate_limit_budget",
@@ -180,6 +187,8 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     // See `crates/sbproxy-modules/src/policy/semantic_constraint.rs`.
     "semantic_constraint",
     "agent_budget",
+    // WOR-2491: see this const's own doc comment above.
+    "owasp_api_top10",
 ];
 
 /// Built-in OSS transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.
@@ -319,6 +328,12 @@ pub fn validate(config: &ConfigFile, opts: &ValidationOptions) -> Vec<PlanFindin
     for host in &hosts {
         let origin = &config.origins[*host];
         check_unknown_types(host, origin, opts, &mut findings);
+    }
+
+    // -- owasp-api-pack (WOR-2491 review round, M2) --
+    for host in &hosts {
+        let origin = &config.origins[*host];
+        check_owasp_pack_config(host, origin, &mut findings);
     }
 
     // -- acme --
@@ -681,6 +696,53 @@ fn check_unknown_types(
                 });
             }
         }
+    }
+}
+
+/// WOR-2491 review round, M2: `sbproxy_config::plan`'s text preview
+/// (`owasp_pack_preview`) runs the real
+/// `owasp_api_pack::expand_owasp_pack` expander over the proposed
+/// config's `owasp_api_top10` entry to render the per-item rows, but
+/// silently drops an `Err` (a malformed entry - an unknown item name,
+/// a duplicate `enable` entry, an out-of-range `per_item.api4.rps`,
+/// and so on) rather than surfacing it, because that preview has
+/// nowhere to put a plan-time finding. This check runs the same
+/// expander here instead, over a scratch clone of the origin's own
+/// `policies`/`transforms`/`expose_openapi`/action type so the real
+/// fields are never mutated, and turns a refusal into a real
+/// `PlanFinding` an operator sees under `sbproxy plan`'s
+/// `Validation:` section - the same severity `unknown-policy-type`
+/// already uses, since both mean "this config will not compile".
+///
+/// A well-formed entry (or no entry at all) adds nothing here; the
+/// expander's own synthesis and manifest construction have no failure
+/// mode once the input parses and validates, so there is nothing left
+/// to check past `Err`.
+fn check_owasp_pack_config(host: &str, origin: &RawOriginConfig, out: &mut Vec<PlanFinding>) {
+    let has_pack_entry = origin
+        .policies
+        .iter()
+        .any(|p| type_of(p) == Some("owasp_api_top10"));
+    if !has_pack_entry {
+        return;
+    }
+    let mut policies = origin.policies.clone();
+    let mut transforms = origin.transforms.clone();
+    let mut expose_openapi = origin.expose_openapi;
+    let action_type = type_of(&origin.action).unwrap_or("");
+    if let Err(error) = crate::owasp_api_pack::expand_owasp_pack(
+        host,
+        &mut policies,
+        &mut transforms,
+        &mut expose_openapi,
+        action_type,
+    ) {
+        out.push(PlanFinding {
+            severity: Severity::Error,
+            rule_id: "invalid-owasp-api-pack-config".to_string(),
+            path: format!("origins.{host}.policies"),
+            message: format!("{error:#}"),
+        });
     }
 }
 
@@ -1080,6 +1142,85 @@ origins:
         assert_eq!(unknown.len(), 1, "got findings: {findings:?}");
         assert!(unknown[0].path.contains("policies[1]"));
         assert_eq!(unknown[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn owasp_api_top10_pack_entry_is_not_flagged_unknown() {
+        // WOR-2491 task 4: `owasp_api_top10` compiles cleanly as a real
+        // origin policy (it's a pseudo-policy consumed by
+        // `owasp_api_pack::expand_owasp_pack`, not dispatched by
+        // `compile_policy`); plan-time validation must not flag it as
+        // an unknown policy type.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: all
+"#;
+        let cfg = parse(yaml);
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let unknown: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "unknown-policy-type")
+            .collect();
+        assert!(unknown.is_empty(), "got findings: {findings:?}");
+    }
+
+    #[test]
+    fn malformed_owasp_api_pack_config_is_a_real_plan_finding() {
+        // WOR-2491 review round, M2: `sbproxy plan`'s text preview
+        // silently drops an expander error; `validate()` must not.
+        // `api11` is not one of the ten items.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: [api11]
+"#;
+        let cfg = parse(yaml);
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let pack_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "invalid-owasp-api-pack-config")
+            .collect();
+        assert_eq!(pack_findings.len(), 1, "got findings: {findings:?}");
+        assert_eq!(pack_findings[0].severity, Severity::Error);
+        assert_eq!(pack_findings[0].path, "origins.api.example.com.policies");
+        assert!(
+            pack_findings[0].message.contains("api11"),
+            "{}",
+            pack_findings[0].message
+        );
+    }
+
+    #[test]
+    fn well_formed_owasp_api_pack_config_produces_no_pack_finding() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: all
+"#;
+        let cfg = parse(yaml);
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.rule_id != "invalid-owasp-api-pack-config"),
+            "got findings: {findings:?}"
+        );
     }
 
     #[test]

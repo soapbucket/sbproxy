@@ -1304,6 +1304,76 @@ fn origin_change_reason(host: &str, old: &serde_json::Value, new: &serde_json::V
     format!("origin '{host}' changed")
 }
 
+/// Best-effort preview of one origin's `owasp_api_top10` pack outcome
+/// (WOR-2491 task 4), computed straight from the proposed JSON
+/// snapshot the diff walker already captured on the entry's `new`
+/// field. Calls the same `owasp_api_pack::expand_owasp_pack` function
+/// `compiler::compile_origin` calls, on the same inputs (`policies`,
+/// `transforms`, `expose_openapi`, the action's `type` string) read
+/// back off that snapshot, so the rows this renders match what
+/// `CompiledOrigin::owasp_pack_manifest` carries once the config is
+/// actually applied.
+///
+/// Returns `None` when the origin has no `owasp_api_top10` policy, or
+/// when the pack entry is malformed. A malformed entry is not
+/// silently swallowed: `validate::check_owasp_pack_config` runs the
+/// same expander over the *proposed* config inside `validate()`
+/// (WOR-2491 review round, M2) and turns an `Err` into a real
+/// [`PlanFinding`] on the same report, so an operator sees the error
+/// under `Validation:` even though this preview has nothing to render
+/// for that origin.
+///
+/// Renders pre-interpolation values. The CLI's `plan` command parses
+/// `new`'s originating `ConfigFile` straight from the on-disk YAML
+/// text (`sbproxy::load_and_validate_with`): it calls `compile_config`
+/// once to validate that the document compiles, then re-parses the
+/// same, still-uninterpolated bytes into the `ConfigFile` this diff
+/// walker actually reads - `compile_config`'s `${VAR}`-expanded result
+/// is discarded, kept only for its `Result`. A `per_item.api3.response_exclude_fields`
+/// entry (or `per_item.api4.rps`, or any other pack field) written
+/// with `${ENV_VAR}` syntax therefore renders here as the literal
+/// placeholder text, not the resolved value; the compiled origin's
+/// real manifest (`CompiledOrigin::owasp_pack_manifest`, and the
+/// `GET /admin/owasp-api-pack` endpoint that reads it) always reflects
+/// the resolved value, since that path runs `compile_config`'s output
+/// forward instead of discarding it.
+fn owasp_pack_preview(
+    host: &str,
+    new: &serde_json::Value,
+) -> Option<crate::owasp_api_pack::PackManifest> {
+    let policies = new.get("policies")?.as_array()?;
+    let has_pack = policies
+        .iter()
+        .any(|p| p.get("type").and_then(|v| v.as_str()) == Some("owasp_api_top10"));
+    if !has_pack {
+        return None;
+    }
+    let mut policies = policies.clone();
+    let mut transforms: Vec<serde_json::Value> = new
+        .get("transforms")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut expose_openapi = new
+        .get("expose_openapi")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let action_type = new
+        .get("action")
+        .and_then(|a| a.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    crate::owasp_api_pack::expand_owasp_pack(
+        host,
+        &mut policies,
+        &mut transforms,
+        &mut expose_openapi,
+        action_type,
+    )
+    .ok()
+    .flatten()
+}
+
 /// Render a [`PlanReport`] as a Terraform-style human-readable text
 /// block. The format is deliberately stable but not promised; tooling
 /// should consume `--format json` instead.
@@ -1312,6 +1382,13 @@ fn origin_change_reason(host: &str, old: &serde_json::Value, new: &serde_json::V
 /// validation), they print after the diff under a `Validation:`
 /// header so an operator sees errors and warnings in the same place
 /// as the change list.
+///
+/// An added or changed origin whose proposed config carries an
+/// `owasp_api_top10` policy (WOR-2491 task 4) gets an indented
+/// sub-block naming every enabled item's canonical name, official
+/// OWASP title, resolved state, and reason - the same rows
+/// `GET /admin/owasp-api-pack` returns for the live compiled origin.
+/// See `owasp_pack_preview`.
 pub fn render_text(report: &PlanReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1335,6 +1412,27 @@ pub fn render_text(report: &PlanReport) -> String {
             BlastRadius::Breaking => "breaking",
         };
         let _ = writeln!(&mut out, "  {sigil} {} [{label}] {}", e.path, e.reason);
+        if matches!(e.kind, PlanKind::Added | PlanKind::Changed) {
+            if let (Some(host), Some(new)) = (e.path.strip_prefix("origins."), e.new.as_ref()) {
+                if let Some(manifest) = owasp_pack_preview(host, new) {
+                    let _ = writeln!(
+                        &mut out,
+                        "      owasp_api_top10 pack (posture: {}):",
+                        manifest.posture.label()
+                    );
+                    for item_entry in &manifest.entries {
+                        let _ = writeln!(
+                            &mut out,
+                            "        {} {} [{}] {}",
+                            item_entry.item.canonical_name(),
+                            item_entry.item.title(),
+                            item_entry.state.label(),
+                            item_entry.reason
+                        );
+                    }
+                }
+            }
+        }
     }
     if !report.entries.is_empty() {
         let _ = writeln!(
@@ -1434,6 +1532,19 @@ origins:
       url: https://upstream.example.com
     transforms:
       - type: noop
+"#;
+
+    // WOR-2491 task 4: same origin as ORIGIN_BASE, plus an
+    // `owasp_api_top10` pack entry enabling every item.
+    const ORIGIN_WITH_OWASP_PACK_ALL: &str = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: all
 "#;
 
     #[test]
@@ -1553,6 +1664,95 @@ origins:
         let report = plan(&a, &b);
         let text = render_text(&report);
         assert!(text.contains("+ origins.www.example.com"), "got {text:?}");
+    }
+
+    // --- WOR-2491 task 4: owasp_api_top10 pack rows in plan text ----
+
+    #[test]
+    fn render_text_names_every_non_enforced_owasp_pack_item() {
+        let a = parse(ORIGIN_BASE);
+        let b = parse(ORIGIN_WITH_OWASP_PACK_ALL);
+        let report = plan(&a, &b);
+        let text = render_text(&report);
+        assert!(
+            text.contains("owasp_api_top10 pack (posture: report_only):"),
+            "got {text:?}"
+        );
+        // Every non-enforced item is named with its canonical name,
+        // official OWASP title, and resolved state. api4 belongs here
+        // (WOR-2491 review round, mechanical fix): ORIGIN_WITH_OWASP_PACK_ALL
+        // sets no per_item.api4.rps, so rate_limiting/ddos_protection
+        // are not synthesized and the item reports
+        // needs_operator_input, same as api1/api3/api5 - not
+        // `enforced`, which was the pack's now-superseded pre-B1-fix
+        // default.
+        for (name, title, state) in [
+            (
+                "api1",
+                "Broken Object Level Authorization",
+                "needs_operator_input",
+            ),
+            ("api2", "Broken Authentication", "not_covered"),
+            (
+                "api3",
+                "Broken Object Property Level Authorization",
+                "needs_operator_input",
+            ),
+            (
+                "api4",
+                "Unrestricted Resource Consumption",
+                "needs_operator_input",
+            ),
+            (
+                "api5",
+                "Broken Function Level Authorization",
+                "needs_operator_input",
+            ),
+            (
+                "api6",
+                "Unrestricted Access to Sensitive Business Flows",
+                "not_covered",
+            ),
+            ("api10", "Unsafe Consumption of APIs", "not_covered"),
+        ] {
+            let row = format!("{name} {title} [{state}]");
+            assert!(text.contains(&row), "missing row {row:?} in {text:?}");
+        }
+        // Enforced items are also present (a superset of the
+        // non-enforced set the contract requires named).
+        for (name, title) in [
+            ("api7", "Server Side Request Forgery"),
+            ("api8", "Security Misconfiguration"),
+            ("api9", "Improper Inventory Management"),
+        ] {
+            let row = format!("{name} {title} [enforced]");
+            assert!(text.contains(&row), "missing row {row:?} in {text:?}");
+        }
+    }
+
+    #[test]
+    fn render_text_owasp_pack_reasons_are_present_not_just_state() {
+        let a = parse(ORIGIN_BASE);
+        let b = parse(ORIGIN_WITH_OWASP_PACK_ALL);
+        let report = plan(&a, &b);
+        let text = render_text(&report);
+        // api2's reason names the operator-choice gap, not just the state.
+        assert!(
+            text.contains("strong authentication is an operator choice"),
+            "got {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_text_no_pack_section_when_origin_has_no_pack() {
+        let a = parse(ORIGIN_BASE);
+        let b = parse(ORIGIN_WITH_TRANSFORM);
+        let report = plan(&a, &b);
+        let text = render_text(&report);
+        assert!(
+            !text.contains("owasp_api_top10 pack"),
+            "no pack entry means no pack section: {text:?}"
+        );
     }
 
     // --- WOR-180 step 4 matrix tests --------------------------------

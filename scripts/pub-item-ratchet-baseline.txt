@@ -436,6 +436,31 @@
 # why this needed its own, always-compiled entry point rather than a
 # visibility change to the existing one.
 
+# 2026-08-17 (WOR-2491 pack skeleton): 294 -> 296. `PackItem` and
+# `PackItemState` (crates/sbproxy-config/src/owasp_api_pack.rs) are new
+# `pub enum`s named only from this file's own tests today; nothing
+# outside the file calls them yet. Not narrowable to `pub(crate)`: both
+# are field types on `PackManifestEntry`, itself a field type on
+# `PackManifest`, which `CompiledOrigin::owasp_pack_manifest` (a `pub`
+# field on a `pub` struct in `sbproxy-config`, one of this workspace's
+# three public crates) carries specifically so a later task can surface
+# the pack's per-item outcome to an operator, most plausibly from a
+# different crate. Narrowing either enum would leak a private type
+# through that public field and trip `private_interfaces` under
+# `-D warnings`. Their real caller is task 4 of the WOR-2491 plan, which
+# has not landed yet; this is the same shape WOR-1898/WOR-1980 faced and
+# resolved by raising the baseline rather than wiring a consumer early.
+
+# 2026-08-17 (WOR-2491 task 4 + review round): the real caller named
+# above has landed. `crates/sbproxy-core/src/admin.rs`'s
+# `GET /admin/owasp-api-pack` handler and
+# `crates/sbproxy-config/src/plan.rs`'s `render_text` both now read
+# `PackItem`/`PackItemState` off `CompiledOrigin::owasp_pack_manifest`
+# from outside `owasp_api_pack.rs`. The count stays 296: no narrowing
+# was possible or needed, the justification above was simply ahead of
+# its own consumer landing. Left here as the closing note on that
+# entry rather than a new baseline bump, since the count did not move.
+
 # 2026-08-17 (WOR-2481): 295 -> 296. One new item:
 # `sbproxy_observe::telemetry::record_active_boot_telemetry_endpoint`, a
 # `#[doc(hidden)]` `pub fn` recording which endpoint each boot-only OTLP
