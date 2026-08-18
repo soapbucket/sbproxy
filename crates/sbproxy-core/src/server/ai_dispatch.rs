@@ -2991,7 +2991,7 @@ mod pii_guardrail_spans_tests {
 
     #[test]
     fn non_pii_guardrail_name_returns_no_spans() {
-        let guardrails = vec![pii_pipeline_guardrail()];
+        let guardrails = [pii_pipeline_guardrail()];
         let (spans, dropped) =
             pii_guardrail_spans(guardrails.iter(), Some("jailbreak"), "user@example.com");
         assert!(spans.is_empty());
@@ -3012,7 +3012,7 @@ mod pii_guardrail_spans_tests {
 
     #[test]
     fn pii_guardrail_name_finds_the_configured_guardrail_and_returns_its_spans() {
-        let guardrails = vec![pii_pipeline_guardrail()];
+        let guardrails = [pii_pipeline_guardrail()];
         let content = "contact user@example.com please";
         let (spans, dropped) = pii_guardrail_spans(guardrails.iter(), Some("pii"), content);
         assert_eq!(dropped, 0);
