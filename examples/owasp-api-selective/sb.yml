@@ -8,6 +8,23 @@
 # one per_item field that is not a posture: response_exclude_fields,
 # which wires the pack's response-side json_projection transform.
 #
+# api4's per_item.rps is set here (unlike examples/owasp-api-top10/,
+# which deliberately leaves it unset): rate_limiting and
+# ddos_protection both key on the caller's observed IP by default, and
+# behind a load balancer with no proxy.trusted_proxies configured
+# every real client collapses to the load balancer's single IP,
+# sharing one budget. It is safe to set a number here only because
+# this example's `static` action has no load balancer in front of it -
+# confirm the same for your own origin (or that proxy.trusted_proxies
+# covers it) before copying this value. See
+# docs/owasp-api-top10.md#api4-unrestricted-resource-consumption.
+#
+# api8's security_headers piece is not synthesized on this origin:
+# security_headers only takes effect in Pingora's response-phase
+# filter, and a `static` action answers entirely in the request phase
+# and never reaches it. http_framing (request-phase, action agnostic)
+# still synthesizes and still enforces. See README.md.
+#
 # A self-contained `static` action seeds a four-field customer record so
 # the example runs offline; response_exclude_fields strips two of them
 # before the client ever sees them.
@@ -20,6 +37,11 @@
 
 proxy:
   http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
 
 origins:
   "owasp-pack-selective.local":
@@ -42,3 +64,5 @@ origins:
             posture: enforce
           api3:
             response_exclude_fields: [ssn, internal_notes]
+          api4:
+            rps: 50

@@ -46,9 +46,10 @@
 use std::net::IpAddr;
 
 use sbproxy_config::compile_config;
+use sbproxy_config::types::FailureMode;
 use sbproxy_modules::policy::{ConcurrentLimitPolicy, HttpFramingPolicy, RequestLimitPolicy};
 use sbproxy_modules::{DdosCheckResult, DdosPolicy, ObjectAuthzPolicy, ObjectAuthzPrincipal};
-use sbproxy_modules::{RateLimitPolicy, SecHeadersPolicy};
+use sbproxy_modules::{RateLimitPolicy, SecHeadersPolicy, TransformConfig};
 
 /// Compiles one origin with the given `policies:` YAML block (indented
 /// as a `policies:` list body) and returns the synthesized JSON entry
@@ -107,7 +108,16 @@ fn api3_response_exclude_yaml() -> &'static str {
 }
 
 fn api4_yaml() -> &'static str {
-    "      - type: owasp_api_top10\n        enable: [api4]\n"
+    // WOR-2491 review round, B1: rate_limiting and ddos_protection
+    // both key on caller IP by default and are only synthesized when
+    // the operator supplies per_item.api4.rps (the pack no longer
+    // guesses a blind default - see owasp_api_pack.rs's own unit
+    // tests for the outage class this avoids). 100 is chosen here
+    // because it happens to match ddos.rs's own built-in per-IP
+    // default, so `api4_ddos_default_blocks_after_its_built_in_per_ip_threshold`
+    // below still exercises the same 100/s boundary either way.
+    "      - type: owasp_api_top10\n        enable: [api4]\n        per_item:\n          \
+     api4:\n            rps: 100\n"
 }
 
 fn api5_yaml() -> &'static str {
@@ -200,10 +210,12 @@ fn api4_concurrent_limit_default_refuses_past_its_configured_max() {
 
 #[test]
 fn api4_ddos_default_blocks_after_its_built_in_per_ip_threshold() {
-    // The pack synthesizes an empty `{"type": "ddos_protection"}`,
-    // relying entirely on ddos.rs's own defaults:
-    // `default_ddos_threshold()` is 100 requests/second per IP in a
-    // sliding 1-second window.
+    // WOR-2491 review round, B1: the pack synthesizes
+    // `{"type": "ddos_protection", "requests_per_second": 100}` from
+    // `api4_yaml()`'s `per_item.api4.rps: 100`; `block_duration_secs`
+    // and the sliding-window width stay at ddos.rs's own module
+    // defaults (chosen deliberately so this test still exercises the
+    // same 100/s boundary `default_ddos_threshold()` documents).
     let json = synthesized_policy(api4_yaml(), "ddos_protection");
     let policy = DdosPolicy::from_config(json).expect("valid ddos_protection config");
     let ip: IpAddr = "203.0.113.7".parse().expect("valid test IP");
@@ -382,5 +394,59 @@ fn api3_response_projection_strips_the_declared_fields_through_the_real_transfor
         after.get("name").and_then(|v| v.as_str()),
         Some("ok"),
         "fields outside the exclude list must survive: {after}"
+    );
+}
+
+#[test]
+fn api3_response_projection_leaves_an_array_body_unchanged() {
+    // WOR-2491 review round, B2: `JsonProjectionTransform::apply`
+    // filters top-level *object* keys only; a JSON array response
+    // body - a very common real API shape - passes through
+    // unfiltered even when it contains the exact field names the
+    // pack was told to strip. This is the honest boundary
+    // `expand_api3_entry`'s doc comment and every doc surface now
+    // name explicitly, proven here through the real synthesized entry
+    // and the real dispatcher, not a hand-copied transform.
+    let json = synthesized_transform(api3_response_exclude_yaml(), "json_projection");
+    let transform =
+        sbproxy_modules::compile_transform(&json).expect("valid json_projection config");
+
+    let original = br#"[{"id":"42","ssn":"000-00-0000","internal_notes":"flagged"}]"#;
+    let mut body = bytes::BytesMut::from(&original[..]);
+    transform
+        .apply(&mut body, Some("application/json"))
+        .expect("json_projection apply must succeed even though it does nothing here");
+
+    let before: serde_json::Value = serde_json::from_slice(original).expect("valid JSON fixture");
+    let after: serde_json::Value =
+        serde_json::from_slice(&body).expect("transform output must still be valid JSON");
+    assert_eq!(
+        after, before,
+        "an array response body is out of scope for json_projection and must pass through byte \
+         for byte, ssn and internal_notes included: {after}"
+    );
+}
+
+#[test]
+fn api3_response_projection_synthesizes_closed_failure_posture() {
+    // WOR-2491 review round, B2: without an explicit `failure_posture`
+    // key, `TransformConfig`'s own default is `open` (a body that is
+    // oversized or fails to parse ships raw and unfiltered - exactly
+    // the leak this pack piece exists to prevent). Parses the
+    // synthesized entry through the same `TransformConfig` wrapper
+    // `sbproxy-core`'s pipeline uses to resolve the failure axis
+    // (`server/proxy_http.rs`'s pre-capture size refusal and
+    // `action_dispatch.rs`'s plugin-action path both key off
+    // `TransformConfig::failure_posture()`), so this is a real proof
+    // the wire value round-trips to `Closed`, not an assertion against
+    // a hand-copied literal. Fails red without the `"failure_posture":
+    // "closed"` key `expand_api3_entry` now sets.
+    let json = synthesized_transform(api3_response_exclude_yaml(), "json_projection");
+    let wrapper: TransformConfig =
+        serde_json::from_value(json).expect("synthesized entry parses as a TransformConfig");
+    assert_eq!(
+        wrapper.failure_posture(),
+        FailureMode::Closed,
+        "an oversized or unparseable response body must be refused, not shipped raw"
     );
 }

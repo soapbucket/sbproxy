@@ -3943,11 +3943,29 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     // relevant list. Must run before `policy_configs`/`transform_configs`/
     // `expose_openapi` move or copy these fields into the compiled
     // origin below.
+    //
+    // Review round (WOR-2491, M1): read `config.action`'s own `type`
+    // string here, before it moves into `action_config` below, so the
+    // expander can tell whether this origin's action reaches
+    // Pingora's response-phase filter at all. `api8`'s
+    // `security_headers` piece only takes effect there
+    // (`server/proxy_http.rs::response_filter`); an action handled
+    // entirely inside `request_filter` (`static`, `mock`, `echo`,
+    // `beacon`, `redirect`, `mcp`, `noop`, `ai_proxy`, `storage`, any
+    // plugin action - see `action_dispatch.rs::handle_action`'s own
+    // match) never reaches it, so synthesizing that piece there would
+    // claim coverage nothing enforces.
+    let action_type = config
+        .action
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let owasp_pack_manifest = crate::owasp_api_pack::expand_owasp_pack(
         hostname,
         &mut config.policies,
         &mut config.transforms,
         &mut config.expose_openapi,
+        action_type,
     )?;
 
     let mut compiled = CompiledOrigin {
@@ -11118,7 +11136,12 @@ origins:
     // --- WOR-2491 task 2: api4, api5, api7, api8 wired at compile time ---
 
     #[test]
-    fn owasp_pack_api4_synthesizes_four_conservative_resource_policies() {
+    fn owasp_pack_api4_synthesizes_only_the_ip_safe_policies_without_rps() {
+        // WOR-2491 review round, B1: rate_limiting and ddos_protection
+        // both key on caller IP by default and are no longer
+        // synthesized without an operator-supplied per_item.api4.rps
+        // budget - see owasp_api_pack.rs's own unit tests for the
+        // outage class this avoids.
         let yaml = r#"
 origins:
   api.example.com:
@@ -11137,10 +11160,48 @@ origins:
             .map(|p| p.get("type").and_then(|v| v.as_str()).unwrap_or(""))
             .collect();
         assert!(types.contains(&"request_limit"), "{types:?}");
+        assert!(types.contains(&"concurrent_limit"), "{types:?}");
+        assert!(!types.contains(&"rate_limiting"), "{types:?}");
+        assert!(!types.contains(&"ddos_protection"), "{types:?}");
+        assert!(!types.contains(&"owasp_api_top10"), "{types:?}");
+
+        let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api4)
+            .expect("api4 entry");
+        assert_eq!(
+            entry.state,
+            crate::owasp_api_pack::PackItemState::NeedsOperatorInput
+        );
+        assert_eq!(entry.synthesized_types.len(), 2);
+    }
+
+    #[test]
+    fn owasp_pack_api4_synthesizes_all_four_policies_when_rps_configured() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api4]
+        per_item:
+          api4:
+            rps: 25
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        let types: Vec<&str> = origin
+            .policy_configs
+            .iter()
+            .map(|p| p.get("type").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert!(types.contains(&"request_limit"), "{types:?}");
         assert!(types.contains(&"rate_limiting"), "{types:?}");
         assert!(types.contains(&"concurrent_limit"), "{types:?}");
         assert!(types.contains(&"ddos_protection"), "{types:?}");
-        assert!(!types.contains(&"owasp_api_top10"), "{types:?}");
 
         let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
         let entry = manifest
@@ -11269,6 +11330,47 @@ origins:
             .entry_for(crate::owasp_api_pack::PackItem::Api8)
             .expect("api8 entry");
         assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
+    }
+
+    #[test]
+    fn owasp_pack_api8_skips_security_headers_on_a_static_action() {
+        // WOR-2491 review round, M1: a `static` action never reaches
+        // Pingora's response-phase filter, so security_headers is not
+        // synthesized on the compiled origin even though the pack
+        // entry enables api8. http_framing (request-phase, action
+        // agnostic) still synthesizes.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        ok: true
+    policies:
+      - type: owasp_api_top10
+        enable: [api8]
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        let types: Vec<&str> = origin
+            .policy_configs
+            .iter()
+            .map(|p| p.get("type").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert!(
+            !types.contains(&"security_headers"),
+            "security_headers must not be synthesized on a static action: {types:?}"
+        );
+        assert!(types.contains(&"http_framing"), "{types:?}");
+
+        let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api8)
+            .expect("api8 entry");
+        assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
+        assert_eq!(entry.synthesized_types, vec!["http_framing"]);
     }
 
     // --- WOR-2491 task 3: api3, api9 wired at compile time ---

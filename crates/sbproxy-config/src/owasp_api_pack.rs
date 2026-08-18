@@ -26,22 +26,33 @@
 //! in [`ITEM_TABLE`]. A row's [`ItemRow::pieces`] list holds zero or
 //! more independently-backing-off synthesized policies: `api1` and
 //! `api5` synthesize one apiece (sharing a single `object_authz` entry
-//! when both are enabled), `api4` synthesizes four (`request_limit`,
-//! `rate_limiting`, `concurrent_limit`, `ddos_protection`), and `api8`
-//! synthesizes two (`security_headers`, `http_framing`). Each piece
-//! backs off on its own, so an operator who authors just one of the
-//! underlying policy types still gets the pack's coverage for the
-//! rest - [`PackManifestEntry::reason`] names exactly which pieces were
-//! added and which the operator's own config already covers.
+//! when both are enabled), and `api8` synthesizes two
+//! (`security_headers`, `http_framing`). Each piece backs off on its
+//! own, so an operator who authors just one of the underlying policy
+//! types still gets the pack's coverage for the rest -
+//! [`PackManifestEntry::reason`] names exactly which pieces were added
+//! and which the operator's own config already covers.
+//!
+//! `api8`'s `security_headers` piece is additionally
+//! `response_phase_gated` (WOR-2491 review round, M1): it only takes
+//! effect in Pingora's response-phase filter, which an origin whose
+//! action responds entirely inside the request phase (`static`,
+//! `mock`, and friends - see [`action_runs_response_phase`]) never
+//! reaches, so it is not synthesized there and the gap is named in the
+//! reason instead of claimed. `http_framing` runs at request phase
+//! unconditionally and stays ungated.
 //!
 //! `api7` has an empty `pieces` list but is not `NotCovered`: its
 //! control (the proxy's outbound SSRF guard) already runs
 //! unconditionally outside the policy chain, so
 //! [`ItemRow::already_enforced_reason`] reports
-//! [`PackItemState::Enforced`] with nothing added to `policies`. `api2`,
-//! `api6`, and `api10` report [`PackItemState::NotCovered`] with a
-//! reason naming the gap; no synthesis is wired for them in this pack
-//! version.
+//! [`PackItemState::Enforced`] with nothing added to `policies` - the
+//! reason is explicit that this covers only sbproxy's own outbound
+//! dials, not the backend application's own server-side URL fetching
+//! (the API7:2023 risk as OWASP defines it), which this pack cannot
+//! see. `api2`, `api6`, and `api10` report [`PackItemState::NotCovered`]
+//! with a reason naming the gap; no synthesis is wired for them in
+//! this pack version.
 //!
 //! `api1`'s and `api5`'s shared `object_authz` entry always reports
 //! [`PackItemState::NeedsOperatorInput`] regardless of posture: with
@@ -366,11 +377,24 @@ impl PackManifest {
 }
 
 /// Raw deserialized shape of a `type: owasp_api_top10` policy entry.
-/// `type` itself is not declared here: it is read by the caller to
-/// find this entry, and `serde_json::from_value` silently ignores the
-/// extra key since this struct has no `deny_unknown_fields`.
+///
+/// `deny_unknown_fields` (WOR-2491 review round, M4): a typo like
+/// `per_items:` (plural) for `per_item:` used to deserialize
+/// silently, since serde drops unrecognized keys by default - an
+/// operator who made that typo believed their overrides took effect
+/// and they were dropped instead. Declaring `deny_unknown_fields`
+/// means every real key must be named on this struct, including
+/// `type` itself (`_pack_type` below): the caller already matched on
+/// it to find this entry before deserializing, so nothing reads the
+/// field again, but leaving it undeclared would make the entry's own
+/// discriminator an "unknown field" and refuse every pack config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPackConfig {
+    /// The `type: owasp_api_top10` discriminator. See the struct doc
+    /// comment for why this is declared at all.
+    #[serde(rename = "type")]
+    _pack_type: String,
     /// `"all"` or an explicit list of item names.
     enable: RawEnable,
     /// Pack-wide default posture. Defaults to `report_only` when
@@ -413,6 +437,17 @@ struct RawPerItem {
     /// the same request as "strip nothing").
     #[serde(default)]
     response_exclude_fields: Option<Vec<String>>,
+    /// `api4`-only: requests-per-second budget for the pack's
+    /// `rate_limiting` and `ddos_protection` pieces (see
+    /// [`expand_api4_entry`]). Rejected on any other item; rejected if
+    /// present but not a positive number. Both pieces key by the
+    /// caller's observed IP by default, and behind a load balancer
+    /// with no `proxy.trusted_proxies` configured every real client
+    /// collapses to the LB's one IP and shares a single budget - this
+    /// pack refuses to guess a number rather than risk that outage
+    /// class (WOR-2491 review round, B1).
+    #[serde(default)]
+    rps: Option<f64>,
 }
 
 /// Returns true when the JSON value's `type` field equals `wanted`.
@@ -421,6 +456,37 @@ struct RawPerItem {
 /// sharing it across the module boundary is not worth the coupling.
 fn config_type_is(value: &serde_json::Value, wanted: &str) -> bool {
     value.get("type").and_then(|v| v.as_str()) == Some(wanted)
+}
+
+/// Appends `entry` to `transforms`, unless a `json_envelope` entry is
+/// already present, in which case `entry` is inserted immediately
+/// before the *first* one instead.
+///
+/// WOR-2491 review round (json_envelope ordering interaction):
+/// `compiler::compile_origin` auto-wires a `json_envelope` transform
+/// at the end of the default content-shaping chain
+/// (`boilerplate -> html_to_markdown -> citation_block ->
+/// json_envelope`) whenever the origin authors `ai_crawl_control` (or
+/// a Wave 4 content-shaping transform) with an empty `transforms:`
+/// list, and that auto-wire runs before this pack's own expansion.
+/// `json_envelope` wraps the response body into an envelope object
+/// (`{"content": ..., ...}`); `api3`'s synthesized `json_projection`
+/// only filters *top-level* object keys (see `expand_api3_entry`'s
+/// doc comment), so appending it after `json_envelope` would filter
+/// the envelope's own keys instead of the real data nested under
+/// `content`. Inserting ahead of `json_envelope` keeps the projection
+/// looking at the actual response shape.
+fn insert_transform_before_json_envelope(
+    transforms: &mut Vec<serde_json::Value>,
+    entry: serde_json::Value,
+) {
+    match transforms
+        .iter()
+        .position(|t| config_type_is(t, "json_envelope"))
+    {
+        Some(idx) => transforms.insert(idx, entry),
+        None => transforms.push(entry),
+    }
 }
 
 /// Outcome of synthesizing one policy inside a multi-piece item's row.
@@ -437,13 +503,16 @@ struct PieceSynthesis {
 }
 
 /// One independently-backing-off policy inside an [`ItemRow`]. Most
-/// items have exactly one piece; `api4` has four and `api8` has two, so
-/// an operator who authors just one of the underlying policy types
-/// still gets the pack's coverage for the rest, with the manifest
-/// reason naming exactly which pieces backed off and which the pack
-/// added. `api1` and `api5` each have exactly one piece too, but both
-/// point at `object_authz`/`bola`: enabling both together produces one
-/// shared entry, not two (see `shared_backoff_reason`).
+/// items have exactly one piece; `api8` has two, so an operator who
+/// authors just one of the underlying policy types still gets the
+/// pack's coverage for the rest, with the manifest reason naming
+/// exactly which pieces backed off and which the pack added. `api1`
+/// and `api5` each have exactly one piece too, but both point at
+/// `object_authz`/`bola`: enabling both together produces one shared
+/// entry, not two (see `shared_backoff_reason`). `api4`'s four pieces
+/// no longer go through this table at all (see
+/// [`expand_api4_entry`]): two need an operator-supplied budget this
+/// table's `fn(PackPosture) -> PieceSynthesis` signature cannot carry.
 struct SynthPiece {
     /// Config `type` strings whose presence in the origin's *original*,
     /// operator-authored policies (captured before this pack's
@@ -459,8 +528,39 @@ struct SynthPiece {
     /// never overlap another item's row; for those this branch cannot
     /// happen.
     shared_backoff_reason: Option<&'static str>,
+    /// True when this piece's policy only takes effect during
+    /// response-phase processing (WOR-2491 review round, M1): today
+    /// only `api8`'s `security_headers` piece. See
+    /// [`action_runs_response_phase`] for which action types reach
+    /// that phase; every other piece leaves this `false`.
+    response_phase_gated: bool,
     /// Synthesizes this one policy entry.
     synth: fn(PackPosture) -> PieceSynthesis,
+}
+
+/// True when an origin whose action has this `type:` string reaches
+/// Pingora's response-phase filter (`server/proxy_http.rs::response_filter`),
+/// where `api8`'s `security_headers` piece takes effect.
+///
+/// Verified against `action_dispatch.rs::handle_action`'s own match:
+/// `Action::Proxy`, `Action::LoadBalancer`, `Action::WebSocket`, and
+/// `Action::A2a` always return `Ok(false)` (fall through to
+/// `upstream_peer`/`response_filter`); `Action::GraphQL` and
+/// `Action::Grpc` do too for the request shapes that proxy rather
+/// than refuse inline. Every other action type
+/// (`static`, `redirect`, `echo`, `mock`, `beacon`, `noop`, `mcp`,
+/// `storage`, `ai_proxy`, any plugin action, or an unrecognized
+/// string) responds from inside `request_filter` and never reaches
+/// `response_filter`. `ai_proxy` has both an `Ok(false)` branch and an
+/// `Ok(true)` fallthrough depending on the runtime path a given
+/// request takes, which a compile-time decision cannot see per
+/// request; treated as not-guaranteed here rather than claiming
+/// coverage a request might not get.
+fn action_runs_response_phase(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        "proxy" | "load_balancer" | "websocket" | "a2a" | "graphql" | "grpc"
+    )
 }
 
 /// One row of the per-item expansion table.
@@ -483,10 +583,12 @@ struct ItemRow {
     /// Manifest state used once at least one piece is present for this
     /// item (freshly synthesized, or shared with an earlier item's
     /// row). [`PackItemState::Enforced`] for items whose synthesized
-    /// defaults are safe to block blind (`api4`, `api8`);
+    /// defaults are safe to block blind (`api8`);
     /// [`PackItemState::NeedsOperatorInput`] for items whose synthesis
     /// still needs operator-authored rules regardless of posture
-    /// (`api1`, `api5`). Unused when `pieces` is empty.
+    /// (`api1`, `api5`). Unused when `pieces` is empty (which includes
+    /// `api4`'s row - see [`expand_api4_entry`], which computes its
+    /// own state instead of reading this field).
     covered_state: PackItemState,
     /// Reason used when `pieces` is empty and the item is nonetheless
     /// already enforced outside the policy chain (`api7` only). `None`
@@ -587,8 +689,12 @@ fn synth_object_authz_bfla_only(posture: PackPosture) -> PieceSynthesis {
 /// `max_query_string_length` unset here is a deliberate "only the
 /// vetted three" choice, not an oversight. `request_limit` has no
 /// report-only knob (`check_request` returns `Err` unconditionally over
-/// any configured limit), so `posture` has no effect on this piece.
-fn synth_request_limit(_posture: PackPosture) -> PieceSynthesis {
+/// any configured limit); it also has no caller-identity knob at all
+/// (the check is on the request's own shape, not who sent it), so
+/// unlike `rate_limiting`/`ddos_protection` below it is safe to
+/// synthesize unconditionally regardless of `proxy.trusted_proxies`
+/// (WOR-2491 review round, B1).
+fn synth_request_limit() -> PieceSynthesis {
     let policy = serde_json::json!({
         "type": "request_limit",
         "max_body_size": 1_048_576,
@@ -600,32 +706,43 @@ fn synth_request_limit(_posture: PackPosture) -> PieceSynthesis {
         synthesized_type: "request_limit",
         reason: "synthesized request_limit (max_body_size: 1 MiB, max_header_count: 64, \
                   max_url_length: 2048): shapes that never reach a rate limiter, safe for \
-                  virtually any JSON API. request_limit has no report-only mode; posture has no \
-                  effect on this piece."
+                  virtually any JSON API and independent of caller identity, so it is safe to \
+                  default blind regardless of proxy.trusted_proxies."
             .to_string(),
     }
 }
 
-/// Synthesizes `api4`'s `rate_limiting` piece: a high-ceiling token
-/// bucket meant to catch a runaway or scripted client rather than
-/// constrain normal traffic. With no `key` expression configured, the
-/// enforcer buckets per caller (client IP) by default, so this is a
-/// per-caller budget, not a shared one. `rate_limiting` has no
-/// report-only knob, so `posture` has no effect on this piece.
-fn synth_rate_limiting(_posture: PackPosture) -> PieceSynthesis {
+/// Synthesizes `api4`'s `rate_limiting` piece at an operator-supplied
+/// budget: a per-caller token bucket meant to catch a runaway or
+/// scripted client rather than constrain normal traffic. With no
+/// `key` expression configured, the enforcer buckets per caller
+/// (client IP) by default. `burst` is set to twice `rps`, the same
+/// ratio the pack's old fixed default used (100 rps / 200 burst).
+///
+/// `rps` is never guessed (WOR-2491 review round, B1): this piece and
+/// [`synth_ddos_protection`] both key on the caller's *observed* IP
+/// by default, and behind a load balancer with no
+/// `proxy.trusted_proxies` configured every real client collapses to
+/// the LB's one IP, sharing a single budget - a fixed blind default
+/// here would produce exactly that outage class the moment real
+/// traffic exceeded it. The caller (`expand_api4_entry`) only invokes
+/// this once `per_item.api4.rps` is confirmed present.
+fn synth_rate_limiting(rps: f64) -> PieceSynthesis {
+    let burst = (rps * 2.0).round().max(1.0) as u64;
     let policy = serde_json::json!({
         "type": "rate_limiting",
-        "requests_per_second": 100.0,
-        "burst": 200,
+        "requests_per_second": rps,
+        "burst": burst,
     });
     PieceSynthesis {
         policy,
         synthesized_type: "rate_limiting",
-        reason: "synthesized rate_limiting (requests_per_second: 100, burst: 200, per-caller by \
-                  default since no key is set): a high ceiling meant to catch a runaway or \
-                  scripted client, not to constrain normal traffic. rate_limiting has no \
-                  report-only mode; posture has no effect on this piece."
-            .to_string(),
+        reason: format!(
+            "synthesized rate_limiting at the operator-supplied per_item.api4.rps budget \
+             (requests_per_second: {rps}, burst: {burst}), per-caller by default since no key \
+             is set. rate_limiting has no report-only mode; posture has no effect on this \
+             piece."
+        ),
     }
 }
 
@@ -636,8 +753,12 @@ fn synth_rate_limiting(_posture: PackPosture) -> PieceSynthesis {
 /// This backstops a stalled or slow upstream piling up requests, a
 /// different failure mode than the per-caller rate limit above.
 /// `concurrent_limit` has no report-only knob, so `posture` has no
-/// effect on this piece.
-fn synth_concurrent_limit(_posture: PackPosture) -> PieceSynthesis {
+/// effect on this piece. `key_by: global` does not key on caller
+/// identity at all (every request through this origin shares the one
+/// counter), so unlike `rate_limiting`/`ddos_protection` it is not
+/// exposed to the `trusted_proxies` outage class and stays safe to
+/// synthesize unconditionally (WOR-2491 review round, B1).
+fn synth_concurrent_limit() -> PieceSynthesis {
     let policy = serde_json::json!({
         "type": "concurrent_limit",
         "max": 200,
@@ -646,32 +767,171 @@ fn synth_concurrent_limit(_posture: PackPosture) -> PieceSynthesis {
         policy,
         synthesized_type: "concurrent_limit",
         reason: "synthesized concurrent_limit (max: 200, key_by left unset so it defaults to \
-                  global: one shared in-flight budget for the whole origin): a backstop against \
-                  a stalled or slow upstream piling up requests. concurrent_limit has no \
-                  report-only mode; posture has no effect on this piece."
+                  global: one shared in-flight budget for the whole origin, not keyed on \
+                  caller identity): a backstop against a stalled or slow upstream piling up \
+                  requests. concurrent_limit has no report-only mode; posture has no effect on \
+                  this piece."
             .to_string(),
     }
 }
 
-/// Synthesizes `api4`'s `ddos_protection` piece with no fields set, so
-/// `ddos.rs`'s own defaults apply unchanged: 100 requests/second per IP
-/// in a sliding 1-second window, 300-second block
-/// (`default_ddos_threshold`/`default_ddos_block_duration`, confirmed
-/// at `ddos.rs`; `DdosPolicy::from_config` succeeds against an empty
-/// object). Already the conservative, high-ceiling shape this item
-/// needs, so there is nothing to override. `ddos_protection` has no
-/// report-only knob, so `posture` has no effect on this piece.
-fn synth_ddos_protection(_posture: PackPosture) -> PieceSynthesis {
-    let policy = serde_json::json!({ "type": "ddos_protection" });
+/// Synthesizes `api4`'s `ddos_protection` piece at an operator-supplied
+/// budget: `requests_per_second` set to `rps`, everything else
+/// (`block_duration_secs`, the sliding-window width) left at
+/// `ddos.rs`'s own module defaults (300-second block) per the review
+/// ruling - only the rate axis is operator-controlled here.
+///
+/// `rps` is never guessed, for the same reason [`synth_rate_limiting`]
+/// documents: this piece keys on the caller's observed IP, and behind
+/// a load balancer with no `proxy.trusted_proxies` configured every
+/// real client collapses to the LB's one IP (WOR-2491 review round,
+/// B1).
+fn synth_ddos_protection(rps: f64) -> PieceSynthesis {
+    let requests_per_second = rps.round().max(1.0) as u64;
+    let policy = serde_json::json!({
+        "type": "ddos_protection",
+        "requests_per_second": requests_per_second,
+    });
     PieceSynthesis {
         policy,
         synthesized_type: "ddos_protection",
-        reason: "synthesized ddos_protection with no fields set, so ddos.rs's own defaults \
-                  apply unchanged (100 requests/second per IP in a sliding 1-second window, \
-                  300-second block): already the conservative, high-ceiling shape this item \
-                  needs. ddos_protection has no report-only mode; posture has no effect on this \
-                  piece."
-            .to_string(),
+        reason: format!(
+            "synthesized ddos_protection at the operator-supplied per_item.api4.rps budget \
+             (requests_per_second: {requests_per_second}); block_duration_secs stays at \
+             ddos.rs's own module default (300-second block, sliding 1-second window). \
+             ddos_protection has no report-only mode; posture has no effect on this piece."
+        ),
+    }
+}
+
+/// Builds `api4`'s manifest entry. Does not use the `SynthPiece` table
+/// (see the `ITEM_TABLE` row's own doc comment): two of its four
+/// pieces (`rate_limiting`, `ddos_protection`) need an
+/// operator-supplied `per_item.api4.rps` budget before they can
+/// synthesize anything, which `SynthPiece::synth: fn(PackPosture) ->
+/// PieceSynthesis` has no parameter for.
+///
+/// `request_limit` and `concurrent_limit` are unconditional and safe
+/// to default blind (see their own doc comments: neither keys on
+/// caller identity). `rate_limiting` and `ddos_protection` back off
+/// to the operator's own policy when authored, synthesize at `rps`
+/// when supplied, and otherwise are simply not synthesized - this is
+/// the review ruling (WOR-2491, B1) that replaced the pack's original
+/// fixed defaults (100 rps for both) after those defaults were found
+/// to reproduce an outage class: both key on the caller's observed IP
+/// by default, and behind a load balancer with no
+/// `proxy.trusted_proxies` configured every real client collapses to
+/// the LB's single IP, sharing (and quickly exhausting) one budget.
+///
+/// Overall state is [`PackItemState::NeedsOperatorInput`] whenever
+/// either rate-shaped piece has a gap (absent and not
+/// operator-authored) - the state names what is missing (the budget,
+/// and the `trusted_proxies` prerequisite for it to mean anything),
+/// not whether `request_limit`/`concurrent_limit` are already
+/// covering part of this item, mirroring `api1`'s established
+/// precedent. Otherwise [`PackItemState::Enforced`].
+fn expand_api4_entry(
+    operator_authored_types: &HashSet<String>,
+    rps: Option<f64>,
+    policies: &mut Vec<serde_json::Value>,
+) -> PackManifestEntry {
+    let mut synthesized_types = Vec::new();
+    let mut fragments: Vec<String> = Vec::new();
+    let mut has_rate_gap = false;
+
+    if operator_authored_types.contains("request_limit")
+        || operator_authored_types.contains("request_limiting")
+    {
+        fragments.push(
+            "request_limit: origin already authors a request_limit/request_limiting policy; \
+             the pack leaves it exactly as configured."
+                .to_string(),
+        );
+    } else {
+        let synthesis = synth_request_limit();
+        policies.push(synthesis.policy);
+        synthesized_types.push(synthesis.synthesized_type);
+        fragments.push(synthesis.reason);
+    }
+
+    if operator_authored_types.contains("concurrent_limit")
+        || operator_authored_types.contains("concurrent_limiting")
+    {
+        fragments.push(
+            "concurrent_limit: origin already authors a concurrent_limit/concurrent_limiting \
+             policy; the pack leaves it exactly as configured."
+                .to_string(),
+        );
+    } else {
+        let synthesis = synth_concurrent_limit();
+        policies.push(synthesis.policy);
+        synthesized_types.push(synthesis.synthesized_type);
+        fragments.push(synthesis.reason);
+    }
+
+    let rate_gap_reason = || {
+        "NOT synthesized: rate_limiting and ddos_protection both key on the caller's observed \
+         IP by default, and behind a load balancer with no proxy.trusted_proxies configured \
+         every real client collapses to the load balancer's single IP, sharing (and quickly \
+         exhausting) one budget - the exact outage class a blind default here would risk. Set \
+         per_item.api4.rps to an operator-chosen requests-per-second budget once \
+         proxy.trusted_proxies covers the load balancer's address (or this origin has no load \
+         balancer in front of it), and both pieces synthesize at that budget."
+    };
+
+    if operator_authored_types.contains("rate_limiting") {
+        fragments.push(
+            "rate_limiting: origin already authors a rate_limiting policy; the pack leaves it \
+             exactly as configured."
+                .to_string(),
+        );
+    } else if let Some(rps_value) = rps {
+        let synthesis = synth_rate_limiting(rps_value);
+        policies.push(synthesis.policy);
+        synthesized_types.push(synthesis.synthesized_type);
+        fragments.push(synthesis.reason);
+    } else {
+        has_rate_gap = true;
+        fragments.push(format!("rate_limiting: {}", rate_gap_reason()));
+    }
+
+    if operator_authored_types.contains("ddos")
+        || operator_authored_types.contains("ddos_protection")
+    {
+        fragments.push(
+            "ddos_protection: origin already authors a ddos/ddos_protection policy; the pack \
+             leaves it exactly as configured."
+                .to_string(),
+        );
+    } else if let Some(rps_value) = rps {
+        let synthesis = synth_ddos_protection(rps_value);
+        policies.push(synthesis.policy);
+        synthesized_types.push(synthesis.synthesized_type);
+        fragments.push(synthesis.reason);
+    } else {
+        has_rate_gap = true;
+        fragments.push(format!("ddos_protection: {}", rate_gap_reason()));
+    }
+
+    // Precedence: a rate-shaped gap always dominates (the state names
+    // what is missing, mirroring api1's established precedent) even
+    // when request_limit/concurrent_limit did synthesize; only when
+    // there is no gap AND nothing at all was added does this collapse
+    // to OperatorAuthored (all four pieces were the operator's own),
+    // matching every other item's "the pack added nothing" outcome.
+    let state = if has_rate_gap {
+        PackItemState::NeedsOperatorInput
+    } else if synthesized_types.is_empty() {
+        PackItemState::OperatorAuthored
+    } else {
+        PackItemState::Enforced
+    };
+
+    PackManifestEntry {
+        item: PackItem::Api4,
+        state,
+        reason: fragments.join(" "),
+        synthesized_types,
     }
 }
 
@@ -757,6 +1017,26 @@ fn synth_http_framing(_posture: PackPosture) -> PieceSynthesis {
 /// plus the missing field list, never "no capability" (per the same
 /// ruling). `json_projection` has no report-only knob, so pack-wide
 /// `posture` has no effect on this half either.
+///
+/// Two things this half does NOT cover, named explicitly rather than
+/// implied by the general claim (WOR-2491 review round, B2):
+///
+/// - `JsonProjectionTransform::apply` (`transform/json.rs`) filters
+///   **top-level object keys only**: a JSON array response body, or
+///   an object whose sensitive fields sit inside a nested object or
+///   array, passes through unchanged. The reason and every doc
+///   surface say "top-level object JSON response bodies", never
+///   "every JSON response body".
+/// - the synthesized entry sets `"failure_posture": "closed"`
+///   (`TransformConfig::failure_posture`, a sibling of `type` at the
+///   transform-wrapper level, not a `json_projection`-local field):
+///   without it the wrapper's own default is `open`, meaning an
+///   oversized or unparseable body - both attacker-influenceable -
+///   ships raw instead of filtered, leaking exactly the fields this
+///   piece exists to strip. `closed` makes the pipeline refuse the
+///   response instead (`server/proxy_http.rs`'s pre-capture size
+///   refusal, and `action_dispatch.rs`'s plugin-action path, both key
+///   off this same field).
 fn expand_api3_entry(
     operator_authored_types: &HashSet<String>,
     response_exclude_fields: Option<&[String]>,
@@ -785,14 +1065,20 @@ fn expand_api3_entry(
                 "type": "json_projection",
                 "fields": fields,
                 "exclude": true,
+                "failure_posture": "closed",
             });
-            transforms.push(policy);
+            insert_transform_before_json_envelope(transforms, policy);
             synthesized_types.push("json_projection");
             (
                 format!(
-                    "response side: synthesized json_projection (fields: [{}], exclude: true) \
-                     onto the origin's transform chain, stripping these fields from every JSON \
-                     response body via response_body_filter. json_projection has no \
+                    "response side: synthesized json_projection (fields: [{}], exclude: true, \
+                     failure_posture: closed) onto the origin's transform chain, stripping \
+                     these fields from the top level of every JSON *object* response body via \
+                     response_body_filter - a JSON array body, or a sensitive field nested \
+                     inside an object or array rather than at the top level, passes through \
+                     unchanged; scope this to responses whose sensitive fields are top-level. \
+                     failure_posture: closed means an oversized or unparseable body is refused \
+                     rather than shipped raw and unfiltered. json_projection has no \
                      report-only mode; posture has no effect on this half.",
                     fields.join(", ")
                 ),
@@ -802,10 +1088,11 @@ fn expand_api3_entry(
         None => (
             "response side: no per_item.api3.response_exclude_fields supplied, so nothing was \
              synthesized. sbproxy-modules::transform::json::JsonProjectionTransform (config \
-             type json_projection) already strips named fields from buffered JSON response \
-             bodies via response_body_filter, but needs an operator-supplied field list this \
-             pack cannot infer. Set per_item.api3.response_exclude_fields: [field, ...] to \
-             enable it."
+             type json_projection) already strips named fields from the top level of buffered \
+             JSON object response bodies via response_body_filter (a JSON array body, or a \
+             field nested inside an object or array, is out of scope for this transform \
+             regardless), but needs an operator-supplied field list this pack cannot infer. Set \
+             per_item.api3.response_exclude_fields: [field, ...] to enable it."
                 .to_string(),
             false,
         ),
@@ -875,6 +1162,7 @@ const API1_PIECES: [SynthPiece; 1] = [SynthPiece {
     operator_backoff_reason: "origin already authors an object_authz/bola policy; the pack \
                                leaves it exactly as configured, including its own posture",
     shared_backoff_reason: None,
+    response_phase_gated: false,
     synth: synth_object_authz,
 }];
 
@@ -895,40 +1183,9 @@ const API5_PIECES: [SynthPiece; 1] = [SynthPiece {
          function_rules stays empty either way, since neither item has a fallback that fires \
          without operator-authored rules",
     ),
+    response_phase_gated: false,
     synth: synth_object_authz_bfla_only,
 }];
-
-/// `api4`'s four independently-backing-off pieces.
-const API4_PIECES: [SynthPiece; 4] = [
-    SynthPiece {
-        backoff_types: &["request_limit", "request_limiting"],
-        operator_backoff_reason: "origin already authors a request_limit/request_limiting \
-                                   policy; the pack leaves it exactly as configured",
-        shared_backoff_reason: None,
-        synth: synth_request_limit,
-    },
-    SynthPiece {
-        backoff_types: &["rate_limiting"],
-        operator_backoff_reason: "origin already authors a rate_limiting policy; the pack \
-                                   leaves it exactly as configured",
-        shared_backoff_reason: None,
-        synth: synth_rate_limiting,
-    },
-    SynthPiece {
-        backoff_types: &["concurrent_limit", "concurrent_limiting"],
-        operator_backoff_reason: "origin already authors a concurrent_limit/concurrent_limiting \
-                                   policy; the pack leaves it exactly as configured",
-        shared_backoff_reason: None,
-        synth: synth_concurrent_limit,
-    },
-    SynthPiece {
-        backoff_types: &["ddos", "ddos_protection"],
-        operator_backoff_reason: "origin already authors a ddos/ddos_protection policy; the \
-                                   pack leaves it exactly as configured",
-        shared_backoff_reason: None,
-        synth: synth_ddos_protection,
-    },
-];
 
 /// `api8`'s two independently-backing-off pieces. A managed `waf`
 /// (Core Rule Set) default is intentionally not part of this row: the
@@ -937,12 +1194,23 @@ const API4_PIECES: [SynthPiece; 4] = [
 /// reasonable candidate for a future version of this pack (matching
 /// the research sketch), but adding it is deferred rather than folded
 /// in here. Configure `waf` directly for CRS-based coverage today.
+///
+/// `security_headers` is `response_phase_gated: true` (WOR-2491
+/// review round, M1): it only takes effect in Pingora's response
+/// filter, so it is not synthesized on an origin whose action never
+/// reaches that filter (see [`action_runs_response_phase`]).
+/// `http_framing` runs at request phase instead, via the
+/// `check_policies` enforcer registry every origin goes through
+/// before any action dispatch decision, independent of action type -
+/// confirmed at `server/request_phase.rs`'s own `check_policies`
+/// call site - so it stays ungated.
 const API8_PIECES: [SynthPiece; 2] = [
     SynthPiece {
         backoff_types: &["security_headers"],
         operator_backoff_reason: "origin already authors a security_headers policy; the pack \
                                    leaves it exactly as configured",
         shared_backoff_reason: None,
+        response_phase_gated: true,
         synth: synth_security_headers,
     },
     SynthPiece {
@@ -950,6 +1218,7 @@ const API8_PIECES: [SynthPiece; 2] = [
         operator_backoff_reason: "origin already authors an http_framing policy; the pack \
                                    leaves it exactly as configured",
         shared_backoff_reason: None,
+        response_phase_gated: false,
         synth: synth_http_framing,
     },
 ];
@@ -989,9 +1258,17 @@ const ITEM_TABLE: [ItemRow; 10] = [
         uncovered_reason: "",
     },
     ItemRow {
+        // Unused: `expand_owasp_pack`'s main loop special-cases api4
+        // via `expand_api4_entry` before it ever calls `item_row` for
+        // this variant (the `rate_limiting`/`ddos_protection` pieces
+        // are gated on `per_item.api4.rps`, which the generic
+        // `SynthPiece::synth: fn(PackPosture) -> PieceSynthesis`
+        // signature has no way to receive - WOR-2491 review round,
+        // B1). This row exists only so every `PackItem` variant still
+        // has exactly one entry, per `item_row`'s own doc comment.
         item: PackItem::Api4,
-        pieces: &API4_PIECES,
-        covered_state: PackItemState::Enforced,
+        pieces: &[],
+        covered_state: PackItemState::NotCovered,
         already_enforced_reason: None,
         uncovered_reason: "",
     },
@@ -1023,7 +1300,12 @@ const ITEM_TABLE: [ItemRow; 10] = [
              provider base URLs, RAG HTTP providers, alerting channels, A2A push targets, \
              external guardrails), independent of whether this pack is enabled at all. Review \
              proxy.extensions.upstream.allow_private_cidrs directly if it looks unusually \
-             broad; this pack does not compute that check from here.",
+             broad; this pack does not compute that check from here. This covers only sbproxy's \
+             own outbound dials - the ones this gateway itself makes on the proxy process's \
+             behalf. It does NOT cover the backend application's own server-side URL fetching \
+             (the API7:2023 risk as OWASP defines it: a caller supplies a URL, or a value the \
+             app resolves into one, and the app's own code fetches it), which happens entirely \
+             behind this origin's action and this pack cannot see or guard.",
         ),
         uncovered_reason: "",
     },
@@ -1122,24 +1404,37 @@ fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>
 /// Also flips `*expose_openapi` to `true` when `api9` is enabled and
 /// it was not already (see [`expand_api9_entry`]).
 ///
+/// `action_type` is the origin's action's own `type:` string (`""`
+/// when absent or not yet known, which resolves the same as any other
+/// unrecognized string: no response-phase piece is synthesized). Used
+/// only by `api8`'s `security_headers` piece (WOR-2491 review round,
+/// M1): that policy takes effect in Pingora's response-phase filter,
+/// which only runs for actions that dial a real upstream peer, so an
+/// action handled entirely in the request phase (`static`, `mock`,
+/// and friends) gets the reason named instead of a claim nothing
+/// enforces. See [`action_runs_response_phase`].
+///
 /// Returns `Ok(None)` when the origin has no `owasp_api_top10` entry -
 /// `transforms` and `*expose_openapi` are left untouched in that case.
 /// Returns `Err` for: more than one `owasp_api_top10` entry on the
 /// origin, an unknown item name in `enable` or `per_item`, a duplicate
 /// item name within `enable`, a `per_item` override for an item not
 /// named in `enable`, a `response_exclude_fields` override on any item
-/// other than `api3`, an empty `response_exclude_fields` list, or a
-/// malformed `posture`/`enable` value.
+/// other than `api3`, an empty `response_exclude_fields` list, an
+/// `api4.rps` override on any item other than `api4`, an `api4.rps`
+/// that is not a positive number, or a malformed `posture`/`enable`
+/// value.
 ///
-/// `pub(crate)`: `compiler::compile_origin` is this crate's only
-/// caller and its own public entry point (`compile_config`) already
-/// covers the pack end to end, so this expansion step does not need
-/// to be reachable outside `sbproxy-config` on its own.
+/// `pub(crate)`: every caller (`compiler::compile_origin`,
+/// `validate::check_owasp_pack_config`, `plan::owasp_pack_preview`)
+/// lives inside this crate, so this expansion step does not need to
+/// be reachable outside `sbproxy-config`.
 pub(crate) fn expand_owasp_pack(
     hostname: &str,
     policies: &mut Vec<serde_json::Value>,
     transforms: &mut Vec<serde_json::Value>,
     expose_openapi: &mut bool,
+    action_type: &str,
 ) -> anyhow::Result<Option<PackManifest>> {
     let pack_indices: Vec<usize> = policies
         .iter()
@@ -1179,6 +1474,7 @@ pub(crate) fn expand_owasp_pack(
 
     let mut per_item_posture: HashMap<PackItem, PackPosture> = HashMap::new();
     let mut api3_response_exclude_fields: Option<Vec<String>> = None;
+    let mut api4_rps: Option<f64> = None;
     for (key, entry) in &raw.per_item {
         let item = parse_item_or_bail(hostname, key, "per_item")?;
         if !enabled_set.contains(&item) {
@@ -1215,6 +1511,22 @@ pub(crate) fn expand_owasp_pack(
             }
             api3_response_exclude_fields = Some(fields.clone());
         }
+        if let Some(rps) = entry.rps {
+            if item != PackItem::Api4 {
+                anyhow::bail!(
+                    "origin '{hostname}': owasp_api_top10 per_item.{key}.rps is only valid for \
+                     api4; {} does not accept it",
+                    item.canonical_name()
+                );
+            }
+            if !(rps > 0.0) {
+                anyhow::bail!(
+                    "origin '{hostname}': owasp_api_top10 per_item.api4.rps must be a positive \
+                     number; got {rps}"
+                );
+            }
+            api4_rps = Some(rps);
+        }
     }
 
     // Snapshot of type strings the OPERATOR already authored, taken
@@ -1236,14 +1548,22 @@ pub(crate) fn expand_owasp_pack(
             continue;
         }
 
-        // api3 and api9 do not fit the ItemRow/SynthPiece table (see
-        // both functions' doc comments): resolve them directly and
-        // skip the generic per-row machinery below entirely.
+        // api3, api4, and api9 do not fit the ItemRow/SynthPiece table
+        // (see each function's doc comment): resolve them directly
+        // and skip the generic per-row machinery below entirely.
         if item == PackItem::Api3 {
             entries.push(expand_api3_entry(
                 &operator_authored_types,
                 api3_response_exclude_fields.as_deref(),
                 transforms,
+            ));
+            continue;
+        }
+        if item == PackItem::Api4 {
+            entries.push(expand_api4_entry(
+                &operator_authored_types,
+                api4_rps,
+                policies,
             ));
             continue;
         }
@@ -1287,6 +1607,7 @@ pub(crate) fn expand_owasp_pack(
         let mut fragments: Vec<String> = Vec::new();
         let mut any_operator_backoff = false;
         let mut any_present = false;
+        let mut any_phase_gapped = false;
 
         for piece in row.pieces {
             let operator_hit = piece
@@ -1296,6 +1617,34 @@ pub(crate) fn expand_owasp_pack(
             if operator_hit {
                 any_operator_backoff = true;
                 fragments.push(piece.operator_backoff_reason.to_string());
+                continue;
+            }
+            // WOR-2491 review round, M1: a response-phase-only piece
+            // (api8's security_headers) is not synthesized on an
+            // origin whose action never reaches Pingora's
+            // response-phase filter. Checked before the shared/synth
+            // branches below: an action that skips response-phase
+            // enforcement skips it regardless of what an earlier item
+            // in this same pass already synthesized.
+            if piece.response_phase_gated && !action_runs_response_phase(action_type) {
+                any_phase_gapped = true;
+                fragments.push(format!(
+                    "{} is response-phase only (it takes effect in Pingora's response filter) \
+                     and this origin's action ('{}') never reaches that filter: only proxy, \
+                     load_balancer, websocket, a2a, graphql, and grpc actions do. Not \
+                     synthesized here; configure it directly on the app behind this origin, or \
+                     move this route to a proxy/load_balancer action.",
+                    piece
+                        .backoff_types
+                        .first()
+                        .copied()
+                        .unwrap_or("this policy"),
+                    if action_type.is_empty() {
+                        "(none)"
+                    } else {
+                        action_type
+                    }
+                ));
                 continue;
             }
             let shared_hit = piece
@@ -1319,10 +1668,17 @@ pub(crate) fn expand_owasp_pack(
 
         let state = if any_present {
             row.covered_state
+        } else if any_phase_gapped {
+            // Nothing was added and it is not because the operator
+            // already authored it: this origin's action type cannot
+            // run the piece at all. Not `OperatorAuthored` (the
+            // operator did nothing) and not the row's usual
+            // `covered_state` (nothing here is actually covered).
+            PackItemState::NotCovered
         } else {
             debug_assert!(
                 any_operator_backoff,
-                "a non-empty pieces list must either synthesize/share something or back off"
+                "a non-empty pieces list must either synthesize/share, back off, or phase-gap"
             );
             PackItemState::OperatorAuthored
         };
@@ -1351,10 +1707,27 @@ mod tests {
     #[test]
     fn no_pack_entry_returns_none_and_leaves_policies_untouched() {
         let mut policies = vec![serde_json::json!({"type": "rate_limiting"})];
-        let manifest =
-            expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false).expect("expand");
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
+            .expect("expand");
         assert!(manifest.is_none());
         assert_eq!(policies.len(), 1);
+    }
+
+    #[test]
+    fn a_typo_d_per_items_field_is_refused_naming_the_field() {
+        // WOR-2491 review round, M4: before `deny_unknown_fields`,
+        // `per_items` (plural, a typo for `per_item`) deserialized
+        // silently - the operator's overrides were dropped without
+        // any error. `RawPackConfig` now refuses it, naming the field.
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api1"],
+            "per_items": {"api1": {"posture": "enforce"}},
+        }));
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("per_items"), "names the bad field: {err}");
     }
 
     #[test]
@@ -1363,7 +1736,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1", "api99"],
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("api99"), "names the bad value: {err}");
@@ -1378,7 +1751,7 @@ mod tests {
             "enable": ["api1"],
             "per_item": {"api99": {"posture": "enforce"}},
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("api99"));
@@ -1391,7 +1764,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1", "api1"],
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("more than once"), "{err}");
@@ -1404,7 +1777,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api1"]}),
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api4"]}),
         ];
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("owasp_api_top10 pack entries found"), "{err}");
@@ -1417,7 +1790,7 @@ mod tests {
             "enable": ["api1"],
             "per_item": {"api4": {"posture": "enforce"}},
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("not enabled"), "{err}");
@@ -1431,7 +1804,7 @@ mod tests {
             "enable": ["api1"],
             "posture": "blocking",
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("blocking"), "{err}");
@@ -1443,7 +1816,8 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1"],
         }));
-        expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false).expect("expand");
+        expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
+            .expect("expand");
         assert!(
             !policies
                 .iter()
@@ -1458,7 +1832,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1485,7 +1859,7 @@ mod tests {
             "enable": ["api1"],
             "posture": "enforce",
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1511,7 +1885,7 @@ mod tests {
             "posture": "report_only",
             "per_item": {"api1": {"posture": "enforce"}},
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1540,7 +1914,7 @@ mod tests {
                 "object_rules": [],
             }),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1555,12 +1929,12 @@ mod tests {
     }
 
     #[test]
-    fn back_off_also_recognises_the_bola_alias() {
+    fn back_off_also_recognizes_the_bola_alias() {
         let mut policies = vec![
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api1"]}),
             serde_json::json!({"type": "bola", "object_rules": []}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1573,7 +1947,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": "all",
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         assert_eq!(manifest.entries.len(), 10);
@@ -1593,7 +1967,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         assert_eq!(manifest.posture, PackPosture::ReportOnly);
@@ -1607,7 +1981,7 @@ mod tests {
             "enable": ["api1"],
             "posture": "enforce",
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         assert_eq!(manifest.posture, PackPosture::Enforce);
@@ -1659,7 +2033,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api2"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api2).expect("api2 entry");
@@ -1678,26 +2052,47 @@ mod tests {
     // --- WOR-2491 task 2: api4, api5, api7, api8 ---
 
     #[test]
-    fn api4_synthesizes_all_four_pieces_enforced_when_nothing_authored() {
+    fn api4_needs_operator_input_and_synthesizes_only_the_safe_pieces_when_no_rps_given() {
+        // WOR-2491 review round, B1: rate_limiting and ddos_protection
+        // both key on the caller's observed IP by default, so they
+        // are no longer synthesized blind. request_limit and
+        // concurrent_limit are not IP-keyed and still synthesize
+        // unconditionally.
         let mut policies = owasp_policy(serde_json::json!({
             "type": "owasp_api_top10",
             "enable": ["api4"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
-        assert_eq!(entry.state, PackItemState::Enforced);
+        assert_eq!(entry.state, PackItemState::NeedsOperatorInput);
         let mut types = entry.synthesized_types.clone();
         types.sort_unstable();
         assert_eq!(
             types,
-            vec![
-                "concurrent_limit",
-                "ddos_protection",
-                "rate_limiting",
-                "request_limit",
-            ]
+            vec!["concurrent_limit", "request_limit"],
+            "rate_limiting and ddos_protection are not synthesized without per_item.api4.rps"
+        );
+        assert!(
+            entry.reason.contains("per_item.api4.rps"),
+            "the reason names the missing budget: {}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("trusted_proxies"),
+            "the reason names the trusted_proxies prerequisite: {}",
+            entry.reason
+        );
+        assert!(
+            !policies.iter().any(|p| config_type_is(p, "rate_limiting")),
+            "no rate_limiting synthesized"
+        );
+        assert!(
+            !policies
+                .iter()
+                .any(|p| config_type_is(p, "ddos_protection")),
+            "no ddos_protection synthesized"
         );
 
         let request_limit = policies
@@ -1719,21 +2114,6 @@ mod tests {
             Some(2048)
         );
 
-        let rate_limiting = policies
-            .iter()
-            .find(|p| config_type_is(p, "rate_limiting"))
-            .expect("rate_limiting present");
-        assert_eq!(
-            rate_limiting
-                .get("requests_per_second")
-                .and_then(|v| v.as_f64()),
-            Some(100.0)
-        );
-        assert_eq!(
-            rate_limiting.get("burst").and_then(|v| v.as_u64()),
-            Some(200)
-        );
-
         let concurrent_limit = policies
             .iter()
             .find(|p| config_type_is(p, "concurrent_limit"))
@@ -1742,38 +2122,122 @@ mod tests {
             concurrent_limit.get("max").and_then(|v| v.as_u64()),
             Some(200)
         );
-
-        assert!(
-            policies
-                .iter()
-                .any(|p| config_type_is(p, "ddos_protection")),
-            "ddos_protection present"
-        );
     }
 
     #[test]
-    fn api4_partial_backoff_when_operator_authors_one_subpolicy() {
-        let mut policies = vec![
-            serde_json::json!({"type": "owasp_api_top10", "enable": ["api4"]}),
-            serde_json::json!({"type": "rate_limiting", "requests_per_second": 5.0}),
-        ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+    fn api4_enforced_and_synthesizes_all_four_pieces_when_rps_given() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api4"],
+            "per_item": {"api4": {"rps": 50.0}},
+        }));
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
-        // Some pieces still synthesized, so the item as a whole is
-        // still Enforced, not OperatorAuthored.
         assert_eq!(entry.state, PackItemState::Enforced);
         let mut types = entry.synthesized_types.clone();
         types.sort_unstable();
         assert_eq!(
             types,
-            vec!["concurrent_limit", "ddos_protection", "request_limit"],
-            "rate_limiting is excluded: the operator's own entry stands"
+            vec![
+                "concurrent_limit",
+                "ddos_protection",
+                "rate_limiting",
+                "request_limit",
+            ]
+        );
+
+        let rate_limiting = policies
+            .iter()
+            .find(|p| config_type_is(p, "rate_limiting"))
+            .expect("rate_limiting present");
+        assert_eq!(
+            rate_limiting
+                .get("requests_per_second")
+                .and_then(|v| v.as_f64()),
+            Some(50.0)
+        );
+        assert_eq!(
+            rate_limiting.get("burst").and_then(|v| v.as_u64()),
+            Some(100),
+            "burst is twice the supplied rps"
+        );
+
+        let ddos = policies
+            .iter()
+            .find(|p| config_type_is(p, "ddos_protection"))
+            .expect("ddos_protection present");
+        assert_eq!(
+            ddos.get("requests_per_second").and_then(|v| v.as_u64()),
+            Some(50),
+            "ddos_protection's threshold moves to the same budget"
+        );
+        assert!(
+            ddos.get("block_duration_secs").is_none(),
+            "block window stays at the module default, per the review ruling"
+        );
+    }
+
+    #[test]
+    fn api4_rejects_a_non_positive_rps() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api4"],
+            "per_item": {"api4": {"rps": 0.0}},
+        }));
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn api4_rejects_rps_on_a_different_item() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api1"],
+            "per_item": {"api1": {"rps": 10.0}},
+        }));
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only valid for api4"), "{err}");
+    }
+
+    #[test]
+    fn api4_partial_backoff_when_operator_authors_one_subpolicy() {
+        // The operator authors rate_limiting themselves (no gap
+        // there) but supplies no per_item.api4.rps, so
+        // ddos_protection - gated on the same budget - still gaps:
+        // the item as a whole stays NeedsOperatorInput, and the
+        // reason must name ddos_protection specifically, not treat
+        // the operator's rate_limiting as covering both.
+        let mut policies = vec![
+            serde_json::json!({"type": "owasp_api_top10", "enable": ["api4"]}),
+            serde_json::json!({"type": "rate_limiting", "requests_per_second": 5.0}),
+        ];
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
+        assert_eq!(entry.state, PackItemState::NeedsOperatorInput);
+        let mut types = entry.synthesized_types.clone();
+        types.sort_unstable();
+        assert_eq!(
+            types,
+            vec!["concurrent_limit", "request_limit"],
+            "rate_limiting is excluded (operator's own entry stands); ddos_protection is \
+             excluded (no per_item.api4.rps)"
         );
         assert!(
             entry.reason.contains("already authors a rate_limiting"),
             "the manifest reason names the partial back-off: {}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("ddos_protection"),
+            "the manifest reason names ddos_protection's own gap: {}",
             entry.reason
         );
 
@@ -1793,6 +2257,12 @@ mod tests {
             Some(5.0),
             "the operator's own rate_limiting is untouched"
         );
+        assert!(
+            !policies
+                .iter()
+                .any(|p| config_type_is(p, "ddos_protection")),
+            "no ddos_protection synthesized"
+        );
     }
 
     #[test]
@@ -1804,7 +2274,7 @@ mod tests {
             serde_json::json!({"type": "concurrent_limit", "max": 10}),
             serde_json::json!({"type": "ddos"}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
@@ -1818,7 +2288,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api5"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api5).expect("api5 entry");
@@ -1848,7 +2318,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1", "api5"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
 
@@ -1886,7 +2356,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api1", "api5"]}),
             serde_json::json!({"type": "object_authz", "function_rules": []}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         assert_eq!(
@@ -1910,7 +2380,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api7"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api7).expect("api7 entry");
@@ -1919,6 +2389,21 @@ mod tests {
         assert!(
             entry.reason.contains("not a policy this pack can toggle"),
             "{}",
+            entry.reason
+        );
+        // WOR-2491 review round, M3: the reason must not overclaim -
+        // it names sbproxy's own outbound dials, not the backend
+        // app's server-side URL fetching (the actual API7:2023 risk).
+        assert!(
+            entry.reason.contains("does NOT cover"),
+            "the reason must name what api7's guard does not cover: {}",
+            entry.reason
+        );
+        assert!(
+            entry
+                .reason
+                .contains("backend application's own server-side URL fetching"),
+            "the reason must name the uncovered risk explicitly: {}",
             entry.reason
         );
         assert!(
@@ -1933,7 +2418,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api8"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
@@ -1967,7 +2452,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api8"]}),
             serde_json::json!({"type": "security_headers", "headers": []}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
@@ -1989,6 +2474,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn api8_security_headers_not_synthesized_on_a_static_action() {
+        // WOR-2491 review round, M1: `static` never reaches Pingora's
+        // response-phase filter (`action_dispatch.rs::handle_action`'s
+        // own match returns `Ok(true)` unconditionally for it), so
+        // security_headers - which only takes effect there - is not
+        // synthesized. http_framing runs at request phase regardless
+        // of action type and still synthesizes. The item stays
+        // Enforced (http_framing is real coverage); the reason names
+        // the phase gap explicitly.
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api8"],
+        }));
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "static")
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
+        assert_eq!(entry.state, PackItemState::Enforced);
+        assert_eq!(
+            entry.synthesized_types,
+            vec!["http_framing"],
+            "security_headers is not synthesized on a static action"
+        );
+        assert!(
+            entry.reason.contains("response-phase only"),
+            "the reason names the phase gap: {}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("'static'"),
+            "the reason names the actual action type: {}",
+            entry.reason
+        );
+        assert!(
+            !policies
+                .iter()
+                .any(|p| config_type_is(p, "security_headers")),
+            "security_headers must not be synthesized on a static action"
+        );
+        assert!(
+            policies.iter().any(|p| config_type_is(p, "http_framing")),
+            "http_framing still synthesizes; it runs at request phase regardless of action type"
+        );
+    }
+
+    #[test]
+    fn api8_security_headers_not_covered_at_all_when_operator_also_authors_http_framing_on_a_static_action(
+    ) {
+        // Both pieces end up with nothing added by the pack: http_framing
+        // because the operator already authors it, security_headers
+        // because the action can't run it. Neither is `OperatorAuthored`
+        // (the operator did not author security_headers) nor
+        // `Enforced` (nothing the pack contributed is actually
+        // running); `NotCovered` is the honest label.
+        let mut policies = vec![
+            serde_json::json!({"type": "owasp_api_top10", "enable": ["api8"]}),
+            serde_json::json!({"type": "http_framing"}),
+        ];
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "mock")
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
+        assert_eq!(entry.state, PackItemState::NotCovered);
+        assert!(entry.synthesized_types.is_empty());
+    }
+
+    #[test]
+    fn action_runs_response_phase_matches_the_verified_action_set() {
+        for t in [
+            "proxy",
+            "load_balancer",
+            "websocket",
+            "a2a",
+            "graphql",
+            "grpc",
+        ] {
+            assert!(action_runs_response_phase(t), "{t}");
+        }
+        for t in [
+            "static",
+            "redirect",
+            "echo",
+            "mock",
+            "beacon",
+            "noop",
+            "mcp",
+            "storage",
+            "ai_proxy",
+            "",
+            "some_plugin_action",
+        ] {
+            assert!(!action_runs_response_phase(t), "{t}");
+        }
+    }
+
     // --- WOR-2491 task 3: api3, api9 ---
 
     #[test]
@@ -1998,7 +2579,7 @@ mod tests {
             "enable": ["api3"],
         }));
         let mut transforms = Vec::new();
-        let manifest = expand_owasp_pack("h", &mut policies, &mut transforms, &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut transforms, &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
@@ -2028,7 +2609,7 @@ mod tests {
                 "spec": {"openapi": "3.0.0"},
             }),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
@@ -2054,7 +2635,7 @@ mod tests {
                 "schema": {"type": "object"},
             }),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
@@ -2077,7 +2658,7 @@ mod tests {
             },
         }));
         let mut transforms = Vec::new();
-        let manifest = expand_owasp_pack("h", &mut policies, &mut transforms, &mut false)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut transforms, &mut false, "proxy")
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
@@ -2102,6 +2683,12 @@ mod tests {
             projection.get("exclude").and_then(|v| v.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            projection.get("failure_posture").and_then(|v| v.as_str()),
+            Some("closed"),
+            "WOR-2491 review round, B2: an oversized/unparseable body must be refused, not \
+             shipped raw and unfiltered"
+        );
         let fields: Vec<&str> = projection
             .get("fields")
             .and_then(|v| v.as_array())
@@ -2117,6 +2704,75 @@ mod tests {
     }
 
     #[test]
+    fn api3_response_projection_inserts_before_an_existing_json_envelope() {
+        // WOR-2491 review round (json_envelope ordering interaction):
+        // `json_projection` only filters top-level object keys.
+        // json_envelope wraps the body into `{"content": ..., ...}`,
+        // so if the projection landed after it, it would filter the
+        // envelope's own keys instead of the real data nested under
+        // `content`. This is exactly the shape
+        // `compiler::compile_origin`'s auto-wired content-shaping
+        // chain produces on an `ai_crawl_control` origin with no
+        // authored `transforms:`: boilerplate -> html_to_markdown ->
+        // citation_block -> json_envelope, added before this pack's
+        // own expansion runs.
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api3"],
+            "per_item": {
+                "api3": {"response_exclude_fields": ["ssn"]},
+            },
+        }));
+        let mut transforms = vec![
+            serde_json::json!({"type": "boilerplate"}),
+            serde_json::json!({"type": "html_to_markdown"}),
+            serde_json::json!({"type": "citation_block"}),
+            serde_json::json!({"type": "json_envelope"}),
+        ];
+        expand_owasp_pack("h", &mut policies, &mut transforms, &mut false, "proxy")
+            .expect("expand")
+            .expect("some");
+
+        let types: Vec<&str> = transforms
+            .iter()
+            .map(|t| t.get("type").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        let projection_idx = types
+            .iter()
+            .position(|&t| t == "json_projection")
+            .expect("json_projection present");
+        let envelope_idx = types
+            .iter()
+            .position(|&t| t == "json_envelope")
+            .expect("json_envelope present");
+        assert!(
+            projection_idx < envelope_idx,
+            "json_projection must run before json_envelope so it sees the real data, not the \
+             envelope wrapper: {types:?}"
+        );
+    }
+
+    #[test]
+    fn api3_response_projection_appends_when_no_json_envelope_present() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api3"],
+            "per_item": {
+                "api3": {"response_exclude_fields": ["ssn"]},
+            },
+        }));
+        let mut transforms = vec![serde_json::json!({"type": "html"})];
+        expand_owasp_pack("h", &mut policies, &mut transforms, &mut false, "proxy")
+            .expect("expand")
+            .expect("some");
+        let types: Vec<&str> = transforms
+            .iter()
+            .map(|t| t.get("type").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(types, vec!["html", "json_projection"]);
+    }
+
+    #[test]
     fn api3_response_exclude_fields_rejected_on_a_different_item() {
         let mut policies = owasp_policy(serde_json::json!({
             "type": "owasp_api_top10",
@@ -2125,7 +2781,7 @@ mod tests {
                 "api1": {"response_exclude_fields": ["ssn"]},
             },
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("only valid for api3"), "{err}");
@@ -2140,7 +2796,7 @@ mod tests {
                 "api3": {"response_exclude_fields": []},
             },
         }));
-        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "proxy")
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not be empty"), "{err}");
@@ -2153,9 +2809,15 @@ mod tests {
             "enable": ["api9"],
         }));
         let mut expose_openapi = false;
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut expose_openapi)
-            .expect("expand")
-            .expect("some");
+        let manifest = expand_owasp_pack(
+            "h",
+            &mut policies,
+            &mut Vec::new(),
+            &mut expose_openapi,
+            "proxy",
+        )
+        .expect("expand")
+        .expect("some");
         assert!(expose_openapi, "api9 must flip expose_openapi to true");
         let entry = manifest.entry_for(PackItem::Api9).expect("api9 entry");
         assert_eq!(entry.state, PackItemState::Enforced);
@@ -2179,9 +2841,15 @@ mod tests {
             "enable": ["api9"],
         }));
         let mut expose_openapi = true;
-        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut expose_openapi)
-            .expect("expand")
-            .expect("some");
+        let manifest = expand_owasp_pack(
+            "h",
+            &mut policies,
+            &mut Vec::new(),
+            &mut expose_openapi,
+            "proxy",
+        )
+        .expect("expand")
+        .expect("some");
         assert!(expose_openapi, "must stay true");
         let entry = manifest.entry_for(PackItem::Api9).expect("api9 entry");
         assert_eq!(entry.state, PackItemState::Enforced);

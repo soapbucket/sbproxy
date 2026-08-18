@@ -58,7 +58,10 @@ one place: `api1`/`api5`'s shared `object_authz` entry, where it flips
 effect on those; they enforce (or, for `security_headers`, simply
 inject headers) the moment they are synthesized, at either posture.
 Do not read `posture: report_only` as a global soft-launch switch: for
-four of this pack's items it is a no-op.
+most of this pack's items it is a no-op. It is a separate axis from
+whether a piece is synthesized *at all*: `rate_limiting` and
+`ddos_protection` (`api4`) and `security_headers` (`api8`) each have
+their own synthesis gate unrelated to posture - see those items below.
 
 **The honest manifest.** Every enabled item resolves to exactly one of
 five states, never a silent no-op: `enforced`, `report_only`,
@@ -70,19 +73,25 @@ five states, never a silent no-op: `enforced`, `report_only`,
 - **enforced** - the pack synthesized something and it blocks (or, for
   a header-injection policy, simply applies) regardless of posture, or
   the item's control already runs outside the policy chain entirely.
+  Coverage can still be partial: `api4` reports `enforced` once its
+  rate-shaped pieces have a budget, even though its reason still names
+  anything the operator's own config is standing in for.
 - **report_only** - reserved for an item whose synthesis both exists
   and has a real report-only knob that the pack-wide or per-item
   posture actually gates. No item in this pack version resolves here
   today; see the posture note above for why.
-- **needs_operator_input** - the pack synthesized a slot (an empty
-  rule set, a missing field list) that does nothing until an operator
-  supplies what only they can: an ownership mapping, a role rule, a
-  field list.
+- **needs_operator_input** - the pack synthesized only part of an item
+  (or a slot - an empty rule set, a missing field list - that does
+  nothing at all) until an operator supplies what only they can: an
+  ownership mapping, a role rule, a field list, or (`api4`) a
+  requests-per-second budget.
 - **operator_authored** - the origin already authors the policy type
   this item would have synthesized; the pack backs off and leaves it
   exactly as configured.
 - **not_covered** - no synthesis is wired for this item in this pack
-  version, or it has no gateway control at all. The reason says which.
+  version, it has no gateway control at all, or (`api8` on a
+  non-response-phase action) this origin's action type cannot run the
+  control that would apply. The reason says which.
 
 ## api1: Broken Object Level Authorization
 
@@ -146,17 +155,32 @@ seeing), the same underlying gap wearing two directions.
 a JSON Schema) with no universal default, the same structural gap as
 `api1`'s ownership rules; the pack only detects whether you already
 author one. Response side: a `json_projection` transform
-(`fields: <your list>`, `exclude: true`) appended to the origin's
-`transforms:`, but only when `per_item.api3.response_exclude_fields`
-supplies the field list. `json_projection` already existed before
-this pack; the pack wires it, it does not invent it.
+(`fields: <your list>`, `exclude: true`, `failure_posture: closed`)
+appended to the origin's `transforms:`, but only when
+`per_item.api3.response_exclude_fields` supplies the field list.
+`json_projection` already existed before this pack; the pack wires it,
+it does not invent it.
+
+**Scope: top-level object fields only.** `json_projection` filters
+the **top-level keys of a JSON object** response body. A JSON array
+body, or a sensitive field nested inside an object or array rather
+than sitting at the top level, passes through completely unfiltered -
+this is not "every JSON response body," and the fields you list are
+only actually stripped when the response is shaped as a flat object
+carrying them at the top. Confirm your response shape before relying
+on this for a field that matters. `failure_posture: closed` (set on
+every synthesized entry) means an oversized or unparseable response
+body is refused rather than shipped raw and unfiltered - without it,
+an attacker-influenceable oversized body would ship the very fields
+this piece exists to strip.
 
 **Default posture and why.** `needs_operator_input` when no field
 list is supplied: neither half does anything. The moment
 `response_exclude_fields` is set, the item as a whole reports
 `enforced`, because the response half is then genuinely,
-unconditionally active; the reason still names the request-side gap
-by name so the label does not overstate what is actually covered.
+unconditionally active for a top-level-object response shape; the
+reason still names the request-side gap by name so the label does not
+overstate what is actually covered.
 
 **report_only -> enforce.** There is no report-only step for this
 item. `json_projection` has no audit mode; supplying the field list
@@ -179,27 +203,58 @@ neither.
 and a credential-stuffing oracle at once, and also how one retry loop
 takes a backend down.
 
-**Synthesizes.** Four independently-backing-off pieces: `request_limit`
-(`max_body_size: 1048576` [1 MiB], `max_header_count: 64`,
-`max_url_length: 2048`), `rate_limiting` (`requests_per_second: 100`,
-`burst: 200`, per-caller by default), `concurrent_limit` (`max: 200`,
-shared globally across the origin), and `ddos_protection` (the
-module's own defaults: 100 requests/second per IP, sliding 1-second
-window, 300-second block). Authoring any one of the four yourself
-backs off just that piece; the other three still land.
+**Synthesizes.** Four independently-backing-off pieces, in two safety
+tiers.
 
-**Default posture and why.** `enforced`, unconditionally. None of the
-four has a report-only mode; each blocks past its configured limit
-regardless of `posture`.
+Always synthesized, safe to default blind: `request_limit`
+(`max_body_size: 1048576` [1 MiB], `max_header_count: 64,
+max_url_length: 2048` - a structural cap on the request's own shape,
+not on who sent it) and `concurrent_limit` (`max: 200`, `key_by:
+global` - one shared in-flight budget for the whole origin, also not
+keyed on caller identity).
+
+Synthesized **only when you supply `per_item.api4.rps`**:
+`rate_limiting` (`requests_per_second: <rps>`, `burst: <rps * 2>`) and
+`ddos_protection` (`requests_per_second: <rps>`; `block_duration_secs`
+stays at the module's own 300-second default). Absent `rps`, neither
+is synthesized and the item reports `needs_operator_input`, even
+though `request_limit`/`concurrent_limit` are already running.
+
+Authoring any one of the four yourself backs that specific piece off;
+the rest still land under the rules above.
+
+> **Read this before setting `per_item.api4.rps`.** `rate_limiting`
+> and `ddos_protection` both key on the caller's *observed* IP by
+> default. Sitting behind a load balancer or reverse proxy with no
+> `proxy.trusted_proxies` configured means sbproxy sees every caller
+> as the load balancer's one IP - so a per-caller budget becomes a
+> *shared* budget across every real client, and the first burst of
+> real traffic that exceeds it 429s (or, for `ddos_protection`, blocks
+> for five minutes) every other client sharing that IP too. This is a
+> real outage class this pack found and fixed by refusing to guess a
+> number. Before setting `rps`: confirm `proxy.trusted_proxies` covers
+> your load balancer's address (or confirm this origin has no load
+> balancer in front of it), then pick a per-caller budget that fits
+> your real traffic - not the module's old blind default. See
+> [Trusted proxies and forwarding headers](configuration.md#trusted-proxies-and-forwarding-headers)
+> for how sbproxy resolves the caller's address behind a proxy chain.
+
+**Default posture and why.** `needs_operator_input` until `rps` is
+set, then `enforced`. None of the four pieces has a report-only mode
+either way; each blocks past its configured limit regardless of
+`posture` - `posture` only ever affects whether a violation is
+audited or blocked, and none of these four ever audits.
 
 **report_only -> enforce.** No-op for this item; there is no
 report-only path to move along. `posture` is accepted but does
 nothing here.
 
-**Operator input needed.** None to get baseline coverage. Tune the
-numbers, or author your own `request_limit` / `rate_limiting` /
-`concurrent_limit` / `ddos_protection` to replace the pack's piece for
-that one control while keeping the rest.
+**Operator input needed.** `per_item.api4.rps` (after confirming
+`trusted_proxies`, above) to get the rate-shaped half of this item's
+coverage; `request_limit`/`concurrent_limit` need nothing. Or author
+your own `request_limit` / `rate_limiting` / `concurrent_limit` /
+`ddos_protection` to replace the pack's piece for that one control
+while keeping the rest.
 
 ## api5: Broken Function Level Authorization
 
@@ -254,9 +309,19 @@ base URLs, RAG HTTP providers, alerting channels, A2A push targets,
 external guardrails), independent of whether this pack is enabled at
 all.
 
-**Default posture and why.** `enforced`, always. This is not a policy
-the pack can toggle; it names an already-running control rather than
-adding one.
+**Scope: sbproxy's own outbound dials only.** This guard covers
+requests *sbproxy itself* makes on the proxy process's behalf. It does
+**not** cover the backend application's own server-side URL fetching -
+a caller supplies a URL, or a value the app resolves into one, and the
+app's own code fetches it - which is the API7:2023 risk as OWASP
+defines it, and which happens entirely behind this origin's action,
+somewhere this pack cannot see or guard. If your backend fetches
+caller-influenced URLs itself, that check belongs in the backend, not
+here.
+
+**Default posture and why.** `enforced`, always, for what this guard
+does cover. This is not a policy the pack can toggle; it names an
+already-running control rather than adding one.
 
 **report_only -> enforce.** Not applicable; there is nothing this
 pack turns on or off for this item.
@@ -282,14 +347,34 @@ control characters in header values; hard-coded, no tunable fields).
 A managed `waf` (Core Rule Set) default is deliberately not part of
 this item in this pack version; configure `waf` directly for that.
 
-**Default posture and why.** `enforced`, unconditionally. Neither
+**`security_headers` needs a response-phase action.** `security_headers`
+takes effect in Pingora's response-phase filter, which only runs for
+an action that actually dials an upstream: `proxy`, `load_balancer`,
+`websocket`, `a2a`, `graphql`, and `grpc`. An origin whose action
+answers entirely inside the request phase - `static`, `mock`, `echo`,
+`beacon`, `redirect`, `mcp`, `noop`, `ai_proxy`, `storage`, or a
+plugin action - never reaches that filter, so `security_headers` is
+not synthesized there; the manifest names the gap by action type
+instead of claiming coverage nothing runs. `http_framing` runs at
+request phase, independent of action type, and always synthesizes
+regardless.
+
+**Default posture and why.** `enforced` whenever at least one piece
+lands (which `http_framing` always does), unconditionally. Neither
 piece has a report-only mode: headers always inject, framing checks
-always block.
+always block. If this origin's action skips response-phase
+enforcement and the operator already authors `http_framing`
+themselves too, nothing from the pack is actually running for this
+item and it reports `not_covered` instead.
 
 **report_only -> enforce.** No-op for this item.
 
-**Operator input needed.** None for baseline coverage. Layer `waf` on
-top yourself for broader misconfiguration coverage; see
+**Operator input needed.** None for baseline coverage on a
+`proxy`/`load_balancer`/etc. origin. On a `static`/`mock`/other
+request-phase-only origin, `security_headers` needs to be configured
+on the app itself (or the route moved to a proxy/load_balancer
+action) if response headers matter for it. Layer `waf` on top yourself
+for broader misconfiguration coverage; see
 [waf-options.md](waf-options.md).
 
 ## api9: Improper Inventory Management

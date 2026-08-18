@@ -1283,17 +1283,35 @@ fn origin_change_reason(host: &str, old: &serde_json::Value, new: &serde_json::V
 /// (WOR-2491 task 4), computed straight from the proposed JSON
 /// snapshot the diff walker already captured on the entry's `new`
 /// field. Calls the same `owasp_api_pack::expand_owasp_pack` function
-/// `compiler::compile_origin` calls, on the same three inputs
-/// (`policies`, `transforms`, `expose_openapi`) read back off that
-/// snapshot, so the rows this renders match what
+/// `compiler::compile_origin` calls, on the same inputs (`policies`,
+/// `transforms`, `expose_openapi`, the action's `type` string) read
+/// back off that snapshot, so the rows this renders match what
 /// `CompiledOrigin::owasp_pack_manifest` carries once the config is
 /// actually applied.
 ///
 /// Returns `None` when the origin has no `owasp_api_top10` policy, or
-/// when the pack entry is malformed. A malformed entry is not an
-/// error here: plan-time semantic validation already surfaces that
-/// separately as a [`PlanFinding`] on the same report, so this
-/// preview does not duplicate it.
+/// when the pack entry is malformed. A malformed entry is not
+/// silently swallowed: `validate::check_owasp_pack_config` runs the
+/// same expander over the *proposed* config inside `validate()`
+/// (WOR-2491 review round, M2) and turns an `Err` into a real
+/// [`PlanFinding`] on the same report, so an operator sees the error
+/// under `Validation:` even though this preview has nothing to render
+/// for that origin.
+///
+/// Renders pre-interpolation values. The CLI's `plan` command parses
+/// `new`'s originating `ConfigFile` straight from the on-disk YAML
+/// text (`sbproxy::load_and_validate_with`): it calls `compile_config`
+/// once to validate that the document compiles, then re-parses the
+/// same, still-uninterpolated bytes into the `ConfigFile` this diff
+/// walker actually reads - `compile_config`'s `${VAR}`-expanded result
+/// is discarded, kept only for its `Result`. A `per_item.api3.response_exclude_fields`
+/// entry (or `per_item.api4.rps`, or any other pack field) written
+/// with `${ENV_VAR}` syntax therefore renders here as the literal
+/// placeholder text, not the resolved value; the compiled origin's
+/// real manifest (`CompiledOrigin::owasp_pack_manifest`, and the
+/// `GET /admin/owasp-api-pack` endpoint that reads it) always reflects
+/// the resolved value, since that path runs `compile_config`'s output
+/// forward instead of discarding it.
 fn owasp_pack_preview(
     host: &str,
     new: &serde_json::Value,
@@ -1315,11 +1333,17 @@ fn owasp_pack_preview(
         .get("expose_openapi")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let action_type = new
+        .get("action")
+        .and_then(|a| a.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     crate::owasp_api_pack::expand_owasp_pack(
         host,
         &mut policies,
         &mut transforms,
         &mut expose_openapi,
+        action_type,
     )
     .ok()
     .flatten()

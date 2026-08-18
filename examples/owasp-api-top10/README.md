@@ -36,12 +36,23 @@ content-type: application/json; charset=utf-8
 {"method":"GET","url":"/get","headers":{"host":"test.sbproxy.dev",...},"query":{},"timestamp":"..."}
 ```
 
-**api4 (Unrestricted Resource Consumption) refuses an oversized body.**
-The pack synthesizes `request_limit` with `max_body_size: 1048576` (1
-MiB) as one of four independently-enforcing pieces
-(`request_limit`, `rate_limiting`, `concurrent_limit`,
-`ddos_protection`); none of the four has a report-only mode, so this
-blocks regardless of the pack's default posture:
+**api4 (Unrestricted Resource Consumption) refuses an oversized body,
+but two of its four pieces need a budget before they land.** The pack
+always synthesizes `request_limit` (`max_body_size: 1048576`, 1 MiB)
+and `concurrent_limit`: neither keys on caller identity, so both are
+safe to default blind. It does **not** synthesize `rate_limiting` or
+`ddos_protection` without `per_item.api4.rps` - this example does not
+set it, on purpose. Both key on the caller's *observed* IP by default,
+and behind a load balancer with no `proxy.trusted_proxies` configured
+every real client collapses to the load balancer's one IP, sharing (and
+quickly exhausting) one budget - a real outage class, not a
+hypothetical one. Measure your real per-caller traffic and confirm
+`proxy.trusted_proxies` covers your load balancer's address (or
+confirm there is no load balancer in front of this origin) before
+setting `rps`; see
+[docs/owasp-api-top10.md](../../docs/owasp-api-top10.md#api4-unrestricted-resource-consumption)
+for the full guidance. `request_limit` alone is still real,
+unconditional coverage:
 
 ```bash
 $ curl -i -H 'Host: owasp-pack.local' \
@@ -53,6 +64,9 @@ content-type: application/json
 
 {"error":"request entity too large"}
 ```
+
+See [`examples/owasp-api-selective/`](../owasp-api-selective/) for a
+config that does set `per_item.api4.rps`, after that measurement step.
 
 **api8 (Security Misconfiguration) refuses ambiguous request framing.**
 The pack synthesizes `security_headers` and `http_framing`; the
@@ -98,9 +112,13 @@ URL, not a caller-influenced one, so there is no request against
 `owasp-pack.local` that exercises it. The manifest still reports
 `api7` as `enforced`, with zero synthesized policies, and names the
 guard by config key (`proxy.extensions.upstream.allow_private_cidrs`)
-in its reason. See `validate_url_resolved_blocks_private_ip`
-(`crates/sbproxy-security/src/ssrf.rs`) for where that guard is
-actually proven.
+in its reason - and names, just as explicitly, what it does not cover:
+this guards sbproxy's own outbound dials only, not a backend
+application's own server-side URL fetching (the actual API7:2023
+risk), which happens entirely behind this origin's action and out of
+this pack's sight. See `validate_url_resolved_blocks_private_ip`
+(`crates/sbproxy-security/src/ssrf.rs`) for where the guard sbproxy
+does own is actually proven.
 
 ## Read the manifest back
 
@@ -139,7 +157,7 @@ $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
 {"item":"api1","state":"needs_operator_input"}
 {"item":"api2","state":"not_covered"}
 {"item":"api3","state":"needs_operator_input"}
-{"item":"api4","state":"enforced"}
+{"item":"api4","state":"needs_operator_input"}
 {"item":"api5","state":"needs_operator_input"}
 {"item":"api6","state":"not_covered"}
 {"item":"api7","state":"enforced"}
@@ -148,15 +166,18 @@ $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
 {"item":"api10","state":"not_covered"}
 ```
 
-Four `enforced` (api4, api7, api8, api9), three `needs_operator_input`
-(api1, api3, api5: each has a slot ready, none has the operator input
-it needs yet), three `not_covered` (api2, api6, api10: no synthesis
-exists for these in this pack version). None is silently skipped.
+Three `enforced` (api7, api8, api9), four `needs_operator_input` (api1,
+api3, api5: each has a slot ready, none has the operator input it
+needs yet; api4: two of its four pieces are already running -
+`request_limit`, `concurrent_limit` - but `rate_limiting` and
+`ddos_protection` are withheld until `per_item.api4.rps` is set, on
+purpose - see below), three `not_covered` (api2, api6, api10: no
+synthesis exists for these in this pack version). None is silently
+skipped.
 
 One full row, including the `reason` every state above carries and
 the `synthesized` policy types behind it (abridged here; the live
-`reason` is one full sentence per synthesized piece, so it runs
-longer than this):
+`reason` is one full sentence per piece, so it runs longer than this):
 
 ```bash
 $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
@@ -167,22 +188,32 @@ $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
 {
   "item": "api4",
   "title": "Unrestricted Resource Consumption",
-  "state": "enforced",
-  "reason": "synthesized request_limit (max_body_size: 1 MiB, ...), rate_limiting (100 req/s, burst 200, per-caller), concurrent_limit (max 200, global), and ddos_protection (module defaults). None has a report-only mode; posture has no effect on this item.",
-  "synthesized": ["request_limit", "rate_limiting", "concurrent_limit", "ddos_protection"]
+  "state": "needs_operator_input",
+  "reason": "request_limit: synthesized (max_body_size: 1 MiB, ...). concurrent_limit: synthesized (max: 200, global). rate_limiting: NOT synthesized: ... behind a load balancer with no proxy.trusted_proxies configured every real client collapses to the load balancer's single IP ... Set per_item.api4.rps ... ddos_protection: NOT synthesized: ...",
+  "synthesized": ["request_limit", "concurrent_limit"]
 }
 ```
+
+Setting `per_item.api4.rps` (after confirming `proxy.trusted_proxies`,
+or confirming there is no load balancer in front of this origin) moves
+this item to `enforced` with all four pieces in `synthesized`. See
+[`examples/owasp-api-selective/`](../owasp-api-selective/) for that
+config.
 
 ## What this exercises
 
 - `type: owasp_api_top10` with `enable: all` and the pack's default
   (`report_only`) posture
-- Four items (`api4`, `api7`, `api8`, `api9`) that enforce regardless
-  of posture, because their controls have no report-only knob or run
+- Three items (`api7`, `api8`, `api9`) that enforce regardless of
+  posture, because their controls have no report-only knob or run
   outside the policy chain entirely
-- Three items (`api1`, `api3`, `api5`) that need operator-authored
-  rules or a field list this pack cannot infer, honestly labeled
-  `needs_operator_input` rather than silently skipped
+- Four items (`api1`, `api3`, `api4`, `api5`) that need
+  operator-authored rules, a field list, or (`api4`) a measured
+  requests-per-second budget this pack cannot infer, honestly labeled
+  `needs_operator_input` rather than silently skipped or guessed -
+  `api4` in particular withholds its two caller-IP-keyed pieces rather
+  than risk a shared-budget outage behind an unconfigured load
+  balancer
 - Three items (`api2`, `api6`, `api10`) with no synthesis wired in
   this pack version, labeled `not_covered` with a reason naming the
   gap
