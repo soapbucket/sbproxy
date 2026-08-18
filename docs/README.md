@@ -4,6 +4,11 @@
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
+[overview.html](overview.html) is the one-page product overview: the five
+classes of AI traffic the proxy governs, the request path, and where we
+stand against the specialists in each class. It renders in any browser
+with no dependencies.
+
 ## Which path is yours?
 
 - **New to SBproxy?** Start at [Start here](#start-here), then [Guides by use case](#guides-by-use-case).
