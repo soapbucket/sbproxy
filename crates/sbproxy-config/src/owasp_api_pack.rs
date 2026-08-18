@@ -39,9 +39,9 @@
 //! unconditionally outside the policy chain, so
 //! [`ItemRow::already_enforced_reason`] reports
 //! [`PackItemState::Enforced`] with nothing added to `policies`. `api2`,
-//! `api3`, `api6`, `api9`, and `api10` report
-//! [`PackItemState::NotCovered`] with a reason naming the gap; no
-//! synthesis is wired for them in this pack version.
+//! `api6`, and `api10` report [`PackItemState::NotCovered`] with a
+//! reason naming the gap; no synthesis is wired for them in this pack
+//! version.
 //!
 //! `api1`'s and `api5`'s shared `object_authz` entry always reports
 //! [`PackItemState::NeedsOperatorInput`] regardless of posture: with
@@ -55,6 +55,33 @@
 //! is missing, not whether the free fallback happens to be blocking or
 //! auditing - and here there is no free fallback yet, only a slot ready
 //! for one the moment an operator adds rules.
+//!
+//! `api3` and `api9` do not fit the `ItemRow`/`SynthPiece` table shape
+//! at all, so [`expand_owasp_pack`] special-cases both before it ever
+//! consults [`ITEM_TABLE`] for them (their table rows exist only so
+//! every [`PackItem`] variant still has one, per that invariant, and
+//! are marked unused in their own fields):
+//!
+//! - `api3` ([`expand_api3_entry`]) splits into a request half that
+//!   synthesizes nothing (`openapi_validation` and `request_validator`
+//!   both require operator-supplied content - a spec or a schema - with
+//!   no universal default, the same structural gap as `api1`'s
+//!   ownership rules; the pack only detects whether the operator
+//!   already authored one and says so) and a response half that
+//!   synthesizes a `json_projection` *transform* (not a policy) onto
+//!   the origin's `transforms:` list, but only when the operator
+//!   supplies `per_item.api3.response_exclude_fields` - the field list
+//!   this pack cannot infer. This is the plan ledger's 2026-08-18
+//!   correction: the response-side gap the original research called
+//!   "no control at all" is real at the *policy* layer but not at the
+//!   *transform* layer, where `JsonProjectionTransform`
+//!   (`sbproxy-modules::transform::json`) already strips named fields
+//!   from buffered response bodies via `response_body_filter`.
+//! - `api9` ([`expand_api9_entry`]) sets the origin-level
+//!   `expose_openapi` boolean (`RawOriginConfig::expose_openapi`,
+//!   confirmed origin-scoped at `types.rs:7580-7585`, not
+//!   server-level) directly, since that field is not a `type:` entry
+//!   in either list this pack otherwise touches.
 
 use std::collections::{HashMap, HashSet};
 
@@ -229,17 +256,20 @@ pub struct PackManifestEntry {
     /// single generic sentence.
     pub reason: String,
     /// Config `type` strings the pack added to the origin's policy
-    /// chain for this item. Empty for `OperatorAuthored` (the pack
-    /// added nothing; every piece backed off to the operator's own
-    /// entry) and for `NotCovered`. Can be a *subset* of an item's
-    /// possible types under a partial back-off: an origin that already
-    /// authors `rate_limiting` itself still gets `request_limit`,
-    /// `concurrent_limit`, and `ddos_protection` from `api4`'s row, and
-    /// only those three appear here. Can also be non-empty for
-    /// `NeedsOperatorInput`: `api1`/`api5` synthesize an
-    /// (as yet inert) `object_authz` entry while still reporting that
-    /// state, because real coverage needs an operator-authored rule
-    /// this pack cannot infer.
+    /// *or transform* chain for this item (`api3`'s response half adds
+    /// a `transforms:` entry, `json_projection`; every other
+    /// non-empty entry here is a `policies:` type). Empty for
+    /// `OperatorAuthored` (the pack added nothing; every piece backed
+    /// off to the operator's own entry) and for `NotCovered`. Can be a
+    /// *subset* of an item's possible types under a partial back-off:
+    /// an origin that already authors `rate_limiting` itself still
+    /// gets `request_limit`, `concurrent_limit`, and `ddos_protection`
+    /// from `api4`'s row, and only those three appear here. Can also
+    /// be non-empty for `NeedsOperatorInput`: `api1`/`api5` synthesize
+    /// an (as yet inert) `object_authz` entry while still reporting
+    /// that state, because real coverage needs an operator-authored
+    /// rule this pack cannot infer. Always empty for `api9`: its
+    /// control is a boolean field, not a `type:` entry in either list.
     pub synthesized_types: Vec<&'static str>,
 }
 
@@ -306,6 +336,13 @@ struct RawPerItem {
     /// Posture override for this one item.
     #[serde(default)]
     posture: Option<String>,
+    /// `api3`-only: field names to strip from JSON response bodies via
+    /// a synthesized `json_projection` transform (see
+    /// [`expand_api3_entry`]). Rejected on any other item; rejected if
+    /// present but empty (omit the key instead - an empty list is not
+    /// the same request as "strip nothing").
+    #[serde(default)]
+    response_exclude_fields: Option<Vec<String>>,
 }
 
 /// Returns true when the JSON value's `type` field equals `wanted`.
@@ -618,6 +655,150 @@ fn synth_http_framing(_posture: PackPosture) -> PieceSynthesis {
     }
 }
 
+/// Builds `api3`'s manifest entry. Does not use the `SynthPiece`
+/// table: the request half never synthesizes anything (see below) and
+/// the response half needs a field list from `per_item.api3`, not
+/// just a posture, plus it writes to `transforms`, a different `Vec`
+/// than every other item in this pack touches - neither fits
+/// `SynthPiece::synth: fn(PackPosture) -> PieceSynthesis`.
+///
+/// Request side (mass assignment / unexpected input fields): `openapi_validation::from_config`
+/// (`crates/sbproxy-modules/src/policy/openapi_validation.rs`) requires
+/// `spec` or `spec_file`; `request_validator::from_config`
+/// (`crates/sbproxy-modules/src/policy/request_validator.rs`) requires
+/// `schema`. Neither has a universal default the way `api4`'s numeric
+/// limits do, so this pack cannot synthesize either - the same
+/// structural gap as `api1`'s ownership rules. This half is advisory
+/// only: it detects whether the operator already authors one of the
+/// two and says so, but never gates `state` on its own (an operator
+/// who supplies `response_exclude_fields` without a request-side
+/// validator still gets `Enforced`, not `NeedsOperatorInput`, because
+/// the response half is genuinely, unconditionally active either way).
+///
+/// Response side (excessive data exposure): synthesizes a
+/// `json_projection` transform (`sbproxy-modules::transform::json::JsonProjectionTransform`,
+/// `fields: exclude_fields`, `exclude: true`) onto the origin's
+/// `transforms:` list when `per_item.api3.response_exclude_fields` is
+/// supplied - the plan ledger's 2026-08-18 correction: this transform
+/// already strips named fields from buffered JSON response bodies via
+/// `response_body_filter`, so the response-side gap is a missing
+/// *field list*, not a missing *mechanism*. Absent the list, nothing
+/// is synthesized and the reason names the transform by module path
+/// plus the missing field list, never "no capability" (per the same
+/// ruling). `json_projection` has no report-only knob, so pack-wide
+/// `posture` has no effect on this half either.
+fn expand_api3_entry(
+    operator_authored_types: &HashSet<String>,
+    response_exclude_fields: Option<&[String]>,
+    transforms: &mut Vec<serde_json::Value>,
+) -> PackManifestEntry {
+    let request_covered = operator_authored_types.contains("openapi_validation")
+        || operator_authored_types.contains("request_validator");
+    let request_reason = if request_covered {
+        "request side: origin already authors openapi_validation or request_validator; the \
+         pack leaves it exactly as configured, including its own mode."
+            .to_string()
+    } else {
+        "request side: no openapi_validation or request_validator policy configured, so mass \
+         assignment / unexpected input fields are not checked. The pack cannot synthesize \
+         either because both require operator-supplied content (an OpenAPI spec or a JSON \
+         Schema) with no universal default, the same structural gap as api1's ownership rules. \
+         Configure openapi_validation (mode: log to bootstrap against real traffic, or mode: \
+         enforce with a spec already in hand) or request_validator directly."
+            .to_string()
+    };
+
+    let mut synthesized_types = Vec::new();
+    let (response_reason, response_synthesized) = match response_exclude_fields {
+        Some(fields) => {
+            let policy = serde_json::json!({
+                "type": "json_projection",
+                "fields": fields,
+                "exclude": true,
+            });
+            transforms.push(policy);
+            synthesized_types.push("json_projection");
+            (
+                format!(
+                    "response side: synthesized json_projection (fields: [{}], exclude: true) \
+                     onto the origin's transform chain, stripping these fields from every JSON \
+                     response body via response_body_filter. json_projection has no \
+                     report-only mode; posture has no effect on this half.",
+                    fields.join(", ")
+                ),
+                true,
+            )
+        }
+        None => (
+            "response side: no per_item.api3.response_exclude_fields supplied, so nothing was \
+             synthesized. sbproxy-modules::transform::json::JsonProjectionTransform (config \
+             type json_projection) already strips named fields from buffered JSON response \
+             bodies via response_body_filter, but needs an operator-supplied field list this \
+             pack cannot infer. Set per_item.api3.response_exclude_fields: [field, ...] to \
+             enable it."
+                .to_string(),
+            false,
+        ),
+    };
+
+    let state = if response_synthesized {
+        PackItemState::Enforced
+    } else {
+        PackItemState::NeedsOperatorInput
+    };
+
+    PackManifestEntry {
+        item: PackItem::Api3,
+        state,
+        reason: format!("{request_reason} {response_reason}"),
+        synthesized_types,
+    }
+}
+
+/// Builds `api9`'s manifest entry. Does not use the `SynthPiece`
+/// table: its control is `RawOriginConfig::expose_openapi`, a single
+/// origin-level `bool` field (confirmed origin-scoped, not
+/// server-level, at `types.rs:7580-7585`), not a `type:` entry in
+/// `policies:` or `transforms:`, so there is nothing for
+/// `operator_authored_types`-style detection to key off - the caller
+/// reads the field's own prior value instead and passes it in as
+/// `was_already_true`.
+///
+/// Always reports [`PackItemState::Enforced`] when this item is
+/// enabled: turning emission on never blocks traffic (it serves a
+/// live OpenAPI document built from the compiled config at
+/// `/.well-known/openapi.json`), matching the design sketch's "this is
+/// a report, not a block." The reason still draws the real tradeoff
+/// (route-shape disclosure) rather than presenting it as a free win,
+/// and names what emission does and does not cover either way.
+fn expand_api9_entry(was_already_true: bool) -> PackManifestEntry {
+    let reason = if was_already_true {
+        "origin already sets expose_openapi: true; the pack makes no change. The live OpenAPI \
+         document is served at /.well-known/openapi.json (and .yaml), built from this compiled \
+         config, so it cannot drift the way a hand-maintained spec does. It only reflects what \
+         this gateway routes: a backend route sbproxy never sees (a shadow API) is not listed, \
+         and there is no sunset/deprecation enforcement for an old version still reachable \
+         through versioning."
+            .to_string()
+    } else {
+        "set expose_openapi: true for this origin (was false, the default): serves a live \
+         OpenAPI document at /.well-known/openapi.json (and .yaml), built from this compiled \
+         config, so it cannot drift the way a hand-maintained spec does. This is a real \
+         route-shape-disclosure tradeoff, not a free win: review whether this origin's route \
+         shape is safe to publish before shipping enable: all or api9 to production. It only \
+         reflects what this gateway routes: a backend route sbproxy never sees (a shadow API) \
+         is not listed, and there is no sunset/deprecation enforcement for an old version still \
+         reachable through versioning."
+            .to_string()
+    };
+    PackManifestEntry {
+        item: PackItem::Api9,
+        state: PackItemState::Enforced,
+        reason,
+        synthesized_types: Vec::new(),
+    }
+}
+
 /// The `api1` piece: shared with `api5`, see [`synth_object_authz`].
 const API1_PIECES: [SynthPiece; 1] = [SynthPiece {
     backoff_types: &["object_authz", "bola"],
@@ -724,14 +905,18 @@ const ITEM_TABLE: [ItemRow; 10] = [
                             block directly.",
     },
     ItemRow {
+        // Unused: `expand_owasp_pack`'s main loop special-cases api3
+        // via `expand_api3_entry` before it ever calls `item_row` for
+        // this variant (api3's response half needs the `transforms`
+        // Vec and a per-item field list, neither of which fits this
+        // row's `pieces`/`covered_state`/`uncovered_reason` shape).
+        // This row exists only so every `PackItem` variant still has
+        // exactly one entry, per `item_row`'s own doc comment.
         item: PackItem::Api3,
         pieces: &[],
         covered_state: PackItemState::NotCovered,
         already_enforced_reason: None,
-        uncovered_reason: "no synthesis wired for this item; request-side coverage exists via \
-                            openapi_validation or request_validator, but the pack cannot \
-                            author a spec-shaped config for you, and there is no response-side \
-                            (excessive data exposure) control at all today.",
+        uncovered_reason: "",
     },
     ItemRow {
         item: PackItem::Api4,
@@ -780,13 +965,18 @@ const ITEM_TABLE: [ItemRow; 10] = [
         uncovered_reason: "",
     },
     ItemRow {
+        // Unused: `expand_owasp_pack`'s main loop special-cases api9
+        // via `expand_api9_entry` before it ever calls `item_row` for
+        // this variant (api9's control is the origin-level
+        // `expose_openapi` bool, not a `type:` entry `SynthPiece`
+        // back-off detection can key off). This row exists only so
+        // every `PackItem` variant still has exactly one entry, per
+        // `item_row`'s own doc comment.
         item: PackItem::Api9,
         pieces: &[],
         covered_state: PackItemState::NotCovered,
         already_enforced_reason: None,
-        uncovered_reason: "no synthesis wired for this item yet; a later version of this pack \
-                            turns on expose_openapi (a route-shape-disclosure tradeoff worth \
-                            reviewing before enabling, not a free win).",
+        uncovered_reason: "",
     },
     ItemRow {
         item: PackItem::Api10,
@@ -855,15 +1045,21 @@ fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>
 }
 
 /// Expands the origin's `owasp_api_top10` policy entry (if any) into
-/// concrete synthesized policies, appended to `policies` in place, and
-/// removes the pseudo-policy entry itself so it never reaches
-/// `sbproxy-modules::compile.rs`'s type-string match arms.
+/// concrete synthesized policies (appended to `policies`) and
+/// transforms (appended to `transforms`, `api3`'s response half
+/// only), and removes the pseudo-policy entry itself so it never
+/// reaches `sbproxy-modules::compile.rs`'s type-string match arms.
+/// Also flips `*expose_openapi` to `true` when `api9` is enabled and
+/// it was not already (see [`expand_api9_entry`]).
 ///
-/// Returns `Ok(None)` when the origin has no `owasp_api_top10` entry.
+/// Returns `Ok(None)` when the origin has no `owasp_api_top10` entry -
+/// `transforms` and `*expose_openapi` are left untouched in that case.
 /// Returns `Err` for: more than one `owasp_api_top10` entry on the
 /// origin, an unknown item name in `enable` or `per_item`, a duplicate
 /// item name within `enable`, a `per_item` override for an item not
-/// named in `enable`, or a malformed `posture`/`enable` value.
+/// named in `enable`, a `response_exclude_fields` override on any item
+/// other than `api3`, an empty `response_exclude_fields` list, or a
+/// malformed `posture`/`enable` value.
 ///
 /// `pub(crate)`: `compiler::compile_origin` is this crate's only
 /// caller and its own public entry point (`compile_config`) already
@@ -872,6 +1068,8 @@ fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>
 pub(crate) fn expand_owasp_pack(
     hostname: &str,
     policies: &mut Vec<serde_json::Value>,
+    transforms: &mut Vec<serde_json::Value>,
+    expose_openapi: &mut bool,
 ) -> anyhow::Result<Option<PackManifest>> {
     let pack_indices: Vec<usize> = policies
         .iter()
@@ -910,6 +1108,7 @@ pub(crate) fn expand_owasp_pack(
     };
 
     let mut per_item_posture: HashMap<PackItem, PackPosture> = HashMap::new();
+    let mut api3_response_exclude_fields: Option<Vec<String>> = None;
     for (key, entry) in &raw.per_item {
         let item = parse_item_or_bail(hostname, key, "per_item")?;
         if !enabled_set.contains(&item) {
@@ -928,6 +1127,23 @@ pub(crate) fn expand_owasp_pack(
                 )
             })?;
             per_item_posture.insert(item, posture);
+        }
+        if let Some(fields) = &entry.response_exclude_fields {
+            if item != PackItem::Api3 {
+                anyhow::bail!(
+                    "origin '{hostname}': owasp_api_top10 per_item.{key}.response_exclude_fields \
+                     is only valid for api3; {} does not accept it",
+                    item.canonical_name()
+                );
+            }
+            if fields.is_empty() {
+                anyhow::bail!(
+                    "origin '{hostname}': owasp_api_top10 per_item.api3.response_exclude_fields \
+                     must not be empty; omit the key entirely to leave the response side \
+                     unsynthesized"
+                );
+            }
+            api3_response_exclude_fields = Some(fields.clone());
         }
     }
 
@@ -949,6 +1165,27 @@ pub(crate) fn expand_owasp_pack(
         if !enabled_set.contains(&item) {
             continue;
         }
+
+        // api3 and api9 do not fit the ItemRow/SynthPiece table (see
+        // both functions' doc comments): resolve them directly and
+        // skip the generic per-row machinery below entirely.
+        if item == PackItem::Api3 {
+            entries.push(expand_api3_entry(
+                &operator_authored_types,
+                api3_response_exclude_fields.as_deref(),
+                transforms,
+            ));
+            continue;
+        }
+        if item == PackItem::Api9 {
+            let was_already_true = *expose_openapi;
+            if !was_already_true {
+                *expose_openapi = true;
+            }
+            entries.push(expand_api9_entry(was_already_true));
+            continue;
+        }
+
         let row = item_row(item).ok_or_else(|| {
             anyhow::anyhow!(
                 "internal error: owasp_api_top10 has no ITEM_TABLE row for {item:?}; this is a \
@@ -1041,7 +1278,8 @@ mod tests {
     #[test]
     fn no_pack_entry_returns_none_and_leaves_policies_untouched() {
         let mut policies = vec![serde_json::json!({"type": "rate_limiting"})];
-        let manifest = expand_owasp_pack("h", &mut policies).expect("expand");
+        let manifest =
+            expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false).expect("expand");
         assert!(manifest.is_none());
         assert_eq!(policies.len(), 1);
     }
@@ -1052,7 +1290,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1", "api99"],
         }));
-        let err = expand_owasp_pack("h", &mut policies)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("api99"), "names the bad value: {err}");
@@ -1067,7 +1305,7 @@ mod tests {
             "enable": ["api1"],
             "per_item": {"api99": {"posture": "enforce"}},
         }));
-        let err = expand_owasp_pack("h", &mut policies)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("api99"));
@@ -1080,7 +1318,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1", "api1"],
         }));
-        let err = expand_owasp_pack("h", &mut policies)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("more than once"), "{err}");
@@ -1093,7 +1331,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api1"]}),
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api4"]}),
         ];
-        let err = expand_owasp_pack("h", &mut policies)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("owasp_api_top10 pack entries found"), "{err}");
@@ -1106,7 +1344,7 @@ mod tests {
             "enable": ["api1"],
             "per_item": {"api4": {"posture": "enforce"}},
         }));
-        let err = expand_owasp_pack("h", &mut policies)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not enabled"), "{err}");
@@ -1120,7 +1358,7 @@ mod tests {
             "enable": ["api1"],
             "posture": "blocking",
         }));
-        let err = expand_owasp_pack("h", &mut policies)
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("blocking"), "{err}");
@@ -1132,7 +1370,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1"],
         }));
-        expand_owasp_pack("h", &mut policies).expect("expand");
+        expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false).expect("expand");
         assert!(
             !policies
                 .iter()
@@ -1147,7 +1385,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1174,7 +1412,7 @@ mod tests {
             "enable": ["api1"],
             "posture": "enforce",
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1200,7 +1438,7 @@ mod tests {
             "posture": "report_only",
             "per_item": {"api1": {"posture": "enforce"}},
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1229,7 +1467,7 @@ mod tests {
                 "object_rules": [],
             }),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1249,7 +1487,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api1"]}),
             serde_json::json!({"type": "bola", "object_rules": []}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api1).expect("api1 entry");
@@ -1262,7 +1500,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": "all",
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         assert_eq!(manifest.entries.len(), 10);
@@ -1280,7 +1518,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api2"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api2).expect("api2 entry");
@@ -1304,7 +1542,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api4"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
@@ -1378,7 +1616,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api4"]}),
             serde_json::json!({"type": "rate_limiting", "requests_per_second": 5.0}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
@@ -1425,7 +1663,7 @@ mod tests {
             serde_json::json!({"type": "concurrent_limit", "max": 10}),
             serde_json::json!({"type": "ddos"}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api4).expect("api4 entry");
@@ -1439,7 +1677,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api5"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api5).expect("api5 entry");
@@ -1469,7 +1707,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api1", "api5"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
 
@@ -1507,7 +1745,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api1", "api5"]}),
             serde_json::json!({"type": "object_authz", "function_rules": []}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         assert_eq!(
@@ -1531,7 +1769,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api7"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api7).expect("api7 entry");
@@ -1554,7 +1792,7 @@ mod tests {
             "type": "owasp_api_top10",
             "enable": ["api8"],
         }));
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
@@ -1588,7 +1826,7 @@ mod tests {
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api8"]}),
             serde_json::json!({"type": "security_headers", "headers": []}),
         ];
-        let manifest = expand_owasp_pack("h", &mut policies)
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
@@ -1607,6 +1845,211 @@ mod tests {
                 .map(|a| a.len()),
             Some(0),
             "the operator's own (empty) security_headers is untouched"
+        );
+    }
+
+    // --- WOR-2491 task 3: api3, api9 ---
+
+    #[test]
+    fn api3_needs_operator_input_when_nothing_is_configured() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api3"],
+        }));
+        let mut transforms = Vec::new();
+        let manifest = expand_owasp_pack("h", &mut policies, &mut transforms, &mut false)
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
+        assert_eq!(entry.state, PackItemState::NeedsOperatorInput);
+        assert!(entry.synthesized_types.is_empty());
+        assert!(
+            entry
+                .reason
+                .contains("no openapi_validation or request_validator"),
+            "names the request-side gap: {}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("json_projection"),
+            "names the existing response-side transform by config type, not \"no capability\": {}",
+            entry.reason
+        );
+        assert!(transforms.is_empty(), "nothing synthesized: {transforms:?}");
+    }
+
+    #[test]
+    fn api3_request_side_backs_off_when_openapi_validation_already_authored() {
+        let mut policies = vec![
+            serde_json::json!({"type": "owasp_api_top10", "enable": ["api3"]}),
+            serde_json::json!({
+                "type": "openapi_validation",
+                "spec": {"openapi": "3.0.0"},
+            }),
+        ];
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
+        // No response_exclude_fields supplied, so the item as a whole
+        // still needs operator input (the response half), even though
+        // the request half is covered by the operator's own policy.
+        assert_eq!(entry.state, PackItemState::NeedsOperatorInput);
+        assert!(
+            entry
+                .reason
+                .contains("origin already authors openapi_validation"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn api3_request_side_backs_off_when_request_validator_already_authored() {
+        let mut policies = vec![
+            serde_json::json!({"type": "owasp_api_top10", "enable": ["api3"]}),
+            serde_json::json!({
+                "type": "request_validator",
+                "schema": {"type": "object"},
+            }),
+        ];
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
+        assert!(
+            entry
+                .reason
+                .contains("origin already authors openapi_validation"),
+            "same shared fragment covers both policy types: {}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn api3_synthesizes_json_projection_transform_when_exclude_fields_supplied() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api3"],
+            "per_item": {
+                "api3": {"response_exclude_fields": ["ssn", "internal_notes"]},
+            },
+        }));
+        let mut transforms = Vec::new();
+        let manifest = expand_owasp_pack("h", &mut policies, &mut transforms, &mut false)
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api3).expect("api3 entry");
+        // Response side alone is real, unconditional coverage, so the
+        // item reports Enforced even with no request-side policy
+        // configured; the reason still names that gap explicitly.
+        assert_eq!(entry.state, PackItemState::Enforced);
+        assert_eq!(entry.synthesized_types, vec!["json_projection"]);
+        assert!(
+            entry
+                .reason
+                .contains("no openapi_validation or request_validator"),
+            "request-side gap still named even though state is Enforced: {}",
+            entry.reason
+        );
+
+        let projection = transforms
+            .iter()
+            .find(|t| config_type_is(t, "json_projection"))
+            .expect("synthesized json_projection present");
+        assert_eq!(
+            projection.get("exclude").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let fields: Vec<&str> = projection
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .expect("fields array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(fields, vec!["ssn", "internal_notes"]);
+
+        // The pack policy entry must be removed and no policy-chain
+        // entry added: this is a transform, not a policy.
+        assert!(policies.is_empty(), "{policies:?}");
+    }
+
+    #[test]
+    fn api3_response_exclude_fields_rejected_on_a_different_item() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api1"],
+            "per_item": {
+                "api1": {"response_exclude_fields": ["ssn"]},
+            },
+        }));
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only valid for api3"), "{err}");
+    }
+
+    #[test]
+    fn api3_response_exclude_fields_rejected_when_empty() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api3"],
+            "per_item": {
+                "api3": {"response_exclude_fields": []},
+            },
+        }));
+        let err = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn api9_sets_expose_openapi_true_when_absent() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api9"],
+        }));
+        let mut expose_openapi = false;
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut expose_openapi)
+            .expect("expand")
+            .expect("some");
+        assert!(expose_openapi, "api9 must flip expose_openapi to true");
+        let entry = manifest.entry_for(PackItem::Api9).expect("api9 entry");
+        assert_eq!(entry.state, PackItemState::Enforced);
+        assert!(entry.synthesized_types.is_empty());
+        assert!(
+            entry.reason.contains("set expose_openapi: true"),
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("route-shape-disclosure"),
+            "names the real tradeoff, not a free win: {}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn api9_backs_off_reason_when_expose_openapi_already_true() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api9"],
+        }));
+        let mut expose_openapi = true;
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut expose_openapi)
+            .expect("expand")
+            .expect("some");
+        assert!(expose_openapi, "must stay true");
+        let entry = manifest.entry_for(PackItem::Api9).expect("api9 entry");
+        assert_eq!(entry.state, PackItemState::Enforced);
+        assert!(
+            entry
+                .reason
+                .contains("origin already sets expose_openapi: true"),
+            "{}",
+            entry.reason
         );
     }
 }

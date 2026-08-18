@@ -2,7 +2,8 @@
 // Copyright 2026 Soap Bucket LLC
 
 //! Red-first live-refusal proof for the `owasp_api_top10` pack's
-//! `api4`/`api5`/`api8` synthesis (WOR-2491).
+//! `api4`/`api5`/`api8` synthesis (WOR-2491), plus `api3`'s response
+//! half (WOR-2491 task 3).
 //!
 //! `sbproxy-config` (which owns `ITEM_TABLE` and the synthesis
 //! functions) cannot construct a policy enforcer itself: the module
@@ -17,7 +18,12 @@
 //! each policy's own unit tests already use (`RequestLimitPolicy`'s
 //! `check_request`, `RateLimitPolicy`'s `allow`, `ConcurrentLimitPolicy`'s
 //! `try_acquire`, `DdosPolicy`'s `check`, `HttpFramingPolicy`'s
-//! `check_request`, `ObjectAuthzPolicy`'s `decide`).
+//! `check_request`, `ObjectAuthzPolicy`'s `decide`). `api3`'s response
+//! half follows the same idiom one level down: it is a *transform*,
+//! not a policy, so its test drives a real JSON response body through
+//! `sbproxy_modules::compile_transform`'s dispatch and
+//! `Transform::apply`, the same entry point the compiled pipeline uses
+//! at `response_body_filter` time.
 //!
 //! Every refusal assertion cites the exact line of the policy's own
 //! check logic it exercises, so a reviewer can see the refusal
@@ -29,6 +35,13 @@
 //! so nothing this pack does changes its behavior - the refusal it
 //! relies on is already proven by
 //! `sbproxy-security::ssrf::tests::validate_url_resolved_blocks_private_ip`.
+//! `api3`'s request half is not retested here either: the pack never
+//! synthesizes anything for it (both `openapi_validation` and
+//! `request_validator` require operator-supplied content), so there is
+//! no pack-added behavior to drive live traffic through - the manifest
+//! state/reason proof lives in `sbproxy-config`'s own tests instead.
+//! `api9` is not retested here either: its control is a plain origin
+//! field (`expose_openapi`), not a module this crate compiles.
 
 use std::net::IpAddr;
 
@@ -60,6 +73,37 @@ fn synthesized_policy(policies_yaml: &str, wanted_type: &str) -> serde_json::Val
             )
         })
         .clone()
+}
+
+/// Compiles one origin with the given `policies:` YAML block and
+/// returns the synthesized JSON *transform* entry of type
+/// `wanted_type` from `transform_configs` - `api3`'s response half
+/// lands there, not on `policy_configs`.
+fn synthesized_transform(policies_yaml: &str, wanted_type: &str) -> serde_json::Value {
+    let yaml = format!(
+        "origins:\n  api.example.com:\n    action:\n      type: proxy\n      \
+         url: https://test.sbproxy.dev\n    policies:\n{policies_yaml}"
+    );
+    let compiled = compile_config(&yaml).expect("owasp pack config must compile");
+    let origin = compiled
+        .resolve_origin("api.example.com")
+        .expect("origin present");
+    origin
+        .transform_configs
+        .iter()
+        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some(wanted_type))
+        .unwrap_or_else(|| {
+            panic!(
+                "synthesized {wanted_type} present among: {:?}",
+                origin.transform_configs
+            )
+        })
+        .clone()
+}
+
+fn api3_response_exclude_yaml() -> &'static str {
+    "      - type: owasp_api_top10\n        enable: [api3]\n        per_item:\n          \
+     api3:\n            response_exclude_fields: [ssn, internal_notes]\n"
 }
 
 fn api4_yaml() -> &'static str {
@@ -286,4 +330,57 @@ fn api8_security_headers_default_injects_a_safe_baseline() {
     assert!(names.contains(&"x-content-type-options"), "{names:?}");
     assert!(names.contains(&"x-frame-options"), "{names:?}");
     assert!(names.contains(&"referrer-policy"), "{names:?}");
+}
+
+// --- api3: Broken Object Property Level Authorization (response half) ---
+
+#[test]
+fn api3_response_projection_strips_the_declared_fields_through_the_real_transform_chain() {
+    // The plan ledger's 2026-08-18 CORRECTION, proven end to end: the
+    // synthesized `json_projection` transform is not a hand-copied
+    // literal here - it is read back off the compiled origin's own
+    // `transform_configs`, then run through
+    // `sbproxy_modules::compile_transform`, the same dispatcher
+    // `sbproxy-core`'s pipeline uses to build the real
+    // `CompiledTransform` chain, and `Transform::apply`, the same
+    // entry point `response_body_filter` calls per chunk
+    // (`transform/mod.rs`). A real JSON response body loses the two
+    // declared fields and keeps everything else.
+    let json = synthesized_transform(api3_response_exclude_yaml(), "json_projection");
+    assert_eq!(
+        json.get("exclude").and_then(|v| v.as_bool()),
+        Some(true),
+        "must exclude the listed fields, not include only them"
+    );
+
+    let transform =
+        sbproxy_modules::compile_transform(&json).expect("valid json_projection config");
+
+    let mut body = bytes::BytesMut::from(
+        &br#"{"id":"42","ssn":"000-00-0000","internal_notes":"flagged","name":"ok"}"#[..],
+    );
+    transform
+        .apply(&mut body, Some("application/json"))
+        .expect("json_projection apply must succeed");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&body).expect("transform output must still be valid JSON");
+    assert!(
+        after.get("ssn").is_none(),
+        "ssn must be stripped from the response body: {after}"
+    );
+    assert!(
+        after.get("internal_notes").is_none(),
+        "internal_notes must be stripped from the response body: {after}"
+    );
+    assert_eq!(
+        after.get("id").and_then(|v| v.as_str()),
+        Some("42"),
+        "fields outside the exclude list must survive: {after}"
+    );
+    assert_eq!(
+        after.get("name").and_then(|v| v.as_str()),
+        Some("ok"),
+        "fields outside the exclude list must survive: {after}"
+    );
 }

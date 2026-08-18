@@ -3933,15 +3933,22 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     )?;
 
     // WOR-2491: expand the `owasp_api_top10` pseudo-policy, if the
-    // origin has one, into concrete synthesized policy entries. This
-    // mutates `config.policies` in place: the pack entry itself is
-    // removed (so it never reaches `sbproxy-modules::compile.rs`'s
-    // type-string match arms below), and any items with synthesis
-    // wired append their policy JSON to the same list. Must run before
-    // `policy_configs: config.policies` moves the list into the
-    // compiled origin.
-    let owasp_pack_manifest =
-        crate::owasp_api_pack::expand_owasp_pack(hostname, &mut config.policies)?;
+    // origin has one, into concrete synthesized policy entries, and
+    // (task 3: api3's response half) transform entries, and (task 3:
+    // api9) the origin-level `expose_openapi` flag. This mutates
+    // `config.policies`/`config.transforms`/`config.expose_openapi` in
+    // place: the pack entry itself is removed from `policies` (so it
+    // never reaches `sbproxy-modules::compile.rs`'s type-string match
+    // arms below), and any items with synthesis wired append to the
+    // relevant list. Must run before `policy_configs`/`transform_configs`/
+    // `expose_openapi` move or copy these fields into the compiled
+    // origin below.
+    let owasp_pack_manifest = crate::owasp_api_pack::expand_owasp_pack(
+        hostname,
+        &mut config.policies,
+        &mut config.transforms,
+        &mut config.expose_openapi,
+    )?;
 
     let mut compiled = CompiledOrigin {
         hostname: CompactString::new(hostname),
@@ -11262,6 +11269,172 @@ origins:
             .entry_for(crate::owasp_api_pack::PackItem::Api8)
             .expect("api8 entry");
         assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
+    }
+
+    // --- WOR-2491 task 3: api3, api9 wired at compile time ---
+
+    #[test]
+    fn owasp_pack_api3_synthesizes_response_projection_into_compiled_transform_chain() {
+        // The ledger's 2026-08-18 correction, proven at the compiled
+        // origin: `per_item.api3.response_exclude_fields` produces a
+        // real `transforms:` entry, not a policy, so it must show up
+        // on `transform_configs`.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api3]
+        per_item:
+          api3:
+            response_exclude_fields: [ssn, internal_notes]
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+
+        assert!(
+            origin.policy_configs.is_empty(),
+            "api3's response half is a transform, not a policy: {:?}",
+            origin.policy_configs
+        );
+        let projection = origin
+            .transform_configs
+            .iter()
+            .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("json_projection"))
+            .expect("synthesized json_projection present on transform_configs");
+        assert_eq!(
+            projection.get("exclude").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api3)
+            .expect("api3 entry");
+        assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
+        assert_eq!(entry.synthesized_types, vec!["json_projection"]);
+    }
+
+    #[test]
+    fn owasp_pack_api3_request_side_backs_off_when_operator_authors_openapi_validation() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api3]
+      - type: openapi_validation
+        spec:
+          openapi: "3.0.0"
+          info:
+            title: test
+            version: "1"
+          paths: {}
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+
+        let openapi_validation_count = origin
+            .policy_configs
+            .iter()
+            .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("openapi_validation"))
+            .count();
+        assert_eq!(
+            openapi_validation_count, 1,
+            "the operator's own openapi_validation survives untouched"
+        );
+        assert!(
+            origin.transform_configs.is_empty(),
+            "no response_exclude_fields supplied, so no transform is synthesized: {:?}",
+            origin.transform_configs
+        );
+
+        let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api3)
+            .expect("api3 entry");
+        // Response half is still uncovered (no exclude_fields), so the
+        // item as a whole still needs operator input even though the
+        // request half backed off cleanly.
+        assert_eq!(
+            entry.state,
+            crate::owasp_api_pack::PackItemState::NeedsOperatorInput
+        );
+        assert!(
+            entry
+                .reason
+                .contains("origin already authors openapi_validation"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn owasp_pack_api9_sets_expose_openapi_true_on_compiled_origin() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api9]
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert!(
+            origin.expose_openapi,
+            "api9 must flip expose_openapi to true on the compiled origin"
+        );
+
+        let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api9)
+            .expect("api9 entry");
+        assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
+        assert!(
+            entry.reason.contains("set expose_openapi: true"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn owasp_pack_api9_leaves_operator_authored_expose_openapi_true_alone() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    expose_openapi: true
+    policies:
+      - type: owasp_api_top10
+        enable: [api9]
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert!(origin.expose_openapi, "must stay true");
+
+        let manifest = origin.owasp_pack_manifest.as_ref().expect("manifest");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api9)
+            .expect("api9 entry");
+        assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
+        assert!(
+            entry
+                .reason
+                .contains("origin already sets expose_openapi: true"),
+            "{}",
+            entry.reason
+        );
     }
 }
 
