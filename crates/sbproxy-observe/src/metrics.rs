@@ -1712,23 +1712,58 @@ pub fn record_waf_persistent_block(
 
 /// Count an `object_authz` (BOLA/BFLA) authorization violation. `kind`
 /// is one of the closed strings `bola`, `bfla`, or `enumeration`; the
-/// origin label is run through the cardinality limiter.
-pub fn record_object_authz_violation(origin: &str, kind: &'static str) {
+/// origin label is run through the cardinality limiter. `enforced` is
+/// `true` only when the proxy actually refused the request; a
+/// violation that was reported but allowed through (`test_mode`, or a
+/// `detect_only` hit from the ruleless enumeration heuristic) lands on
+/// the `enforced="false"` series, so an operator alerting on refusals
+/// is never paged by audit-only traffic and audit-only traffic is
+/// still visible on its own series.
+pub fn record_object_authz_violation(origin: &str, kind: &'static str, enforced: bool) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_object_authz_violations_total",
-            "Object/function-level authorization violations, by kind (bola, bfla, enumeration)",
-            &["origin", "kind"],
+            "Object/function-level authorization violations, by kind (bola, bfla, enumeration) and enforcement disposition (enforced=true refused the request; enforced=false was audited only)",
+            &["origin", "kind", "enforced"],
         )
         .expect("object_authz violation counter registers")
     });
     let origin_san = sanitize_label("origin", origin);
     counter
-        .with_label_values(&[origin_san.as_str(), kind])
+        .with_label_values(&[
+            origin_san.as_str(),
+            kind,
+            if enforced { "true" } else { "false" },
+        ])
         .inc();
+}
+
+/// Record one enumeration observation the `object_authz` policy could
+/// not track because its per-principal tracker was at capacity with
+/// only live windows, even after sweeping expired ones
+/// (`sbproxy_object_authz_enumeration_tracker_saturated_total`). No
+/// labels, mirroring `record_mcp_peer_registry_saturated`'s reasoning:
+/// the principal that caused the refusal is exactly the
+/// caller-controlled string the cap exists to bound. Ticks on every
+/// refused observation, not once per episode, so the series size shows
+/// how much traffic went unobserved; the once-per-window
+/// `tracing::warn!` beside it is a separate, deliberately quieter
+/// signal.
+pub fn record_object_authz_tracker_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_object_authz_enumeration_tracker_saturated_total",
+            "Enumeration observations the object_authz policy could not track because the per-principal tracker was at capacity with live windows",
+        )
+        .expect("object_authz tracker saturated counter registers")
+    });
+    counter.inc();
 }
 
 /// Count a governed key admission that bypassed reservation because the

@@ -270,6 +270,7 @@ fn api5_alone_never_refuses_because_function_rules_stays_empty() {
     let caller = ObjectAuthzPrincipal {
         owner: Some("tenant-a".to_string()),
         roles: Vec::new(),
+        ..Default::default()
     };
     assert_eq!(
         policy.decide(&caller, "DELETE", "/admin/anything"),
@@ -300,6 +301,7 @@ fn api1_and_api5_share_one_object_authz_entry_that_still_refuses_nothing_blind()
     let caller = ObjectAuthzPrincipal {
         owner: Some("tenant-a".to_string()),
         roles: Vec::new(),
+        ..Default::default()
     };
     for id in 1..=25 {
         match policy.decide(&caller, "GET", &format!("/orders/{id}")) {

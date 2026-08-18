@@ -7097,7 +7097,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7375,7 +7375,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-core"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7569,7 +7569,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-k8s-controller"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7595,7 +7595,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-k8s-operator"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7847,7 +7847,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
