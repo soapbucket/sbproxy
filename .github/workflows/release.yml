@@ -85,7 +85,10 @@ jobs:
     # job log, ~60min wall time). certify-model-host-apple-silicon
     # already gives the same fat-LTO-on-macOS profile 75min for exactly
     # this reason; matching it here rather than tuning to the minute.
-    timeout-minutes: 75
+    # Was 75: the v1.12.0 cut hit that wall too (cancelled mid
+    # "build release binary" at 75:23, still cold-cache), so the spiral
+    # continued. 90 gives a cold fat-LTO build honest headroom.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
