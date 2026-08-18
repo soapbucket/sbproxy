@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2152,7 +2152,7 @@ origins:
 |-------|------|---------|-------------|
 | `mode` | string | `gateway` | MCP operating mode. Other values fail configuration. |
 | `server_info` | object | generated defaults | Name and version returned by MCP `initialize`. |
-| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
+| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers, or `type: local` servers whose tools are declared entirely in config. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, local `tools[]` (a `static`, `http`, or `steps` handler per tool; see [mcp-compose.md](mcp-compose.md)), `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
 | `rbac_policies` | map | `{}` | Named tool-access policies referenced by `federated_servers[].rbac`. |
 | `argument_policies` | list | `[]` | CEL or OPA-compatible Rego rules evaluated against the tool-call context (name, server, session, tenant, principal, parsed arguments) after RBAC and JSON-Schema validation, before dispatch. `mode: warn` (default) or `block`. |
 | `result_policies` | list | `[]` | Same CEL/Rego shape as `argument_policies`, evaluated against the tool-call result after dispatch and after `content_filters`, before the result reaches the caller. |
@@ -2175,7 +2175,9 @@ origins:
 | `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
 
 See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
-versioning, and cost attribution.
+versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
+`type: local` servers: config-declared tools, HTTP and step-DAG handlers,
+and response shaping.
 
 ### noop
 

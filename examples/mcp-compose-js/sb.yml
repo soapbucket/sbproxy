@@ -1,0 +1,133 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The same composed tool as examples/mcp-compose, shaped with
+# JavaScript (QuickJS) instead of Lua, to show the two response-shaping
+# engines bind the identical `input = {args, steps}` context (WOR-2489).
+# Everything else -- the two-step DAG against test.sbproxy.dev's
+# `hello`/`echo` tools, the `condition` on the echo step, RBAC,
+# egress, and evidence -- is unchanged from examples/mcp-compose. See
+# that example's README and sb.yml comments for the full walkthrough;
+# this file's comments only call out what differs.
+#
+# Run:
+#   sbproxy serve -f examples/mcp-compose-js/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+events:
+  sink: file
+  path: mcp-compose-js-events.ndjson
+  types:
+    - mcp_governance_decision
+  fail_closed:
+    - mcp_governance_decision
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: composed-tools-js-demo
+        version: "1.0.0"
+
+      rbac_policies:
+        caller:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - "compose.greet_and_echo"
+            # compose.ping is deliberately left off the allowed list.
+
+      federated_servers:
+        - origin: compose
+          type: local
+          prefix: compose
+          namespace: always
+          rbac: caller
+          egress:
+            mode: deny_by_default
+            hosts: [test.sbproxy.dev]
+          tools:
+            - name: ping
+              description: >-
+                Static reachability check. Not on `caller`'s allowed
+                list, on purpose: see examples/mcp-compose's README.
+              input_schema:
+                type: object
+                properties: {}
+                additionalProperties: false
+              static:
+                pong: true
+
+            - name: greet_and_echo
+              description: >-
+                Greets a name via the upstream `hello` tool, then,
+                when asked, echoes a derived message back through the
+                upstream `echo` tool, composing both results into one.
+              input_schema:
+                type: object
+                required: [name, verbose]
+                properties:
+                  name:
+                    type: string
+                    description: Name to greet.
+                  verbose:
+                    type: boolean
+                    description: When true, also runs the echo step.
+                additionalProperties: false
+              steps:
+                steps:
+                  - name: hello
+                    http:
+                      method: POST
+                      url: "https://test.sbproxy.dev/mcp"
+                      headers:
+                        content-type: application/json
+                        accept: "application/json, text/event-stream"
+                      body:
+                        jsonrpc: "2.0"
+                        id: 1
+                        method: tools/call
+                        params:
+                          name: hello
+                          arguments:
+                            name: "${args.name}"
+                      timeout: 10s
+
+                  - name: echo
+                    depends_on: [hello]
+                    condition: "mcp.arguments.verbose == true"
+                    http:
+                      method: POST
+                      url: "https://test.sbproxy.dev/mcp"
+                      headers:
+                        content-type: application/json
+                        accept: "application/json, text/event-stream"
+                      body:
+                        jsonrpc: "2.0"
+                        id: 2
+                        method: tools/call
+                        params:
+                          name: echo
+                          arguments:
+                            message: "Echo of: ${steps.hello.body.result.content[0].text}"
+                      timeout: 10s
+
+                response:
+                  # QuickJS: no top-level `return`, so a script that
+                  # branches wraps itself in an immediately invoked
+                  # function, the same convention response_cache's
+                  # admit_event/key_event JS scripts use. Arrays are
+                  # 0-indexed here, unlike the Lua sandbox.
+                  js: |
+                    (() => {
+                      const greeting = input.steps.hello.body.result.content[0].text;
+                      const result = { greeting };
+                      const echo = input.steps.echo;
+                      if (echo && echo.body) {
+                        result.echoed = echo.body.result.content[0].text;
+                      }
+                      return result;
+                    })()

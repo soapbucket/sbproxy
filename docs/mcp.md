@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -383,15 +383,16 @@ success.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `origin` | string | required | For an `mcp` server, a bare hostname (normalized to `https://<host>/mcp`) or a full URL. For an `openapi` server, the REST base URL. |
-| `type` | string | `mcp` | `mcp` speaks MCP to the origin; `openapi` derives tools from a spec and dispatches `tools/call` as REST (see the OpenAPI section below). |
+| `origin` | string | required | For an `mcp` server, a bare hostname (normalized to `https://<host>/mcp`) or a full URL. For an `openapi` server, the REST base URL. For a `local` server, a nominal label only; nothing is ever dialed there. |
+| `type` | string | `mcp` | `mcp` speaks MCP to the origin; `openapi` derives tools from a spec and dispatches `tools/call` as REST (see the OpenAPI section below); `local` serves tools declared entirely in config, with no upstream dial at all (see [mcp-compose.md](mcp-compose.md)). |
 | `spec` / `spec_path` | object / string | unset | Inline OpenAPI spec or a path to one, for a `type: openapi` server. Read at config load; a bad spec fails startup. |
+| `tools` | list | `[]` | Locally defined tools for a `type: local` server: a static value, a single HTTP call, or a step DAG. Rejected on non-`local` servers. See [mcp-compose.md](mcp-compose.md). |
 | `prefix` | string | derived from host | Namespace prefix applied to every tool from this upstream. Tools become `<prefix>.<tool>`. |
 | `rbac` | string | unset | Label referencing a key in `rbac_policies`. Required on every server once `rbac_policies` is non-empty. Validated at config-load time. Enforced on every `tools/call`. |
 | `timeout` | duration | unset | Caps each `tools/call` dispatch. Accepts `250ms`, `10s`, `2m`. |
-| `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
+| `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. Not consulted for a `type: local` server. |
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
-| `egress` | object | inherited | Per-server egress policy for this upstream's outbound dials: the OpenAPI REST calls a `type: openapi` server makes, or the base MCP connect a plain `type: mcp` server makes over `streamable_http` or `sse`. `stdio` servers spawn a local process and never consult it. Omitted inherits the action-level `egress`, then allow-all (legacy, ungated). |
+| `egress` | object | inherited | Per-server egress policy for this upstream's outbound dials: the OpenAPI REST calls a `type: openapi` server makes, the base MCP connect a plain `type: mcp` server makes over `streamable_http` or `sse`, or the HTTP calls a `type: local` server's `http`/`steps` tools make. `stdio` servers spawn a local process and never consult it. Required (no action-level fallback) on a `local` server that can make HTTP calls; omitted on `mcp`/`openapi` inherits the action-level `egress`, then allow-all (legacy, ungated). |
 | `headers` | map<string, string> | `{}` | Static headers attached to every REST request a `type: openapi` server dispatches, e.g. a shared service credential. Values pass through `${VAR}` interpolation; keep secrets in the environment. Rejected on non-`openapi` servers. |
 | `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
 | `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
@@ -586,6 +587,38 @@ One self-referential use of this is pointing an `openapi` server at
 the gateway's own admin API, which turns the admin surface into
 governed MCP tools; [admin-mcp.md](admin-mcp.md) walks through that
 setup end to end.
+
+## Local tool servers
+
+A `federated_servers[]` entry with `type: local` serves tools declared
+entirely in config: a fixed value, one HTTP call, or a dependency-ordered
+DAG of HTTP calls shaped into a single response with a template,
+JavaScript, or Lua. No upstream MCP server or OpenAPI spec is involved.
+
+```yaml
+federated_servers:
+  - type: local
+    origin: local-tools
+    prefix: local
+    egress:
+      mode: deny_by_default
+      hosts: [api.internal]
+    tools:
+      - name: status
+        description: Fixed status blob.
+        input_schema: { type: object, properties: {} }
+        static: { ok: true }
+```
+
+A local tool publishes into the same catalog a federated tool does, so
+RBAC, registry approval status, the version-bump gate, quotas, content
+filters, and the governance evidence feed all apply unchanged. See
+[mcp-compose.md](mcp-compose.md) for handler kinds, the interpolation
+vocabulary, DAG semantics, response shaping, and the full governance
+mapping, and
+[`examples/mcp-local-tools`](../examples/mcp-local-tools/) /
+[`examples/mcp-compose`](../examples/mcp-compose/) for runnable
+configs.
 
 ## Sessions
 
@@ -933,6 +966,9 @@ walks through that same fixture end to end, including a real
 
 ## See also
 
+- [`mcp-compose.md`](mcp-compose.md): the field reference for
+  `type: local` servers -- handler kinds, interpolation vocabulary,
+  DAG semantics, and response shaping.
 - [`mcp-security-coverage.md`](mcp-security-coverage.md): the OWASP MCP
   Top 10 scorecard for the surfaces on this page.
 - [`use-case-mcp-federation.md`](use-case-mcp-federation.md): the
