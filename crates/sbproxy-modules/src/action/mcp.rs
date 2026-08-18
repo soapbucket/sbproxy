@@ -1205,7 +1205,7 @@ pub struct McpLocalResponseConfig {
     /// A JSON document (as literal text) interpolated against `{args,
     /// steps}` with the same `${...}` engine a `body:` field uses:
     /// parsed as JSON first, then every string leaf run through
-    /// [`mcp_interpolate::interpolate_json_tree`] (WOR-2489 Task 5).
+    /// `mcp_interpolate::interpolate_json_tree` (WOR-2489 Task 5).
     #[serde(default)]
     pub template: Option<String>,
     /// A JavaScript expression (QuickJS) producing the response. See
