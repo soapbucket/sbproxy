@@ -332,6 +332,13 @@ enum ConfigSub {
     /// Preview the configuration this node's authority would apply next,
     /// without applying it.
     Pull(ConfigPullArgs),
+    /// List every config revision recorded in the running proxy's
+    /// `proxy.config_history` ring (WOR-2456/2457), newest first.
+    /// Requires `proxy.config_history.enabled` on that node.
+    History(ConfigHistoryArgs),
+    /// Print one recorded revision's stored document, selected by the
+    /// revision number `config history` lists.
+    Show(ConfigShowArgs),
 }
 
 impl ConfigCmd {
@@ -516,6 +523,37 @@ struct ConfigPullArgs {
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     dry_run: bool,
     /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config history`: list the running proxy's recorded config
+/// revisions.
+#[derive(clap::Args, Debug)]
+struct ConfigHistoryArgs {
+    /// Admin endpoint and Basic Auth credentials of the running proxy.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format. `text` (default) prints a table; `json` prints
+    /// the admin API's response verbatim.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config show`: print one recorded revision's stored document.
+#[derive(clap::Args, Debug)]
+struct ConfigShowArgs {
+    /// Revision number, from `sbproxy config history`'s `REVISION`
+    /// column. Resolved to a content digest via that same listing, so
+    /// the revision named here must still be in the ring (it has not
+    /// aged out under `proxy.config_history.keep`).
+    revision: u64,
+    /// Admin endpoint and Basic Auth credentials of the running proxy.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format. `text` (default) prints just the stored
+    /// document. `json` prints the admin API's full detail envelope
+    /// (`entry`, `document`, `plan_text`).
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -8468,6 +8506,8 @@ fn handle_config_subcommand(
             },
         },
         ConfigSub::Pull(args) => handle_config_pull(args, global_config),
+        ConfigSub::History(args) => handle_config_history(args),
+        ConfigSub::Show(args) => handle_config_show(args),
     }
 }
 
@@ -9924,6 +9964,180 @@ fn handle_config_pull(
         }
     }
     Ok(plan_exit_code(&report))
+}
+
+/// `sbproxy config history`: list every config revision recorded in the
+/// running proxy's `proxy.config_history` ring (WOR-2456/2457), newest
+/// first. Speaks to the admin API the same way `apply` and `config
+/// authority status` do: `--admin-url`/`SB_ADMIN_URL`,
+/// `--username`/`SB_ADMIN_USERNAME`, `--password`/`SB_ADMIN_PASSWORD`.
+fn handle_config_history(args: &ConfigHistoryArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::GET,
+        "/admin/config/history",
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config history",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal("config history", status, &body));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => print_config_history_table(&body),
+    }
+    Ok(0)
+}
+
+/// Render `GET /admin/config/history`'s body as the `--format text`
+/// table: one row per revision, in the order the admin API already
+/// returns them (newest first).
+fn print_config_history_table(body: &serde_json::Value) {
+    let lineage = body
+        .get("lineage")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let lkg_line = body
+        .get("lkg_revision")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(String::new, |revision| {
+            format!(", last-known-good revision {revision}")
+        });
+    println!("lineage {lineage}{lkg_line}");
+
+    let entries = body
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if entries.is_empty() {
+        println!("no config revisions recorded yet");
+        return;
+    }
+    println!("REVISION\tSTATE\tBLAST RADIUS\tPROVENANCE\tAPPLIED AT\tACTOR\tDIGEST");
+    for entry in &entries {
+        let revision = json_u64(entry, "revision");
+        let state = entry
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let blast_radius = entry
+            .get("blast_radius")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let provenance = entry
+            .get("provenance")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let applied_at = entry
+            .get("applied_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let actor = entry
+            .get("actor")
+            .and_then(serde_json::Value::as_str)
+            .filter(|actor| !actor.is_empty())
+            .unwrap_or("-");
+        let digest = entry
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        println!(
+            "{revision}\t{state}\t{blast_radius}\t{provenance}\t{applied_at}\t{actor}\t{digest}"
+        );
+    }
+}
+
+/// `sbproxy config show <rev>`: resolve a revision number to its
+/// content digest via `GET /admin/config/history` (the same listing
+/// `config history` prints), then print the stored document
+/// `GET /admin/config/history/{digest}` returns for that revision.
+fn handle_config_show(args: &ConfigShowArgs) -> anyhow::Result<i32> {
+    let list_body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::GET,
+        "/admin/config/history",
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config show",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal("config show", status, &body));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    let digest = list_body
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|&entry| json_u64(entry, "revision") == args.revision)
+        })
+        .and_then(|entry| entry.get("digest"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(digest) = digest else {
+        eprintln!(
+            "config show: revision {} was not found in this node's config history. Run \
+             `sbproxy config history` to see what is currently in the ring.",
+            args.revision
+        );
+        return Ok(4);
+    };
+
+    // The digest is always a lowercase hex sha256 minted by the store
+    // itself (see `sbproxy_config::revision_store`'s `sha256_hex`), so it
+    // carries nothing a URL path needs escaped.
+    let detail_path = format!("/admin/config/history/{digest}");
+    let detail = match admin_request_parts(&args.admin, reqwest::Method::GET, &detail_path, None)? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config show",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal("config show", status, &body));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&detail)?),
+        OutputFormat::Text => print!("{}", config_show_document_text(&detail)),
+    }
+    Ok(0)
+}
+
+/// The `--format text` rendering of `GET /admin/config/history/{digest}`'s
+/// response: the `document` field, verbatim, and nothing else. The admin
+/// route redacts `document` (and `plan_text`) before it ever serializes
+/// a response -- see `sbproxy_core::admin::handle_config_history_detail`
+/// -- so there is nothing left for the CLI to redact here; this
+/// function does no transformation of its own precisely so a test can
+/// assert that fact, rather than only asserting the server-side JSON
+/// shape. `--format json` above takes the same already-redacted `detail`
+/// value through `serde_json::to_string_pretty` with no extra field
+/// access, so it carries the identical guarantee.
+fn config_show_document_text(detail: &serde_json::Value) -> &str {
+    detail
+        .get("document")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
 }
 
 /// `${VAR}` interpolation matching the config compiler: a set variable
@@ -14023,6 +14237,95 @@ hooks:
         };
         assert_eq!(args.config_path, std::path::PathBuf::from("sb.yml"));
         assert_eq!(args.out, Some(std::path::PathBuf::from("migrated.yml")));
+    }
+
+    #[test]
+    fn parses_config_history_subcommand() {
+        let cli = parse(&[
+            "sbproxy",
+            "config",
+            "history",
+            "--admin-url",
+            "http://127.0.0.1:9091",
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--format",
+            "json",
+        ]);
+        let cmd = match cli.cmd {
+            Some(Cmd::Config(cmd)) => cmd,
+            other => panic!("expected Config, got {other:?}"),
+        };
+        let ConfigSub::History(args) = cmd.sub else {
+            panic!("expected History subcommand");
+        };
+        assert_eq!(
+            args.admin.admin_url.as_deref(),
+            Some("http://127.0.0.1:9091")
+        );
+        assert_eq!(args.admin.username.as_deref(), Some("admin"));
+        assert!(matches!(args.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn parses_config_show_subcommand_with_a_revision_number() {
+        let cli = parse(&["sbproxy", "config", "show", "7"]);
+        let cmd = match cli.cmd {
+            Some(Cmd::Config(cmd)) => cmd,
+            other => panic!("expected Config, got {other:?}"),
+        };
+        let ConfigSub::Show(args) = cmd.sub else {
+            panic!("expected Show subcommand");
+        };
+        assert_eq!(args.revision, 7);
+        assert!(matches!(args.format, OutputFormat::Text));
+    }
+
+    #[test]
+    fn config_show_requires_a_revision_argument() {
+        let err = Cli::try_parse_from(["sbproxy", "config", "show"]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("required") || msg.contains("REVISION"),
+            "expected a missing-argument message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_show_displays_whatever_the_server_sent_verbatim_including_redaction() {
+        // The admin route is the one that redacts (see admin.rs's
+        // `config_history_detail_redacts_a_literal_secret_while_the_ring_file_keeps_the_original`);
+        // this proves the CLI's own display path -- both --format text
+        // and --format json -- has no separate transformation that
+        // could show the planted secret even if it somehow arrived
+        // unredacted, because there is no transformation to get wrong:
+        // both paths print exactly what the server sent.
+        let detail = serde_json::json!({
+            "entry": {
+                "revision": 1,
+                "digest": "abc123",
+                "provenance": "local_file",
+                "state": "applied",
+                "applied_at": "2026-01-01T00:00:00.000Z",
+                "actor": "",
+                "blast_radius": serde_json::Value::Null,
+                "degraded": [],
+            },
+            "document": "ai:\n  api_key_literal: AKIA[REDACTED]\n",
+            "plan_text": "",
+        });
+
+        assert_eq!(
+            config_show_document_text(&detail),
+            "ai:\n  api_key_literal: AKIA[REDACTED]\n"
+        );
+        assert!(!config_show_document_text(&detail).contains("AKIAIOSFODNN7EXAMPLE"));
+
+        let pretty = serde_json::to_string_pretty(&detail).expect("serializes");
+        assert!(pretty.contains("AKIA[REDACTED]"), "{pretty}");
+        assert!(!pretty.contains("AKIAIOSFODNN7EXAMPLE"), "{pretty}");
     }
 
     #[test]

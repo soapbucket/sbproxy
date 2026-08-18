@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -33,6 +33,7 @@ There is no custom calling convention. The host pipes:
 | stdin | host -> module | The full upstream response body |
 | stdout | module -> host | The new response body |
 | stderr | module -> host | Captured for debug logging |
+| `SBPROXY_REQUEST_CONTEXT` env var | host -> module | Only set when the transform's config has `request_context: true`; JSON-encoded per-request `ctx` (see [scripting.md §6.1](scripting.md#61-request_context-opting-a-module-into-ctx)) |
 
 Whatever the module writes to stdout becomes the new response body.
 If the module writes nothing, the body becomes empty. If `_start`
@@ -191,8 +192,14 @@ What the host enforces:
 - **Network.** Not exposed, and no config key claims otherwise. There
   are no WASI sockets and no host callout function, so there is nothing
   for a host allowlist to allow.
-- **Environment.** No environment variables forwarded; `std::env`
-  reads return empty.
+- **Environment.** No environment variables forwarded by default;
+  `std::env` reads return empty. The one exception is opt-in: a
+  transform configured with `request_context: true` sets exactly one
+  variable, `SBPROXY_REQUEST_CONTEXT`, holding the same JSON `ctx`
+  document the Lua and JavaScript transforms get. A module that never
+  reads it, and every module belonging to a transform that leaves
+  `request_context` unset, sees no difference at all. See
+  [scripting.md §6.1](scripting.md#61-request_context-opting-a-module-into-ctx).
 - **Random.** WASI's `random_get` is allowed and produces
   cryptographically random bytes from the host. Use this for any
   randomness; do not seed from a fixed value.
@@ -204,7 +211,9 @@ What the module observes:
 - A working stdin (the response body) and stdout (the new body).
 - A working stderr that the host pipes to the proxy's debug log.
 - A WASI clock and a WASI random source.
-- Nothing else. No FS, no network, no env, no `args`.
+- `SBPROXY_REQUEST_CONTEXT` when its transform opted in with
+  `request_context: true`; otherwise nothing else. No FS, no network,
+  no env, no `args`.
 
 ## Performance notes
 

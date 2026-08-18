@@ -269,6 +269,15 @@ answer "does it compile, lint, and pass"; the rubric answers "is this
 going to be a problem in six months", and this repository has merged
 nothing without both since the protocol landed.
 
+Running the rubric is not optional, and neither is acting on it: every
+finding it produces gets fixed in the same loop that surfaced it,
+Critical through Minor and nits included, before the PR merges. Do not
+park a finding as a ticket unless its remedy is a separate product
+feature (new scope rather than a defect in the change under review),
+and record why in the PR body when that happens. A finding surfaced
+after a merge gets fixed immediately on a fresh branch rather than
+queued.
+
 ## Workspace layout
 
 ```
@@ -443,9 +452,11 @@ commit:
    (README, docs/ai-gateway.md, every use-case doc, the comparison
    table, root `llms.txt`); check each hit's context before editing so
    an unrelated number is not caught.
-4. Leave `docs/llms-full.txt` alone. CI regenerates it on `main`
-   after the merge (`.github/workflows/llms-full-refresh.yml`); a
-   branch that commits it fails the docs lane.
+4. Leave `docs/llms-full.txt` alone on feature branches. The old
+   push-to-main refresh workflow is gone (branch protection refused
+   its pushes); the corpus is regenerated at release prep with
+   `bash scripts/regen-llms-full.sh` and carried in the release-prep
+   PR, which the docs lane accepts as long as the regen matches.
 5. The sbproxy.dev site keeps its own copy of the provider docs; flag
    the change for the site repo.
 

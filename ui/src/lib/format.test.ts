@@ -12,6 +12,12 @@ describe("toDate", () => {
     expect(toDate(1_754_945_238_000)?.toISOString()).toBe(
       "2025-08-11T20:47:18.000Z",
     );
+    // RFC 3339 with millisecond precision, the config history ring's
+    // `applied_at` wire format (WOR-2456/2457). `Number()` on this is
+    // NaN, so it takes the ISO-parse branch, not the numeric-ms one.
+    expect(toDate("2026-08-16T10:15:32.456Z")?.toISOString()).toBe(
+      "2026-08-16T10:15:32.456Z",
+    );
   });
 
   it("is idempotent, so a Date round-trips instead of becoming null", () => {

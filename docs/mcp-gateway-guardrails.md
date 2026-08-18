@@ -11,6 +11,52 @@ one rule instead of stopping at the first hit, see
 out-of-process classifier guardrail on the same request path, see
 [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/).
 
+## Gate order for one tool call
+
+These mechanisms do not run in the order they are described below; they
+run in a fixed sequence around dispatch, and each one can only narrow an
+allow that every earlier gate already gave, never widen it. The diagram
+covers the gates this page documents; schema validation and the
+tool-version gate run earlier still and are covered in
+[tool-versioning.md](tool-versioning.md).
+
+```mermaid
+flowchart TD
+    A[tools/call request] --> B["lethal_trifecta: session risk"]
+    B --> C["Registry status: draft refuses the call"]
+    C --> D["RBAC: per-server tool access policy"]
+    D --> E["argument_policies: CEL or Rego"]
+    E --> F[Per-tool quota]
+    F --> G["Registry status: deprecated warns, never blocks"]
+    G --> H["Peer downgrade: protocol pin vs remembered profile"]
+    H --> I["flow: session Rule of Two"]
+    I --> J["content_filters: outbound arguments"]
+    J --> K[Dispatch to upstream tool]
+    K --> L["dual_llm_quarantine: judge tool output, opt-in"]
+    L --> M["content_filters: inbound result"]
+    M --> N["result_policies: CEL or Rego"]
+    N --> O[Token compaction]
+    O --> P[Response to caller]
+    B -->|deny| X["Refused, mcp_governance_decision emitted"]
+    C -->|deny| X
+    D -->|deny| X
+    E -->|block mode| X
+    F -->|exceeded| X
+    H -->|block mode| X
+    I -->|block mode| X
+    J -->|block mode| X
+    L -->|quarantined| X
+    M -->|block mode| X
+    N -->|block mode| X
+```
+
+Registry status is checked twice, at two different points: `draft`
+refuses the call outright before RBAC ever runs, while `deprecated` only
+warns, after the quota check, and never blocks by itself. Every gate that
+can deny or warn also emits an `mcp_governance_decision` record; see
+[Governance evidence and fail-closed delivery](#governance-evidence-and-fail-closed-delivery)
+below for the wire shape.
+
 ## Mechanisms
 
 ### Deterministic egress

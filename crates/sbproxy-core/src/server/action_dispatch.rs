@@ -2201,7 +2201,29 @@ pub(super) async fn handle_mcp_action(
         // WOR-1640: module emission and hashing are cached by
         // (registry generation, callback base), so a warm hit does
         // neither; the ETag stays stable until the catalogue moves.
-        let (module, etag_value) = mcp.federation.codemode_ts_cached(&callback_base);
+        //
+        // WOR-2484: this listing surface must hide a `draft` server's
+        // tools exactly like `tools/list` and `resources/list` already
+        // do below -- same "not advertised until approved" rule, same
+        // `McpServerApprovalStatus::Draft` check, reused here rather
+        // than re-implemented so there is exactly one place that
+        // decides what "draft" hides. `deprecated` is unaffected: like
+        // `tools/list`, only `draft` is filtered out of a listing.
+        // Codemode.ts is served ahead of per-caller authentication (see
+        // the well-known-route comment above) and its module is cached
+        // per catalogue generation, not per principal, so this closure
+        // deliberately checks only registry approval status -- RBAC
+        // (`policy_for_server`) is a per-caller decision this shared,
+        // cacheable surface cannot apply; see docs/mcp-security-coverage.md's
+        // MCP09 row.
+        let (module, etag_value) =
+            mcp.federation
+                .codemode_ts_cached(&callback_base, |server_name| {
+                    !matches!(
+                        mcp.server_status(server_name),
+                        sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+                    )
+                });
 
         let if_none_match = session
             .req_header()
@@ -10169,6 +10191,67 @@ mod mcp_catalog_snapshot_tests {
         .expect("MCP JSON response")
     }
 
+    /// [`mcp_handler_exchange`], but for a plain `GET` against a
+    /// well-known route (`/.well-known/mcp/codemode.ts` today) rather
+    /// than a JSON-RPC `POST /`. Returns the response status and raw
+    /// body text so a caller can assert on emitted TypeScript rather
+    /// than a parsed JSON-RPC envelope.
+    async fn mcp_handler_get(action: &McpAction, path: &str) -> (u16, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP downstream fixture");
+        let address = listener.local_addr().expect("MCP downstream address");
+        let path = path.to_string();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect MCP downstream fixture");
+            let headers =
+                format!("GET {path} HTTP/1.1\r\nHost: mcp.test\r\nconnection: close\r\n\r\n");
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write MCP GET request");
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read MCP response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse MCP downstream GET request");
+        let mut context = RequestContext::new();
+
+        handle_mcp_action(&mut session, action, &mut context, false)
+            .await
+            .expect("MCP handler response");
+        drop(session);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("MCP response timeout")
+            .expect("MCP downstream task");
+        let response = String::from_utf8(response).expect("MCP HTTP response UTF-8");
+        let status = response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("MCP HTTP status line");
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
     /// WOR-2384 (F1/F2 fix round 2): crosses the wire boundary that
     /// `sbproxy_extension::mcp::sessions`'s own store-level tests only
     /// reach as far as `SessionStore::create_capped` returning
@@ -10968,6 +11051,121 @@ mod mcp_catalog_snapshot_tests {
                 .all(|t| t["name"] != "progressive-draft-tool"),
             "progressive discovery's search meta-tool must hide a draft \
              server's tools, same as tools/list: {results:?}"
+        );
+    }
+
+    /// WOR-2484 red-first: the Code Mode TypeScript listing
+    /// (`GET /.well-known/mcp/codemode.ts`) rendered the full,
+    /// unfiltered federation registry, so a `draft` server's tool
+    /// names and descriptions leaked into the emitted module even
+    /// though `tools/list` and `tools/call` already hid and refused
+    /// them (docs/mcp-security-coverage.md's MCP09 row documented this
+    /// as a known carve-out). This proves the same draft-status filter
+    /// `tools/list` applies now gates this surface too, and that an
+    /// `approved` server's tools are unaffected.
+    #[tokio::test]
+    async fn wor_2484_codemode_ts_hides_a_draft_servers_tools_and_keeps_an_approved_servers() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "codemode-draft-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                {
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": "codemode-draft-server",
+                    "status": "draft"
+                },
+                {
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": "codemode-approved-server",
+                    "status": "approved"
+                }
+            ]
+        }))
+        .expect("codemode draft-status fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([
+                (
+                    "codemode-draft-tool".to_string(),
+                    tool("codemode-draft-tool", "codemode-draft-server"),
+                ),
+                (
+                    "codemode-approved-tool".to_string(),
+                    tool("codemode-approved-tool", "codemode-approved-server"),
+                ),
+            ]),
+            None,
+        );
+
+        let (status, body) = mcp_handler_get(&action, "/.well-known/mcp/codemode.ts").await;
+        assert_eq!(status, 200, "codemode.ts must be served: {body}");
+        assert!(
+            !body.contains("codemode-draft-tool"),
+            "a draft server's tool name/description must not reach the \
+             emitted codemode.ts module at all, not even hidden behind a \
+             filtered key: {body}"
+        );
+        assert!(
+            body.contains("['codemode-approved-tool']:"),
+            "an approved server's tool must still be advertised in \
+             codemode.ts: {body}"
+        );
+    }
+
+    /// WOR-2484: registry approval status is immutable config data for
+    /// the lifetime of one `McpFederation` (see
+    /// `McpFederation::codemode_ts_cached`'s doc comment) -- an
+    /// operator only changes it by editing config, which rebuilds the
+    /// whole `McpAction`, and therefore this federation, from scratch.
+    /// This proves that structural claim end to end: two `McpAction`s
+    /// compiled from configs that differ only in one server's
+    /// `status`, each queried once, never share a stale codemode.ts
+    /// cache entry across the "reload."
+    #[tokio::test]
+    async fn wor_2484_codemode_ts_reflects_the_status_a_fresh_reload_compiled_with() {
+        let config_with = |status: &str| {
+            json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "codemode-reload-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": "codemode-reload-server",
+                    "status": status
+                }]
+            })
+        };
+        let seed = || {
+            HashMap::from([(
+                "codemode-reload-tool".to_string(),
+                tool("codemode-reload-tool", "codemode-reload-server"),
+            )])
+        };
+
+        let approved = McpAction::from_config(config_with("approved"))
+            .expect("approved reload fixture compiles");
+        approved.federation.seed_tools_for_test(seed(), None);
+        let (_, approved_body) = mcp_handler_get(&approved, "/.well-known/mcp/codemode.ts").await;
+        assert!(
+            approved_body.contains("['codemode-reload-tool']:"),
+            "an approved server's tool must be advertised before the \
+             reload: {approved_body}"
+        );
+
+        // A status change is a config edit, which recompiles the whole
+        // `McpAction` -- a brand-new `McpFederation` with its own,
+        // cold `codemode_cache` -- rather than mutating the one above
+        // in place, exactly like every other config reload in this
+        // gateway.
+        let draft =
+            McpAction::from_config(config_with("draft")).expect("draft reload fixture compiles");
+        draft.federation.seed_tools_for_test(seed(), None);
+        let (_, draft_body) = mcp_handler_get(&draft, "/.well-known/mcp/codemode.ts").await;
+        assert!(
+            !draft_body.contains("codemode-reload-tool"),
+            "the post-reload draft status must hide the tool immediately, \
+             never serving the pre-reload approved-server cache entry: \
+             {draft_body}"
         );
     }
 
@@ -11993,31 +12191,76 @@ mod mcp_catalog_snapshot_tests {
     /// read zero after the call below -- this is the exact caller-
     /// facing shape a call that already ran (and, in a real
     /// deployment, already cost money) must not lose attribution for.
+    ///
+    /// The queue-full condition below is deterministic, not a race
+    /// (fixed after this test flaked on CI TRY 2 of an unrelated PR).
+    /// An earlier version kept the dedicated egress's one queue slot
+    /// full with a background thread that looped `publish_checked`
+    /// calls until the dispatch below finished, racing the real file
+    /// worker for the slot the instant it drained one: the flooder
+    /// usually refilled it first, but whenever the worker's drain won
+    /// that race, this dispatch's own evidence emit slipped into the
+    /// freed slot instead, delivery succeeded, and the fail-closed
+    /// refusal this test asserts never happened. `EventEgress::
+    /// never_drained_for_test` (WOR-2384) removes the race instead of
+    /// trying to win it: it builds a queue with no worker at all, so
+    /// nothing ever drains it, and the one pre-fill publish below
+    /// occupies the queue's single slot permanently. The dispatch's own
+    /// publish is then provably the second attempt against an
+    /// already-full queue, with no thread, no timing window, and no
+    /// dependence on how a scheduler happens to interleave anything.
     #[tokio::test]
     async fn wor_2384_queue_full_post_dispatch_evidence_failure_still_records_attribution() {
         const TOOL_NAME: &str = "wor-2384-queue-full-attribution-tool";
         const SERVER: &str = "queue-full-attribution-server";
 
-        // A dedicated, tiny-capacity event egress, distinct from the
+        // A dedicated, capacity-1 event egress, distinct from the
         // shared, capacity-64 one
         // `wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios`
         // installs above: nextest runs each test function in its own
         // process, so a second `install_event_egress` call here is a
         // fresh process-global slot, not a conflict with that test's.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let events_path = dir.path().join("queue-full-events.ndjson");
-        let egress = sbproxy_observe::event_sink::EventEgress::start(
-            sbproxy_observe::event_sink::EventSinkTarget::File {
-                path: events_path.clone(),
-            },
+        //
+        // No real file sink and no worker thread here
+        // (`EventEgress::never_drained_for_test`, WOR-2384): see this
+        // test's doc comment above for why a background flooding
+        // thread racing a real drain loop used to flake, and why a
+        // queue nothing ever drains removes the race instead of
+        // trying to win it. Nothing gets written anywhere, so there is
+        // no temp path to make unique across nextest's per-process
+        // isolation or a serial fallback either -- there is no file at
+        // all for two runs to collide on.
+        let egress = sbproxy_observe::event_sink::EventEgress::never_drained_for_test(
             sbproxy_observe::event_sink::EventTypeMask::from_types(&[
                 sbproxy_observe::events::EventType::McpGovernanceDecision,
             ]),
+            "file",
             1,
-        )
-        .expect("dedicated file egress starts");
+        );
         sbproxy_observe::install_event_egress(egress)
             .expect("this test's own event egress installs exactly once in its own process");
+
+        // Occupy the queue's one slot before dispatch runs. Nothing
+        // ever drains this queue, so this permanently fills it: the
+        // dispatch's own evidence emit below is provably the second
+        // attempt against an already-full queue, not a race against
+        // anything.
+        assert!(
+            sbproxy_observe::event_sink::publish_proxy_event_checked(
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+                || {
+                    sbproxy_observe::events::ProxyEvent::new(
+                        sbproxy_observe::events::EventType::McpGovernanceDecision,
+                        "prefill.test".to_string(),
+                        "prefill-tenant".to_string(),
+                        json!({}),
+                    )
+                },
+            )
+            .is_ok(),
+            "the queue's one slot must accept this pre-fill publish; if this fails, the \
+             egress's queue_capacity above no longer matches this test's arithmetic"
+        );
 
         // A pipeline whose only job here is to carry
         // `events.fail_closed`: `mcp_governance_fail_closed` reads
@@ -12059,30 +12302,6 @@ mod mcp_catalog_snapshot_tests {
             .create("__default__")
             .minted()
             .expect("mint below the cap");
-
-        // Keep the dedicated egress's single queue slot continuously
-        // full for as long as the dispatch below is in flight: a
-        // one-shot burst only guarantees `Full` for the microseconds
-        // the burst itself takes, not for a real async round trip,
-        // since the channel drains the instant the file worker (a
-        // real, separate OS thread) gets scheduled and catches up.
-        let stop_flooding = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flood_stop = Arc::clone(&stop_flooding);
-        let flooder = std::thread::spawn(move || {
-            while !flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = sbproxy_observe::event_sink::publish_proxy_event_checked(
-                    sbproxy_observe::events::EventType::McpGovernanceDecision,
-                    || {
-                        sbproxy_observe::events::ProxyEvent::new(
-                            sbproxy_observe::events::EventType::McpGovernanceDecision,
-                            "flood.test".to_string(),
-                            "flood-tenant".to_string(),
-                            json!({}),
-                        )
-                    },
-                );
-            }
-        });
 
         async fn raw_tools_call_exchange(
             action: &McpAction,
@@ -12161,9 +12380,6 @@ mod mcp_catalog_snapshot_tests {
             events_pipeline,
         )
         .await;
-
-        stop_flooding.store(true, std::sync::atomic::Ordering::Relaxed);
-        flooder.join().expect("flooding thread joins");
 
         assert_eq!(
             call["error"]["message"].as_str().unwrap_or_default(),

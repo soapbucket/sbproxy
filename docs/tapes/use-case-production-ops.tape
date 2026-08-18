@@ -54,6 +54,6 @@ Sleep 2.5s
 
 Type `# ...and every request left one JSON access-log line.`
 Enter
-Type `grep -o '{"timestamp.*' "$SBPROXY_REC_LOG" | grep '"origin":"checkout.local"' | tail -n 1`
+Type `grep -o '{.*"origin":"checkout.local".*}' "$SBPROXY_REC_LOG" | tail -n 1`
 Enter
 Sleep 4s

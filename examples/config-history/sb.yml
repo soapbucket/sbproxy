@@ -1,0 +1,68 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Config history: a durable, local, content-addressed ring of every
+# config this proxy applies.
+#
+# Every applied revision is kept as pre-resolution bytes, exactly what
+# was read off disk before ${VAR} / vault:// / secret:// references
+# resolved. This config carries an unresolved ${DEMO_VAR} on purpose:
+# nobody exports it, so it demonstrates that the stored copy never
+# carries a resolved secret, the same guarantee the live config editor
+# makes -- that is a guarantee about resolution, not about what an
+# operator typed. A literal secret pasted directly into a config (not
+# this one) stores exactly as written, protected only by the ring
+# directory's owner-only filesystem permissions; the admin routes and
+# `config show` mask it as [REDACTED] on display, but the ring file
+# underneath keeps the original bytes, because a rollback needs them.
+#
+# Restart-required to enable: proxy.config_history.enabled has to be
+# true at boot for the ring recorder to be built at all. This config
+# already ships that way, so the walkthrough starts from a live ring.
+#
+# Run (clean state first; revision numbers below assume a fresh ring):
+#   rm -rf /tmp/sbproxy-config-history
+#   sbproxy serve -f sb.yml
+#
+# Test (in another terminal):
+#   curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/history | jq .
+#   sbproxy config history --password demo-change-me
+#
+# The full walkthrough, including the trivial edit + reload that
+# appends a second entry and the `config show` call that proves the
+# stored document is pre-resolution, is examples/config-history/README.md.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # The operator surface this example reads history back through:
+  # GET /admin/config/history and GET /admin/config/history/{digest}.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    # Demo password for local runs. Change before any non-loopback bind.
+    password: demo-change-me
+
+  config_history:
+    enabled: true
+    dir: /tmp/sbproxy-config-history
+    # Small on purpose so a short demo session can watch the ring fill
+    # up; production deployments default to 20.
+    keep: 5
+    keep_rejected: 3
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # A harmless place to carry the unresolved ${DEMO_VAR}: it becomes
+    # a literal outbound header value rather than a secret or anything
+    # that gates pipeline construction. See the README's "Read one
+    # revision back" section for what this proves about the ring.
+    request_modifiers:
+      - headers:
+          set:
+            X-Demo-Var: "${DEMO_VAR}"
+# sbproxy-docs:end

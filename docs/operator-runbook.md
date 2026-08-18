@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -610,3 +610,46 @@ Config rollback:
 kubectl apply -f sbproxyconfig.yaml
 kubectl rollout status deploy/demo
 ```
+
+### Config history ring
+
+`proxy.config_history`, once enabled, keeps every config this proxy applies
+as a local, content-addressed entry: the digest, its lifecycle state
+(`applied`, `good`, `failed`, `reverted`), the blast radius against the
+previous entry, which subsystems (if any) came up degraded, and the
+pre-resolution document bytes exactly as read, before `${VAR}` and
+`vault://`/`secret://` references were resolved. Read it back with
+[`GET /admin/config/history`](admin-api-reference.md#get-adminconfighistory)
+and
+[`GET /admin/config/history/{digest}`](admin-api-reference.md#get-adminconfighistorydigest),
+or directly off disk: entries are plain, zstd-compressed files under
+`proxy.config_history.dir`, readable with `zstdcat` while the process is
+stopped. See [configuration.md](configuration.md#config_history) for the
+block's fields and defaults.
+
+Six different entry paths can trigger a config apply, and all of them
+funnel into the same reload transaction and the same ring entry:
+
+```mermaid
+flowchart TD
+    Boot[Boot] --> Transaction
+    Watcher[File watcher] --> Transaction
+    SIGHUP --> Transaction
+    Admin["POST /admin/reload"] --> Transaction
+    Poller["source: git refresh poller"] --> Transaction
+    Authority[Config authority publish path] --> Transaction
+    Transaction["One reload transaction\n(reload_compiled_config_locked)"] --> Compile{Compile succeeds?}
+    Compile -->|no| Keep[Previous config keeps serving]
+    Compile -->|yes| Publish[Hot-swap the running config]
+    Publish --> Ring[Config history ring records the entry]
+    Ring -->|no subsystem came up degraded| Clean[applied, clean]
+    Ring -->|a subsystem came up degraded| Degraded["applied, degraded: subsystems named"]
+```
+
+What it does not do yet: nothing here promotes an entry to last-known-good,
+nothing reads the `lkg` pointer to decide anything, and nothing reapplies a
+prior entry. The ring is a durable audit trail an operator can inspect by
+hand today, not an automatic rollback path. Soak-window promotion and a
+rollback that actually reapplies a ring entry are follow-on work; until they
+land, use the Helm or `kubectl apply` steps above, or `sbproxy apply`, to
+move the running config back.

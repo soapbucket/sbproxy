@@ -249,7 +249,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45  # was 30; hit the wall twice on 2026-08-18
     permissions:
       contents: read
     steps:

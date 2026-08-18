@@ -424,6 +424,31 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Hitless,
         reason: "correlation-id policy is read per request",
     },
+    // --- Config history (WOR-2457): process-owned storage opened once
+    //     at boot, the same shape as `proxy.compression_state` just
+    //     above. Nothing under this block is ever read on the request
+    //     path -- it is an audit sink a rollback reads later, not a
+    //     setting any request's routing, auth, or response depends on
+    //     -- but the recorder itself (the open ring handle, the
+    //     process-wide slot it installs into) is built exactly once at
+    //     boot, right after the pipeline publishes (`sbproxy-core`'s
+    //     `server::lifecycle::record_boot_config_revision`). A hot
+    //     reload that flips `enabled` from false to true, or repoints
+    //     `dir`, finds the recorder already built and does nothing: the
+    //     ring a reload's plan promised never opens until the next
+    //     restart. Classifying this Hitless would tell an operator a
+    //     config-only toggle takes effect immediately when it silently
+    //     does not. ---
+    BlastRadiusRule {
+        pattern: "proxy.config_history.**",
+        radius: BlastRadius::Restart,
+        reason: "enabling or changing config history storage requires restart",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.config_history",
+        radius: BlastRadius::Restart,
+        reason: "enabling or changing config history storage requires restart",
+    },
     BlastRadiusRule {
         pattern: "access_log.**",
         radius: BlastRadius::Hitless,
@@ -1649,6 +1674,14 @@ origins:
     fn matrix_lookup_metrics_is_hitless() {
         let (r, _) = lookup_blast_radius("proxy.metrics.scrape_endpoint");
         assert_eq!(r, BlastRadius::Hitless);
+    }
+
+    #[test]
+    fn matrix_lookup_config_history_is_restart() {
+        let (r, _) = lookup_blast_radius("proxy.config_history.keep");
+        assert_eq!(r, BlastRadius::Restart);
+        let (r2, _) = lookup_blast_radius("proxy.config_history");
+        assert_eq!(r2, BlastRadius::Restart);
     }
 
     #[test]

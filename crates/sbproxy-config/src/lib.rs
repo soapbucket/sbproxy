@@ -12,6 +12,9 @@
 //!   ([`config_authority`])
 //! - Merging an authority-supplied document into a locally owned one
 //!   ([`config_merge`])
+//! - A durable, node-local, content-addressed ring of applied config
+//!   revisions, used to find the last known good document
+//!   ([`revision_store`])
 //! - Resolving a `source:` block, including a git repository, into the
 //!   config document that actually compiles ([`source`])
 //! - The exact, typed settlement configuration under `proxy.payments`
@@ -37,6 +40,7 @@ pub mod model_host;
 pub mod payments;
 pub mod plan;
 pub mod raw;
+pub mod revision_store;
 pub mod schema;
 mod secret_refs;
 pub mod snapshot;
@@ -87,6 +91,9 @@ pub use plan::{
     PlanEntry, PlanFile, PlanKind, PlanReport, PlanSummary, BLAST_RADIUS_MATRIX,
 };
 pub use raw::*;
+pub use revision_store::{
+    AppendMetadata, RevisionEntry, RevisionState, RevisionStore, RevisionStoreError, SoakVerdict,
+};
 pub use schema::{config_json_schema, CONFIG_SCHEMA_FILE};
 pub use snapshot::*;
 pub use source::{

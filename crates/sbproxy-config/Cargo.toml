@@ -49,6 +49,15 @@ hex = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
 subtle = { workspace = true }
 ed25519-dalek = "2"
+# WOR-2456: content-addressed blob compression for the revision ring
+# (`revision_store`). Version pinned to match the crate already resolved
+# in the workspace lockfile via sbproxy-middleware's compression path, so
+# this adds no new dependency to the graph.
+zstd = "0.13"
+# WOR-2456: lineage identifiers for the revision ring. Already a
+# workspace dependency (used for request-id generation elsewhere); this
+# just extends its use to this crate.
+uuid = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

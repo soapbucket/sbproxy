@@ -1,5 +1,5 @@
 # Routing and traffic management
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
@@ -79,11 +79,11 @@ Registering a new strategy is a Rust `inventory::submit!` call in an out-of-tree
 
 Beyond plain HTTP `proxy`, dedicated actions route other transports through the same origin/policy/transform pipeline:
 
-- **WebSocket** (`type: websocket`): proxies `ws://`/`wss://` with configurable subprotocols and max message size.
+- **WebSocket** (`type: websocket`): proxies `ws://`/`wss://`. The `subprotocols` and `max_message_size` fields are accepted by config but not currently enforced; see [websocket.md](websocket.md) for what actually runs before and after the upgrade. Runnable at [`examples/websocket-proxy/`](../examples/websocket-proxy/).
 - **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
-- **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream.
+- **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream, including a 64 KiB validated-body limit and whole-batch rejection. Runnable at [`examples/graphql-gateway/`](../examples/graphql-gateway/).
 
-Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql).
+Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql). WebSocket also has its own dedicated page, [websocket.md](websocket.md), covering upgrade semantics and honest limits in more depth than the field table alone.
 
 ## Routing AI traffic
 
@@ -119,5 +119,7 @@ Everything above that reacts to failure (health checks, circuit breaker, outlier
 | [`lora-aware-routing`](../examples/lora-aware-routing/) | Adapter-aware target selection |
 | [`fallback-origin`](../examples/fallback-origin/) | Degraded-backend failover |
 | [`grpc-h2c`](../examples/grpc-h2c/) | gRPC over cleartext HTTP/2 |
+| [`graphql-gateway`](../examples/graphql-gateway/) | Fail-closed GraphQL validation: depth, introspection, batches, and the 64 KiB body limit |
+| [`websocket-proxy`](../examples/websocket-proxy/) | Upgrade handshake, an auth gate before it, and what post-upgrade traffic is not inspected |
 | [`correlation-id`](../examples/correlation-id/) | Request-ID propagation across a routed hop |
 | [`ai-routing-policy`](../examples/ai-routing-policy/) | Operator-authored CEL routing decision over AI-specific signals |
