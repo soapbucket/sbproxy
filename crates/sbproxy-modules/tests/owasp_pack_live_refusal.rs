@@ -283,10 +283,11 @@ fn api1_and_api5_share_one_object_authz_entry_that_still_refuses_nothing_blind()
     // Companion to `api5_alone_never_refuses_because_function_rules_stays_empty`:
     // when api1 and api5 are both enabled, they share one object_authz
     // entry rather than adding two. That shared entry has both
-    // object_rules and function_rules empty, so - per the same
-    // decide() trace - neither BOLA, BFLA, nor enumeration has
-    // anything to evaluate. This is intentionally a green proof, not a
-    // red one: there is no context-free fallback in this entry today.
+    // object_rules and function_rules empty, so BOLA and BFLA have
+    // nothing to evaluate. The ruleless enumeration heuristic still
+    // observes id-shaped sweeps, but its violations are detect_only:
+    // audited, never a refusal. "Refuses nothing blind" is the
+    // blocking axis, and this pins it.
     let json = synthesized_policy(api1_and_api5_yaml(), "object_authz");
     assert_eq!(
         json.get("function_rules")
@@ -301,11 +302,14 @@ fn api1_and_api5_share_one_object_authz_entry_that_still_refuses_nothing_blind()
         roles: Vec::new(),
     };
     for id in 1..=25 {
-        assert_eq!(
-            policy.decide(&caller, "GET", &format!("/orders/{id}")),
-            None,
-            "id {id}: no object_rules means nothing to enumerate either"
-        );
+        match policy.decide(&caller, "GET", &format!("/orders/{id}")) {
+            None => {}
+            Some(v) => assert!(
+                v.detect_only,
+                "id {id}: a ruleless heuristic hit must be detect_only \
+                 (audited, never refused), got: {v:?}"
+            ),
+        }
     }
 }
 
