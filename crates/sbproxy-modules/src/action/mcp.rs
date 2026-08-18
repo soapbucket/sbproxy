@@ -1131,7 +1131,7 @@ pub struct McpLocalStepsConfig {
     /// not any single step's own call. Accepts Go duration syntax
     /// (`10s`, `500ms`); defaults to 30 seconds when unset
     /// (WOR-2489 Task 4) and is refused at compile time past 5
-    /// minutes -- see [`compile_local_steps`].
+    /// minutes -- see `compile_local_steps`.
     #[serde(default, with = "duration_str")]
     pub timeout: Option<Duration>,
     /// Named on purpose rather than left to fall through
