@@ -33,16 +33,15 @@ use std::sync::mpsc::TrySendError;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use opentelemetry::trace::{
-    Link, SamplingDecision, SamplingResult, SpanKind, Status, TraceContextExt, TraceError, TraceId,
-    TraceResult,
-};
+use opentelemetry::trace::{Link, SpanKind, Status, TraceContextExt, TraceId};
 use opentelemetry::{global, Context, KeyValue, Value};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
-use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace as sdktrace;
-use opentelemetry_sdk::trace::{ShouldSample, SpanProcessor};
+use opentelemetry_sdk::trace::{
+    SamplingDecision, SamplingResult, ShouldSample, SpanData, SpanExporter, SpanProcessor,
+};
 use opentelemetry_sdk::{trace::Span, Resource};
 use opentelemetry_semantic_conventions as semconv;
 use serde::Deserialize;
@@ -396,9 +395,9 @@ impl ShouldSample for OutcomeAwareSampler {
 #[derive(Debug)]
 enum TraceExportMessage {
     ExportSpan(Box<SpanData>),
-    ForceFlush(mpsc::Sender<ExportResult>),
+    ForceFlush(mpsc::Sender<OTelSdkResult>),
     SetResource(Resource),
-    Shutdown(mpsc::Sender<ExportResult>),
+    Shutdown(mpsc::Sender<OTelSdkResult>),
 }
 
 /// Span processor that exports the spans selected by the head sampler
@@ -450,15 +449,15 @@ impl OutcomeSamplingSpanProcessor {
 
     fn send_control(
         &self,
-        build: impl FnOnce(mpsc::Sender<ExportResult>) -> TraceExportMessage,
-    ) -> TraceResult<()> {
+        build: impl FnOnce(mpsc::Sender<OTelSdkResult>) -> TraceExportMessage,
+    ) -> OTelSdkResult {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(build(reply_tx))
-            .map_err(|_| TraceError::Other("trace export worker is closed".into()))?;
+            .map_err(|_| OTelSdkError::InternalFailure("trace export worker is closed".into()))?;
         reply_rx
             .recv_timeout(TRACE_EXPORT_FLUSH_TIMEOUT)
-            .map_err(|_| TraceError::Other("trace export worker timed out".into()))?
+            .map_err(|_| OTelSdkError::InternalFailure("trace export worker timed out".into()))?
     }
 }
 
@@ -490,11 +489,15 @@ impl SpanProcessor for OutcomeSamplingSpanProcessor {
         }
     }
 
-    fn force_flush(&self) -> TraceResult<()> {
+    fn force_flush(&self) -> OTelSdkResult {
         self.send_control(TraceExportMessage::ForceFlush)
     }
 
-    fn shutdown(&self) -> TraceResult<()> {
+    // `_timeout` deliberately unheeded: control messages to the export
+    // worker have always used the fixed TRACE_EXPORT_FLUSH_TIMEOUT
+    // (send_control), and honoring the SDK's default here would change
+    // how long a shutdown waits for the final flush.
+    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
         let dropped = self.dropped_spans.load(Ordering::Relaxed);
         if dropped > 0 {
             tracing::warn!(
@@ -568,14 +571,14 @@ fn spawn_trace_export_worker(
                         }
                     }
                     TraceExportMessage::ForceFlush(reply) => {
-                        let _ = reply.send(rt.block_on(exporter.force_flush()));
+                        let _ = reply.send(exporter.force_flush());
                     }
                     TraceExportMessage::SetResource(resource) => {
                         exporter.set_resource(&resource);
                     }
                     TraceExportMessage::Shutdown(reply) => {
-                        let result = rt.block_on(exporter.force_flush());
-                        exporter.shutdown();
+                        let result = exporter.force_flush();
+                        let _ = exporter.shutdown();
                         let _ = reply.send(result);
                         break;
                     }
@@ -764,12 +767,16 @@ pub fn build_otlp_trace_pipeline(config: &TelemetryConfig) -> Result<Option<Otlp
     let processor =
         OutcomeSamplingSpanProcessor::new(config.clone(), endpoint.clone(), policy.clone())?;
 
-    let provider = sdktrace::TracerProvider::builder()
+    let provider = sdktrace::SdkTracerProvider::builder()
         .with_span_processor(processor)
         .with_sampler(OutcomeAwareSampler::new(policy.clone()))
         .with_resource(resource)
         .build();
     let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "sbproxy");
+    // 0.28 removed `global::shutdown_tracer_provider()`; shutdown is now
+    // a method on the provider itself, so keep a handle for
+    // [`shutdown_otlp_pipeline`] to call at process exit.
+    let _ = INSTALLED_TRACER_PROVIDER.set(provider.clone());
     global::set_tracer_provider(provider);
     init_propagator();
 
@@ -880,7 +887,14 @@ fn otlp_resource(config: &TelemetryConfig) -> Resource {
     for (k, v) in &config.resource_attrs {
         resource_kv.push(KeyValue::new(k.clone(), v.clone()));
     }
-    Resource::new(resource_kv)
+    // builder_empty(), not builder(): 0.28 replaced `Resource::new`
+    // (exactly the given attributes) with a builder whose default form
+    // seeds `service.name = unknown_service` and `telemetry.sdk.*`
+    // attributes. The empty form is the 0.27 behavior: the attribute
+    // set an operator sees is exactly what this function computed.
+    Resource::builder_empty()
+        .with_attributes(resource_kv)
+        .build()
 }
 
 /// Authorize an OTLP exporter endpoint against the top-level
@@ -1164,10 +1178,24 @@ fn build_span_exporter(
     }
 }
 
+/// The provider [`build_otlp_trace_pipeline`] installed globally, kept
+/// so [`shutdown_otlp_pipeline`] can flush and stop it: the OTel 0.28+
+/// API dropped `global::shutdown_tracer_provider()` in favor of an
+/// explicit `SdkTracerProvider::shutdown` on a handle the installer
+/// keeps. Set at most once per process, exactly like the pipeline it
+/// belongs to (the trace pipeline is boot-only; see WOR-2481's notes on
+/// `authorize_telemetry_endpoint_or_refuse_boot`).
+static INSTALLED_TRACER_PROVIDER: std::sync::OnceLock<sdktrace::SdkTracerProvider> =
+    std::sync::OnceLock::new();
+
 /// Shut down the OTLP pipeline cleanly. Should be called at process
 /// exit so any pending span batches get flushed.
 pub fn shutdown_otlp_pipeline() {
-    global::shutdown_tracer_provider();
+    if let Some(provider) = INSTALLED_TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            tracing::debug!(error = ?e, "telemetry: OTLP tracer provider shutdown reported an error");
+        }
+    }
 }
 
 // --- OTLP metrics pipeline ---
@@ -1269,12 +1297,19 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
     };
 
     let interval = std::time::Duration::from_secs(config.metrics_interval_secs.unwrap_or(30));
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
-        exporter,
-        opentelemetry_sdk::runtime::TokioCurrentThread,
-    )
-    .with_interval(interval)
-    .build();
+    // `periodic_reader_with_async_runtime` (behind the
+    // `experimental_metrics_periodicreader_with_async_runtime` feature)
+    // is where 0.28 moved the runtime-bound reader this pipeline has
+    // always used; the plain `PeriodicReader` now blocks on exports
+    // from its own std thread instead, which is not what the async
+    // reqwest HTTP exporter above expects to run under.
+    let reader =
+        opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader::builder(
+            exporter,
+            opentelemetry_sdk::runtime::TokioCurrentThread,
+        )
+        .with_interval(interval)
+        .build();
 
     let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(reader)
@@ -1291,13 +1326,13 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
     Ok(())
 }
 
-/// Shut down the OTLP metric pipeline cleanly. The 0.27 OTel API
-/// has no global meter-provider shutdown; the `SdkMeterProvider`
-/// installed in [`init_otlp_metrics_pipeline`] is flushed on its
-/// own `Drop` when the process exits. This function exists as a
-/// symmetry point with [`shutdown_otlp_pipeline`] so a shutdown
-/// handler can call both without conditional compilation; today it
-/// is a no-op. When upstream exposes a global flush, this fn
+/// Shut down the OTLP metric pipeline cleanly. The OTel API (still
+/// true on 0.32) has no global meter-provider shutdown; the
+/// `SdkMeterProvider` installed in [`init_otlp_metrics_pipeline`] is
+/// flushed on its own `Drop` when the process exits. This function
+/// exists as a symmetry point with [`shutdown_otlp_pipeline`] so a
+/// shutdown handler can call both without conditional compilation;
+/// today it is a no-op. When upstream exposes a global flush, this fn
 /// becomes the seam.
 pub fn shutdown_otlp_metrics_pipeline() {
     // Intentionally empty; see fn-doc.
@@ -1577,7 +1612,12 @@ pub fn parent_span_on_remote_trace_context(
         opentelemetry::trace::TraceState::NONE,
     );
     let cx = Context::new().with_remote_span_context(span_context);
-    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, cx);
+    // tracing-opentelemetry 0.33 reports "no OTel layer installed" /
+    // "span already started" as an `Err` where 0.28 silently no-oped.
+    // Those are exactly the cases this function has always no-oped on
+    // (see the doc comment and the subscriber-less tests below), so the
+    // result is deliberately dropped rather than logged.
+    let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, cx);
 }
 
 // --- Span-naming helpers ---
@@ -1989,6 +2029,7 @@ mod tests {
                 opentelemetry::trace::TraceState::default(),
             ),
             parent_span_id: opentelemetry::trace::SpanId::INVALID,
+            parent_span_is_remote: false,
             span_kind: SpanKind::Internal,
             name: std::borrow::Cow::Borrowed("ai.request"),
             start_time,
@@ -2491,7 +2532,7 @@ mod tests {
         assert_eq!(parsed.trace_id, "0af7651916cd43dd8448eb211c80319c");
         assert!(parsed.is_sampled());
 
-        let provider = sdktrace::TracerProvider::builder().build();
+        let provider = sdktrace::SdkTracerProvider::builder().build();
         let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "test");
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
         let subscriber = tracing_subscriber::registry().with(otel_layer);
@@ -2635,14 +2676,14 @@ mod tests {
         let resource = otlp_resource(&config);
         assert_eq!(
             resource
-                .get(opentelemetry::Key::from_static_str("os.type"))
+                .get(&opentelemetry::Key::from_static_str("os.type"))
                 .map(|v| v.to_string()),
             Some("operator-override".to_string()),
             "operator resource_attrs must beat detection"
         );
         assert_eq!(
             resource
-                .get(opentelemetry::Key::from_static_str("service.name"))
+                .get(&opentelemetry::Key::from_static_str("service.name"))
                 .map(|v| v.to_string()),
             Some("sbproxy-test".to_string())
         );
@@ -2661,7 +2702,7 @@ mod tests {
         let resource = otlp_resource(&TelemetryConfig::default());
         assert_eq!(
             resource
-                .get(opentelemetry::Key::from_static_str("service.version"))
+                .get(&opentelemetry::Key::from_static_str("service.version"))
                 .map(|v| v.to_string()),
             Some(env!("CARGO_PKG_VERSION").to_string())
         );
@@ -2685,7 +2726,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         init_propagator();
-        let provider = sdktrace::TracerProvider::builder().build();
+        let provider = sdktrace::SdkTracerProvider::builder().build();
         let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "test");
         let subscriber =
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));

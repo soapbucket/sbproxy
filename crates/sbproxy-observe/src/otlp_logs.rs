@@ -26,7 +26,7 @@
 use opentelemetry::logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
-use opentelemetry_sdk::logs::LoggerProvider as SdkLoggerProvider;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::Resource;
 
 use crate::sink_dispatcher::SinkOutput;
@@ -105,7 +105,7 @@ impl OtlpLogSink {
         crate::telemetry::authorize_telemetry_endpoint_or_reject(&endpoint, "logs")?;
 
         // Build the OTLP exporter per the operator's transport choice.
-        // The 0.27 OTLP-logs builder API mirrors the trace + metric
+        // The OTLP-logs builder API mirrors the trace + metric
         // builders already wired in `telemetry.rs`.
         let exporter = match options.transport {
             OtlpTransport::Http => {
@@ -149,10 +149,29 @@ impl OtlpLogSink {
         for (k, v) in &options.resource_attrs {
             kv.push(KeyValue::new(k.clone(), v.clone()));
         }
-        let resource = Resource::new(kv);
+        // builder_empty(), not builder(): the empty form carries exactly
+        // the attributes computed above, matching what `Resource::new`
+        // produced before 0.28 (the default builder would add
+        // `telemetry.sdk.*` and an `unknown_service` service.name).
+        let resource = Resource::builder_empty().with_attributes(kv).build();
 
+        // `log_processor_with_async_runtime` (behind the
+        // `experimental_logs_batch_log_processor_with_async_runtime`
+        // feature) is where 0.28 moved the runtime-bound batch processor
+        // this sink has always used (`with_batch_exporter(exporter,
+        // runtime::Tokio)` before the split); the plain batch processor
+        // now blocks on exports from its own std thread instead, which
+        // is not what the async reqwest HTTP exporter expects to run
+        // under. Construction still requires an ambient Tokio runtime,
+        // exactly as before.
+        let processor =
+            opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor::builder(
+                exporter,
+                opentelemetry_sdk::runtime::Tokio,
+            )
+            .build();
         let provider = SdkLoggerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_log_processor(processor)
             .with_resource(resource)
             .build();
 
@@ -171,7 +190,7 @@ impl OtlpLogSink {
     /// Force the provider to flush. Used by the shutdown handler so
     /// pending batches drain before the process exits.
     pub fn force_flush(&self) {
-        // Provider exposes `force_flush`; the returned `Vec<LogResult<()>>`
+        // Provider exposes `force_flush`; the returned `OTelSdkResult`
         // is ignored because the dispatcher's `flush_all` is best-effort.
         let _ = self.provider.force_flush();
     }
@@ -449,7 +468,7 @@ mod tests {
         // assert.
         live.flush_all();
 
-        // Give the exporter a moment to ship the batch. The 0.27 batch
+        // Give the exporter a moment to ship the batch. The batch
         // processor flushes synchronously on `force_flush`, but the
         // mock collector's accept loop is async so we yield a couple
         // of times.

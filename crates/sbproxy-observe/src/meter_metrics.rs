@@ -725,12 +725,12 @@ pub fn install() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::metrics::data::ResourceMetrics;
     use opentelemetry_sdk::metrics::reader::MetricReader;
     use opentelemetry_sdk::metrics::{
-        InstrumentKind, ManualReader, MetricResult, Pipeline, SdkMeterProvider, Temporality,
+        InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
     };
-    use opentelemetry_sdk::Resource;
     use std::sync::{Arc, Weak};
 
     /// A `ManualReader` that can be handed to a provider and still read
@@ -748,14 +748,14 @@ mod tests {
         fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
             self.0.register_pipeline(pipeline);
         }
-        fn collect(&self, rm: &mut ResourceMetrics) -> MetricResult<()> {
+        fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
             self.0.collect(rm)
         }
-        fn force_flush(&self) -> MetricResult<()> {
+        fn force_flush(&self) -> OTelSdkResult {
             self.0.force_flush()
         }
-        fn shutdown(&self) -> MetricResult<()> {
-            self.0.shutdown()
+        fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> OTelSdkResult {
+            self.0.shutdown_with_timeout(timeout)
         }
         fn temporality(&self, kind: InstrumentKind) -> Temporality {
             self.0.temporality(kind)
@@ -1034,19 +1034,15 @@ mod tests {
         set_meter_chain_seq(9);
         record_meter_append_duration(0.001);
 
-        let mut collected = ResourceMetrics {
-            resource: Resource::default(),
-            scope_metrics: Vec::new(),
-        };
+        let mut collected = ResourceMetrics::default();
         reader
             .collect(&mut collected)
             .expect("the manual reader collects from its provider");
 
         let names: Vec<String> = collected
-            .scope_metrics
-            .iter()
-            .flat_map(|scope| scope.metrics.iter())
-            .map(|metric| metric.name.to_string())
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .map(|metric| metric.name().to_string())
             .collect();
 
         for instrument in [

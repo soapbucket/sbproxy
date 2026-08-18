@@ -66,24 +66,42 @@ ed25519-dalek = "2"
 # protocol, and tracing bridge. The `logs` feature flips on the
 # OTLP-logs surface that WOR-1046 plumbs into the sink dispatcher;
 # the trace + metrics surfaces remain wired the same way as before.
-opentelemetry = { version = "0.27", features = ["trace", "metrics", "logs"] }
+opentelemetry = { version = "0.32", features = ["trace", "metrics", "logs"] }
 # rt-tokio-current-thread: the OTLP metrics PeriodicReader needs this
 # binding (not plain rt-tokio) so it spawns its own dedicated
 # thread+runtime instead of assuming an ambient multi-thread Tokio
 # runtime, which does not exist yet at the point main() initializes
-# telemetry (Pingora builds its runtime later).
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "rt-tokio-current-thread", "trace", "metrics", "logs"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics", "logs"] }
-opentelemetry-semantic-conventions = "0.27"
-tracing-opentelemetry = "0.28"
+# telemetry (Pingora builds its runtime later). Since 0.28 the
+# runtime-bound PeriodicReader and BatchLogProcessor live behind the
+# `experimental_*_with_async_runtime` features; they are the same
+# runtime bindings 0.27 shipped by default, kept so the metrics and
+# log pipelines run on the exact runtimes they always did.
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "rt-tokio-current-thread", "trace", "metrics", "logs", "experimental_metrics_periodicreader_with_async_runtime", "experimental_logs_batch_log_processor_with_async_runtime"] }
+# default-features = false: the 0.28+ default set adds
+# reqwest-blocking-client, which would silently switch the OTLP/HTTP
+# exporters onto a blocking client. This list reproduces the exact
+# effective feature set the 0.27 pin resolved to (its defaults plus
+# what was requested), so the HTTP exporters keep using the async
+# reqwest client they always have.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-semantic-conventions = "0.32"
+tracing-opentelemetry = "0.33"
 # WOR-1869: build gRPC MetadataMap for authenticated OTLP export.
-# Version pinned by the workspace to match opentelemetry-otlp's tonic.
-tonic.workspace = true
+# Pinned to match opentelemetry-otlp 0.32's tonic (0.14), NOT the
+# workspace tonic (0.12, which the classifier sidecar contract keeps):
+# `with_metadata` takes this tonic's MetadataMap by type, so the two
+# must agree here even though the workspace carries both majors.
+tonic = "0.14"
 # WOR-1875: durable usage rollup buckets (the workspace's embedded-KV
 # convention; the response cache and keystore use redb the same way).
 redb.workspace = true
 
 [dev-dependencies]
+# 0.28 moved `ManualReader`, `Pipeline`, and the `MetricReader` trait
+# behind `experimental_metrics_custom_reader`. Only the meter
+# reconciliation test consumes them, so the feature rides the
+# dev-dependency union rather than the shipped one.
+opentelemetry_sdk = { version = "0.32.1", features = ["experimental_metrics_custom_reader"] }
 tempfile = "3"
 # WOR-2333: the redaction test asserts a redacted config still parses,
 # which is the property an operator depends on when the Config page
