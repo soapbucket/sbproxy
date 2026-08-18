@@ -1,0 +1,160 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The headline `type: local` shape: one composed tool built from a
+# two-step DAG against test.sbproxy.dev's own small MCP endpoint
+# (tools `hello` and `echo`, the same pair examples/mcp-governance and
+# examples/mcp-tool-versioning already call over federation), shaped
+# with Lua, RBAC'd, with governance evidence on.
+#
+# `compose.greet_and_echo` runs two steps:
+#   - `hello`: calls the upstream `hello` tool with the caller's
+#     `name`, over a raw JSON-RPC POST (the same request shape
+#     sbproxy's own MCP federation client sends).
+#   - `echo`: depends on `hello`, and only runs when the caller passes
+#     `verbose: true` (its `condition`). Its message is built from
+#     `hello`'s own outcome via `${steps.hello.status}` -- the ${}
+#     engine has no array indexing, so it cannot reach into `hello`'s
+#     result content array; that's what `response.lua` is for below.
+# `response.lua` shapes the two step outputs into one JSON result,
+# reading `hello`'s actual greeting text out of its result content
+# array with real Lua indexing.
+#
+# Both steps dial test.sbproxy.dev, so the server's `egress:` gates
+# them exactly like an `openapi`-backed server's REST calls would.
+# `rbac_policies` is default-deny, and `events:` turns on the same
+# `mcp_governance_decision` evidence feed examples/mcp-governance uses,
+# fail-closed.
+#
+# Run:
+#   sbproxy serve -f examples/mcp-compose/sb.yml
+#
+# See README.md for the full walkthrough, and docs/mcp-compose.md for
+# the field-by-field reference this example exercises.
+
+proxy:
+  http_bind_port: 8080
+
+events:
+  sink: file
+  path: mcp-compose-events.ndjson
+  types:
+    - mcp_governance_decision
+  fail_closed:
+    - mcp_governance_decision
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: composed-tools-demo
+        version: "1.0.0"
+
+      # Default-deny. `caller` is the only policy, matching the
+      # `principals: []` (anyone) shape examples/mcp-rbac-quotas uses,
+      # so this example needs no `authentication:` block to show RBAC
+      # actually gating something.
+      # `compose.ping` exists in the catalog and is reachable (real,
+      # static, no egress needed) but is deliberately left off
+      # `caller`'s allowed list, so the RBAC-denied call in README.md
+      # has something real to deny rather than a tool that was never
+      # going to resolve either way.
+      rbac_policies:
+        caller:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - "compose.greet_and_echo"
+
+      federated_servers:
+        - origin: compose
+          type: local
+          prefix: compose
+          namespace: always
+          rbac: caller
+          egress:
+            mode: deny_by_default
+            hosts: [test.sbproxy.dev]
+          tools:
+            - name: ping
+              description: >-
+                Static reachability check. Not on `caller`'s allowed
+                list, on purpose: the RBAC-denied call in this
+                example's README targets a tool that is real, not one
+                that was never going to resolve.
+              input_schema:
+                type: object
+                properties: {}
+                additionalProperties: false
+              static:
+                pong: true
+
+            - name: greet_and_echo
+              description: >-
+                Greets a name via the upstream `hello` tool, then,
+                when asked, echoes a derived message back through the
+                upstream `echo` tool, composing both results into one.
+              input_schema:
+                type: object
+                required: [name, verbose]
+                properties:
+                  name:
+                    type: string
+                    description: Name to greet.
+                  verbose:
+                    type: boolean
+                    description: When true, also runs the echo step.
+                additionalProperties: false
+              steps:
+                steps:
+                  - name: hello
+                    http:
+                      method: POST
+                      url: "https://test.sbproxy.dev/mcp"
+                      headers:
+                        content-type: application/json
+                        accept: "application/json, text/event-stream"
+                      body:
+                        jsonrpc: "2.0"
+                        id: 1
+                        method: tools/call
+                        params:
+                          name: hello
+                          arguments:
+                            name: "${args.name}"
+                      timeout: 10s
+
+                  - name: echo
+                    depends_on: [hello]
+                    # Same CEL vocabulary argument_policies[] uses
+                    # (mcp.tool, mcp.arguments, mcp.principal, ...);
+                    # see docs/mcp-compose.md's interpolation section
+                    # for why this cannot read a prior step's result.
+                    condition: "mcp.arguments.verbose == true"
+                    http:
+                      method: POST
+                      url: "https://test.sbproxy.dev/mcp"
+                      headers:
+                        content-type: application/json
+                        accept: "application/json, text/event-stream"
+                      body:
+                        jsonrpc: "2.0"
+                        id: 2
+                        method: tools/call
+                        params:
+                          name: echo
+                          arguments:
+                            message: "Echo after hello returned HTTP ${steps.hello.status}"
+                      timeout: 10s
+
+                response:
+                  lua: |
+                    -- Luau tables are 1-indexed, unlike the JS sandbox.
+                    local greeting = ctx.steps.hello.body.result.content[1].text
+                    local result = { greeting = greeting }
+                    local echo = ctx.steps.echo
+                    if echo ~= nil and echo.body ~= nil then
+                      result.echoed = echo.body.result.content[1].text
+                    end
+                    return result

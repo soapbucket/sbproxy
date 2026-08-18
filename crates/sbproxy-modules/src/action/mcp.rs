@@ -84,6 +84,8 @@ use sbproxy_extension::mcp::{
 use sbproxy_extension::rego::CompiledRego;
 use serde::Deserialize;
 
+use super::mcp_interpolate;
+
 // --- Wire format ---
 
 /// Top-level MCP action config as parsed from YAML.
@@ -964,6 +966,14 @@ pub struct McpFederatedServerConfig {
     /// config error; pick one credential source.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Locally defined tools for a `type: local` server (WOR-2489).
+    /// Each entry declares one tool the gateway serves itself, with no
+    /// upstream MCP or REST dial: a static value, a single HTTP call,
+    /// or a DAG of HTTP steps. See [`McpLocalToolConfig`]. Rejected on
+    /// non-`local` servers, mirroring how `spec`/`spec_path`/`headers`
+    /// are rejected on non-`openapi` servers.
+    #[serde(default)]
+    pub tools: Vec<McpLocalToolConfig>,
     /// Protocol negotiation pin for this upstream (WOR-2384). `"auto"`
     /// (default) negotiates: the gateway remembers, per tenant, the best
     /// era this upstream has demonstrated and refuses (or, under
@@ -1023,6 +1033,189 @@ pub struct McpFederatedServerConfig {
 
 fn default_federated_protocol() -> String {
     "auto".to_string()
+}
+
+// --- `type: local` tool config (WOR-2489) ---
+//
+// A `type: local` federated server serves its own tools: no MCP or
+// REST dial to an upstream, just config-declared handlers. Three
+// handler shapes exist, and a tool sets exactly one:
+//
+//   * `static`: always returns the same JSON value.
+//   * `http`: makes one HTTP call and returns its response.
+//   * `steps`: runs a DAG of HTTP calls (dependency-ordered, with a
+//     per-step CEL `condition` gate and `retry`), then shapes one
+//     response from the step outputs.
+//
+// This section is config structs and compile-time validation only.
+// The compiled representation lands on `McpAction::local_servers` and
+// is published into the shared tool catalog by `from_parsed` (WOR-2489
+// Task 2, via `sbproxy_extension::mcp::LocalBacking`); nothing here
+// dispatches a request -- that is Task 3's job.
+
+/// One locally served tool on a `type: local` federated server
+/// (WOR-2489). `handler` is exactly one of `static`, `http`, or
+/// `steps`; declaring zero or more than one is a config-compile
+/// error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalToolConfig {
+    /// Tool name, as advertised in `tools/list`. Must not be empty.
+    pub name: String,
+    /// Human-readable description shown to the calling model.
+    pub description: String,
+    /// JSON Schema for the tool's arguments. Must be a JSON object (an
+    /// object with `type: object` and friends, not a bare
+    /// array/string/scalar); refused otherwise at compile time.
+    pub input_schema: serde_json::Value,
+    /// Always returns this value, unconditionally. No HTTP call is
+    /// made, so this handler needs no `egress:` on the server.
+    #[serde(default, rename = "static")]
+    pub r#static: Option<serde_json::Value>,
+    /// Makes one HTTP call and returns its response.
+    #[serde(default)]
+    pub http: Option<McpLocalHttpCallConfig>,
+    /// Runs a dependency-ordered DAG of HTTP calls and shapes one
+    /// response from their outputs. See [`McpLocalStepsConfig`].
+    #[serde(default)]
+    pub steps: Option<McpLocalStepsConfig>,
+    /// Shapes a standalone `http` handler's response from
+    /// `template`/`js`/`lua` (WOR-2489 Task 5). Only valid alongside
+    /// `http`: a `steps` handler configures its own response shaping
+    /// under `steps.response` instead, and `static` never calls out so
+    /// there is nothing to shape. Omitted means `http`'s own `{status,
+    /// headers, body}` document is returned unshaped, exactly as
+    /// before this field existed.
+    #[serde(default)]
+    pub response: Option<McpLocalResponseConfig>,
+}
+
+/// One HTTP call: the shared shape for a tool's `http` handler and a
+/// step's `http` field (WOR-2489).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalHttpCallConfig {
+    /// HTTP method (`GET`, `POST`, ...).
+    pub method: String,
+    /// Request URL.
+    pub url: String,
+    /// Static request headers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Request body, sent as JSON.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    /// Retry policy for this call. Reuses [`super::RetryConfig`], the
+    /// same shape a `proxy`/`load_balancer` action's `retry:` uses.
+    #[serde(default)]
+    pub retry: Option<super::RetryConfig>,
+    /// Request timeout. Accepts Go duration syntax (`10s`, `500ms`).
+    #[serde(default, with = "duration_str")]
+    pub timeout: Option<Duration>,
+}
+
+/// A DAG of HTTP steps and how to shape their outputs into one tool
+/// result (WOR-2489).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalStepsConfig {
+    /// The steps, in any declaration order; execution order is
+    /// derived from `depends_on`. Must not be empty.
+    pub steps: Vec<McpLocalStepConfig>,
+    /// How to shape the final tool result from step outputs. Exactly
+    /// one of `template`, `js`, or `lua` when present; omitted means
+    /// no shaping is configured (a later task defines the default).
+    #[serde(default)]
+    pub response: Option<McpLocalResponseConfig>,
+    /// Whole-call budget: the deadline covers every step in the DAG,
+    /// not any single step's own call. Accepts Go duration syntax
+    /// (`10s`, `500ms`); defaults to 30 seconds when unset
+    /// (WOR-2489 Task 4) and is refused at compile time past 5
+    /// minutes -- see `compile_local_steps`.
+    #[serde(default, with = "duration_str")]
+    pub timeout: Option<Duration>,
+    /// Named on purpose rather than left to fall through
+    /// `deny_unknown_fields`'s generic "unknown field" refusal: an
+    /// operator reaching for concurrent step execution gets a
+    /// specific answer instead of a typo-shaped error. Steps always
+    /// run in dependency order today; a parallel scheduler is a
+    /// tracked follow-up, not yet implemented. Setting this field to
+    /// any value is a config-compile error. See `compile_local_steps`.
+    #[serde(default)]
+    pub parallel: Option<serde_json::Value>,
+}
+
+/// One step in a `steps` handler's DAG (WOR-2489).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalStepConfig {
+    /// Step name. Must be unique within the tool and not empty;
+    /// referenced by other steps' `depends_on`.
+    pub name: String,
+    /// The HTTP call this step makes. Same shape as a tool's `http`
+    /// handler.
+    pub http: McpLocalHttpCallConfig,
+    /// Names of steps that must complete before this one runs. Every
+    /// name must match another step in the same `steps[]` list, and
+    /// the graph they form must not contain a cycle.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// CEL expression gating whether this step runs. Compiled with the
+    /// same [`sbproxy_extension::cel::CelSurface::McpArgumentPolicy`]
+    /// vocabulary `argument_policies[]` uses (tool name, server,
+    /// session, tenant, principal, and the parsed call arguments), so
+    /// a malformed expression is a config-compile error.
+    #[serde(default)]
+    pub condition: Option<String>,
+    /// When true, a failed call from this step does not fail the
+    /// whole tool call; dependent steps still run. Defaults to false.
+    #[serde(default)]
+    pub continue_on_error: bool,
+    /// Retry policy for this step's HTTP call. Reuses
+    /// [`super::RetryConfig`].
+    #[serde(default)]
+    pub retry: Option<super::RetryConfig>,
+}
+
+/// How a `steps` handler (or an `http` handler that opts in via
+/// [`McpLocalToolConfig::response`]) shapes its final response
+/// (WOR-2489). Exactly one field is set; declaring zero or more than
+/// one is a config-compile error. No `cel:` variant: CEL only returns
+/// a scalar, and a response shape needs a document -- the same
+/// reasoning `sbproxy-config`'s cache-decision script config
+/// (`key_event` / `admit_event`) already applies by refusing a `cel`
+/// engine there.
+///
+/// `js`/`lua` bind the identical entry convention that
+/// cache-decision script (`sbproxy-core::decision_script::evaluate`)
+/// already uses: a single `ctx` global set to `{"args": <call
+/// arguments>, "steps": <step outputs so far>}` before the script
+/// runs, and the script's own completion value -- a bare expression in
+/// JS, an explicit top-level `return` in Lua -- is the shaped
+/// document. This is deliberately *not* the `modify_json(data, ctx)`
+/// named-function convention `sbproxy-modules::transform`'s
+/// `JsJsonTransform`/`LuaJsonTransform` use: those exist to mutate an
+/// existing document in place, and a response-shaping script has no
+/// existing document to mutate, only a context to read and a document
+/// to produce -- exactly `decision_script`'s shape, not `transform`'s
+/// (WOR-2489 Task 5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalResponseConfig {
+    /// A JSON document (as literal text) interpolated against `{args,
+    /// steps}` with the same `${...}` engine a `body:` field uses:
+    /// parsed as JSON first, then every string leaf run through
+    /// `mcp_interpolate::interpolate_json_tree` (WOR-2489 Task 5).
+    #[serde(default)]
+    pub template: Option<String>,
+    /// A JavaScript expression (QuickJS) producing the response. See
+    /// this struct's doc comment for the `ctx` binding.
+    #[serde(default)]
+    pub js: Option<String>,
+    /// A Lua expression (Luau) producing the response. See this
+    /// struct's doc comment for the `ctx` binding.
+    #[serde(default)]
+    pub lua: Option<String>,
 }
 
 /// Wire form of `federated_servers[].downgrade` (WOR-2384). See
@@ -1660,6 +1853,17 @@ pub struct McpAction {
     /// under `gen_ai.tool.call.arguments`. Off by default. See
     /// [`McpAuditConfig::capture_arguments`].
     pub mcp_audit_capture_arguments: bool,
+    /// Compiled `type: local` federated servers' tool catalogs
+    /// (WOR-2489), one entry per local server, empty when none are
+    /// configured. Validated and compiled at config-compile time by
+    /// [`compile_local_server`]. Each server's tools are also
+    /// published into `federation`'s shared catalog as ordinary
+    /// [`sbproxy_extension::mcp::FederatedTool`] entries (via
+    /// `McpServerConfig::local`), so every existing governance gate
+    /// (RBAC, draft/deprecated approval, the tool-versioning gate,
+    /// `tools/list` filtering) applies unchanged; nothing dispatches a
+    /// call against a resolved local tool yet, which is Task 3's job.
+    pub(crate) local_servers: Vec<CompiledLocalMcpServer>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -2389,6 +2593,1676 @@ fn compile_mcp_result_policy(
     })
 }
 
+// --- `type: local` compiled tools (WOR-2489) ---
+
+/// Compiled `tools[]` catalog for one `type: local` federated server.
+/// Built once at config-compile time by [`compile_local_server`] and
+/// stored on `McpAction::local_servers`. `from_parsed` also derives a
+/// JSON tool-document list from this (name/description/inputSchema)
+/// and hands it to `federation` as a `LocalBacking`, which is what
+/// actually publishes these tools into the shared catalog (WOR-2489).
+/// Nothing dispatches a call against a resolved local tool yet, which
+/// is Task 3's job.
+///
+/// `Debug` is hand-written, not derived, on every `CompiledLocal*` type
+/// in this section: rustc's dead-code pass explicitly and deliberately
+/// ignores a *derived* `Debug` impl's field reads (confirmed against a
+/// standalone rustc build; the note reads "has a derived impl for the
+/// trait `Debug`, but this is intentionally ignored during dead code
+/// analysis"), so `#[derive(Debug)]` alone does not keep these fields
+/// off the "never read" list. A hand-written impl's field reads do
+/// count. This mirrors why `McpAction` and `CompiledCel` elsewhere in
+/// this file already hand-write `Debug` rather than derive it.
+pub(crate) struct CompiledLocalMcpServer {
+    /// Server name, matching the `name` key used elsewhere for this
+    /// upstream (`McpServerPrefix::name`).
+    pub(crate) name: String,
+    /// Compiled tools, in declaration order.
+    pub(crate) tools: Vec<CompiledLocalMcpTool>,
+    /// Egress policy gating every HTTP call this server's tools make.
+    /// `None` only when every tool is `static` (no call is ever made,
+    /// so there is nothing to gate); see [`compile_local_server`].
+    pub(crate) egress: Option<EgressPolicy>,
+    /// Cap on any upstream response body a tool's dial buffers, from
+    /// the action-level `max_upstream_response_bytes` knob (default
+    /// [`DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES`]); a body over it
+    /// fails the call closed (WOR-2489 review).
+    pub(crate) max_response_bytes: usize,
+}
+
+impl std::fmt::Debug for CompiledLocalMcpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalMcpServer")
+            .field("name", &self.name)
+            .field("tools", &self.tools)
+            .field("egress", &self.egress)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
+}
+
+/// One compiled local tool.
+pub(crate) struct CompiledLocalMcpTool {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: serde_json::Value,
+    pub(crate) handler: CompiledLocalToolHandler,
+}
+
+impl std::fmt::Debug for CompiledLocalMcpTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalMcpTool")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("input_schema", &self.input_schema)
+            .field("handler", &self.handler)
+            .finish()
+    }
+}
+
+/// A compiled tool's exactly-one handler. See [`McpLocalToolConfig`]'s
+/// `static`/`http`/`steps` field docs for the wire shape.
+pub(crate) enum CompiledLocalToolHandler {
+    /// Always returns this value.
+    Static(serde_json::Value),
+    /// Makes one HTTP call, optionally shaping the response (WOR-2489
+    /// Task 5, [`McpLocalToolConfig::response`]).
+    Http {
+        call: CompiledLocalHttpCall,
+        response: Option<CompiledLocalResponseShaping>,
+    },
+    /// Runs a step DAG.
+    Steps(CompiledLocalSteps),
+}
+
+impl std::fmt::Debug for CompiledLocalToolHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(value) => f.debug_tuple("Static").field(value).finish(),
+            Self::Http { call, response } => f
+                .debug_struct("Http")
+                .field("call", call)
+                .field("response", response)
+                .finish(),
+            Self::Steps(steps) => f.debug_tuple("Steps").field(steps).finish(),
+        }
+    }
+}
+
+/// One compiled HTTP call (a tool's `http` handler, or a step's
+/// `http`).
+pub(crate) struct CompiledLocalHttpCall {
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body: Option<serde_json::Value>,
+    pub(crate) retry: Option<super::RetryConfig>,
+    pub(crate) timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for CompiledLocalHttpCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalHttpCall")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("retry", &self.retry)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// A compiled step DAG plus its response shaping.
+pub(crate) struct CompiledLocalSteps {
+    /// Steps in declaration order (not execution order; the WOR-2489
+    /// Task 4 executor derives that from `depends_on` -- see
+    /// `local_steps_topological_order`).
+    pub(crate) steps: Vec<CompiledLocalStep>,
+    pub(crate) response: Option<CompiledLocalResponseShaping>,
+    /// Whole-call budget. `None` means the executor's own default
+    /// applies (see `DEFAULT_LOCAL_STEPS_BUDGET`); always `Some` and
+    /// `<= MAX_LOCAL_STEPS_BUDGET` when present, enforced by
+    /// [`compile_local_steps`].
+    pub(crate) timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for CompiledLocalSteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalSteps")
+            .field("steps", &self.steps)
+            .field("response", &self.response)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// One compiled DAG step.
+pub(crate) struct CompiledLocalStep {
+    pub(crate) name: String,
+    pub(crate) http: CompiledLocalHttpCall,
+    pub(crate) depends_on: Vec<String>,
+    /// Compiled once here so a malformed step condition is a
+    /// config-load error, exactly like every other CEL surface in
+    /// this codebase.
+    pub(crate) condition: Option<CompiledCel>,
+    pub(crate) continue_on_error: bool,
+    pub(crate) retry: Option<super::RetryConfig>,
+}
+
+impl std::fmt::Debug for CompiledLocalStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalStep")
+            .field("name", &self.name)
+            .field("http", &self.http)
+            .field("depends_on", &self.depends_on)
+            .field("condition", &self.condition)
+            .field("continue_on_error", &self.continue_on_error)
+            .field("retry", &self.retry)
+            .finish()
+    }
+}
+
+/// A compiled `steps` handler's response shaping. See
+/// [`McpLocalResponseConfig`].
+pub(crate) enum CompiledLocalResponseShaping {
+    Template(String),
+    Js(String),
+    Lua(String),
+}
+
+impl std::fmt::Debug for CompiledLocalResponseShaping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Template(value) => f.debug_tuple("Template").field(value).finish(),
+            Self::Js(value) => f.debug_tuple("Js").field(value).finish(),
+            Self::Lua(value) => f.debug_tuple("Lua").field(value).finish(),
+        }
+    }
+}
+
+/// Compile one `type: local` federated server's `tools[]` (WOR-2489).
+/// `name` is the server's already-resolved name (prefix or derived
+/// from `origin`), matching what the caller uses for `McpServerPrefix`
+/// on every other server kind.
+fn compile_local_server(
+    name: &str,
+    upstream: &McpFederatedServerConfig,
+    max_response_bytes: usize,
+) -> anyhow::Result<CompiledLocalMcpServer> {
+    if upstream.tools.is_empty() {
+        anyhow::bail!("mcp action: local server '{name}' (type: local) declares no tools");
+    }
+
+    // WOR-2489 review: duplicate tool names are refused up front,
+    // naming both positions. `refresh_tools` would otherwise advertise
+    // the second under a namespaced alias whose schema and description
+    // it carried, while `execute_local_tool` resolves by upstream name
+    // and always runs the first -- a catalog contract validated against
+    // one tool and dispatched to another.
+    let mut seen_tools: HashMap<&str, usize> = HashMap::with_capacity(upstream.tools.len());
+    for (index, tool) in upstream.tools.iter().enumerate() {
+        if let Some(&first) = seen_tools.get(tool.name.as_str()) {
+            anyhow::bail!(
+                "mcp action: local server '{name}' declares duplicate tool name '{}' \
+                 (tools[{first}] and tools[{index}]); the catalog would advertise one tool's \
+                 schema while the executor ran the other's handler -- rename one",
+                tool.name
+            );
+        }
+        seen_tools.insert(tool.name.as_str(), index);
+    }
+
+    // Per-server egress is required the moment any tool can make an
+    // HTTP call -- a `steps` handler's steps always carry `http`, so a
+    // `steps` tool counts exactly like an `http` tool does. Only a
+    // server whose every tool is `static` needs none. This mirrors the
+    // `openapi` backing's posture (egress gates every REST call an
+    // `openapi` server's tools make) without inheriting its
+    // allow-all-by-default fallback: a local server has no legacy
+    // config to stay compatible with, so the safer default is to ask
+    // for the policy explicitly rather than fall back to the
+    // action-level default silently.
+    let needs_egress = upstream
+        .tools
+        .iter()
+        .any(|t| t.http.is_some() || t.steps.is_some());
+    if needs_egress && upstream.egress.is_none() {
+        anyhow::bail!(
+            "mcp action: local server '{name}' declares tools that make HTTP calls but sets no egress policy; add `egress:` (mode: deny_by_default plus hosts/suffixes) -- a server whose tools are all `static` needs none"
+        );
+    }
+
+    let tools = upstream
+        .tools
+        .iter()
+        .map(|tool| compile_local_tool(name, tool))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(CompiledLocalMcpServer {
+        name: name.to_string(),
+        tools,
+        egress: upstream.egress.clone(),
+        max_response_bytes,
+    })
+}
+
+/// Compile one `tools[]` entry.
+fn compile_local_tool(
+    server_name: &str,
+    tool: &McpLocalToolConfig,
+) -> anyhow::Result<CompiledLocalMcpTool> {
+    anyhow::ensure!(
+        !tool.name.trim().is_empty(),
+        "mcp action: local server '{server_name}' has a tool with an empty name"
+    );
+    let site = format!(
+        "mcp action: local server '{server_name}' tool '{}'",
+        tool.name
+    );
+    if !tool.input_schema.is_object() {
+        anyhow::bail!("{site}: input_schema must be a JSON object");
+    }
+
+    let handler = match (&tool.r#static, &tool.http, &tool.steps) {
+        (Some(value), None, None) => {
+            anyhow::ensure!(
+                tool.response.is_none(),
+                "{site}: response: is only valid alongside http (a static value never calls out, \
+                 so there is nothing to shape)"
+            );
+            CompiledLocalToolHandler::Static(value.clone())
+        }
+        (None, Some(http), None) => {
+            let response = tool
+                .response
+                .as_ref()
+                .map(|r| compile_local_response(&site, r))
+                .transpose()?;
+            CompiledLocalToolHandler::Http {
+                call: compile_local_http_call(&site, http)?,
+                response,
+            }
+        }
+        (None, None, Some(steps)) => {
+            anyhow::ensure!(
+                tool.response.is_none(),
+                "{site}: response: at the tool level is only valid alongside http; a steps \
+                 handler configures its own response shaping under `steps.response` instead"
+            );
+            CompiledLocalToolHandler::Steps(compile_local_steps(&site, steps)?)
+        }
+        (None, None, None) => {
+            anyhow::bail!("{site}: needs exactly one of static, http, or steps")
+        }
+        _ => anyhow::bail!("{site}: sets more than one of static, http, steps; pick exactly one"),
+    };
+
+    Ok(CompiledLocalMcpTool {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+        handler,
+    })
+}
+
+/// Compile one HTTP call (a tool's `http` handler or a step's `http`).
+fn compile_local_http_call(
+    site: &str,
+    cfg: &McpLocalHttpCallConfig,
+) -> anyhow::Result<CompiledLocalHttpCall> {
+    anyhow::ensure!(
+        !cfg.method.trim().is_empty(),
+        "{site}: http.method must not be empty"
+    );
+    anyhow::ensure!(
+        !cfg.url.trim().is_empty(),
+        "{site}: http.url must not be empty"
+    );
+    // WOR-2489 review: the per-attempt timeout can never exceed the
+    // maximum whole-call budget, mirroring the `steps.timeout` ceiling
+    // -- an attempt longer than the widest possible budget could never
+    // complete, so accepting it would be a dead knob.
+    if let Some(timeout) = cfg.timeout {
+        anyhow::ensure!(
+            timeout <= MAX_LOCAL_STEPS_BUDGET,
+            "{site}: http.timeout ({timeout:?}) exceeds the maximum whole-call budget of {MAX_LOCAL_STEPS_BUDGET:?}"
+        );
+    }
+    Ok(CompiledLocalHttpCall {
+        method: cfg.method.clone(),
+        url: cfg.url.clone(),
+        headers: cfg.headers.clone(),
+        body: cfg.body.clone(),
+        retry: cfg.retry.clone(),
+        timeout: cfg.timeout,
+    })
+}
+
+/// Compile a `steps` handler: structural checks (the named `parallel`
+/// refusal, duplicate step names, dangling `depends_on`, dependency
+/// cycles), then each step's HTTP call and CEL `condition`, then the
+/// response shaping.
+fn compile_local_steps(
+    site: &str,
+    cfg: &McpLocalStepsConfig,
+) -> anyhow::Result<CompiledLocalSteps> {
+    if cfg.parallel.is_some() {
+        anyhow::bail!(
+            "{site}: steps.parallel is not supported yet; steps always run in dependency order today (a parallel scheduler is a tracked follow-up) -- remove `parallel:`"
+        );
+    }
+    if cfg.steps.is_empty() {
+        anyhow::bail!("{site}: steps.steps must not be empty");
+    }
+
+    let mut seen = HashSet::with_capacity(cfg.steps.len());
+    for step in &cfg.steps {
+        anyhow::ensure!(
+            !step.name.trim().is_empty(),
+            "{site}: steps[] has a step with an empty name"
+        );
+        if !seen.insert(step.name.as_str()) {
+            anyhow::bail!("{site}: steps[] has duplicate step name '{}'", step.name);
+        }
+    }
+    for step in &cfg.steps {
+        for dep in &step.depends_on {
+            if !seen.contains(dep.as_str()) {
+                anyhow::bail!(
+                    "{site}: step '{}' depends_on names undeclared step '{dep}'",
+                    step.name
+                );
+            }
+        }
+    }
+    if let Some(cycle) = detect_step_cycle(&cfg.steps) {
+        anyhow::bail!(
+            "{site}: steps[] has a dependency cycle: {}",
+            cycle.join(" -> ")
+        );
+    }
+    // WOR-2489 Task 4: the whole-call budget is capped at 5 minutes,
+    // the same ceiling the Go implementation used -- a `steps` DAG
+    // dials real upstreams on the gateway's own request path, and an
+    // unbounded (or unreasonably long) budget there is a resource leak
+    // waiting to happen, not a knob an operator needs. `None` (the
+    // field omitted) is unrestricted at this check; the executor's own
+    // default (30s) applies at that point instead.
+    if let Some(timeout) = cfg.timeout {
+        anyhow::ensure!(
+            timeout <= MAX_LOCAL_STEPS_BUDGET,
+            "{site}: steps.timeout ({timeout:?}) exceeds the maximum whole-call budget of {MAX_LOCAL_STEPS_BUDGET:?}"
+        );
+    }
+
+    let steps = cfg
+        .steps
+        .iter()
+        .map(|step| {
+            let step_site = format!("{site} step '{}'", step.name);
+            let http = compile_local_http_call(&step_site, &step.http)?;
+            let condition = step
+                .condition
+                .as_ref()
+                .map(|source| {
+                    CompiledCel::compile(
+                        CelSurface::McpArgumentPolicy,
+                        format!("{step_site} condition"),
+                        source,
+                    )
+                })
+                .transpose()?;
+            Ok(CompiledLocalStep {
+                name: step.name.clone(),
+                http,
+                depends_on: step.depends_on.clone(),
+                condition,
+                continue_on_error: step.continue_on_error,
+                retry: step.retry.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let response = cfg
+        .response
+        .as_ref()
+        .map(|r| compile_local_response(site, r))
+        .transpose()?;
+
+    Ok(CompiledLocalSteps {
+        steps,
+        response,
+        timeout: cfg.timeout,
+    })
+}
+
+/// Find a dependency cycle among `steps[].depends_on`, if one exists.
+/// Every `depends_on` entry is assumed already validated to name a
+/// real step (see the caller in [`compile_local_steps`]). Returns the
+/// cycle's members in traversal order, closing on the repeated name,
+/// so the error can print `a -> b -> a`.
+fn detect_step_cycle(steps: &[McpLocalStepConfig]) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        Unvisited,
+        InProgress,
+        Done,
+    }
+
+    let by_name: HashMap<&str, &McpLocalStepConfig> =
+        steps.iter().map(|s| (s.name.as_str(), s)).collect();
+    let mut marks: HashMap<&str, Mark> = steps
+        .iter()
+        .map(|s| (s.name.as_str(), Mark::Unvisited))
+        .collect();
+
+    fn visit<'a>(
+        name: &'a str,
+        by_name: &HashMap<&'a str, &'a McpLocalStepConfig>,
+        marks: &mut HashMap<&'a str, Mark>,
+        stack: &mut Vec<&'a str>,
+    ) -> Option<Vec<String>> {
+        match marks.get(name) {
+            Some(Mark::Done) => return None,
+            Some(Mark::InProgress) => {
+                let start = stack.iter().position(|s| *s == name).unwrap_or(0);
+                let mut cycle: Vec<String> =
+                    stack[start..].iter().map(|s| (*s).to_string()).collect();
+                cycle.push(name.to_string());
+                return Some(cycle);
+            }
+            _ => {}
+        }
+        marks.insert(name, Mark::InProgress);
+        stack.push(name);
+        if let Some(step) = by_name.get(name) {
+            for dep in &step.depends_on {
+                if let Some(cycle) = visit(dep.as_str(), by_name, marks, stack) {
+                    return Some(cycle);
+                }
+            }
+        }
+        stack.pop();
+        marks.insert(name, Mark::Done);
+        None
+    }
+
+    for step in steps {
+        if matches!(marks.get(step.name.as_str()), Some(Mark::Unvisited)) {
+            let mut stack = Vec::new();
+            if let Some(cycle) = visit(step.name.as_str(), &by_name, &mut marks, &mut stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
+/// Compile a `steps` handler's response shaping.
+fn compile_local_response(
+    site: &str,
+    cfg: &McpLocalResponseConfig,
+) -> anyhow::Result<CompiledLocalResponseShaping> {
+    match (&cfg.template, &cfg.js, &cfg.lua) {
+        (Some(t), None, None) => Ok(CompiledLocalResponseShaping::Template(t.clone())),
+        (None, Some(js), None) => Ok(CompiledLocalResponseShaping::Js(js.clone())),
+        (None, None, Some(lua)) => Ok(CompiledLocalResponseShaping::Lua(lua.clone())),
+        (None, None, None) => {
+            anyhow::bail!("{site}: response needs exactly one of template, js, or lua")
+        }
+        _ => {
+            anyhow::bail!(
+                "{site}: response sets more than one of template, js, lua; pick exactly one"
+            )
+        }
+    }
+}
+
+// --- `type: local` tool dispatch (WOR-2489 Task 3) ---
+//
+// The seam this section implements: `sbproxy-extension::mcp::LocalBacking`
+// (what `McpFederation` holds for a `local` server) cannot carry the
+// `CompiledLocal*` types just above -- the dependency runs the other
+// way, `sbproxy-modules` depends on `sbproxy-extension`, not back --
+// so a resolved local tool cannot be dispatched from inside
+// `McpFederation` the way an `openapi`-backed one is. Instead,
+// `sbproxy-core::action_dispatch` (which already depends on
+// `sbproxy-modules`) checks `McpAction::is_local_server` at the exact
+// point in its gate chain where it would otherwise call
+// `federation.call_tool_with_upstream_headers_from_snapshot`, i.e.
+// after every governance gate (RBAC, argument policies, quota, the
+// versioning gate, content filters) has already run, and calls
+// `McpAction::execute_local_tool` instead. `McpFederation`'s own
+// `local`-backing branch (federation.rs) is unreachable through that
+// path and stays only as a defensive fallback; see its doc comment.
+
+/// Default connect timeout for a local `http` tool's dial, mirroring
+/// `McpFederation`'s own default (`FederationIoSettings`). A local
+/// tool has no per-action IO settings to inherit -- each tool call
+/// builds its own one-shot client -- so this is a fixed constant
+/// rather than a configurable field; `timeout:` on the `http` config
+/// governs the overall request instead (see
+/// [`DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT`]).
+const DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default overall request timeout for a local `http` tool call when
+/// its compiled `timeout:` is unset.
+const DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default cap on a local tool's upstream response body, mirroring
+/// `FederationIoSettings::max_response_bytes`' own 8 MiB default
+/// (`sbproxy-extension::mcp::federation`). The operator knob is the
+/// same one, `max_upstream_response_bytes`: `from_parsed` threads it
+/// onto every [`CompiledLocalMcpServer`] so a local `http` or `steps`
+/// dial honors exactly the ceiling every other MCP upstream exchange
+/// already does, instead of buffering an unbounded body (WOR-2489
+/// review).
+const DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A local `http` call's send-and-wait outcome that is not a plain
+/// upstream response: either the send itself failed (connection
+/// refused, DNS failure, reset, ...) or the per-attempt timeout
+/// elapsed first. Kept distinct from `reqwest::Error` so a timeout
+/// (which never produces one) still has a `retry_condition` and a
+/// safe display message.
+enum LocalHttpFailure {
+    Transport(reqwest::Error),
+    Timeout,
+}
+
+impl LocalHttpFailure {
+    /// The `retry.retry_on` condition string this failure matches, if
+    /// any (`RetryConfig::allows` compares case-insensitively against
+    /// exactly these two strings plus numeric status codes, which
+    /// only a real response -- not a failure -- can match).
+    fn retry_condition(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport(e) if e.is_timeout() => "timeout",
+            Self::Transport(e) if e.is_connect() => "connect_error",
+            Self::Transport(_) => "",
+        }
+    }
+
+    /// A short, closed-set label for this failure, safe for any log
+    /// line or client-facing message.
+    fn class_label(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timed out",
+            Self::Transport(e) if e.is_timeout() => "timed out",
+            Self::Transport(e) if e.is_connect() => "connection failed",
+            Self::Transport(_) => "transport error",
+        }
+    }
+
+    /// The client-facing error. Deliberately names no URL and no host,
+    /// and never renders the `reqwest::Error` `Display` (which embeds
+    /// the full request URL): the interpolated URL can carry a resolved
+    /// `${VAR}` config secret or caller-supplied arguments, and on the
+    /// legacy MCP era the whole anyhow chain is reflected to the caller
+    /// verbatim (WOR-2489 review; repo rule: log the failure, never the
+    /// credential). The server-side warn at the call site carries the
+    /// egress-authorized scheme://host:port for diagnosis.
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Timeout => anyhow::anyhow!("mcp: local http tool call timed out"),
+            failure => {
+                anyhow::anyhow!(
+                    "mcp: local http tool call failed: {}",
+                    failure.class_label()
+                )
+            }
+        }
+    }
+}
+
+/// Build the tool-result document for a `static` handler: always
+/// `isError: false`, since a `static` value never fails. A string
+/// value is used as the content text verbatim; any other JSON type is
+/// rendered as its compact JSON text, matching how an `http` handler's
+/// JSON body renders below.
+fn local_static_tool_result(value: &serde_json::Value) -> serde_json::Value {
+    let text = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": false,
+    })
+}
+
+/// Build the client for one dial of a local `http` tool call
+/// (WOR-2080). A pinned destination (an enforced `egress:` policy
+/// recorded pins) gets a per-dial client whose resolver override
+/// carries exactly the verified pin set, so a DNS answer that changed
+/// since authorization is refused before this connect rather than
+/// silently re-resolved; an unpinned destination (legacy
+/// allow-by-default egress records no pins) gets a plain client.
+/// Mirrors `McpFederation::openapi_dial_client` (`sbproxy-extension`)
+/// exactly, since local tools reuse the same `EgressPurpose::OpenApiTool`
+/// (see the WOR-2489 Task 3 report for why).
+fn local_http_dial_client(
+    egress: &EgressPolicy,
+    dest: &sbproxy_security::egress::AuthorizedDestination,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<reqwest::Client> {
+    let Some(addrs) = egress
+        .verified_dial_addrs(dest, resolver)
+        .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?
+    else {
+        return reqwest::Client::builder()
+            .connect_timeout(DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| anyhow::anyhow!("mcp: local http tool client construction failed: {e}"));
+    };
+    let host = dest
+        .url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("mcp: local http tool: authorized URL lost its host"))?;
+    reqwest::Client::builder()
+        .connect_timeout(DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .map_err(|e| anyhow::anyhow!("mcp: pinned local http tool client construction failed: {e}"))
+}
+
+/// Execute one `http` handler: interpolate `url`/`headers`/`body`
+/// against the call's arguments, authorize and DNS-pin the dial
+/// (WOR-2080), send with `retry`/`timeout` honored, and shape the
+/// response into an MCP tool-result document -- either the plain
+/// `{status, headers, body}` document (no `response:` configured) or,
+/// when one is, [`shape_local_response`] (WOR-2489 Task 5).
+async fn execute_local_http_call(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    call: &CompiledLocalHttpCall,
+    response: Option<&CompiledLocalResponseShaping>,
+    arguments: &serde_json::Value,
+    tenant: &str,
+) -> anyhow::Result<serde_json::Value> {
+    execute_local_http_call_with_resolver(
+        server,
+        tool_name,
+        call,
+        response,
+        arguments,
+        tenant,
+        &sbproxy_security::egress::SystemHostResolver,
+    )
+    .await
+}
+
+/// [`execute_local_http_call`] with an injectable resolver, so tests
+/// can simulate a DNS answer that changes between authorize and dial
+/// (WOR-2080) without live DNS. Production always calls
+/// [`execute_local_http_call`], which passes
+/// [`sbproxy_security::egress::SystemHostResolver`].
+async fn execute_local_http_call_with_resolver(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    call: &CompiledLocalHttpCall,
+    response: Option<&CompiledLocalResponseShaping>,
+    arguments: &serde_json::Value,
+    tenant: &str,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let context = mcp_interpolate::args_context(arguments);
+    // WOR-2489 review: the same whole-call budget a `steps` DAG gets.
+    // The per-attempt timeout inside the retry loop bounds one attempt;
+    // nothing bounded the loop, so `max_attempts: 16` against a black
+    // hole could hold a dispatch slot for minutes. The budget is the
+    // steps default, widened to the configured per-attempt timeout when
+    // that is longer (so an explicit `timeout: 2m` still gets its one
+    // full attempt); compile time caps the per-attempt timeout at
+    // [`MAX_LOCAL_STEPS_BUDGET`], so the budget never exceeds it.
+    let budget = call
+        .timeout
+        .unwrap_or(DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT)
+        .max(DEFAULT_LOCAL_STEPS_BUDGET);
+    let (status, document) = match tokio::time::timeout(
+        budget,
+        run_local_http_call_with_resolver(server, call, &context, tenant, resolver),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' on server '{}' exceeded its whole-call budget of \
+                 {}ms (retry attempts do not extend it)",
+                server.name,
+                budget.as_millis()
+            ));
+        }
+    };
+    let Some(response_cfg) = response else {
+        return Ok(serde_json::json!({
+            "content": [{"type": "text", "text": document.to_string()}],
+            "isError": !status.is_success(),
+        }));
+    };
+    // Response shaping only ever runs over a completed call: a
+    // non-2xx status fails the whole tool call closed here, the same
+    // rule a `steps` DAG step with no `continue_on_error` already
+    // applies (WOR-2489 Task 4's `run_local_step_with_resolver`) --
+    // applied at the single-call layer too, so "shape a result" means
+    // the same thing everywhere `response:` is offered. Without
+    // `response:` configured (the branch above), a non-2xx status is
+    // never a failure here, unchanged from Task 3.
+    anyhow::ensure!(
+        status.is_success(),
+        "mcp: local tool '{tool_name}' on server '{}' returned non-success status {}; response \
+         shaping did not run",
+        server.name,
+        status.as_u16()
+    );
+    let mut steps_context = serde_json::Map::with_capacity(1);
+    steps_context.insert(tool_name.to_string(), document);
+    shape_local_response(
+        &server.name,
+        tool_name,
+        response_cfg,
+        arguments,
+        steps_context,
+    )
+}
+
+/// The shared half of [`execute_local_http_call_with_resolver`]:
+/// interpolate, authorize/dial, retry, and build the
+/// `{"status", "headers", "body"}` document, but stop short of
+/// wrapping it as a tool-result envelope. A standalone `http` handler
+/// wraps this once (see [`execute_local_http_call_with_resolver`]); a
+/// `steps` handler's DAG (WOR-2489 Task 4) calls this once per step,
+/// reusing the exact same interpolation, egress, retry, and timeout
+/// machinery a standalone `http` tool gets, over a wider `context`
+/// that also carries `steps.*` (see [`run_local_steps_dag`]).
+///
+/// Returns `Ok((status, document))` for *any* completed HTTP response,
+/// success or not -- matching a standalone `http` tool's own
+/// not-an-error treatment of a non-2xx response (it renders as
+/// `isError: true` in the tool-result envelope, not an `Err`). A
+/// `steps` handler decides for itself whether a non-2xx response
+/// counts as a step failure (see [`run_local_step_with_resolver`]);
+/// this function does not bake that policy in, since it differs
+/// between callers. `Err` here is always a genuine failure to
+/// complete: interpolation, egress, or transport/timeout after
+/// `retry` is exhausted.
+async fn run_local_http_call_with_resolver(
+    server: &CompiledLocalMcpServer,
+    call: &CompiledLocalHttpCall,
+    context: &serde_json::Value,
+    tenant: &str,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+    use sbproxy_security::egress::{
+        record_egress_refused, record_egress_seen, EgressPurpose, EgressSightingStatus,
+    };
+
+    // WOR-2489 review: `interpolate_url`, not `interpolate_string` --
+    // an embedded placeholder's resolved value is percent-encoded as
+    // data, so a caller-controlled argument cannot rewrite the path or
+    // inject query parameters on the egress-allowed host.
+    let url = mcp_interpolate::interpolate_url(&call.url, context)
+        .map_err(|e| anyhow::anyhow!("mcp: local http tool: url interpolation failed: {e}"))?;
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(call.headers.len());
+    for (name, value) in &call.headers {
+        let rendered = mcp_interpolate::interpolate_string(value, context).map_err(|e| {
+            anyhow::anyhow!("mcp: local http tool: header '{name}' interpolation failed: {e}")
+        })?;
+        headers.push((name.clone(), rendered));
+    }
+    let body = call
+        .body
+        .as_ref()
+        .map(|b| mcp_interpolate::interpolate_json_tree(b, context))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("mcp: local http tool: body interpolation failed: {e}"))?;
+    let method = reqwest::Method::from_bytes(call.method.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "mcp: local http tool: invalid HTTP method {}: {e}",
+            call.method
+        )
+    })?;
+
+    // WOR-2489: local `http` tools reuse `EgressPurpose::OpenApiTool`
+    // rather than minting `EgressPurpose::LocalTool`. Both are the
+    // identical shape (an MCP action dispatching one HTTP call on the
+    // gateway's own behalf, gated by a per-server `EgressPolicy`), and
+    // a distinct purpose would need its own admin-inventory doc
+    // language and the purpose-count prose in
+    // `docs/admin-api-reference.md` updated in the same commit. See
+    // the WOR-2489 Task 3 report for the full decision.
+    let egress = server.egress.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "mcp: local server '{}' has an http tool but no compiled egress policy \
+             (this should already be refused at config compile time)",
+            server.name
+        )
+    })?;
+    let is_gated = egress.mode.is_enforce();
+    let dest = match egress.authorize(EgressPurpose::OpenApiTool, &url, resolver) {
+        Ok(dest) => {
+            record_egress_seen(
+                EgressPurpose::OpenApiTool,
+                &url,
+                &server.name,
+                if is_gated {
+                    EgressSightingStatus::Allowed
+                } else {
+                    EgressSightingStatus::Ungated
+                },
+                None,
+            );
+            dest
+        }
+        Err(e) => {
+            record_egress_seen(
+                EgressPurpose::OpenApiTool,
+                &url,
+                &server.name,
+                EgressSightingStatus::Denied,
+                Some(e),
+            );
+            record_egress_refused(EgressPurpose::OpenApiTool, e, tenant, &server.name);
+            anyhow::bail!("egress denied: {e:?}");
+        }
+    };
+    // The only shape of this destination that may appear in any error
+    // or log line: the rendered URL's path and query can carry a
+    // resolved `${VAR}` config secret or caller arguments, while the
+    // scheme/host/port is exactly what the egress inventory already
+    // records for this dial (WOR-2489 review).
+    let dest_label = dest.url.origin().ascii_serialization();
+
+    let retry = call.retry.clone().unwrap_or_default();
+    let request_timeout = call.timeout.unwrap_or(DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT);
+    let mut retries_used: u32 = 0;
+    let response = loop {
+        // WOR-2080: re-verify this attempt's dial addresses against
+        // the pins recorded at authorize time immediately before
+        // connect, on every attempt including retries.
+        let client = local_http_dial_client(egress, &dest, resolver)?;
+        let mut builder = client.request(method.clone(), dest.url.clone());
+        for (name, value) in &headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = &body {
+            builder = builder.json(body);
+        }
+        let outcome = match tokio::time::timeout(request_timeout, builder.send()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(LocalHttpFailure::Transport(e)),
+            Err(_elapsed) => Err(LocalHttpFailure::Timeout),
+        };
+
+        match outcome {
+            Ok(resp)
+                if retry.enabled()
+                    && retry.allows_status(resp.status().as_u16())
+                    && retry.attempts_remaining(retries_used) =>
+            {
+                tokio::time::sleep(Duration::from_millis(
+                    retry.backoff_for_attempt(retries_used),
+                ))
+                .await;
+                retries_used += 1;
+            }
+            Ok(resp) => break resp,
+            Err(failure) => {
+                let retryable = retry.enabled()
+                    && retry.allows(failure.retry_condition())
+                    && retry.attempts_remaining(retries_used);
+                if !retryable {
+                    // Server-side diagnosis line: scheme://host:port
+                    // only, never the rendered URL (see `dest_label`).
+                    tracing::warn!(
+                        target: "sbproxy::mcp",
+                        server = %server.name,
+                        upstream = %dest_label,
+                        failure = failure.class_label(),
+                        "mcp: local http tool call failed",
+                    );
+                    return Err(failure.into_anyhow());
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    retry.backoff_for_attempt(retries_used),
+                ))
+                .await;
+                retries_used += 1;
+            }
+        }
+    };
+
+    let status = response.status();
+    let mut response_headers = serde_json::Map::new();
+    if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+        if let Ok(v) = content_type.to_str() {
+            response_headers.insert(
+                "content-type".to_string(),
+                serde_json::Value::String(v.to_string()),
+            );
+        }
+    }
+    // WOR-2489 review: read incrementally and bail at the operator's
+    // `max_upstream_response_bytes` cap, the same
+    // accumulate-and-bail idiom `McpFederation`'s own exchanges use
+    // (`streamable::read_body_capped`), instead of buffering an
+    // unbounded body. `without_url()` strips the request URL from the
+    // reqwest display for the same reason `into_anyhow` never renders
+    // it: the URL can carry a resolved secret.
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        anyhow::anyhow!(
+            "mcp: local http tool: failed reading response body: {}",
+            e.without_url()
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > server.max_response_bytes {
+            anyhow::bail!(
+                "mcp: local http tool response from {dest_label} exceeded \
+                 max_upstream_response_bytes ({} bytes); refusing to buffer more",
+                server.max_response_bytes
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body_value = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string()));
+
+    let document = serde_json::json!({
+        "status": status.as_u16(),
+        "headers": serde_json::Value::Object(response_headers),
+        "body": body_value,
+    });
+    Ok((status, document))
+}
+
+// --- `type: local` step DAG executor (WOR-2489 Task 4) ---
+//
+// A `steps` handler runs its DAG to completion (or a fail-closed
+// error) and shapes exactly one tool result from it. The dependency
+// rule below is the one subtlety in this section; everything else
+// (interpolation, egress, retry, per-call timeout) is
+// `run_local_http_call_with_resolver`, reused verbatim per step.
+//
+// ## Step DAG dependency rule
+//
+// A step's `condition` (compiled CEL, evaluated once per call against
+// the *same* context every step in this DAG shares -- see
+// [`McpAction::local_step_condition_context`]) is checked first,
+// independent of whether its `depends_on` steps completed:
+//
+// - `condition` evaluates `false` (or is a CEL `Violation`, in the
+//   [`McpArgumentPolicyEngineOutcome`] sense): the step is skipped.
+//   Always -- this is true whether or not its dependencies completed.
+//   Skipping is not itself an error.
+// - `condition` fails to evaluate (a CEL runtime error or panic): the
+//   whole tool call fails closed, exactly like an `argument_policies[]`
+//   rule that cannot prove itself.
+// - `condition` is absent, or evaluates `true`: the step *would* run,
+//   so its `depends_on` are now consulted. If every dependency
+//   completed (`Success`), it runs. If any dependency did **not**
+//   complete (`Skipped`, or `Failed` -- including a `Failed` step
+//   whose `continue_on_error` let the DAG continue past it), this step
+//   has nothing to run against: the whole tool call fails closed,
+//   naming the incomplete dependency.
+//
+// This is the plan's ruled ordering, restated precisely: "depends_on
+// on a step that did not complete = tool-call error, unless the
+// dependent step's own condition evaluates false (natural skip)."
+// `continue_on_error` does not soften this -- it only governs what
+// happens when *this* step's own call fails, not what happens when a
+// step it depends on already didn't run.
+//
+// ## `steps.<name>` context entries
+//
+// Only a `Success` step's entry carries `status`/`headers`/`body`; a
+// `Failed` step recorded via `continue_on_error` carries only `error`
+// (a string); a `Skipped` step gets no entry in the `steps` object at
+// all. `mcp_interpolate`'s existing fail-closed `MissingPath` handling
+// is what makes a later step's `${steps.<name>.body...}` read of an
+// incomplete step (skipped, or failed-but-continued) a clean error
+// with no code change needed in that module -- see its new tests for
+// the exact shape. This is also why the dependency rule above exists
+// at all: without it, a downstream step with no `depends_on` on the
+// incomplete step could still silently attempt to read
+// `${steps.<name>...}` and get a `MissingPath` failure with no
+// warning that its upstream never ran; declaring `depends_on` at least
+// lets the executor fail fast, before attempting any interpolation.
+
+/// Default whole-tool-call budget for a `steps` handler when its
+/// compiled `timeout:` is unset (WOR-2489 Task 4), mirroring the Go
+/// implementation's default.
+const DEFAULT_LOCAL_STEPS_BUDGET: Duration = Duration::from_secs(30);
+
+/// The step DAG whole-call budget's hard cap (WOR-2489 Task 4),
+/// mirroring the Go implementation's ceiling. Enforced at config
+/// compile time in [`compile_local_steps`], so a configured `timeout:`
+/// wider than this never reaches the executor.
+const MAX_LOCAL_STEPS_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// One DAG step's terminal outcome, tracked across a `steps` handler's
+/// whole run so later steps' `depends_on` checks (and the final
+/// default-response fallback) can consult what already happened
+/// without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalStepOutcome {
+    /// The step's own HTTP call completed with a success (2xx)
+    /// status. The only outcome that "completes" a dependency.
+    Success,
+    /// The step's `condition` evaluated `false`; it was never
+    /// attempted.
+    Skipped,
+    /// The step's own call failed (interpolation, egress, transport,
+    /// timeout, or a non-2xx response -- unlike a standalone `http`
+    /// tool, a `steps` DAG step treats a non-2xx response as a
+    /// failure, since a downstream step has no way to branch on
+    /// status via `condition`; see the module doc above) and
+    /// `continue_on_error: true` let the DAG continue past it. A
+    /// `Failed` step without `continue_on_error` is never recorded
+    /// here: the whole tool call already returned `Err` at that point.
+    Failed,
+}
+
+impl LocalStepOutcome {
+    /// The `mcp_audit` trace label for this outcome (WOR-2489 Task 4:
+    /// "step name, status, ms", never a body).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Emit one `mcp_audit` tracing event per DAG step outcome (WOR-2489
+/// Task 4): step name, its outcome label, and elapsed wall-clock
+/// milliseconds -- deliberately nothing else. No response body, no
+/// interpolated URL, no header value: a step's outcome is audit
+/// metadata, not a copy of what it carried. Reuses the `mcp_audit`
+/// tracing target `sbproxy-core::action_dispatch`'s own MCP dispatch
+/// audit trail already writes to, so an operator filtering on that
+/// target sees a tool call's step outcomes alongside its
+/// prompt/argument audit line.
+///
+/// `info!`, matching the prompt-linked audit line it sits beside
+/// (WOR-2489 review): release builds compile with
+/// `tracing/release_max_level_info`, so a `debug!` here would be
+/// compiled out of every shipped binary and the per-step record would
+/// exist only in dev builds.
+fn emit_local_step_audit(
+    server: &str,
+    tool: &str,
+    step: &str,
+    outcome: LocalStepOutcome,
+    elapsed: Duration,
+) {
+    tracing::info!(
+        target: "mcp_audit",
+        mcp_server = %server,
+        mcp_tool = %tool,
+        mcp_step = %step,
+        mcp_step_status = %outcome.label(),
+        mcp_step_ms = elapsed.as_millis() as u64,
+        "mcp local tool step completed",
+    );
+}
+
+/// Deterministic execution order for a `steps` DAG: a topological sort
+/// of `depends_on`, breaking ties by declaration order among steps
+/// that are all currently ready (WOR-2489 Task 4). Returns indices
+/// into `steps`. The DAG is already known cycle-free (enforced at
+/// compile time by `detect_step_cycle`), so this always accounts for
+/// every step; the trailing defensive branch only guards against that
+/// invariant somehow not holding rather than expressing a real
+/// runtime possibility.
+fn local_steps_topological_order(steps: &[CompiledLocalStep]) -> Vec<usize> {
+    let n = steps.len();
+    let name_to_index: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    let mut indegree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, step) in steps.iter().enumerate() {
+        for dep in &step.depends_on {
+            if let Some(&dep_idx) = name_to_index.get(dep.as_str()) {
+                indegree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+    let mut ready: std::collections::BTreeSet<usize> =
+        (0..n).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    while let Some(&next) = ready.iter().next() {
+        ready.remove(&next);
+        order.push(next);
+        for &dependent in &dependents[next] {
+            indegree[dependent] -= 1;
+            if indegree[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if order.len() != n {
+        // Defensive only -- see doc comment above.
+        let mut placed = vec![false; n];
+        for &i in &order {
+            placed[i] = true;
+        }
+        for (i, seen) in placed.iter().enumerate() {
+            if !seen {
+                order.push(i);
+            }
+        }
+    }
+    order
+}
+
+// --- Response shaping (WOR-2489 Task 5) ---
+//
+// One shared function, [`shape_local_response`], serves both callers:
+// a `steps` DAG's final response (over the full `steps_context` map
+// [`run_local_steps_dag`] built as it ran) and a standalone `http`
+// handler that opts into shaping (over a single-entry map keyed by its
+// own tool name, built by [`execute_local_http_call_with_resolver`]).
+// Both bind the identical `ctx = {"args": ..., "steps": ...}`
+// vocabulary, so an operator who has learned one has learned the
+// other.
+
+/// Shape a completed call's response from `template`/`js`/`lua`
+/// (WOR-2489 Task 5), returning the final MCP tool-result document
+/// (`{"content": [...], "isError": false}` -- shaping never produces
+/// `isError: true`; a script that wants the call to read as failed
+/// throws instead, which this function surfaces as `Err`, the same
+/// "tool-call error, never a partial result" outcome a syntax error or
+/// a watchdog-killed busy loop produces).
+///
+/// `js`/`lua` bind a single `ctx` global (matching
+/// `sbproxy-core::decision_script::evaluate`'s own `{"ctx": ...}` cache
+/// -decision-script convention, which
+/// [`McpLocalResponseConfig`]'s doc comment already points at) and run
+/// the script's completion value as the result: a bare expression in
+/// JS (`JsEngine::execute`), an explicit top-level `return` in Lua
+/// (`LuaEngine::execute`). Neither engine gets a wrapping timeout here
+/// -- each already enforces its own CPU-budget watchdog
+/// (`proxy.scripting.{javascript,lua}.sandbox`), and a script that
+/// exceeds it is killed and surfaces as `Err` through the same path a
+/// thrown exception does, exactly matching this task's "watchdogs and
+/// timeouts exactly as the existing engines configure them" binding.
+/// `template` runs the same `${...}` engine a `body:` field already
+/// uses. A template that parses as JSON is walked with
+/// [`mcp_interpolate::interpolate_json_tree`] (every string leaf
+/// interpolated against `ctx`); a template that is not valid JSON is
+/// treated as one template string itself, so the documented bare form
+/// `template: "${steps.enrich.body}"` splices the whole parsed body
+/// through under the ordinary whole-string splice rule (WOR-2489
+/// review; docs/mcp-compose.md). Either way, interpolation is
+/// fail-closed on any unresolved `${...}` path exactly like a `body:`
+/// field. `template`/`js`/`lua` are all stored as opaque strings at
+/// compile time (WOR-2489 Task 1), so every one of these outcomes is a
+/// tool-call error, never a config-compile error.
+///
+/// `JsEngine::execute` / `LuaEngine::execute` run synchronously on the
+/// calling tokio worker. Deliberate: each engine enforces its own
+/// sandbox CPU budget (100 ms by default), matching the
+/// `decision_script::evaluate` convention this shaping mirrors. If
+/// those budgets are ever raised materially, move these calls behind
+/// `spawn_blocking`.
+fn shape_local_response(
+    server_name: &str,
+    tool_name: &str,
+    response_cfg: &CompiledLocalResponseShaping,
+    arguments: &serde_json::Value,
+    steps_context: serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    // By hand, not `json!`: the macro copies interpolated `Value`s
+    // through `to_value(&...)`, and `steps_context` can be large.
+    let mut ctx_map = serde_json::Map::with_capacity(2);
+    ctx_map.insert("args".to_string(), arguments.clone());
+    ctx_map.insert(
+        "steps".to_string(),
+        serde_json::Value::Object(steps_context),
+    );
+    let ctx = serde_json::Value::Object(ctx_map);
+
+    let shaped = match response_cfg {
+        CompiledLocalResponseShaping::Template(template) => {
+            let rendered = match serde_json::from_str::<serde_json::Value>(template) {
+                Ok(parsed) => mcp_interpolate::interpolate_json_tree(&parsed, &ctx),
+                // Not a JSON document: the string itself is the
+                // template (the documented bare-placeholder form).
+                Err(_) => mcp_interpolate::interpolate_value(template, &ctx),
+            };
+            rendered.map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.template: {e}"
+                )
+            })?
+        }
+        CompiledLocalResponseShaping::Js(script) => {
+            let mut globals = HashMap::with_capacity(1);
+            globals.insert("ctx".to_string(), ctx);
+            let engine = sbproxy_extension::js::JsEngine::new().map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.js: \
+                     engine unavailable: {e}"
+                )
+            })?;
+            engine.execute(script, globals).map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.js failed: {e}"
+                )
+            })?
+        }
+        CompiledLocalResponseShaping::Lua(script) => {
+            let mut globals = HashMap::with_capacity(1);
+            globals.insert("ctx".to_string(), ctx);
+            let engine = sbproxy_extension::lua::LuaEngine::new().map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.lua: \
+                     engine unavailable: {e}"
+                )
+            })?;
+            engine.execute(script, globals).map_err(|e| {
+                anyhow::anyhow!(
+                    "mcp: local tool '{tool_name}' on server '{server_name}' response.lua failed: {e}"
+                )
+            })?
+        }
+    };
+
+    Ok(serde_json::json!({
+        "content": [{"type": "text", "text": shaped.to_string()}],
+        "isError": false,
+    }))
+}
+
+/// Run one DAG step's HTTP call and decide whether it counts as
+/// complete. Unlike a standalone `http` tool (which never turns a
+/// non-2xx response into an `Err`), a `steps` DAG step does: a
+/// downstream step cannot branch on `${steps.<name>.status}` via
+/// `condition` (conditions only see the call-level `mcp.*` vocabulary,
+/// never `steps.*`; see the module doc above), so a non-2xx response
+/// has to be a failure here for `continue_on_error` and the dependency
+/// rule to have anything to act on.
+async fn run_local_step_with_resolver(
+    server: &CompiledLocalMcpServer,
+    step: &CompiledLocalStep,
+    context: &serde_json::Value,
+    tenant: &str,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let (status, document) =
+        run_local_http_call_with_resolver(server, &step.http, context, tenant, resolver).await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "mcp: local step '{}' returned non-success status {}",
+        step.name,
+        status.as_u16()
+    );
+    Ok(document)
+}
+
+/// Run a `steps` handler's DAG to completion and shape its final
+/// response. See the module doc above for the dependency rule and the
+/// `steps.<name>` context shape.
+async fn run_local_steps_dag(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    steps_cfg: &CompiledLocalSteps,
+    arguments: &serde_json::Value,
+    condition_ctx: &sbproxy_extension::cel::CelContext,
+    tenant: &str,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let order = local_steps_topological_order(&steps_cfg.steps);
+    let mut outcomes: HashMap<&str, LocalStepOutcome> =
+        HashMap::with_capacity(steps_cfg.steps.len());
+    let mut steps_context = serde_json::Map::with_capacity(steps_cfg.steps.len());
+    let mut last_success: Option<&str> = None;
+
+    for &idx in &order {
+        let step = &steps_cfg.steps[idx];
+        let started = std::time::Instant::now();
+
+        let condition_says_run = match &step.condition {
+            None => true,
+            Some(condition) => match evaluate_mcp_argument_expr(condition, condition_ctx) {
+                McpArgumentPolicyEngineOutcome::Compliant => true,
+                McpArgumentPolicyEngineOutcome::Violation => false,
+                McpArgumentPolicyEngineOutcome::Error
+                | McpArgumentPolicyEngineOutcome::Panicked => {
+                    return Err(anyhow::anyhow!(
+                        "mcp: local tool '{tool_name}' step '{}' condition failed to evaluate",
+                        step.name
+                    ));
+                }
+            },
+        };
+
+        if !condition_says_run {
+            outcomes.insert(step.name.as_str(), LocalStepOutcome::Skipped);
+            emit_local_step_audit(
+                &server.name,
+                tool_name,
+                &step.name,
+                LocalStepOutcome::Skipped,
+                started.elapsed(),
+            );
+            continue;
+        }
+
+        if let Some(missing) = step
+            .depends_on
+            .iter()
+            .find(|dep| !matches!(outcomes.get(dep.as_str()), Some(LocalStepOutcome::Success)))
+        {
+            // The dependency rule (see module doc): `condition` said
+            // "run", but a step this one depends on did not complete.
+            return Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' step '{}' depends on '{missing}', which did not complete",
+                step.name
+            ));
+        }
+
+        // WOR-2489 review: move the accumulated step context into the
+        // per-step `ctx` value and take it back out after the call,
+        // instead of deep-cloning every prior step's whole response
+        // body once per step (O(N^2 * B) copying under the old
+        // `steps_context.clone()`). Built by hand rather than with
+        // `json!`, because the macro routes interpolated values
+        // through `to_value(&...)`, which rebuilds (copies) the tree.
+        let mut context_map = serde_json::Map::with_capacity(2);
+        context_map.insert("args".to_string(), arguments.clone());
+        context_map.insert(
+            "steps".to_string(),
+            serde_json::Value::Object(std::mem::take(&mut steps_context)),
+        );
+        let call_context = serde_json::Value::Object(context_map);
+        let step_outcome =
+            run_local_step_with_resolver(server, step, &call_context, tenant, resolver).await;
+        if let serde_json::Value::Object(mut context_map) = call_context {
+            if let Some(serde_json::Value::Object(map)) = context_map.remove("steps") {
+                steps_context = map;
+            }
+        }
+
+        match step_outcome {
+            Ok(document) => {
+                outcomes.insert(step.name.as_str(), LocalStepOutcome::Success);
+                last_success = Some(step.name.as_str());
+                steps_context.insert(step.name.clone(), document);
+                emit_local_step_audit(
+                    &server.name,
+                    tool_name,
+                    &step.name,
+                    LocalStepOutcome::Success,
+                    started.elapsed(),
+                );
+            }
+            Err(e) if step.continue_on_error => {
+                outcomes.insert(step.name.as_str(), LocalStepOutcome::Failed);
+                steps_context.insert(
+                    step.name.clone(),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                emit_local_step_audit(
+                    &server.name,
+                    tool_name,
+                    &step.name,
+                    LocalStepOutcome::Failed,
+                    started.elapsed(),
+                );
+            }
+            Err(e) => {
+                emit_local_step_audit(
+                    &server.name,
+                    tool_name,
+                    &step.name,
+                    LocalStepOutcome::Failed,
+                    started.elapsed(),
+                );
+                return Err(e.context(format!(
+                    "mcp: local tool '{tool_name}' step '{}' failed",
+                    step.name
+                )));
+            }
+        }
+    }
+
+    match &steps_cfg.response {
+        // WOR-2489 Task 5: shape the final response from `template`/
+        // `js`/`lua` over the completed `steps_context` map.
+        Some(response_cfg) => shape_local_response(
+            &server.name,
+            tool_name,
+            response_cfg,
+            arguments,
+            steps_context,
+        ),
+        // No shaping configured: the default is the last step (in
+        // execution order) that actually completed, returned exactly
+        // as its own `http` call would have been (WOR-2489 Task 4).
+        None => match last_success {
+            Some(name) => {
+                let document = steps_context
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": document.to_string()}],
+                    "isError": false,
+                }))
+            }
+            None => Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' on server '{}': no step completed, so there is no \
+                 result to return (every step was skipped)",
+                server.name
+            )),
+        },
+    }
+}
+
+/// [`run_local_steps_dag`] wrapped in the whole-call budget (WOR-2489
+/// Task 4): one deadline covers every step, not any single step's own
+/// call, defaulting to [`DEFAULT_LOCAL_STEPS_BUDGET`] and capped at
+/// [`MAX_LOCAL_STEPS_BUDGET`] (enforced at compile time). Exceeding it
+/// fails the whole tool call closed rather than returning a partial
+/// response from whichever steps happened to finish.
+async fn execute_local_steps_with_resolver(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    steps_cfg: &CompiledLocalSteps,
+    arguments: serde_json::Value,
+    condition_ctx: &sbproxy_extension::cel::CelContext,
+    tenant: &str,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let budget = steps_cfg.timeout.unwrap_or(DEFAULT_LOCAL_STEPS_BUDGET);
+    match tokio::time::timeout(
+        budget,
+        run_local_steps_dag(
+            server,
+            tool_name,
+            steps_cfg,
+            &arguments,
+            condition_ctx,
+            tenant,
+            resolver,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "mcp: local tool '{tool_name}' on server '{}' exceeded its steps budget of {}ms",
+            server.name,
+            budget.as_millis()
+        )),
+    }
+}
+
+/// [`execute_local_steps_with_resolver`] with the production resolver.
+async fn execute_local_steps(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    steps_cfg: &CompiledLocalSteps,
+    arguments: serde_json::Value,
+    condition_ctx: &sbproxy_extension::cel::CelContext,
+    tenant: &str,
+) -> anyhow::Result<serde_json::Value> {
+    execute_local_steps_with_resolver(
+        server,
+        tool_name,
+        steps_cfg,
+        arguments,
+        condition_ctx,
+        tenant,
+        &sbproxy_security::egress::SystemHostResolver,
+    )
+    .await
+}
+
+impl McpAction {
+    /// True when `server_name` names a compiled `type: local` server
+    /// (WOR-2489). `sbproxy-core::action_dispatch` calls this at the
+    /// same point in the gate chain where it would otherwise call into
+    /// `federation`'s dispatch, after every governance gate has
+    /// already run, to decide whether to resolve the tool here instead.
+    pub fn is_local_server(&self, server_name: &str) -> bool {
+        self.local_servers.iter().any(|s| s.name == server_name)
+    }
+
+    /// Execute a resolved local tool's handler and return the MCP
+    /// tool-result document (`{"content": [...], "isError": bool}`),
+    /// the same shape `McpFederation`'s OpenAPI and plain-MCP dispatch
+    /// paths already return, so this slots into `action_dispatch.rs`'s
+    /// existing `anyhow::Result<serde_json::Value>` outcome handling
+    /// unchanged.
+    ///
+    /// `server_name`/`tool_name` must both be resolved, unprefixed
+    /// names (`FederatedTool::server_name` / `FederatedTool::upstream_name`),
+    /// not the possibly-namespaced advertised name a caller sent on
+    /// the wire -- exactly the distinction `call_openapi_tool` already
+    /// draws for the OpenAPI-backed dispatch path.
+    ///
+    /// `principal`/`tenant`/`session_id` are only consulted for a
+    /// `steps` handler, whose per-step `condition` is CEL compiled
+    /// under the same [`CelSurface::McpArgumentPolicy`] vocabulary
+    /// `argument_policies[]` uses -- evaluating it needs the same
+    /// caller-identity view `evaluate_argument_policies` already
+    /// builds from these three (WOR-2489 Task 4). `static` and `http`
+    /// handlers ignore them entirely.
+    pub async fn execute_local_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        principal: &sbproxy_plugin::Principal,
+        tenant: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let server = self
+            .local_servers
+            .iter()
+            .find(|s| s.name == server_name)
+            .ok_or_else(|| anyhow::anyhow!("mcp: local server '{server_name}' not found"))?;
+        let tool = server
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("mcp: local tool '{tool_name}' not found on server '{server_name}'")
+            })?;
+
+        match &tool.handler {
+            CompiledLocalToolHandler::Static(value) => Ok(local_static_tool_result(value)),
+            CompiledLocalToolHandler::Http { call, response } => {
+                execute_local_http_call(
+                    server,
+                    tool_name,
+                    call,
+                    response.as_ref(),
+                    &arguments,
+                    tenant,
+                )
+                .await
+            }
+            CompiledLocalToolHandler::Steps(steps_cfg) => {
+                let condition_ctx = self.local_step_condition_context(
+                    tool_name,
+                    server_name,
+                    tenant,
+                    session_id,
+                    principal,
+                    &arguments,
+                );
+                execute_local_steps(
+                    server,
+                    tool_name,
+                    steps_cfg,
+                    arguments,
+                    &condition_ctx,
+                    tenant,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Build the CEL context every step `condition` in a `steps` DAG
+    /// evaluates against (WOR-2489 Task 4): identical vocabulary to
+    /// `argument_policies[]` (WOR-2384, MCP05) -- `mcp.tool.name`,
+    /// `mcp.server`, `mcp.session.*`, `mcp.tenant`, `mcp.principal.*`,
+    /// `mcp.arguments` -- because [`CompiledLocalStep::condition`] is
+    /// compiled under the exact same [`CelSurface::McpArgumentPolicy`]
+    /// surface (see `compile_local_steps`); there is no `steps.*`
+    /// binding here (that vocabulary belongs to `${}` interpolation,
+    /// not CEL -- see the step DAG executor's module doc).
+    ///
+    /// Built once per tool call, not once per step: none of these
+    /// bindings change as steps run, so rebuilding it per step would
+    /// be wasted work without changing any evaluation's outcome.
+    /// `mcp.result` is always CEL `null` here, matching every
+    /// `argument_policies[]` evaluation -- a step condition runs
+    /// before this tool call has produced a result to bind.
+    fn local_step_condition_context(
+        &self,
+        tool_name: &str,
+        server_name: &str,
+        tenant: &str,
+        session_id: Option<&str>,
+        principal: &sbproxy_plugin::Principal,
+        arguments: &serde_json::Value,
+    ) -> sbproxy_extension::cel::CelContext {
+        let flow_labels = self.current_flow_labels(session_id);
+        let view = sbproxy_extension::cel::context::McpArgumentPolicyView {
+            tool_name,
+            server: server_name,
+            session_id,
+            tenant,
+            principal_sub: principal.sub.as_str(),
+            principal_team: principal.attrs.team.as_deref(),
+            principal_project: principal.attrs.project.as_deref(),
+            principal_user: principal.attrs.user.as_deref(),
+            arguments,
+            result: None,
+            session_integrity: flow_labels.integrity.as_str(),
+            session_sensitive_touched: flow_labels.sensitive_touched,
+        };
+        sbproxy_extension::cel::context::build_mcp_argument_policy_context(&view)
+    }
+}
+
 impl McpAction {
     /// Compile an `McpAction` from a generic JSON config value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
@@ -2515,6 +4389,11 @@ impl McpAction {
             .egress
             .clone()
             .unwrap_or_else(|| EgressPolicy::allow_all("action"));
+        // WOR-2489: every `type: local` server's compiled tool
+        // handlers, one entry per server, populated inside the loop
+        // below alongside its `McpServerConfig`/`prefixes` entries.
+        // See `compile_local_server`.
+        let mut local_servers: Vec<CompiledLocalMcpServer> = Vec::new();
 
         for upstream in cfg.federated_servers {
             // The upstream `name` doubles as the implicit collision-prefix
@@ -2529,6 +4408,22 @@ impl McpAction {
                 .transport
                 .clone()
                 .unwrap_or_else(|| "streamable_http".to_string());
+
+            // WOR-2489 review: `run_as_user_auth` mints a per-call
+            // upstream credential at dispatch, and a `type: local`
+            // server's tools dial with only their own configured
+            // `headers:` -- the minted credential would be silently
+            // discarded (the same dead-knob reasoning that refuses
+            // `headers:` on non-`openapi` servers below).
+            let is_local = upstream.server_type.as_deref() == Some("local");
+            if is_local && upstream.run_as_user_auth {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].run_as_user_auth is not supported on \
+                     type: local (origin '{}'); a local tool dials with its own http.headers, \
+                     so a minted per-caller credential would be silently discarded",
+                    upstream.origin
+                );
+            }
 
             // WOR-1792: stdio + run-as-user is a hard config error until
             // a safe secret-delivery path exists for local children.
@@ -2581,6 +4476,15 @@ impl McpAction {
                     upstream.origin
                 );
             }
+
+            // WOR-2489: `tools[]` is a `local`-only field, mirroring
+            // how `headers` above is an `openapi`-only field.
+            if !upstream.tools.is_empty() && !is_local {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].tools requires type: local (origin '{}')",
+                    upstream.origin
+                );
+            }
             // WOR-2384 (MCP09): computed once per server so both the
             // `openapi` REST-call gate (`OpenApiBacking::egress_policy`,
             // pre-existing) and the base MCP dial gate
@@ -2589,14 +4493,56 @@ impl McpAction {
             // action-level default over allow-all -- regardless of
             // which kind of upstream this is. `stdio` servers get one
             // too (uniform construction) but it is never consulted:
-            // stdio is a local process spawn, not a network dial.
+            // stdio is a local process spawn, not a network dial. A
+            // `local` server's tools are gated by their own compiled
+            // `CompiledLocalMcpServer::egress` instead (below); this
+            // value is stored on its `McpServerConfig` too, for the
+            // same uniform-construction reason, but is equally inert.
             let server_egress_policy = upstream
                 .egress
                 .clone()
                 .unwrap_or_else(|| action_egress.clone())
                 .with_scope(format!("server:{name}"));
 
-            let (url, openapi) = if is_stdio {
+            // WOR-2489: a `local` server serves its own tools -- no
+            // MCP or REST dial -- but it still publishes into the SAME
+            // catalog every other upstream's tools live in
+            // (`server_configs`, via `LocalBacking`) and the same
+            // per-server table every other upstream's RBAC label and
+            // approval status resolve through (`prefixes`, below). That
+            // is what makes RBAC, draft/deprecated status, and the
+            // tool-versioning gate apply to a local tool with zero
+            // server-type-specific code at any of those call sites:
+            // they all key on `server_name`, never on transport kind.
+            // `url`/`transport` are nominal placeholders nothing ever
+            // dials; `compile_local_server` (unchanged from Task 1) is
+            // still what validates `tools[]` and produces the compiled
+            // handlers Task 3's executor will consume.
+            let (url, openapi, local) = if is_local {
+                let compiled = compile_local_server(
+                    &name,
+                    &upstream,
+                    cfg.max_upstream_response_bytes
+                        .unwrap_or(DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES),
+                )?;
+                let tool_docs: Vec<serde_json::Value> = compiled
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        })
+                    })
+                    .collect();
+                local_servers.push(compiled);
+                (
+                    format!("local://{name}"),
+                    None,
+                    Some(sbproxy_extension::mcp::LocalBacking { tools: tool_docs }),
+                )
+            } else if is_stdio {
                 let command = upstream.command.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "mcp action: stdio server '{}' needs command",
@@ -2605,6 +4551,7 @@ impl McpAction {
                 })?;
                 (
                     sbproxy_extension::mcp::encode_stdio_url(command, &upstream.args),
+                    None,
                     None,
                 )
             } else if is_openapi {
@@ -2634,9 +4581,10 @@ impl McpAction {
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect(),
                     }),
+                    None,
                 )
             } else {
-                (normalize_origin(&upstream.origin)?, None)
+                (normalize_origin(&upstream.origin)?, None, None)
             };
 
             server_configs.push(McpServerConfig {
@@ -2645,6 +4593,7 @@ impl McpAction {
                 transport,
                 namespace: upstream.namespace,
                 openapi,
+                local,
                 egress_policy: server_egress_policy,
             });
             // WOR-2384: computed before `upstream.protocol` /
@@ -2882,6 +4831,7 @@ impl McpAction {
             content_filters,
             result_policies,
             mcp_audit_capture_arguments: cfg.mcp_audit.capture_arguments,
+            local_servers,
         })
     }
 
@@ -3564,6 +5514,7 @@ impl std::fmt::Debug for McpAction {
             .field("prefixes", &self.prefixes)
             .field("tool_allowlist", &self.tool_allowlist)
             .field("lethal_trifecta", &self.lethal_trifecta)
+            .field("local_server_count", &self.local_servers.len())
             .finish()
     }
 }
@@ -5018,6 +6969,7 @@ mod tests {
                 spec: None,
                 spec_path: None,
                 headers: BTreeMap::new(),
+                tools: Vec::new(),
                 egress: None,
                 protocol: default_federated_protocol(),
                 downgrade: McpDowngradePolicy::default(),
@@ -7104,5 +9056,835 @@ allow := false if {
 
         install_configured_gate(EgressPurpose::UsageSink, None);
         install_configured_gate(EgressPurpose::Webhook, None);
+    }
+
+    // --- `type: local` servers (WOR-2489) ---
+
+    #[test]
+    fn local_static_tool_compiles_without_egress() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        });
+        let action =
+            McpAction::from_config(value).expect("a static-only local server needs no egress");
+        assert_eq!(action.local_servers.len(), 1);
+        assert_eq!(action.local_servers[0].tools.len(), 1);
+        assert!(action.local_servers[0].egress.is_none());
+    }
+
+    #[test]
+    fn local_steps_tool_compiles_with_condition_and_response_shaping() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"}
+                            },
+                            {
+                                "name": "enrich",
+                                "http": {"method": "GET", "url": "https://api.example.com/b"},
+                                "depends_on": ["fetch"],
+                                "condition": "mcp.tool.name == \"lookup\"",
+                                "continue_on_error": true
+                            }
+                        ],
+                        "response": {"template": "{{ steps.enrich.body }}"}
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("a valid steps DAG must compile");
+        assert_eq!(action.local_servers[0].tools.len(), 1);
+    }
+
+    #[test]
+    fn local_tools_field_requires_type_local() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "origin": "example.com",
+                "tools": [{
+                    "name": "x",
+                    "description": "x",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err =
+            McpAction::from_config(value).expect_err("tools on a non-local server must refuse");
+        assert!(err.to_string().contains("requires type: local"), "{err}");
+    }
+
+    #[test]
+    fn local_server_with_no_tools_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal"
+            }]
+        });
+        let err =
+            McpAction::from_config(value).expect_err("a local server with no tools must refuse");
+        assert!(err.to_string().contains("declares no tools"), "{err}");
+    }
+
+    #[test]
+    fn local_tool_name_must_not_be_empty() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "",
+                    "description": "x",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("an empty tool name must refuse");
+        assert!(err.to_string().contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn local_tool_input_schema_must_be_a_json_object() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "bad-schema",
+                    "description": "schema is not an object",
+                    "input_schema": ["not", "an", "object"],
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("a non-object input_schema must refuse");
+        assert!(
+            err.to_string()
+                .contains("input_schema must be a JSON object"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_tool_handler_must_be_exactly_one_of_static_http_steps() {
+        let no_handler = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "noop",
+                    "description": "does nothing",
+                    "input_schema": {"type": "object"}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(no_handler).expect_err("no handler must refuse");
+        assert!(
+            err.to_string()
+                .contains("needs exactly one of static, http, or steps"),
+            "{err}"
+        );
+
+        let both_handlers = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "both",
+                    "description": "sets two handlers",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true},
+                    "http": {"method": "GET", "url": "https://api.example.com/x"}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(both_handlers).expect_err("two handlers must refuse");
+        assert!(
+            err.to_string()
+                .contains("more than one of static, http, steps"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_steps_tool_without_server_egress_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("an http-calling steps tool with no server egress must refuse");
+        assert!(err.to_string().contains("no egress policy"), "{err}");
+    }
+
+    #[test]
+    fn local_steps_duplicate_step_names_are_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}},
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/b"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("duplicate step names must refuse");
+        assert!(err.to_string().contains("duplicate step name"), "{err}");
+    }
+
+    #[test]
+    fn local_steps_depends_on_missing_step_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"},
+                                "depends_on": ["missing"]
+                            }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("a dangling depends_on must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("undeclared step"), "{msg}");
+        assert!(msg.contains("missing"), "{msg}");
+    }
+
+    #[test]
+    fn local_steps_dependency_cycle_is_refused_and_names_the_cycle() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "a",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"},
+                                "depends_on": ["b"]
+                            },
+                            {
+                                "name": "b",
+                                "http": {"method": "GET", "url": "https://api.example.com/b"},
+                                "depends_on": ["a"]
+                            }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("a dependency cycle must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("dependency cycle"), "{msg}");
+        assert!(msg.contains('a') && msg.contains('b'), "{msg}");
+    }
+
+    #[test]
+    fn local_steps_parallel_is_refused_with_a_named_message() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "parallel": true,
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err(
+            "parallel must be refused with a specific message, not silently ignored or an \
+             anonymous deny_unknown_fields error",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("parallel"), "{msg}");
+        assert!(msg.contains("not supported yet"), "{msg}");
+        assert!(
+            !msg.contains("unknown field"),
+            "the refusal must be named, not anonymous: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_step_invalid_cel_condition_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"},
+                                "condition": "this is not valid CEL !!!"
+                            }
+                        ]
+                    }
+                }]
+            }]
+        });
+        assert!(McpAction::from_config(value).is_err());
+    }
+
+    /// WOR-2489 Task 4: `steps.timeout` is optional; an unset one
+    /// compiles to `None`, not a materialized default -- the
+    /// executor's own `DEFAULT_LOCAL_STEPS_BUDGET` applies at
+    /// execution time instead, mirroring how a plain `http` call's own
+    /// `timeout:` field already works.
+    #[test]
+    fn local_steps_timeout_defaults_to_none_when_unset() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("a steps tool with no timeout compiles");
+        match &action.local_servers[0].tools[0].handler {
+            CompiledLocalToolHandler::Steps(steps) => assert_eq!(steps.timeout, None),
+            other => panic!("expected a Steps handler, got {other:?}"),
+        }
+    }
+
+    /// WOR-2489 Task 4: a valid duration string parses to the right
+    /// `Duration`, using the same `duration_str` idiom every other
+    /// `timeout:` field in this module already uses.
+    #[test]
+    fn local_steps_timeout_parses_a_valid_duration() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ],
+                        "timeout": "45s"
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("a valid steps.timeout compiles");
+        match &action.local_servers[0].tools[0].handler {
+            CompiledLocalToolHandler::Steps(steps) => {
+                assert_eq!(steps.timeout, Some(Duration::from_secs(45)));
+            }
+            other => panic!("expected a Steps handler, got {other:?}"),
+        }
+    }
+
+    /// WOR-2489 Task 4: `steps.timeout` past the 5-minute cap is a
+    /// config-compile error naming both the configured value and the
+    /// cap, not a silently-accepted knob -- a `steps` DAG dials real
+    /// upstreams on the gateway's own request path, so an unbounded
+    /// whole-call budget is a resource leak waiting to happen.
+    #[test]
+    fn local_steps_timeout_over_five_minutes_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ],
+                        "timeout": "6m"
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("a steps.timeout past the 5-minute cap must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("steps.timeout"), "{msg}");
+        assert!(msg.contains("exceeds the maximum"), "{msg}");
+    }
+
+    /// WOR-2489 review: two tools with the same name would advertise
+    /// one tool's schema while the executor (which resolves by
+    /// upstream name and takes the first match) ran the other's
+    /// handler. Refused at compile time, naming both positions.
+    #[test]
+    fn wor_2489_review_duplicate_local_tool_names_are_refused_naming_both_positions() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "description": "first",
+                        "input_schema": {"type": "object"},
+                        "static": {"which": "first"}
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "second, different schema",
+                        "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                        "static": {"which": "second"}
+                    }
+                ]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("duplicate tool names must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate tool name 'lookup'"), "{msg}");
+        assert!(msg.contains("tools[0]"), "{msg}");
+        assert!(msg.contains("tools[1]"), "{msg}");
+    }
+
+    /// WOR-2489 review: `run_as_user_auth` mints a per-call credential
+    /// the local dispatch path never sends. Dead-knob doctrine: refuse
+    /// at load rather than accept-and-discard.
+    #[test]
+    fn wor_2489_review_run_as_user_auth_on_a_local_server_is_refused() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "run_as_user_auth": true,
+                "tools": [{
+                    "name": "ping",
+                    "description": "static",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("run_as_user_auth on a local server must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported on type: local"),
+            "the refusal must name the local-server incompatibility, not a generic \
+             upstream_auth requirement: {msg}"
+        );
+    }
+
+    /// WOR-2489 review: a per-attempt `http.timeout` past the maximum
+    /// whole-call budget could never complete; refuse it like the
+    /// `steps.timeout` cap above.
+    #[test]
+    fn wor_2489_review_http_timeout_over_the_budget_cap_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "http": {"method": "GET", "url": "https://api.example.com/a", "timeout": "6m"}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("an http.timeout past the 5-minute budget cap must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("http.timeout"), "{msg}");
+        assert!(
+            msg.contains("exceeds the maximum whole-call budget"),
+            "{msg}"
+        );
+    }
+
+    /// WOR-2489 review: the per-step audit record must be emitted at
+    /// `info` on the `mcp_audit` target. Release builds compile with
+    /// `tracing/release_max_level_info`, so a `debug!` emission would
+    /// not exist in any shipped binary -- the operator-facing per-step
+    /// trail would be dev-only.
+    #[test]
+    fn wor_2489_review_step_audit_emits_at_info_on_the_mcp_audit_target() {
+        use std::sync::{Arc, Mutex};
+        use tracing::span::{Attributes, Record};
+        use tracing::{Event, Id, Metadata};
+
+        #[derive(Clone, Default)]
+        struct LevelCapture {
+            events: Arc<Mutex<Vec<tracing::Level>>>,
+        }
+
+        impl tracing::Subscriber for LevelCapture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.target() == "mcp_audit"
+            }
+            fn new_span(&self, _span: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() == "mcp_audit" {
+                    self.events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(*event.metadata().level());
+                }
+            }
+            fn enter(&self, _span: &Id) {}
+            fn exit(&self, _span: &Id) {}
+        }
+
+        let capture = LevelCapture::default();
+        let events = capture.events.clone();
+        tracing::subscriber::with_default(capture, || {
+            emit_local_step_audit(
+                "server-a",
+                "tool-b",
+                "step-c",
+                LocalStepOutcome::Success,
+                Duration::from_millis(3),
+            );
+        });
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 1, "exactly one step audit event");
+        assert_eq!(
+            events[0],
+            tracing::Level::INFO,
+            "the per-step audit line must survive release_max_level_info"
+        );
+    }
+
+    /// WOR-2489 review: retry x per-attempt-timeout is bounded by the
+    /// same whole-call budget a `steps` DAG gets. A retry config that
+    /// would run past the budget is cut off by it. Virtual time
+    /// (`start_paused`) keeps this instant: the stub never answers, so
+    /// every timer -- per-attempt timeout, backoff, and the budget --
+    /// fires on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn wor_2489_review_standalone_http_whole_call_budget_cuts_off_retries() {
+        // A listener that accepts nothing: connects sit in the backlog
+        // and no response ever arrives.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "retries against a black hole",
+                    "input_schema": {"type": "object"},
+                    "http": {
+                        "method": "GET",
+                        "url": format!("http://{addr}/"),
+                        "timeout": "7s",
+                        "retry": {"max_attempts": 16, "retry_on": ["connect_error", "timeout"], "backoff_ms": 100}
+                    }
+                }]
+            }]
+        }))
+        .expect("budget fixture compiles");
+
+        let server = &action.local_servers[0];
+        let CompiledLocalToolHandler::Http { call, response } = &server.tools[0].handler else {
+            panic!("fixture declares an http handler");
+        };
+
+        let started = std::time::Instant::now();
+        let err = execute_local_http_call_with_resolver(
+            server,
+            "fetch",
+            call,
+            response.as_ref(),
+            &json!({}),
+            "tenant-a",
+            &sbproxy_security::egress::SystemHostResolver,
+        )
+        .await
+        .expect_err("the whole-call budget must end the call");
+        assert!(
+            err.to_string().contains("whole-call budget"),
+            "the failure must name the budget, not retry exhaustion: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "virtual time must keep this instant; a real 16x7s retry loop ran instead \
+             (took {:?})",
+            started.elapsed()
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn compiled_local_types_exhaustive_shape() {
+        // Documents the full compiled contract Task 2 will consume by
+        // destructuring every `CompiledLocal*` type end to end
+        // (structs field-by-field, enums arm-by-arm), including the
+        // handler/response variants a single config can't exercise at
+        // once. `Debug` is hand-written (not derived) on all of these
+        // specifically so rustc's dead-code pass doesn't ignore the
+        // field reads -- see the doc comment on `CompiledLocalMcpServer`
+        // -- so this test's job is documentation and a regression
+        // guard (a future field/variant added or removed here breaks
+        // the build), not silencing warnings by itself.
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "lookup-server",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"}
+                            },
+                            {
+                                "name": "enrich",
+                                "http": {
+                                    "method": "POST",
+                                    "url": "https://api.example.com/b",
+                                    "headers": {"accept": "application/json"},
+                                    "body": {"q": "hello"},
+                                    "retry": {"max_attempts": 2},
+                                    "timeout": "5s"
+                                },
+                                "depends_on": ["fetch"],
+                                "condition": "mcp.tool.name == \"lookup\"",
+                                "continue_on_error": true,
+                                "retry": {"max_attempts": 3}
+                            }
+                        ],
+                        "response": {"template": "{{ steps.enrich.body }}"},
+                        "timeout": "45s"
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("full-shape local server must compile");
+
+        let mut servers = action.local_servers;
+        assert_eq!(servers.len(), 1);
+        let CompiledLocalMcpServer {
+            name: server_name,
+            mut tools,
+            egress,
+            max_response_bytes,
+        } = servers.remove(0);
+        assert_eq!(server_name, "lookup-server");
+        assert!(egress.is_some());
+        assert_eq!(
+            max_response_bytes, DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES,
+            "no action-level max_upstream_response_bytes configured, so the shared default applies"
+        );
+        assert_eq!(tools.len(), 1);
+
+        let CompiledLocalMcpTool {
+            name: tool_name,
+            description,
+            input_schema,
+            handler,
+        } = tools.remove(0);
+        assert_eq!(tool_name, "lookup");
+        assert_eq!(description, "look something up");
+        assert!(input_schema.is_object());
+
+        let mut steps = match handler {
+            CompiledLocalToolHandler::Steps(CompiledLocalSteps {
+                steps,
+                response,
+                timeout: steps_timeout,
+            }) => {
+                match response.expect("response shaping was configured") {
+                    CompiledLocalResponseShaping::Template(t) => {
+                        assert_eq!(t, "{{ steps.enrich.body }}");
+                    }
+                    other => panic!("expected Template, got {other:?}"),
+                }
+                assert_eq!(steps_timeout, Some(Duration::from_secs(45)));
+                steps
+            }
+            other => panic!("expected a Steps handler, got {other:?}"),
+        };
+        assert_eq!(steps.len(), 2);
+
+        let CompiledLocalStep {
+            name: step_name,
+            http,
+            depends_on,
+            condition,
+            continue_on_error,
+            retry: step_retry,
+        } = steps.remove(1);
+        assert_eq!(step_name, "enrich");
+        assert_eq!(depends_on, vec!["fetch".to_string()]);
+        assert!(condition.is_some());
+        assert!(continue_on_error);
+        assert!(step_retry.is_some());
+
+        let CompiledLocalHttpCall {
+            method,
+            url,
+            headers,
+            body,
+            retry: call_retry,
+            timeout,
+        } = http;
+        assert_eq!(method, "POST");
+        assert_eq!(url, "https://api.example.com/b");
+        assert_eq!(headers.get("accept"), Some(&"application/json".to_string()));
+        assert!(body.is_some());
+        assert!(call_retry.is_some());
+        assert!(timeout.is_some());
+
+        // Cover the handler/response arms this config didn't exercise
+        // (Static, Http, Js, Lua) by constructing and matching them
+        // directly.
+        match CompiledLocalToolHandler::Static(json!({"ok": true})) {
+            CompiledLocalToolHandler::Static(v) => assert_eq!(v, json!({"ok": true})),
+            other => panic!("expected Static, got {other:?}"),
+        }
+        let http_handler = CompiledLocalToolHandler::Http {
+            call: CompiledLocalHttpCall {
+                method: "GET".to_string(),
+                url: "https://api.example.com/c".to_string(),
+                headers: BTreeMap::new(),
+                body: None,
+                retry: None,
+                timeout: None,
+            },
+            response: Some(CompiledLocalResponseShaping::Template(
+                "{\"ok\": \"${args.ok}\"}".to_string(),
+            )),
+        };
+        match http_handler {
+            CompiledLocalToolHandler::Http { call, response } => {
+                assert_eq!(call.method, "GET");
+                assert!(response.is_some());
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+        match CompiledLocalResponseShaping::Js("1 + 1".to_string()) {
+            CompiledLocalResponseShaping::Js(src) => assert_eq!(src, "1 + 1"),
+            other => panic!("expected Js, got {other:?}"),
+        }
+        match CompiledLocalResponseShaping::Lua("1 + 1".to_string()) {
+            CompiledLocalResponseShaping::Lua(src) => assert_eq!(src, "1 + 1"),
+            other => panic!("expected Lua, got {other:?}"),
+        }
     }
 }

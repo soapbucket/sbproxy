@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# A `type: local` MCP server: tools the gateway serves itself, no
+# upstream MCP or REST dial required.
+#
+# Two tools, no step DAG:
+#   - `status`: a `static` handler. Always returns the same JSON value.
+#     Makes no HTTP call, so it alone would need no `egress:`.
+#   - `lookup`: a single `http` handler. Makes one GET against
+#     test.sbproxy.dev (the project's public HTTP echo service, like
+#     httpbin) and returns what it saw. This is what makes `egress:`
+#     required on the server: the moment any tool can make an HTTP
+#     call, the server has to say which hosts it may reach.
+#
+# `${args.id}` splices the caller-supplied `id` argument into the
+# request URL. See docs/mcp-compose.md for the full interpolation
+# vocabulary.
+#
+# Run:
+#   sbproxy serve -f examples/mcp-local-tools/sb.yml
+#
+# See README.md for the full walkthrough.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: local-tools-demo
+        version: "1.0.0"
+
+      federated_servers:
+        - origin: local-tools
+          type: local
+          prefix: local
+          namespace: always
+          egress:
+            mode: deny_by_default
+            hosts: [test.sbproxy.dev]
+          tools:
+            - name: status
+              description: >-
+                Fixed status blob for this gateway. Always returns the
+                same value; makes no HTTP call.
+              input_schema:
+                type: object
+                properties: {}
+                additionalProperties: false
+              static:
+                service: mcp-local-tools-demo
+                ok: true
+                version: "1.0.0"
+
+            - name: lookup
+              description: >-
+                Looks an id up against the project's public echo/test
+                service and returns what it saw (a real HTTP round
+                trip, egress-gated to test.sbproxy.dev).
+              input_schema:
+                type: object
+                required: [id]
+                properties:
+                  id:
+                    type: string
+                    description: Value to look up.
+                additionalProperties: false
+              http:
+                method: GET
+                url: "https://test.sbproxy.dev/get?id=${args.id}"
+                timeout: 10s

@@ -111,12 +111,32 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing or empty 'type' field"))
 }
 
+/// True when a `${...}` placeholder's name (the part before an optional
+/// `:-` default) can name an environment variable at all.
+///
+/// A POSIX environment variable name never contains a dot, while every
+/// dotted `${...}` form belongs to a later consumer: the MCP local-tool
+/// interpolation vocabulary (`${args.id}`, `${steps.fetch.body.x}`; see
+/// docs/mcp-compose.md) and template literals inside embedded JS
+/// scripts. A dotted placeholder is therefore never an env reference:
+/// the substitution pass leaves it byte-for-byte literal even when a
+/// same-named process variable exists, and the hazard scan does not
+/// report it as unresolved (reporting it would tell the operator to
+/// export a variable that would break the tool if they did, and the
+/// config-authority subscriber would refuse the whole bundle over it).
+fn placeholder_is_env_reference(var_name: &str) -> bool {
+    let name = var_name.split_once(":-").map_or(var_name, |(name, _)| name);
+    !name.contains('.')
+}
+
 /// Interpolate `${VAR_NAME}` patterns in a string with environment variables.
 ///
 /// `${VAR:-default}` takes the shell meaning: the variable's value when it
 /// is set and non-empty, the literal default otherwise. Unresolvable
 /// variables without a default are left as-is (literal `${...}` in the
-/// output), which `scan_yaml_hazards` reports after parsing.
+/// output), which `scan_yaml_hazards` reports after parsing. A
+/// placeholder whose name is not a possible environment variable name
+/// (see [`placeholder_is_env_reference`]) is not touched at all.
 fn interpolate_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -135,6 +155,15 @@ fn interpolate_env_vars(input: &str) -> String {
                     var_name.push(c);
                 }
                 if found_close && !var_name.is_empty() {
+                    // Not an env reference (a dotted runtime-vocabulary
+                    // path): keep the placeholder byte-for-byte, even
+                    // when a colliding process variable exists.
+                    if !placeholder_is_env_reference(&var_name) {
+                        result.push_str("${");
+                        result.push_str(&var_name);
+                        result.push('}');
+                        continue;
+                    }
                     // `${VAR:-default}`: shell semantics, default wins
                     // when the variable is unset or empty.
                     let (name, default) = match var_name.split_once(":-") {
@@ -194,7 +223,13 @@ fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
             let tail = &rest[start..];
             match tail.find('}') {
                 Some(end) => {
-                    out.push(&tail[..=end]);
+                    // Only a placeholder that could name an environment
+                    // variable is an unresolved env reference; a dotted
+                    // runtime-vocabulary path (`${args.id}`) is left
+                    // for its own consumer and never reported here.
+                    if placeholder_is_env_reference(&tail[2..end]) {
+                        out.push(&tail[..=end]);
+                    }
                     rest = &tail[end + 1..];
                 }
                 None => break,
@@ -4585,6 +4620,90 @@ flags:
         assert_eq!(
             interpolate_env_vars("a ${SBPROXY_TEST_UNSET_XYZ} b"),
             "a ${SBPROXY_TEST_UNSET_XYZ} b"
+        );
+    }
+
+    // WOR-2489 review: a dotted `${...}` placeholder is runtime
+    // interpolation vocabulary (`${args.id}`, `${steps.fetch.body.x}`),
+    // never an env reference -- no POSIX environment variable name
+    // contains a dot. It must survive the pre-parse substitution
+    // byte-for-byte even when a same-named process variable exists.
+    #[test]
+    fn dotted_placeholder_survives_interpolation_even_with_a_colliding_env_var() {
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("args.user_id", Some("spliced-from-env-would-be-a-bug")),
+            ("SBPROXY_TEST_SET_XYZ", Some("live")),
+        ]);
+        assert_eq!(interpolate_env_vars("${args.user_id}"), "${args.user_id}");
+        // A dotted name with a `:-` default is still not an env
+        // reference; the whole placeholder, default included, stays.
+        assert_eq!(
+            interpolate_env_vars("${steps.fetch.body.x:-fallback}"),
+            "${steps.fetch.body.x:-fallback}"
+        );
+        // A real env reference in the same string still resolves.
+        assert_eq!(
+            interpolate_env_vars("${SBPROXY_TEST_SET_XYZ}/${args.user_id}"),
+            "live/${args.user_id}"
+        );
+    }
+
+    // WOR-2489 review: the hazard scan must not report a dotted
+    // placeholder as an unresolved env reference. Before this fix, a
+    // `type: local` MCP tool carrying `${args.user_id}` in its
+    // `http.url` produced a misleading boot warning, and the
+    // config-authority subscriber refused any bundle carrying it
+    // fleet-wide (config_subscriber.rs's hard-refusal path).
+    #[test]
+    fn dotted_placeholders_are_not_reported_as_unresolved_env_references() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info: {name: dotted-fixture, version: "1.0.0"}
+      federated_servers:
+        - type: local
+          origin: local.internal
+          prefix: dotted-local
+          egress: {mode: enforce, hosts: [api.internal]}
+          tools:
+            - name: fetch
+              description: dotted placeholder fixture
+              input_schema: {type: object, properties: {}}
+              http:
+                method: GET
+                url: "https://api.internal/items/${args.user_id}?v=${steps.fetch.body.x}"
+"#;
+        assert_eq!(
+            unresolved_env_references(yaml),
+            Vec::<String>::new(),
+            "dotted placeholders are runtime vocabulary, not env references"
+        );
+        // The config also compiles (the executor, not the env layer,
+        // owns those placeholders from here on).
+        compile_config(yaml).expect("a local tool with dotted placeholders compiles");
+
+        // A genuine `${VAR}` miss is still reported exactly as before.
+        let missing = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "${SBPROXY_TEST_UNSET_REVIEW_TOKEN}"
+"#;
+        let refs = unresolved_env_references(missing);
+        assert_eq!(refs.len(), 1, "got: {refs:?}");
+        assert!(
+            refs[0].contains("${SBPROXY_TEST_UNSET_REVIEW_TOKEN}"),
+            "got: {refs:?}"
         );
     }
 

@@ -2210,7 +2210,7 @@ origins:
 |-------|------|---------|-------------|
 | `mode` | string | `gateway` | MCP operating mode. Other values fail configuration. |
 | `server_info` | object | generated defaults | Name and version returned by MCP `initialize`. |
-| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
+| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers, or `type: local` servers whose tools are declared entirely in config. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, OpenAPI `spec` or `spec_path`, local `tools[]` (a `static`, `http`, or `steps` handler per tool; see [mcp-compose.md](mcp-compose.md)), `protocol` (era pinning, default `auto`), `downgrade` (`warn`/`block` on a weaker later contact), `status` (`draft`/`approved`/`deprecated`), and operator-attested `approved_by`/`approved_at`. |
 | `rbac_policies` | map | `{}` | Named tool-access policies referenced by `federated_servers[].rbac`. |
 | `argument_policies` | list | `[]` | CEL or OPA-compatible Rego rules evaluated against the tool-call context (name, server, session, tenant, principal, parsed arguments) after RBAC and JSON-Schema validation, before dispatch. `mode: warn` (default) or `block`. |
 | `result_policies` | list | `[]` | Same CEL/Rego shape as `argument_policies`, evaluated against the tool-call result after dispatch and after `content_filters`, before the result reaches the caller. |
@@ -2233,7 +2233,9 @@ origins:
 | `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
 
 See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
-versioning, and cost attribution.
+versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
+`type: local` servers: config-declared tools, HTTP and step-DAG handlers,
+and response shaping.
 
 ### noop
 

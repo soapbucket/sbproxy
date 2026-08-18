@@ -1,6 +1,6 @@
 # MCP security coverage
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 What the gateway enforces against the OWASP MCP Top 10 (MCP01:2025 through
 MCP10:2025, currently in beta; the next revision is expected around October
@@ -23,6 +23,13 @@ reference, see [mcp.md](mcp.md) and
 are the pack's own end-to-end suite,
 [`e2e/tests/mcp_governance_pack_e2e.rs`](../e2e/tests/mcp_governance_pack_e2e.rs),
 unless otherwise noted.
+
+A composed tool (`federated_servers[].type: local`, see
+[mcp-compose.md](mcp-compose.md)) publishes into the same catalog a
+federated tool does and passes through the same per-call pipeline, so
+it intersects every row below that reads on a tool's registration,
+call, or result rather than its transport, with no separate row of
+its own.
 
 ## OWASP MCP Top 10 (2025, beta) mapping
 

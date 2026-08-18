@@ -98,6 +98,37 @@ pub struct OpenApiBacking {
     pub headers: Vec<(String, String)>,
 }
 
+/// A locally served upstream (WOR-2489): the gateway serves its own
+/// tools, no MCP or REST dial to an origin at all. Sibling to
+/// [`OpenApiBacking`], the same WOR-1648 precedent this clones: tools
+/// are declared, not fetched, so `fetch_tools_from_server` publishes
+/// them into the same catalog every other upstream's tools live in
+/// with no network round trip.
+///
+/// The actual tool handlers (`static`/`http`/`steps`) are compiled and
+/// typed one crate over, in `sbproxy-modules` (`CompiledLocalMcpServer`
+/// et al.), which itself depends on this crate -- `sbproxy-extension`
+/// cannot hold that type without an illegal reverse dependency. This
+/// struct therefore carries only what catalog registration needs: the
+/// same `name`/`description`/`inputSchema` documents `OpenApiBacking`
+/// carries for the identical reason. Dispatch resolution is a marker,
+/// not a mechanism, and stays that way even after WOR-2489 Task 3:
+/// `call_tool_with_policy_cause_and_headers_from_held_tool` still
+/// matches on `McpServerConfig::local`'s presence exactly like it
+/// matches on `openapi`'s, but the real executor lives one crate over
+/// (`sbproxy-modules::action::mcp::McpAction::execute_local_tool`),
+/// reached from `sbproxy-core::action_dispatch` before this function
+/// is ever called for a local tool. The branch here is unreachable
+/// through that path and stays only as a defensive fallback; see its
+/// doc comment below.
+#[derive(Debug, Clone)]
+pub struct LocalBacking {
+    /// Tools declared for this server (`name`/`description`/
+    /// `inputSchema`), built once at config-compile time from each
+    /// tool's compiled definition.
+    pub tools: Vec<serde_json::Value>,
+}
+
 /// Configuration for one upstream MCP server.
 #[derive(Debug, Clone, Default)]
 pub struct McpServerConfig {
@@ -113,12 +144,20 @@ pub struct McpServerConfig {
     /// spec (tools derived locally, `tools/call` dispatched as REST)
     /// rather than by speaking MCP to `url`.
     pub openapi: Option<OpenApiBacking>,
+    /// WOR-2489: when set, this upstream serves its own tools with no
+    /// dial at all, rather than by speaking MCP to `url`. Mutually
+    /// exclusive with `openapi` (a server is one kind or the other).
+    pub local: Option<LocalBacking>,
     /// Deterministic egress policy for the base MCP dial itself
     /// (`EgressPurpose::McpUpstream`, WOR-2384 / MCP09), independent
     /// of any `OpenApiBacking::egress_policy` an `openapi`-backed
     /// server also carries for its REST calls. `stdio` servers carry
     /// a policy too (uniform construction) but it is never consulted:
-    /// stdio is a local process spawn, not a network dial.
+    /// stdio is a local process spawn, not a network dial. A `local`
+    /// server's tools are gated by their own compiled `egress` policy
+    /// instead (`CompiledLocalMcpServer::egress`, in `sbproxy-modules`);
+    /// this field is present for uniform construction but never
+    /// consulted on the local path either.
     pub egress_policy: EgressPolicy,
 }
 
@@ -288,6 +327,22 @@ impl FederatedTool {
             document,
             server_name,
             streaming,
+            LegacyMetaProjection::Omit,
+        )
+    }
+
+    /// Construct a `type: local` tool (WOR-2489). Built the same way
+    /// an OpenAPI-derived tool is: no upstream ever produced `_meta`
+    /// for a config-declared tool either, so the legacy projection
+    /// omits it for the identical reason `from_openapi_document` does.
+    /// This is what makes a local tool's contract, digest, and
+    /// tool-versioning-gate treatment identical in kind to an
+    /// upstream's -- the same function builds both.
+    fn from_local_document(document: Value, server_name: String) -> Result<Self, McpContractError> {
+        Self::from_document_with_legacy_meta(
+            document,
+            server_name,
+            false,
             LegacyMetaProjection::Omit,
         )
     }
@@ -1621,6 +1676,37 @@ impl McpFederation {
             return Ok(federated);
         }
 
+        // WOR-2489: a `local` server serves tools from its own
+        // compiled config, no MCP round-trip either -- the same "no
+        // network fetch" shape as the OpenAPI arm above, reusing the
+        // same contract-building function under a name that documents
+        // why (`from_local_document`).
+        if let Some(backing) = &server.local {
+            let federated = backing
+                .tools
+                .iter()
+                .filter_map(|t| {
+                    match FederatedTool::from_local_document(t.clone(), server.name.clone()) {
+                        Ok(tool) => Some(tool),
+                        // WOR-2489 review: a local tool's document comes
+                        // from config the operator wrote, so a silent
+                        // drop means a tool they declared just is not
+                        // there. Name it.
+                        Err(e) => {
+                            warn!(
+                                server = %server.name,
+                                tool = %t.get("name").and_then(serde_json::Value::as_str).unwrap_or("<unnamed>"),
+                                error = %e,
+                                "config-declared local tool failed contract construction and will not be advertised"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
+            return Ok(federated);
+        }
+
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/list".to_string(),
@@ -1765,6 +1851,16 @@ impl McpFederation {
             .find_map(|s| capabilities.get(&s.name)?.get("mcpApps").cloned());
 
         for server in &self.servers {
+            // WOR-2489 review: an `openapi` server has no MCP endpoint
+            // to fetch resources from, and a `local` server's URL is
+            // the placeholder `local://<name>` nothing can ever dial --
+            // attempting it every refresh cycle put a warn line, an
+            // io-failure metric tick, and a permanent false positive in
+            // the egress inventory on a completely normal path.
+            // Matches `refresh_server_capabilities`' own skip.
+            if server.openapi.is_some() || server.local.is_some() {
+                continue;
+            }
             match self.fetch_resources_from_server(server).await {
                 Ok(resources) => {
                     info!(
@@ -1841,10 +1937,11 @@ impl McpFederation {
     /// before [`Self::refresh_resources`] (which reads `mcpApps` out of
     /// it) and [`Self::refresh_prompts`] (which reads `prompts`).
     ///
-    /// OpenAPI-backed upstreams are skipped: they speak REST, not MCP,
-    /// so there is no handshake to run and no capability to read.
-    /// Per-upstream failures log and continue; an upstream missing from
-    /// the snapshot simply declares nothing.
+    /// OpenAPI-backed and local (WOR-2489) upstreams are skipped: an
+    /// OpenAPI server speaks REST, not MCP, and a local server dials
+    /// nothing at all, so neither has a handshake to run or a
+    /// capability to read. Per-upstream failures log and continue; an
+    /// upstream missing from the snapshot simply declares nothing.
     ///
     /// Returns the number of upstreams that answered.
     pub async fn refresh_server_capabilities(&self) -> usize {
@@ -1867,7 +1964,7 @@ impl McpFederation {
             (*self.server_protocol_versions.load_full()).clone();
         let mut auth_required: HashMap<String, bool> = HashMap::new();
         for server in &self.servers {
-            if server.openapi.is_some() {
+            if server.openapi.is_some() || server.local.is_some() {
                 continue;
             }
             match self.fetch_server_capabilities(server).await {
@@ -2177,7 +2274,12 @@ impl McpFederation {
     pub async fn refresh_prompts(&self) -> anyhow::Result<usize> {
         let mut fetched: Vec<(String, NamespaceMode, Vec<FederatedPrompt>)> = Vec::new();
         for server in &self.servers {
-            if server.openapi.is_some() {
+            // WOR-2489 review: skip `local` servers structurally, not
+            // via the capability-map side effect below (a `local`
+            // server never appears in the capability snapshot, so
+            // `server_declares` happened to save this loop -- but that
+            // is a coincidence of refresh ordering, not a guarantee).
+            if server.openapi.is_some() || server.local.is_some() {
                 continue;
             }
             if !self.server_declares(&server.name, "prompts") {
@@ -2733,6 +2835,41 @@ impl McpFederation {
                     upstream_headers,
                 )
                 .await;
+        }
+
+        // WOR-2489 Task 3: a `local` server's tool call no longer
+        // reaches this function on the normal request path.
+        // `sbproxy-core::action_dispatch` resolves and executes a
+        // local tool's compiled handler (`static`/`http`) directly
+        // against `McpAction::local_servers`
+        // (`McpAction::execute_local_tool`) at the exact point in its
+        // gate chain this dispatch seam sits at: AFTER every
+        // governance gate above (policy hooks) and every gate the
+        // caller in `action_dispatch` already ran (RBAC, argument
+        // policies, quota, the versioning gate, content filters), but
+        // BEFORE it ever calls
+        // `call_tool_with_upstream_headers_from_snapshot` (which is
+        // what reaches here). `sbproxy-extension` cannot host that
+        // executor itself -- `LocalBacking` cannot carry the compiled
+        // `CompiledLocalToolHandler` types `sbproxy-modules` defines,
+        // since the dependency runs the other way -- so this branch is
+        // unreachable through the real request path and is kept only
+        // as a defensive fallback: a hypothetical caller that reaches
+        // this function directly, bypassing `action_dispatch`'s
+        // local-server check, must still fail closed here rather than
+        // silently succeed with nothing executed or fall through to a
+        // plain `tools/call` against a URL nothing is listening on
+        // (`server.url` is a nominal placeholder for a local server,
+        // never dialed on any real path).
+        if server.local.is_some() {
+            anyhow::bail!(
+                "mcp: local tool '{}' on server '{}' reached the federation dispatch path, \
+                 which never executes a local tool; dispatch happens in \
+                 sbproxy-core::action_dispatch before this function is called (WOR-2489 \
+                 Task 3) -- this is a defensive internal error, not an expected failure mode",
+                federated.name,
+                server.name
+            );
         }
 
         // WOR-2384: the upstream never learned the advertised
@@ -4690,6 +4827,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         }
     }
@@ -5022,6 +5160,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            local: None,
             egress_policy: EgressPolicy::default(),
         }]);
 
@@ -6447,6 +6586,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
@@ -6554,6 +6694,34 @@ mod tests {
     }
 
     // --- Federation construction ---
+
+    /// WOR-2489 review: a `local` server's URL is the placeholder
+    /// `local://<name>` -- nothing can dial it, so a resource refresh
+    /// must skip the server entirely rather than attempt (and record)
+    /// a dial every cycle. The egress inventory is the operator's
+    /// answer to "where did this proxy try to go", so even one
+    /// `local://` sighting there is a permanent self-inflicted false
+    /// positive.
+    #[tokio::test]
+    async fn wor_2489_review_refresh_resources_never_dials_a_local_server() {
+        let host = "wor2489-local-resources-skip";
+        let mut server = mock_server(host, &format!("local://{host}"));
+        server.local = Some(LocalBacking { tools: vec![] });
+        let fed = McpFederation::new(vec![server]);
+
+        fed.refresh_resources()
+            .await
+            .expect("refresh must succeed with only a local server");
+
+        let sighting = sbproxy_security::egress::egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.host == host);
+        assert!(
+            sighting.is_none(),
+            "a local server must never be dialed (or even authorized) during resource \
+             refresh, got a sighting: {sighting:?}"
+        );
+    }
 
     #[test]
     fn test_new_federation_starts_empty() {
@@ -7957,6 +8125,7 @@ mod tests {
             transport: "sse".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         assert_eq!(config.transport, "sse");
@@ -8000,6 +8169,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
@@ -8085,6 +8255,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::Always,
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
@@ -8153,6 +8324,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
 
@@ -8204,6 +8376,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         fed.authorize_mcp_upstream_dial(&ungated)
@@ -8218,6 +8391,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["127.0.0.1".to_string()],
@@ -8239,6 +8413,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["127.0.0.1".to_string()],
@@ -8287,6 +8462,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["127.0.0.1".to_string()],
@@ -8338,6 +8514,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 // allow_private so the loopback fixture pins authorize.
                 mode: crate::mcp::EgressMode::Enforce,
@@ -8393,6 +8570,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["mcp-pin-rebind.invalid".to_string()],
@@ -8451,6 +8629,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["mcp-redirect.invalid".to_string()],
@@ -8538,6 +8717,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
 
@@ -8624,6 +8804,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            local: None,
             egress_policy: EgressPolicy::default(),
         }
     }
@@ -9476,6 +9657,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
