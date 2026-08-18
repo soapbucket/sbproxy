@@ -55,6 +55,16 @@ describe("config history presentation", () => {
     const serverError = new ApiError(500, "GET /admin/config/history failed (500)", "");
     expect(isConfigHistoryDisabled(serverError)).toBe(false);
 
+    // A 503 (the block is enabled but the ring failed to open at boot)
+    // is a real error too, not the disabled empty state: an operator
+    // whose store broke needs to see that, not a "turn this on" prompt.
+    const failedToOpen = new ApiError(
+      503,
+      "GET /admin/config/history failed (503)",
+      '{"error":"config history failed to open at boot: permission denied"}',
+    );
+    expect(isConfigHistoryDisabled(failedToOpen)).toBe(false);
+
     expect(isConfigHistoryDisabled(null)).toBe(false);
   });
 });

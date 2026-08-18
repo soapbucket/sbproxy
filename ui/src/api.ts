@@ -1469,6 +1469,11 @@ export interface ConfigHistoryEntry {
   digest: string;
   provenance: string;
   state: ConfigHistoryState;
+  /** RFC 3339, UTC, millisecond precision (e.g. "2026-08-16T10:15:32.456Z").
+   *  Not epoch millis: `toDate` in `../lib/format` still handles it
+   *  correctly, but through its ISO-string branch, not its numeric-ms
+   *  heuristic -- `Number()` on an RFC 3339 string is NaN, so the
+   *  numeric branch never fires for this field. */
   applied_at: string;
   actor: string;
   blast_radius: ConfigHistoryBlastRadius | null;
@@ -1477,7 +1482,11 @@ export interface ConfigHistoryEntry {
 
 /** GET /admin/config/history. Entries arrive newest first. 404s with
  *  `{"error":"config history is not enabled"}` when
- *  proxy.config_history.enabled is off or the store is absent. */
+ *  proxy.config_history.enabled is off or the store is absent. 503s
+ *  with `{"error":"config history failed to open at boot: <reason>"}`
+ *  when the block is enabled but the ring could not open -- a real
+ *  error, not the disabled empty state; `isConfigHistoryDisabled`
+ *  (`./lib/config-history`) only ever matches the 404. */
 export interface ConfigHistoryResponse {
   lineage: string;
   lkg_revision: number | null;
@@ -1487,7 +1496,7 @@ export interface ConfigHistoryResponse {
 /** GET /admin/config/history/{digest}. `document` is the stored
  *  pre-resolution YAML; `plan_text` is the rendered plan() diff against
  *  the running config. 404s the same way as the list route, plus for an
- *  unknown digest. */
+ *  unknown digest; 503s the same way as the list route too. */
 export interface ConfigHistoryDetail {
   entry: ConfigHistoryEntry;
   document: string;

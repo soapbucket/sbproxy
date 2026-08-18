@@ -9,14 +9,23 @@
 //!
 //! [`ConfigHistoryRecorder::from_config`] opens the ring named by
 //! `proxy.config_history` once, at boot. [`install_config_history_recorder`]
-//! publishes it into a process-wide slot; the reload transaction in
-//! `crate::server::lifecycle` appends to it through
-//! [`current_config_history_recorder`], and the admin history routes (a
-//! later change) read it back the same way. A block that is absent or
-//! carries `enabled: false` means `from_config` returns `None`, nothing
-//! is ever installed, and every downstream call site treats an empty
-//! slot as a silent no-op: recording is opt-in, and an operator who
-//! never opted in pays nothing for it.
+//! publishes it into a process-wide slot as [`ConfigHistoryState::Open`];
+//! the reload transaction in `crate::server::lifecycle` appends to it
+//! through [`current_config_history_recorder`], and the admin history
+//! routes (`GET /admin/config/history` and its `/{digest}` sibling)
+//! read [`current_config_history_state`] directly so they can tell all
+//! three states apart. A block that is absent or carries `enabled:
+//! false` means `from_config` returns `None`, nothing is ever
+//! installed, and the slot stays at its default
+//! [`ConfigHistoryState::Disabled`]: recording is opt-in, and an
+//! operator who never opted in pays nothing for it. A block that is
+//! enabled but whose store fails to open (an unwritable directory, or a
+//! ring shape [`sbproxy_config::RevisionStore::open`] refuses to
+//! repair) moves the slot to [`ConfigHistoryState::Failed`] instead:
+//! the boot itself still succeeds (see [`ConfigHistoryRecorder::from_config`]'s
+//! own documentation for why), but the admin routes surface that
+//! failure explicitly rather than answering as though the operator
+//! never turned the feature on.
 //!
 //! # Never advances the last-known-good pointer
 //!
@@ -42,9 +51,9 @@
 //! dedup guarantee [`sbproxy_config::RevisionStore`] documents is
 //! unaffected.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::ArcSwap;
 use sbproxy_config::{
     AppendMetadata, BaseOrigin, ConfigHistoryConfig, RevisionEntry, RevisionStore,
     RevisionStoreError,
@@ -79,9 +88,15 @@ impl ConfigHistoryRecorder {
     /// `index.json` in the one shape
     /// [`sbproxy_config::RevisionStore::open`] refuses outright rather
     /// than repairs (a named digest with no blob, or an `lkg` pointer
-    /// naming a digest no entry carries). A boot that cannot open its
-    /// own audit trail fails loudly rather than silently running
-    /// without one.
+    /// naming a digest no entry carries). The caller
+    /// (`crate::server::lifecycle`'s boot path) does not fail the boot
+    /// over this: it logs the error and marks the process-wide slot
+    /// [`ConfigHistoryState::Failed`], so the proxy boots and serves
+    /// traffic without a history ring rather than refusing to start
+    /// over its own audit trail. The admin history routes surface that
+    /// failure explicitly (`503`) instead of answering as though the
+    /// feature were never turned on; see `GET /admin/config/history` in
+    /// `crate::admin`.
     pub fn from_config(history: Option<&ConfigHistoryConfig>) -> anyhow::Result<Option<Self>> {
         let Some(history) = history else {
             return Ok(None);
@@ -263,33 +278,95 @@ fn provenance_label(provenance: &BaseOrigin) -> &'static str {
     }
 }
 
-/// The process-wide recorder, when this node has one.
+/// Tri-state view of the process-wide config-history slot.
 ///
-/// A swap slot rather than a set-once cell so a test can install one,
-/// and so a later change can rebuild the recorder without the process
-/// having to restart. Mirrors the `PROCESS_AUTHORITY` slot in
-/// `crate::config_authority`.
-static PROCESS_CONFIG_HISTORY: ArcSwapOption<ConfigHistoryRecorder> = ArcSwapOption::const_empty();
-
-/// Install the process-wide recorder, replacing any previous one.
-pub fn install_config_history_recorder(recorder: Arc<ConfigHistoryRecorder>) {
-    PROCESS_CONFIG_HISTORY.store(Some(recorder));
+/// A plain `Option<Arc<ConfigHistoryRecorder>>` cannot tell an operator
+/// who never opted in ([`Self::Disabled`]) apart from one whose
+/// `proxy.config_history.enabled: true` node failed to open its own
+/// ring at boot ([`Self::Failed`]): both looked identical as `None`
+/// before this type existed, so `GET /admin/config/history` answered a
+/// boot-time open failure with the exact same `{"error":"config
+/// history is not enabled"}` body a node that never turned the feature
+/// on gets, silently hiding a real failure behind the opt-in empty
+/// state.
+#[derive(Clone)]
+pub enum ConfigHistoryState {
+    /// `proxy.config_history` is absent or `enabled: false`.
+    Disabled,
+    /// The store opened successfully at boot and is recording.
+    Open(Arc<ConfigHistoryRecorder>),
+    /// The block is enabled but [`ConfigHistoryRecorder::from_config`]
+    /// failed to open the store at boot (an unwritable directory, or a
+    /// ring shape [`sbproxy_config::RevisionStore::open`] refuses to
+    /// repair). The proxy still boots and serves traffic; this ring's
+    /// history is simply unavailable for the life of the process.
+    Failed {
+        /// The open error's `Display`, bounded to 256 characters so a
+        /// pathological error message cannot inflate an admin response
+        /// without bound.
+        reason: String,
+    },
 }
 
-/// The process-wide recorder, when `proxy.config_history.enabled` is
-/// true on this node. `None` is not an error: it is what an operator
-/// who never opted in sees, and every call site here treats it as a
-/// no-op.
+/// The process-wide config-history slot.
+///
+/// Lazily initialized to [`ConfigHistoryState::Disabled`] rather than
+/// given a `const` initializer directly: [`ArcSwap::from_pointee`]
+/// allocates, so it cannot run at const-eval time the way
+/// `ArcSwapOption::const_empty()` (this slot's shape before it needed a
+/// third state) could. Mirrors the lazily-initialized `PIPELINE` slot
+/// in `crate::reload`.
+static PROCESS_CONFIG_HISTORY: OnceLock<ArcSwap<ConfigHistoryState>> = OnceLock::new();
+
+fn process_config_history_slot() -> &'static ArcSwap<ConfigHistoryState> {
+    PROCESS_CONFIG_HISTORY.get_or_init(|| ArcSwap::from_pointee(ConfigHistoryState::Disabled))
+}
+
+/// Install the process-wide recorder, replacing whatever state (open,
+/// failed, or disabled) was there before.
+pub fn install_config_history_recorder(recorder: Arc<ConfigHistoryRecorder>) {
+    process_config_history_slot().store(Arc::new(ConfigHistoryState::Open(recorder)));
+}
+
+/// Mark the process-wide slot [`ConfigHistoryState::Failed`]: the block
+/// was enabled, but [`ConfigHistoryRecorder::from_config`] could not
+/// open the store. Called once, from `crate::server::lifecycle`'s boot
+/// path, when that open fails.
+pub fn install_config_history_failure(reason: &str) {
+    let bounded: String = reason.chars().take(256).collect();
+    process_config_history_slot().store(Arc::new(ConfigHistoryState::Failed { reason: bounded }));
+}
+
+/// The process-wide slot's current state: disabled, open, or failed to
+/// open at boot. The admin history routes read this directly so they
+/// can distinguish all three; [`current_config_history_recorder`]
+/// below collapses `Failed` and `Disabled` together for the one caller
+/// (the reload transaction) that only ever needs "is there a ring to
+/// append to".
+#[must_use]
+pub fn current_config_history_state() -> Arc<ConfigHistoryState> {
+    process_config_history_slot().load_full()
+}
+
+/// The process-wide recorder, when the slot is
+/// [`ConfigHistoryState::Open`]. `None` for both `Disabled` and
+/// `Failed`: the reload transaction that calls this only ever needs to
+/// know whether there is a ring to append to, not why there might not
+/// be one. See [`current_config_history_state`] for the distinction the
+/// admin routes need.
 #[must_use]
 pub fn current_config_history_recorder() -> Option<Arc<ConfigHistoryRecorder>> {
-    PROCESS_CONFIG_HISTORY.load_full()
+    match &*current_config_history_state() {
+        ConfigHistoryState::Open(recorder) => Some(Arc::clone(recorder)),
+        ConfigHistoryState::Disabled | ConfigHistoryState::Failed { .. } => None,
+    }
 }
 
-/// Drop the process-wide recorder. Used by tests that must not leak one
-/// into the next case.
+/// Drop the process-wide recorder, resetting the slot to `Disabled`.
+/// Used by tests that must not leak state into the next case.
 #[cfg(test)]
 pub(crate) fn clear_config_history_recorder() {
-    PROCESS_CONFIG_HISTORY.store(None);
+    process_config_history_slot().store(Arc::new(ConfigHistoryState::Disabled));
 }
 
 #[cfg(test)]
@@ -359,6 +436,59 @@ mod tests {
         assert!(current_config_history_recorder().is_some());
         clear_config_history_recorder();
         assert!(current_config_history_recorder().is_none());
+    }
+
+    #[test]
+    fn the_slot_defaults_to_disabled() {
+        clear_config_history_recorder();
+        assert!(matches!(
+            &*current_config_history_state(),
+            ConfigHistoryState::Disabled
+        ));
+        assert!(current_config_history_recorder().is_none());
+    }
+
+    #[test]
+    fn a_boot_failure_marks_the_slot_failed_distinctly_from_disabled() {
+        clear_config_history_recorder();
+        install_config_history_failure("open config history store 'x': permission denied");
+        match &*current_config_history_state() {
+            ConfigHistoryState::Failed { reason } => {
+                assert!(reason.contains("permission denied"));
+            }
+            other => panic!("expected Failed, not {}", failed_variant_name(other)),
+        }
+        // The one caller that only needs "is there a ring to append to"
+        // must not be able to tell Failed and Disabled apart: both are
+        // `None` there. Only `current_config_history_state` carries the
+        // distinction the admin routes need.
+        assert!(
+            current_config_history_recorder().is_none(),
+            "a failed-to-open store must not look like an open one to the reload transaction"
+        );
+        clear_config_history_recorder();
+    }
+
+    #[test]
+    fn a_failure_reason_is_bounded_to_256_characters() {
+        clear_config_history_recorder();
+        let huge_reason = "x".repeat(10_000);
+        install_config_history_failure(&huge_reason);
+        match &*current_config_history_state() {
+            ConfigHistoryState::Failed { reason } => {
+                assert_eq!(reason.chars().count(), 256);
+            }
+            other => panic!("expected Failed, not {}", failed_variant_name(other)),
+        }
+        clear_config_history_recorder();
+    }
+
+    fn failed_variant_name(state: &ConfigHistoryState) -> &'static str {
+        match state {
+            ConfigHistoryState::Disabled => "Disabled",
+            ConfigHistoryState::Open(_) => "Open",
+            ConfigHistoryState::Failed { .. } => "Failed",
+        }
     }
 
     fn metadata(actor: &str) -> AppendMetadata {

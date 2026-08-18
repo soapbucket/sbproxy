@@ -1604,12 +1604,22 @@ on and the retention it applies.
 | `entries` | array | Newest first. |
 | `entries[].revision` | number | Node-local, monotonic. Durable across restart, never reused. |
 | `entries[].digest` | string | SHA-256 of the pre-resolution document, lowercase hex, no scheme prefix. |
-| `entries[].provenance` | string | `local_file`, `git`, `authority`, or `merged`. |
+| `entries[].provenance` | string | `local_file`, `git`, `authority`, or `merged`. This release emits `local_file` and `git` only; see the note below. |
 | `entries[].state` | string | `applied`, `good`, `failed`, or `reverted`. |
 | `entries[].applied_at` | string | RFC 3339. |
 | `entries[].actor` | string | Operator id, `"boot"`, or the config authority's identity, when known. May be empty. |
 | `entries[].blast_radius` | string or null | `hitless`, `reload`, `restart`, or `breaking`, against the previous entry. `null` for the ring's first entry. |
 | `entries[].degraded` | array of strings | Subsystems that did not apply cleanly when this revision applied. Empty for a fully applied revision. |
+
+`provenance` is a four-value vocabulary going forward, but this release can
+only ever emit `local_file` or `git`. What is stored is where the *base*
+document came from before any config-authority overlay merged into it, not
+whether an overlay was involved; distinguishing `authority` (fully
+authority-sourced) and `merged` (base plus an authority overlay) needs the
+per-leaf provenance map `GET /admin/config/effective` already computes to be
+threaded into the ring's write path, which has not happened yet. An
+authority-merged or `source:`-refreshed revision still records `local_file`
+or `git` here today, whichever the base document was.
 
 Read-only operators may call this.
 
@@ -1617,6 +1627,7 @@ Read-only operators may call this.
 |---|---|
 | `200` | Ring read successfully. |
 | `404` | `proxy.config_history` is absent or `enabled: false`. Body: `{"error": "config history is not enabled"}`. |
+| `503` | The block is enabled but the ring failed to open at boot (an unwritable directory, or a shape it refuses to repair). Body: `{"error": "config history failed to open at boot: <reason>"}`. The proxy is otherwise running normally; only this ring is unavailable. Check the boot log for the same reason. |
 
 The ring is a local audit trail today. Nothing in this response promotes an
 entry, and nothing here moves the `lkg_revision` pointer; see
@@ -1659,7 +1670,8 @@ Read-only operators may call this.
 | Status | When |
 |---|---|
 | `200` | Entry found. |
-| `404` | `proxy.config_history` is absent or `enabled: false` (`{"error": "config history is not enabled"}`), or `digest` names no entry in the ring. |
+| `404` | `proxy.config_history` is absent or `enabled: false` (`{"error": "config history is not enabled"}`), or `digest` names no entry in the ring (`{"error": "unknown digest"}`). |
+| `503` | The block is enabled but the ring failed to open at boot. Same body shape as [`GET /admin/config/history`](#get-adminconfighistory)'s `503`. |
 
 ### `GET`, `PUT` `/admin/log-level`
 

@@ -1332,19 +1332,26 @@ fn record_applied_config_revision(input: RevisionRecordingInput<'_>, outcome: &R
 /// this process's boot entry.
 ///
 /// Split out of `run` so boot's own wiring is unit-testable without
-/// booting a full server: a `None` block, a disabled block, and an
-/// unopenable store are each exercised directly against this function
-/// rather than only indirectly through `run`.
+/// booting a full server: `boot_path_records_a_ring_entry` (the happy
+/// path) and `boot_path_marks_the_slot_failed_when_the_store_cannot_open`
+/// (the unopenable-store path) both exercise this function directly.
+/// The `None`/disabled-block cases are exercised indirectly, through
+/// `ConfigHistoryRecorder::from_config`'s own tests in
+/// `crate::config_history`: this function's `Ok(None) => {}` arm has
+/// nothing of its own to test beyond what those already cover.
 ///
 /// `ConfigHistoryRecorder::from_config` returns `None` for an absent or
 /// disabled block, so this is a no-op on every node that has not opted
-/// in. A store that fails to open is logged and otherwise swallowed: a
-/// boot that has already published its pipeline must not fail over its
-/// own audit trail. `"boot"` is the fixed actor; boot has no
-/// degraded-subsystem concept of its own (it hard-fails via `?` instead
-/// of continuing in a degraded state), so `ReloadOutcome::default`'s
-/// empty, fully-applied outcome is exactly right for the entry's
-/// `degraded` list.
+/// in. A store that fails to open is logged and marks the process-wide
+/// slot [`crate::config_history::ConfigHistoryState::Failed`] rather
+/// than propagating: a boot that has already published its pipeline
+/// must not fail over its own audit trail, but the admin history routes
+/// still surface the failure (`503`) instead of answering as though the
+/// feature were never turned on. `"boot"` is the fixed actor; boot has
+/// no degraded-subsystem concept of its own (it hard-fails via `?`
+/// instead of continuing in a degraded state), so
+/// `ReloadOutcome::default`'s empty, fully-applied outcome is exactly
+/// right for the entry's `degraded` list.
 fn record_boot_config_revision(
     history: Option<&sbproxy_config::ConfigHistoryConfig>,
     content: &[u8],
@@ -1367,10 +1374,18 @@ fn record_boot_config_revision(
         }
         Ok(None) => {}
         Err(error) => {
+            // Contained, not fatal: a boot that has already validated
+            // and is about to publish its pipeline must not fail over
+            // its own audit trail. The admin history routes surface
+            // this explicitly (503) rather than the "not enabled" 404 a
+            // node that never opted in gets, so an operator sees the
+            // real cause instead of a silently missing ring.
             tracing::error!(
                 error = %error,
-                "config history: failed to open the revision ring at boot"
+                "config history: failed to open the revision ring at boot; the proxy is \
+                 booting without one"
             );
+            crate::config_history::install_config_history_failure(&error.to_string());
         }
     }
 }
@@ -7094,6 +7109,61 @@ egress:
         assert_eq!(entries[0].actor.as_deref(), Some("boot"));
         assert_eq!(entries[0].provenance, sbproxy_config::BaseOrigin::Local);
         assert_eq!(entries[0].state, sbproxy_config::RevisionState::Applied);
+    }
+
+    #[test]
+    fn boot_path_marks_the_slot_failed_when_the_store_cannot_open() {
+        crate::config_history::clear_config_history_recorder();
+        // `/` is always a real directory, root-owned, and not writable
+        // by an ordinary user: `RevisionStore::open`'s `create_dir_all`
+        // on a subdirectory of it fails with a permission error for any
+        // process that is not itself root. The same "well-known
+        // unwritable root-owned directory" fixture
+        // `ownership_store_rejects_a_directory_owned_by_another_uid` in
+        // `sbproxy-model-host` uses, chosen over `chmod`-ing a temp
+        // directory because `create_private_dir_all` self-heals a temp
+        // directory it owns back to 0700 before the open would even
+        // reach the permission check those tests rely on.
+        let unwritable_dir = "/sbproxy-config-history-unwritable-fixture-do-not-create";
+        let history = sbproxy_config::ConfigHistoryConfig {
+            enabled: true,
+            dir: unwritable_dir.to_string(),
+            ..Default::default()
+        };
+
+        record_boot_config_revision(
+            Some(&history),
+            b"proxy: {}\n# boot\n",
+            sbproxy_config::BaseOrigin::Local,
+        );
+
+        match &*crate::config_history::current_config_history_state() {
+            crate::config_history::ConfigHistoryState::Open(_) => {
+                // This process can write under `/` (running as root, or
+                // some other environment where the fixture's premise
+                // does not hold): the failure this test exists to
+                // exercise cannot be produced here. Not a false pass --
+                // there is nothing to assert against in this
+                // environment, so the test simply has nothing to say.
+            }
+            crate::config_history::ConfigHistoryState::Failed { reason } => {
+                assert!(
+                    !reason.is_empty(),
+                    "a failed boot open must carry a non-empty reason"
+                );
+                // The proxy is still up: nothing here panicked or
+                // propagated past `record_boot_config_revision`, which
+                // returns `()` and was called exactly as `run` calls it
+                // right after publishing the pipeline.
+            }
+            crate::config_history::ConfigHistoryState::Disabled => {
+                panic!(
+                    "an enabled block whose store failed to open must mark the slot Failed, \
+                     not leave it Disabled"
+                );
+            }
+        }
+        crate::config_history::clear_config_history_recorder();
     }
 
     #[test]

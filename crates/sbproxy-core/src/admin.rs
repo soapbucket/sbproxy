@@ -1858,25 +1858,56 @@ fn handle_config_write(
 
 // --- /admin/config/history ---
 
+/// Resolve the process-wide config-history slot to an open recorder, or
+/// a ready-to-return response for the two states that are not open.
+///
+/// `404` with `{"error":"config history is not enabled"}` for
+/// [`crate::config_history::ConfigHistoryState::Disabled`] -- the UI's
+/// `isConfigHistoryDisabled` (`ui/src/lib/config-history.ts`) matches
+/// this exact body to render an opt-in empty state instead of an error
+/// toast, so the wording is part of the contract, not incidental.
+///
+/// `503` for [`crate::config_history::ConfigHistoryState::Failed`]: the
+/// block was enabled but the store could not open at boot. Answering
+/// this the same way as `Disabled` would tell an operator whose ring
+/// failed to open that the feature was never turned on, which is worse
+/// than saying nothing -- it reads as "you forgot to enable this"
+/// rather than "this broke". `reason` already carries only the bounded,
+/// no-secrets-by-construction open-error text
+/// [`crate::config_history::ConfigHistoryState::Failed`] documents (an
+/// unwritable path, a corrupt-ring shape `RevisionStore::open` names),
+/// so it is safe to echo back verbatim past the one JSON-quote escape
+/// every hand-built error body here already applies.
+fn config_history_open_recorder(
+) -> Result<Arc<crate::config_history::ConfigHistoryRecorder>, (u16, &'static str, String)> {
+    match &*crate::config_history::current_config_history_state() {
+        crate::config_history::ConfigHistoryState::Open(recorder) => Ok(Arc::clone(recorder)),
+        crate::config_history::ConfigHistoryState::Disabled => Err((
+            404,
+            "application/json",
+            r#"{"error":"config history is not enabled"}"#.to_string(),
+        )),
+        crate::config_history::ConfigHistoryState::Failed { reason } => Err((
+            503,
+            "application/json",
+            format!(
+                r#"{{"error":"config history failed to open at boot: {}"}}"#,
+                reason.replace('"', "'")
+            ),
+        )),
+    }
+}
+
 /// `GET /admin/config/history`: every recorded config revision, newest
 /// first, alongside this ring's lineage identity and last-known-good
 /// revision.
 ///
-/// `404`s with `{"error":"config history is not enabled"}` when
-/// `proxy.config_history.enabled` is off or the block is absent, which
-/// is exactly when
-/// [`crate::config_history::current_config_history_recorder`] reports
-/// `None`. The UI matches this exact string
-/// (`isConfigHistoryDisabled` in `ui/src/lib/config-history.ts`) to
-/// render an opt-in empty state instead of an error toast, so the
-/// wording is part of the contract, not incidental.
+/// `404`/`503` per [`config_history_open_recorder`] when the slot is
+/// not open.
 fn handle_config_history_list() -> (u16, &'static str, String) {
-    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
-        return (
-            404,
-            "application/json",
-            r#"{"error":"config history is not enabled"}"#.to_string(),
-        );
+    let recorder = match config_history_open_recorder() {
+        Ok(recorder) => recorder,
+        Err(response) => return response,
     };
     let mut entries = recorder.entries();
     // The ring stores oldest first; the response contract is newest
@@ -1896,9 +1927,9 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
 /// document for one ring entry, plus a `plan()` diff of that document
 /// against what this node is running right now.
 ///
-/// `404`s the same way as the list route when config history is not
-/// enabled, and additionally with `{"error":"unknown digest"}` when no
-/// entry in the ring names `digest`.
+/// `404`/`503` per [`config_history_open_recorder`] when the slot is
+/// not open, and additionally `404` with `{"error":"unknown digest"}`
+/// when the slot is open but no entry in the ring names `digest`.
 ///
 /// `document` is returned byte for byte as the ring stored it: the raw
 /// text read before `${VAR}` / `vault://` / `secret://` interpolation
@@ -1908,12 +1939,9 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
 /// would change if this were applied now", the question an operator
 /// browsing history is actually asking.
 fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'static str, String) {
-    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
-        return (
-            404,
-            "application/json",
-            r#"{"error":"config history is not enabled"}"#.to_string(),
-        );
+    let recorder = match config_history_open_recorder() {
+        Ok(recorder) => recorder,
+        Err(response) => return response,
     };
     let Some(entry) = recorder
         .entries()
@@ -1993,18 +2021,39 @@ fn config_history_plan_text(state: &AdminState, stored_document: &str) -> String
 /// than derived from the entry's own `Serialize` impl: that impl also
 /// carries `soak_verdict` and `boot_attempts`, which are not part of
 /// this contract and nothing writes yet, and it would emit `applied_at`
-/// as a JSON number where the contract is a string.
+/// as a JSON number of unix milliseconds where the contract is an RFC
+/// 3339 string.
 fn config_history_entry_json(entry: &sbproxy_config::RevisionEntry) -> serde_json::Value {
     serde_json::json!({
         "revision": entry.revision,
         "digest": entry.digest,
         "provenance": config_history_provenance_label(&entry.provenance),
         "state": config_history_state_label(entry.state),
-        "applied_at": entry.applied_at.to_string(),
+        "applied_at": config_history_rfc3339(entry.applied_at),
         "actor": entry.actor.clone().unwrap_or_default(),
         "blast_radius": entry.blast_radius.map(config_history_blast_radius_label),
         "degraded": entry.degraded,
     })
+}
+
+/// `applied_at_ms` (unix milliseconds, as every [`sbproxy_config::RevisionEntry`]
+/// stores it) rendered as RFC 3339 UTC with millisecond precision, the
+/// wire format `docs/admin-api-reference.md` documents for
+/// `entries[].applied_at` and the same idiom `handle_reload`'s
+/// `loaded_at` uses (`chrono::Utc::now().to_rfc3339()`), here applied to
+/// a stored instant instead of "now".
+///
+/// Falls back to the plain millisecond number as a string on the
+/// pathological overflow [`chrono::DateTime::from_timestamp_millis`]
+/// refuses (an instant so far in the future or past it cannot be
+/// represented): still a string, as the contract requires, just not
+/// RFC 3339 in that unreachable-in-practice case.
+fn config_history_rfc3339(applied_at_ms: u64) -> String {
+    let millis = i64::try_from(applied_at_ms).unwrap_or(i64::MAX);
+    match chrono::DateTime::from_timestamp_millis(millis) {
+        Some(when) => when.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        None => applied_at_ms.to_string(),
+    }
 }
 
 /// Provenance label in the four-way vocabulary
@@ -6882,9 +6931,12 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             assert_eq!(keys, expected_keys, "entry: {entry}");
+            let applied_at = entry["applied_at"]
+                .as_str()
+                .expect("applied_at must be a string");
             assert!(
-                entry["applied_at"].is_string(),
-                "applied_at must be a string: {entry}"
+                chrono::DateTime::parse_from_rfc3339(applied_at).is_ok(),
+                "applied_at must parse as RFC 3339: {applied_at}"
             );
             assert!(
                 entry["actor"].is_string(),
@@ -6948,6 +7000,45 @@ mod tests {
         crate::config_history::clear_config_history_recorder();
         assert_eq!(status, 404);
         assert_eq!(body, r#"{"error":"unknown digest"}"#);
+    }
+
+    /// The route distinction for all three slot states: `Disabled` ->
+    /// the existing 404, `Failed` -> a distinct 503 naming the reason,
+    /// `Open` -> 200. `Disabled` and `Open` are already covered by
+    /// their own tests above; this one is the `Failed` third of the
+    /// same claim, on both routes.
+    #[test]
+    fn config_history_routes_distinguish_failed_from_disabled_and_open() {
+        crate::config_history::clear_config_history_recorder();
+        crate::config_history::install_config_history_failure(
+            "open config history store '/no/such/place': permission denied",
+        );
+        let state = make_state();
+
+        let (status, _, body) = handle_config_history_list();
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            r#"{"error":"config history failed to open at boot: open config history store '/no/such/place': permission denied"}"#
+        );
+
+        let (status, _, body) = handle_config_history_detail(&state, "any-digest");
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            r#"{"error":"config history failed to open at boot: open config history store '/no/such/place': permission denied"}"#
+        );
+
+        // And through the full auth-gated dispatch, not just the
+        // handler functions directly: a 503 is not a 404, and a
+        // Failed slot is not a 401 either.
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/history", &state, Some(&auth), None);
+        assert_eq!(status, 503);
+        assert!(body.contains("failed to open at boot"), "{body}");
+
+        crate::config_history::clear_config_history_recorder();
     }
 
     #[test]

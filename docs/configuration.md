@@ -903,6 +903,12 @@ The directory is a one-process durability boundary, not shared fleet state,
 the same as [`compression_state`](#compression_state): a config authority
 publish can never repoint or clear it.
 
+Enabling or changing config history storage requires restart. The ring
+recorder is built once at boot, right after the pipeline publishes; a hot
+reload that flips `enabled` from `false` to `true`, or repoints `dir`, does
+not open (or reopen) it. Restart the process for a change to this block to
+take effect, the same as [`compression_state`](#compression_state).
+
 For what the ring records today, and what it deliberately does not do yet,
 see [operator-runbook.md](operator-runbook.md#config-history-ring). The
 admin routes that read it back are documented in
