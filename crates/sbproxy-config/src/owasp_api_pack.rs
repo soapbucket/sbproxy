@@ -182,6 +182,25 @@ impl PackItem {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// The official OWASP API Security Top 10 (2023) title for this
+    /// item, verbatim (WOR-2491 task 4: pinned by the manifest admin
+    /// endpoint contract and rendered by `sbproxy plan`'s text output).
+    /// Matches this variant's own doc comment above.
+    pub fn title(self) -> &'static str {
+        match self {
+            PackItem::Api1 => "Broken Object Level Authorization",
+            PackItem::Api2 => "Broken Authentication",
+            PackItem::Api3 => "Broken Object Property Level Authorization",
+            PackItem::Api4 => "Unrestricted Resource Consumption",
+            PackItem::Api5 => "Broken Function Level Authorization",
+            PackItem::Api6 => "Unrestricted Access to Sensitive Business Flows",
+            PackItem::Api7 => "Server Side Request Forgery",
+            PackItem::Api8 => "Security Misconfiguration",
+            PackItem::Api9 => "Improper Inventory Management",
+            PackItem::Api10 => "Unsafe Consumption of APIs",
+        }
+    }
 }
 
 /// Pack-wide or per-item enforcement posture.
@@ -205,6 +224,29 @@ impl PackPosture {
             "report_only" => Some(PackPosture::ReportOnly),
             _ => None,
         }
+    }
+
+    /// The wire label used by the manifest admin endpoint and by
+    /// `sbproxy plan`'s text renderer (WOR-2491 task 4): the same two
+    /// spellings this enum's `Serialize` impl produces, exposed as a
+    /// plain function so a text-only caller (the plan renderer) does
+    /// not need to round-trip through `serde_json::to_value` to get
+    /// the same string a JSON caller sees.
+    pub fn label(self) -> &'static str {
+        match self {
+            PackPosture::Enforce => "enforce",
+            PackPosture::ReportOnly => "report_only",
+        }
+    }
+}
+
+impl Default for PackPosture {
+    /// `report_only`: the same default `expand_owasp_pack` falls back
+    /// to when the operator's `owasp_api_top10` entry omits `posture`
+    /// entirely, so an operator dropping in `enable: all` sight-unseen
+    /// does not start every synthesized item out blocking traffic.
+    fn default() -> Self {
+        PackPosture::ReportOnly
     }
 }
 
@@ -239,6 +281,25 @@ pub enum PackItemState {
     /// for it yet, or (per the design sketch) it has no gateway
     /// control today. The `reason` field says which.
     NotCovered,
+}
+
+impl PackItemState {
+    /// The wire label used by the manifest admin endpoint and by
+    /// `sbproxy plan`'s text renderer (WOR-2491 task 4): the same
+    /// five spellings this enum's `Serialize` impl produces
+    /// (`#[serde(rename_all = "snake_case")]`), exposed as a plain
+    /// function so a text-only caller (the plan renderer) does not
+    /// need to round-trip through `serde_json::to_value` to get the
+    /// same string a JSON caller sees.
+    pub fn label(self) -> &'static str {
+        match self {
+            PackItemState::Enforced => "enforced",
+            PackItemState::ReportOnly => "report_only",
+            PackItemState::OperatorAuthored => "operator_authored",
+            PackItemState::NeedsOperatorInput => "needs_operator_input",
+            PackItemState::NotCovered => "not_covered",
+        }
+    }
 }
 
 /// One item's outcome inside a [`PackManifest`].
@@ -285,6 +346,15 @@ pub struct PackManifest {
     /// One entry per item named in `enable` (or all ten, for
     /// `enable: all`), in [`PackItem::ALL`] order.
     pub entries: Vec<PackManifestEntry>,
+    /// The pack-wide posture this origin's `owasp_api_top10` entry
+    /// declared (`posture:`, defaulting to [`PackPosture::ReportOnly`]
+    /// when absent). WOR-2491 task 4: this is the single `posture`
+    /// value the manifest admin endpoint and `sbproxy plan` surface
+    /// per origin. A `per_item.<name>.posture` override changes what
+    /// that one item's synthesized JSON carries (see
+    /// [`synth_object_authz`]) without changing this field; this is
+    /// the pack-wide default, not a per-item resolved value.
+    pub posture: PackPosture,
 }
 
 impl PackManifest {
@@ -1264,7 +1334,10 @@ pub(crate) fn expand_owasp_pack(
         });
     }
 
-    Ok(Some(PackManifest { entries }))
+    Ok(Some(PackManifest {
+        entries,
+        posture: pack_posture,
+    }))
 }
 
 #[cfg(test)]
@@ -1509,6 +1582,74 @@ mod tests {
                 manifest.entry_for(item).is_some(),
                 "{item:?} missing from manifest"
             );
+        }
+    }
+
+    #[test]
+    fn manifest_posture_defaults_to_report_only() {
+        // WOR-2491 task 4: the manifest admin endpoint and `sbproxy
+        // plan` both surface this field per origin.
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api1"],
+        }));
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+            .expect("expand")
+            .expect("some");
+        assert_eq!(manifest.posture, PackPosture::ReportOnly);
+        assert_eq!(manifest.posture.label(), "report_only");
+    }
+
+    #[test]
+    fn manifest_posture_reflects_explicit_pack_wide_value() {
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api1"],
+            "posture": "enforce",
+        }));
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false)
+            .expect("expand")
+            .expect("some");
+        assert_eq!(manifest.posture, PackPosture::Enforce);
+        assert_eq!(manifest.posture.label(), "enforce");
+    }
+
+    #[test]
+    fn item_titles_match_official_owasp_2023_names() {
+        // Pinned verbatim (WOR-2491 task 4): the manifest admin
+        // endpoint contract and `sbproxy plan`'s text renderer both
+        // surface these exact strings.
+        let expected = [
+            (PackItem::Api1, "Broken Object Level Authorization"),
+            (PackItem::Api2, "Broken Authentication"),
+            (PackItem::Api3, "Broken Object Property Level Authorization"),
+            (PackItem::Api4, "Unrestricted Resource Consumption"),
+            (PackItem::Api5, "Broken Function Level Authorization"),
+            (
+                PackItem::Api6,
+                "Unrestricted Access to Sensitive Business Flows",
+            ),
+            (PackItem::Api7, "Server Side Request Forgery"),
+            (PackItem::Api8, "Security Misconfiguration"),
+            (PackItem::Api9, "Improper Inventory Management"),
+            (PackItem::Api10, "Unsafe Consumption of APIs"),
+        ];
+        for (item, title) in expected {
+            assert_eq!(item.title(), title, "{item:?}");
+        }
+    }
+
+    #[test]
+    fn item_state_labels_match_the_manifest_endpoint_contract() {
+        let expected = [
+            (PackItemState::Enforced, "enforced"),
+            (PackItemState::ReportOnly, "report_only"),
+            (PackItemState::OperatorAuthored, "operator_authored"),
+            (PackItemState::NeedsOperatorInput, "needs_operator_input"),
+            (PackItemState::NotCovered, "not_covered"),
+        ];
+        for (state, label) in expected {
+            assert_eq!(state.label(), label, "{state:?}");
         }
     }
 

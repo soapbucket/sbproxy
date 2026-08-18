@@ -1054,6 +1054,63 @@ fn render_target_health() -> String {
     .to_string()
 }
 
+// --- OWASP API Security Top 10 pack manifest ---
+
+/// `GET /admin/owasp-api-pack`: per-origin outcome of expanding each
+/// origin's `owasp_api_top10` pack entry (WOR-2491), computed once at
+/// compile time by `sbproxy_config::owasp_api_pack::expand_owasp_pack`
+/// and carried on `CompiledOrigin::owasp_pack_manifest`. An origin
+/// with no `owasp_api_top10` policy is absent from `origins`
+/// entirely; a config with no pack anywhere returns
+/// `{"origins":{}}`.
+///
+/// The JSON shape here is a controller-ruled contract shared verbatim
+/// with the docs task and with `sbproxy plan`'s text renderer
+/// (`sbproxy_config::plan::render_text`): `item`/`title`/`state`/
+/// `reason`/`synthesized` per row, `enabled`/`posture`/`items` per
+/// origin. See the plan's `manifest-endpoint-contract.md` for the
+/// full pinned shape.
+fn handle_owasp_api_pack() -> (u16, &'static str, String) {
+    let pipeline = crate::reload::current_pipeline();
+    let mut origins = serde_json::Map::new();
+    for origin in pipeline.config.origins.iter() {
+        let Some(manifest) = origin.owasp_pack_manifest.as_ref() else {
+            continue;
+        };
+        let enabled: Vec<&'static str> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.item.canonical_name())
+            .collect();
+        let items: Vec<serde_json::Value> = manifest
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "item": entry.item.canonical_name(),
+                    "title": entry.item.title(),
+                    "state": entry.state.label(),
+                    "reason": entry.reason,
+                    "synthesized": entry.synthesized_types,
+                })
+            })
+            .collect();
+        origins.insert(
+            origin.hostname.to_string(),
+            serde_json::json!({
+                "enabled": enabled,
+                "posture": manifest.posture.label(),
+                "items": items,
+            }),
+        );
+    }
+    (
+        200,
+        "application/json",
+        serde_json::json!({ "origins": origins }).to_string(),
+    )
+}
+
 // --- OpenAPI rendering ---
 
 /// Render the live pipeline's OpenAPI document as JSON or YAML.
@@ -2960,6 +3017,20 @@ pub fn handle_admin_request(
     if path_only == "/admin/config/effective" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_effective(state);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2491: per-origin outcome of the owasp_api_top10 pack, read
+    // off the live compiled pipeline. Read-only; gated by the same
+    // operator-auth check every route past this point already sits
+    // behind.
+    if path_only == "/admin/owasp-api-pack" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_owasp_api_pack();
         }
         return (
             405,
@@ -8344,5 +8415,204 @@ origins:
         assert!(!constant_time_eq(b"admin-password", b"admin-passworX"));
         assert!(!constant_time_eq(b"admin-password", b"admin-passwor"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    // --- WOR-2491 task 4: GET /admin/owasp-api-pack ------------------
+
+    /// Compiles `yaml` and installs it as the live pipeline, the same
+    /// `compile_config` -> `CompiledPipeline::from_config` ->
+    /// `load_pipeline` idiom `canonical_pipeline_publish_installs_compiled_flags_for_cel`
+    /// (`reload.rs`) already uses.
+    fn install_test_pipeline(yaml: &str) {
+        use crate::pipeline::CompiledPipeline;
+        let compiled = sbproxy_config::compile_config(yaml).expect("test config compiles");
+        let pipeline = CompiledPipeline::from_config(compiled).expect("pipeline compiles");
+        crate::reload::load_pipeline(pipeline);
+    }
+
+    #[test]
+    fn owasp_api_pack_endpoint_requires_auth() {
+        install_test_pipeline(
+            r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+"#,
+        );
+        let state = make_state();
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/owasp-api-pack", &state, None, None);
+        assert_eq!(status, 401, "got body: {body}");
+    }
+
+    #[test]
+    fn owasp_api_pack_endpoint_only_answers_get() {
+        install_test_pipeline(
+            r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+"#,
+        );
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for method in ["PUT", "POST", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/owasp-api-pack", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+    }
+
+    #[test]
+    fn owasp_api_pack_endpoint_no_pack_anywhere_returns_empty_origins() {
+        install_test_pipeline(
+            r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+"#,
+        );
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/owasp-api-pack", &state, Some(&auth), None);
+        assert_eq!(status, 200, "got body: {body}");
+        assert_eq!(body, r#"{"origins":{}}"#);
+    }
+
+    #[test]
+    fn owasp_api_pack_endpoint_enable_all_matches_contract_shape() {
+        install_test_pipeline(
+            r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: all
+"#,
+        );
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/owasp-api-pack", &state, Some(&auth), None);
+        assert_eq!(status, 200, "got body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let origin = &json["origins"]["api.example.com"];
+        assert!(!origin.is_null(), "got: {body}");
+
+        let enabled = origin["enabled"].as_array().expect("enabled array");
+        assert_eq!(enabled.len(), 10, "enable: all covers all ten items");
+        assert_eq!(origin["posture"], "report_only");
+
+        let items = origin["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 10, "one row per enabled item");
+
+        // Every row carries exactly the contract's five keys.
+        for item in items {
+            let obj = item.as_object().expect("item is an object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["item", "reason", "state", "synthesized", "title"],
+                "got: {item}"
+            );
+        }
+
+        let find = |name: &str| {
+            items
+                .iter()
+                .find(|it| it["item"] == name)
+                .unwrap_or_else(|| panic!("missing item {name} in {items:?}"))
+        };
+
+        // Field-for-field spot checks against the pinned contract,
+        // including the official OWASP 2023 titles.
+        let api1 = find("api1");
+        assert_eq!(api1["title"], "Broken Object Level Authorization");
+        assert_eq!(api1["state"], "needs_operator_input");
+        assert!(!api1["reason"].as_str().unwrap().is_empty());
+        assert_eq!(api1["synthesized"], serde_json::json!(["object_authz"]));
+
+        let api2 = find("api2");
+        assert_eq!(api2["title"], "Broken Authentication");
+        assert_eq!(api2["state"], "not_covered");
+        assert_eq!(api2["synthesized"], serde_json::json!([]));
+
+        let api3 = find("api3");
+        assert_eq!(api3["title"], "Broken Object Property Level Authorization");
+
+        let api4 = find("api4");
+        assert_eq!(api4["title"], "Unrestricted Resource Consumption");
+        assert_eq!(api4["state"], "enforced");
+        assert_eq!(api4["synthesized"].as_array().unwrap().len(), 4);
+
+        let api5 = find("api5");
+        assert_eq!(api5["title"], "Broken Function Level Authorization");
+
+        let api6 = find("api6");
+        assert_eq!(
+            api6["title"],
+            "Unrestricted Access to Sensitive Business Flows"
+        );
+        assert_eq!(api6["state"], "not_covered");
+
+        let api7 = find("api7");
+        assert_eq!(api7["title"], "Server Side Request Forgery");
+        assert_eq!(api7["state"], "enforced");
+
+        let api8 = find("api8");
+        assert_eq!(api8["title"], "Security Misconfiguration");
+        assert_eq!(api8["state"], "enforced");
+
+        let api9 = find("api9");
+        assert_eq!(api9["title"], "Improper Inventory Management");
+        assert_eq!(api9["state"], "enforced");
+
+        let api10 = find("api10");
+        assert_eq!(api10["title"], "Unsafe Consumption of APIs");
+        assert_eq!(api10["state"], "not_covered");
+    }
+
+    #[test]
+    fn owasp_api_pack_endpoint_omits_origins_without_the_pack() {
+        install_test_pipeline(
+            r#"
+origins:
+  plain.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+  packed.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: [api1]
+"#,
+        );
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/owasp-api-pack", &state, Some(&auth), None);
+        assert_eq!(status, 200, "got body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let origins = json["origins"].as_object().expect("origins object");
+        assert_eq!(
+            origins.keys().collect::<Vec<_>>(),
+            vec!["packed.example.com"],
+            "origin without the pack must be absent, not present with an empty entry"
+        );
     }
 }

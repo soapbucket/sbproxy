@@ -141,7 +141,14 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "noop",
 ];
 
-/// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`.
+/// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`,
+/// plus `owasp_api_top10` (WOR-2491): a pseudo-policy consumed and
+/// removed by `sbproxy_config::owasp_api_pack::expand_owasp_pack`
+/// before an origin's policies ever reach `compile_policy`'s
+/// type-string match arms. It compiles cleanly as a real origin
+/// policy entry, so this plan-time list treats it as one; leaving it
+/// out would flag every config that uses the pack with a spurious
+/// `unknown-policy-type` error.
 pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "rego",
     "rate_limit_budget",
@@ -180,6 +187,8 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     // See `crates/sbproxy-modules/src/policy/semantic_constraint.rs`.
     "semantic_constraint",
     "agent_budget",
+    // WOR-2491: see this const's own doc comment above.
+    "owasp_api_top10",
 ];
 
 /// Built-in OSS transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.
@@ -1079,6 +1088,32 @@ origins:
         assert_eq!(unknown.len(), 1, "got findings: {findings:?}");
         assert!(unknown[0].path.contains("policies[1]"));
         assert_eq!(unknown[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn owasp_api_top10_pack_entry_is_not_flagged_unknown() {
+        // WOR-2491 task 4: `owasp_api_top10` compiles cleanly as a real
+        // origin policy (it's a pseudo-policy consumed by
+        // `owasp_api_pack::expand_owasp_pack`, not dispatched by
+        // `compile_policy`); plan-time validation must not flag it as
+        // an unknown policy type.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    policies:
+      - type: owasp_api_top10
+        enable: all
+"#;
+        let cfg = parse(yaml);
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let unknown: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "unknown-policy-type")
+            .collect();
+        assert!(unknown.is_empty(), "got findings: {findings:?}");
     }
 
     #[test]
