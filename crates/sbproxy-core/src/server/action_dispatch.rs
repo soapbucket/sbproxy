@@ -14761,4 +14761,603 @@ mod mcp_catalog_snapshot_tests {
         assert_eq!(document["status"], json!(200));
         assert_eq!(document["body"], json!({"hello": "world"}));
     }
+
+    // --- WOR-2489 Task 6: governance proof for local tools at the
+    // action_dispatch level. RBAC default-deny is already proven above
+    // by `wor_2489_rbac_default_deny_gates_a_local_tool` (Task 2); the
+    // tests below cover every other gate the brief names: argument
+    // policies (CEL and Rego), per-tool quota, session-flow
+    // taint-then-outbound (with a local `http` tool as the outbound
+    // leg), `content_filters` on a local tool's RESULT, evidence-record
+    // gaplessness across an allowed and a refused local call, and
+    // `mcp_audit.capture_arguments` on a local denial.
+    //
+    // None of these gates needed any local-specific wiring to already
+    // cover local tools: reading `handle_mcp_action` top to bottom,
+    // RBAC, argument_policies, per-tool quota, peer-downgrade,
+    // session-flow, and content_filters(arguments) all run BEFORE the
+    // `mcp.is_local_server(governed_server)` branch that picks local
+    // vs. federated dispatch, and content_filters(result),
+    // result_policies, and the evidence/attribution funnel all run
+    // AFTER it, over the same `outcome` value regardless of which arm
+    // produced it. In particular the flow gate's outbound classifier
+    // (`mcp.rs`'s compiled `flow` guardrail) matches `outbound_tools[]`
+    // globs against the resolved tool name alone and has no notion of a
+    // tool's backing at all, so a local `http` tool qualifies as the
+    // outbound leg with zero code changes -- see
+    // `wor_2489_flow_taint_then_local_http_outbound_is_refused` below,
+    // which is this task's proof rather than a fix. ---
+
+    /// Red-first: `argument_policies[]` (CEL, WOR-2384 MCP05) applies to
+    /// a local tool's call exactly like a federated one --
+    /// `evaluate_argument_policies` has no notion of a tool's backing at
+    /// all, but this is the first test proving it end to end through
+    /// the real dispatch path for a `local` server rather than only
+    /// unit-testing the function directly
+    /// (`a_cel_rule_denies_a_path_traversal_shaped_argument_in_block_mode`,
+    /// `sbproxy-modules`).
+    #[tokio::test]
+    async fn wor_2489_argument_policy_cel_denies_a_local_tool() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-argpolicy-cel-local-fixture", "version": "1.0.0"},
+            "argument_policies": [{
+                "name": "no-path-traversal",
+                "engine": "cel",
+                "source": "!mcp.arguments.path.contains(\"..\")",
+                "mode": "block"
+            }],
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "argpolicy-cel-local",
+                "tools": [{
+                    "name": "read_file",
+                    "description": "reads a file by path",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"ok": true}
+                }]
+            }]
+        }))
+        .expect("argument-policy (CEL) local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": "../../etc/passwd"}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected an argument-policy refusal, got: {call:?}"));
+        assert!(
+            message.contains("denied by argument policy"),
+            "a local tool must be refused by a CEL argument policy exactly like a federated \
+             one, got: {message}"
+        );
+    }
+
+    /// Red-first: the Rego variant of the same rule denies the same
+    /// call, over the same `local` tool -- CEL/Rego parity
+    /// (`a_rego_rule_over_the_same_predicate_produces_the_same_verdict_as_cel`,
+    /// `sbproxy-modules`) confirmed through the real dispatch path.
+    #[tokio::test]
+    async fn wor_2489_argument_policy_rego_denies_a_local_tool() {
+        const MODULE: &str = r#"
+package sbproxy
+
+default allow := true
+
+allow := false if {
+    contains(input.mcp.arguments.path, "..")
+}
+"#;
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-argpolicy-rego-local-fixture", "version": "1.0.0"},
+            "argument_policies": [{
+                "name": "no-path-traversal-rego",
+                "engine": "rego",
+                "source": MODULE,
+                "mode": "block"
+            }],
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "argpolicy-rego-local",
+                "tools": [{
+                    "name": "read_file",
+                    "description": "reads a file by path",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"ok": true}
+                }]
+            }]
+        }))
+        .expect("argument-policy (Rego) local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": "../../etc/passwd"}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected an argument-policy refusal, got: {call:?}"));
+        assert!(
+            message.contains("denied by argument policy"),
+            "a local tool must be refused by a Rego argument policy exactly like a CEL one \
+             does, got: {message}"
+        );
+    }
+
+    /// Red-first: the per-tool sliding-window quota (WOR-1065) applies
+    /// to a local tool exactly like a federated one -- `max: 1` lets
+    /// the first call through and rejects the second within the same
+    /// window.
+    #[tokio::test]
+    async fn wor_2489_quota_exhaustion_denies_a_local_tool() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-quota-local-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "quota-policy": {
+                    "default_allow": true,
+                    "tool_quotas": [{
+                        "tool_name": "ping",
+                        "principals": [],
+                        "rate": {"per": "1h", "max": 1}
+                    }]
+                }
+            },
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "quota-local",
+                "rbac": "quota-policy",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        }))
+        .expect("quota-labeled local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let first = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            first.get("error").is_none(),
+            "the first call must pass under the quota, got: {first:?}"
+        );
+
+        let second = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = second["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a quota refusal, got: {second:?}"));
+        assert!(
+            message.contains("tool quota exceeded"),
+            "a local tool must be gated by the same per-tool quota a federated tool is, \
+             got: {message}"
+        );
+    }
+
+    /// Red-first: session-flow taint-then-outbound (WOR-2384, MCP06)
+    /// refuses a call whose OUTBOUND leg is a local `http` tool. The
+    /// first call (a local `static` tool on an untrusted server) taints
+    /// the session; the second call (a local `http` tool classified
+    /// `outbound_tools`) is then refused before any egress check or
+    /// dial is attempted -- no stub upstream is needed, since the
+    /// refusal returns before dispatch. See the section banner above
+    /// for why this needed no classification fix.
+    #[tokio::test]
+    async fn wor_2489_flow_taint_then_local_http_outbound_is_refused() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-flow-outbound-local-fixture", "version": "1.0.0"},
+            "sessions": {"enabled": true},
+            "flow": {
+                "mode": "block",
+                "rule": "taint_and_outbound",
+                "trusted_servers": [],
+                "outbound_tools": ["send_email"]
+            },
+            "federated_servers": [
+                {
+                    "type": "local",
+                    "origin": "local.internal",
+                    "prefix": "flow-read-local",
+                    "tools": [{
+                        "name": "fetch_doc",
+                        "description": "reads an untrusted document",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "static": {"content": "untrusted doc"}
+                    }]
+                },
+                {
+                    "type": "local",
+                    "origin": "local.internal",
+                    "prefix": "flow-outbound-local",
+                    "egress": {},
+                    "tools": [{
+                        "name": "send_email",
+                        "description": "sends an email over http",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "http": {
+                            "method": "POST",
+                            "url": "https://wor2489-flow-outbound.invalid/send"
+                        }
+                    }]
+                }
+            ]
+        }))
+        .expect("flow-gated local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        // `mcp_handler_exchange_with_session` builds its `RequestContext`
+        // via `RequestContext::new()`, whose `tenant_id` defaults to
+        // `"__default__"` -- the session must be minted under that same
+        // tenant, or the tenant-bound `validate()` sees a
+        // `TenantMismatch` and every call below 404s before it ever
+        // reaches the flow gate (`wor_2384_prompts_get_wires_flow_record_entry`
+        // above pins this same requirement for `prompts/get`).
+        let session_id = action
+            .sessions
+            .as_ref()
+            .expect("sessions enabled")
+            .create("__default__")
+            .minted()
+            .expect("mint below the cap");
+
+        let read = mcp_handler_exchange_with_session(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch_doc", "arguments": {}}
+            }),
+            &session_id,
+        )
+        .await;
+        assert!(
+            read.get("error").is_none(),
+            "the tainting read must itself succeed, got: {read:?}"
+        );
+
+        let outbound = mcp_handler_exchange_with_session(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "send_email", "arguments": {}}
+            }),
+            &session_id,
+        )
+        .await;
+        let message = outbound["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a session-flow refusal, got: {outbound:?}"));
+        assert!(
+            message.contains("session-flow guardrail"),
+            "a local http tool classified `outbound_tools` must be refused after an untrusted \
+             local read tainted the session, got: {message}"
+        );
+    }
+
+    /// Red-first: `content_filters.secrets: redact` mutates a local
+    /// tool's RESULT in place -- the result-side half of MCP01/MCP10,
+    /// proven for a `local` server's own `static` tool rather than only
+    /// a federated server's.
+    #[tokio::test]
+    async fn wor_2489_content_filters_redacts_a_local_tools_result() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-content-filter-local-fixture", "version": "1.0.0"},
+            "content_filters": {"secrets": "redact"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "leaky-local",
+                "tools": [{
+                    "name": "leak",
+                    "description": "returns a planted secret",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": "key: AKIAIOSFODNN7EXAMPLE"
+                }]
+            }]
+        }))
+        .expect("content-filter-gated local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "leak", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "a redact hit must not deny the call, got: {call:?}"
+        );
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            !text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "a local tool's result must be redacted exactly like a federated tool's, got: {text}"
+        );
+        assert!(text.contains("[REDACTED:APIKEY]"), "got: {text}");
+    }
+
+    /// Red-first: `sbproxy.evidence.seq` (WOR-2384) is strictly
+    /// monotonic and gapless across an allowed local dispatch followed
+    /// by a refused one -- the same guarantee the SIEM-facing evidence
+    /// feed makes for federated tools, unchanged for local ones.
+    #[tokio::test]
+    async fn wor_2489_evidence_gapless_seq_across_allowed_and_refused_local_calls() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("wor2489-local-governance-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("event egress installs exactly once per test binary");
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-evidence-seq-local-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "gate": {
+                    "default_allow": false,
+                    "tool_access": [{"principals": [], "allowed": ["ping"]}]
+                }
+            },
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "evidence-seq-local",
+                "rbac": "gate",
+                "tools": [
+                    {
+                        "name": "ping",
+                        "description": "always returns pong",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "static": {"message": "pong"}
+                    },
+                    {
+                        "name": "secret",
+                        "description": "not on the allowlist",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "static": {"message": "shh"}
+                    }
+                ]
+            }]
+        }))
+        .expect("evidence-seq local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let allowed = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(allowed.get("error").is_none(), "got: {allowed:?}");
+
+        let refused = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "secret", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("denied by RBAC policy"),
+            "got: {refused:?}"
+        );
+
+        let allow_event = poll_for_governance_event(&events_path, |event| {
+            event["data"]["gen_ai.tool.name"] == "ping"
+        })
+        .await
+        .expect(
+            "an mcp_governance_decision event for the allowed local call was not observed \
+             within 5s",
+        );
+        assert_eq!(allow_event["data"]["sbproxy.decision.verdict"], "allow");
+        let allow_seq = allow_event["data"]["sbproxy.evidence.seq"]
+            .as_u64()
+            .expect("allow event carries a numeric seq");
+
+        let deny_event = poll_for_governance_event(&events_path, |event| {
+            event["data"]["gen_ai.tool.name"] == "secret"
+        })
+        .await
+        .expect(
+            "an mcp_governance_decision event for the refused local call was not observed \
+             within 5s",
+        );
+        assert_eq!(deny_event["data"]["sbproxy.decision.verdict"], "deny");
+        let deny_seq = deny_event["data"]["sbproxy.evidence.seq"]
+            .as_u64()
+            .expect("deny event carries a numeric seq");
+
+        assert_eq!(
+            deny_seq,
+            allow_seq + 1,
+            "the refused call's evidence record must be the next gapless seq after the \
+             allowed call's, got allow={allow_seq} deny={deny_seq}"
+        );
+    }
+
+    /// Red-first: `mcp_audit.capture_arguments: true` (WOR-2392) carries
+    /// the call's verbatim (redacted, bounded) arguments on a local
+    /// tool's DENIAL -- the moment an auditor most wants to see what
+    /// was attempted, per `governance_tool_arguments_field`'s own doc.
+    #[tokio::test]
+    async fn wor_2489_capture_arguments_captures_verbatim_arguments_on_a_local_denial() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("wor2489-local-capture-arguments.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("event egress installs exactly once per test binary");
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {
+                "name": "wor2489-capture-arguments-local-fixture",
+                "version": "1.0.0"
+            },
+            "mcp_audit": {"capture_arguments": true},
+            "rbac_policies": {
+                "deny_all": {"default_allow": false}
+            },
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "capture-arguments-local",
+                "rbac": "deny_all",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        }))
+        .expect("capture-arguments local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {"city": "sf"}}
+            }),
+        )
+        .await;
+        assert!(
+            call["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("denied by RBAC policy"),
+            "got: {call:?}"
+        );
+
+        let event = poll_for_governance_event(&events_path, |event| {
+            event["data"]["gen_ai.tool.name"] == "ping"
+        })
+        .await
+        .expect("an mcp_governance_decision event for the local denial was not observed within 5s");
+        assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+        assert_eq!(
+            event["data"]["gen_ai.tool.call.arguments"], r#"{"city":"sf"}"#,
+            "capture_arguments must carry the local denial's verbatim arguments, got: {event:?}"
+        );
+    }
 }
