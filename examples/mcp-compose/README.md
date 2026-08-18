@@ -21,12 +21,15 @@ composition shaped with JavaScript instead of Lua.
   federate to), with the caller's `name`.
 - **`echo`**: `depends_on: [hello]`, and only runs when `verbose:
   true` (its `condition`). Its message is built from `hello`'s own
-  result: `"Echo of: ${steps.hello.body.result.content[0].text}"`,
-  demonstrating the `${steps.<name>.body.<path>}` interpolation
-  vocabulary against a real prior step's output.
-- **`response.lua`** shapes whatever ran into one JSON object:
-  `{"greeting": "...", "echoed": "..."}` when `echo` ran, just
-  `{"greeting": "..."}` when it did not.
+  outcome: `"Echo after hello returned HTTP ${steps.hello.status}"`,
+  demonstrating `${steps.<name>.status}` interpolation against a real
+  prior step. `hello`'s actual greeting text is *not* reachable this
+  way (it sits inside an array, and `${}` has no array indexing); see
+  [docs/mcp-compose.md](../../docs/mcp-compose.md#interpolation-vocabulary).
+- **`response.lua`** shapes whatever ran into one JSON object,
+  reading `hello`'s greeting text out of its result array with real
+  Lua indexing: `{"greeting": "...", "echoed": "..."}` when `echo`
+  ran, just `{"greeting": "..."}` when it did not.
 
 A second tool, `compose.ping`, is a plain `static` handler present in
 the catalog but left off the RBAC allowed list on purpose (see
@@ -66,7 +69,7 @@ calls are real HTTP round trips to `test.sbproxy.dev`, egress-checked
 first:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"greeting\":\"Hello, Ada!\",\"echoed\":\"Echo of: Hello, Ada!\"}"}],"isError":false}}
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"greeting\":\"Hello, Ada!\",\"echoed\":\"Echo after hello returned HTTP 200\"}"}],"isError":false}}
 ```
 
 ### `verbose: false`: the echo step is skipped, not run
@@ -128,9 +131,10 @@ refused the call rather than serving it with no evidence behind it.
 - `federated_servers[].type: local` with `tools[].steps`
 - `steps[].depends_on` (dependency ordering) and `steps[].condition`
   (CEL, per-call skip)
-- `${steps.<name>.body.<path>}` interpolation reading a prior step's
-  result
-- `response.lua`, run over `input = {args, steps}`
+- `${steps.<name>.status}` interpolation reading a prior step's
+  outcome
+- `response.lua`, run over `input = {args, steps}`, indexing into a
+  step's result array natively where `${}` cannot
 - `rbac_policies` default-deny gating a `type: local` tool the same
   way it gates a federated one
 - `events.sink: file`, `events.types`, `events.fail_closed` on MCP

@@ -112,7 +112,7 @@ origins:
                         params:
                           name: echo
                           arguments:
-                            message: "Echo of: ${steps.hello.body.result.content[0].text}"
+                            message: "Echo after hello returned HTTP ${steps.hello.status}"
                       timeout: 10s
 
                 response:

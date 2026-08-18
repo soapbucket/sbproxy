@@ -142,9 +142,15 @@ the action-level `egress:` default: since there is no legacy config to
 stay compatible with, an HTTP-calling local server with no `egress:`
 is a compile error, not a silent allow-all. Every dial goes through
 the same DNS-pinned, egress-gated client an `openapi`-backed server's
-REST calls use, and is recorded in the same egress inventory (`GET
-/api/egress`); see
+REST calls use, authorized under the same egress purpose an
+`openapi`-backed tool's REST calls use, and lands in the same `GET
+/api/egress` inventory rows (labeled `openapi_tool`, not a separate
+label of its own); see
 [mcp-gateway-guardrails.md#deterministic-egress](mcp-gateway-guardrails.md#deterministic-egress).
+A local tool's denied or allowed dials are therefore visible in that
+inventory, but not separable from an `openapi`-backed server's by
+purpose alone; `origin` (the denied host, or the local server's own
+name) is what tells them apart in practice.
 
 ## Interpolation vocabulary
 
@@ -158,27 +164,51 @@ response contains one:
 | `${steps.<name>.status}` | The HTTP status code a completed step's call returned. |
 | `${steps.<name>.body.<path>}` | A value from a completed step's parsed response body. |
 
-`<path>` is a dot-separated, bracket-indexed JSON path
-(`user.id`, `items[0].name`) into the value it starts from; there is
-no full JSONPath engine and no new dependency behind it. Only steps
-that have already completed, in dependency order, are in scope for
+`<path>` is a **dot-separated JSON object path only**
+(`user.id`, `billing.plan.tier`): each segment is looked up as an
+object key. There is no array indexing of any kind, bracket or
+numeric, and no full JSONPath engine behind it: a path that steps into
+an array fails to resolve the same way a genuinely missing key does.
+This matters in practice because a raw MCP `tools/call` result wraps
+its payload in a `content` array (`result.content[0].text`), which
+means `${steps.<name>.body...}` can reach `status` and any flat,
+object-shaped field of a step's body, but not into that array; pull a
+value out of an array in [response shaping](#response-shaping)
+instead, where a real script indexes it natively. Only steps that have
+already completed, in dependency order, are in scope for
 `${steps...}`: a step can read any step named in its own `depends_on`
 chain (transitively), never a step declared after it or one it does
 not depend on.
 
-**Whole-string splice vs. stringify.** When a `${...}` placeholder is
-the *entire* value of a string (`url: "${args.payload}"`), it splices
-in the underlying JSON value as-is, preserving its type: an object
-stays an object, a number stays a number. When it is embedded inside a
-larger string (`url: "https://api.internal/widgets/${args.id}"`), the
-value is stringified into that position instead.
+**Escaping.** `$$` renders one literal `$` and never opens a
+placeholder, so `$$` followed by `{args.x}` renders the literal text
+`${args.x}`, with `args.x` never looked up. Any other bare `$` not
+immediately followed by `{` or another `$` is also literal. An
+unterminated or empty `${...}` is a call-time fail-closed error, the
+same as a missing path.
+
+**Whole-string splice vs. stringify.** This distinction only applies
+to `body:` field values, which are JSON, not plain strings. When a
+`${...}` placeholder there is the *entire* value of a field
+(`body: {"id": "${args.id}"}`), it splices in the underlying JSON
+value as-is, preserving its type: an object stays an object, a number
+stays a number, so a typed argument reaches the upstream typed rather
+than as a quoted string. `url` and header values can only ever be
+strings, so there this distinction collapses: whether the placeholder
+is the whole value or embedded in a larger one
+(`url: "https://api.internal/widgets/${args.id}"`), the resolved value
+is always stringified into position -- a string passes through
+unchanged, a number or boolean renders as its bare text, `null`
+renders as an empty string, and an object or array renders as compact
+JSON text. The same stringify rule applies to any placeholder embedded
+inside a larger `body:` string too, not just whole-value splices.
 
 **Missing paths fail closed.** A path that does not resolve, an
-argument that was not supplied, a field absent from a step's body, an
-out-of-range index, is a tool-call error, not an empty string. Nothing
-here has an implicit default; if a value might be absent, gate its use
-behind a `condition` (below) rather than relying on the splice to
-degrade gracefully.
+argument that was not supplied, or a field absent from a step's body
+is a tool-call error, not an empty string. Nothing here has an
+implicit default; if a value might be absent, gate its use behind a
+`condition` (below) rather than relying on the splice to degrade
+gracefully.
 
 ### Worked example: reading a prior step's output
 
@@ -211,7 +241,7 @@ parsed body shaped like:
 ```
 
 The `echo` step, which `depends_on: [hello]`, builds its own message
-from that result:
+from that call's outcome:
 
 ```yaml
 - name: echo
@@ -220,14 +250,19 @@ from that result:
     body:
       params:
         arguments:
-          message: "Echo of: ${steps.hello.body.result.content[0].text}"
+          message: "Echo after hello returned HTTP ${steps.hello.status}"
 ```
 
 Here the placeholder is embedded in a larger string, so
-`steps.hello.body.result.content[0].text` (`"Hello, Ada!"`) is
-stringified into position: `message` resolves to `"Echo of: Hello,
-Ada!"`. `${steps.hello.status}` in the same step would resolve to
-`200`, the HTTP status `hello`'s own call returned.
+`${steps.hello.status}` (`200`, a number) is stringified into
+position: `message` resolves to `"Echo after hello returned HTTP
+200"`. `status` and any flat field of `hello`'s parsed body are in
+reach this way; `hello`'s actual greeting text is not, because it sits
+inside `result.content[0]`, an array element -- exactly the case
+[Response shaping](#response-shaping) below exists for.
+`response.lua` reads `steps.hello.body.result.content[1].text`
+directly (Luau, 1-indexed) to pull that greeting into the tool's final
+result, something no `${}` field can do.
 
 ### What `condition` cannot see
 
@@ -404,9 +439,13 @@ applies verbatim to a `type: local` one.
   CEL `condition` is; validate it yourself (a JSON Schema linter, or a
   quick `tools/call` against a case you expect to fail) before relying
   on it to reject bad arguments.
-- **No JSONPath engine.** `${}` paths are plain dot/bracket-index
-  lookups into a JSON value, not a JSONPath or JMESPath expression:
-  no wildcards, no filters, no slicing.
+- **No JSONPath engine, and no array indexing.** `${}` paths are
+  plain dot-separated object-key lookups, not a JSONPath or JMESPath
+  expression: no wildcards, no filters, no slicing, and no way to step
+  into a JSON array by index either. A path that needs an array
+  element (an MCP result's `content[0]`, most commonly) has to go
+  through `response` shaping instead, where a real script indexes it
+  natively.
 
 ## See also
 

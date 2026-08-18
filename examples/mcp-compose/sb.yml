@@ -11,8 +11,12 @@
 #     sbproxy's own MCP federation client sends).
 #   - `echo`: depends on `hello`, and only runs when the caller passes
 #     `verbose: true` (its `condition`). Its message is built from
-#     `hello`'s own result via `${steps.hello.body...}`.
-# `response.lua` shapes the two step outputs into one JSON result.
+#     `hello`'s own outcome via `${steps.hello.status}` -- the ${}
+#     engine has no array indexing, so it cannot reach into `hello`'s
+#     result content array; that's what `response.lua` is for below.
+# `response.lua` shapes the two step outputs into one JSON result,
+# reading `hello`'s actual greeting text out of its result content
+# array with real Lua indexing.
 #
 # Both steps dial test.sbproxy.dev, so the server's `egress:` gates
 # them exactly like an `openapi`-backed server's REST calls would.
@@ -141,7 +145,7 @@ origins:
                         params:
                           name: echo
                           arguments:
-                            message: "Echo of: ${steps.hello.body.result.content[0].text}"
+                            message: "Echo after hello returned HTTP ${steps.hello.status}"
                       timeout: 10s
 
                 response:
