@@ -588,6 +588,73 @@ the gateway's own admin API, which turns the admin surface into
 governed MCP tools; [admin-mcp.md](admin-mcp.md) walks through that
 setup end to end.
 
+### What the bridge reads from a spec, and what it does not
+
+The conversion is deliberately simple: one tool per `paths` operation,
+built from the operation object alone. Knowing exactly which parts of a
+spec it consumes tells you whether your API will bridge cleanly or
+needs its spec adjusted first.
+
+What is read:
+
+- **Tool name**: an `x-mcp` / `x-sbproxy-mcp` `name` override, else
+  `operationId`, else `method_path` derived from the method and path.
+- **Description**: the extension's `description` override, else the
+  operation's `summary`, else its `description`.
+- **Input schema**: the operation's own `parameters[]` list. Each
+  parameter contributes its `name`, its `schema` (copied verbatim), and
+  its `required` flag.
+- **Emission shaping**: per-operation `x-mcp: false` suppresses a tool;
+  the object form overrides `name` / `description` / `scope`, with
+  `x-sbproxy-mcp` winning over `x-mcp`. The value shape matches
+  Speakeasy's `x-speakeasy-mcp`, so a spec annotated for that tool
+  ports by renaming the key; the literal `x-speakeasy-mcp` key itself
+  is not read. Root-level `x-mcp-defaults` (or
+  `x-sbproxy-mcp-defaults`) carries `include_tags` / `exclude_tags`
+  for whole-tag filtering.
+
+The limits, each a consequence of "operation object alone":
+
+- **`requestBody` is never read.** A POST or PUT operation's body
+  schema does not appear in the tool's `inputSchema`, so a model
+  calling the tool is never told which body fields exist, which are
+  required, or what type they are. The body is still reachable: on a
+  non-GET dispatch, every argument that does not match a `{path}`
+  placeholder is sent as a top-level field of a JSON request body. But
+  the caller has to know those fields from the description or from out
+  of band, and only `application/json` bodies are produced; form and
+  multipart request bodies cannot be expressed.
+- **`$ref` is not resolved.** A parameter defined as a reference
+  (`- $ref: "#/components/parameters/..."`) has no inline `name`, so it
+  is skipped entirely and simply missing from the tool. A `schema`
+  containing a `$ref` is copied into the `inputSchema` as-is, and the
+  spec's `components` are not carried along, so the MCP client sees a
+  dangling reference. Inline the schemas you need before pointing the
+  gateway at the spec (most OpenAPI toolchains have a dereference or
+  bundle command).
+- **Parameter location (`in:`) is ignored.** Path, query, header, and
+  cookie parameters all become flat `inputSchema` properties. At
+  dispatch, an argument matching a `{placeholder}` in the path template
+  is substituted into the path; everything else goes to the query
+  string (GET) or the JSON body (non-GET), whatever the spec declared.
+  An `in: header` or `in: cookie` parameter is never sent as an actual
+  HTTP header or cookie. For a fixed upstream header, use the
+  server-level `headers:` block above; for a per-caller credential,
+  `run_as_user_auth`.
+- **Path-item-level `parameters` are not read.** Parameters shared
+  across operations by declaring them on the path item, rather than on
+  each operation, do not reach any tool's schema. The same duplication
+  a dereference pass does for `$ref` fixes this: push shared
+  parameters down into the operations.
+- **The spec's `servers` list is ignored.** Every dispatch goes to the
+  configured `origin`, which is also what the egress policy
+  authorizes. A spec whose `servers` point elsewhere does not redirect
+  the gateway.
+
+Everything past the schema is unaffected by these limits: RBAC,
+quotas, `argument_policies[]`, egress authorization, and usage
+attribution govern a bridged tool exactly as they do a native one.
+
 ## Local tool servers
 
 A `federated_servers[]` entry with `type: local` serves tools declared

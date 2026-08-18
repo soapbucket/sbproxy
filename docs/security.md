@@ -1,6 +1,6 @@
 # Security
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 SBproxy sits between your clients and whatever they are calling, which makes it
 a good place to enforce things the service behind it might have forgotten. This
@@ -104,8 +104,9 @@ relabel a request past body inspection. [guardrails.md](guardrails.md),
 [ai-gateway.md](ai-gateway.md).
 
 The `pii:` block redacts AI request and response bodies. The `dlp` policy scans
-URI and headers only and never masks. They cover different surfaces and should
-not be confused. [prompt-injection-v2.md](prompt-injection-v2.md) states the
+the request URI, headers, and by default the first 16 KiB of the buffered
+request body; it tags or blocks and never masks, and it never sees a response.
+They cover different surfaces and should not be confused. [prompt-injection-v2.md](prompt-injection-v2.md) states the
 detector's limits plainly: the default is a substring heuristic, and no
 detection model ships in the binary.
 

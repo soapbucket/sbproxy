@@ -59,6 +59,8 @@ SBproxy's traditional reverse-proxy pillar: routing, load balancing, transforms,
 - [api-gateway.md](api-gateway.md) - the entry point for the traditional reverse-proxy pillar: routing, auth, rate limiting, WAF, load balancing, protocols, and OpenAPI, independent of any AI functionality. Start here if you're replacing Nginx, Envoy, or Kong.
 - [routing.md](routing.md) - the hub for how a request gets matched to an upstream: hostname matching, forward rules, load balancing algorithms, protocol-specific actions (GraphQL, gRPC, gRPC-Web, WebSocket), and failover.
 - [websocket.md](websocket.md) - the `websocket` action: config keys, upgrade semantics, what runs before the upgrade, and which of `subprotocols` / `max_message_size` are actually enforced.
+- [graphql.md](graphql.md) - the `graphql` action: transparent by default, fail-closed syntax validation (depth, introspection, batches) when enabled, and where in the pipeline it runs.
+- [storage.md](storage.md) - the `storage` action (serve objects from S3, GCS, Azure, or local disk), plus the map of where the gateway persists its own state and which backends hold what.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
 - [transforms.md](transforms.md) - what a transform is, the common transform fields, chaining and order, and one section per shipped transform kind (JSON shaping, text/encoding, HTML/Markdown, scripting transforms, WASM, agent content-shaping).
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
@@ -164,6 +166,8 @@ Point a framework you already run at the gateway: chat completions through the O
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
+- [cap.md](cap.md) - the `cap` provider: verifying Crawler Authorization Protocol capability tokens (path globs, rate grants, agent binding) against an issuer's JWKS.
+- [trust-tiers.md](trust-tiers.md) - the four-value trust tier every request gets (`suspicious`, `strong`, `named`, `anonymous`), what earns each, and how policies and dashboards consume it.
 - [outbound-dpop.md](outbound-dpop.md) - RFC 9449 sender-constrained OAuth credentials and per-request proof minting for upstream calls.
 - [secrets.md](secrets.md) - the secret-reference vocabulary (env vars, files, provider URIs) resolved everywhere in config, plus backend setup for HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and Kubernetes Secrets.
 

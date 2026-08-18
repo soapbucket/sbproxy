@@ -1,6 +1,6 @@
 # AI gateway security coverage
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 This page proves what the gateway enforces in the AI traffic path, not what a
 feature list claims: every row below points at a named test or a signal you
@@ -305,16 +305,16 @@ whether or not `pii:` is configured. [ai-gateway.md](ai-gateway.md),
 
 **Proof.** `e2e/tests/redaction.rs::redaction_per_sink_fan_out`.
 
-**Limits.** The `dlp` policy scans request URI and headers only, never
-bodies, and only tags or blocks; it never masks. That is a different
-control from `pii:`, and the docs say so explicitly so the two are not
-mistaken for each other. Rationale: `crates/sbproxy-modules/src/policy/dlp.rs`
-states body scanning is intentionally out of scope for this cut, not a
-speed tradeoff; the `pii:` block already handles request-body redaction
-with the same regex catalog today, and a stated follow-up extends `dlp`
-to consume the buffered body `RequestValidator` already produces. Until
-that lands, `pii:` is the masking control and `dlp` is the metadata-only
-one, and the two stay separate rather than one doing both jobs partway.
+**Limits.** The `dlp` policy scans the request URI, the request headers,
+and, on by default (`scan_body: true`), the buffered request body, capped
+at the first 16 KiB (`body_max_bytes`), where most PII shapes sit. Its
+actions are tag and block; it never masks. It is request-side only:
+`direction: response` or `both` is accepted and warned about at config
+load, and the request-side scan runs regardless, because the policy
+enforcement phase has no response body to hand it. So `pii:` remains the
+masking control and the response-direction control, and `dlp` is the
+request-side detect-and-refuse one; the two stay separate rather than one
+doing both jobs partway.
 
 ### LLM03: Excessive Agency
 
