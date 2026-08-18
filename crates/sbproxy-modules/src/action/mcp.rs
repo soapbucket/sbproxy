@@ -2623,6 +2623,11 @@ pub(crate) struct CompiledLocalMcpServer {
     /// `None` only when every tool is `static` (no call is ever made,
     /// so there is nothing to gate); see [`compile_local_server`].
     pub(crate) egress: Option<EgressPolicy>,
+    /// Cap on any upstream response body a tool's dial buffers, from
+    /// the action-level `max_upstream_response_bytes` knob (default
+    /// [`DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES`]); a body over it
+    /// fails the call closed (WOR-2489 review).
+    pub(crate) max_response_bytes: usize,
 }
 
 impl std::fmt::Debug for CompiledLocalMcpServer {
@@ -2631,6 +2636,7 @@ impl std::fmt::Debug for CompiledLocalMcpServer {
             .field("name", &self.name)
             .field("tools", &self.tools)
             .field("egress", &self.egress)
+            .field("max_response_bytes", &self.max_response_bytes)
             .finish()
     }
 }
@@ -2782,9 +2788,29 @@ impl std::fmt::Debug for CompiledLocalResponseShaping {
 fn compile_local_server(
     name: &str,
     upstream: &McpFederatedServerConfig,
+    max_response_bytes: usize,
 ) -> anyhow::Result<CompiledLocalMcpServer> {
     if upstream.tools.is_empty() {
         anyhow::bail!("mcp action: local server '{name}' (type: local) declares no tools");
+    }
+
+    // WOR-2489 review: duplicate tool names are refused up front,
+    // naming both positions. `refresh_tools` would otherwise advertise
+    // the second under a namespaced alias whose schema and description
+    // it carried, while `execute_local_tool` resolves by upstream name
+    // and always runs the first -- a catalog contract validated against
+    // one tool and dispatched to another.
+    let mut seen_tools: HashMap<&str, usize> = HashMap::with_capacity(upstream.tools.len());
+    for (index, tool) in upstream.tools.iter().enumerate() {
+        if let Some(&first) = seen_tools.get(tool.name.as_str()) {
+            anyhow::bail!(
+                "mcp action: local server '{name}' declares duplicate tool name '{}' \
+                 (tools[{first}] and tools[{index}]); the catalog would advertise one tool's \
+                 schema while the executor ran the other's handler -- rename one",
+                tool.name
+            );
+        }
+        seen_tools.insert(tool.name.as_str(), index);
     }
 
     // Per-server egress is required the moment any tool can make an
@@ -2817,6 +2843,7 @@ fn compile_local_server(
         name: name.to_string(),
         tools,
         egress: upstream.egress.clone(),
+        max_response_bytes,
     })
 }
 
@@ -2892,6 +2919,16 @@ fn compile_local_http_call(
         !cfg.url.trim().is_empty(),
         "{site}: http.url must not be empty"
     );
+    // WOR-2489 review: the per-attempt timeout can never exceed the
+    // maximum whole-call budget, mirroring the `steps.timeout` ceiling
+    // -- an attempt longer than the widest possible budget could never
+    // complete, so accepting it would be a dead knob.
+    if let Some(timeout) = cfg.timeout {
+        anyhow::ensure!(
+            timeout <= MAX_LOCAL_STEPS_BUDGET,
+            "{site}: http.timeout ({timeout:?}) exceeds the maximum whole-call budget of {MAX_LOCAL_STEPS_BUDGET:?}"
+        );
+    }
     Ok(CompiledLocalHttpCall {
         method: cfg.method.clone(),
         url: cfg.url.clone(),
@@ -3113,6 +3150,16 @@ const DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// its compiled `timeout:` is unset.
 const DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default cap on a local tool's upstream response body, mirroring
+/// `FederationIoSettings::max_response_bytes`' own 8 MiB default
+/// (`sbproxy-extension::mcp::federation`). The operator knob is the
+/// same one, `max_upstream_response_bytes`: `from_parsed` threads it
+/// onto every [`CompiledLocalMcpServer`] so a local `http` or `steps`
+/// dial honors exactly the ceiling every other MCP upstream exchange
+/// already does, instead of buffering an unbounded body (WOR-2489
+/// review).
+const DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// A local `http` call's send-and-wait outcome that is not a plain
 /// upstream response: either the send itself failed (connection
 /// refused, DNS failure, reset, ...) or the per-attempt timeout
@@ -3138,11 +3185,33 @@ impl LocalHttpFailure {
         }
     }
 
-    fn into_anyhow(self, url: &str) -> anyhow::Error {
+    /// A short, closed-set label for this failure, safe for any log
+    /// line or client-facing message.
+    fn class_label(&self) -> &'static str {
         match self {
-            Self::Timeout => anyhow::anyhow!("mcp: local http tool call to {url} timed out"),
-            Self::Transport(e) => {
-                anyhow::anyhow!("mcp: local http tool call to {url} failed: {e}")
+            Self::Timeout => "timed out",
+            Self::Transport(e) if e.is_timeout() => "timed out",
+            Self::Transport(e) if e.is_connect() => "connection failed",
+            Self::Transport(_) => "transport error",
+        }
+    }
+
+    /// The client-facing error. Deliberately names no URL and no host,
+    /// and never renders the `reqwest::Error` `Display` (which embeds
+    /// the full request URL): the interpolated URL can carry a resolved
+    /// `${VAR}` config secret or caller-supplied arguments, and on the
+    /// legacy MCP era the whole anyhow chain is reflected to the caller
+    /// verbatim (WOR-2489 review; repo rule: log the failure, never the
+    /// credential). The server-side warn at the call site carries the
+    /// egress-authorized scheme://host:port for diagnosis.
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Timeout => anyhow::anyhow!("mcp: local http tool call timed out"),
+            failure => {
+                anyhow::anyhow!(
+                    "mcp: local http tool call failed: {}",
+                    failure.class_label()
+                )
             }
         }
     }
@@ -3213,6 +3282,7 @@ async fn execute_local_http_call(
     call: &CompiledLocalHttpCall,
     response: Option<&CompiledLocalResponseShaping>,
     arguments: &serde_json::Value,
+    tenant: &str,
 ) -> anyhow::Result<serde_json::Value> {
     execute_local_http_call_with_resolver(
         server,
@@ -3220,6 +3290,7 @@ async fn execute_local_http_call(
         call,
         response,
         arguments,
+        tenant,
         &sbproxy_security::egress::SystemHostResolver,
     )
     .await
@@ -3236,11 +3307,38 @@ async fn execute_local_http_call_with_resolver(
     call: &CompiledLocalHttpCall,
     response: Option<&CompiledLocalResponseShaping>,
     arguments: &serde_json::Value,
+    tenant: &str,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<serde_json::Value> {
     let context = mcp_interpolate::args_context(arguments);
-    let (status, document) =
-        run_local_http_call_with_resolver(server, call, &context, resolver).await?;
+    // WOR-2489 review: the same whole-call budget a `steps` DAG gets.
+    // The per-attempt timeout inside the retry loop bounds one attempt;
+    // nothing bounded the loop, so `max_attempts: 16` against a black
+    // hole could hold a dispatch slot for minutes. The budget is the
+    // steps default, widened to the configured per-attempt timeout when
+    // that is longer (so an explicit `timeout: 2m` still gets its one
+    // full attempt); compile time caps the per-attempt timeout at
+    // [`MAX_LOCAL_STEPS_BUDGET`], so the budget never exceeds it.
+    let budget = call
+        .timeout
+        .unwrap_or(DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT)
+        .max(DEFAULT_LOCAL_STEPS_BUDGET);
+    let (status, document) = match tokio::time::timeout(
+        budget,
+        run_local_http_call_with_resolver(server, call, &context, tenant, resolver),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' on server '{}' exceeded its whole-call budget of \
+                 {}ms (retry attempts do not extend it)",
+                server.name,
+                budget.as_millis()
+            ));
+        }
+    };
     let Some(response_cfg) = response else {
         return Ok(serde_json::json!({
             "content": [{"type": "text", "text": document.to_string()}],
@@ -3269,7 +3367,7 @@ async fn execute_local_http_call_with_resolver(
         tool_name,
         response_cfg,
         arguments,
-        &steps_context,
+        steps_context,
     )
 }
 
@@ -3297,13 +3395,18 @@ async fn run_local_http_call_with_resolver(
     server: &CompiledLocalMcpServer,
     call: &CompiledLocalHttpCall,
     context: &serde_json::Value,
+    tenant: &str,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
     use sbproxy_security::egress::{
         record_egress_refused, record_egress_seen, EgressPurpose, EgressSightingStatus,
     };
 
-    let url = mcp_interpolate::interpolate_string(&call.url, context)
+    // WOR-2489 review: `interpolate_url`, not `interpolate_string` --
+    // an embedded placeholder's resolved value is percent-encoded as
+    // data, so a caller-controlled argument cannot rewrite the path or
+    // inject query parameters on the egress-allowed host.
+    let url = mcp_interpolate::interpolate_url(&call.url, context)
         .map_err(|e| anyhow::anyhow!("mcp: local http tool: url interpolation failed: {e}"))?;
     let mut headers: Vec<(String, String)> = Vec::with_capacity(call.headers.len());
     for (name, value) in &call.headers {
@@ -3364,10 +3467,16 @@ async fn run_local_http_call_with_resolver(
                 EgressSightingStatus::Denied,
                 Some(e),
             );
-            record_egress_refused(EgressPurpose::OpenApiTool, e, "", &server.name);
+            record_egress_refused(EgressPurpose::OpenApiTool, e, tenant, &server.name);
             anyhow::bail!("egress denied: {e:?}");
         }
     };
+    // The only shape of this destination that may appear in any error
+    // or log line: the rendered URL's path and query can carry a
+    // resolved `${VAR}` config secret or caller arguments, while the
+    // scheme/host/port is exactly what the egress inventory already
+    // records for this dial (WOR-2489 review).
+    let dest_label = dest.url.origin().ascii_serialization();
 
     let retry = call.retry.clone().unwrap_or_default();
     let request_timeout = call.timeout.unwrap_or(DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT);
@@ -3408,7 +3517,16 @@ async fn run_local_http_call_with_resolver(
                     && retry.allows(failure.retry_condition())
                     && retry.attempts_remaining(retries_used);
                 if !retryable {
-                    return Err(failure.into_anyhow(&url));
+                    // Server-side diagnosis line: scheme://host:port
+                    // only, never the rendered URL (see `dest_label`).
+                    tracing::warn!(
+                        target: "sbproxy::mcp",
+                        server = %server.name,
+                        upstream = %dest_label,
+                        failure = failure.class_label(),
+                        "mcp: local http tool call failed",
+                    );
+                    return Err(failure.into_anyhow());
                 }
                 tokio::time::sleep(Duration::from_millis(
                     retry.backoff_for_attempt(retries_used),
@@ -3429,10 +3547,30 @@ async fn run_local_http_call_with_resolver(
             );
         }
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("mcp: local http tool: failed reading response body: {e}"))?;
+    // WOR-2489 review: read incrementally and bail at the operator's
+    // `max_upstream_response_bytes` cap, the same
+    // accumulate-and-bail idiom `McpFederation`'s own exchanges use
+    // (`streamable::read_body_capped`), instead of buffering an
+    // unbounded body. `without_url()` strips the request URL from the
+    // reqwest display for the same reason `into_anyhow` never renders
+    // it: the URL can carry a resolved secret.
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        anyhow::anyhow!(
+            "mcp: local http tool: failed reading response body: {}",
+            e.without_url()
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > server.max_response_bytes {
+            anyhow::bail!(
+                "mcp: local http tool response from {dest_label} exceeded \
+                 max_upstream_response_bytes ({} bytes); refusing to buffer more",
+                server.max_response_bytes
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     let body_value = serde_json::from_slice::<serde_json::Value>(&bytes)
         .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string()));
 
@@ -3552,6 +3690,12 @@ impl LocalStepOutcome {
 /// audit trail already writes to, so an operator filtering on that
 /// target sees a tool call's step outcomes alongside its
 /// prompt/argument audit line.
+///
+/// `info!`, matching the prompt-linked audit line it sits beside
+/// (WOR-2489 review): release builds compile with
+/// `tracing/release_max_level_info`, so a `debug!` here would be
+/// compiled out of every shipped binary and the per-step record would
+/// exist only in dev builds.
 fn emit_local_step_audit(
     server: &str,
     tool: &str,
@@ -3559,7 +3703,7 @@ fn emit_local_step_audit(
     outcome: LocalStepOutcome,
     elapsed: Duration,
 ) {
-    tracing::debug!(
+    tracing::info!(
         target: "mcp_audit",
         mcp_server = %server,
         mcp_tool = %tool,
@@ -3610,8 +3754,12 @@ fn local_steps_topological_order(steps: &[CompiledLocalStep]) -> Vec<usize> {
     }
     if order.len() != n {
         // Defensive only -- see doc comment above.
-        for i in 0..n {
-            if !order.contains(&i) {
+        let mut placed = vec![false; n];
+        for &i in &order {
+            placed[i] = true;
+        }
+        for (i, seen) in placed.iter().enumerate() {
+            if !seen {
                 order.push(i);
             }
         }
@@ -3651,33 +3799,50 @@ fn local_steps_topological_order(steps: &[CompiledLocalStep]) -> Vec<usize> {
 /// thrown exception does, exactly matching this task's "watchdogs and
 /// timeouts exactly as the existing engines configure them" binding.
 /// `template` runs the same `${...}` engine a `body:` field already
-/// uses ([`mcp_interpolate::interpolate_json_tree`]): the stored string
-/// is parsed as JSON first (a parse failure is a tool-call error, not a
-/// config-compile error -- `template`/`js`/`lua` are all stored as
-/// opaque strings at compile time, WOR-2489 Task 1), then every string
-/// leaf is interpolated against `ctx`, fail-closed on any unresolved
-/// `${...}` path exactly like a `body:` field.
+/// uses. A template that parses as JSON is walked with
+/// [`mcp_interpolate::interpolate_json_tree`] (every string leaf
+/// interpolated against `ctx`); a template that is not valid JSON is
+/// treated as one template string itself, so the documented bare form
+/// `template: "${steps.enrich.body}"` splices the whole parsed body
+/// through under the ordinary whole-string splice rule (WOR-2489
+/// review; docs/mcp-compose.md). Either way, interpolation is
+/// fail-closed on any unresolved `${...}` path exactly like a `body:`
+/// field. `template`/`js`/`lua` are all stored as opaque strings at
+/// compile time (WOR-2489 Task 1), so every one of these outcomes is a
+/// tool-call error, never a config-compile error.
+///
+/// `JsEngine::execute` / `LuaEngine::execute` run synchronously on the
+/// calling tokio worker. Deliberate: each engine enforces its own
+/// sandbox CPU budget (100 ms by default), matching the
+/// `decision_script::evaluate` convention this shaping mirrors. If
+/// those budgets are ever raised materially, move these calls behind
+/// `spawn_blocking`.
 fn shape_local_response(
     server_name: &str,
     tool_name: &str,
     response_cfg: &CompiledLocalResponseShaping,
     arguments: &serde_json::Value,
-    steps_context: &serde_json::Map<String, serde_json::Value>,
+    steps_context: serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    let ctx = serde_json::json!({
-        "args": arguments,
-        "steps": serde_json::Value::Object(steps_context.clone()),
-    });
+    // By hand, not `json!`: the macro copies interpolated `Value`s
+    // through `to_value(&...)`, and `steps_context` can be large.
+    let mut ctx_map = serde_json::Map::with_capacity(2);
+    ctx_map.insert("args".to_string(), arguments.clone());
+    ctx_map.insert(
+        "steps".to_string(),
+        serde_json::Value::Object(steps_context),
+    );
+    let ctx = serde_json::Value::Object(ctx_map);
 
     let shaped = match response_cfg {
         CompiledLocalResponseShaping::Template(template) => {
-            let parsed: serde_json::Value = serde_json::from_str(template).map_err(|e| {
-                anyhow::anyhow!(
-                    "mcp: local tool '{tool_name}' on server '{server_name}' \
-                     response.template is not valid JSON: {e}"
-                )
-            })?;
-            mcp_interpolate::interpolate_json_tree(&parsed, &ctx).map_err(|e| {
+            let rendered = match serde_json::from_str::<serde_json::Value>(template) {
+                Ok(parsed) => mcp_interpolate::interpolate_json_tree(&parsed, &ctx),
+                // Not a JSON document: the string itself is the
+                // template (the documented bare-placeholder form).
+                Err(_) => mcp_interpolate::interpolate_value(template, &ctx),
+            };
+            rendered.map_err(|e| {
                 anyhow::anyhow!(
                     "mcp: local tool '{tool_name}' on server '{server_name}' response.template: {e}"
                 )
@@ -3733,10 +3898,11 @@ async fn run_local_step_with_resolver(
     server: &CompiledLocalMcpServer,
     step: &CompiledLocalStep,
     context: &serde_json::Value,
+    tenant: &str,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<serde_json::Value> {
     let (status, document) =
-        run_local_http_call_with_resolver(server, &step.http, context, resolver).await?;
+        run_local_http_call_with_resolver(server, &step.http, context, tenant, resolver).await?;
     anyhow::ensure!(
         status.is_success(),
         "mcp: local step '{}' returned non-success status {}",
@@ -3755,6 +3921,7 @@ async fn run_local_steps_dag(
     steps_cfg: &CompiledLocalSteps,
     arguments: &serde_json::Value,
     condition_ctx: &sbproxy_extension::cel::CelContext,
+    tenant: &str,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<serde_json::Value> {
     let order = local_steps_topological_order(&steps_cfg.steps);
@@ -3807,12 +3974,29 @@ async fn run_local_steps_dag(
             ));
         }
 
-        let call_context = serde_json::json!({
-            "args": arguments,
-            "steps": serde_json::Value::Object(steps_context.clone()),
-        });
+        // WOR-2489 review: move the accumulated step context into the
+        // per-step `ctx` value and take it back out after the call,
+        // instead of deep-cloning every prior step's whole response
+        // body once per step (O(N^2 * B) copying under the old
+        // `steps_context.clone()`). Built by hand rather than with
+        // `json!`, because the macro routes interpolated values
+        // through `to_value(&...)`, which rebuilds (copies) the tree.
+        let mut context_map = serde_json::Map::with_capacity(2);
+        context_map.insert("args".to_string(), arguments.clone());
+        context_map.insert(
+            "steps".to_string(),
+            serde_json::Value::Object(std::mem::take(&mut steps_context)),
+        );
+        let call_context = serde_json::Value::Object(context_map);
+        let step_outcome =
+            run_local_step_with_resolver(server, step, &call_context, tenant, resolver).await;
+        if let serde_json::Value::Object(mut context_map) = call_context {
+            if let Some(serde_json::Value::Object(map)) = context_map.remove("steps") {
+                steps_context = map;
+            }
+        }
 
-        match run_local_step_with_resolver(server, step, &call_context, resolver).await {
+        match step_outcome {
             Ok(document) => {
                 outcomes.insert(step.name.as_str(), LocalStepOutcome::Success);
                 last_success = Some(step.name.as_str());
@@ -3863,7 +4047,7 @@ async fn run_local_steps_dag(
             tool_name,
             response_cfg,
             arguments,
-            &steps_context,
+            steps_context,
         ),
         // No shaping configured: the default is the last step (in
         // execution order) that actually completed, returned exactly
@@ -3900,6 +4084,7 @@ async fn execute_local_steps_with_resolver(
     steps_cfg: &CompiledLocalSteps,
     arguments: serde_json::Value,
     condition_ctx: &sbproxy_extension::cel::CelContext,
+    tenant: &str,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<serde_json::Value> {
     let budget = steps_cfg.timeout.unwrap_or(DEFAULT_LOCAL_STEPS_BUDGET);
@@ -3911,6 +4096,7 @@ async fn execute_local_steps_with_resolver(
             steps_cfg,
             &arguments,
             condition_ctx,
+            tenant,
             resolver,
         ),
     )
@@ -3932,6 +4118,7 @@ async fn execute_local_steps(
     steps_cfg: &CompiledLocalSteps,
     arguments: serde_json::Value,
     condition_ctx: &sbproxy_extension::cel::CelContext,
+    tenant: &str,
 ) -> anyhow::Result<serde_json::Value> {
     execute_local_steps_with_resolver(
         server,
@@ -3939,6 +4126,7 @@ async fn execute_local_steps(
         steps_cfg,
         arguments,
         condition_ctx,
+        tenant,
         &sbproxy_security::egress::SystemHostResolver,
     )
     .await
@@ -3999,8 +4187,15 @@ impl McpAction {
         match &tool.handler {
             CompiledLocalToolHandler::Static(value) => Ok(local_static_tool_result(value)),
             CompiledLocalToolHandler::Http { call, response } => {
-                execute_local_http_call(server, tool_name, call, response.as_ref(), &arguments)
-                    .await
+                execute_local_http_call(
+                    server,
+                    tool_name,
+                    call,
+                    response.as_ref(),
+                    &arguments,
+                    tenant,
+                )
+                .await
             }
             CompiledLocalToolHandler::Steps(steps_cfg) => {
                 let condition_ctx = self.local_step_condition_context(
@@ -4011,7 +4206,15 @@ impl McpAction {
                     principal,
                     &arguments,
                 );
-                execute_local_steps(server, tool_name, steps_cfg, arguments, &condition_ctx).await
+                execute_local_steps(
+                    server,
+                    tool_name,
+                    steps_cfg,
+                    arguments,
+                    &condition_ctx,
+                    tenant,
+                )
+                .await
             }
         }
     }
@@ -4206,6 +4409,22 @@ impl McpAction {
                 .clone()
                 .unwrap_or_else(|| "streamable_http".to_string());
 
+            // WOR-2489 review: `run_as_user_auth` mints a per-call
+            // upstream credential at dispatch, and a `type: local`
+            // server's tools dial with only their own configured
+            // `headers:` -- the minted credential would be silently
+            // discarded (the same dead-knob reasoning that refuses
+            // `headers:` on non-`openapi` servers below).
+            let is_local = upstream.server_type.as_deref() == Some("local");
+            if is_local && upstream.run_as_user_auth {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].run_as_user_auth is not supported on \
+                     type: local (origin '{}'); a local tool dials with its own http.headers, \
+                     so a minted per-caller credential would be silently discarded",
+                    upstream.origin
+                );
+            }
+
             // WOR-1792: stdio + run-as-user is a hard config error until
             // a safe secret-delivery path exists for local children.
             if upstream.run_as_user_auth {
@@ -4260,7 +4479,6 @@ impl McpAction {
 
             // WOR-2489: `tools[]` is a `local`-only field, mirroring
             // how `headers` above is an `openapi`-only field.
-            let is_local = upstream.server_type.as_deref() == Some("local");
             if !upstream.tools.is_empty() && !is_local {
                 anyhow::bail!(
                     "mcp action: federated_servers[].tools requires type: local (origin '{}')",
@@ -4301,7 +4519,12 @@ impl McpAction {
             // still what validates `tools[]` and produces the compiled
             // handlers Task 3's executor will consume.
             let (url, openapi, local) = if is_local {
-                let compiled = compile_local_server(&name, &upstream)?;
+                let compiled = compile_local_server(
+                    &name,
+                    &upstream,
+                    cfg.max_upstream_response_bytes
+                        .unwrap_or(DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES),
+                )?;
                 let tool_docs: Vec<serde_json::Value> = compiled
                     .tools
                     .iter()
@@ -9286,6 +9509,221 @@ allow := false if {
         assert!(msg.contains("exceeds the maximum"), "{msg}");
     }
 
+    /// WOR-2489 review: two tools with the same name would advertise
+    /// one tool's schema while the executor (which resolves by
+    /// upstream name and takes the first match) ran the other's
+    /// handler. Refused at compile time, naming both positions.
+    #[test]
+    fn wor_2489_review_duplicate_local_tool_names_are_refused_naming_both_positions() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "description": "first",
+                        "input_schema": {"type": "object"},
+                        "static": {"which": "first"}
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "second, different schema",
+                        "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                        "static": {"which": "second"}
+                    }
+                ]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("duplicate tool names must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate tool name 'lookup'"), "{msg}");
+        assert!(msg.contains("tools[0]"), "{msg}");
+        assert!(msg.contains("tools[1]"), "{msg}");
+    }
+
+    /// WOR-2489 review: `run_as_user_auth` mints a per-call credential
+    /// the local dispatch path never sends. Dead-knob doctrine: refuse
+    /// at load rather than accept-and-discard.
+    #[test]
+    fn wor_2489_review_run_as_user_auth_on_a_local_server_is_refused() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "run_as_user_auth": true,
+                "tools": [{
+                    "name": "ping",
+                    "description": "static",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("run_as_user_auth on a local server must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported on type: local"),
+            "the refusal must name the local-server incompatibility, not a generic \
+             upstream_auth requirement: {msg}"
+        );
+    }
+
+    /// WOR-2489 review: a per-attempt `http.timeout` past the maximum
+    /// whole-call budget could never complete; refuse it like the
+    /// `steps.timeout` cap above.
+    #[test]
+    fn wor_2489_review_http_timeout_over_the_budget_cap_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "http": {"method": "GET", "url": "https://api.example.com/a", "timeout": "6m"}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("an http.timeout past the 5-minute budget cap must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("http.timeout"), "{msg}");
+        assert!(
+            msg.contains("exceeds the maximum whole-call budget"),
+            "{msg}"
+        );
+    }
+
+    /// WOR-2489 review: the per-step audit record must be emitted at
+    /// `info` on the `mcp_audit` target. Release builds compile with
+    /// `tracing/release_max_level_info`, so a `debug!` emission would
+    /// not exist in any shipped binary -- the operator-facing per-step
+    /// trail would be dev-only.
+    #[test]
+    fn wor_2489_review_step_audit_emits_at_info_on_the_mcp_audit_target() {
+        use std::sync::{Arc, Mutex};
+        use tracing::span::{Attributes, Record};
+        use tracing::{Event, Id, Metadata};
+
+        #[derive(Clone, Default)]
+        struct LevelCapture {
+            events: Arc<Mutex<Vec<tracing::Level>>>,
+        }
+
+        impl tracing::Subscriber for LevelCapture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.target() == "mcp_audit"
+            }
+            fn new_span(&self, _span: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() == "mcp_audit" {
+                    self.events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(*event.metadata().level());
+                }
+            }
+            fn enter(&self, _span: &Id) {}
+            fn exit(&self, _span: &Id) {}
+        }
+
+        let capture = LevelCapture::default();
+        let events = capture.events.clone();
+        tracing::subscriber::with_default(capture, || {
+            emit_local_step_audit(
+                "server-a",
+                "tool-b",
+                "step-c",
+                LocalStepOutcome::Success,
+                Duration::from_millis(3),
+            );
+        });
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 1, "exactly one step audit event");
+        assert_eq!(
+            events[0],
+            tracing::Level::INFO,
+            "the per-step audit line must survive release_max_level_info"
+        );
+    }
+
+    /// WOR-2489 review: retry x per-attempt-timeout is bounded by the
+    /// same whole-call budget a `steps` DAG gets. A retry config that
+    /// would run past the budget is cut off by it. Virtual time
+    /// (`start_paused`) keeps this instant: the stub never answers, so
+    /// every timer -- per-attempt timeout, backoff, and the budget --
+    /// fires on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn wor_2489_review_standalone_http_whole_call_budget_cuts_off_retries() {
+        // A listener that accepts nothing: connects sit in the backlog
+        // and no response ever arrives.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "retries against a black hole",
+                    "input_schema": {"type": "object"},
+                    "http": {
+                        "method": "GET",
+                        "url": format!("http://{addr}/"),
+                        "timeout": "7s",
+                        "retry": {"max_attempts": 16, "retry_on": ["connect_error", "timeout"], "backoff_ms": 100}
+                    }
+                }]
+            }]
+        }))
+        .expect("budget fixture compiles");
+
+        let server = &action.local_servers[0];
+        let CompiledLocalToolHandler::Http { call, response } = &server.tools[0].handler else {
+            panic!("fixture declares an http handler");
+        };
+
+        let started = std::time::Instant::now();
+        let err = execute_local_http_call_with_resolver(
+            server,
+            "fetch",
+            call,
+            response.as_ref(),
+            &json!({}),
+            "tenant-a",
+            &sbproxy_security::egress::SystemHostResolver,
+        )
+        .await
+        .expect_err("the whole-call budget must end the call");
+        assert!(
+            err.to_string().contains("whole-call budget"),
+            "the failure must name the budget, not retry exhaustion: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "virtual time must keep this instant; a real 16x7s retry loop ran instead \
+             (took {:?})",
+            started.elapsed()
+        );
+        drop(listener);
+    }
+
     #[test]
     fn compiled_local_types_exhaustive_shape() {
         // Documents the full compiled contract Task 2 will consume by
@@ -9345,9 +9783,14 @@ allow := false if {
             name: server_name,
             mut tools,
             egress,
+            max_response_bytes,
         } = servers.remove(0);
         assert_eq!(server_name, "lookup-server");
         assert!(egress.is_some());
+        assert_eq!(
+            max_response_bytes, DEFAULT_LOCAL_HTTP_MAX_RESPONSE_BYTES,
+            "no action-level max_upstream_response_bytes configured, so the shared default applies"
+        );
         assert_eq!(tools.len(), 1);
 
         let CompiledLocalMcpTool {

@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # The same composed tool as examples/mcp-compose, shaped with
 # JavaScript (QuickJS) instead of Lua, to show the two response-shaping
-# engines bind the identical `ctx = {args, steps}` context (WOR-2489).
+# engines bind the identical `ctx = {args, steps}` context.
 # Everything else -- the two-step DAG against test.sbproxy.dev's
 # `hello`/`echo` tools, the `condition` on the echo step, RBAC,
 # egress, and evidence -- is unchanged from examples/mcp-compose. See

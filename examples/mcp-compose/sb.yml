@@ -3,7 +3,7 @@
 # two-step DAG against test.sbproxy.dev's own small MCP endpoint
 # (tools `hello` and `echo`, the same pair examples/mcp-governance and
 # examples/mcp-tool-versioning already call over federation), shaped
-# with Lua, RBAC'd, with governance evidence on (WOR-2489).
+# with Lua, RBAC'd, with governance evidence on.
 #
 # `compose.greet_and_echo` runs two steps:
 #   - `hello`: calls the upstream `hello` tool with the caller's

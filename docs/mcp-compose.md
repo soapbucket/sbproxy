@@ -97,13 +97,24 @@ http:
 numeric status code, default `[connect_error, timeout]`), and
 `backoff_ms` (default `100`, doubled per attempt, capped at 5s).
 
+`timeout` bounds one attempt; the whole call -- every retry attempt
+and backoff included -- is additionally bounded by the same whole-call
+budget a `steps` DAG gets: 30 seconds, widened to the configured
+per-attempt `timeout` when that is longer, and never past 5 minutes
+(a `timeout` beyond 5 minutes is a config-compile error). Retry
+attempts do not extend the budget: a retry schedule that would run
+past it is cut off by it.
+
 A tool with an `http` handler can also set its own `response:`
 (sibling of `http:`, not nested inside it) to shape the call's result
 with the same `template`/`js`/`lua` engines a `steps` handler's
 `response:` uses -- see [Response shaping](#response-shaping) below.
 The call's own `{status, headers, body}` document is bound under
-`steps.<tool name>` in that case, so a single-call `http` tool and a
-`steps` DAG bind the identical `ctx = {args, steps}` vocabulary.
+`steps.<tool name>` in that case -- the tool's *declared* name in
+`tools[]`, never the namespaced advertised name, so under
+`prefix: local` a tool advertised as `local.lookup` still binds
+`steps.lookup`. A single-call `http` tool and a `steps` DAG therefore
+bind the identical `ctx = {args, steps}` vocabulary.
 Shaping only runs over a completed (2xx) call; a non-2xx response
 fails the tool call closed instead of running `response:` against it,
 the same rule a `steps` DAG step with no `continue_on_error` already
@@ -177,6 +188,8 @@ response contains one:
 | `${args.<path>}` | A value from the tool call's parsed arguments. |
 | `${steps.<name>.status}` | The HTTP status code a completed step's call returned. |
 | `${steps.<name>.body.<path>}` | A value from a completed step's parsed response body. |
+| `${steps.<name>.headers.<header>}` | A response header from a completed step's call. Only `content-type` is captured today. |
+| `${steps.<name>.error}` | The recorded failure text of a step that failed with `continue_on_error: true`. A failed-and-continued step's entry carries *only* `error`; reading `.status` or `.body` off it fails closed. |
 
 `<path>` is a **dot-separated JSON object path only**
 (`user.id`, `billing.plan.tier`): each segment is looked up as an
@@ -188,11 +201,17 @@ its payload in a `content` array (`result.content[0].text`), which
 means `${steps.<name>.body...}` can reach `status` and any flat,
 object-shaped field of a step's body, but not into that array; pull a
 value out of an array in [response shaping](#response-shaping)
-instead, where a real script indexes it natively. Only steps that have
-already completed, in dependency order, are in scope for
-`${steps...}`: a step can read any step named in its own `depends_on`
-chain (transitively), never a step declared after it or one it does
-not depend on.
+instead, where a real script indexes it natively. Every step that has
+already run when a step executes is in scope for its `${steps...}`
+reads -- scope follows execution order, not the `depends_on` graph.
+`depends_on` is what makes that order deterministic (and what makes
+the executor fail fast when a named dependency did not complete), not
+a visibility boundary: a step *can* read a step it never declared a
+dependency on, if that step happens to sort earlier. Do not rely on
+that -- which independent step runs first is a declaration-order tie
+break, so reordering `steps[]` can silently break the read, and
+`depends_on` gives no isolation between steps. Declare `depends_on`
+for every step whose output you read.
 
 **Escaping.** `$$` renders one literal `$` and never opens a
 placeholder, so `$$` followed by `{args.x}` renders the literal text
@@ -217,12 +236,27 @@ renders as an empty string, and an object or array renders as compact
 JSON text. The same stringify rule applies to any placeholder embedded
 inside a larger `body:` string too, not just whole-value splices.
 
+**URL splices are data, never structure.** A placeholder embedded in a
+`url:` template is percent-encoded after it resolves: every character
+outside the RFC 3986 unreserved set (letters, digits, `-` `.` `_` `~`)
+arrives encoded. A caller who passes `id: "../admin"` therefore
+reaches `/widgets/..%2Fadmin` -- a literal path segment on the allowed
+host -- not `/admin`; `?`, `#`, `&`, and `=` are neutralized the same
+way, so an argument cannot inject query parameters or truncate the
+template either. The one exception is a `url:` that is *entirely* one
+placeholder (`url: "${steps.discover.body.next}"`): that splices
+verbatim, because the operator delegated the whole URL deliberately,
+and egress authorization still gates whatever host it names.
+
 **Missing paths fail closed.** A path that does not resolve, an
 argument that was not supplied, or a field absent from a step's body
 is a tool-call error, not an empty string. Nothing here has an
 implicit default; if a value might be absent, gate its use behind a
 `condition` (below) rather than relying on the splice to degrade
-gracefully.
+gracefully -- and guard the condition itself with `has(...)`, because
+CEL reads of an absent argument are an evaluation error, not `false`,
+and a condition that errors fails the whole tool call closed. See
+[What `condition` cannot see](#what-condition-cannot-see).
 
 ### Worked example: reading a prior step's output
 
@@ -292,8 +326,16 @@ belongs in `response` shaping (below), reading the earlier step's
 output there instead.
 
 ```yaml
-condition: "mcp.arguments.verbose == true"
+condition: "has(mcp.arguments.verbose) && mcp.arguments.verbose == true"
 ```
+
+The `has(...)` guard is load-bearing when an argument is optional: CEL
+map access on a missing key is an evaluation error, not `false`, and a
+`condition` that fails to evaluate fails the **whole tool call**
+closed (the same rule an `argument_policies[]` rule that cannot prove
+itself follows), rather than skipping the step. Write the bare
+`mcp.arguments.verbose == true` form only when `input_schema` marks
+`verbose` required.
 
 ## DAG semantics
 
@@ -307,17 +349,24 @@ rather than accepting the key and ignoring it.
 
 **`condition`.** Evaluated immediately before a step would otherwise
 run. `false` skips the step: it is not attempted, and skipping is not
-itself an error. A step whose `depends_on` names a step that did not
-complete (skipped by its own `condition`, or failed without
-`continue_on_error`) is itself skipped if its own `condition`
-evaluates false, and is a tool-call error otherwise, since it would
-have run but has nothing to run against.
+itself an error. A `condition` that fails to *evaluate* (a CEL runtime
+error -- most commonly reading an optional argument without a
+`has(...)` guard) fails the whole tool call closed. A step whose
+`depends_on` names a step that did not complete -- skipped by its own
+`condition`, or failed, **with or without** `continue_on_error` -- is
+itself skipped if its own `condition` evaluates false, and is a
+tool-call error otherwise, since it would have run but has nothing to
+run against. Only a step that completed successfully satisfies a
+dependency.
 
 **`continue_on_error`.** By default, a failed step call (a non-2xx
 response, a connect failure, a timeout that exhausts its `retry`)
 fails the whole tool call. Setting `continue_on_error: true` on a step
-records that failure onto its `steps.<name>` context entry instead of
-stopping the DAG, so steps that do not depend on it still run.
+records that failure onto its `steps.<name>` context entry (as
+`error`, its only field) instead of stopping the DAG, so steps that do
+not depend on it still run. It does not soften the dependency rule
+above: a step that `depends_on` the failed step still errors the tool
+call, because a failed-and-continued step never counts as complete.
 
 **Retry.** Each step's own `http.retry` applies to that step's call
 only, the same `RetryConfig` shape [`http` handlers](#http) use.
@@ -356,7 +405,10 @@ response:
 A whole-string placeholder like this one splices the entire parsed
 body through unchanged; build a literal JSON document with embedded
 placeholders (`'{"vendor": "${steps.enrich.body.name}"}'`) when you
-need to reshape rather than pass through.
+need to reshape rather than pass through. A template that parses as a
+JSON document has every string leaf interpolated in place; a template
+that is not valid JSON is treated as one template string itself, which
+is what makes the bare form above work.
 
 ### `js`
 
@@ -402,7 +454,7 @@ A local server publishes its tools into the exact same catalog a
 federated `mcp` or `openapi` server does: the same `FederatedTool`
 entries, built the same way, so nothing downstream can tell a local
 tool apart from an upstream one by looking at the registry. Every
-WOR-2384 gate that reads that catalog therefore applies unchanged,
+governance gate that reads that catalog therefore applies unchanged,
 with no local-specific wiring of its own:
 
 - **`rbac_policies`** filters a local tool out of `tools/list` and
@@ -460,6 +512,13 @@ applies verbatim to a `type: local` one.
   CEL `condition` is; validate it yourself (a JSON Schema linter, or a
   quick `tools/call` against a case you expect to fail) before relying
   on it to reject bad arguments.
+- **A whole-placeholder `url:` is delegated wholesale.** When a
+  `url:` template is exactly one `${...}` placeholder, the resolved
+  value is used verbatim as the URL -- no percent-encoding, unlike an
+  embedded splice (see
+  [Interpolation vocabulary](#interpolation-vocabulary)). Egress still
+  gates the host, but the path and query are whatever the source value
+  says; only point this form at data you trust to name URLs.
 - **No JSONPath engine, and no array indexing.** `${}` paths are
   plain dot-separated object-key lookups, not a JSONPath or JMESPath
   expression: no wildcards, no filters, no slicing, and no way to step

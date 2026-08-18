@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # A `type: local` MCP server: tools the gateway serves itself, no
-# upstream MCP or REST dial required (WOR-2489).
+# upstream MCP or REST dial required.
 #
 # Two tools, no step DAG:
 #   - `status`: a `static` handler. Always returns the same JSON value.

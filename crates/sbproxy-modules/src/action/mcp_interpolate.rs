@@ -201,15 +201,62 @@ pub(crate) fn interpolate_value(
     }
 }
 
-/// [`interpolate_value`] for a field that must remain a string (a URL
-/// or an HTTP header value): a whole-string splice of a non-string
-/// value is rendered the same way [`stringify`] renders an embedded
-/// one, since a URL or header can only ever hold text.
+/// [`interpolate_value`] for a field that must remain a string (an
+/// HTTP header value): a whole-string splice of a non-string value is
+/// rendered the same way [`stringify`] renders an embedded one, since
+/// a header can only ever hold text.
 pub(crate) fn interpolate_string(
     template: &str,
     context: &Value,
 ) -> Result<String, InterpolationError> {
     Ok(stringify(&interpolate_value(template, context)?))
+}
+
+/// Percent-encoding set for a placeholder value spliced into a URL
+/// template: everything except the RFC 3986 unreserved characters
+/// (ALPHA / DIGIT / `-` / `.` / `_` / `~`) is encoded, so a resolved
+/// value is always data and never URL structure.
+const URL_DATA_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// [`interpolate_string`] for a `url:` template (WOR-2489 review).
+///
+/// A placeholder embedded in a larger template is stringified and then
+/// percent-encoded under [`URL_DATA_ENCODE_SET`], so a
+/// caller-controlled argument spliced into a path or query cannot
+/// change which path the request reaches or which parameters it
+/// carries on the egress-allowed host: `../`, `?`, `#`, `&`, and `=`
+/// all arrive encoded. A template that is exactly one placeholder is
+/// spliced verbatim instead -- it IS the URL, the operator delegated
+/// the whole thing deliberately, and egress authorization still gates
+/// whatever host it names.
+pub(crate) fn interpolate_url(
+    template: &str,
+    context: &Value,
+) -> Result<String, InterpolationError> {
+    let segments = scan(template)?;
+    match segments.as_slice() {
+        [Segment::Placeholder(path)] => Ok(stringify(resolve_path(path, context)?)),
+        _ => {
+            let mut out = String::new();
+            for segment in &segments {
+                match segment {
+                    Segment::Literal(s) => out.push_str(s),
+                    Segment::Placeholder(path) => {
+                        let rendered = stringify(resolve_path(path, context)?);
+                        out.extend(percent_encoding::utf8_percent_encode(
+                            &rendered,
+                            URL_DATA_ENCODE_SET,
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Recursively interpolate every string leaf of a JSON tree (a local
@@ -285,7 +332,7 @@ mod tests {
     fn interpolate_string_stringifies_a_whole_string_non_string_splice() {
         // A URL or header can only be text, so a whole-string splice
         // of a JSON object still renders as text there, unlike
-        // `interpolate_value`'s behaviour for a body leaf.
+        // `interpolate_value`'s behavior for a body leaf.
         let ctx = args(json!({"obj": {"a": 1}}));
         assert_eq!(
             interpolate_string("${args.obj}", &ctx).expect("resolves"),
@@ -516,6 +563,63 @@ mod tests {
             err,
             InterpolationError::MissingPath {
                 path: "steps.skipped_step.status".to_string()
+            }
+        );
+    }
+
+    // --- URL splices are data, not structure (WOR-2489 review) ---
+
+    /// A caller-controlled value spliced into a URL path must not be
+    /// able to traverse to a sibling path on the egress-allowed host:
+    /// `..%2F` arrives encoded, so the origin sees a path segment, not
+    /// a parent-directory hop the WHATWG URL parser would collapse.
+    #[test]
+    fn url_embedded_placeholder_is_percent_encoded_as_data() {
+        let ctx = args(json!({"id": "../../admin/api-keys"}));
+        assert_eq!(
+            interpolate_url("https://api.internal/widgets/${args.id}", &ctx).expect("resolves"),
+            "https://api.internal/widgets/..%2F..%2Fadmin%2Fapi-keys"
+        );
+        // Query and fragment metacharacters are neutralized the same
+        // way: no parameter injection, no template truncation.
+        let ctx = args(json!({"q": "a&admin=true#tail?x=1"}));
+        assert_eq!(
+            interpolate_url("https://api.internal/search?q=${args.q}", &ctx).expect("resolves"),
+            "https://api.internal/search?q=a%26admin%3Dtrue%23tail%3Fx%3D1"
+        );
+        // Plain alphanumeric values pass through unchanged.
+        let ctx = args(json!({"id": 42}));
+        assert_eq!(
+            interpolate_url("https://api.internal/widgets/${args.id}", &ctx).expect("resolves"),
+            "https://api.internal/widgets/42"
+        );
+    }
+
+    /// A template that IS one placeholder splices the resolved value
+    /// verbatim: the operator delegated the entire URL, and egress
+    /// still gates whatever host it names.
+    #[test]
+    fn url_whole_string_placeholder_splices_the_url_verbatim() {
+        let ctx = steps_context(json!({
+            "discover": {"status": 200, "headers": {}, "body": {"next": "https://api.internal/page/2?cursor=a+b"}}
+        }));
+        assert_eq!(
+            interpolate_url("${steps.discover.body.next}", &ctx).expect("resolves"),
+            "https://api.internal/page/2?cursor=a+b"
+        );
+    }
+
+    /// The URL form keeps the shared fail-closed rule: a missing path
+    /// is an error, never an empty splice.
+    #[test]
+    fn url_missing_path_fails_closed() {
+        let ctx = args(json!({}));
+        let err = interpolate_url("https://api.internal/widgets/${args.id}", &ctx)
+            .expect_err("must fail closed");
+        assert_eq!(
+            err,
+            InterpolationError::MissingPath {
+                path: "args.id".to_string()
             }
         );
     }

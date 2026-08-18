@@ -14053,6 +14053,189 @@ mod mcp_catalog_snapshot_tests {
         );
     }
 
+    /// WOR-2489 review red-first: an upstream body over the
+    /// operator's `max_upstream_response_bytes` cap must fail the tool
+    /// call closed with a refusal naming the knob -- a local tool
+    /// honors the exact ceiling every other MCP upstream exchange
+    /// already does, instead of buffering an unbounded body.
+    #[tokio::test]
+    async fn wor_2489_review_http_local_tool_response_over_the_cap_fails_closed() {
+        // 64-byte cap; the stub answers with a 200-byte body.
+        let big_body: &'static str =
+            Box::leak(format!("{{\"pad\":\"{}\"}}", "x".repeat(190)).into_boxed_str());
+        let addr = spawn_local_http_stub(vec![(200, big_body)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-cap-fixture", "version": "1.0.0"},
+            "max_upstream_response_bytes": 64,
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "cap-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "calls an oversized upstream",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "http": {"method": "GET", "url": format!("http://{addr}/")}
+                }]
+            }]
+        }))
+        .expect("cap fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a cap refusal, got: {call:?}"));
+        assert!(
+            message.contains("max_upstream_response_bytes"),
+            "the refusal must name the operator knob, got: {message}"
+        );
+        assert!(
+            message.contains("64"),
+            "the refusal must name the configured cap, got: {message}"
+        );
+    }
+
+    /// WOR-2489 review red-first: a transport failure's client-facing
+    /// error must never reflect the interpolated request URL. The URL
+    /// can carry a resolved `${VAR}` config secret (query-key auth is
+    /// the documented shape) and caller arguments, and on the legacy
+    /// MCP era the whole anyhow chain reaches the caller verbatim.
+    #[tokio::test]
+    async fn wor_2489_review_http_local_tool_error_never_reflects_the_resolved_url() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-leak-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "leak-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "dials a dead port with a secret-bearing query",
+                    "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    "http": {
+                        "method": "GET",
+                        "url": "http://127.0.0.1:1/items/${args.id}?api_key=sk-test-4242"
+                    }
+                }]
+            }]
+        }))
+        .expect("leak fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {"id": "argument-7"}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a transport failure, got: {call:?}"));
+        assert!(
+            message.contains("mcp: local http tool call failed"),
+            "the failure must still be named, got: {message}"
+        );
+        assert!(
+            !message.contains("sk-test-4242"),
+            "the query-string credential must never reach the caller, got: {message}"
+        );
+        assert!(
+            !message.contains("argument-7"),
+            "the interpolated argument must never reach the caller, got: {message}"
+        );
+        assert!(
+            !message.contains("127.0.0.1"),
+            "the dialed host must not be reflected to the caller either, got: {message}"
+        );
+    }
+
+    /// WOR-2489 review red-first: a caller-controlled argument spliced
+    /// into a URL path arrives percent-encoded as data -- `../` cannot
+    /// traverse to a sibling path on the egress-allowed host, because
+    /// the origin receives `..%2F` path segments, not dot-dot hops the
+    /// URL parser would collapse before dialing.
+    #[tokio::test]
+    async fn wor_2489_review_http_local_tool_url_splice_cannot_traverse_the_path() {
+        let (addr, recorded) = spawn_recording_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-traversal-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "traversal-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "splices a caller argument into the path",
+                    "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    "http": {"method": "GET", "url": format!("http://{addr}/widgets/${{args.id}}")}
+                }]
+            }]
+        }))
+        .expect("traversal fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {"id": "../secret"}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+
+        let recorded = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(recorded.len(), 1, "got: {recorded:?}");
+        assert!(
+            recorded[0].contains("GET /widgets/..%2Fsecret"),
+            "the origin must see the traversal attempt as an encoded path segment, got: {recorded:?}"
+        );
+    }
+
     // --- `type: local` step DAG dispatch (WOR-2489 Task 4) ---
     //
     // Continues the section above: these drive a real DAG through the
@@ -14181,6 +14364,48 @@ mod mcp_catalog_snapshot_tests {
         assert!(
             message.contains("does not resolve against the call arguments"),
             "a missing template path must fail closed with a named reason, got: {message}"
+        );
+    }
+
+    /// WOR-2489 review red-first: the documented bare-placeholder form
+    /// (`template: "${steps.<name>.body}"`, docs/mcp-compose.md) must
+    /// work -- a template that is not a JSON document is the template
+    /// string itself, and a whole-string placeholder splices the
+    /// entire parsed body through unchanged.
+    #[tokio::test]
+    async fn wor_2489_review_response_template_bare_placeholder_passes_the_body_through() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"value":42,"name":"widget"}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"template": "${steps.only.body}"}),
+        ))
+        .expect("bare-placeholder template fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(
+            document,
+            json!({"value": 42, "name": "widget"}),
+            "the bare whole-string placeholder must splice the step body through unchanged"
         );
     }
 
@@ -14636,6 +14861,129 @@ mod mcp_catalog_snapshot_tests {
         );
     }
 
+    /// WOR-2489 review: the `condition` fail-closed arm, pinned by
+    /// name. CEL map access on a missing key is an evaluation error,
+    /// not `false`, and an erroring condition must fail the whole tool
+    /// call closed -- never silently skip or run the step. The
+    /// `input_schema` is permissive, so the call reaches the executor.
+    #[tokio::test]
+    async fn wor_2489_review_steps_condition_evaluation_error_fails_the_whole_call_closed() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-condition-error-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "condition-error-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "one step whose condition reads an argument the call omits",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "gated",
+                                "condition": "mcp.arguments.absent == true",
+                                "http": {"method": "GET", "url": format!("http://{addr}/")}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("condition-error DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an erroring condition must fail the call, got: {call:?}"));
+        assert!(
+            message.contains("condition failed to evaluate"),
+            "the failure must name the condition, got: {message}"
+        );
+    }
+
+    /// WOR-2489 review: the guarded form docs/mcp-compose.md now
+    /// recommends for optional arguments --
+    /// `has(mcp.arguments.x) && mcp.arguments.x == true` -- must skip
+    /// the step cleanly when the argument is absent, not error the
+    /// call. Pins that the documented advice actually works.
+    #[tokio::test]
+    async fn wor_2489_review_steps_condition_has_guard_skips_cleanly_on_an_absent_argument() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"stage":"always"}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-condition-has-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "condition-has-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "an optional-argument step guarded by has(), plus an always-on step",
+                    "input_schema": {"type": "object", "properties": {"verbose": {"type": "boolean"}}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "guarded",
+                                "condition": "has(mcp.arguments.verbose) && mcp.arguments.verbose == true",
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            },
+                            {
+                                "name": "always",
+                                "http": {"method": "GET", "url": format!("http://{addr}/")}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("has()-guarded DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "the has() guard must skip, not error, on an absent argument, got: {call:?}"
+        );
+    }
+
     /// Red-first: the ruled dependency rule's hard-error branch. A
     /// step with `continue_on_error: true` fails (its own call never
     /// reaches a listener), so the DAG continues past it -- but a
@@ -14854,9 +15202,16 @@ mod mcp_catalog_snapshot_tests {
             1,
             "only 'reporter' dials the recording stub, got: {recorded:?}"
         );
+        // WOR-2489 review: the recorded error names only the failure
+        // class -- never the URL, whose path/query can carry a
+        // resolved `${VAR}` secret or caller arguments.
         assert!(
-            recorded[0].contains("mcp: local http tool call to http://127.0.0.1:1/ failed"),
+            recorded[0].contains("mcp: local http tool call failed: connection failed"),
             "'reporter' must have read flaky's recorded error through steps.flaky.error, got: {recorded:?}"
+        );
+        assert!(
+            !recorded[0].contains("127.0.0.1:1/"),
+            "the recorded step error must not carry the dialed URL, got: {recorded:?}"
         );
     }
 

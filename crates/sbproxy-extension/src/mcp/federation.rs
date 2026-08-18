@@ -1686,7 +1686,22 @@ impl McpFederation {
                 .tools
                 .iter()
                 .filter_map(|t| {
-                    FederatedTool::from_local_document(t.clone(), server.name.clone()).ok()
+                    match FederatedTool::from_local_document(t.clone(), server.name.clone()) {
+                        Ok(tool) => Some(tool),
+                        // WOR-2489 review: a local tool's document comes
+                        // from config the operator wrote, so a silent
+                        // drop means a tool they declared just is not
+                        // there. Name it.
+                        Err(e) => {
+                            warn!(
+                                server = %server.name,
+                                tool = %t.get("name").and_then(serde_json::Value::as_str).unwrap_or("<unnamed>"),
+                                error = %e,
+                                "config-declared local tool failed contract construction and will not be advertised"
+                            );
+                            None
+                        }
+                    }
                 })
                 .collect();
             return Ok(federated);
@@ -1836,6 +1851,16 @@ impl McpFederation {
             .find_map(|s| capabilities.get(&s.name)?.get("mcpApps").cloned());
 
         for server in &self.servers {
+            // WOR-2489 review: an `openapi` server has no MCP endpoint
+            // to fetch resources from, and a `local` server's URL is
+            // the placeholder `local://<name>` nothing can ever dial --
+            // attempting it every refresh cycle put a warn line, an
+            // io-failure metric tick, and a permanent false positive in
+            // the egress inventory on a completely normal path.
+            // Matches `refresh_server_capabilities`' own skip.
+            if server.openapi.is_some() || server.local.is_some() {
+                continue;
+            }
             match self.fetch_resources_from_server(server).await {
                 Ok(resources) => {
                     info!(
@@ -2249,7 +2274,12 @@ impl McpFederation {
     pub async fn refresh_prompts(&self) -> anyhow::Result<usize> {
         let mut fetched: Vec<(String, NamespaceMode, Vec<FederatedPrompt>)> = Vec::new();
         for server in &self.servers {
-            if server.openapi.is_some() {
+            // WOR-2489 review: skip `local` servers structurally, not
+            // via the capability-map side effect below (a `local`
+            // server never appears in the capability snapshot, so
+            // `server_declares` happened to save this loop -- but that
+            // is a coincidence of refresh ordering, not a guarantee).
+            if server.openapi.is_some() || server.local.is_some() {
                 continue;
             }
             if !self.server_declares(&server.name, "prompts") {
@@ -6664,6 +6694,34 @@ mod tests {
     }
 
     // --- Federation construction ---
+
+    /// WOR-2489 review: a `local` server's URL is the placeholder
+    /// `local://<name>` -- nothing can dial it, so a resource refresh
+    /// must skip the server entirely rather than attempt (and record)
+    /// a dial every cycle. The egress inventory is the operator's
+    /// answer to "where did this proxy try to go", so even one
+    /// `local://` sighting there is a permanent self-inflicted false
+    /// positive.
+    #[tokio::test]
+    async fn wor_2489_review_refresh_resources_never_dials_a_local_server() {
+        let host = "wor2489-local-resources-skip";
+        let mut server = mock_server(host, &format!("local://{host}"));
+        server.local = Some(LocalBacking { tools: vec![] });
+        let fed = McpFederation::new(vec![server]);
+
+        fed.refresh_resources()
+            .await
+            .expect("refresh must succeed with only a local server");
+
+        let sighting = sbproxy_security::egress::egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| s.host == host);
+        assert!(
+            sighting.is_none(),
+            "a local server must never be dialed (or even authorized) during resource \
+             refresh, got a sighting: {sighting:?}"
+        );
+    }
 
     #[test]
     fn test_new_federation_starts_empty() {
