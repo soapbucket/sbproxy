@@ -2201,7 +2201,29 @@ pub(super) async fn handle_mcp_action(
         // WOR-1640: module emission and hashing are cached by
         // (registry generation, callback base), so a warm hit does
         // neither; the ETag stays stable until the catalogue moves.
-        let (module, etag_value) = mcp.federation.codemode_ts_cached(&callback_base);
+        //
+        // WOR-2484: this listing surface must hide a `draft` server's
+        // tools exactly like `tools/list` and `resources/list` already
+        // do below -- same "not advertised until approved" rule, same
+        // `McpServerApprovalStatus::Draft` check, reused here rather
+        // than re-implemented so there is exactly one place that
+        // decides what "draft" hides. `deprecated` is unaffected: like
+        // `tools/list`, only `draft` is filtered out of a listing.
+        // Codemode.ts is served ahead of per-caller authentication (see
+        // the well-known-route comment above) and its module is cached
+        // per catalogue generation, not per principal, so this closure
+        // deliberately checks only registry approval status -- RBAC
+        // (`policy_for_server`) is a per-caller decision this shared,
+        // cacheable surface cannot apply; see docs/mcp-security-coverage.md's
+        // MCP09 row.
+        let (module, etag_value) =
+            mcp.federation
+                .codemode_ts_cached(&callback_base, |server_name| {
+                    !matches!(
+                        mcp.server_status(server_name),
+                        sbproxy_modules::action::mcp::McpServerApprovalStatus::Draft
+                    )
+                });
 
         let if_none_match = session
             .req_header()
@@ -10128,6 +10150,67 @@ mod mcp_catalog_snapshot_tests {
         .expect("MCP JSON response")
     }
 
+    /// [`mcp_handler_exchange`], but for a plain `GET` against a
+    /// well-known route (`/.well-known/mcp/codemode.ts` today) rather
+    /// than a JSON-RPC `POST /`. Returns the response status and raw
+    /// body text so a caller can assert on emitted TypeScript rather
+    /// than a parsed JSON-RPC envelope.
+    async fn mcp_handler_get(action: &McpAction, path: &str) -> (u16, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP downstream fixture");
+        let address = listener.local_addr().expect("MCP downstream address");
+        let path = path.to_string();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect MCP downstream fixture");
+            let headers =
+                format!("GET {path} HTTP/1.1\r\nHost: mcp.test\r\nconnection: close\r\n\r\n");
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write MCP GET request");
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read MCP response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept MCP downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse MCP downstream GET request");
+        let mut context = RequestContext::new();
+
+        handle_mcp_action(&mut session, action, &mut context, false)
+            .await
+            .expect("MCP handler response");
+        drop(session);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("MCP response timeout")
+            .expect("MCP downstream task");
+        let response = String::from_utf8(response).expect("MCP HTTP response UTF-8");
+        let status = response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("MCP HTTP status line");
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
     /// WOR-2384 (F1/F2 fix round 2): crosses the wire boundary that
     /// `sbproxy_extension::mcp::sessions`'s own store-level tests only
     /// reach as far as `SessionStore::create_capped` returning
@@ -10927,6 +11010,121 @@ mod mcp_catalog_snapshot_tests {
                 .all(|t| t["name"] != "progressive-draft-tool"),
             "progressive discovery's search meta-tool must hide a draft \
              server's tools, same as tools/list: {results:?}"
+        );
+    }
+
+    /// WOR-2484 red-first: the Code Mode TypeScript listing
+    /// (`GET /.well-known/mcp/codemode.ts`) rendered the full,
+    /// unfiltered federation registry, so a `draft` server's tool
+    /// names and descriptions leaked into the emitted module even
+    /// though `tools/list` and `tools/call` already hid and refused
+    /// them (docs/mcp-security-coverage.md's MCP09 row documented this
+    /// as a known carve-out). This proves the same draft-status filter
+    /// `tools/list` applies now gates this surface too, and that an
+    /// `approved` server's tools are unaffected.
+    #[tokio::test]
+    async fn wor_2484_codemode_ts_hides_a_draft_servers_tools_and_keeps_an_approved_servers() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "codemode-draft-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                {
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": "codemode-draft-server",
+                    "status": "draft"
+                },
+                {
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": "codemode-approved-server",
+                    "status": "approved"
+                }
+            ]
+        }))
+        .expect("codemode draft-status fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([
+                (
+                    "codemode-draft-tool".to_string(),
+                    tool("codemode-draft-tool", "codemode-draft-server"),
+                ),
+                (
+                    "codemode-approved-tool".to_string(),
+                    tool("codemode-approved-tool", "codemode-approved-server"),
+                ),
+            ]),
+            None,
+        );
+
+        let (status, body) = mcp_handler_get(&action, "/.well-known/mcp/codemode.ts").await;
+        assert_eq!(status, 200, "codemode.ts must be served: {body}");
+        assert!(
+            !body.contains("codemode-draft-tool"),
+            "a draft server's tool name/description must not reach the \
+             emitted codemode.ts module at all, not even hidden behind a \
+             filtered key: {body}"
+        );
+        assert!(
+            body.contains("['codemode-approved-tool']:"),
+            "an approved server's tool must still be advertised in \
+             codemode.ts: {body}"
+        );
+    }
+
+    /// WOR-2484: registry approval status is immutable config data for
+    /// the lifetime of one `McpFederation` (see
+    /// `McpFederation::codemode_ts_cached`'s doc comment) -- an
+    /// operator only changes it by editing config, which rebuilds the
+    /// whole `McpAction`, and therefore this federation, from scratch.
+    /// This proves that structural claim end to end: two `McpAction`s
+    /// compiled from configs that differ only in one server's
+    /// `status`, each queried once, never share a stale codemode.ts
+    /// cache entry across the "reload."
+    #[tokio::test]
+    async fn wor_2484_codemode_ts_reflects_the_status_a_fresh_reload_compiled_with() {
+        let config_with = |status: &str| {
+            json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "codemode-reload-fixture", "version": "1.0.0"},
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": "codemode-reload-server",
+                    "status": status
+                }]
+            })
+        };
+        let seed = || {
+            HashMap::from([(
+                "codemode-reload-tool".to_string(),
+                tool("codemode-reload-tool", "codemode-reload-server"),
+            )])
+        };
+
+        let approved = McpAction::from_config(config_with("approved"))
+            .expect("approved reload fixture compiles");
+        approved.federation.seed_tools_for_test(seed(), None);
+        let (_, approved_body) = mcp_handler_get(&approved, "/.well-known/mcp/codemode.ts").await;
+        assert!(
+            approved_body.contains("['codemode-reload-tool']:"),
+            "an approved server's tool must be advertised before the \
+             reload: {approved_body}"
+        );
+
+        // A status change is a config edit, which recompiles the whole
+        // `McpAction` -- a brand-new `McpFederation` with its own,
+        // cold `codemode_cache` -- rather than mutating the one above
+        // in place, exactly like every other config reload in this
+        // gateway.
+        let draft =
+            McpAction::from_config(config_with("draft")).expect("draft reload fixture compiles");
+        draft.federation.seed_tools_for_test(seed(), None);
+        let (_, draft_body) = mcp_handler_get(&draft, "/.well-known/mcp/codemode.ts").await;
+        assert!(
+            !draft_body.contains("codemode-reload-tool"),
+            "the post-reload draft status must hide the tool immediately, \
+             never serving the pre-reload approved-server cache entry: \
+             {draft_body}"
         );
     }
 

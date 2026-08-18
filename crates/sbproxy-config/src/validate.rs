@@ -200,6 +200,7 @@ pub const KNOWN_TRANSFORM_TYPES: &[&str] = &[
     "html_to_markdown",
     "markdown",
     "css",
+    "lua",
     "lua_json",
     "javascript",
     "js_json",
