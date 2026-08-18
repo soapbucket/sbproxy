@@ -112,10 +112,14 @@ fn api4_yaml() -> &'static str {
     // both key on caller IP by default and are only synthesized when
     // the operator supplies per_item.api4.rps (the pack no longer
     // guesses a blind default - see owasp_api_pack.rs's own unit
-    // tests for the outage class this avoids). 100 is chosen here
-    // because it happens to match ddos.rs's own built-in per-IP
-    // default, so `api4_ddos_default_blocks_after_its_built_in_per_ip_threshold`
-    // below still exercises the same 100/s boundary either way.
+    // tests for the outage class this avoids). rps: 100 gives
+    // burst: 200 (rate_limit_burst_from_rps) and ddos threshold: 300
+    // (ddos_threshold_from_burst, headroom above the burst ceiling -
+    // a second review-round fix: the threshold used to be `rps`
+    // itself, which let a client bursting within rate_limiting's own
+    // tolerance trip a five-minute ddos block instead of an ordinary
+    // 429). Both tests below read their expected numbers back out of
+    // the synthesized JSON rather than hard-coding them.
     "      - type: owasp_api_top10\n        enable: [api4]\n        per_item:\n          \
      api4:\n            rps: 100\n"
 }
@@ -210,26 +214,36 @@ fn api4_concurrent_limit_default_refuses_past_its_configured_max() {
 
 #[test]
 fn api4_ddos_default_blocks_after_its_built_in_per_ip_threshold() {
-    // WOR-2491 review round, B1: the pack synthesizes
-    // `{"type": "ddos_protection", "requests_per_second": 100}` from
-    // `api4_yaml()`'s `per_item.api4.rps: 100`; `block_duration_secs`
+    // WOR-2491 review round: the pack synthesizes
+    // `{"type": "ddos_protection", "requests_per_second": <threshold>}`
+    // where `<threshold>` is `ddos_threshold_from_burst`'s headroom
+    // above `rate_limiting`'s own burst ceiling for the same
+    // `per_item.api4.rps`, not the raw rps value - a real interaction
+    // bug caught in review (a burst inside rate_limiting's own
+    // tolerance used to trip a five-minute ddos block instead of an
+    // ordinary 429). Read the pack's own threshold out of the
+    // synthesized JSON rather than hard-coding it, so this test
+    // tracks the formula if it ever changes. `block_duration_secs`
     // and the sliding-window width stay at ddos.rs's own module
-    // defaults (chosen deliberately so this test still exercises the
-    // same 100/s boundary `default_ddos_threshold()` documents).
+    // defaults.
     let json = synthesized_policy(api4_yaml(), "ddos_protection");
+    let threshold = json
+        .get("requests_per_second")
+        .and_then(|v| v.as_u64())
+        .expect("pack sets an explicit requests_per_second") as usize;
     let policy = DdosPolicy::from_config(json).expect("valid ddos_protection config");
     let ip: IpAddr = "203.0.113.7".parse().expect("valid test IP");
 
-    for n in 0..100 {
+    for n in 0..threshold {
         assert_eq!(
             policy.check(ip),
             DdosCheckResult::Allow,
-            "request {n} within the built-in 100/s threshold must pass"
+            "request {n} within the configured {threshold}/s threshold must pass"
         );
     }
     assert!(
         matches!(policy.check(ip), DdosCheckResult::Block { .. }),
-        "the 101st request within the same second must be blocked"
+        "one request past the configured threshold must be blocked"
     );
 }
 

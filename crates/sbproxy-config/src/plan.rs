@@ -1654,7 +1654,13 @@ origins:
             "got {text:?}"
         );
         // Every non-enforced item is named with its canonical name,
-        // official OWASP title, and resolved state.
+        // official OWASP title, and resolved state. api4 belongs here
+        // (WOR-2491 review round, mechanical fix): ORIGIN_WITH_OWASP_PACK_ALL
+        // sets no per_item.api4.rps, so rate_limiting/ddos_protection
+        // are not synthesized and the item reports
+        // needs_operator_input, same as api1/api3/api5 - not
+        // `enforced`, which was the pack's now-superseded pre-B1-fix
+        // default.
         for (name, title, state) in [
             (
                 "api1",
@@ -1665,6 +1671,11 @@ origins:
             (
                 "api3",
                 "Broken Object Property Level Authorization",
+                "needs_operator_input",
+            ),
+            (
+                "api4",
+                "Unrestricted Resource Consumption",
                 "needs_operator_input",
             ),
             (
@@ -1685,7 +1696,6 @@ origins:
         // Enforced items are also present (a superset of the
         // non-enforced set the contract requires named).
         for (name, title) in [
-            ("api4", "Unrestricted Resource Consumption"),
             ("api7", "Server Side Request Forgery"),
             ("api8", "Security Misconfiguration"),
             ("api9", "Improper Inventory Management"),

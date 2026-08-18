@@ -214,8 +214,9 @@ global` - one shared in-flight budget for the whole origin, also not
 keyed on caller identity).
 
 Synthesized **only when you supply `per_item.api4.rps`**:
-`rate_limiting` (`requests_per_second: <rps>`, `burst: <rps * 2>`) and
-`ddos_protection` (`requests_per_second: <rps>`; `block_duration_secs`
+`rate_limiting` (`requests_per_second: <rps>`, `burst: round(rps * 2)`)
+and `ddos_protection` (`requests_per_second: ceil(burst * 1.5)` - not
+`rps` itself; see the headroom note just below; `block_duration_secs`
 stays at the module's own 300-second default). Absent `rps`, neither
 is synthesized and the item reports `needs_operator_input`, even
 though `request_limit`/`concurrent_limit` are already running.
@@ -238,6 +239,20 @@ the rest still land under the rules above.
 > your real traffic - not the module's old blind default. See
 > [Trusted proxies and forwarding headers](configuration.md#trusted-proxies-and-forwarding-headers)
 > for how sbproxy resolves the caller's address behind a proxy chain.
+
+> **Why `ddos_protection`'s threshold is not `rps`.** `ddos_protection`
+> has no throttle-first step the way `rate_limiting`'s token bucket
+> does: the moment an IP's count inside the current 1-second window
+> exceeds the threshold, that IP is hard-blocked for
+> `block_duration_secs` (five minutes at the module default). Setting
+> the threshold to the same `rps` value used for `rate_limiting` meant
+> a client legitimately bursting between `rps` and `rate_limiting`'s
+> own `burst` ceiling - squarely inside what `rate_limiting` already
+> tolerates - tripped a five-minute IP block instead of an ordinary
+> 429. The pack sets `ddos_protection`'s threshold to
+> `ceil(burst * 1.5)` instead: comfortably above `rate_limiting`'s own
+> tolerance, so `ddos_protection` only fires meaningfully above what
+> `rate_limiting` already lets through, never inside it.
 
 **Default posture and why.** `needs_operator_input` until `rps` is
 set, then `enforced`. None of the four pieces has a report-only mode

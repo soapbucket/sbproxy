@@ -542,20 +542,41 @@ struct SynthPiece {
 /// Pingora's response-phase filter (`server/proxy_http.rs::response_filter`),
 /// where `api8`'s `security_headers` piece takes effect.
 ///
+/// The principle (WOR-2491 review round): this asks whether the
+/// action's *normal, successful* traffic reaches `response_filter`,
+/// not whether every possible code path for that action type does.
 /// Verified against `action_dispatch.rs::handle_action`'s own match:
-/// `Action::Proxy`, `Action::LoadBalancer`, `Action::WebSocket`, and
-/// `Action::A2a` always return `Ok(false)` (fall through to
-/// `upstream_peer`/`response_filter`); `Action::GraphQL` and
-/// `Action::Grpc` do too for the request shapes that proxy rather
-/// than refuse inline. Every other action type
-/// (`static`, `redirect`, `echo`, `mock`, `beacon`, `noop`, `mcp`,
-/// `storage`, `ai_proxy`, any plugin action, or an unrecognized
-/// string) responds from inside `request_filter` and never reaches
-/// `response_filter`. `ai_proxy` has both an `Ok(false)` branch and an
-/// `Ok(true)` fallthrough depending on the runtime path a given
-/// request takes, which a compile-time decision cannot see per
-/// request; treated as not-guaranteed here rather than claiming
-/// coverage a request might not get.
+///
+/// - `Action::Proxy`, `Action::LoadBalancer`, `Action::WebSocket`, and
+///   `Action::A2a` always return `Ok(false)` (fall through to
+///   `upstream_peer`/`response_filter`).
+/// - `Action::GraphQL` and `Action::Grpc` also return `Ok(false)` for
+///   their normal path. Both have early `Ok(true)` returns, but only
+///   on request-validation failure - GraphQL's body-too-large (413)
+///   or replay-capture failure (400), Grpc's unmatched-transcode-route
+///   (404) - the same shape every action's own error handling takes;
+///   an ordinary, valid request for either always reaches
+///   `response_filter`, so both belong in this allowlist.
+/// - `Action::AiProxy` does not, and this is the genuine asymmetry
+///   with GraphQL/Grpc above: its normal, successful path calls
+///   `handle_ai_proxy(...).await?; Ok(true)` unconditionally - every
+///   ordinary AI proxy request (not just error cases) is answered
+///   entirely inside `request_filter` and never reaches
+///   `response_filter` at all. Only a narrow realtime-WebSocket-upgrade
+///   sub-case returns `Ok(false)`. Since a compile-time decision
+///   cannot see which sub-path a given request will take, `ai_proxy`
+///   is treated as not-guaranteed here rather than claiming coverage
+///   most requests will not get.
+/// - Every other action type (`static`, `redirect`, `echo`, `mock`,
+///   `beacon`, `noop`, `mcp`, `storage`, any plugin action, or an
+///   unrecognized string) responds from inside `request_filter`
+///   unconditionally and never reaches `response_filter`.
+///
+/// `action_runs_response_phase_matches_the_verified_action_set` (this
+/// module's own tests) pins the exact allowlist against a hardcoded
+/// expectations list; a future edit to `handle_action`'s match arms
+/// that changes which actions short-circuit must also touch that test,
+/// so drift is a conscious two-place edit rather than a silent one.
 fn action_runs_response_phase(action_type: &str) -> bool {
     matches!(
         action_type,
@@ -712,12 +733,42 @@ fn synth_request_limit() -> PieceSynthesis {
     }
 }
 
+/// `burst` for [`synth_rate_limiting`]'s token bucket at a given
+/// `rps` budget: twice the per-second rate, the same ratio the pack's
+/// old fixed default used (100 rps / 200 burst). This is the ceiling
+/// of what `rate_limiting` itself tolerates before throttling; a
+/// client bursting up to this many requests is within budget as far
+/// as `rate_limiting` is concerned; see [`ddos_threshold_from_burst`]
+/// for why `synth_ddos_protection` must not block inside it.
+fn rate_limit_burst_from_rps(rps: f64) -> u64 {
+    (rps * 2.0).round().max(1.0) as u64
+}
+
+/// `api4`'s `ddos_protection` per-second threshold, derived from
+/// [`rate_limit_burst_from_rps`]'s `burst` rather than from `rps`
+/// directly (WOR-2491 review round: a real interaction bug caught in
+/// review). `ddos.rs::check` hard-blocks an IP for `block_duration_secs`
+/// (five minutes at the module default) the moment its count inside
+/// the current 1-second window exceeds the threshold - there is no
+/// throttle-first step the way `rate_limiting`'s token bucket has.
+/// Setting the threshold to `rps` itself (the original shape of this
+/// function) meant a client legitimately bursting between `rps` and
+/// `burst` requests - squarely inside what `rate_limiting`'s own
+/// advertised tolerance allows - tripped a five-minute IP block
+/// instead of an ordinary 429. The threshold must clear the burst
+/// ceiling with headroom, so `ddos_protection` only fires meaningfully
+/// *above* what `rate_limiting` already tolerates, not inside it:
+/// `ceil(burst * 1.5)`, always strictly greater than `burst` for any
+/// `burst >= 1`.
+fn ddos_threshold_from_burst(burst: u64) -> u64 {
+    ((burst as f64) * 1.5).ceil() as u64
+}
+
 /// Synthesizes `api4`'s `rate_limiting` piece at an operator-supplied
 /// budget: a per-caller token bucket meant to catch a runaway or
 /// scripted client rather than constrain normal traffic. With no
 /// `key` expression configured, the enforcer buckets per caller
-/// (client IP) by default. `burst` is set to twice `rps`, the same
-/// ratio the pack's old fixed default used (100 rps / 200 burst).
+/// (client IP) by default. `burst` is [`rate_limit_burst_from_rps`].
 ///
 /// `rps` is never guessed (WOR-2491 review round, B1): this piece and
 /// [`synth_ddos_protection`] both key on the caller's *observed* IP
@@ -728,7 +779,7 @@ fn synth_request_limit() -> PieceSynthesis {
 /// traffic exceeded it. The caller (`expand_api4_entry`) only invokes
 /// this once `per_item.api4.rps` is confirmed present.
 fn synth_rate_limiting(rps: f64) -> PieceSynthesis {
-    let burst = (rps * 2.0).round().max(1.0) as u64;
+    let burst = rate_limit_burst_from_rps(rps);
     let policy = serde_json::json!({
         "type": "rate_limiting",
         "requests_per_second": rps,
@@ -776,10 +827,13 @@ fn synth_concurrent_limit() -> PieceSynthesis {
 }
 
 /// Synthesizes `api4`'s `ddos_protection` piece at an operator-supplied
-/// budget: `requests_per_second` set to `rps`, everything else
-/// (`block_duration_secs`, the sliding-window width) left at
-/// `ddos.rs`'s own module defaults (300-second block) per the review
-/// ruling - only the rate axis is operator-controlled here.
+/// budget: `requests_per_second` set to [`ddos_threshold_from_burst`]
+/// of the *same* `burst` [`synth_rate_limiting`] computes for this
+/// `rps` (not `rps` itself - see that function's doc comment for the
+/// real bug this fixes), everything else (`block_duration_secs`, the
+/// sliding-window width) left at `ddos.rs`'s own module defaults
+/// (300-second block) per the review ruling - only the rate axis is
+/// operator-controlled here.
 ///
 /// `rps` is never guessed, for the same reason [`synth_rate_limiting`]
 /// documents: this piece keys on the caller's observed IP, and behind
@@ -787,7 +841,8 @@ fn synth_concurrent_limit() -> PieceSynthesis {
 /// real client collapses to the LB's one IP (WOR-2491 review round,
 /// B1).
 fn synth_ddos_protection(rps: f64) -> PieceSynthesis {
-    let requests_per_second = rps.round().max(1.0) as u64;
+    let burst = rate_limit_burst_from_rps(rps);
+    let requests_per_second = ddos_threshold_from_burst(burst);
     let policy = serde_json::json!({
         "type": "ddos_protection",
         "requests_per_second": requests_per_second,
@@ -796,10 +851,13 @@ fn synth_ddos_protection(rps: f64) -> PieceSynthesis {
         policy,
         synthesized_type: "ddos_protection",
         reason: format!(
-            "synthesized ddos_protection at the operator-supplied per_item.api4.rps budget \
-             (requests_per_second: {requests_per_second}); block_duration_secs stays at \
-             ddos.rs's own module default (300-second block, sliding 1-second window). \
-             ddos_protection has no report-only mode; posture has no effect on this piece."
+            "synthesized ddos_protection at requests_per_second: {requests_per_second} - \
+             headroom above rate_limiting's own burst ceiling ({burst}) for this rps budget, \
+             not the raw per_item.api4.rps value itself, so a client bursting within \
+             rate_limiting's advertised tolerance is throttled there instead of tripping a \
+             five-minute IP block here. block_duration_secs stays at ddos.rs's own module \
+             default (300-second block, sliding 1-second window). ddos_protection has no \
+             report-only mode; posture has no effect on this piece."
         ),
     }
 }
@@ -1519,7 +1577,16 @@ pub(crate) fn expand_owasp_pack(
                     item.canonical_name()
                 );
             }
-            if !(rps > 0.0) {
+            // Not `!(rps > 0.0)` (clippy::neg_cmp_op_on_partial_ord):
+            // that form and this one differ on NaN, and NaN must stay
+            // refused. `rps > 0.0` is `false` for NaN, so the negated
+            // form refuses it (correct); `rps <= 0.0` is ALSO `false`
+            // for NaN (`PartialOrd`, not `Ord` - NaN compares
+            // unordered against everything), so it would let NaN
+            // through unrefused. `!rps.is_finite() || rps <= 0.0`
+            // refuses NaN and infinities explicitly, then refuses
+            // non-positive finite values with a plain `<=`.
+            if !rps.is_finite() || rps <= 0.0 {
                 anyhow::bail!(
                     "origin '{hostname}': owasp_api_top10 per_item.api4.rps must be a positive \
                      number; got {rps}"
@@ -2168,10 +2235,29 @@ mod tests {
             .iter()
             .find(|p| config_type_is(p, "ddos_protection"))
             .expect("ddos_protection present");
+        let ddos_threshold = ddos
+            .get("requests_per_second")
+            .and_then(|v| v.as_u64())
+            .expect("ddos_protection sets an explicit requests_per_second");
         assert_eq!(
-            ddos.get("requests_per_second").and_then(|v| v.as_u64()),
-            Some(50),
-            "ddos_protection's threshold moves to the same budget"
+            ddos_threshold, 150,
+            "ceil(burst * 1.5) = ceil(100 * 1.5) = 150, not the raw rps (50) or burst (100)"
+        );
+        // WOR-2491 review round: the real bug this fixes. `ddos.rs`
+        // hard-blocks for five minutes past its threshold with no
+        // throttle-first step; a threshold set to `rps` itself let a
+        // client bursting between `rps` and `burst` - squarely inside
+        // rate_limiting's own advertised tolerance - trip a
+        // five-minute IP block instead of an ordinary 429.
+        let burst = rate_limiting
+            .get("burst")
+            .and_then(|v| v.as_u64())
+            .expect("rate_limiting sets an explicit burst");
+        assert!(
+            ddos_threshold > burst,
+            "ddos threshold ({ddos_threshold}) must clear rate_limiting's burst ceiling \
+             ({burst}), or a burst inside rate_limiting's own tolerance trips a five-minute \
+             block instead of an ordinary 429"
         );
         assert!(
             ddos.get("block_duration_secs").is_none(),
@@ -2190,6 +2276,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn rps_refusal_condition_rejects_nan_and_every_non_positive_value() {
+        // WOR-2491 review round: pins the exact refusal condition
+        // `expand_owasp_pack` uses for `per_item.api4.rps`
+        // (`clippy::neg_cmp_op_on_partial_ord`). `!(rps > 0.0)` and
+        // `!rps.is_finite() || rps <= 0.0` agree on every ordinary
+        // value; they disagree only on NaN, where a bare `rps <= 0.0`
+        // would (wrongly) let it through - `PartialOrd`, not `Ord`:
+        // NaN compares unordered against everything, including 0.0.
+        //
+        // Tested directly against `f64` rather than through the JSON
+        // pipeline: `serde_json`'s own `f64 -> Value` conversion maps
+        // NaN to `Value::Null` (JSON has no NaN representation), which
+        // deserializes back to `rps: None` and never reaches this
+        // check at all - this is the one place in this pack the
+        // condition itself can be exercised.
+        let refuses = |rps: f64| !rps.is_finite() || rps <= 0.0;
+        assert!(refuses(f64::NAN), "NaN must be refused");
+        assert!(refuses(0.0), "zero must be refused");
+        assert!(refuses(-5.0), "negative must be refused");
+        assert!(refuses(f64::INFINITY), "infinity must be refused");
+        assert!(
+            refuses(f64::NEG_INFINITY),
+            "negative infinity must be refused"
+        );
+        assert!(
+            !refuses(50.0),
+            "an ordinary positive value must be accepted"
+        );
+        assert!(!refuses(0.001), "a small positive value must be accepted");
     }
 
     #[test]
@@ -2543,6 +2661,19 @@ mod tests {
 
     #[test]
     fn action_runs_response_phase_matches_the_verified_action_set() {
+        // WOR-2491 review round: this hardcoded list is the drift tie
+        // against `crates/sbproxy-core/src/server/action_dispatch.rs`'s
+        // `handle_action` match. That function decides per action type
+        // whether NORMAL (not just any) traffic reaches
+        // `Ok(false)`/`response_filter`; `action_runs_response_phase`'s
+        // own doc comment records the exact reasoning per type,
+        // including why `graphql`/`grpc` (normal path proxies; only
+        // request-validation failures short-circuit) are included
+        // while `ai_proxy` (normal path never reaches it at all) is
+        // not. A future edit to `handle_action`'s match arms that
+        // changes which actions short-circuit must update this test
+        // too - that is the point of pinning it here rather than only
+        // asserting behavior indirectly through a pack test.
         for t in [
             "proxy",
             "load_balancer",
