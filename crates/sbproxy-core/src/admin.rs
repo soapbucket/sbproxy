@@ -8554,8 +8554,12 @@ origins:
 
         let api4 = find("api4");
         assert_eq!(api4["title"], "Unrestricted Resource Consumption");
-        assert_eq!(api4["state"], "enforced");
-        assert_eq!(api4["synthesized"].as_array().unwrap().len(), 4);
+        assert_eq!(api4["state"], "needs_operator_input");
+        assert_eq!(api4["synthesized"].as_array().unwrap().len(), 2);
+        assert!(
+            api4["reason"].as_str().unwrap().contains("per_item.api4.rps"),
+            "the api4 row must name the knob that completes it, got: {api4}"
+        );
 
         let api5 = find("api5");
         assert_eq!(api5["title"], "Broken Function Level Authorization");
