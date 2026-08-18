@@ -1,11 +1,12 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # WebSocket proxy with an auth gate on the upgrade request.
 #
-# `type: websocket` proxies `ws://`/`wss://` upstreams. The action
-# itself does not parse WebSocket frames; the gateway forwards the
-# HTTP Upgrade request through the same auth/policy/transform pipeline
-# as any other origin, and once the upstream answers 101 the
-# connection becomes a transparent byte pipe in both directions.
+# `type: websocket` proxies `ws://`/`wss://` upstreams. The gateway
+# forwards the HTTP Upgrade request through the same auth/policy/
+# transform pipeline as any other origin; once the upstream answers
+# 101 the connection becomes a byte pipe in both directions, with
+# frame headers scanned to enforce max_message_size (payloads are
+# never read).
 #
 # `bearer` auth here shows that a policy applied to the origin runs
 # before the upgrade completes: a request without a valid token never

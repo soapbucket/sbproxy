@@ -79,7 +79,7 @@ Registering a new strategy is a Rust `inventory::submit!` call in an out-of-tree
 
 Beyond plain HTTP `proxy`, dedicated actions route other transports through the same origin/policy/transform pipeline:
 
-- **WebSocket** (`type: websocket`): proxies `ws://`/`wss://`. The `subprotocols` and `max_message_size` fields are accepted by config but not currently enforced; see [websocket.md](websocket.md) for what actually runs before and after the upgrade. Runnable at [`examples/websocket-proxy/`](../examples/websocket-proxy/).
+- **WebSocket** (`type: websocket`): proxies `ws://`/`wss://`. `max_message_size` closes the tunnel on an oversized message in either direction, and `subprotocols` allowlists `Sec-WebSocket-Protocol` negotiation; see [websocket.md](websocket.md) for what runs before and after the upgrade. Runnable at [`examples/websocket-proxy/`](../examples/websocket-proxy/).
 - **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 - **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream, including a 64 KiB validated-body limit and whole-batch rejection. Runnable at [`examples/graphql-gateway/`](../examples/graphql-gateway/).
 

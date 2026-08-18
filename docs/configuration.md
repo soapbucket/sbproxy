@@ -1498,8 +1498,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend WebSocket URL (ws:// or wss://) |
-| `subprotocols` | list | | Subprotocols this origin is meant to support. Accepted by config; not currently read anywhere the gateway negotiates or filters on `Sec-WebSocket-Protocol`. |
-| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB). Accepted by config; not currently enforced, frames larger than this pass through unmodified. |
+| `subprotocols` | list | | Allowlist for `Sec-WebSocket-Protocol` negotiation. Empty leaves negotiation to the client and upstream; non-empty filters the client's offer, refuses an offer with no allowed subprotocol (`400`), and refuses an upstream selection outside the negotiated set (`502`). |
+| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB), enforced in both directions on the upgraded tunnel. A message declaring more payload than this closes the connection. |
 
 ### grpc
 

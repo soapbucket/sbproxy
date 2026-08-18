@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-18*
 
-The `websocket` action proxies `ws://`/`wss://` upstreams. It does not parse WebSocket frames itself: the HTTP `Upgrade` request runs through the same auth, policy, and transform pipeline as any other origin, and once the upstream answers `101 Switching Protocols` the connection becomes a transparent byte pipe in both directions. This example puts `bearer` auth on the origin to make that concrete: a request without a valid token is rejected before the upgrade completes, and the WebSocket backend never sees it.
+The `websocket` action proxies `ws://`/`wss://` upstreams. The HTTP `Upgrade` request runs through the same auth, policy, and transform pipeline as any other origin, and once the upstream answers `101 Switching Protocols` the connection becomes a byte pipe in both directions, with frame headers (never payloads) scanned to enforce `max_message_size`. This example puts `bearer` auth on the origin to make the pre-upgrade pipeline concrete: a request without a valid token is rejected before the upgrade completes, and the WebSocket backend never sees it. It also demonstrates the message-size cap closing a connection.
 
 No live public WebSocket endpoint ships with this repo, so `fixture.py` stands in for one: a stdlib-only server that speaks just enough of RFC 6455 to complete the handshake and echo text frames back with `echo: ` prepended.
 
@@ -60,14 +60,14 @@ received: echo: hello through the gateway
 
 `python3 client.py "hi" --no-token` reproduces the 401 above end to end, including the frame layer never getting used.
 
-**Oversized frame: `max_message_size` does not bound frame size.** This origin sets `max_message_size: 65536`. Send an 80,000-byte text frame anyway, well past that ceiling, and it round-trips unmodified: the gateway never counts frame payload bytes, so nothing rejects it or closes the connection. `client.py` prints a summary instead of the raw 80,000 bytes for anything over 200 bytes received.
+**Oversized frame: `max_message_size` closes the connection.** This origin sets `max_message_size: 65536`. Send an 80,000-byte text frame and the gateway refuses it on the frame header, before the payload has even finished arriving: the declared length is over the cap, so the tunnel is torn down and the frame never reaches the fixture.
 
 ```bash
 $ python3 client.py "$(python3 -c "print('x' * 80000, end='')")" | tail -1
-received: 80006 bytes, starts 'echo: xxxxxxxxxxxxxxxxxxxxxxxx', ends 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+connection closed by the gateway (no frame received)
 ```
 
-80,006 bytes back is the fixture's 6-byte `echo: ` prefix plus the full 80,000-byte payload, confirming nothing was truncated, rejected, or otherwise touched by `max_message_size`. Fixing this is tracked separately; the field stays in the config schema and in this demo because it documents the gap honestly rather than removing the knob and losing the paper trail.
+The teardown is abrupt by design. There is no `1009 Message Too Big` close handshake, because the gateway will not forward a message it has refused; the client sees the socket die. The same cap applies to what the upstream sends back: a fixture echo larger than the cap closes the connection in the other direction (which here means a payload within about six bytes of the cap survives the trip in but not the echo out, since the fixture's `echo: ` prefix grows the return message). A comfortably conforming message still round-trips: try `python3 client.py "$(python3 -c "print('x' * 65000, end='')")"` and see the summary line `client.py` prints for anything over 200 bytes received.
 
 **Failure mode: a non-upgrade request to a `websocket` origin.** The action does not check whether the request carries `Upgrade: websocket` before deciding where to send it. `type: websocket` just means "proxy this Host to a `ws://`/`wss://` target." A plain GET with a valid token still passes auth and gets proxied to the same upstream, byte for byte, as a normal HTTP request:
 
@@ -86,23 +86,23 @@ That `400` is `fixture.py`'s own response, not the gateway's. A real WebSocket s
 
 **Before the upgrade completes**, a `websocket` origin gets the same treatment as any other origin: hostname routing, `authentication`, `policies`, and request transforms all run against the initial `GET` request and its headers, exactly as they would for a `proxy` action. The auth gate demonstrated above is one instance of that; rate limiting, WAF, CEL policies, and anything else attachable to an origin apply the same way.
 
-**After the `101` response**, the connection is a transparent byte pipe with no per-frame inspection. Two fields on this action look like they should change that and currently do not:
+**After the `101` response**, the connection is a byte pipe with exactly one gateway-side reader on it: a frame-header scanner enforcing `max_message_size` in both directions, demonstrated above. Two fields on this action shape what the tunnel allows:
 
-- `max_message_size` (this example sets `65536`) is accepted by config parsing but is not enforced anywhere in the current build. The oversized-frame check above sends an 80,000-byte text frame over this same config and it passes through unmodified; nothing in the gateway counts frame payload bytes or closes the connection for exceeding the configured limit.
-- `subprotocols` is likewise accepted but not read anywhere the codebase negotiates or filters on `Sec-WebSocket-Protocol`. Whatever the client and the real upstream negotiate between themselves is what happens; the gateway is not a party to it.
+- `max_message_size` (this example sets `65536`) bounds a message's payload, summed across continuation fragments, in either direction. A message declaring more closes the connection without a WebSocket close handshake. The cap measures wire bytes, so with `permessage-deflate` negotiated it applies to compressed sizes.
+- `subprotocols`, when non-empty, is an allowlist for `Sec-WebSocket-Protocol` negotiation: the client's offer is filtered to it before going upstream, an offer with no allowed entry is refused with a `400` before any upstream connection, and an upstream selecting outside the negotiated set is refused with a `502`. This example leaves it empty, which means negotiation passes through untouched.
 
-Anything after the handshake, policy enforcement, PII redaction, payload inspection, per-message rate limiting, is out of scope for this action today. If you need control over what flows after the upgrade, that has to live in the WebSocket backend itself.
+Anything content-level after the handshake, policy enforcement, PII redaction, payload inspection, per-message rate limiting, is out of scope for this action today; the scanner reads frame headers, never payloads. If you need control over frame content after the upgrade, that has to live in the WebSocket backend itself.
 
 ## What this exercises
 
 - `websocket` action - proxy an HTTP `Upgrade` request and the connection it opens to a `ws://`/`wss://` upstream
 - `authentication: bearer` applied to a `websocket` origin - proof that origin-level policy runs before the upgrade, not after
 - The RFC 6455 handshake computation (`Sec-WebSocket-Key` → `Sec-WebSocket-Accept`)
-- What is and is not enforced post-upgrade: `max_message_size` and `subprotocols` are configuration fields with no current runtime effect
+- `max_message_size` enforcement on the upgraded tunnel: an oversized message closes the connection instead of passing through
 
 ## See also
 
-- [docs/websocket.md](../../docs/websocket.md) - the dedicated reference for this action: field table, upgrade semantics, and the same honest-limits list above
+- [docs/websocket.md](../../docs/websocket.md) - the dedicated reference for this action: field table, upgrade semantics, message-size enforcement, and subprotocol negotiation
 - [docs/configuration.md#websocket](../../docs/configuration.md#websocket) - field reference in the general configuration guide
 - [docs/routing.md#protocol-specific-routing](../../docs/routing.md#protocol-specific-routing) - where `websocket` sits among the other protocol actions
 - The action implementation at `crates/sbproxy-modules/src/action/websocket.rs`

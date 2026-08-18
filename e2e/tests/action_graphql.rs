@@ -1195,3 +1195,73 @@ fn graphql_revalidates_persisted_idempotency_hits_after_rules_tighten() {
         "strict retries must neither replay a cached 200 nor reach upstream"
     );
 }
+
+// --- WOR-2490: validation refuses before the upstream connect ---
+
+fn validated_graphql_config_for(upstream_url: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{upstream_url}/graphql"
+      validate_queries: true
+"#
+    )
+}
+
+#[test]
+fn graphql_invalid_query_against_unreachable_upstream_returns_400() {
+    // WOR-2490: validation used to run in `upstream_request_filter`,
+    // which only executes once the upstream connection exists, so an
+    // invalid document against a down upstream surfaced as the connect
+    // failure's 502. The refusal now runs in the request phase, before
+    // any connect: the client gets its 400 whether or not the upstream
+    // is reachable.
+    let unreachable = format!("http://127.0.0.1:{}", pick_loopback_port());
+    let proxy = ProxyHarness::start_with_yaml(&validated_graphql_config_for(&unreachable))
+        .expect("start proxy");
+
+    let resp = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({ "query": "{ hello" }),
+            &[("content-type", "application/json")],
+        )
+        .expect("send malformed graphql query");
+
+    assert_eq!(
+        resp.status, 400,
+        "an invalid document must be refused before the connect attempt"
+    );
+    let body = resp.json().expect("refusal body is JSON");
+    assert_eq!(body["error"], "GraphQL request validation failed");
+}
+
+#[test]
+fn graphql_valid_query_against_unreachable_upstream_returns_502() {
+    // Companion check: a document that passes validation still has to
+    // reach the upstream, and a dead upstream is still the connect
+    // failure it always was.
+    let unreachable = format!("http://127.0.0.1:{}", pick_loopback_port());
+    let proxy = ProxyHarness::start_with_yaml(&validated_graphql_config_for(&unreachable))
+        .expect("start proxy");
+
+    let resp = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({ "query": "{ hello }" }),
+            &[("content-type", "application/json")],
+        )
+        .expect("send valid graphql query");
+
+    assert_eq!(
+        resp.status, 502,
+        "a valid document against a dead upstream stays a bad-gateway failure"
+    );
+}

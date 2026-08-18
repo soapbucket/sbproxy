@@ -79,6 +79,16 @@ pub type ClientWebSocket = WebSocketStream<TcpStream>;
 
 /// Spawn a capture-enabled echo WebSocket server on an ephemeral port.
 pub async fn spawn_echo_ws_server() -> EchoWebSocketServer {
+    spawn_echo_ws_server_selecting(None).await
+}
+
+/// Spawn an echo server that answers every handshake by selecting the
+/// given subprotocol (`Sec-WebSocket-Protocol` on the 101), regardless of
+/// what the client offered. `None` selects nothing, like a server that
+/// does not speak subprotocols.
+pub async fn spawn_echo_ws_server_selecting(
+    selected_subprotocol: Option<&'static str>,
+) -> EchoWebSocketServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("ws bind");
     let addr = listener.local_addr().expect("ws addr");
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -100,7 +110,7 @@ pub async fn spawn_echo_ws_server() -> EchoWebSocketServer {
                 // tungstenite fixes this callback's error type to a full HTTP
                 // response, so its size is outside this test helper's control.
                 #[allow(clippy::result_large_err)]
-                let callback = move |request: &Request, response: Response| {
+                let callback = move |request: &Request, mut response: Response| {
                     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
                     for (name, value) in request.headers() {
                         headers
@@ -115,6 +125,12 @@ pub async fn spawn_echo_ws_server() -> EchoWebSocketServer {
                             uri: request.uri().to_string(),
                             headers,
                         });
+                    if let Some(subprotocol) = selected_subprotocol {
+                        response.headers_mut().append(
+                            HeaderName::from_static("sec-websocket-protocol"),
+                            HeaderValue::from_static(subprotocol),
+                        );
+                    }
                     Ok(response)
                 };
                 let websocket = match accept_hdr_async(stream, callback).await {
