@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -15,6 +15,42 @@ see [mcp-security.md](mcp-security.md). For the whole picture, start at
 The public reference here is the OWASP API Security Top 10:
 [owasp.org/API-Security](https://owasp.org/API-Security/). The sections below
 solve the same problems in configuration terms.
+
+## The owasp_api_top10 pack
+
+Everything below can also be configured by hand, one policy at a time. The
+`owasp_api_top10` pack is the faster path: one config entry that expands
+into the same policies and transforms, item by item, with an honest
+manifest naming exactly what it did for each.
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+    policies:
+      - type: owasp_api_top10
+        enable: all
+```
+
+| # | Risk | Pack default | Manual config |
+|---|---|---|---|
+| API1 | Broken Object Level Authorization | `needs_operator_input`: adds `object_authz` with enumeration ready to go, blocking nothing until you add `object_rules` | [Object access that trusts the caller's ID](#object-access-that-trusts-the-callers-id) |
+| API2 | Broken Authentication | `not_covered`: the provider choice is yours | [Authentication that is weaker than it looks](#authentication-that-is-weaker-than-it-looks) |
+| API3 | Broken Object Property Level Authorization | `needs_operator_input` by default; `enforced` once `per_item.api3.response_exclude_fields` is set (adds a `json_projection` transform) | [Input the service will trust](#input-the-service-will-trust) |
+| API4 | Unrestricted Resource Consumption | `enforced`: adds `request_limit`, `rate_limiting`, `concurrent_limit`, `ddos_protection` | [No limit on what one caller can consume](#no-limit-on-what-one-caller-can-consume) |
+| API5 | Broken Function Level Authorization | `needs_operator_input`: shares API1's `object_authz` entry, blocking nothing until you add `function_rules` | [Object access that trusts the caller's ID](#object-access-that-trusts-the-callers-id) |
+| API6 | Unrestricted Access to Sensitive Business Flows | `not_covered`: compose `rate_limiting`, `object_authz`, and bot checks yourself | [Automated traffic you cannot distinguish](#automated-traffic-you-cannot-distinguish) |
+| API7 | Server Side Request Forgery | `enforced`, always, with nothing synthesized: the SSRF guard already runs on every outbound dial | [Requests the service makes on the caller's behalf](#requests-the-service-makes-on-the-callers-behalf) |
+| API8 | Security Misconfiguration | `enforced`: adds `security_headers` and `http_framing`; layer `waf` yourself for broader coverage | [Browser-facing misconfiguration](#browser-facing-misconfiguration) |
+| API9 | Improper Inventory Management | `enforced`: sets `expose_openapi: true`, a disclosure decision worth reviewing first | [openapi-emission.md](openapi-emission.md) |
+| API10 | Unsafe Consumption of APIs | `not_covered`: no response-handling safety net for third-party API calls today | n/a |
+
+`enable: all` defaults every item's posture to `report_only`, but four
+items (API4, API7, API8, API9) enforce regardless: their controls either
+have no report-only mode or run outside the policy chain entirely. See
+[owasp-api-top10.md](owasp-api-top10.md) for what each item synthesizes,
+why, and what it still needs from you, and
+[`examples/owasp-api-top10/`](../examples/owasp-api-top10/) and
+[`examples/owasp-api-selective/`](../examples/owasp-api-selective/) for
+runnable configs.
 
 ## Object access that trusts the caller's ID
 
@@ -237,9 +273,12 @@ field carries a key, matching against a list you supply as `passwords`,
 `dlp` handles the regulated-data case, and it has two limits worth knowing
 before you plan around it.
 
-It scans **requests only**. Setting `direction: response` or `both` is accepted
-and then warned about at load, and the scan still runs on the request side.
-So `dlp` catches regulated data on the way in, not on the way out.
+It scans the **request URI and headers only, never a body**, request or
+response. Setting `direction: response` or `both` is accepted and then
+warned about at load, and the scan still runs against the URI and headers,
+not a body either way. Body scanning is on the roadmap; the `pii:` block on
+`ai_proxy` origins handles request-body redaction with the same detector
+catalog today.
 
 Its actions are `tag` and `block`, not redact. `tag` marks the request for
 downstream handling and lets it through; `block` refuses it. Redact-and-continue
@@ -344,6 +383,8 @@ attacker's point of view. Network placement is the precondition for all of it.
 ## Where to go next
 
 - [security.md](security.md) for the whole picture across traffic types.
+- [owasp-api-top10.md](owasp-api-top10.md) for the `owasp_api_top10` pack,
+  item by item.
 - [object-authz.md](object-authz.md) for object-level authorization in depth.
 - [audit-log.md](audit-log.md) for the audit record shapes.
 - [configuration.md](configuration.md) for every field these examples use.

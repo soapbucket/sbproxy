@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The OWASP API Top 10 pack, adopted selectively.
+#
+# The realistic rollout shape: name the items you want instead of
+# `enable: all`, leave the pack-wide posture at report_only (the
+# default), then promote one item at a time with a `per_item` override
+# once you have reviewed what it would have done. api3 also shows the
+# one per_item field that is not a posture: response_exclude_fields,
+# which wires the pack's response-side json_projection transform.
+#
+# A self-contained `static` action seeds a four-field customer record so
+# the example runs offline; response_exclude_fields strips two of them
+# before the client ever sees them.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Test (see README.md for the full sequence and expected output):
+#   curl -s -H 'Host: owasp-pack-selective.local' http://127.0.0.1:8080/customers/42
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "owasp-pack-selective.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        id: 42
+        email: "alice@example.com"
+        ssn: "123-45-6789"
+        internal_notes: "flagged for manual review"
+
+    policies:
+      - type: owasp_api_top10
+        enable: [api1, api3, api4, api8]
+        posture: report_only
+        per_item:
+          api1:
+            posture: enforce
+          api3:
+            response_exclude_fields: [ssn, internal_notes]
