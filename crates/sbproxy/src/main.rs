@@ -2391,9 +2391,12 @@ fn runtime_telemetry_config_for_cli(cli: &Cli) -> Option<sbproxy_observe::Teleme
     // the process-wide configured-gate registry before `init_tracing`
     // (called just after this returns) builds any OTLP exporter, so the
     // trace and metrics exporters' boot-time egress check has something
-    // to read. Runs once, here, at boot only: the OTLP exporters are
-    // never rebuilt on reload, so there is no reload-path counterpart
-    // (WOR-2481 tracks adding real reload re-verification).
+    // to read. Runs once, here, at boot only: the trace and metrics
+    // exporters are never rebuilt on reload, so there is no reload-path
+    // counterpart that reinstalls this registry slot. A reload instead
+    // re-verifies those already-built exporters' recorded endpoints
+    // directly, in `sbproxy_core::server::lifecycle::reload_compiled_config_locked`
+    // (`sbproxy_observe::telemetry::reverify_active_boot_telemetry_endpoints`).
     sbproxy_security::egress::install_configured_gate(
         sbproxy_security::egress::EgressPurpose::Telemetry,
         compiled.egress.telemetry.clone(),

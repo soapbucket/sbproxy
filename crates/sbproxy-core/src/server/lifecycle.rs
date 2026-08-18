@@ -1460,6 +1460,17 @@ fn reload_compiled_config_locked(
     // backends are silently ignored.
     reconcile_process_secrets(compiled.server.secrets.as_ref())?;
 
+    // WOR-2481: the boot-only OTLP trace and metric exporters are never
+    // rebuilt on reload (see `arm_egress_gates_from_config`'s doc
+    // comment for why `Telemetry` is not armed there), so a candidate
+    // whose `egress.telemetry:` allowlist newly denies the endpoint they
+    // are still dialing must not be allowed to publish silently: refuse
+    // the reload here, in the reject-only phase, before anything about
+    // this candidate installs.
+    sbproxy_observe::telemetry::reverify_active_boot_telemetry_endpoints(
+        compiled.egress.telemetry.as_ref(),
+    )?;
+
     let mut outcome = ReloadOutcome::default();
 
     // --- Phase 2: construct, with the catalog installed and undoable ---
@@ -4770,14 +4781,21 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 /// because `AiClient` is a process-wide `ArcSwap` this function owns
 /// rebuilding, not a lazily-read handle some other call site owns.
 ///
-/// `Telemetry` is deliberately not installed here. The OTLP exporters are
-/// built once at process boot, before either caller of this function
-/// runs (see `sbproxy::main`'s `runtime_telemetry_config_for_cli`, which
-/// installs `Telemetry` itself from the same compiled config, ahead of
-/// `run`), and are never rebuilt on reload, so re-installing it on every
-/// reload here would only ever matter for a `Telemetry` sighting the
-/// exporters are not built again to observe. WOR-2481 tracks adding real
-/// reload re-verification.
+/// `Telemetry` is deliberately not installed here. The OTLP trace and
+/// metric exporters are built once at process boot, before either
+/// caller of this function runs (see `sbproxy::main`'s
+/// `runtime_telemetry_config_for_cli`, which installs `Telemetry` itself
+/// from the same compiled config, ahead of `run`), and are never rebuilt
+/// on reload, so re-installing this registry slot on every reload here
+/// would only ever matter for a `Telemetry` sighting those exporters are
+/// not built again to produce. Reload re-verification for them happens
+/// as its own reject-only step instead, `reload_compiled_config_locked`
+/// calling `sbproxy_observe::telemetry::reverify_active_boot_telemetry_endpoints`,
+/// which checks the still-running exporters' recorded endpoints directly
+/// against this reload's freshly compiled `egress.telemetry:` value
+/// rather than through this registry (WOR-2481). The OTLP-logs sink is
+/// unaffected either way: it is rebuilt on every reload and
+/// re-authorizes itself at construction time.
 fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
     use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
     install_configured_gate(
@@ -6990,6 +7008,70 @@ egress:
             None,
         );
         reload_ai_client();
+    }
+
+    // WOR-2481: the reload-time seam for the boot-only OTLP trace and
+    // metric exporters. Neither test builds a real exporter (that needs
+    // live network I/O and a tokio runtime); instead they seed
+    // `sbproxy_observe::telemetry`'s active-endpoint registry directly
+    // with `record_active_boot_telemetry_endpoint`, the exact state
+    // `authorize_telemetry_endpoint_or_refuse_boot` leaves behind on its
+    // allow path at real boot, then drive a real reload transaction
+    // through `reload_from_config_yaml` the same way every other
+    // reload-refusal test in this module does.
+
+    #[test]
+    fn reload_refuses_when_the_new_egress_telemetry_config_denies_a_running_boot_only_exporter() {
+        let signal = "wor2481-lifecycle-refuses";
+        let endpoint = "https://wor2481-fixture-collector.invalid:4317";
+        sbproxy_observe::telemetry::record_active_boot_telemetry_endpoint(signal, endpoint);
+
+        // A host allowlist check short-circuits before any DNS lookup
+        // (see `EgressAuthorizer::authorize_inner`), so a fictional
+        // `.invalid` host denies deterministically with no network I/O.
+        let yaml = r#"
+proxy: {}
+egress:
+  telemetry:
+    mode: deny_by_default
+    hosts: ["a-completely-different-collector.invalid"]
+    ports: [4317]
+"#;
+        let error = reload_from_config_yaml("sb.yml", yaml).expect_err(
+            "a reload whose new egress.telemetry config denies a still-running boot-only \
+             exporter's endpoint must be refused, not silently keep exporting to it",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(signal) && message.contains(endpoint),
+            "the refusal must name the signal and endpoint so an operator can act on it: \
+             {message}"
+        );
+    }
+
+    #[test]
+    fn reload_proceeds_when_the_new_egress_telemetry_config_still_allows_a_running_boot_only_exporter(
+    ) {
+        let signal = "wor2481-lifecycle-proceeds";
+        let endpoint = "https://127.0.0.1:4317";
+        sbproxy_observe::telemetry::record_active_boot_telemetry_endpoint(signal, endpoint);
+
+        // 127.0.0.1 resolves with no network I/O (an IP literal needs no
+        // DNS lookup), same as the sibling test in
+        // `sbproxy_observe::telemetry`'s own test module.
+        let yaml = r#"
+proxy: {}
+egress:
+  telemetry:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    ports: [4317]
+    allow_private: true
+"#;
+        reload_from_config_yaml("sb.yml", yaml).expect(
+            "a reload whose new egress.telemetry config still allows a running boot-only \
+             exporter's endpoint must proceed",
+        );
     }
 
     #[test]

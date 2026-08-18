@@ -102,9 +102,13 @@ pub enum EgressPurpose {
     EngineArtifact,
     /// Extension bundle hook outbound call (`net:outbound` grant).
     BundleHook,
-    /// OTLP trace/metric/log exporter endpoint (WOR-2481). Authorized once
-    /// at boot, where the exporter is constructed; config reload does not
-    /// re-verify it.
+    /// OTLP trace/metric/log exporter endpoint (WOR-2481). Authorized
+    /// once at boot, where the exporter is constructed. A config reload
+    /// re-verifies the boot-only trace and metric exporters' already-
+    /// dialing endpoints directly against the new generation
+    /// (`sbproxy_observe::telemetry::reverify_active_boot_telemetry_endpoints`);
+    /// the log exporter is rebuilt on every reload and re-authorizes
+    /// itself at construction time instead.
     Telemetry,
 }
 
@@ -991,8 +995,14 @@ pub fn egress_inventory_snapshot() -> Vec<EgressSighting> {
 // reload: `lifecycle::run` and the reload path both call that one function,
 // deliberately, so a `deny_by_default` purpose is armed on a process's very
 // first request rather than only from its first reload onward. `Telemetry`
-// is the one exception, installed once at boot only, since the OTLP
-// exporters are never rebuilt on reload (WOR-2481 tracks adding that).
+// is the one exception, installed once at boot only, since the trace and
+// metric exporters are never rebuilt on reload: reinstalling this
+// registry slot on every reload would only ever matter for a sighting
+// those exporters are not built again to produce. A config reload
+// re-verifies them a different way instead, by checking their already-
+// dialing endpoints directly against the new generation's compiled
+// value (`sbproxy_observe::telemetry::reverify_active_boot_telemetry_endpoints`,
+// WOR-2481) rather than through this registry.
 
 fn configured_gates() -> &'static std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>> {
     static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<EgressPurpose, EgressAuthorizer>>> =

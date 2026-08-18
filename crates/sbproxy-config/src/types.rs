@@ -484,8 +484,11 @@ pub struct EgressTopLevelConfig {
     pub token_exchange: Option<EgressPurposeConfig>,
     /// Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric,
     /// and log exporter endpoints. Authorized once at boot, where each
-    /// exporter is constructed; a config reload does not re-verify an
-    /// already-running exporter (WOR-2481 tracks closing that gap).
+    /// exporter is constructed. A config reload re-verifies the
+    /// already-running trace and metric exporters' endpoints against the
+    /// new allowlist and refuses the reload if either is now denied; the
+    /// log exporter is rebuilt on every reload and re-authorizes itself
+    /// then.
     #[serde(default)]
     pub telemetry: Option<EgressPurposeConfig>,
 }

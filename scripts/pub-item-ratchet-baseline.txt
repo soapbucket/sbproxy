@@ -435,3 +435,17 @@
 # in the `rlib` a different crate's tests link against, which is exactly
 # why this needed its own, always-compiled entry point rather than a
 # visibility change to the existing one.
+
+# 2026-08-17 (WOR-2481): 295 -> 296. One new item:
+# `sbproxy_observe::telemetry::record_active_boot_telemetry_endpoint`, a
+# `#[doc(hidden)]` `pub fn` recording which endpoint each boot-only OTLP
+# exporter (traces, metrics) is dialing, so a config reload can
+# re-verify it later. Its one production caller,
+# `authorize_telemetry_endpoint_or_refuse_boot`, lives in the same file,
+# so `pub(crate)` would satisfy that call alone. `pub` is what it takes
+# for `sbproxy-core`'s `reload_refuses_when_the_new_egress_telemetry_config_denies_a_running_boot_only_exporter`
+# and its sibling `..._proceeds_when...` test, in
+# `crates/sbproxy-core/src/server/lifecycle.rs`, to seed the same state
+# a real, allowed boot-only exporter leaves behind, without booting one:
+# that needs live network I/O and a tokio runtime neither test wants to
+# pay for. Same shape as `EventEgress::never_drained_for_test` above.

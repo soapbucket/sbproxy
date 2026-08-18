@@ -897,11 +897,15 @@ fn otlp_resource(config: &TelemetryConfig) -> Resource {
 /// audit-chain's boot-time fail-loud contract (WOR-2478).
 ///
 /// `None` (an omitted `egress.telemetry:` sub-block, or an authorizer
-/// that permits `endpoint`) stamps the sighting and returns normally, so
-/// boot continues. Called once, at exporter construction, by each of the
-/// three OTLP exporters (traces, metrics, logs); a config reload does
-/// not re-verify an exporter already built at boot (WOR-2481 tracks
-/// closing that gap).
+/// that permits `endpoint`) stamps the sighting, records `endpoint` as
+/// this signal's active boot-only endpoint (via
+/// [`record_active_boot_telemetry_endpoint`]), and returns normally, so
+/// boot continues. This function itself only ever runs once per
+/// process, at boot; a later config reload re-verifies the recorded
+/// endpoint against the *new* generation's authorizer through the
+/// separate [`reverify_active_boot_telemetry_endpoints`], called from
+/// `sbproxy_core::server::lifecycle::reload_compiled_config_locked`'s
+/// reject-only phase rather than by rerunning this function (WOR-2481).
 ///
 /// Split from [`check_telemetry_egress`] so the authorization decision
 /// (stamps the inventory, returns an outcome) is unit-testable on its
@@ -931,6 +935,7 @@ pub(crate) fn authorize_telemetry_endpoint_or_refuse_boot(endpoint: &str, signal
         );
         std::process::exit(1);
     }
+    record_active_boot_telemetry_endpoint(signal, endpoint);
 }
 
 /// Authorize `endpoint` against `egress.telemetry:` and stamp the egress
@@ -975,13 +980,45 @@ pub(crate) enum TelemetryEgressOutcome {
 /// denial) and [`authorize_telemetry_endpoint_or_reject`] (reload-safe,
 /// returns `Err` on denial) for the two production entry points built
 /// on this shared decision.
+///
+/// Reads the *currently installed* generation's authorizer out of the
+/// process-wide configured-gate registry. See
+/// [`check_telemetry_egress_against`] for the sibling that checks
+/// against an explicit authorizer instead, which is what lets a config
+/// reload re-verify a boot-only exporter's endpoint against the *new*
+/// generation before that generation is installed anywhere (WOR-2481).
 pub(crate) fn check_telemetry_egress(endpoint: &str, signal: &str) -> TelemetryEgressOutcome {
+    use sbproxy_security::egress::{configured_gate, EgressPurpose};
+    check_telemetry_egress_against(
+        configured_gate(EgressPurpose::Telemetry).as_ref(),
+        endpoint,
+        signal,
+    )
+}
+
+/// Same decision as [`check_telemetry_egress`], against an explicit
+/// `authorizer` rather than whatever the process-wide configured-gate
+/// registry currently holds. `None` means ungated, exactly as an absent
+/// registry entry does.
+///
+/// A denial here also counts against
+/// [`sbproxy_security::egress::record_egress_refused`], the same
+/// Prometheus counter and typed-event bridge every other egress purpose
+/// already goes through, so a refused telemetry destination is visible
+/// on `sbproxy_egress_refused_total` and the `egress_refused` event feed
+/// exactly like an AI-provider or usage-sink refusal (it was previously
+/// stamped in the sightings inventory only).
+pub(crate) fn check_telemetry_egress_against(
+    authorizer: Option<&sbproxy_security::egress::EgressAuthorizer>,
+    endpoint: &str,
+    signal: &str,
+) -> TelemetryEgressOutcome {
     use sbproxy_security::egress::{
-        configured_gate, record_egress_seen, EgressPurpose, EgressSightingStatus,
+        record_egress_refused, record_egress_seen, EgressPurpose, EgressSightingStatus,
         SystemHostResolver,
     };
     let origin = format!("telemetry.{signal}");
-    let Some(authorizer) = configured_gate(EgressPurpose::Telemetry) else {
+    let Some(authorizer) = authorizer else {
         record_egress_seen(
             EgressPurpose::Telemetry,
             endpoint,
@@ -1010,9 +1047,90 @@ pub(crate) fn check_telemetry_egress(endpoint: &str, signal: &str) -> TelemetryE
                 EgressSightingStatus::Denied,
                 Some(denied),
             );
+            record_egress_refused(EgressPurpose::Telemetry, denied, "unset", &origin);
             TelemetryEgressOutcome::Denied(denied)
         }
     }
+}
+
+/// Endpoints the two boot-only OTLP exporters (traces, metrics) are
+/// currently dialing, keyed by signal (`"traces"` / `"metrics"`).
+///
+/// Populated by [`record_active_boot_telemetry_endpoint`] once
+/// [`authorize_telemetry_endpoint_or_refuse_boot`] lets an exporter
+/// proceed. The OTLP-logs sink is deliberately absent: it is rebuilt on
+/// every config reload and re-authorizes itself at construction time
+/// through [`authorize_telemetry_endpoint_or_reject`], so it never goes
+/// stale the way a boot-only exporter can (WOR-2481).
+fn active_boot_telemetry_endpoints(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static ACTIVE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record that the boot-only `signal` exporter is now dialing `endpoint`,
+/// so a later config reload can re-verify it through
+/// [`reverify_active_boot_telemetry_endpoints`] (WOR-2481).
+///
+/// `#[doc(hidden)]`: a cross-crate test seam, not part of the supported
+/// API surface (this crate is internal to begin with; see the workspace
+/// `CLAUDE.md`'s public-surface list). Its one production caller,
+/// [`authorize_telemetry_endpoint_or_refuse_boot`], lives in this same
+/// file, so `pub(crate)` would satisfy that call alone; `pub` is what it
+/// takes for `sbproxy_core::server::lifecycle`'s reload-refusal test to
+/// seed the same state a real, allowed boot-only exporter would leave
+/// behind, without booting one (which needs live network I/O and a
+/// tokio runtime neither test process wants to pay for). Named to match
+/// the `..._for_test` seams `sbproxy_extension::mcp::federation` and
+/// `sbproxy_observe::event_sink::EventEgress` expose for the same
+/// reason.
+#[doc(hidden)]
+pub fn record_active_boot_telemetry_endpoint(signal: &str, endpoint: &str) {
+    if let Ok(mut active) = active_boot_telemetry_endpoints().lock() {
+        active.insert(signal.to_string(), endpoint.to_string());
+    }
+}
+
+/// Re-authorize every recorded boot-only exporter endpoint against
+/// `authorizer`, the *next* generation's compiled `egress.telemetry:`
+/// value, stamping the sightings inventory for each exactly as the
+/// original boot-time check did.
+///
+/// Called from
+/// `sbproxy_core::server::lifecycle::reload_compiled_config_locked`'s
+/// reject-only phase, before anything about the candidate reload is
+/// installed. Returns `Err` naming the signal and endpoint on the first
+/// one the new generation denies, which refuses the whole reload the
+/// same way `reconcile_process_cluster` and `reconcile_process_secrets`
+/// already refuse it over their own irreversible process state
+/// (WOR-2481): the trace and metric exporters are never rebuilt, so an
+/// endpoint that was allowed at boot and is denied by this reload would
+/// otherwise keep exporting, silently, to a destination the operator's
+/// own allowlist no longer approves. That silent continuation is
+/// exactly the gap this function closes.
+pub fn reverify_active_boot_telemetry_endpoints(
+    authorizer: Option<&sbproxy_security::egress::EgressAuthorizer>,
+) -> Result<()> {
+    let active: Vec<(String, String)> = match active_boot_telemetry_endpoints().lock() {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Err(_) => Vec::new(),
+    };
+    for (signal, endpoint) in active {
+        if let TelemetryEgressOutcome::Denied(denied) =
+            check_telemetry_egress_against(authorizer, &endpoint, &signal)
+        {
+            anyhow::bail!(
+                "reload refused: the running telemetry {signal} exporter's endpoint \
+                 '{endpoint}' is no longer on the egress.telemetry allowlist ({denied:?}). \
+                 This exporter is never rebuilt, so continuing would leave it exporting to a \
+                 now-denied destination. Add '{endpoint}' back to egress.telemetry.hosts, or \
+                 restart sbproxy once you want the new allowlist to take effect."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn build_span_exporter(
@@ -2872,5 +2990,137 @@ mod tests {
         assert_eq!(sighting.status, "allowed");
 
         install_configured_gate(EgressPurpose::Telemetry, None);
+    }
+
+    /// A denied telemetry endpoint used to stop at the sightings
+    /// inventory. `record_egress_refused` is the same funnel every other
+    /// egress purpose (AI provider, usage sink, token exchange, ...)
+    /// already goes through for its Prometheus counter and its bridge to
+    /// the `egress_refused` typed event; a telemetry denial has to reach
+    /// it too, or that counter and event feed silently under-report the
+    /// one purpose whose exporters run unattended.
+    #[test]
+    fn denied_telemetry_endpoint_also_records_egress_refused() {
+        use sbproxy_security::egress::{
+            install_configured_gate, install_egress_refused_hook, EgressDenied, EgressPurpose,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SEEN: std::sync::Mutex<Vec<(&'static str, &'static str, String, String)>> =
+            std::sync::Mutex::new(Vec::new());
+
+        fn hook(purpose: EgressPurpose, reason: EgressDenied, tenant: &str, origin: &str) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            SEEN.lock().expect("test lock").push((
+                purpose.as_label(),
+                reason.as_label(),
+                tenant.to_owned(),
+                origin.to_owned(),
+            ));
+        }
+        let _ = install_egress_refused_hook(hook);
+
+        install_configured_gate(
+            EgressPurpose::Telemetry,
+            Some(enforce_telemetry(&["otel-collector.example.com"], false)),
+        );
+
+        let outcome = check_telemetry_egress(
+            "http://attacker-collector.invalid:4317",
+            "traces-wor2481-refused-bridge",
+        );
+        assert_eq!(
+            outcome,
+            TelemetryEgressOutcome::Denied(EgressDenied::UnlistedHost)
+        );
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "a denied telemetry endpoint must reach record_egress_refused"
+        );
+        let seen = SEEN.lock().expect("test lock");
+        assert_eq!(
+            seen.last(),
+            Some(&(
+                "telemetry",
+                "unlisted_host",
+                "unset".to_string(),
+                "telemetry.traces-wor2481-refused-bridge".to_string()
+            ))
+        );
+
+        install_configured_gate(EgressPurpose::Telemetry, None);
+    }
+
+    /// `authorize_telemetry_endpoint_or_refuse_boot` calls
+    /// `std::process::exit(1)` on denial, so only the allow path is
+    /// reachable from this test process; that is exactly the path that
+    /// has to record the endpoint for later reload re-verification.
+    #[test]
+    fn authorize_telemetry_endpoint_or_refuse_boot_records_the_active_boot_endpoint_when_allowed() {
+        use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
+
+        let signal = "wor2481-record-active-traces";
+        let endpoint = "https://127.0.0.1:4317";
+        install_configured_gate(
+            EgressPurpose::Telemetry,
+            Some(enforce_telemetry(&["127.0.0.1"], true)),
+        );
+
+        authorize_telemetry_endpoint_or_refuse_boot(endpoint, signal);
+
+        let recorded = active_boot_telemetry_endpoints()
+            .lock()
+            .expect("test lock")
+            .get(signal)
+            .cloned();
+        assert_eq!(
+            recorded,
+            Some(endpoint.to_string()),
+            "an allowed boot-only endpoint must be recorded for later reload re-verification"
+        );
+
+        install_configured_gate(EgressPurpose::Telemetry, None);
+    }
+
+    // WOR-2481: reload re-verification of the boot-only trace and metric
+    // exporters. The exporters themselves are never rebuilt on reload
+    // (see `reverify_active_boot_telemetry_endpoints`'s doc comment), so
+    // these tests seed the active-endpoint registry directly with
+    // `record_active_boot_telemetry_endpoint`, the same call
+    // `authorize_telemetry_endpoint_or_refuse_boot` makes on its allow
+    // path, rather than building a real exporter.
+
+    #[test]
+    fn reverify_active_boot_telemetry_endpoints_proceeds_when_the_new_generation_still_allows() {
+        let signal = "wor2481-reverify-still-allowed";
+        let endpoint = "https://otel-collector.example.com:4317";
+        record_active_boot_telemetry_endpoint(signal, endpoint);
+
+        let authorizer = enforce_telemetry(&["otel-collector.example.com"], false);
+        reverify_active_boot_telemetry_endpoints(Some(&authorizer))
+            .expect("an endpoint the new generation still allows must not refuse the reload");
+    }
+
+    #[test]
+    fn reverify_active_boot_telemetry_endpoints_refuses_when_the_new_generation_denies() {
+        let signal = "wor2481-reverify-now-denied";
+        let endpoint = "https://otel-collector.example.com:4317";
+        record_active_boot_telemetry_endpoint(signal, endpoint);
+
+        // The new generation's `egress.telemetry:` allowlist no longer
+        // names this host: a config change that revokes an endpoint the
+        // running, never-rebuilt exporter is still dialing.
+        let authorizer = enforce_telemetry(&["a-different-collector.example.com"], false);
+        let error = reverify_active_boot_telemetry_endpoints(Some(&authorizer))
+            .expect_err("an endpoint the new generation denies must refuse the reload");
+        let message = error.to_string();
+        assert!(
+            message.contains(signal) && message.contains(endpoint),
+            "the refusal must name the signal and endpoint so an operator can act on it: \
+             {message}"
+        );
     }
 }

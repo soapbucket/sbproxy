@@ -316,7 +316,7 @@ egress:
 | `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
 | `token_exchange` | `token_exchange` | The non-MCP outbound-credential resolver's OAuth token-endpoint calls. The MCP token-exchange path has its own per-server `egress:` block (see [mcp-security.md](mcp-security.md)) and is unaffected by this section. |
-| `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload does not re-verify an exporter already running. |
+| `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload re-verifies the still-running trace and metric exporters against the new allowlist and refuses the reload, naming the endpoint, if either is now denied; the log exporter is rebuilt on every reload and re-authorizes itself then. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
 default `allow_by_default`), `hosts` (exact hostnames, case-insensitive),
