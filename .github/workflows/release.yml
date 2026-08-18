@@ -730,7 +730,12 @@ jobs:
           if [ -f /tmp/sbproxy-cert-boot.log ]; then
             tail -c 8388608 /tmp/sbproxy-cert-boot.log > "${OUT}/sbproxy-cert-boot.log"
           fi
-          if [ -f /tmp/sbproxy-cert-artifacts/record.json ]; then
+          # record.json is written straight into ${OUT} by the
+          # certification step itself; copying it onto itself makes
+          # macOS cp exit 1 and fails the whole job after a passing
+          # certification.
+          if [ -f /tmp/sbproxy-cert-artifacts/record.json ] \
+             && [ "/tmp/sbproxy-cert-artifacts/record.json" != "${OUT}/record.json" ]; then
             cp /tmp/sbproxy-cert-artifacts/record.json "${OUT}/record.json"
           fi
           if [ -f /tmp/sbproxy-cert-host.json ]; then
