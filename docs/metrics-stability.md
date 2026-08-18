@@ -277,7 +277,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_model_plane_stream_cancellations_total` | Counter | `stable` | `beta` | `route_class` | Managed response streams dropped before completion by route class. |
 | `sbproxy_mtls_cert_cache_evictions_total` | Counter | `stable` | `beta` | none | Number of mTLS client cert metadata entries evicted by the LRU bound. |
 | `sbproxy_mtls_handshake_total` | Counter | `stable` | `beta` | `result` | mTLS client-certificate verification outcomes. |
-| `sbproxy_object_authz_violations_total` | Counter | `stable` | `beta` | `origin`, `kind` | Object/function-level authorization violations, by kind (bola, bfla, enumeration). |
+| `sbproxy_object_authz_enumeration_tracker_saturated_total` | Counter | `stable` | `beta` | none | Enumeration observations the object_authz policy could not track because the per-principal tracker was at capacity with live windows. |
+| `sbproxy_object_authz_violations_total` | Counter | `stable` | `beta` | `origin`, `kind`, `enforced` | Object/function-level authorization violations, by kind (bola, bfla, enumeration) and enforcement disposition (enforced=true refused the request; enforced=false was audited only). |
 | `sbproxy_ocsp_fetch_total` | Counter | `stable` | `beta` | `result` | OCSP fetch attempts, by outcome. |
 | `sbproxy_ocsp_staple_age_seconds` | Gauge | `stable` | `beta` | `host` | Age of the cached OCSP staple for the host, in seconds. Published once a minute by the refresh task; absent until the first successful fetch, so never-stapled is distinguishable from stale. |
 | `sbproxy_operator_leader_is_leader` | Gauge | `stable` | `beta` | none | 1 when this operator replica currently holds the leader lease. |

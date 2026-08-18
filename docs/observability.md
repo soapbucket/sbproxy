@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -295,7 +295,8 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_agent_detect_score_bucket` | 11 | Histogram buckets over the 0-100 agent-detect score. No labels. |
 | `sbproxy_agent_detect_inference_seconds_bucket` | 9 | Histogram buckets 50us..10ms for in-process scorer latency. No labels. |
 | `sbproxy_trust_tier_requests_total` | 4 | Label: `tier` (`suspicious`\|`strong`\|`named`\|`anonymous`). One closed-set observation per request after identity enrichment and authentication. |
-| `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|enumeration). Counts BOLA / BFLA / enumeration violations the object-authz policy refused. |
+| `sbproxy_object_authz_violations_total` | 400 | Labels: `origin`, `kind` (bola\|bfla\|enumeration), `enforced` (true\|false). Counts BOLA / BFLA / enumeration violations by enforcement disposition: `enforced="true"` refused the request; `enforced="false"` was reported but allowed through (`test_mode`, or a detect-only hit from the ruleless enumeration heuristic). Alert on refusals via `enforced="true"`. |
+| `sbproxy_object_authz_enumeration_tracker_saturated_total` | 1 | No labels. Enumeration observations the object-authz policy could not track because its per-principal tracker was at capacity with live windows; movement means new principals are going unobserved. |
 | `sbproxy_waf_persistent_blocks_total` | 600 | Labels: `origin`, `event` (rule_match\|ip_blocklisted\|anomaly_threshold), `key_kind` (ip\|jwt_sub\|api_key\|session). Counts the WAF blocks that landed on the persistent (cross-process) blocklist as opposed to the in-process rate-limit decision path. |
 | `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitized). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | 6 | Labels: `result` (ok\|backend_error\|kid_still_missing). Counts on-demand JWKS refetches triggered by an unknown `kid` in a presented JWT. |
