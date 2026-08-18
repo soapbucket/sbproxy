@@ -2555,7 +2555,16 @@ fn compile_mcp_result_policy(
 /// Built once at config-compile time by [`compile_local_server`] and
 /// stored on `McpAction::local_servers`. Nothing in this crate reads
 /// it yet; wiring it into the tool catalog is a later task.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written, not derived, on every `CompiledLocal*` type
+/// in this section: rustc's dead-code pass explicitly and deliberately
+/// ignores a *derived* `Debug` impl's field reads (confirmed against a
+/// standalone rustc build; the note reads "has a derived impl for the
+/// trait `Debug`, but this is intentionally ignored during dead code
+/// analysis"), so `#[derive(Debug)]` alone does not keep these fields
+/// off the "never read" list. A hand-written impl's field reads do
+/// count. This mirrors why `McpAction` and `CompiledCel` elsewhere in
+/// this file already hand-write `Debug` rather than derive it.
 pub(crate) struct CompiledLocalMcpServer {
     /// Server name, matching the `name` key used elsewhere for this
     /// upstream (`McpServerPrefix::name`).
@@ -2568,8 +2577,17 @@ pub(crate) struct CompiledLocalMcpServer {
     pub(crate) egress: Option<EgressPolicy>,
 }
 
+impl std::fmt::Debug for CompiledLocalMcpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalMcpServer")
+            .field("name", &self.name)
+            .field("tools", &self.tools)
+            .field("egress", &self.egress)
+            .finish()
+    }
+}
+
 /// One compiled local tool.
-#[derive(Debug)]
 pub(crate) struct CompiledLocalMcpTool {
     pub(crate) name: String,
     pub(crate) description: String,
@@ -2577,9 +2595,19 @@ pub(crate) struct CompiledLocalMcpTool {
     pub(crate) handler: CompiledLocalToolHandler,
 }
 
+impl std::fmt::Debug for CompiledLocalMcpTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalMcpTool")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("input_schema", &self.input_schema)
+            .field("handler", &self.handler)
+            .finish()
+    }
+}
+
 /// A compiled tool's exactly-one handler. See [`McpLocalToolConfig`]'s
 /// `static`/`http`/`steps` field docs for the wire shape.
-#[derive(Debug)]
 pub(crate) enum CompiledLocalToolHandler {
     /// Always returns this value.
     Static(serde_json::Value),
@@ -2589,9 +2617,18 @@ pub(crate) enum CompiledLocalToolHandler {
     Steps(CompiledLocalSteps),
 }
 
+impl std::fmt::Debug for CompiledLocalToolHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(value) => f.debug_tuple("Static").field(value).finish(),
+            Self::Http(call) => f.debug_tuple("Http").field(call).finish(),
+            Self::Steps(steps) => f.debug_tuple("Steps").field(steps).finish(),
+        }
+    }
+}
+
 /// One compiled HTTP call (a tool's `http` handler, or a step's
 /// `http`).
-#[derive(Debug)]
 pub(crate) struct CompiledLocalHttpCall {
     pub(crate) method: String,
     pub(crate) url: String,
@@ -2601,8 +2638,20 @@ pub(crate) struct CompiledLocalHttpCall {
     pub(crate) timeout: Option<Duration>,
 }
 
+impl std::fmt::Debug for CompiledLocalHttpCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalHttpCall")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("retry", &self.retry)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
 /// A compiled step DAG plus its response shaping.
-#[derive(Debug)]
 pub(crate) struct CompiledLocalSteps {
     /// Steps in declaration order (not execution order; a future
     /// task's executor derives that from `depends_on`).
@@ -2610,8 +2659,16 @@ pub(crate) struct CompiledLocalSteps {
     pub(crate) response: Option<CompiledLocalResponseShaping>,
 }
 
+impl std::fmt::Debug for CompiledLocalSteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalSteps")
+            .field("steps", &self.steps)
+            .field("response", &self.response)
+            .finish()
+    }
+}
+
 /// One compiled DAG step.
-#[derive(Debug)]
 pub(crate) struct CompiledLocalStep {
     pub(crate) name: String,
     pub(crate) http: CompiledLocalHttpCall,
@@ -2624,13 +2681,35 @@ pub(crate) struct CompiledLocalStep {
     pub(crate) retry: Option<super::RetryConfig>,
 }
 
+impl std::fmt::Debug for CompiledLocalStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLocalStep")
+            .field("name", &self.name)
+            .field("http", &self.http)
+            .field("depends_on", &self.depends_on)
+            .field("condition", &self.condition)
+            .field("continue_on_error", &self.continue_on_error)
+            .field("retry", &self.retry)
+            .finish()
+    }
+}
+
 /// A compiled `steps` handler's response shaping. See
 /// [`McpLocalResponseConfig`].
-#[derive(Debug)]
 pub(crate) enum CompiledLocalResponseShaping {
     Template(String),
     Js(String),
     Lua(String),
+}
+
+impl std::fmt::Debug for CompiledLocalResponseShaping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Template(value) => f.debug_tuple("Template").field(value).finish(),
+            Self::Js(value) => f.debug_tuple("Js").field(value).finish(),
+            Self::Lua(value) => f.debug_tuple("Lua").field(value).finish(),
+        }
+    }
 }
 
 /// Compile one `type: local` federated server's `tools[]` (WOR-2489).
@@ -5559,6 +5638,7 @@ mod tests {
                 spec: None,
                 spec_path: None,
                 headers: BTreeMap::new(),
+                tools: Vec::new(),
                 egress: None,
                 protocol: default_federated_protocol(),
                 downgrade: McpDowngradePolicy::default(),
@@ -7998,5 +8078,149 @@ allow := false if {
             }]
         });
         assert!(McpAction::from_config(value).is_err());
+    }
+
+    #[test]
+    fn compiled_local_types_exhaustive_shape() {
+        // Documents the full compiled contract Task 2 will consume by
+        // destructuring every `CompiledLocal*` type end to end
+        // (structs field-by-field, enums arm-by-arm), including the
+        // handler/response variants a single config can't exercise at
+        // once. `Debug` is hand-written (not derived) on all of these
+        // specifically so rustc's dead-code pass doesn't ignore the
+        // field reads -- see the doc comment on `CompiledLocalMcpServer`
+        // -- so this test's job is documentation and a regression
+        // guard (a future field/variant added or removed here breaks
+        // the build), not silencing warnings by itself.
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "lookup-server",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"}
+                            },
+                            {
+                                "name": "enrich",
+                                "http": {
+                                    "method": "POST",
+                                    "url": "https://api.example.com/b",
+                                    "headers": {"accept": "application/json"},
+                                    "body": {"q": "hello"},
+                                    "retry": {"max_attempts": 2},
+                                    "timeout": "5s"
+                                },
+                                "depends_on": ["fetch"],
+                                "condition": "mcp.tool.name == \"lookup\"",
+                                "continue_on_error": true,
+                                "retry": {"max_attempts": 3}
+                            }
+                        ],
+                        "response": {"template": "{{ steps.enrich.body }}"}
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("full-shape local server must compile");
+
+        let mut servers = action.local_servers;
+        assert_eq!(servers.len(), 1);
+        let CompiledLocalMcpServer {
+            name: server_name,
+            mut tools,
+            egress,
+        } = servers.remove(0);
+        assert_eq!(server_name, "lookup-server");
+        assert!(egress.is_some());
+        assert_eq!(tools.len(), 1);
+
+        let CompiledLocalMcpTool {
+            name: tool_name,
+            description,
+            input_schema,
+            handler,
+        } = tools.remove(0);
+        assert_eq!(tool_name, "lookup");
+        assert_eq!(description, "look something up");
+        assert!(input_schema.is_object());
+
+        let mut steps = match handler {
+            CompiledLocalToolHandler::Steps(CompiledLocalSteps { steps, response }) => {
+                match response.expect("response shaping was configured") {
+                    CompiledLocalResponseShaping::Template(t) => {
+                        assert_eq!(t, "{{ steps.enrich.body }}");
+                    }
+                    other => panic!("expected Template, got {other:?}"),
+                }
+                steps
+            }
+            other => panic!("expected a Steps handler, got {other:?}"),
+        };
+        assert_eq!(steps.len(), 2);
+
+        let CompiledLocalStep {
+            name: step_name,
+            http,
+            depends_on,
+            condition,
+            continue_on_error,
+            retry: step_retry,
+        } = steps.remove(1);
+        assert_eq!(step_name, "enrich");
+        assert_eq!(depends_on, vec!["fetch".to_string()]);
+        assert!(condition.is_some());
+        assert!(continue_on_error);
+        assert!(step_retry.is_some());
+
+        let CompiledLocalHttpCall {
+            method,
+            url,
+            headers,
+            body,
+            retry: call_retry,
+            timeout,
+        } = http;
+        assert_eq!(method, "POST");
+        assert_eq!(url, "https://api.example.com/b");
+        assert_eq!(headers.get("accept"), Some(&"application/json".to_string()));
+        assert!(body.is_some());
+        assert!(call_retry.is_some());
+        assert!(timeout.is_some());
+
+        // Cover the handler/response arms this config didn't exercise
+        // (Static, Http, Js, Lua) by constructing and matching them
+        // directly.
+        match CompiledLocalToolHandler::Static(json!({"ok": true})) {
+            CompiledLocalToolHandler::Static(v) => assert_eq!(v, json!({"ok": true})),
+            other => panic!("expected Static, got {other:?}"),
+        }
+        match CompiledLocalToolHandler::Http(CompiledLocalHttpCall {
+            method: "GET".to_string(),
+            url: "https://api.example.com/c".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            retry: None,
+            timeout: None,
+        }) {
+            CompiledLocalToolHandler::Http(call) => assert_eq!(call.method, "GET"),
+            other => panic!("expected Http, got {other:?}"),
+        }
+        match CompiledLocalResponseShaping::Js("1 + 1".to_string()) {
+            CompiledLocalResponseShaping::Js(src) => assert_eq!(src, "1 + 1"),
+            other => panic!("expected Js, got {other:?}"),
+        }
+        match CompiledLocalResponseShaping::Lua("1 + 1".to_string()) {
+            CompiledLocalResponseShaping::Lua(src) => assert_eq!(src, "1 + 1"),
+            other => panic!("expected Lua, got {other:?}"),
+        }
     }
 }
