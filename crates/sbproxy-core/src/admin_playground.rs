@@ -2,7 +2,8 @@
 //!
 //! Three routes on the admin server (operator-only, behind the admin auth
 //! and RBAC gate) let an operator exercise any AI endpoint the server is
-//! configured with, straight from the dashboard:
+//! configured with. The dashboard's Playground page uses `endpoints` and
+//! `dispatch`; `chat` is a scripting-only escape hatch:
 //!
 //! - `GET /admin/api/playground/endpoints` lists every AI origin the live
 //!   pipeline serves, with each provider's declared models.
@@ -10,7 +11,12 @@
 //!   chosen endpoint via the same [`AiClient`](sbproxy_ai) the data plane
 //!   uses, returning the upstream response plus token usage, cost, and
 //!   latency. It bypasses per-key governance and guardrails entirely,
-//!   because it never traverses the data plane's own dispatch path.
+//!   because it never traverses the data plane's own dispatch path, so
+//!   the bypass is explicit and audited (WOR-2497): the body must carry
+//!   `"bypass_governance": true` or the request is refused with a `400`
+//!   naming the governed `/dispatch` route, and every completion that
+//!   does run emits an admin audit event naming the actor, origin, and
+//!   model (never the prompt).
 //! - `POST /admin/api/playground/dispatch` runs the same shape of request
 //!   through the *real* data-plane pipeline instead, impersonating a
 //!   chosen virtual key via a short-lived `ticket` so key policy,
@@ -26,7 +32,9 @@
 
 use serde_json::json;
 
-/// Path for the playground chat endpoint (POST).
+/// Path for the playground chat endpoint (POST). Ungoverned by design
+/// and gated on an explicit `bypass_governance: true` in the body; see
+/// the module docs and [`handle_chat`].
 pub const CHAT_PATH: &str = "/admin/api/playground/chat";
 
 /// Path listing the AI endpoints the server is configured with (GET).
@@ -75,6 +83,16 @@ pub(crate) mod ticket {
     /// minutes later.
     const TTL: Duration = Duration::from_secs(30);
 
+    /// Hard cap on live (unredeemed, unexpired) tickets (WOR-2497).
+    ///
+    /// Every mint is followed by a loopback redemption within seconds,
+    /// so a store anywhere near this size means tickets are being
+    /// minted and abandoned. The cap bounds the process-global map
+    /// regardless; at the cap, minting evicts the earliest-expiring
+    /// entry, and an evicted ticket denies exactly like an unknown
+    /// key, so pressure fails closed rather than growing the map.
+    const MAX_LIVE_TICKETS: usize = 1024;
+
     struct Ticket {
         key_id: String,
         expires_at: Instant,
@@ -88,20 +106,41 @@ pub(crate) mod ticket {
     /// Mint a fresh single-use ticket naming `key_id`, valid for `TTL`.
     /// Returns the full bearer token (`PREFIX` + random hex).
     pub(crate) fn mint(key_id: &str) -> String {
-        mint_with_ttl(key_id, TTL)
+        mint_with_ttl_in(store(), key_id, TTL)
     }
 
-    fn mint_with_ttl(key_id: &str, ttl: Duration) -> String {
+    /// The store is a parameter so tests exercise minting, bounding,
+    /// and redemption against their own map instead of racing each
+    /// other (and any concurrently-running dispatch test) on the
+    /// process-global one.
+    fn mint_with_ttl_in(
+        store: &Mutex<HashMap<String, Ticket>>,
+        key_id: &str,
+        ttl: Duration,
+    ) -> String {
         // Same primitive `admin_session::SessionSigner` uses for its
         // per-process key and nonce: `rand::random` over a fixed-size
         // array, hex-encoded.
         let random_bytes: [u8; 32] = rand::random();
         let random = hex::encode(random_bytes);
-        let mut guard = store().lock().expect("ticket store lock");
+        let mut guard = store.lock().expect("ticket store lock");
         // Opportunistic sweep: drop expired entries nobody redeemed so a
         // long-lived process does not accumulate them.
         let now = Instant::now();
         guard.retain(|_, ticket| ticket.expires_at > now);
+        // Bound the map: evict the earliest-expiring live entries until
+        // the new ticket fits. All tickets share one TTL, so
+        // earliest-expiring is oldest-minted.
+        while guard.len() >= MAX_LIVE_TICKETS {
+            let Some(oldest) = guard
+                .iter()
+                .min_by_key(|(_, ticket)| ticket.expires_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            guard.remove(&oldest);
+        }
         guard.insert(
             random.clone(),
             Ticket {
@@ -118,8 +157,12 @@ pub(crate) mod ticket {
     /// unknown key. Returns `None` for any token that is not ours,
     /// unknown, or expired.
     pub(crate) fn consume(token: &str) -> Option<String> {
+        consume_in(store(), token)
+    }
+
+    fn consume_in(store: &Mutex<HashMap<String, Ticket>>, token: &str) -> Option<String> {
         let random = token.strip_prefix(PREFIX)?;
-        let mut guard = store().lock().expect("ticket store lock");
+        let mut guard = store.lock().expect("ticket store lock");
         let ticket = guard.remove(random)?;
         (ticket.expires_at > Instant::now()).then_some(ticket.key_id)
     }
@@ -158,9 +201,43 @@ pub(crate) mod ticket {
 
         #[test]
         fn an_expired_ticket_is_denied() {
-            let token = mint_with_ttl("key-abc", Duration::from_millis(0));
+            let store = Mutex::new(HashMap::new());
+            let token = mint_with_ttl_in(&store, "key-abc", Duration::from_millis(0));
             std::thread::sleep(Duration::from_millis(5));
-            assert_eq!(consume(&token), None);
+            assert_eq!(consume_in(&store, &token), None);
+        }
+
+        #[test]
+        fn the_live_ticket_map_is_bounded_and_evicts_the_oldest() {
+            // A local store, not the process-global one: flooding the
+            // shared map to the cap would evict tickets a concurrent
+            // test just minted.
+            let store = Mutex::new(HashMap::new());
+            let first = mint_with_ttl_in(&store, "key-first", TTL);
+            for n in 1..MAX_LIVE_TICKETS {
+                mint_with_ttl_in(&store, &format!("key-{n}"), TTL);
+            }
+            assert_eq!(
+                store.lock().expect("test store lock").len(),
+                MAX_LIVE_TICKETS
+            );
+
+            let over = mint_with_ttl_in(&store, "key-over", TTL);
+            assert_eq!(
+                store.lock().expect("test store lock").len(),
+                MAX_LIVE_TICKETS,
+                "minting past the cap must not grow the map"
+            );
+            assert_eq!(
+                consume_in(&store, &first),
+                None,
+                "the oldest ticket must have been evicted, denying like an unknown key"
+            );
+            assert_eq!(
+                consume_in(&store, &over).as_deref(),
+                Some("key-over"),
+                "the newest ticket must still redeem"
+            );
         }
 
         #[test]
@@ -214,25 +291,75 @@ pub fn list_endpoints() -> (u16, &'static str, String) {
     )
 }
 
+/// The `400` refusing a `/chat` call that did not opt into the bypass
+/// (WOR-2497). Names the flag and the governed route so an accidental
+/// curl fails closed with the fix in hand.
+const CHAT_BYPASS_REFUSAL: &str = r#"{"error":"POST /admin/api/playground/chat calls the provider directly and bypasses key policy, budgets, and guardrails. Use POST /admin/api/playground/dispatch to run the request through the real pipeline as a virtual key, or resend with \"bypass_governance\": true to deliberately run ungoverned (the bypass is audited)."}"#;
+
+/// Emit the admin audit record for a completed ungoverned `/chat` call
+/// (WOR-2497): actor, origin, model, and upstream status. Never the
+/// prompt or the response. One tracing line on the admin audit target
+/// plus the same record on the audit ring and, when installed, the
+/// durable admin chain.
+fn audit_chat_bypass(actor: &str, origin: &str, model: &str, upstream_status: u16) {
+    tracing::info!(
+        target: "sbproxy::admin::audit",
+        operator = %actor,
+        origin = %origin,
+        model = %model,
+        upstream_status,
+        bypass_governance = true,
+        "playground chat completed outside the data plane"
+    );
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "playground_chat_bypass",
+        Some(actor.to_string()),
+        None,
+        None,
+        None,
+        Some(format!(
+            "origin={origin} model={model} status={upstream_status} bypass_governance=true"
+        )),
+    )
+    .emit();
+}
+
 /// Run a chat completion against a chosen AI endpoint. Body:
-/// `{ "origin": "<hostname>", "request": { <OpenAI chat body> } }`.
+/// `{ "origin": "<hostname>", "request": { <OpenAI chat body> },
+/// "bypass_governance": true }`.
+///
+/// This route never traverses the data plane, so the body must opt into
+/// that with an explicit `bypass_governance: true`; anything else is
+/// refused with a `400` naming the governed `/dispatch` route
+/// (WOR-2497). `actor` is the resolved operator username, used for the
+/// audit record every completed call emits.
 ///
 /// Returns the upstream response plus token usage, estimated cost, the
 /// resolved model, and round-trip latency, or an error envelope. The
 /// caller must have already enforced the `admin` role.
-pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
+pub async fn handle_chat(body: Option<&str>, actor: &str) -> (u16, &'static str, String) {
     use sbproxy_modules::Action;
 
-    let parsed: serde_json::Value = match body.and_then(|b| serde_json::from_str(b).ok()) {
-        Some(v) => v,
-        None => {
-            return (
+    let parsed: serde_json::Value =
+        match body.and_then(|b| serde_json::from_str(b).ok()) {
+            Some(v) => v,
+            None => return (
                 400,
                 "application/json",
-                r#"{"error":"invalid JSON body; expected {origin, request}"}"#.to_string(),
-            )
-        }
-    };
+                r#"{"error":"invalid JSON body; expected {origin, request, bypass_governance}"}"#
+                    .to_string(),
+            ),
+        };
+    // The gate comes before any other validation: an accidental curl
+    // must fail closed whether or not the rest of the body is well
+    // formed.
+    let bypass = parsed
+        .get("bypass_governance")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !bypass {
+        return (400, "application/json", CHAT_BYPASS_REFUSAL.to_string());
+    }
     let origin = parsed
         .get("origin")
         .and_then(|v| v.as_str())
@@ -321,7 +448,7 @@ pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
         .await
         {
             Ok(Some(upstream)) => {
-                return managed_chat(&origin, upstream, request, debug, &pipeline).await;
+                return managed_chat(&origin, upstream, request, debug, &pipeline, actor).await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -394,6 +521,7 @@ pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
             cache_creation: 0,
         },
     );
+    audit_chat_bypass(actor, &origin, &model, status);
 
     let mut out = json!({
         "origin": origin,
@@ -446,6 +574,7 @@ async fn managed_chat(
     mut request: serde_json::Value,
     debug: bool,
     pipeline: &crate::pipeline::CompiledPipeline,
+    actor: &str,
 ) -> (u16, &'static str, String) {
     let public_model = upstream.public_model.clone();
     if let Some(obj) = request.as_object_mut() {
@@ -511,6 +640,7 @@ async fn managed_chat(
             cache_creation: 0,
         },
     );
+    audit_chat_bypass(actor, origin, &public_model, status);
 
     let mut out = json!({
         "origin": origin,
@@ -783,23 +913,112 @@ mod tests {
 
     #[tokio::test]
     async fn chat_rejects_missing_body() {
-        let (status, _, body) = handle_chat(None).await;
+        let (status, _, body) = handle_chat(None, "tester").await;
         assert_eq!(status, 400);
         assert!(body.contains("invalid JSON"));
     }
 
     #[tokio::test]
     async fn chat_rejects_missing_request() {
-        let (status, _, body) = handle_chat(Some(r#"{"origin":"api.ai"}"#)).await;
+        let (status, _, body) = handle_chat(
+            Some(r#"{"origin":"api.ai","bypass_governance":true}"#),
+            "tester",
+        )
+        .await;
         assert_eq!(status, 400);
         assert!(body.contains("request"));
     }
 
     #[tokio::test]
     async fn chat_rejects_missing_origin() {
-        let (status, _, body) = handle_chat(Some(r#"{"request":{"model":"m"}}"#)).await;
+        let (status, _, body) = handle_chat(
+            Some(r#"{"request":{"model":"m"},"bypass_governance":true}"#),
+            "tester",
+        )
+        .await;
         assert_eq!(status, 400);
         assert!(body.contains("origin"));
+    }
+
+    #[tokio::test]
+    async fn chat_without_the_bypass_flag_is_refused_naming_dispatch() {
+        let (status, _, body) = handle_chat(
+            Some(r#"{"origin":"wor2497.bypass-gate.test","request":{"model":"m"}}"#),
+            "tester",
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "an accidental /chat curl must fail closed, not complete ungoverned: {body}"
+        );
+        assert!(
+            body.contains("bypass_governance"),
+            "the refusal must name the flag that opens the gate: {body}"
+        );
+        assert!(
+            body.contains("/admin/api/playground/dispatch"),
+            "the refusal must point at the governed route: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_the_bypass_flag_false_is_refused() {
+        let (status, _, body) = handle_chat(
+            Some(
+                r#"{"origin":"wor2497.bypass-gate.test","request":{"model":"m"},"bypass_governance":false}"#,
+            ),
+            "tester",
+        )
+        .await;
+        assert_eq!(status, 400, "an explicit false must refuse too: {body}");
+        assert!(body.contains("bypass_governance"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_the_bypass_flag_true_passes_the_gate() {
+        // No pipeline is installed in unit tests, so a gated request
+        // proceeds to origin resolution and 404s on the unknown origin.
+        // The point pinned here is that the explicit flag opens the
+        // gate: the response is no longer the 400 refusal.
+        let (status, _, body) = handle_chat(
+            Some(
+                r#"{"origin":"wor2497.bypass-gate.test","request":{"model":"m"},"bypass_governance":true}"#,
+            ),
+            "tester",
+        )
+        .await;
+        assert_eq!(status, 404, "expected origin resolution, got: {body}");
+        assert!(body.contains("no AI endpoint configured"));
+    }
+
+    #[test]
+    fn a_chat_bypass_audit_names_the_actor_and_target_and_never_the_prompt() {
+        // The success paths cannot run without a live upstream, so the
+        // emission helper both of them call is pinned here by name; the
+        // ring is process-global, so filter to this event's kind rather
+        // than asserting on the ring's whole contents.
+        audit_chat_bypass("op-wor2497", "audit.bypass.test", "test-model-wor2497", 200);
+        let events =
+            sbproxy_observe::audit_ring::recent_audit_events(64, Some("admin"), None, None);
+        let event = events
+            .iter()
+            .find(|e| {
+                e.kind == "playground_chat_bypass" && e.actor.as_deref() == Some("op-wor2497")
+            })
+            .expect("the bypass audit event must land on the admin audit ring");
+        let detail = event.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("origin=audit.bypass.test"),
+            "the audit detail must name the origin: {detail}"
+        );
+        assert!(
+            detail.contains("model=test-model-wor2497"),
+            "the audit detail must name the model: {detail}"
+        );
+        assert!(
+            detail.contains("bypass_governance=true"),
+            "the audit detail must mark the bypass explicit: {detail}"
+        );
     }
 
     #[tokio::test]

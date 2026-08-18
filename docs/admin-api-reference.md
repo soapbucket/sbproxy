@@ -622,8 +622,7 @@ diagnose why a load balancer is short on candidates.
           "circuit_breaker_state": "closed",
           "weight": 10,
           "backup": false,
-          "group": null,
-          "zone": "us-west-1a"
+          "group": null
         }
       ]
     }
@@ -645,7 +644,11 @@ diagnose why a load balancer is short on candidates.
 | `origins[].targets[].weight` | int | Authored weight. |
 | `origins[].targets[].backup` | bool | True when this is a backup target. |
 | `origins[].targets[].group` | string \| null | Authored group tag, if any. |
-| `origins[].targets[].zone` | string \| null | Authored zone tag, if any. |
+
+A `zone` field used to appear here, echoing the load balancer's
+`targets[].zone` label. That config key is refused at config compile
+now (target selection was never locality aware), so the response no
+longer carries it.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.
@@ -2424,14 +2427,21 @@ so they require the `admin` role.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/admin/api/playground/endpoints` | List every AI origin the live pipeline serves, with each provider's declared models and default model. Read-only, sourced from the compiled pipeline, so a config reload updates it without a restart. |
-| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint by calling the AI client directly. Returns the upstream response plus token usage, cost, and latency. Bypasses the data-plane pipeline (see below). |
-| POST | `/admin/api/playground/dispatch` | Run a chat completion as a chosen virtual key by minting a single-use `sbpgtkt_` ticket and making a real loopback call to the data-plane listener, so the full request pipeline applies: the key's policy, governance, routing, guardrails, and transforms. |
+| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint by calling the AI client directly. Returns the upstream response plus token usage, cost, and latency. Bypasses the data-plane pipeline, so it requires an explicit `bypass_governance: true` in the body and audits every completion (see below). |
+| POST | `/admin/api/playground/dispatch` | Run a chat completion as a chosen virtual key by minting a single-use `sbpgtkt_` ticket and making a real loopback call to the data-plane listener, so the full request pipeline applies: the key's policy, governance, routing, guardrails, and transforms. This is the route the dashboard's Playground page uses. |
 
 The two POST routes differ in what they exercise. `/chat` calls the AI
 client directly and does not traverse the data-plane pipeline:
 per-origin policies, guardrails, transforms, and the
 `x-sbproxy-debug-*` header stamping do not apply. Use it to check that
-an upstream and model answer at all.
+an upstream and model answer at all. Because that is a governance
+bypass, the route fails closed: a body without `"bypass_governance":
+true` returns `400` with an error naming `/dispatch`, so an operator
+debugging a blocked key cannot complete against a gated origin by
+accident. Every completion `/chat` does run emits an admin audit event
+(action `playground_chat_bypass`, visible on `/api/audit/events` and in
+the durable admin chain when one is installed) naming the operator,
+origin, model, and upstream status. The prompt is never logged.
 
 `/dispatch` is the governed path: it impersonates a virtual key through
 a single-use ticket and loops back through the data-plane listener, so

@@ -53,7 +53,7 @@ Runnable: [`examples/forward-rules/`](../examples/forward-rules/), [`examples/bo
 | `ip_hash` / `uri_hash` / `header_hash` / `cookie_hash` | Sticky by client IP, path, a named header, or a named cookie. |
 | `ring_hash` | Ketama-style consistent hashing; removing one of N targets remaps roughly 1/N of keys instead of reshuffling most of them. |
 
-The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead.
+The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead. Zone-aware routing is not implemented: `targets[].zone` never influenced selection and is refused at config compile rather than accepted as an inert label.
 
 **Health, failure, and resilience signals** apply per target and compose:
 

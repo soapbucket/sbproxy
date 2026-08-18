@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-12*
+*Last modified: 2026-08-18*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -124,6 +124,7 @@ surface that does the job. Boot and reload both refuse the document.
 |---|---|---|
 | `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand. No configuration reroutes an oversized prompt to a larger-window model; order the larger model first, or alias to it. |
 | `origins.*.action.sticky` (`load_balancer`) | No affinity cookie was ever issued. | `algorithm: ring_hash` keyed on `cookie`, `header`, `ip`, or `uri`. |
+| `origins.*.action.targets[].zone` (`load_balancer`) | Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone. The key's name promises the zone-aware routing that Envoy and Nginx operators expect, and a promise-shaped label is a foot-gun rather than a convenience. | Remove the key; zone-aware routing is not implemented. To tell replicas apart, use `targets[].metadata`, which promises nothing about selection. |
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
 | `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
 | `transforms[].on_response`, and its `expression` alias (`type: cel`) | Replaced the entire response body with whatever scalar the expression evaluated to. No partial edit, no structure-aware change, no streaming. CEL is for deciding; producing a payload is a different job, and no config in the tree ever authored the key. | A `javascript`, `lua_json`, or WASM transform, each of which parses the body, edits part of it, and re-emits. The same transform's `headers:` rules still set response headers from CEL. |
@@ -131,11 +132,14 @@ surface that does the job. Boot and reload both refuse the document.
 #### Schema keys refused at config compile
 
 These parsed, warned once at boot, and then governed nothing. A warning
-is the proportionate response to a key that does less than its name
-promises while still doing something. `origins.*.action.targets[].zone`
-is one: it renders a column in the admin target-health view and never
-makes the proxy prefer a same-zone target, so refusing it would delete a
-working label over a routing promise nobody made.
+can be the proportionate response to a key that does less than its name
+promises while still doing something, but the promise has to be small.
+`origins.*.action.targets[].zone` sat in that category for a while (it
+rendered a column in the admin target-health view) and moved to the
+refused table above once it was clear the column was not what operators
+were writing the key for: `zone` reads as locality routing, and a
+multi-region config that trusts it round-robins globally with nothing
+but a boot warning to say so.
 
 Refusal is for two other shapes. The first is a key with nothing behind
 it at all, where a config that sets it keeps claiming a property the
@@ -207,7 +211,6 @@ see that case, because the key is read.
 | Field or subtree | What happens today |
 |---|---|
 | `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. No fetcher is installed, and no signature check is installed for one either, so the bootstrap keys verify nothing. |
-| `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label has one reader, the admin target-health view behind `GET /api/health/targets`, so zoning your targets renders a column and does not make the proxy prefer a same-zone target. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
 | `origins.*.credentials[].attrs.budget.reset` | Credential lowering copies `max_tokens` and `max_cost_usd` and nothing else, so the cap is cumulative and never resets. For a resetting cap today, use the AI action's `budget.limits[]`, which does take a `period`. The same leaf is config-only at proxy and tenant credential scopes. |
 | `proxy.observability.log.sampling.info`, `.debug`, `.trace` | The process logger has no sampling call site, so no rate is applied at any level and every line is emitted. Throttle request logs with `access_log.sample_rate` instead. The sibling `log.level` and `log.format` are live; see [observability.md](observability.md) for where they sit against the CLI flags and `RUST_LOG`. |
