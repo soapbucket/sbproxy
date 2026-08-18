@@ -181,6 +181,14 @@ record() {
   [ -f "$tape" ] || tape="docs/tapes/${tape%.tape}.tape"
   if [ ! -f "$tape" ]; then echo "skip: no such tape $tape" >&2; return 1; fi
 
+  # A directive missing its space (`#FIXTURE:` where `# FIXTURE:` was
+  # meant) is silently not a directive at all, so a typo records a tape
+  # with no fixture instead of erroring. Refuse it.
+  if grep -qE '^#(CONFIG|AUX_CONFIG|FIXTURE|FIXTURE_PORT|LOGLEVEL):' "$tape"; then
+    echo "skip: $tape has a malformed directive (missing space after '#')" >&2
+    return 1
+  fi
+
   local cfg aux_cfg
   cfg="$(sed -n 's/^# CONFIG:[[:space:]]*//p' "$tape" | head -n1)"
   if [ -z "$cfg" ]; then echo "skip: $tape has no '# CONFIG:' directive" >&2; return 1; fi
@@ -193,6 +201,15 @@ record() {
 
   local fixture fixture_port
   fixture="$(sed -n 's/^# FIXTURE:[[:space:]]*//p' "$tape" | head -n1)"
+  # Repo-relative only: a tape is repo content, and `# FIXTURE:` names a
+  # python program this script runs, so an absolute or parent-escaping
+  # path has no business here.
+  case "$fixture" in
+    /* | *..*)
+      echo "skip: fixture path $fixture (from $tape) must be repo-relative" >&2
+      return 1
+      ;;
+  esac
   if [ -n "$fixture" ] && [ ! -f "$fixture" ]; then
     echo "skip: fixture $fixture (from $tape) missing" >&2
     return 1
@@ -242,6 +259,13 @@ record() {
     reject_occupied_port "$aux_admin_port" || return 1
   fi
   if [ -n "$fixture_port" ]; then
+    local taken
+    for taken in "$port" "$aux_port" "$admin_port" "$aux_admin_port"; do
+      if [ -n "$taken" ] && [ "$fixture_port" = "$taken" ]; then
+        echo "error: fixture port $fixture_port collides with a proxy port required by $tape" >&2
+        return 1
+      fi
+    done
     reject_occupied_port "$fixture_port" || return 1
   fi
 
@@ -276,6 +300,18 @@ record() {
       # per-request (rather than something the proxy dials at startup) has
       # nothing to probe readiness against, so a fixed settle time stands in.
       sleep 1
+      # The settle time is not a liveness check. A fixture that died at
+      # startup (its port already held by a leaked listener, a syntax
+      # error) would otherwise be invisible: the tape records against a
+      # dead fixture and reports success, and only the committed GIF
+      # shows the 502s. Fail the tape by name instead.
+      if ! kill -0 "$fixture_pid" 2>/dev/null; then
+        echo "error: fixture $fixture exited during startup (no FIXTURE_PORT to probe); log follows" >&2
+        sed -n '1,20p' "$fixture_log" >&2 || true
+        stop_active_from "$start_index"
+        remove_workspaces_from "$workspace_start"
+        return 1
+      fi
     fi
   fi
   if [ -n "$aux_cfg" ]; then

@@ -57,15 +57,14 @@
 //! `api1`'s and `api5`'s shared `object_authz` entry always reports
 //! [`PackItemState::NeedsOperatorInput`] regardless of posture: with
 //! `object_rules` and `function_rules` both empty, neither BOLA
-//! ownership checking nor BFLA role checking nor the enumeration
-//! sub-check has anything to evaluate (confirmed by tracing
-//! `sbproxy-modules::policy::object_authz::ObjectAuthzPolicy::decide` -
-//! the enumeration counter is only populated *inside* the `object_rules`
-//! match loop, so it stays inert without at least one operator-authored
-//! rule; see `synth_object_authz`'s doc comment). The state names what
-//! is missing, not whether the free fallback happens to be blocking or
-//! auditing - and here there is no free fallback yet, only a slot ready
-//! for one the moment an operator adds rules.
+//! ownership checking nor BFLA role checking has anything to evaluate.
+//! The enumeration sub-check is the exception: with `object_rules`
+//! empty, `ObjectAuthzPolicy::decide` falls back to a ruleless
+//! path-shape heuristic for identified callers and reports id sweeps
+//! as detect-only violations (audited and counted, never blocked; see
+//! `synth_object_authz`'s doc comment). The state names what is still
+//! missing - the ownership rules only an operator can author - not
+//! whether that audit-only fallback is running, which it is.
 //!
 //! `api3` and `api9` do not fit the `ItemRow`/`SynthPiece` table shape
 //! at all, so `expand_owasp_pack` special-cases both before it ever
@@ -629,21 +628,21 @@ struct ItemRow {
 /// `test_mode: true` (violations audited, request passes); `enforce`
 /// sets `test_mode: false` (violations blocked).
 ///
-/// The enumeration flag is set now as a slot ready for the moment an
-/// operator adds an `object_rules` entry with an `object_param`, not
-/// because it detects anything on its own today. Tracing
-/// `ObjectAuthzPolicy::decide` (`sbproxy-modules::policy::object_authz`)
-/// shows the enumeration counter is only populated *inside* the
-/// `object_rules` match loop (`enumeration_hit` is set from a matched
-/// rule's captured `object_param`), so with `object_rules` empty the
-/// enumeration check's own `if let Some(obj_id) = enumeration_hit`
-/// never has a value to test, regardless of `enumeration.enabled`. This
-/// pack cannot synthesize an `object_rules` entry that only enumerates
-/// without also enforcing BOLA ownership, because `decide()` ties any
-/// matching rule's owner check to the same loop: a rule with no
-/// `object_param` skips enumeration but still enforces BOLA, and a rule
-/// with one enforces BOLA on the way to counting it. There is
-/// currently no way to get one without the other from config alone.
+/// The enumeration flag does two things. Today, with `object_rules`
+/// empty, `ObjectAuthzPolicy::decide`
+/// (`sbproxy-modules::policy::object_authz`) falls back to its ruleless
+/// path-shape heuristic (`heuristic_object_key`) for callers with a
+/// resolved `principal.owner`: an identified caller sweeping more than
+/// `enumeration.max_distinct` distinct path-shaped ids inside the
+/// window produces a detect-only violation - a
+/// `sbproxy_object_authz_violations_total{kind="enumeration"}`
+/// increment and a security-audit record, never a block, regardless of
+/// posture. And the moment an operator adds an `object_rules` entry
+/// with an `object_param`, enumeration narrows to rule-captured ids
+/// and its violations follow `test_mode` like any other. What the pack
+/// still cannot synthesize is BOLA ownership coverage: an
+/// `object_rules` entry needs the operator's own path template and
+/// owner mapping, which no default can infer.
 fn synth_object_authz(posture: PackPosture) -> PieceSynthesis {
     let test_mode = matches!(posture, PackPosture::ReportOnly);
     let policy = serde_json::json!({
@@ -652,20 +651,21 @@ fn synth_object_authz(posture: PackPosture) -> PieceSynthesis {
         "enumeration": { "enabled": true },
     });
     let mode_note = if test_mode {
-        "test_mode: true, so a future violation is audited but the request passes"
+        "test_mode: true, so a rule-derived violation is audited but the request passes"
     } else {
-        "test_mode: false, so a future violation is blocked"
+        "test_mode: false, so a rule-derived violation is blocked"
     };
     PieceSynthesis {
         policy,
         synthesized_type: "object_authz",
         reason: format!(
             "synthesized object_authz with empty object_rules and enumeration.enabled: true \
-             ({mode_note}). With object_rules empty this entry has no rule to match against any \
-             path, so it does not yet block or flag anything: real BOLA coverage needs an \
-             operator-authored object_rules entry, which this pack cannot infer. \
-             enumeration.enabled is set now so it activates the moment such a rule is added, \
-             without a second config change."
+             ({mode_note}). With object_rules empty the ruleless path-shape heuristic is \
+             active: an identified caller sweeping many distinct ids is reported as an \
+             enumeration violation for audit only (counted and logged, never blocked, \
+             regardless of posture). Real BOLA ownership coverage still needs an \
+             operator-authored object_rules entry, which this pack cannot infer; adding one \
+             scopes enumeration to rule-captured ids and makes violations follow test_mode."
         ),
     }
 }
@@ -694,8 +694,8 @@ fn synth_object_authz_bfla_only(posture: PackPosture) -> PieceSynthesis {
                   required role, which this pack cannot infer; with function_rules empty, \
                   decide()'s BFLA loop never runs, so nothing is refused regardless of posture. \
                   Enabling api1 alongside this item shares one object_authz entry instead of \
-                  adding a second; neither has a fallback that fires without operator-authored \
-                  rules."
+                  adding a second; the shared entry then also carries api1's ruleless \
+                  enumeration heuristic, which reports id sweeps for audit only."
             .to_string(),
     }
 }
@@ -1908,6 +1908,19 @@ mod tests {
         // object_rules means no real ownership check runs either way.
         assert_eq!(entry.state, PackItemState::NeedsOperatorInput);
         assert_eq!(entry.synthesized_types, vec!["object_authz"]);
+        // The manifest reason must describe the ruleless enumeration
+        // heuristic as live and audit-only (#1118/#1128), not claim
+        // the entry flags nothing.
+        assert!(
+            entry.reason.contains("ruleless path-shape heuristic"),
+            "reason must name the live audit-only heuristic: {}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("does not yet block or flag anything"),
+            "stale pre-#1118 claim resurfaced: {}",
+            entry.reason
+        );
 
         let synthesized = policies
             .iter()

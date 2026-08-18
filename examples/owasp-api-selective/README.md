@@ -1,6 +1,6 @@
 # The OWASP API Top 10 pack, adopted selectively
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 Most operators do not flip on `enable: all` on day one. This example is
 the realistic path: name a handful of items, leave the pack-wide
@@ -54,9 +54,11 @@ default is `report_only`; `per_item.api1.posture: enforce` promotes
 just this one item, which flips the synthesized `object_authz` entry's
 `test_mode` from `true` to `false`. But `api1`'s synthesized entry has
 empty `object_rules` (this pack cannot infer your ownership model),
-and with no rule to match, the policy has nothing to block or flag
-either way. The manifest still reports `needs_operator_input`, not
-`enforced`, and says so:
+and with no rule to match, ownership checking has nothing to block
+either way. What does run ruleless is the enumeration heuristic: it
+reports an identified caller's id sweeps for audit only, in both
+postures, and never blocks. The manifest still reports
+`needs_operator_input`, not `enforced`, and says so:
 
 ```bash
 $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
@@ -68,7 +70,7 @@ $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
   "item": "api1",
   "title": "Broken Object Level Authorization",
   "state": "needs_operator_input",
-  "reason": "synthesized object_authz with empty object_rules and enumeration.enabled: true (test_mode: false, so a future violation is blocked). With object_rules empty this entry has no rule to match against any path, so it does not yet block or flag anything: real BOLA coverage needs an operator-authored object_rules entry, which this pack cannot infer. ...",
+  "reason": "synthesized object_authz with empty object_rules and enumeration.enabled: true (test_mode: false, so a rule-derived violation is blocked). With object_rules empty the ruleless path-shape heuristic is active: an identified caller sweeping many distinct ids is reported as an enumeration violation for audit only (counted and logged, never blocked, regardless of posture). Real BOLA ownership coverage still needs an operator-authored object_rules entry, which this pack cannot infer; ...",
   "synthesized": ["object_authz"]
 }
 ```

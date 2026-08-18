@@ -3,6 +3,7 @@
 #
 # CONFIG: examples/routing-strategies/sb.yml
 # FIXTURE: examples/routing-strategies/fixture.py
+# FIXTURE_PORT: 18091
 
 Output "docs/assets/routing-strategies.gif"
 

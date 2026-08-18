@@ -1681,7 +1681,7 @@ on and the retention it applies.
 | `lineage` | string | UUID minted the first time this ring was created. Stable across restarts and `source:` repoints. |
 | `lkg_revision` | number or null | Revision number of the entry marked last-known-good, or `null` when nothing has been marked yet. |
 | `entries` | array | Newest first. |
-| `entries[].revision` | number | Node-local, monotonic. Durable across restart, never reused. |
+| `entries[].revision` | number | Node-local, monotonic. Durable across restart, never reused. One repair exception: if both the ring's `index.json` and its backup copy are lost or corrupted, the ring reinitializes and numbering restarts at 1. |
 | `entries[].digest` | string | SHA-256 of the pre-resolution document, lowercase hex, no scheme prefix. |
 | `entries[].provenance` | string | `local_file`, `git`, `authority`, or `merged`. This release emits `local_file` and `git` only; see the note below. |
 | `entries[].state` | string | `applied`, `good`, `failed`, or `reverted`. |
@@ -1741,7 +1741,7 @@ secret-redacted view of the stored pre-resolution YAML, and the rendered
 | Field | Type | Description |
 |---|---|---|
 | `entry` | object | Same shape as one element of `entries[]` in [`GET /admin/config/history`](#get-adminconfighistory). |
-| `document` | string | A secret-redacted view of the stored pre-resolution YAML. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. A literal secret an operator typed directly into the file (an inline API key, a password field) is masked as `[REDACTED]`, the same redaction pass [`GET /admin/config`](#get-put-adminconfig) applies. This is display redaction only: the ring file on disk still holds the original bytes (a rollback needs them), protected by the ring directory's owner-only filesystem permissions (`0700`/`0600`), not by this response. |
+| `document` | string | A secret-redacted view of the stored pre-resolution YAML. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. A literal secret an operator typed directly into the file (an inline API key, a password field) is masked as `[REDACTED]`, the same redaction pass [`GET /admin/config`](#get-put-adminconfig) applies; masking is by recognized credential shape and key name, so a secret under an unrecognized name passes through as written. This is display redaction only: the ring file on disk still holds the original bytes (a rollback needs them), protected by the ring directory's owner-only filesystem permissions (`0700`/`0600`), not by this response. |
 | `plan_text` | string | The same terraform-style text diff `sbproxy plan` renders by default, computed between this revision and the config running now, then redacted the same way `document` is. |
 
 Read-only operators may call this.

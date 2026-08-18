@@ -1113,10 +1113,12 @@ const METRIC_CTORS: &[&str] = &[
     "register_gauge_vec!(",
     "register_histogram_vec!(",
     "register_int_counter!(",
+    "register_counter!(",
     "register_int_gauge!(",
     "register_gauge!(",
     "register_histogram!(",
     "IntCounter::new(",
+    "Counter::new(",
     "IntGauge::new(",
     "Gauge::new(",
 ];

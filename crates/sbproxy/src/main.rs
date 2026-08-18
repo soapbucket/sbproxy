@@ -14296,40 +14296,16 @@ hooks:
         );
     }
 
-    #[test]
-    fn config_show_displays_whatever_the_server_sent_verbatim_including_redaction() {
-        // The admin route is the one that redacts (see admin.rs's
-        // `config_history_detail_redacts_a_literal_secret_while_the_ring_file_keeps_the_original`);
-        // this proves the CLI's own display path -- both --format text
-        // and --format json -- has no separate transformation that
-        // could show the planted secret even if it somehow arrived
-        // unredacted, because there is no transformation to get wrong:
-        // both paths print exactly what the server sent.
-        let detail = serde_json::json!({
-            "entry": {
-                "revision": 1,
-                "digest": "abc123",
-                "provenance": "local_file",
-                "state": "applied",
-                "applied_at": "2026-01-01T00:00:00.000Z",
-                "actor": "",
-                "blast_radius": serde_json::Value::Null,
-                "degraded": [],
-            },
-            "document": "ai:\n  api_key_literal: AKIA[REDACTED]\n",
-            "plan_text": "",
-        });
-
-        assert_eq!(
-            config_show_document_text(&detail),
-            "ai:\n  api_key_literal: AKIA[REDACTED]\n"
-        );
-        assert!(!config_show_document_text(&detail).contains("AKIAIOSFODNN7EXAMPLE"));
-
-        let pretty = serde_json::to_string_pretty(&detail).expect("serializes");
-        assert!(pretty.contains("AKIA[REDACTED]"), "{pretty}");
-        assert!(!pretty.contains("AKIAIOSFODNN7EXAMPLE"), "{pretty}");
-    }
+    // A test named `config_show_displays_whatever_the_server_sent_verbatim
+    // _including_redaction` used to sit here. It hand-built a `detail` JSON
+    // whose document was already redacted and asserted a two-line field
+    // accessor returned it, so it passed identically with redaction deleted
+    // and pinned nothing. The enforcement lives server-side, in admin.rs's
+    // `config_history_detail_redacts_a_literal_secret_while_the_ring_file_keeps_the_original`.
+    // The CLI property worth pinning (that `handle_config_show` issues the
+    // two admin GETs and applies no transformation of its own) needs an
+    // admin-server mock this test module does not have; until one exists,
+    // no test here is more honest than a test that proves nothing.
 
     #[test]
     fn parses_cluster_init_token_and_enroll_commands() {

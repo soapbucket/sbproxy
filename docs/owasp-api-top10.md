@@ -1,6 +1,6 @@
 # OWASP API Top 10 pack
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 `owasp_api_top10` is a policy pack: one config entry that expands into
 the real, individually-documented policies and transforms this page
@@ -104,11 +104,15 @@ order is yours.
 enabling either first, then the other, produces one entry, not two.
 
 **Default posture and why.** `needs_operator_input`, regardless of
-`posture`. With `object_rules` empty there is no rule for the policy
-to match a request against, so nothing blocks or flags yet.
-`enumeration.enabled: true` is set now, ahead of any rule, so it
-activates the moment one is added rather than requiring a second
-config change.
+`posture`. With `object_rules` empty there is no ownership rule for
+the policy to match a request against, so BOLA checking has nothing
+to evaluate. `enumeration.enabled: true` is live immediately, though:
+with no rules, the policy falls back to a path-shape heuristic and
+reports an identified caller who sweeps many distinct ids as an
+enumeration violation, for audit only (counted and logged, never
+blocked, regardless of posture). Adding an `object_rules` entry
+scopes enumeration to rule-captured ids and makes violations follow
+the posture.
 
 **report_only -> enforce.** `posture: enforce` (pack-wide or
 `per_item.api1.posture: enforce`) flips the synthesized entry's

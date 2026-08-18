@@ -1046,8 +1046,12 @@ pub struct ConfigHistoryConfig {
     /// 20.
     #[serde(default = "default_config_history_keep")]
     pub keep: usize,
-    /// Number of rejected entries the ring retains for operator
-    /// inspection. Defaults to 10.
+    /// Accepted, not yet wired. Nothing writes the ring's `rejected/`
+    /// directory in this release, so this field has no observable
+    /// effect today; a config that fails to apply is not recorded
+    /// anywhere. Parsed and stored for forward compatibility: once the
+    /// writer ships, it bounds how many rejected candidates the ring
+    /// retains for operator inspection. Defaults to 10.
     #[serde(default = "default_config_history_keep_rejected")]
     pub keep_rejected: usize,
 }

@@ -1,5 +1,5 @@
 # MCP gateway guardrails
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 SBproxy's MCP gateway carries a small set of guardrail mechanisms for
 tool traffic: egress control, session risk accumulation, output
@@ -212,7 +212,12 @@ target as `span_count` and `spans_dropped` alongside the existing
 byte offset and length into the pre-redaction document, never the
 matched value, and the count is capped at 32 per category so a document
 stuffed with hundreds of matches cannot bloat the record; anything past
-the cap only moves `spans_dropped`.
+the cap only moves `spans_dropped`. The span detail is a log-target
+signal only: the `mcp_governance_decision` evidence record beside it
+carries the category, mode, and detector list, not the spans or their
+count, so a pipeline that needs the counts must ingest the
+`sbproxy::mcp::content_filter` tracing target rather than the event
+feed.
 
 ### Governance evidence and fail-closed delivery
 

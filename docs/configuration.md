@@ -906,8 +906,13 @@ that permission boundary is what actually protects a literal secret at
 rest, the same as the config file itself. `GET /admin/config/history/{digest}`
 and `sbproxy config show` mask a literal secret as `[REDACTED]` before
 either ever leaves the process, the same redaction pass
-[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies,
-but that is display redaction: the ring file underneath still holds the
+[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies.
+Masking is by recognized credential shape and key name (vendor key
+prefixes, `Authorization` values, and the schema's own key / secret /
+token / password fields); a secret under a name or shape the redactor
+does not recognize is returned as written, which is one more reason the
+permission boundary above is the real control. And it is display
+redaction either way: the ring file underneath still holds the
 original bytes, because a rollback needs them.
 
 The directory is a one-process durability boundary, not shared fleet state,
@@ -3003,11 +3008,13 @@ policies:
 | `action` | string | `tag` | `tag` stamps `<header>: <detector_csv>` on the upstream. `block` returns `403`. |
 | `direction` | string | `request` | `request` is the only path enforced today; `response` and `both` are accepted for forward compatibility. |
 | `header` | string | `dlp-detection` | Header name when `action: tag`. |
+| `scan_body` | bool | `true` | Include the buffered request body in the scan, in addition to the URI and headers. |
+| `body_max_bytes` | int | `16384` | Maximum bytes of the request body scanned when `scan_body` is true. |
 | `rules` | list | `[]` | Custom regex rules layered on top of the catalog. Same shape as the `pii.rules` block on `ai_proxy` origins. |
 
-The scan covers the request URI (path + query) and request headers; auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. Body scanning is on the roadmap; the existing `pii:` block on `ai_proxy` origins handles request-body redaction with the same regex catalog today.
+The scan covers the request URI (path + query), request headers, and, unless `scan_body: false`, the buffered request body. Auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. The body is capped at `body_max_bytes` and decoded lossily, so a non-text payload with a regulated shape near the head is still caught.
 
-Every hit also carries bounded detection spans: an entity type plus a byte offset and length into the scanned URI or header text for each match, never the matched value itself, capped at 32 spans across the whole scan. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
+Every hit also carries bounded detection spans: an entity type plus a byte offset and length for each match, never the matched value itself. Offsets are relative to the segment that produced the span: the URI text (path + query), the individual header value that matched, or the capped, lossily decoded body text. A span does not name its segment, so treat offsets as evidence within one of those three coordinate spaces rather than positions in the raw request. The merged list is capped at 32 spans across the whole scan, filled round-robin across the URI, header, and body matches so no one segment can crowd the others out of the cap; everything past the cap is counted, not carried. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
 
 ### prompt_injection_v2
 

@@ -377,6 +377,13 @@ fn validate_config(root: &Path, index: usize, config: &str) -> Result<()> {
     Ok(())
 }
 
+/// Convergence budget for every status wait in this file. Sized for a
+/// loaded CI runner, not a quiet laptop: the 2026-08-18 release
+/// certification run lost a 60s deadline to runner load on a tree that
+/// had passed hours earlier. The poll returns as soon as the predicate
+/// holds, so a healthy cluster never spends the full budget.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+
 fn wait_for_statuses<F>(
     client: &reqwest::blocking::Client,
     admin_ports: &[u16],
@@ -403,9 +410,11 @@ where
             Err(_) => {}
         }
         // The production admin listener permits 60 requests per minute per
-        // client IP. One request per second keeps the fixture below that guard
-        // even when both the convergence and failure windows run to timeout.
-        std::thread::sleep(Duration::from_secs(1));
+        // client IP. One request per second sits exactly at that guard, so
+        // clock jitter on a loaded runner can trip it and turn every later
+        // poll into a refusal the predicate never sees. 1.5s keeps the
+        // fixture at 40 requests per minute per listener with margin.
+        std::thread::sleep(Duration::from_millis(1500));
     }
     panic!("cluster status did not converge within {timeout:?}; last observation:\n{last}");
 }
@@ -727,12 +736,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         .context("build admin client")?;
     let all_admin_ports = nodes.iter().map(|node| node.admin_port).collect::<Vec<_>>();
     let initial_convergence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wait_for_statuses(
-            &client,
-            &all_admin_ports,
-            Duration::from_secs(60),
-            converged,
-        )
+        wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged)
     }));
     let mut statuses = match initial_convergence {
         Ok(statuses) => statuses,
@@ -765,12 +769,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     drop(gateway);
     let restarted_gateway = start_node(&configs[1]).context("restart gateway controller")?;
     processes.insert("gateway-a", restarted_gateway);
-    statuses = wait_for_statuses(
-        &client,
-        &all_admin_ports,
-        Duration::from_secs(60),
-        converged,
-    );
+    statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
     let restarted_gateway_status = statuses
         .iter()
         .find(|status| status["local_node_id"] == "gateway-a")
@@ -811,12 +810,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         Duration::from_secs(15),
         |status| rolling_handoff_is_waiting(status, rolling_generation, "worker-a", "worker-b"),
     );
-    statuses = wait_for_statuses(
-        &client,
-        &all_admin_ports,
-        Duration::from_secs(60),
-        converged,
-    );
+    statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
     assert_eq!(deployment_generation(&statuses[0]), rolling_generation);
     assert_eq!(
         assignment_nodes(&statuses[0]),
@@ -852,12 +846,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
             recreate_is_draining_before_start(status, recreate_generation, "worker-b", "worker-a")
         },
     );
-    statuses = wait_for_statuses(
-        &client,
-        &all_admin_ports,
-        Duration::from_secs(60),
-        converged,
-    );
+    statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
     assert_eq!(deployment_generation(&statuses[0]), recreate_generation);
     assert_eq!(
         assignment_nodes(&statuses[0]),
@@ -884,12 +873,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         })
         .collect::<Vec<_>>();
     reload_cluster_configs(&client, &nodes, &processes, &steady_configs)?;
-    statuses = wait_for_statuses(
-        &client,
-        &all_admin_ports,
-        Duration::from_secs(60),
-        converged,
-    );
+    statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
 
     let initial_assignments = assignment_nodes(&statuses[0]);
     assert_eq!(initial_assignments.len(), 1);
@@ -1009,12 +993,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         .context("restart worker with matching deployment policy")?;
     processes.insert(nodes[failed_index].node_id, recovered);
     let recovery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wait_for_statuses(
-            &client,
-            &all_admin_ports,
-            Duration::from_secs(60),
-            converged,
-        )
+        wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged)
     }));
     if let Err(panic) = recovery {
         for (node_id, process) in &processes {

@@ -5815,7 +5815,7 @@
           "minimum": 0.0
         },
         "keep_rejected": {
-          "description": "Number of rejected entries the ring retains for operator inspection. Defaults to 10.",
+          "description": "Accepted, not yet wired. Nothing writes the ring's `rejected/` directory in this release, so this field has no observable effect today; a config that fails to apply is not recorded anywhere. Parsed and stored for forward compatibility: once the writer ships, it bounds how many rejected candidates the ring retains for operator inspection. Defaults to 10.",
           "default": 10,
           "type": "integer",
           "format": "uint",

@@ -2818,6 +2818,14 @@ enum InputGuardrailDecision {
         reason: String,
         /// HTTP status the caller must answer with.
         status: u16,
+        /// Index of the blocking guardrail in the pipeline's `input`
+        /// list, when a single serial instance produced the verdict.
+        /// `None` for external-guardrail and mesh-fused blocks, whose
+        /// verdict is not one pipeline instance's. The recording
+        /// wrapper attributes detection spans by this index so a
+        /// record never carries a different `pii` instance's spans
+        /// than the one that blocked.
+        pipeline_index: Option<usize>,
     },
 }
 
@@ -2828,6 +2836,7 @@ fn blocked_input_decision(
     name: String,
     reason: String,
     status: u16,
+    pipeline_index: Option<usize>,
 ) -> InputGuardrailDecision {
     if stage.is_rag_augmented() {
         warn!(
@@ -2840,6 +2849,7 @@ fn blocked_input_decision(
         name,
         reason,
         status,
+        pipeline_index,
     }
 }
 
@@ -2883,16 +2893,22 @@ async fn evaluate_ai_input_guardrails(
     // the record and nothing would say so. The evaluator itself stays
     // free of observability so its many internal return paths cannot
     // each decide what to emit.
-    let (outcome, guardrail, flagged) = match &decision {
+    let (outcome, guardrail, flagged, blocking_index) = match &decision {
         InputGuardrailDecision::Allow { flagged_count, .. } => (
             sbproxy_observe::decision::DecisionOutcome::Allow,
             None,
             *flagged_count,
+            None,
         ),
-        InputGuardrailDecision::Block { name, .. } => (
+        InputGuardrailDecision::Block {
+            name,
+            pipeline_index,
+            ..
+        } => (
             sbproxy_observe::decision::DecisionOutcome::Deny,
             Some(name.as_str()),
             0,
+            *pipeline_index,
         ),
     };
     // WOR-2492 item 6: bounded detection spans for a `pii` block, over
@@ -2903,10 +2919,16 @@ async fn evaluate_ai_input_guardrails(
     // `pipeline.check_input` runs internally (see its doc comment);
     // `extract_input_text` is what a non-chat surface's
     // `check_input_text` path scans instead, when there are no
-    // `messages` to derive text from. Re-derived here rather than
-    // threaded out of `_inner` so the many internal return paths there
-    // stay free of this concern too, matching why this whole function
-    // records instead of the call sites.
+    // `messages` to derive text from. The text is re-derived here
+    // rather than threaded out of `_inner` so the many internal return
+    // paths there stay free of this concern too, matching why this
+    // whole function records instead of the call sites. The blocking
+    // guardrail's pipeline index, by contrast, IS threaded out of
+    // `_inner` on the `Block` variant: two `pii` entries with
+    // different pattern sets are a legal config, and only the serial
+    // check knows which instance blocked, so recomputing spans from
+    // "the first `Pii` in the pipeline" could attach one instance's
+    // matches to another instance's verdict.
     //
     // Gated on `guardrail == Some("pii")` before doing any of that
     // extraction work: every other guardrail name (jailbreak, toxicity,
@@ -2931,10 +2953,8 @@ async fn evaluate_ai_input_guardrails(
             sbproxy_ai::guardrails::message_text(&messages)
         };
         pii_guardrail_spans(
-            guardrail_pipeline
-                .map(|p| p.input.iter())
-                .into_iter()
-                .flatten(),
+            guardrail_pipeline.map_or(&[][..], |p| p.input.as_slice()),
+            blocking_index,
             guardrail,
             &content,
         )
@@ -2956,25 +2976,45 @@ async fn evaluate_ai_input_guardrails(
 
 /// Bounded detection spans for a `pii` guardrail block (WOR-2492 item
 /// 6). Only the `pii` guardrail carries positional detail, so every
-/// other guardrail name returns empty, and so does a `pii` name whose
-/// guardrail is not actually present in `guardrails` -- a mesh-fused or
-/// external-guardrail block can share the `pii` name without this
-/// crate's `PiiGuardrail` having produced it, and this degrades to no
-/// spans rather than guessing at a position nothing here computed.
-fn pii_guardrail_spans<'a>(
-    guardrails: impl Iterator<Item = &'a sbproxy_ai::guardrails::Guardrail>,
+/// other guardrail name returns empty.
+///
+/// Spans are attributed to the guardrail instance whose verdict is
+/// being recorded, never to "the first `Pii` in the pipeline": two
+/// `pii` entries with disjoint pattern sets are a legal config and
+/// both block under the name `"pii"`, so recomputing from the first
+/// one can name an entity the blocking instance never looks for.
+/// `blocking_index` is the serial check's index for the instance that
+/// blocked; when it is absent (a mesh-fused or external-guardrail
+/// block sharing the `pii` name), the spans come from the single
+/// `Guardrail::Pii` in `guardrails` if there is exactly one, because
+/// only then is the attribution unambiguous. Zero or several `Pii`
+/// instances with no index degrade to no spans rather than guessing
+/// at a position nothing here computed.
+fn pii_guardrail_spans(
+    guardrails: &[sbproxy_ai::guardrails::Guardrail],
+    blocking_index: Option<usize>,
     guardrail_name: Option<&str>,
     content: &str,
 ) -> (Vec<sbproxy_security::span::DetectionSpan>, usize) {
     if guardrail_name != Some("pii") {
         return (Vec::new(), 0);
     }
-    for g in guardrails {
-        if let sbproxy_ai::guardrails::Guardrail::Pii(pii) = g {
+    if let Some(index) = blocking_index {
+        if let Some(sbproxy_ai::guardrails::Guardrail::Pii(pii)) = guardrails.get(index) {
             return pii.detect_spans(content);
         }
+        // An index that does not resolve to a `Pii` cannot happen via
+        // the serial paths that set it; degrade rather than guess.
+        return (Vec::new(), 0);
     }
-    (Vec::new(), 0)
+    let mut pii_instances = guardrails.iter().filter_map(|g| match g {
+        sbproxy_ai::guardrails::Guardrail::Pii(pii) => Some(pii),
+        _ => None,
+    });
+    match (pii_instances.next(), pii_instances.next()) {
+        (Some(pii), None) => pii.detect_spans(content),
+        _ => (Vec::new(), 0),
+    }
 }
 
 #[cfg(test)]
@@ -2993,7 +3033,7 @@ mod pii_guardrail_spans_tests {
     fn non_pii_guardrail_name_returns_no_spans() {
         let guardrails = [pii_pipeline_guardrail()];
         let (spans, dropped) =
-            pii_guardrail_spans(guardrails.iter(), Some("jailbreak"), "user@example.com");
+            pii_guardrail_spans(&guardrails, Some(0), Some("jailbreak"), "user@example.com");
         assert!(spans.is_empty());
         assert_eq!(dropped, 0);
     }
@@ -3005,7 +3045,7 @@ mod pii_guardrail_spans_tests {
         // share the `pii` name.
         let guardrails: Vec<Guardrail> = Vec::new();
         let (spans, dropped) =
-            pii_guardrail_spans(guardrails.iter(), Some("pii"), "user@example.com");
+            pii_guardrail_spans(&guardrails, None, Some("pii"), "user@example.com");
         assert!(spans.is_empty());
         assert_eq!(dropped, 0);
     }
@@ -3014,12 +3054,95 @@ mod pii_guardrail_spans_tests {
     fn pii_guardrail_name_finds_the_configured_guardrail_and_returns_its_spans() {
         let guardrails = [pii_pipeline_guardrail()];
         let content = "contact user@example.com please";
-        let (spans, dropped) = pii_guardrail_spans(guardrails.iter(), Some("pii"), content);
+        let (spans, dropped) = pii_guardrail_spans(&guardrails, Some(0), Some("pii"), content);
         assert_eq!(dropped, 0);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].entity_type, "email");
         let matched = &content[spans[0].offset..spans[0].offset + spans[0].len];
         assert_eq!(matched, "user@example.com");
+    }
+
+    /// Red-first (v1.13 phase-2 review): two `pii` guardrails with
+    /// disjoint pattern sets, and the SECOND one produced the block.
+    /// The record's spans must reflect the blocking instance's
+    /// patterns, not whichever `Guardrail::Pii` happens to sit first
+    /// in the pipeline. Went red against the pre-fix recomputation,
+    /// which returned the ssn span for an email block.
+    #[test]
+    fn spans_come_from_the_blocking_pii_instance_not_the_first() {
+        let guardrails = [
+            Guardrail::Pii(PiiGuardrail {
+                patterns: vec!["ssn".to_string()],
+                action: PiiAction::Log,
+            }),
+            Guardrail::Pii(PiiGuardrail {
+                patterns: vec!["email".to_string()],
+                action: PiiAction::Block,
+            }),
+        ];
+        let content = "my ssn is 123-45-6789, reach me at a@b.co";
+        let (spans, dropped) = pii_guardrail_spans(&guardrails, Some(1), Some("pii"), content);
+        assert_eq!(dropped, 0);
+        assert!(
+            !spans.is_empty(),
+            "the blocking instance matched, so the record must carry its spans"
+        );
+        assert!(
+            spans.iter().all(|s| s.entity_type == "email"),
+            "spans must come from the blocking instance's patterns (email), \
+             not the first instance's (ssn); got {spans:?}"
+        );
+    }
+
+    /// An unindexed block (mesh-fused or external, sharing the `pii`
+    /// name) still gets spans when the pipeline holds exactly one
+    /// `Pii` instance: the attribution is unambiguous.
+    #[test]
+    fn unindexed_pii_block_with_a_single_instance_still_attributes() {
+        let guardrails = [pii_pipeline_guardrail()];
+        let content = "contact user@example.com please";
+        let (spans, dropped) = pii_guardrail_spans(&guardrails, None, Some("pii"), content);
+        assert_eq!(dropped, 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "email");
+    }
+
+    /// An unindexed block with SEVERAL `Pii` instances degrades to no
+    /// spans: nothing here can say which instance's patterns the
+    /// verdict reflects, and guessing would attach the wrong evidence
+    /// to a deny record.
+    #[test]
+    fn unindexed_pii_block_with_two_instances_degrades_to_no_spans() {
+        let guardrails = [
+            Guardrail::Pii(PiiGuardrail {
+                patterns: vec!["ssn".to_string()],
+                action: PiiAction::Block,
+            }),
+            Guardrail::Pii(PiiGuardrail {
+                patterns: vec!["email".to_string()],
+                action: PiiAction::Block,
+            }),
+        ];
+        let (spans, dropped) = pii_guardrail_spans(
+            &guardrails,
+            None,
+            Some("pii"),
+            "my ssn is 123-45-6789, reach me at a@b.co",
+        );
+        assert!(spans.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    /// A stale or foreign index that does not resolve to a `Pii`
+    /// degrades to no spans rather than falling back to scanning with
+    /// some other instance.
+    #[test]
+    fn an_index_that_is_not_a_pii_instance_degrades_to_no_spans() {
+        let guardrails = [pii_pipeline_guardrail()];
+        let (spans, dropped) =
+            pii_guardrail_spans(&guardrails, Some(7), Some("pii"), "user@example.com");
+        assert!(spans.is_empty());
+        assert_eq!(dropped, 0);
     }
 }
 
@@ -3157,7 +3280,7 @@ async fn evaluate_ai_input_guardrails_inner(
                     reason = %reason,
                     "AI proxy: guardrail blocked content"
                 );
-                return blocked_input_decision(stage, name, reason, 400);
+                return blocked_input_decision(stage, name, reason, 400, None);
             }
         }
         if let Some(pipeline) = guardrail_pipeline {
@@ -3200,11 +3323,16 @@ async fn evaluate_ai_input_guardrails_inner(
                             "AI proxy: guardrail mesh blocked request"
                         );
                         let reason = decision.reasons.join("; ");
+                        // A mesh-fused verdict is not one pipeline
+                        // instance's, so no index: the span site then
+                        // attributes only when a single `pii` instance
+                        // makes the attribution unambiguous.
                         return blocked_input_decision(
                             stage,
                             decision.security_labels.join(","),
                             reason,
                             400,
+                            None,
                         );
                     }
                     if decision.redact {
@@ -3213,13 +3341,19 @@ async fn evaluate_ai_input_guardrails_inner(
                         }
                     }
                 } else {
-                    if let Some(block) = pipeline.check_input(&messages) {
+                    if let Some((index, block)) = pipeline.check_input_indexed(&messages) {
                         warn!(
                             guardrail = %block.name,
                             reason = %block.reason,
                             "AI proxy: input guardrail blocked request"
                         );
-                        return blocked_input_decision(stage, block.name, block.reason, 400);
+                        return blocked_input_decision(
+                            stage,
+                            block.name,
+                            block.reason,
+                            400,
+                            Some(index),
+                        );
                     }
                     labels = pipeline
                         .classify_input(&messages)
@@ -3244,7 +3378,10 @@ async fn evaluate_ai_input_guardrails_inner(
                         reason = %block.reason,
                         "AI proxy: body-aware input guardrail blocked request"
                     );
-                    return blocked_input_decision(stage, block.name, block.reason, 400);
+                    // Only `agent_alignment` opts into the body-aware
+                    // path and it carries no positional detail, so no
+                    // index is threaded here.
+                    return blocked_input_decision(stage, block.name, block.reason, 400, None);
                 }
 
                 // Per-surface input guardrails: image generation,
@@ -3254,14 +3391,20 @@ async fn evaluate_ai_input_guardrails_inner(
                 // that text via check_input_text. Chat-shape surfaces
                 // are already covered by the messages check above.
                 if let Some(text) = sbproxy_ai::handler::extract_input_text(surface, body) {
-                    if let Some(block) = pipeline.check_input_text(&text) {
+                    if let Some((index, block)) = pipeline.check_input_text_indexed(&text) {
                         warn!(
                             ai.surface = surface.label(),
                             guardrail = %block.name,
                             reason = %block.reason,
                             "AI proxy: per-surface input guardrail blocked request"
                         );
-                        return blocked_input_decision(stage, block.name, block.reason, 400);
+                        return blocked_input_decision(
+                            stage,
+                            block.name,
+                            block.reason,
+                            400,
+                            Some(index),
+                        );
                     }
                 }
             }
@@ -4678,6 +4821,7 @@ pub(super) async fn handle_ai_proxy(
                     name,
                     reason,
                     status,
+                    ..
                 } => {
                     sbproxy_ai::tracing_spans::record_error(
                         &ai_span,
@@ -6025,6 +6169,7 @@ pub(super) async fn handle_ai_proxy(
             name,
             reason,
             status,
+            ..
         } => {
             sbproxy_ai::tracing_spans::record_error(
                 &ai_span,
@@ -6216,6 +6361,7 @@ pub(super) async fn handle_ai_proxy(
                                 name,
                                 reason,
                                 status,
+                                ..
                             } => {
                                 sbproxy_ai::tracing_spans::record_error(
                                     &ai_span,
@@ -9773,14 +9919,19 @@ async fn ai_output_guardrail_block(
     // function returns before inspecting anything, so recording here
     // would manufacture an allow for a response no guardrail read.
     if !(200..300).contains(&status) {
-        return block;
+        return block.map(|(_, block)| block);
     }
-    let (outcome, name) = match &block {
-        Some(block) => (
+    let (outcome, name, blocking_index) = match &block {
+        Some((index, block)) => (
             sbproxy_observe::decision::DecisionOutcome::Deny,
             Some(block.name.as_str()),
+            *index,
         ),
-        None => (sbproxy_observe::decision::DecisionOutcome::Allow, None),
+        None => (
+            sbproxy_observe::decision::DecisionOutcome::Allow,
+            None,
+            None,
+        ),
     };
     // WOR-2492 item 6: as the input funnel, bounded detection spans for
     // a `pii` block over the same output text the guardrail evaluated
@@ -9795,7 +9946,8 @@ async fn ai_output_guardrail_block(
         if outcome == sbproxy_observe::decision::DecisionOutcome::Deny && name == Some("pii") {
             match std::str::from_utf8(body) {
                 Ok(content) => pii_guardrail_spans(
-                    builtin.map(|p| p.output.iter()).into_iter().flatten(),
+                    builtin.map_or(&[][..], |p| p.output.as_slice()),
+                    blocking_index,
                     name,
                     content,
                 ),
@@ -9814,23 +9966,32 @@ async fn ai_output_guardrail_block(
         &spans,
         spans_dropped,
     );
-    block
+    block.map(|(_, block)| block)
 }
 
+/// The output-guardrail evaluation behind [`ai_output_guardrail_block`].
+/// A builtin block carries `Some(index)` naming the blocking guardrail
+/// in the pipeline's `output` list, so the recording wrapper can
+/// attribute detection spans to the exact instance whose verdict it
+/// records; an external-provider block carries `None`.
 async fn ai_output_guardrail_block_inner(
     status: u16,
     builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
     external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
     body: &[u8],
     model: &str,
-) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+) -> Option<(Option<usize>, sbproxy_ai::guardrails::GuardrailBlock)> {
     if !(200..300).contains(&status) {
         return None;
     }
-    if let Some(block) = builtin.and_then(|pipeline| pipeline.check_output_bytes(body)) {
-        return Some(block);
+    if let Some((index, block)) =
+        builtin.and_then(|pipeline| pipeline.check_output_bytes_indexed(body))
+    {
+        return Some((Some(index), block));
     }
-    external_output_guardrail_block(external, body, model).await
+    external_output_guardrail_block(external, body, model)
+        .await
+        .map(|block| (None, block))
 }
 
 fn external_guardrail_text_media_type(content_type: &str) -> bool {
