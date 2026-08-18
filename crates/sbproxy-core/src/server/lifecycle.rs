@@ -7047,6 +7047,12 @@ egress:
             "the refusal must name the signal and endpoint so an operator can act on it: \
              {message}"
         );
+        assert!(
+            message.contains("UnlistedHost"),
+            "this must be denied because the new config dropped the host, not for an \
+             unrelated reason such as the explicit `ports: [4317]` this fixture also sets: \
+             {message}"
+        );
     }
 
     #[test]

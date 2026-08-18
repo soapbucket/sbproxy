@@ -2900,6 +2900,23 @@ mod tests {
         hosts: &[&str],
         allow_private: bool,
     ) -> sbproxy_security::egress::EgressAuthorizer {
+        enforce_telemetry_with_ports(hosts, allow_private, &[443, 80])
+    }
+
+    /// Sibling of [`enforce_telemetry`] for a fixture whose endpoint is
+    /// not on the default `[443, 80]` ports: an OTLP collector's real
+    /// default ports (4317 gRPC, 4318 HTTP) never are. Mirrors how
+    /// `otlp_logs.rs`'s own denial-test fixture sets
+    /// `ports: HashSet::from([4317])` inline rather than hardcoding
+    /// `[443, 80]` for every purpose (WOR-2481 review: two tests here
+    /// used to build a `:4317` endpoint against `enforce_telemetry`'s
+    /// fixed `[443, 80]` allowlist and got denied by `DisallowedPort`
+    /// while believing they were testing something else entirely).
+    fn enforce_telemetry_with_ports(
+        hosts: &[&str],
+        allow_private: bool,
+        ports: &[u16],
+    ) -> sbproxy_security::egress::EgressAuthorizer {
         use sbproxy_security::egress::{
             EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist,
         };
@@ -2907,7 +2924,7 @@ mod tests {
         let allow = PurposeAllowlist {
             hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             schemes: HashSet::from(["https".to_string(), "http".to_string()]),
-            ports: HashSet::from([443, 80]),
+            ports: ports.iter().copied().collect(),
             allow_private,
         };
         EgressAuthorizer::new(EgressConfig {
@@ -3066,7 +3083,7 @@ mod tests {
         let endpoint = "https://127.0.0.1:4317";
         install_configured_gate(
             EgressPurpose::Telemetry,
-            Some(enforce_telemetry(&["127.0.0.1"], true)),
+            Some(enforce_telemetry_with_ports(&["127.0.0.1"], true, &[4317])),
         );
 
         authorize_telemetry_endpoint_or_refuse_boot(endpoint, signal);
@@ -3096,10 +3113,16 @@ mod tests {
     #[test]
     fn reverify_active_boot_telemetry_endpoints_proceeds_when_the_new_generation_still_allows() {
         let signal = "wor2481-reverify-still-allowed";
-        let endpoint = "https://otel-collector.example.com:4317";
+        // 127.0.0.1 resolves with no network I/O (an IP literal needs no
+        // DNS lookup): this outcome is `Proceed`, which -- unlike a
+        // denial -- has to actually clear DNS resolution, so a
+        // non-resolving fixture host would make this test flaky (or
+        // outright fail with `DnsResolutionFailed`) rather than prove
+        // what it claims to.
+        let endpoint = "https://127.0.0.1:4317";
         record_active_boot_telemetry_endpoint(signal, endpoint);
 
-        let authorizer = enforce_telemetry(&["otel-collector.example.com"], false);
+        let authorizer = enforce_telemetry_with_ports(&["127.0.0.1"], true, &[4317]);
         reverify_active_boot_telemetry_endpoints(Some(&authorizer))
             .expect("an endpoint the new generation still allows must not refuse the reload");
     }
@@ -3112,7 +3135,11 @@ mod tests {
 
         // The new generation's `egress.telemetry:` allowlist no longer
         // names this host: a config change that revokes an endpoint the
-        // running, never-rebuilt exporter is still dialing.
+        // running, never-rebuilt exporter is still dialing. Port stays
+        // the fixture default ([443, 80]): the host check runs before
+        // the port check in `EgressAuthorizer::authorize_inner`, so this
+        // denies on the host mismatch regardless, but the reason
+        // assertion below pins that down rather than trusting it.
         let authorizer = enforce_telemetry(&["a-different-collector.example.com"], false);
         let error = reverify_active_boot_telemetry_endpoints(Some(&authorizer))
             .expect_err("an endpoint the new generation denies must refuse the reload");
@@ -3121,6 +3148,12 @@ mod tests {
             message.contains(signal) && message.contains(endpoint),
             "the refusal must name the signal and endpoint so an operator can act on it: \
              {message}"
+        );
+        assert!(
+            message.contains("UnlistedHost"),
+            "this must be denied because the new generation dropped the host, not for an \
+             unrelated reason (e.g. a port/scheme mismatch this fixture did not intend to \
+             test): {message}"
         );
     }
 }
