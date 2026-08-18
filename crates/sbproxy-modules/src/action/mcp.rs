@@ -964,6 +964,14 @@ pub struct McpFederatedServerConfig {
     /// config error; pick one credential source.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Locally defined tools for a `type: local` server (WOR-2489).
+    /// Each entry declares one tool the gateway serves itself, with no
+    /// upstream MCP or REST dial: a static value, a single HTTP call,
+    /// or a DAG of HTTP steps. See [`McpLocalToolConfig`]. Rejected on
+    /// non-`local` servers, mirroring how `spec`/`spec_path`/`headers`
+    /// are rejected on non-`openapi` servers.
+    #[serde(default)]
+    pub tools: Vec<McpLocalToolConfig>,
     /// Protocol negotiation pin for this upstream (WOR-2384). `"auto"`
     /// (default) negotiates: the gateway remembers, per tenant, the best
     /// era this upstream has demonstrated and refuses (or, under
@@ -1023,6 +1031,151 @@ pub struct McpFederatedServerConfig {
 
 fn default_federated_protocol() -> String {
     "auto".to_string()
+}
+
+// --- `type: local` tool config (WOR-2489) ---
+//
+// A `type: local` federated server serves its own tools: no MCP or
+// REST dial to an upstream, just config-declared handlers. Three
+// handler shapes exist, and a tool sets exactly one:
+//
+//   * `static`: always returns the same JSON value.
+//   * `http`: makes one HTTP call and returns its response.
+//   * `steps`: runs a DAG of HTTP calls (dependency-ordered, with a
+//     per-step CEL `condition` gate and `retry`), then shapes one
+//     response from the step outputs.
+//
+// This section is config structs and compile-time validation only.
+// The compiled representation lands on `McpAction::local_servers`,
+// ready for a later task's catalog registration; nothing here
+// dispatches a request.
+
+/// One locally served tool on a `type: local` federated server
+/// (WOR-2489). `handler` is exactly one of `static`, `http`, or
+/// `steps`; declaring zero or more than one is a config-compile
+/// error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalToolConfig {
+    /// Tool name, as advertised in `tools/list`. Must not be empty.
+    pub name: String,
+    /// Human-readable description shown to the calling model.
+    pub description: String,
+    /// JSON Schema for the tool's arguments. Must be a JSON object (an
+    /// object with `type: object` and friends, not a bare
+    /// array/string/scalar); refused otherwise at compile time.
+    pub input_schema: serde_json::Value,
+    /// Always returns this value, unconditionally. No HTTP call is
+    /// made, so this handler needs no `egress:` on the server.
+    #[serde(default, rename = "static")]
+    pub r#static: Option<serde_json::Value>,
+    /// Makes one HTTP call and returns its response.
+    #[serde(default)]
+    pub http: Option<McpLocalHttpCallConfig>,
+    /// Runs a dependency-ordered DAG of HTTP calls and shapes one
+    /// response from their outputs. See [`McpLocalStepsConfig`].
+    #[serde(default)]
+    pub steps: Option<McpLocalStepsConfig>,
+}
+
+/// One HTTP call: the shared shape for a tool's `http` handler and a
+/// step's `http` field (WOR-2489).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalHttpCallConfig {
+    /// HTTP method (`GET`, `POST`, ...).
+    pub method: String,
+    /// Request URL.
+    pub url: String,
+    /// Static request headers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Request body, sent as JSON.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    /// Retry policy for this call. Reuses [`super::RetryConfig`], the
+    /// same shape a `proxy`/`load_balancer` action's `retry:` uses.
+    #[serde(default)]
+    pub retry: Option<super::RetryConfig>,
+    /// Request timeout. Accepts Go duration syntax (`10s`, `500ms`).
+    #[serde(default, with = "duration_str")]
+    pub timeout: Option<Duration>,
+}
+
+/// A DAG of HTTP steps and how to shape their outputs into one tool
+/// result (WOR-2489).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalStepsConfig {
+    /// The steps, in any declaration order; execution order is
+    /// derived from `depends_on`. Must not be empty.
+    pub steps: Vec<McpLocalStepConfig>,
+    /// How to shape the final tool result from step outputs. Exactly
+    /// one of `template`, `js`, or `lua` when present; omitted means
+    /// no shaping is configured (a later task defines the default).
+    #[serde(default)]
+    pub response: Option<McpLocalResponseConfig>,
+    /// Named on purpose rather than left to fall through
+    /// `deny_unknown_fields`'s generic "unknown field" refusal: an
+    /// operator reaching for concurrent step execution gets a
+    /// specific answer instead of a typo-shaped error. Steps always
+    /// run in dependency order today; a parallel scheduler is a
+    /// tracked follow-up, not yet implemented. Setting this field to
+    /// any value is a config-compile error. See `compile_local_steps`.
+    #[serde(default)]
+    pub parallel: Option<serde_json::Value>,
+}
+
+/// One step in a `steps` handler's DAG (WOR-2489).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalStepConfig {
+    /// Step name. Must be unique within the tool and not empty;
+    /// referenced by other steps' `depends_on`.
+    pub name: String,
+    /// The HTTP call this step makes. Same shape as a tool's `http`
+    /// handler.
+    pub http: McpLocalHttpCallConfig,
+    /// Names of steps that must complete before this one runs. Every
+    /// name must match another step in the same `steps[]` list, and
+    /// the graph they form must not contain a cycle.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// CEL expression gating whether this step runs. Compiled with the
+    /// same [`sbproxy_extension::cel::CelSurface::McpArgumentPolicy`]
+    /// vocabulary `argument_policies[]` uses (tool name, server,
+    /// session, tenant, principal, and the parsed call arguments), so
+    /// a malformed expression is a config-compile error.
+    #[serde(default)]
+    pub condition: Option<String>,
+    /// When true, a failed call from this step does not fail the
+    /// whole tool call; dependent steps still run. Defaults to false.
+    #[serde(default)]
+    pub continue_on_error: bool,
+    /// Retry policy for this step's HTTP call. Reuses
+    /// [`super::RetryConfig`].
+    #[serde(default)]
+    pub retry: Option<super::RetryConfig>,
+}
+
+/// How a `steps` handler shapes its final response (WOR-2489). Exactly
+/// one field is set; declaring zero or more than one is a
+/// config-compile error. No `cel:` variant: CEL only returns a scalar,
+/// and a response shape needs a document -- the same reasoning
+/// `sbproxy-config`'s cache-decision script config (`key_event` /
+/// `admit_event`) already applies by refusing a `cel` engine there.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpLocalResponseConfig {
+    /// A template string interpolated against step outputs.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// A JavaScript expression (QuickJS) producing the response.
+    #[serde(default)]
+    pub js: Option<String>,
+    /// A Lua expression (Luau) producing the response.
+    #[serde(default)]
+    pub lua: Option<String>,
 }
 
 /// Wire form of `federated_servers[].downgrade` (WOR-2384). See
@@ -1660,6 +1813,13 @@ pub struct McpAction {
     /// under `gen_ai.tool.call.arguments`. Off by default. See
     /// [`McpAuditConfig::capture_arguments`].
     pub mcp_audit_capture_arguments: bool,
+    /// Compiled `type: local` federated servers' tool catalogs
+    /// (WOR-2489), one entry per local server, empty when none are
+    /// configured. Validated and compiled at config-compile time by
+    /// [`compile_local_server`]; nothing in this crate dispatches a
+    /// call against these yet -- wiring them into the tool catalog is
+    /// a later task's job.
+    pub(crate) local_servers: Vec<CompiledLocalMcpServer>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -2389,6 +2549,360 @@ fn compile_mcp_result_policy(
     })
 }
 
+// --- `type: local` compiled tools (WOR-2489) ---
+
+/// Compiled `tools[]` catalog for one `type: local` federated server.
+/// Built once at config-compile time by [`compile_local_server`] and
+/// stored on `McpAction::local_servers`. Nothing in this crate reads
+/// it yet; wiring it into the tool catalog is a later task.
+#[derive(Debug)]
+pub(crate) struct CompiledLocalMcpServer {
+    /// Server name, matching the `name` key used elsewhere for this
+    /// upstream (`McpServerPrefix::name`).
+    pub(crate) name: String,
+    /// Compiled tools, in declaration order.
+    pub(crate) tools: Vec<CompiledLocalMcpTool>,
+    /// Egress policy gating every HTTP call this server's tools make.
+    /// `None` only when every tool is `static` (no call is ever made,
+    /// so there is nothing to gate); see [`compile_local_server`].
+    pub(crate) egress: Option<EgressPolicy>,
+}
+
+/// One compiled local tool.
+#[derive(Debug)]
+pub(crate) struct CompiledLocalMcpTool {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: serde_json::Value,
+    pub(crate) handler: CompiledLocalToolHandler,
+}
+
+/// A compiled tool's exactly-one handler. See [`McpLocalToolConfig`]'s
+/// `static`/`http`/`steps` field docs for the wire shape.
+#[derive(Debug)]
+pub(crate) enum CompiledLocalToolHandler {
+    /// Always returns this value.
+    Static(serde_json::Value),
+    /// Makes one HTTP call.
+    Http(CompiledLocalHttpCall),
+    /// Runs a step DAG.
+    Steps(CompiledLocalSteps),
+}
+
+/// One compiled HTTP call (a tool's `http` handler, or a step's
+/// `http`).
+#[derive(Debug)]
+pub(crate) struct CompiledLocalHttpCall {
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body: Option<serde_json::Value>,
+    pub(crate) retry: Option<super::RetryConfig>,
+    pub(crate) timeout: Option<Duration>,
+}
+
+/// A compiled step DAG plus its response shaping.
+#[derive(Debug)]
+pub(crate) struct CompiledLocalSteps {
+    /// Steps in declaration order (not execution order; a future
+    /// task's executor derives that from `depends_on`).
+    pub(crate) steps: Vec<CompiledLocalStep>,
+    pub(crate) response: Option<CompiledLocalResponseShaping>,
+}
+
+/// One compiled DAG step.
+#[derive(Debug)]
+pub(crate) struct CompiledLocalStep {
+    pub(crate) name: String,
+    pub(crate) http: CompiledLocalHttpCall,
+    pub(crate) depends_on: Vec<String>,
+    /// Compiled once here so a malformed step condition is a
+    /// config-load error, exactly like every other CEL surface in
+    /// this codebase.
+    pub(crate) condition: Option<CompiledCel>,
+    pub(crate) continue_on_error: bool,
+    pub(crate) retry: Option<super::RetryConfig>,
+}
+
+/// A compiled `steps` handler's response shaping. See
+/// [`McpLocalResponseConfig`].
+#[derive(Debug)]
+pub(crate) enum CompiledLocalResponseShaping {
+    Template(String),
+    Js(String),
+    Lua(String),
+}
+
+/// Compile one `type: local` federated server's `tools[]` (WOR-2489).
+/// `name` is the server's already-resolved name (prefix or derived
+/// from `origin`), matching what the caller uses for `McpServerPrefix`
+/// on every other server kind.
+fn compile_local_server(
+    name: &str,
+    upstream: &McpFederatedServerConfig,
+) -> anyhow::Result<CompiledLocalMcpServer> {
+    if upstream.tools.is_empty() {
+        anyhow::bail!("mcp action: local server '{name}' (type: local) declares no tools");
+    }
+
+    // Per-server egress is required the moment any tool can make an
+    // HTTP call -- a `steps` handler's steps always carry `http`, so a
+    // `steps` tool counts exactly like an `http` tool does. Only a
+    // server whose every tool is `static` needs none. This mirrors the
+    // `openapi` backing's posture (egress gates every REST call an
+    // `openapi` server's tools make) without inheriting its
+    // allow-all-by-default fallback: a local server has no legacy
+    // config to stay compatible with, so the safer default is to ask
+    // for the policy explicitly rather than fall back to the
+    // action-level default silently.
+    let needs_egress = upstream
+        .tools
+        .iter()
+        .any(|t| t.http.is_some() || t.steps.is_some());
+    if needs_egress && upstream.egress.is_none() {
+        anyhow::bail!(
+            "mcp action: local server '{name}' declares tools that make HTTP calls but sets no egress policy; add `egress:` (mode: deny_by_default plus hosts/suffixes) -- a server whose tools are all `static` needs none"
+        );
+    }
+
+    let tools = upstream
+        .tools
+        .iter()
+        .map(|tool| compile_local_tool(name, tool))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(CompiledLocalMcpServer {
+        name: name.to_string(),
+        tools,
+        egress: upstream.egress.clone(),
+    })
+}
+
+/// Compile one `tools[]` entry.
+fn compile_local_tool(
+    server_name: &str,
+    tool: &McpLocalToolConfig,
+) -> anyhow::Result<CompiledLocalMcpTool> {
+    anyhow::ensure!(
+        !tool.name.trim().is_empty(),
+        "mcp action: local server '{server_name}' has a tool with an empty name"
+    );
+    let site = format!(
+        "mcp action: local server '{server_name}' tool '{}'",
+        tool.name
+    );
+    if !tool.input_schema.is_object() {
+        anyhow::bail!("{site}: input_schema must be a JSON object");
+    }
+
+    let handler = match (&tool.r#static, &tool.http, &tool.steps) {
+        (Some(value), None, None) => CompiledLocalToolHandler::Static(value.clone()),
+        (None, Some(http), None) => {
+            CompiledLocalToolHandler::Http(compile_local_http_call(&site, http)?)
+        }
+        (None, None, Some(steps)) => {
+            CompiledLocalToolHandler::Steps(compile_local_steps(&site, steps)?)
+        }
+        (None, None, None) => {
+            anyhow::bail!("{site}: needs exactly one of static, http, or steps")
+        }
+        _ => anyhow::bail!("{site}: sets more than one of static, http, steps; pick exactly one"),
+    };
+
+    Ok(CompiledLocalMcpTool {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+        handler,
+    })
+}
+
+/// Compile one HTTP call (a tool's `http` handler or a step's `http`).
+fn compile_local_http_call(
+    site: &str,
+    cfg: &McpLocalHttpCallConfig,
+) -> anyhow::Result<CompiledLocalHttpCall> {
+    anyhow::ensure!(
+        !cfg.method.trim().is_empty(),
+        "{site}: http.method must not be empty"
+    );
+    anyhow::ensure!(
+        !cfg.url.trim().is_empty(),
+        "{site}: http.url must not be empty"
+    );
+    Ok(CompiledLocalHttpCall {
+        method: cfg.method.clone(),
+        url: cfg.url.clone(),
+        headers: cfg.headers.clone(),
+        body: cfg.body.clone(),
+        retry: cfg.retry.clone(),
+        timeout: cfg.timeout,
+    })
+}
+
+/// Compile a `steps` handler: structural checks (the named `parallel`
+/// refusal, duplicate step names, dangling `depends_on`, dependency
+/// cycles), then each step's HTTP call and CEL `condition`, then the
+/// response shaping.
+fn compile_local_steps(
+    site: &str,
+    cfg: &McpLocalStepsConfig,
+) -> anyhow::Result<CompiledLocalSteps> {
+    if cfg.parallel.is_some() {
+        anyhow::bail!(
+            "{site}: steps.parallel is not supported yet; steps always run in dependency order today (a parallel scheduler is a tracked follow-up) -- remove `parallel:`"
+        );
+    }
+    if cfg.steps.is_empty() {
+        anyhow::bail!("{site}: steps.steps must not be empty");
+    }
+
+    let mut seen = HashSet::with_capacity(cfg.steps.len());
+    for step in &cfg.steps {
+        anyhow::ensure!(
+            !step.name.trim().is_empty(),
+            "{site}: steps[] has a step with an empty name"
+        );
+        if !seen.insert(step.name.as_str()) {
+            anyhow::bail!("{site}: steps[] has duplicate step name '{}'", step.name);
+        }
+    }
+    for step in &cfg.steps {
+        for dep in &step.depends_on {
+            if !seen.contains(dep.as_str()) {
+                anyhow::bail!(
+                    "{site}: step '{}' depends_on names undeclared step '{dep}'",
+                    step.name
+                );
+            }
+        }
+    }
+    if let Some(cycle) = detect_step_cycle(&cfg.steps) {
+        anyhow::bail!(
+            "{site}: steps[] has a dependency cycle: {}",
+            cycle.join(" -> ")
+        );
+    }
+
+    let steps = cfg
+        .steps
+        .iter()
+        .map(|step| {
+            let step_site = format!("{site} step '{}'", step.name);
+            let http = compile_local_http_call(&step_site, &step.http)?;
+            let condition = step
+                .condition
+                .as_ref()
+                .map(|source| {
+                    CompiledCel::compile(
+                        CelSurface::McpArgumentPolicy,
+                        format!("{step_site} condition"),
+                        source,
+                    )
+                })
+                .transpose()?;
+            Ok(CompiledLocalStep {
+                name: step.name.clone(),
+                http,
+                depends_on: step.depends_on.clone(),
+                condition,
+                continue_on_error: step.continue_on_error,
+                retry: step.retry.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let response = cfg
+        .response
+        .as_ref()
+        .map(|r| compile_local_response(site, r))
+        .transpose()?;
+
+    Ok(CompiledLocalSteps { steps, response })
+}
+
+/// Find a dependency cycle among `steps[].depends_on`, if one exists.
+/// Every `depends_on` entry is assumed already validated to name a
+/// real step (see the caller in [`compile_local_steps`]). Returns the
+/// cycle's members in traversal order, closing on the repeated name,
+/// so the error can print `a -> b -> a`.
+fn detect_step_cycle(steps: &[McpLocalStepConfig]) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        Unvisited,
+        InProgress,
+        Done,
+    }
+
+    let by_name: HashMap<&str, &McpLocalStepConfig> =
+        steps.iter().map(|s| (s.name.as_str(), s)).collect();
+    let mut marks: HashMap<&str, Mark> = steps
+        .iter()
+        .map(|s| (s.name.as_str(), Mark::Unvisited))
+        .collect();
+
+    fn visit<'a>(
+        name: &'a str,
+        by_name: &HashMap<&'a str, &'a McpLocalStepConfig>,
+        marks: &mut HashMap<&'a str, Mark>,
+        stack: &mut Vec<&'a str>,
+    ) -> Option<Vec<String>> {
+        match marks.get(name) {
+            Some(Mark::Done) => return None,
+            Some(Mark::InProgress) => {
+                let start = stack.iter().position(|s| *s == name).unwrap_or(0);
+                let mut cycle: Vec<String> =
+                    stack[start..].iter().map(|s| (*s).to_string()).collect();
+                cycle.push(name.to_string());
+                return Some(cycle);
+            }
+            _ => {}
+        }
+        marks.insert(name, Mark::InProgress);
+        stack.push(name);
+        if let Some(step) = by_name.get(name) {
+            for dep in &step.depends_on {
+                if let Some(cycle) = visit(dep.as_str(), by_name, marks, stack) {
+                    return Some(cycle);
+                }
+            }
+        }
+        stack.pop();
+        marks.insert(name, Mark::Done);
+        None
+    }
+
+    for step in steps {
+        if matches!(marks.get(step.name.as_str()), Some(Mark::Unvisited)) {
+            let mut stack = Vec::new();
+            if let Some(cycle) = visit(step.name.as_str(), &by_name, &mut marks, &mut stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
+/// Compile a `steps` handler's response shaping.
+fn compile_local_response(
+    site: &str,
+    cfg: &McpLocalResponseConfig,
+) -> anyhow::Result<CompiledLocalResponseShaping> {
+    match (&cfg.template, &cfg.js, &cfg.lua) {
+        (Some(t), None, None) => Ok(CompiledLocalResponseShaping::Template(t.clone())),
+        (None, Some(js), None) => Ok(CompiledLocalResponseShaping::Js(js.clone())),
+        (None, None, Some(lua)) => Ok(CompiledLocalResponseShaping::Lua(lua.clone())),
+        (None, None, None) => {
+            anyhow::bail!("{site}: response needs exactly one of template, js, or lua")
+        }
+        _ => {
+            anyhow::bail!(
+                "{site}: response sets more than one of template, js, lua; pick exactly one"
+            )
+        }
+    }
+}
+
 impl McpAction {
     /// Compile an `McpAction` from a generic JSON config value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
@@ -2515,6 +3029,11 @@ impl McpAction {
             .egress
             .clone()
             .unwrap_or_else(|| EgressPolicy::allow_all("action"));
+        // WOR-2489: `type: local` servers never dial an upstream, so
+        // they are diverted out of the loop below before any of the
+        // MCP/REST-dial bookkeeping and land here instead. See
+        // `compile_local_server`.
+        let mut local_servers: Vec<CompiledLocalMcpServer> = Vec::new();
 
         for upstream in cfg.federated_servers {
             // The upstream `name` doubles as the implicit collision-prefix
@@ -2580,6 +3099,26 @@ impl McpAction {
                     "mcp action: openapi server '{}' sets both headers.authorization and run_as_user_auth; pick one",
                     upstream.origin
                 );
+            }
+
+            // WOR-2489: `tools[]` is a `local`-only field, mirroring
+            // how `headers` above is an `openapi`-only field.
+            let is_local = upstream.server_type.as_deref() == Some("local");
+            if !upstream.tools.is_empty() && !is_local {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].tools requires type: local (origin '{}')",
+                    upstream.origin
+                );
+            }
+            // A `local` server serves its own tools -- no MCP or REST
+            // dial, so it never enters `server_configs`, `prefixes`,
+            // or the peer-profile/protocol-negotiation bookkeeping
+            // below, all of which exist for an upstream this gateway
+            // actually contacts. Its compiled tools land on
+            // `local_servers` instead.
+            if is_local {
+                local_servers.push(compile_local_server(&name, &upstream)?);
+                continue;
             }
             // WOR-2384 (MCP09): computed once per server so both the
             // `openapi` REST-call gate (`OpenApiBacking::egress_policy`,
@@ -2882,6 +3421,7 @@ impl McpAction {
             content_filters,
             result_policies,
             mcp_audit_capture_arguments: cfg.mcp_audit.capture_arguments,
+            local_servers,
         })
     }
 
@@ -3564,6 +4104,7 @@ impl std::fmt::Debug for McpAction {
             .field("prefixes", &self.prefixes)
             .field("tool_allowlist", &self.tool_allowlist)
             .field("lethal_trifecta", &self.lethal_trifecta)
+            .field("local_server_count", &self.local_servers.len())
             .finish()
     }
 }
@@ -7104,5 +7645,358 @@ allow := false if {
 
         install_configured_gate(EgressPurpose::UsageSink, None);
         install_configured_gate(EgressPurpose::Webhook, None);
+    }
+
+    // --- `type: local` servers (WOR-2489) ---
+
+    #[test]
+    fn local_static_tool_compiles_without_egress() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        });
+        let action =
+            McpAction::from_config(value).expect("a static-only local server needs no egress");
+        assert_eq!(action.local_servers.len(), 1);
+        assert_eq!(action.local_servers[0].tools.len(), 1);
+        assert!(action.local_servers[0].egress.is_none());
+    }
+
+    #[test]
+    fn local_steps_tool_compiles_with_condition_and_response_shaping() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"}
+                            },
+                            {
+                                "name": "enrich",
+                                "http": {"method": "GET", "url": "https://api.example.com/b"},
+                                "depends_on": ["fetch"],
+                                "condition": "mcp.tool.name == \"lookup\"",
+                                "continue_on_error": true
+                            }
+                        ],
+                        "response": {"template": "{{ steps.enrich.body }}"}
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("a valid steps DAG must compile");
+        assert_eq!(action.local_servers[0].tools.len(), 1);
+    }
+
+    #[test]
+    fn local_tools_field_requires_type_local() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "origin": "example.com",
+                "tools": [{
+                    "name": "x",
+                    "description": "x",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err =
+            McpAction::from_config(value).expect_err("tools on a non-local server must refuse");
+        assert!(err.to_string().contains("requires type: local"), "{err}");
+    }
+
+    #[test]
+    fn local_server_with_no_tools_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal"
+            }]
+        });
+        let err =
+            McpAction::from_config(value).expect_err("a local server with no tools must refuse");
+        assert!(err.to_string().contains("declares no tools"), "{err}");
+    }
+
+    #[test]
+    fn local_tool_name_must_not_be_empty() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "",
+                    "description": "x",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("an empty tool name must refuse");
+        assert!(err.to_string().contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn local_tool_input_schema_must_be_a_json_object() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "bad-schema",
+                    "description": "schema is not an object",
+                    "input_schema": ["not", "an", "object"],
+                    "static": {"ok": true}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("a non-object input_schema must refuse");
+        assert!(
+            err.to_string()
+                .contains("input_schema must be a JSON object"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_tool_handler_must_be_exactly_one_of_static_http_steps() {
+        let no_handler = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "noop",
+                    "description": "does nothing",
+                    "input_schema": {"type": "object"}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(no_handler).expect_err("no handler must refuse");
+        assert!(
+            err.to_string()
+                .contains("needs exactly one of static, http, or steps"),
+            "{err}"
+        );
+
+        let both_handlers = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "both",
+                    "description": "sets two handlers",
+                    "input_schema": {"type": "object"},
+                    "static": {"ok": true},
+                    "http": {"method": "GET", "url": "https://api.example.com/x"}
+                }]
+            }]
+        });
+        let err = McpAction::from_config(both_handlers).expect_err("two handlers must refuse");
+        assert!(
+            err.to_string()
+                .contains("more than one of static, http, steps"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_steps_tool_without_server_egress_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("an http-calling steps tool with no server egress must refuse");
+        assert!(err.to_string().contains("no egress policy"), "{err}");
+    }
+
+    #[test]
+    fn local_steps_duplicate_step_names_are_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}},
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/b"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("duplicate step names must refuse");
+        assert!(err.to_string().contains("duplicate step name"), "{err}");
+    }
+
+    #[test]
+    fn local_steps_depends_on_missing_step_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"},
+                                "depends_on": ["missing"]
+                            }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("a dangling depends_on must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("undeclared step"), "{msg}");
+        assert!(msg.contains("missing"), "{msg}");
+    }
+
+    #[test]
+    fn local_steps_dependency_cycle_is_refused_and_names_the_cycle() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "a",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"},
+                                "depends_on": ["b"]
+                            },
+                            {
+                                "name": "b",
+                                "http": {"method": "GET", "url": "https://api.example.com/b"},
+                                "depends_on": ["a"]
+                            }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("a dependency cycle must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("dependency cycle"), "{msg}");
+        assert!(msg.contains('a') && msg.contains('b'), "{msg}");
+    }
+
+    #[test]
+    fn local_steps_parallel_is_refused_with_a_named_message() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "parallel": true,
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err(
+            "parallel must be refused with a specific message, not silently ignored or an \
+             anonymous deny_unknown_fields error",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("parallel"), "{msg}");
+        assert!(msg.contains("not supported yet"), "{msg}");
+        assert!(
+            !msg.contains("unknown field"),
+            "the refusal must be named, not anonymous: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_step_invalid_cel_condition_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "fetch",
+                                "http": {"method": "GET", "url": "https://api.example.com/a"},
+                                "condition": "this is not valid CEL !!!"
+                            }
+                        ]
+                    }
+                }]
+            }]
+        });
+        assert!(McpAction::from_config(value).is_err());
     }
 }
