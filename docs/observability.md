@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -295,7 +295,7 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_agent_detect_score_bucket` | 11 | Histogram buckets over the 0-100 agent-detect score. No labels. |
 | `sbproxy_agent_detect_inference_seconds_bucket` | 9 | Histogram buckets 50us..10ms for in-process scorer latency. No labels. |
 | `sbproxy_trust_tier_requests_total` | 4 | Label: `tier` (`suspicious`\|`strong`\|`named`\|`anonymous`). One closed-set observation per request after identity enrichment and authentication. |
-| `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|enumeration). Counts BOLA / BFLA / enumeration violations the object-authz policy refused. |
+| `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|enumeration). Counts BOLA / BFLA / enumeration violations the object-authz policy detected. Rule-derived violations are refused when `test_mode: false`; ruleless-heuristic enumeration hits are detect-only and always allowed through, and both increment the same series. |
 | `sbproxy_waf_persistent_blocks_total` | 600 | Labels: `origin`, `event` (rule_match\|ip_blocklisted\|anomaly_threshold), `key_kind` (ip\|jwt_sub\|api_key\|session). Counts the WAF blocks that landed on the persistent (cross-process) blocklist as opposed to the in-process rate-limit decision path. |
 | `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitized). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | 6 | Labels: `result` (ok\|backend_error\|kid_still_missing). Counts on-demand JWKS refetches triggered by an unknown `kid` in a presented JWT. |
@@ -496,7 +496,7 @@ Agent-to-agent lines additionally carry the run correlation columns, so a multi-
 
 Read `a2a_identity_verified` before aggregating on `a2a_context_id`. An unverified caller picks its own context id, so it can merge its usage into another caller's run or shard one run across unbounded distinct ids. A per-run total computed without that filter is a number the caller chose. The `sbproxy_a2a_hops_total` metric splits hops the same way with its `allow:verified` and `allow:unverified` decision labels.
 
-`event_type` is the `EventType` enum from `crates/sbproxy-observe/src/events.rs`, and it is closed at 11 values: `request_started`, `request_completed`, `request_error`, `auth_denied`, `policy_denied`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, `guardrail_triggered`, `config_reloaded`. The same enum drives the `events:` webhook sink, so a log line's `event_type` and the event names an operator can subscribe to under `events.types:` are the same closed set.
+`event_type` is the `EventType` enum from `crates/sbproxy-observe/src/events.rs`, and it is closed at 13 values: `request_started`, `request_completed`, `request_error`, `auth_denied`, `policy_denied`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, `guardrail_triggered`, `config_reloaded`, `egress_refused`, `mcp_governance_decision`. The same enum drives the `events:` webhook sink, so a log line's `event_type` and the event names an operator can subscribe to under `events.types:` are the same closed set; [events.md](events.md#the-typed-proxy-events) has the per-event table and is the page to trust if the two ever diverge.
 
 ### Redaction policy
 

@@ -913,14 +913,6 @@ pub struct DecisionDetails {
     /// key. Zero means the policy ran and added nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vary_count: Option<usize>,
-    /// Which authentication method decided.
-    ///
-    /// The closed-ish set the `sbproxy_auth_results_total` metric
-    /// already labels by (`virtual_key`, `forward_auth`, `api_key`,
-    /// `bearer`, and the rest), so a rule can select "every forward-auth
-    /// refusal" as a term query and correlate it with the metric that
-    /// alerted.
-    ///
     /// The MCP tool a dispatch decision concerns.
     ///
     /// The name the agent asked for, as advertised by the gateway, so
@@ -963,6 +955,14 @@ pub struct DecisionDetails {
     /// Count of matches past the span cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guardrail_spans_dropped: Option<usize>,
+    /// Which authentication method decided.
+    ///
+    /// The closed-ish set the `sbproxy_auth_results_total` metric
+    /// already labels by (`virtual_key`, `forward_auth`, `api_key`,
+    /// `bearer`, and the rest), so a rule can select "every forward-auth
+    /// refusal" as a term query and correlate it with the metric that
+    /// alerted.
+    ///
     /// Deliberately the method and not the subject. A resolved principal
     /// is the one field on this path that is attacker-influenced and
     /// frequently personal, and `DecisionDetails` is the half of the

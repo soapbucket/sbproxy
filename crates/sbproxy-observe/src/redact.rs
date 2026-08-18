@@ -55,6 +55,31 @@ static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)api[_\-]?key["'\s:=]+[a-zA-Z0-9_\-]{16,}"#).expect("valid regex")
 });
 
+/// Credential-bearing keys this product's own schema defines
+/// (`master_key`, `signing_key`, `shared_key`, `virtual_key`,
+/// `challenge_binding_key`, `signing_secret`, `client_secret`,
+/// `session_token`) whose values have no vendor-recognizable shape of
+/// their own: a 32-hex Slack signing secret, a Google `GOCSPX-...`
+/// client secret (its hyphen breaks `RE_AWS_SECRET`'s base64 run), and
+/// a raw cluster master key all sail past the shape patterns above.
+/// Matched by key, like `api_key` and `password`. Groups: key,
+/// separator, value; see [`keyed_credential_replacement`].
+static RE_CREDENTIAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b(session[_-]?token|master[_-]?key|signing[_-]?key|shared[_-]?key|virtual[_-]?key|challenge[_-]?binding[_-]?key|signing[_-]?secret|client[_-]?secret)(["'\s:=]+)(\S{4,})"#,
+    )
+    .expect("valid regex")
+});
+
+/// A bare `token` key (`token: eyJ...`), which `RE_BEARER` misses
+/// because it requires the literal `Bearer ` prefix. Split from
+/// [`RE_CREDENTIAL_KEY`] because prose uses the word constantly
+/// ("token count", "token budget"), so this one requires an explicit
+/// `:` or `=` separator rather than matching across a bare space.
+static RE_BARE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(token)(["'\s]*[:=]["'\s]*)(\S{4,})"#).expect("valid regex")
+});
+
 /// Generic `password = "..."` / `password: ...` patterns.
 ///
 /// Split into the label-plus-separator run and the value so the value can
@@ -62,8 +87,11 @@ static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// Sibling patterns get away with a single group because their value
 /// character classes happen to exclude the reference syntax; this one
 /// matches `\S`, so it has to check.
+/// The value run is `\S{4,}`: short real passwords (`hunter2`) must
+/// still be masked, while staying above YAML's one-character block
+/// and quote indicators (`|`, `>`, `-`, `"`) so structure survives.
 static RE_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)(password["'\s:=]+)(\S{8,})"#).expect("valid regex"));
+    LazyLock::new(|| Regex::new(r#"(?i)(password["'\s:=]+)(\S{4,})"#).expect("valid regex"));
 
 /// Whether `value` names a secret rather than being one.
 ///
@@ -113,6 +141,29 @@ fn is_secret_reference(value: &str) -> bool {
     })
 }
 
+/// Replacement for the keyed credential patterns: mask an inline
+/// value, keep a resolver reference, and keep anything an earlier
+/// pattern already masked (`master_key: sk-ant-[REDACTED]` must not
+/// double-mask, and `token: Bearer [REDACTED]` is already done).
+fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
+    let value = &caps[3];
+    if is_secret_reference(value)
+        || value.contains("[REDACTED]")
+        || value.eq_ignore_ascii_case("bearer")
+        || value.eq_ignore_ascii_case("basic")
+    {
+        caps[0].to_string()
+    } else {
+        // Same normalization and same deliberate separator consumption
+        // as the password path: an inline credential is not meant to
+        // survive a GET-edit-PUT round trip.
+        format!(
+            "{}=[REDACTED]",
+            caps[1].to_ascii_lowercase().replace('-', "_")
+        )
+    }
+}
+
 /// Apply the password redaction, leaving secret references intact.
 fn redact_passwords(input: &str) -> String {
     RE_PASSWORD
@@ -153,6 +204,8 @@ pub fn redact_secrets(input: &str) -> String {
     let s = RE_BEARER.replace_all(&s, "Bearer [REDACTED]");
     let s = RE_BASIC.replace_all(&s, "Basic [REDACTED]");
     let s = RE_API_KEY.replace_all(&s, "api_key=[REDACTED]");
+    let s = RE_CREDENTIAL_KEY.replace_all(&s, keyed_credential_replacement);
+    let s = RE_BARE_TOKEN.replace_all(&s, keyed_credential_replacement);
     redact_passwords(&s)
 }
 
@@ -176,6 +229,12 @@ pub fn contains_secret(input: &str) -> bool {
         || RE_PASSWORD
             .captures_iter(input)
             .any(|caps| !is_secret_reference(&caps[2]))
+        || RE_CREDENTIAL_KEY
+            .captures_iter(input)
+            .any(|caps| !is_secret_reference(&caps[3]))
+        || RE_BARE_TOKEN
+            .captures_iter(input)
+            .any(|caps| !is_secret_reference(&caps[3]))
 }
 
 // --- Tests ---
@@ -496,6 +555,119 @@ mod tests {
         // redactable.
         let input = "password: ${SB_ADMIN_PASSWORD}-suffix";
         assert!(redact_secrets(input).contains("password=[REDACTED]"));
+    }
+
+    // --- Phase-2 review: the product's own credential keys ---
+    //
+    // docs/configuration.md and the config-history routes promise that
+    // "a literal secret an operator typed directly into the file (an
+    // inline API key, a password field) is masked as [REDACTED]".
+    // These pin that promise for the credential keys this product's
+    // own schema defines, not just vendor-shaped tokens. Each test was
+    // red against the pre-widening pattern set.
+
+    #[test]
+    fn a_raw_token_value_is_redacted() {
+        // RE_BEARER requires the literal `Bearer ` prefix, so a raw
+        // JWT under `token:` used to pass through verbatim.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcHMifQ.c2lnbmF0dXJl";
+        let input = format!("token: {jwt}");
+        let output = redact_secrets(&input);
+        assert!(
+            !output.contains(jwt),
+            "raw token value must be masked: {output}"
+        );
+        assert!(contains_secret(&input));
+    }
+
+    #[test]
+    fn a_session_token_is_redacted() {
+        let input = "session_token: 5d41402abc4b2a76b9719d911017c592";
+        let output = redact_secrets(input);
+        assert!(
+            !output.contains("5d41402abc4b2a76b9719d911017c592"),
+            "session token must be masked: {output}"
+        );
+        assert!(contains_secret(input));
+    }
+
+    #[test]
+    fn product_key_names_are_redacted() {
+        // RE_API_KEY requires the literal `api` before `key`, so every
+        // one of the schema's own *_key credentials escaped it.
+        for key in [
+            "master_key",
+            "signing_key",
+            "shared_key",
+            "virtual_key",
+            "challenge_binding_key",
+        ] {
+            let input = format!("{key}: 6fa459eaee8a3ca4894edb77e160355e");
+            let output = redact_secrets(&input);
+            assert!(
+                !output.contains("6fa459ea"),
+                "{key} value must be masked: {output}"
+            );
+            assert!(contains_secret(&input), "{key} must count as a secret");
+        }
+    }
+
+    #[test]
+    fn short_signing_and_client_secrets_are_redacted() {
+        // RE_AWS_SECRET wants an exactly-40-char base64 run, so a
+        // 32-hex Slack signing secret and a Google `GOCSPX-...` client
+        // secret (its hyphen breaks the run) both escaped.
+        let slack = "signing_secret: 8f742231b10e8888abcd99aaabbb85a5";
+        let output = redact_secrets(slack);
+        assert!(
+            !output.contains("8f742231b10e8888abcd99aaabbb85a5"),
+            "a 32-hex signing secret must be masked: {output}"
+        );
+        let google = "client_secret: GOCSPX-abcDEFghiJKLmnoPQRstu";
+        let output = redact_secrets(google);
+        assert!(
+            !output.contains("GOCSPX-abcDEFghiJKLmnoPQRstu"),
+            "a GOCSPX client secret must be masked: {output}"
+        );
+    }
+
+    #[test]
+    fn a_short_password_is_still_redacted() {
+        // `\S{8,}` let `password: hunter2` through as typed.
+        let input = "password: hunter2";
+        let output = redact_secrets(input);
+        assert!(!output.contains("hunter2"), "{output}");
+        assert!(output.contains("password=[REDACTED]"));
+    }
+
+    #[test]
+    fn credential_key_references_survive_redaction() {
+        // The WOR-2333 rule extends to every widened key: a resolver
+        // reference names a secret, it is not one.
+        for input in [
+            "master_key: vault://primary/cluster?key=master",
+            "client_secret: ${OIDC_CLIENT_SECRET}",
+            "token: env:SB_UPSTREAM_TOKEN",
+            "session_token: file:/run/secrets/session-token",
+        ] {
+            assert_eq!(
+                redact_secrets(input),
+                input,
+                "a reference under a credential key must be preserved"
+            );
+            assert!(
+                !contains_secret(input),
+                "a reference must not be reported as a secret: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_about_tokens_is_not_redacted() {
+        // The bare `token` key requires an explicit `:` or `=`
+        // separator precisely so log prose keeps reading normally.
+        let input = "request used 1204 tokens; token budget nearly exhausted";
+        assert_eq!(redact_secrets(input), input);
     }
 
     #[test]

@@ -906,8 +906,13 @@ that permission boundary is what actually protects a literal secret at
 rest, the same as the config file itself. `GET /admin/config/history/{digest}`
 and `sbproxy config show` mask a literal secret as `[REDACTED]` before
 either ever leaves the process, the same redaction pass
-[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies,
-but that is display redaction: the ring file underneath still holds the
+[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies.
+Masking is by recognized credential shape and key name (vendor key
+prefixes, `Authorization` values, and the schema's own key / secret /
+token / password fields); a secret under a name or shape the redactor
+does not recognize is returned as written, which is one more reason the
+permission boundary above is the real control. And it is display
+redaction either way: the ring file underneath still holds the
 original bytes, because a rollback needs them.
 
 The directory is a one-process durability boundary, not shared fleet state,

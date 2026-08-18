@@ -104,7 +104,11 @@ FIXTURE_RUN_LINE = re.compile(r"^python3\s+(\S+\.py)(?:\s+\S+)?\s*&$")
 # `base_url: "http://127.0.0.1:8098/anything"`. Scoped to those keys (and
 # not searched against the header) so a port mentioned in a Test: curl
 # example above the YAML body is never mistaken for the fixture's port.
-FIXTURE_PORT_HINT = re.compile(r"^\s*(?:base_url|url):.*127\.0\.0\.1:(\d+)")
+# `-?` covers targets written as sequence items (`- url: http://...`),
+# the shape examples/routing-strategies/sb.yml uses; without it that
+# tape got no FIXTURE_PORT and record-tapes.sh could not probe the
+# fixture's readiness.
+FIXTURE_PORT_HINT = re.compile(r"^\s*-?\s*(?:base_url|url):.*127\.0\.0\.1:(\d+)")
 
 
 def extract_fixture(hdr, name, sb_text):

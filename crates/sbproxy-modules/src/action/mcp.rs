@@ -5031,14 +5031,19 @@ impl McpAction {
     /// shortens or lengthens the live document; scanning that
     /// already-mutated text for `pii` would report spans in a
     /// different coordinate system than the `secrets` spans in the
-    /// same verdict. The snapshot is taken lazily, only once, on the
-    /// first category that is not `off`, so the documented zero-clone
-    /// behavior above still holds when nothing is configured.
+    /// same verdict. The snapshot is taken lazily, only once, at the
+    /// first `redact` mutation: until something mutates the live
+    /// document, scanning it directly is byte-identical to scanning a
+    /// snapshot, so warn-only and block-only configurations stay
+    /// zero-clone too, not just the unconfigured default.
     pub fn apply_content_filters(
         &self,
         document: &mut serde_json::Value,
     ) -> McpContentFilterVerdict {
         let mut hits = Vec::new();
+        // `Some` only after a `redact` arm has mutated `document`; a
+        // scan reads the snapshot when one exists and the live
+        // document otherwise (identical until the first mutation).
         let mut scanned_snapshot: Option<serde_json::Value> = None;
         for (category, filter) in [
             ("secrets", &self.content_filters.secrets),
@@ -5047,8 +5052,8 @@ impl McpAction {
             if filter.mode == McpFilterModeConfig::Off {
                 continue;
             }
-            let snapshot = scanned_snapshot.get_or_insert_with(|| document.clone());
-            let (detectors, spans, spans_dropped) = filter.scan(snapshot);
+            let (detectors, spans, spans_dropped) =
+                filter.scan(scanned_snapshot.as_ref().unwrap_or(document));
             if detectors.is_empty() {
                 continue;
             }
@@ -5071,6 +5076,9 @@ impl McpAction {
                     };
                 }
                 McpFilterModeConfig::Redact => {
+                    if scanned_snapshot.is_none() {
+                        scanned_snapshot = Some(document.clone());
+                    }
                     filter.redact(document);
                     hits.push(McpContentFilterHit {
                         category,

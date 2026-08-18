@@ -1,10 +1,10 @@
 # Release notes
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 A category view of recent SBproxy changes, for readers who want to know
 what changed in an area they care about rather than read a chronological
-diff. Covers `[Unreleased]` plus versions 1.8.0 through 1.11.0.
+diff. Covers versions 1.8.0 through 1.12.0.
 
 [`CHANGELOG.md`](../CHANGELOG.md) stays the canonical, chronological,
 Keep-a-Changelog-style record with full detail and exact version
@@ -35,7 +35,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 - OCSP stapling now builds a real RFC 6960 request and validates the response; a staple no client could verify is no longer sent. (1.11.0)
 - Four fixes from a security inventory of the auth path: async JWKS refresh, constant-time comparators via `subtle`, malformed CIDR now fails config compile. (1.11.0)
 - `key_management.crypto.pepper`/`master_key` and `cluster.security.shared_key` can now resolve through any configured secrets backend, not just env or file. (1.11.0)
-- Boot and every SIGHUP reload now warn when `key_management.inbound.provider_hints` recognizes a native provider credential that no `inbound.native_key_policy` admits, surfacing a gap that previously refused those keys with a silent 403. (Unreleased)
+- Boot and every SIGHUP reload now warn when `key_management.inbound.provider_hints` recognizes a native provider credential that no `inbound.native_key_policy` admits, surfacing a gap that previously refused those keys with a silent 403. (1.11.0)
 - A bulk credential purge (`invalidate_all`) now reaches every node in a cluster instead of only the local shard. (1.10.0)
 - A clustered node running the embedded per-node keystore now warns, or refuses to start, when its cache tier can't actually propagate key state the way the deployment implies. (1.10.0)
 - Outbound credentials can use DPoP-bound tokens. (1.9.0)
@@ -49,8 +49,8 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
-- **`timeout_ms` on an AI provider is now enforced.** (Unreleased) The key previously validated and did nothing; a forgotten low value starts cutting requests off on upgrade.
-- **A broken `ai_policy.expression` now refuses the config instead of disabling itself.** (Unreleased) If your config stops loading on upgrade, the expression was never actually running.
+- **`timeout_ms` on an AI provider is now enforced.** (1.12.0) The key previously validated and did nothing; a forgotten low value starts cutting requests off on upgrade.
+- **A broken `ai_policy.expression` now refuses the config instead of disabling itself.** (1.12.0) If your config stops loading on upgrade, the expression was never actually running.
 - **`model_aliases` now actually does something.** (1.11.0) The key previously parsed and was silently ignored; a second bug also closed credential model-gate bypass via alias.
 - **The in-process embedded engine (`engine: embedded`) is removed.** (1.10.0)
 - **The AI gateway's `context_overflow:` block is removed.** (1.11.0) It parsed and was never wired to anything; an authored key now fails config compile naming the compression settings (`window_fit`) that actually fit a prompt to the model's window.
@@ -59,8 +59,8 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
-- Anthropic multi-tool-call streams now close every content block correctly. (Unreleased)
-- Gemini empty `generateContent` bodies now surface as an error instead of a fake empty success. (Unreleased)
+- Anthropic multi-tool-call streams now close every content block correctly. (1.12.0)
+- Gemini empty `generateContent` bodies now surface as an error instead of a fake empty success. (1.12.0)
 - `sbproxy ai ledger report` reads the AI value ledger offline. (1.11.0)
 - Ollama's NDJSON streaming responses now stay on the streaming relay instead of being buffered whole, so their usage is recorded and workspace budgets enforce correctly again. (1.10.0)
 - [`GET /v1/key/usage`](admin-api-guide.md) lets a caller read its own governance snapshot (requests, tokens, spend, remaining budget), scoped to its own key. (1.9.0)
@@ -86,6 +86,8 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
+- `policy: rego` and the AI gateway's Rego engine can load a module from a file (`module_path`) and accept pre-OPA-1.0 syntax (`rego_v0: true`); request and response modifiers gained a Rego form, and signed extension bundles can ship a `.rego` policy module. (1.12.0)
+- `sbproxy rego test` runs Rego fixtures offline with per-module line coverage and a `--min-coverage` gate. (1.12.0)
 - Rate limits converge across a gossip mesh with no Redis required. (1.10.0)
 - Workspace rate-budget behavior now has one owner. (1.8.0)
 - A rate-limit `key:` expression that fails to evaluate has corrected behavior. (1.9.0)
@@ -110,8 +112,8 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
-- **A configured origin now owns `/health` on the data plane.** (Unreleased) A load balancer probing `/health` with a configured origin's Host header now reaches your upstream instead of the proxy's built-in `{"status":"ok"}`. An upstream with no `/health` route now answers 404 there, which a health checker reads as unhealthy; point such probes at the admin listener's health route, or make sure the upstream serves the path.
-- **The response cache now stores the transform chain's output.** (Unreleased) All existing response-cache entries are retired on upgrade (one cold start per key).
+- **A configured origin now owns `/health` on the data plane.** (1.12.0) A load balancer probing `/health` with a configured origin's Host header now reaches your upstream instead of the proxy's built-in `{"status":"ok"}`. An upstream with no `/health` route now answers 404 there, which a health checker reads as unhealthy; point such probes at the admin listener's health route, or make sure the upstream serves the path.
+- **The response cache now stores the transform chain's output.** (1.12.0) All existing response-cache entries are retired on upgrade (one cold start per key).
 
 **Also shipped:**
 
@@ -138,8 +140,8 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 **Also shipped:**
 
 - Extension bundle manifests can declare `secret_vars` and `masked_vars` on a hook, resolved through the standard secret-reference forms. (1.11.0)
-- Bundles can make granted outbound HTTP calls via a declared `net:outbound=` permission and the sandboxed `sbproxy_fetch` host function. (Unreleased)
-- `ai_tool_call` hooks can rewrite tool calls in-flight, gated by `execution.mutates: true`. (Unreleased)
+- Bundles can make granted outbound HTTP calls via a declared `net:outbound=` permission and the sandboxed `sbproxy_fetch` host function. (1.12.0)
+- `ai_tool_call` hooks can rewrite tool calls in-flight, gated by `execution.mutates: true`. (1.12.0)
 - `digest_scope: bundle_v1` covers a whole extension bundle's digest, including `bundle.yaml`, not just the entry file. (1.11.0)
 - Extension bundles: install TypeScript, JavaScript, or WebAssembly directly. (1.10.0)
 - A bundle's declared `failure_posture` is now the posture the pipeline actually uses, and a bundle hook can no longer end a request with a non-HTTP status. (1.10.0)
@@ -153,6 +155,13 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
+- The full MCP surface is governed: `content_filters` runs the shared secret and PII detector catalog over tool-call arguments and results (`off | warn | redact | block` per category), sessions are tenant-bound with fail-closed caps, `result_policies[]` runs CEL/Rego over tool results, and `federated_servers[].status` stages a draft / approved / deprecated review lifecycle. (1.12.0)
+- Every dispatched MCP `tools/call` emits an `mcp_governance_decision` evidence event; `events.fail_closed` can refuse a call rather than serve it un-evidenced, and tool-definition changes and registry status transitions emit their own records. (1.12.0)
+- Federated MCP servers resist a silent protocol or auth downgrade: `federated_servers[].protocol` pins an era, and `downgrade: warn | block` acts on a peer answering weaker than it ever has. (1.12.0)
+- `argument_policies[]` authorizes an MCP tool call on its arguments with CEL or Rego after RBAC and schema validation; a rule can only narrow an allow, and a rule that cannot be evaluated fails closed. (1.12.0)
+- An `mcp` action's `flow` block adds deterministic session-flow enforcement (Meta's Rule of Two): a session that read something untrusted and touched something sensitive is warned or blocked on its next outbound call. (1.12.0)
+- The base MCP connect is egress-gated and inventoried at `GET /api/egress` under purpose `mcp_upstream`. (1.12.0)
+- A prefix-namespaced federated tool call now reaches its upstream instead of being refused as unknown. (1.12.0)
 - The MCP gateway now federates `prompts/list` and `prompts/get`. (1.11.0)
 - The configured A2A agent card is now served at its well-known path (`/.well-known/agent-card.json`). (1.11.0)
 - `examples/admin-mcp` lets an agent client (Claude Code, Cursor) manage a running proxy over MCP. (1.11.0)
@@ -171,19 +180,20 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 - The served-quote nonce ledger for x402 payments is now SQLite-durable; previously a client re-presenting a settled quote token got served twice per restart. (1.11.0)
 - A stranded payment intent with no identifiable payer now stops withholding challenges after a bounded window. (1.11.0)
 - A plain "not paid yet" read from a Lightning invoice no longer poisons the settlement intent. (1.11.0)
-- Meter receipts now fold extra attempts under `billable.retry: collapse`. (Unreleased)
+- Meter receipts now fold extra attempts under `billable.retry: collapse`. (1.12.0)
 
 ## Observability & operations
 
 **Breaking / needs attention:**
 
-- **The `outcome` label value `auth_denied` split in two.** (Unreleased) Dashboards keyed on `outcome="auth_denied"` need updating; usage rollups keep the legacy mapping.
-- **Single-tenant traffic now reports workspace `__default__`, not `default`.** (Unreleased) Dashboards or alerts matching `workspace="default"` need updating.
+- **The `outcome` label value `auth_denied` split in two.** (1.12.0) Dashboards keyed on `outcome="auth_denied"` need updating; usage rollups keep the legacy mapping.
+- **Single-tenant traffic now reports workspace `__default__`, not `default`.** (1.12.0) Dashboards or alerts matching `workspace="default"` need updating.
 - **The in-process burn-rate rule now reads the hour it is named for.** (1.11.0) A slow burn under 14.4x over the last hour no longer opens an in-process incident; alert labels changed from `scope`+`objectives` to `scope`+`objective`+`window`, which changes the PagerDuty dedup key.
 - **Unsupported `telemetry.propagation` values now fail boot.** (1.9.0)
 
 **Also shipped:**
 
+- A new `egress_refused` typed event carries every purpose-scoped outbound-dial refusal to the `events:` sink; all six config-reload paths write `config_audit` records, mTLS handshake rejections and circuit-breaker transitions get structured records, and boot warns when `events.types:` names a type nothing publishes. (1.12.0)
 - Trace spans now cover the ordinary proxied request, not only the AI gateway (`sbproxy.intake.accept`, `.authenticate`, `sbproxy.policy.enforce`, `sbproxy.transform.shape`). (1.11.0)
 - A top-level `request_events:` block lets request events leave the process (`logging` or `file` NDJSON sinks). (1.11.0)
 - `proxy.observability.log.level` and `.format` now actually reach the process logger. (1.11.0)
@@ -202,8 +212,9 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 - ACME HTTP-01 challenge validation now works behind a load balancer (shared `KVStore` instead of a process-local map). (1.11.0)
 - ACME issuance now retries a `badNonce` rejection with the nonce the server actually returned, instead of failing outright. (1.11.0)
 - The Helm chart, the operator crate, and the workspace version now agree instead of reporting three different numbers; a stock `helm install` no longer lands the operator pod in `ImagePullBackOff`. (1.11.0)
-- Self-host certification writes a complete `record.json` (macOS version, chip, memory, engine version, digest, time to ready). (Unreleased)
-- The Kubernetes operator image now builds inside Docker instead of copying a host-compiled, wrong-platform binary. (Unreleased)
+- Self-host certification writes a complete `record.json` (macOS version, chip, memory, engine version, digest, time to ready). (1.12.0)
+- The Kubernetes operator image now builds inside Docker instead of copying a host-compiled, wrong-platform binary. (1.12.0)
+- llama.cpp and mistral.rs Model Host provisioning works on the official distroless Docker image: engine archives unpack in-process instead of shelling out to a `tar` the image does not contain. (1.12.0)
 - `sbproxy doctor --strict` runs startup checks (GPU visibility, `/dev/shm` sizing, weight-cache mount, cluster identity) so a managed worker refuses to boot into a configuration it can't serve, instead of joining the cluster and failing every dispatch. (1.10.0)
 - See also under Security: `sbproxy run` and `sbproxy service install` no longer bind to `0.0.0.0` by default. (1.10.0)
 - The self-host matrix has a runner and an evidence ledger; the macOS launchd agent has an environment file. (1.10.0)
@@ -217,7 +228,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 - **Five config keys that parsed, warned, and governed nothing are now removed.** (1.11.0) `origins.*.connection_pool.max_connections`, `.max_lifetime_secs`, `origins.*.traffic_capture`, `origins.*.sessions.ttl_seconds`, `proxy.device_parser_file`; each now fails config compile naming a real replacement.
 - **`audit.sink: tracing` and the origin-level `rate_limit_headers:` block are removed.** (1.11.0) Both were accepted and did nothing.
-- **`proxy.messenger_settings` names the deleted bus defects and must be removed.** (Unreleased) Config distribution is `proxy.config_authority`, and cache invalidation is `POST /admin/cache/purge`.
+- **`proxy.messenger_settings` names the deleted bus defects and must be removed.** (1.12.0) Config distribution is `proxy.config_authority`, and cache invalidation is `POST /admin/cache/purge`.
 - **A CEL syntax error is now a config error everywhere CEL comes from.** (1.9.0) A config with a CEL typo that used to boot fine will now refuse to start; run `sbproxy validate` against your config before upgrading.
 - **A reload that fails now really does change nothing.** (1.8.0)
 - **Changing `proxy.secrets` on a reload is now refused instead of silently ignored.** (1.8.0) The secret resolver holds live backend connections and is only ever built at startup, so a reload never actually picked up the change; it now fails outright with a message saying a restart is required. Rotating a secret's value inside your backend still needs no restart, only changing where SBproxy looks does.
@@ -227,4 +238,4 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 - `localsecret://` replaces the overloaded `secret://` scheme name (old spelling still works, with a deprecation warning). (1.11.0)
 - `env:NAME` now resolves through the same secret resolver as every other secret-bearing field. (1.11.0)
 - Config compile now enforces GraphQL depth/introspection/syntax limits before upstream dispatch, keys concurrent-limit policies by client/API key/header/route, and refuses the reserved HTTP/3 listener at compile time instead of logging and continuing without QUIC. (1.8.0)
-- NOTICE now names the 27 Apache-2.0-only crates it previously omitted, and a CI gate keeps it that way. (Unreleased)
+- NOTICE now names the 27 Apache-2.0-only crates it previously omitted, and a CI gate keeps it that way. (1.12.0)

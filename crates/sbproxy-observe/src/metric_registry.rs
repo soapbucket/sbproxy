@@ -784,6 +784,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_context_poisoning_blocked_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_context_poisoning_blocked"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Requests blocked by the context-poisoning guardrail (a finding whose configured action is deny).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_cost_dollars_attributed_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_ai_request_attributed"),
@@ -1280,6 +1291,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["guardrail"],
         description: "Streaming output guardrail violations, by guardrail type.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_stream_guardrail_decode_fallback_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_stream_guardrail_decode_fallback"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Streaming chunks where guardrails fell back to raw-frame matching because delta decoding failed.",
         dead_reason: None,
     },
     MetricCapability {
@@ -4067,7 +4089,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-15*\n\n\
+         *Last modified: 2026-08-18*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

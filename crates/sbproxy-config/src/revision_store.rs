@@ -10,6 +10,7 @@
 //! ```text
 //! <dir>/
 //!   index.json               ring index: lineage, lkg pointer, entries
+//!   index.json.bak           backup of the index, written before the primary
 //!   blobs/<sha256>.yaml.zst  pre-resolution document bytes, content addressed
 //!   rejected/<sha256>.json   refused candidates and why (populated by a later change)
 //! ```
@@ -40,11 +41,18 @@
 //! independently recoverable from `blobs/` (the content-addressed digest
 //! is right there in the file name). So a malformed or truncated
 //! `index.json` is *repaired* at [`RevisionStore::open`] rather than
-//! refused: the index is reinitialized to an empty ring (a fresh
-//! `lineage`, no entries, no `lkg`) and the repair is persisted before
-//! `open` returns, so a second open is a no-op rather than a second
-//! repair. Existing blobs on disk are untouched by this and simply
-//! become unnamed until something appends over them again.
+//! refused. Repair rebuilds from the backup copy every index save
+//! maintains (`index.json.bak`, written before the primary): the
+//! entries whose blob files survive are kept, together with the
+//! recorded `high_water_revision`, `lkg` pointer, and `lineage`, so
+//! history, the rollback target, and the never-reuse-a-revision
+//! invariant all outlive the truncation. Only when the backup is
+//! unreadable too does repair fall back to reinitializing an empty
+//! ring (a fresh `lineage`, no entries, no `lkg`, revision numbering
+//! restarted), and the warning says so plainly. Either way the repair
+//! is persisted before `open` returns, so a second open is a no-op
+//! rather than a second repair, and existing blobs on disk are
+//! untouched by it.
 //!
 //! The one shape of corruption this module still refuses outright is an
 //! index that parses cleanly but names a digest with no blob on disk, or
@@ -107,6 +115,12 @@ const REVISION_INDEX_SCHEMA_VERSION: u32 = 1;
 
 /// Index file name inside the store directory.
 const INDEX_FILE: &str = "index.json";
+
+/// Backup index file name inside the store directory. [`RevisionStore`]
+/// writes it before the primary on every index save, so an `index.json`
+/// lost to external truncation is recoverable with its
+/// `high_water_revision`, `lkg` pointer, and `lineage` intact.
+const INDEX_BACKUP_FILE: &str = "index.json.bak";
 
 /// Subdirectory holding content-addressed document blobs.
 const BLOBS_DIR: &str = "blobs";
@@ -213,7 +227,9 @@ pub struct RevisionEntry {
     pub digest: String,
     /// Node-local monotonic revision number. Durable across restart and
     /// never reused, even when the same content is applied again (see
-    /// `digest` for that case).
+    /// `digest` for that case). One repair exception exists: when both
+    /// `index.json` and its backup are lost or corrupted, `open`
+    /// reinitializes the ring and numbering restarts at 1.
     pub revision: u64,
     /// Where the underlying document came from.
     pub provenance: BaseOrigin,
@@ -369,20 +385,18 @@ impl RevisionStore {
             Some(bytes) => match serde_json::from_slice::<RevisionIndex>(&bytes) {
                 Ok(index) => index,
                 Err(source) => {
-                    tracing::warn!(
-                        path = %index_path.display(),
-                        error = %source,
-                        "config revision index failed to parse; reinitializing an empty ring. \
-                         existing content-addressed blobs are untouched and become adoptable by \
-                         a future append",
-                    );
                     changed = true;
-                    RevisionIndex::fresh(fingerprint_digest.clone())
+                    recover_index(
+                        &directory,
+                        &index_path,
+                        Some(&source),
+                        fingerprint_digest.clone(),
+                    )
                 }
             },
             None => {
                 changed = true;
-                RevisionIndex::fresh(fingerprint_digest.clone())
+                recover_index(&directory, &index_path, None, fingerprint_digest.clone())
             }
         };
 
@@ -584,6 +598,12 @@ impl RevisionStore {
         let mut body = serde_json::to_vec_pretty(index)
             .map_err(|source| RevisionStoreError::json("encode revision index", source))?;
         body.push(b'\n');
+        // Backup first, primary second. A crash between the two leaves
+        // the primary one save behind the backup, never ahead of it, so
+        // an index later recovered from the backup carries an equal or
+        // higher `high_water_revision` - the direction that preserves
+        // the never-reuse-a-revision invariant.
+        write_atomically(&self.directory.join(INDEX_BACKUP_FILE), &body)?;
         write_atomically(&self.directory.join(INDEX_FILE), &body)
     }
 }
@@ -656,15 +676,71 @@ fn fingerprint_digest_of(fingerprint: &ClusterRestartFingerprint) -> String {
     sha256_hex(fingerprint.stable_lineage_key().as_bytes())
 }
 
+/// Rebuild the ring index after the primary `index.json` was missing or
+/// failed to parse. Prefers the backup copy [`RevisionStore`] maintains
+/// on every save: entries whose blob files survive are kept, with the
+/// recorded `high_water_revision`, `lkg` pointer, and `lineage`;
+/// entries whose blobs are gone are dropped, and an `lkg` pointer left
+/// naming no surviving entry is cleared so `open`'s consistency checks
+/// hold. When no readable backup exists either, falls back to a fresh
+/// empty ring, which restarts revision numbering and loses the
+/// last-known-good pointer - the warning says so.
+fn recover_index(
+    directory: &Path,
+    index_path: &Path,
+    parse_error: Option<&serde_json::Error>,
+    fingerprint_digest: Option<String>,
+) -> RevisionIndex {
+    let backup_path = directory.join(INDEX_BACKUP_FILE);
+    let backup = match read_bounded(&backup_path, MAX_INDEX_BYTES) {
+        Ok(Some(bytes)) => serde_json::from_slice::<RevisionIndex>(&bytes).ok(),
+        _ => None,
+    };
+    if let Some(mut recovered) = backup {
+        let named = recovered.entries.len();
+        recovered
+            .entries
+            .retain(|entry| blob_path(directory, &entry.digest).is_file());
+        if let Some(lkg) = &recovered.lkg {
+            if !recovered.entries.iter().any(|entry| &entry.digest == lkg) {
+                recovered.lkg = None;
+            }
+        }
+        tracing::warn!(
+            path = %index_path.display(),
+            backup = %backup_path.display(),
+            error = parse_error.map(tracing::field::display),
+            recovered_entries = recovered.entries.len(),
+            dropped_entries = named - recovered.entries.len(),
+            lkg_recovered = recovered.lkg.is_some(),
+            "config revision index was missing or failed to parse; rebuilt it from the backup \
+             copy, keeping the entries whose blob files survive and the recorded \
+             high_water_revision, so revision numbers are not reused",
+        );
+        return recovered;
+    }
+    if parse_error.is_some() || backup_path.exists() {
+        tracing::warn!(
+            path = %index_path.display(),
+            error = parse_error.map(tracing::field::display),
+            "config revision index was missing or failed to parse and no readable backup \
+             exists; reinitializing an empty ring. revision numbering restarts at 1 and any \
+             last-known-good pointer is lost. existing content-addressed blobs are untouched \
+             and become adoptable by a future append",
+        );
+    }
+    RevisionIndex::fresh(fingerprint_digest)
+}
+
 /// Read a bounded file. `Ok(None)` means it does not exist yet.
 ///
 /// An existing file that is zero-length is read as `Ok(Some(vec![]))`
-/// rather than refused outright as [`RevisionStoreError::Corrupt`]: a
-/// host crash can leave `index.json` truncated to exactly zero bytes
-/// (the rename in [`write_atomically`] lands, but the `File::create`
-/// that starts a from-scratch write on some filesystems can itself be
-/// the last thing durable before a crash), and that is a truncation
-/// like any other, not a distinct failure mode. Feeding empty bytes to
+/// rather than refused outright as [`RevisionStoreError::Corrupt`]:
+/// `index.json` can reach zero bytes through paths outside
+/// [`write_atomically`]'s own crash guarantees - external truncation by
+/// a backup or sync tool, filesystem repair after power loss, an
+/// operator's stray shell redirection - and that is a truncation like
+/// any other, not a distinct failure mode. Feeding empty bytes to
 /// [`RevisionStore::open`]'s existing `serde_json::from_slice` call
 /// fails to parse exactly the way a half-written file does, so it
 /// takes the same repair-and-reinitialize path already documented
@@ -710,11 +786,17 @@ fn write_atomically(path: &Path, body: &[u8]) -> Result<(), RevisionStoreError> 
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let temporary = parent.join(format!(".{file_name}.{}.{nanos}.tmp", std::process::id()));
-    let result = (|| {
+    let result: std::io::Result<()> = (|| {
         let mut file = create_private_file(&temporary)?;
         file.write_all(body)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)
+        std::fs::rename(&temporary, path)?;
+        // The rename is atomic but not durable until the parent
+        // directory's entry is flushed; without this, a crash right
+        // after the rename can forget it and resurface the old file.
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -858,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_index_is_repaired_on_the_first_open() {
+    fn a_truncated_index_is_repaired_from_the_backup_on_the_first_open() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         {
             let mut store = store(temp.path(), 10);
@@ -873,11 +955,14 @@ mod tests {
         std::fs::write(&index_path, &original[..original.len() / 2]).expect("truncate index");
 
         // The repair must be the effect of `open` itself: no other store
-        // call happens before this assertion.
+        // call happens before this assertion. Every index save also
+        // wrote the backup copy, so the repair recovers the history
+        // instead of reinitializing an empty ring.
         let reopened = RevisionStore::open(temp.path(), 10, None).expect("open repairs");
-        assert!(
-            reopened.entries().is_empty(),
-            "a truncated index is reinitialized to an empty ring rather than refused",
+        assert_eq!(
+            reopened.entries().len(),
+            1,
+            "a truncated index is rebuilt from the backup rather than emptied or refused",
         );
 
         // And the repair was persisted immediately, so a second open finds
@@ -887,15 +972,43 @@ mod tests {
             .expect("repaired index is valid json");
     }
 
-    /// A host crash can leave `index.json` truncated all the way down
-    /// to zero bytes, not just to a half-written fragment: the case the
-    /// test above covers. Before this test's fix, a zero-length file
-    /// took a different path than a truncated-but-nonempty one --
+    /// When the backup copy is gone or corrupt too, repair falls back
+    /// to the pre-backup behavior: reinitialize an empty ring rather
+    /// than refuse to open, with the loss named in the warning.
+    #[test]
+    fn a_ring_with_both_index_copies_corrupted_reinitializes_empty() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut store = store(temp.path(), 10);
+            store
+                .append(b"origins: {}\n", metadata(1_000))
+                .expect("append");
+        }
+        std::fs::write(temp.path().join(INDEX_FILE), []).expect("zero the index");
+        std::fs::write(temp.path().join(INDEX_BACKUP_FILE), b"{not json")
+            .expect("corrupt the backup");
+
+        let reopened = RevisionStore::open(temp.path(), 10, None)
+            .expect("open still repairs rather than refusing");
+        assert!(
+            reopened.entries().is_empty(),
+            "nothing is recoverable without a readable index copy",
+        );
+        let on_disk = std::fs::read(temp.path().join(INDEX_FILE)).expect("read repaired index");
+        serde_json::from_slice::<serde_json::Value>(&on_disk)
+            .expect("repaired index is valid json");
+    }
+
+    /// External truncation can leave `index.json` at exactly zero
+    /// bytes, not just a half-written fragment: the case the test
+    /// above covers. Before this test's fix, a zero-length file took a
+    /// different path than a truncated-but-nonempty one --
     /// `read_bounded` refused it outright as `Corrupt` -- so `open`
     /// returned `Err` instead of repairing, which bricks the ring
     /// (`sbproxy-core`'s process-wide slot moves to its `Failed` state
     /// and every history route 503s) until an operator deletes the file
-    /// by hand.
+    /// by hand. Repair now recovers from the backup copy, so the ring
+    /// keeps its history too.
     #[test]
     fn a_zero_byte_index_is_repaired_on_the_first_open_exactly_like_a_truncated_one() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -922,9 +1035,10 @@ mod tests {
         // call happens before this assertion.
         let reopened = RevisionStore::open(temp.path(), 10, None)
             .expect("a zero-byte index must be repaired, not refused");
-        assert!(
-            reopened.entries().is_empty(),
-            "a zero-byte index is reinitialized to an empty ring rather than refused",
+        assert_eq!(
+            reopened.entries().len(),
+            1,
+            "a zero-byte index is rebuilt from the backup rather than emptied or refused",
         );
 
         // And the repair was persisted immediately, so a second open
@@ -936,6 +1050,49 @@ mod tests {
         );
         serde_json::from_slice::<serde_json::Value>(&on_disk)
             .expect("repaired index is valid json");
+    }
+
+    /// Phase-2 review: a zeroed `index.json` must not cost the ring
+    /// its history. `save_index` writes a backup alongside the
+    /// primary, and the repair path rebuilds from it, keeping only
+    /// entries whose blob files survive - so `high_water_revision` and
+    /// the last-known-good pointer outlive the truncation, and
+    /// revision numbers are still never reused.
+    #[test]
+    fn a_zeroed_index_recovers_entries_high_water_and_lkg_from_the_backup() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut store = store(temp.path(), 10);
+            store
+                .append(b"origins: {}\n# one\n", metadata(1_000))
+                .expect("append");
+            let second = store
+                .append(b"origins: {}\n# two\n", metadata(2_000))
+                .expect("append");
+            store.mark_good(second.revision).expect("mark lkg");
+        }
+        std::fs::write(temp.path().join(INDEX_FILE), []).expect("zero the index");
+
+        let mut reopened = RevisionStore::open(temp.path(), 10, None).expect("open repairs");
+        assert_eq!(
+            reopened.entries().len(),
+            2,
+            "both applied revisions must survive a zeroed index"
+        );
+        assert_eq!(
+            reopened.lkg().map(|entry| entry.revision),
+            Some(2),
+            "the last-known-good pointer must survive a zeroed index"
+        );
+        // `high_water_revision` survived too: the next append continues
+        // the sequence instead of reusing revision 1.
+        let third = reopened
+            .append(b"origins: {}\n# three\n", metadata(3_000))
+            .expect("append after repair");
+        assert_eq!(
+            third.revision, 3,
+            "revision numbers are never reused, repair included"
+        );
     }
 
     /// The other half of `read_bounded`'s zero-length change: a blob

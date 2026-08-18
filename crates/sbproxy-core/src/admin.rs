@@ -2028,10 +2028,10 @@ fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'sta
             return (
                 500,
                 "application/json",
-                format!(
-                    r#"{{"error":"read stored revision: {}"}}"#,
-                    error.to_string().replace('"', "'")
-                ),
+                serde_json::json!({
+                    "error": format!("read stored revision: {error}"),
+                })
+                .to_string(),
             )
         }
     };

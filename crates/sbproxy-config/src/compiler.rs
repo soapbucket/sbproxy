@@ -111,6 +111,27 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing or empty 'type' field"))
 }
 
+/// The access-log `custom_fields` bare-name interpolation vocabulary,
+/// resolved per request by `sbproxy-core`'s `custom_log::resolve_var`
+/// and documented in docs/access-log.md. Like the dotted runtime
+/// vocabulary, a placeholder naming one of these is not an env
+/// reference: substituting a process variable would bake a boot-time
+/// constant into a per-request log field, and reporting it as
+/// unresolved would make a config authority refuse the whole bundle
+/// over a documented form. Exact names only - a `:-` default is not
+/// part of `resolve_var`'s syntax, so `${method:-GET}` keeps its env
+/// treatment.
+const ACCESS_LOG_BARE_VARS: &[&str] = &[
+    "method",
+    "path",
+    "host",
+    "query",
+    "status",
+    "tenant_id",
+    "provider",
+    "model",
+];
+
 /// True when a `${...}` placeholder's name (the part before an optional
 /// `:-` default) can name an environment variable at all.
 ///
@@ -124,7 +145,12 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
 /// report it as unresolved (reporting it would tell the operator to
 /// export a variable that would break the tool if they did, and the
 /// config-authority subscriber would refuse the whole bundle over it).
+/// The bare access-log names in [`ACCESS_LOG_BARE_VARS`] are excluded
+/// by exact match for the same reason.
 fn placeholder_is_env_reference(var_name: &str) -> bool {
+    if ACCESS_LOG_BARE_VARS.contains(&var_name) {
+        return false;
+    }
     let name = var_name.split_once(":-").map_or(var_name, |(name, _)| name);
     !name.contains('.')
 }
@@ -4705,6 +4731,52 @@ origins:
             refs[0].contains("${SBPROXY_TEST_UNSET_REVIEW_TOKEN}"),
             "got: {refs:?}"
         );
+    }
+
+    // Phase-2 review: the access-log `custom_fields` bare-name
+    // vocabulary (docs/access-log.md; `custom_log.rs`'s `resolve_var`)
+    // is per-request interpolation, not env references. Before this
+    // fix, the shipped example `value: "${tenant_id}"` was reported as
+    // an unresolved env reference, so a config authority refused the
+    // bundle fleet-wide - and exporting the named variable made it
+    // worse by baking a boot-time constant into a per-request field.
+    #[test]
+    fn access_log_bare_names_survive_interpolation_and_are_not_reported() {
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("tenant_id", Some("spliced-from-env-would-be-a-bug")),
+            ("path", Some("also-a-bug")),
+            ("method", None),
+        ]);
+        for name in ACCESS_LOG_BARE_VARS {
+            let placeholder = format!("${{{name}}}");
+            assert_eq!(
+                interpolate_env_vars(&placeholder),
+                placeholder,
+                "bare access-log name {name} must survive pre-parse interpolation"
+            );
+        }
+        // The hazard scan does not report them either, so a config
+        // authority no longer refuses the documented example.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      custom_fields:
+        - name: tenant
+          value: "${tenant_id}"
+        - name: m
+          value: "${method}"
+"#;
+        assert_eq!(
+            unresolved_env_references(yaml),
+            Vec::<String>::new(),
+            "access-log bare names are per-request vocabulary, not env references"
+        );
+        // A `:-` default keeps env semantics: `resolve_var` has no
+        // default syntax, so this form was never access-log vocabulary
+        // and its v1.12 shell-default treatment is preserved.
+        assert_eq!(interpolate_env_vars("${method:-GET}"), "GET");
     }
 
     // WOR-1817: custom YAML tags are stripped by the parser, so

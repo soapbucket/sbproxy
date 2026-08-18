@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-18*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -108,6 +108,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
+| `sbproxy_ai_context_poisoning_blocked_total` | Counter | `stable` | `beta` | none | Requests blocked by the context-poisoning guardrail (a finding whose configured action is deny). |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
 | `sbproxy_ai_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model` | Micro-USD avoided by a semantic-cache hit. |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `stable` | `beta` | `provider`, `model`, `tenant_id` | Derived AI request cost in micro-USD. |
@@ -151,6 +152,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_shadow_timeout_total` | Counter | `stable` | `beta` | none | Shadow tasks canceled after their wall-clock supervisor timeout. |
 | `sbproxy_ai_stream_guardrail_skipped_total` | Counter | `stable` | `beta` | `guardrail` | Output guardrails skipped on streaming responses via stream_policy: off. |
 | `sbproxy_ai_stream_guardrail_violations_total` | Counter | `stable` | `beta` | `guardrail` | Streaming output guardrail violations, by guardrail type. |
+| `sbproxy_ai_stream_guardrail_decode_fallback_total` | Counter | `stable` | `beta` | none | Streaming chunks where guardrails fell back to raw-frame matching because delta decoding failed. |
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `stable` | `stable` | `surface`, `method` | AI request latency partitioned by classified surface. |
 | `sbproxy_ai_surface_requests_total` | Counter | `stable` | `stable` | `surface`, `method` | AI gateway requests partitioned by classified surface. |
 | `sbproxy_ai_token_estimate_error_ratio` | Histogram | `stable` | `beta` | `model` | Relative error of pre-request token estimate vs upstream usage.prompt_tokens. |
