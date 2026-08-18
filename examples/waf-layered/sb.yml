@@ -110,7 +110,8 @@ origins:
           track_by: ip
 
       # 4. The other direction: outbound credentials, not inbound
-      #    attacks. Scans the same URI + headers surface the WAF does.
+      #    attacks. Scans the URI, headers, and (by default) the
+      #    buffered body.
       - type: dlp
         action: block
         detectors:

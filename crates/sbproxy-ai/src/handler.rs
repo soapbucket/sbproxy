@@ -1159,6 +1159,31 @@ impl AiHandlerConfig {
         // Out-of-band placeholder maps (a per-request side channel
         // keyed off the cache hit) would re-enable both at once but
         // are out of scope for v1.
+        // `pii.redact_response: true` ("apply redaction to outbound
+        // response bodies") is declared on `PiiConfig` but nothing on
+        // the AI response path reads it: `redact_request` is applied
+        // by `apply_json_request_pii_redaction` before the request
+        // forwards, and there is no response-side counterpart,
+        // buffered or streaming. `PiiRedactor::from_config` itself
+        // does not read either flag, so this is not caught anywhere
+        // downstream either. An operator who sets `redact_response:
+        // true` believes model output is being scrubbed when it is
+        // not. Refuse rather than boot green with the knob silently
+        // inert, the same disposition `routing.strategy: token_rate`
+        // and the removed `context_overflow:` block get above.
+        if config.pii.as_ref().is_some_and(|p| p.redact_response) {
+            anyhow::bail!(
+                "ai `pii.redact_response: true` is refused: no code path applies PII \
+                 redaction to outbound AI response bodies today. `redact_request` covers \
+                 inbound request bodies only. Configuring `redact_response: true` would \
+                 leave an operator believing responses are scrubbed when they are not. \
+                 Remove `redact_response` (or leave it at its default `false`) until \
+                 response-body redaction ships. The AI guardrail mesh's `redact_on_flag` \
+                 (docs/ai-guardrail-mesh.md) redacts a *request* body pre-dispatch on a \
+                 flagged verdict; nothing redacts the model's response before it reaches \
+                 the client."
+            );
+        }
         let has_reversible = config
             .pii
             .as_ref()
@@ -3211,8 +3236,7 @@ mod tests {
             "providers": [{"name": "openai"}],
             "pii": {
                 "enabled": true,
-                "redact_request": false,
-                "redact_response": true
+                "redact_request": false
             }
         });
         let config = AiHandlerConfig::from_config(cfg_json).unwrap();
@@ -3220,6 +3244,48 @@ mod tests {
         let redacted = config.apply_request_pii(&mut body);
         assert!(!redacted);
         assert_eq!(body["prompt"].as_str(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn redact_response_true_is_refused_at_load() {
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "pii": {
+                "enabled": true,
+                "redact_response": true
+            }
+        });
+        let err = AiHandlerConfig::from_config(cfg_json).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("redact_response"),
+            "error should name the refused key: {message}"
+        );
+        assert!(
+            message.contains("no code path applies PII"),
+            "error should explain why, not just reject the value: {message}"
+        );
+    }
+
+    #[test]
+    fn redact_response_default_false_still_loads() {
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "pii": { "enabled": true }
+        });
+        AiHandlerConfig::from_config(cfg_json).unwrap();
+    }
+
+    #[test]
+    fn redact_response_explicit_false_still_loads() {
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "pii": {
+                "enabled": true,
+                "redact_response": false
+            }
+        });
+        AiHandlerConfig::from_config(cfg_json).unwrap();
     }
 
     #[test]
