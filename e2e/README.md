@@ -1,11 +1,11 @@
 # sbproxy-e2e
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-18*
 
 End-to-end integration tests for the OSS sbproxy binary. The crate
 ships a small `ProxyHarness` library plus per-feature integration
 test files. Each test spawns the release `sbproxy` binary against a
 temporary YAML config on an ephemeral port, exercises documented
-HTTP behaviour via reqwest, and tears the child down on Drop.
+HTTP behavior via reqwest, and tears the child down on Drop.
 
 ## Prerequisites
 
@@ -65,17 +65,20 @@ false-fails a sidecar-shutdown test):
 cargo test --release -p sbproxy-e2e -- --test-threads=1
 ```
 
-The required CI gate covers the OSS workspace's unit + lib tests;
-e2e runs on a schedule and locally, not on every PR.
+The required CI gate covers the OSS workspace's unit + lib tests plus
+a small offline e2e subset; the rest of the suite runs on a schedule
+and locally, not on every PR.
 
 | Workflow | Trigger | Covers |
 |---|---|---|
+| `.github/workflows/ci.yml` (`e2e-subset` job) | every code PR, required | a small offline subset (see the job's comment block for the list and the bar for adding to it) |
 | `.github/workflows/payments-e2e.yml` | 03:40 UTC nightly, `workflow_dispatch` | `settlement_gate` + `usage_bridge` only, against the payments binary |
 | `.github/workflows/release-checks.yml` | 09:30 UTC nightly, tags, `workflow_dispatch` | the whole workspace single-threaded, e2e included |
 | `.github/workflows/e2e.yml` | 09:30 UTC Mondays, tags, `workflow_dispatch` | the whole e2e suite, Redis required |
 
-Only the first of those is named for the tests it runs, and only the
-first and the third open a GitHub issue when they go red.
+Of the scheduled lanes, only `payments-e2e.yml` is named for the tests
+it runs, and only `payments-e2e.yml` and `e2e.yml` open a GitHub issue
+when they go red.
 `payments-e2e.yml` exists because the exactly-once assertion in
 `challenge_settle_allow_and_replay_refusal` is a revenue property, and
 finding it broken a week later, buried in a run of roughly 8500 other

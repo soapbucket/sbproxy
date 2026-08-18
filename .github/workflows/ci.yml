@@ -10,6 +10,8 @@ name: CI
 #   lint           (~4 min) fmt, clippy, rustdoc
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
 #                           (three test targets; see the job for why)
+#   e2e-subset     (~6 min) five offline e2e files against a spawned proxy,
+#                           required on every code PR (WOR-2469)
 #   payments      (~13 min) clippy + tests under the settlement feature union
 #   ui             (~40 s)  node typecheck + vitest
 #   supply-chain   (~60 s)  cargo-deny (crates) + npm audit (admin UI)
@@ -137,14 +139,15 @@ jobs:
       - name: build workspace
         run: cargo build --workspace --exclude sbproxy-e2e --locked
 
-      # E2E tests are intentionally OUT OF SCOPE for the PR-required CI
-      # lane. They spin up the full proxy binary, listen on real ports,
-      # and exercise the network stack; on shared CI runners this leads
-      # to startup-timeout flakiness (mesh gossip, websocket upgrade)
-      # that does not signal a real regression. Run them locally with
-      # `cargo test --workspace` after building the binary, or run them
-      # nightly via the release-checks lane. The cardinality and redaction
-      # canaries are the exception and run in the obs-budgets job.
+      # The bulk of the e2e suite is intentionally OUT OF SCOPE for this
+      # job. Those tests spin up the full proxy binary, listen on real
+      # ports, and exercise the network stack; on shared CI runners the
+      # heavier ones (mesh gossip, websocket upgrade) hit startup-timeout
+      # flakiness that does not signal a real regression. Run them locally
+      # with `cargo test --workspace` after building the binary, or rely
+      # on the scheduled lanes. Two narrow slices are the exception: the
+      # cardinality and redaction canaries in the obs-budgets job, and the
+      # required offline subset in the e2e-subset job (WOR-2469).
       - name: test (excludes e2e)
         run: cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
 
@@ -375,6 +378,100 @@ jobs:
         run: >-
           cargo test --workspace --locked
           --test cardinality --test metrics_per_agent --test redaction
+
+  e2e-subset:
+    name: e2e subset (required)
+    needs: changes
+    # WOR-2469: PR #1049 changed 425 lines across request_phase.rs and
+    # proxy_http.rs, merged with every required check green, and altered
+    # four documented end-to-end behaviors, one of them an outright break
+    # of a shipped example (WOR-2468). The only tests that assert
+    # end-to-end observable behavior ran weekly, so the break sat on main
+    # for three days. This lane closes that false green: a small offline
+    # slice of the e2e suite runs on every code PR, and it is required.
+    #
+    # The broad `code` filter, deliberately, and not an allowlist of the
+    # two files #1049 touched, for the same reason the payments lane
+    # documents below: what this lane guards is assembled end-to-end
+    # behavior, and that breaks from sbproxy-modules, sbproxy-transport,
+    # config compilation, and the pingora glue just as well as from
+    # request_phase.rs. A lane that does not fire on the change that
+    # breaks it reports success while doing nothing.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # The harness's documented override for an unusually slow host
+      # (e2e/src/lib.rs). Shared runners need more startup headroom than
+      # a quiet dev machine; e2e.yml sets the same value.
+      SBPROXY_E2E_STARTUP_TIMEOUT_SECS: '60'
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same package selection and cache key as obs-budgets: sbproxy-e2e
+      # widens the feature union past the `test` lane's, so its artifacts
+      # live behind the `e2e` key. On a push to main both jobs may reach
+      # the save step for this key; the second save finds the entry
+      # already present and skips, so sharing the key is cheaper than a
+      # third multi-GB cache line against the 10 GB per-repo limit.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: e2e
+
+      # `--workspace` rather than `-p sbproxy-e2e` so both calls in this
+      # job agree on the feature union and the build is paid once. cargo
+      # cannot infer that the harness spawns the sbproxy binary at
+      # runtime, so the build step produces it explicitly.
+      - name: build sbproxy binary (for the e2e harness)
+        run: cargo build --workspace --locked
+
+      # The subset, five files, retracing three of #1049's four silent
+      # behavior changes plus the response-phase class the sessions
+      # example documents (the fourth, MCP session-id freshness, lives in
+      # the MCP stream tests, which are too heavy for the offline bar):
+      #
+      #   static_action  - harness smoke; "if this fails everything else
+      #                    is suspect" (its own module doc)
+      #   body_routing   - JSON-body forward_rules routing, the exact
+      #                    shipped-example shape #1049 broke (WOR-2468)
+      #   sessions       - session-cookie issuance in the proxied response
+      #                    filter, the shipped sessions example's
+      #                    contract; response-filter injection is the
+      #                    rubric's recurring silent-no-op class
+      #   admin_reload   - POST /admin/reload swaps the live pipeline;
+      #                    #1049 changed the rejected-reload status
+      #   transform_json - response-transform contracts including the
+      #                    fail_on_error failure path, whose status
+      #                    semantics #1049 changed undocumented
+      #
+      # Selection bar, in order: offline (MockUpstream or static actions
+      # on loopback; no mesh, no websockets, no Redis, no payments or
+      # no-default-features binary), absent from the known load-flake
+      # roster, and covering a behavior a shipped example documents.
+      # model_cluster_control is deliberately NOT here: its root-cause
+      # fix (#1142) is a day old, and a test earns a place in a required
+      # lane by a quiet scheduled history first. Grow the list under the
+      # same bar; one timing-sensitive test flaking here would burn trust
+      # in exactly the lane that exists to restore it.
+      #
+      # --test-threads=1 for the same reason e2e.yml runs the full suite
+      # single-threaded: every test spawns its own proxy process with a
+      # multi-core tokio runtime, and parallel harnesses oversubscribe
+      # the runner. A handful of tests; the serialization costs seconds.
+      # SBPROXY_E2E_BIN pins the harness to the binary this job just
+      # built, because the harness prefers target/release/sbproxy when
+      # one is present and nothing restored from cache may shadow the
+      # code under test.
+      - name: e2e subset (shipped-example behavior)
+        env:
+          SBPROXY_E2E_BIN: ${{ github.workspace }}/target/debug/sbproxy
+        run: >-
+          cargo test --workspace --locked
+          --test static_action --test body_routing --test sessions
+          --test admin_reload --test transform_json
+          -- --test-threads=1
 
   payments:
     name: payments (settlement features)
@@ -677,10 +774,15 @@ jobs:
   # improvement. The cost of being wrong in the two directions is not
   # symmetric either: a false red here is a rerun, while a false green ships
   # code that moves money.
+  #
+  # `e2e-subset` is in the list on the same asymmetry: a false red is a
+  # rerun, while a false green is a behavior change or an outright break
+  # sitting on main until the weekly sweep notices, which is how WOR-2468
+  # went out and stayed out for three days (WOR-2469).
   required:
     name: build / test
     if: always()
-    needs: [changes, test, lint, obs-budgets, payments, ui, supply-chain, embed-admin-ui]
+    needs: [changes, test, lint, obs-budgets, e2e-subset, payments, ui, supply-chain, embed-admin-ui]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
