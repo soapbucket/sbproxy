@@ -187,7 +187,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_bundle_fetch_total` | Counter | `stable` | `beta` | `result` | Config bundle fetch cycles, by result. |
 | `sbproxy_config_bundle_gossip_total` | Counter | `stable` | `beta` | `outcome` | Cluster config-revision announcement probes, by outcome. |
 | `sbproxy_config_bundle_revision` | Gauge | `stable` | `beta` | none | Authority revision of the config bundle this node currently serves. |
+| `sbproxy_config_history_entries` | Gauge | `stable` | `beta` | none | Entries currently held in the config revision ring. |
 | `sbproxy_config_reload_total` | Counter | `stable` | `beta` | `result` | Config reload attempts, by result. |
+| `sbproxy_config_revision_info` | Gauge | `stable` | `beta` | `revision`, `digest`, `provenance` | Current entry in the config revision ring; always 1, the revision/digest/provenance are the labels. |
 | `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |

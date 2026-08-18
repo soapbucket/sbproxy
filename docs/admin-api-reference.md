@@ -1,14 +1,14 @@
 # Admin API reference
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-18*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
 lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
-operations, per-target health, spend and audit, config read/write and hot reload/drift, model-host catalog and
-deployment lifecycle, the response/semantic/key-policy caches, cluster
-status and the replicated-state substrate, prompts, the chat playground, and
-the emitted OpenAPI document.
+operations, per-target health, spend and audit, config read/write and hot reload/drift, the local config-revision
+history ring, model-host catalog and deployment lifecycle, the
+response/semantic/key-policy caches, cluster status and the replicated-state
+substrate, prompts, the chat playground, and the emitted OpenAPI document.
 
 This page is the per-route reference: every path, its auth/role
 requirement, request and response shape, and status codes. For a
@@ -27,7 +27,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
 - [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
-- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, log level, the owasp_api_top10 pack manifest
+- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
 - [Cache admin](#cache-admin) - response cache and key-policy cache
 - [Cluster control plane](#cluster-control-plane) - status, deployments, enrollment, replicated state
@@ -774,6 +774,8 @@ published generation. Loaded hooks without an attachment are `unconsumed`.
 `not_evaluated` means doctor fell back to loader-level inspection because full
 candidate construction did not finish. See the
 [extension bundle runbook](operator-runbook.md#extension-bundles).
+
+![The running /api/extensions inventory for a loaded bundle, then sbproxy doctor showing the same bundle as a stopped candidate, then a broken manifest staying visible as a bounded failed record](assets/extension-inventory.gif)
 
 ### `GET /api/openapi.json`, `GET /api/openapi.yaml`
 
@@ -1626,6 +1628,111 @@ describe the previous build. Content type is
 | `304` | `If-None-Match` matched the current build's schema. No body. |
 | `401` | Not authenticated. |
 | `405` | Anything other than `GET`. |
+
+---
+
+### `GET /admin/config/history`
+
+The durable local ring of every config this proxy has applied: content-addressed
+entries, newest first, plus the ring's lineage id and which entry (if any) is
+marked last-known-good. Requires `proxy.config_history.enabled: true`; see
+[configuration.md](configuration.md#config_history) for the block that turns it
+on and the retention it applies.
+
+```json
+{
+  "lineage": "b2b1b8b0-4b8e-4f7a-9b8b-1f0a2c3d4e5f",
+  "lkg_revision": 41,
+  "entries": [
+    {
+      "revision": 42,
+      "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+      "provenance": "local_file",
+      "state": "applied",
+      "applied_at": "2026-08-16T10:15:32.456Z",
+      "actor": "admin",
+      "blast_radius": "reload",
+      "degraded": []
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `lineage` | string | UUID minted the first time this ring was created. Stable across restarts and `source:` repoints. |
+| `lkg_revision` | number or null | Revision number of the entry marked last-known-good, or `null` when nothing has been marked yet. |
+| `entries` | array | Newest first. |
+| `entries[].revision` | number | Node-local, monotonic. Durable across restart, never reused. |
+| `entries[].digest` | string | SHA-256 of the pre-resolution document, lowercase hex, no scheme prefix. |
+| `entries[].provenance` | string | `local_file`, `git`, `authority`, or `merged`. This release emits `local_file` and `git` only; see the note below. |
+| `entries[].state` | string | `applied`, `good`, `failed`, or `reverted`. |
+| `entries[].applied_at` | string | RFC 3339. |
+| `entries[].actor` | string | Operator id, `"boot"`, or the config authority's identity, when known. May be empty. |
+| `entries[].blast_radius` | string or null | `hitless`, `reload`, `restart`, or `breaking`, against the previous entry. `null` for the ring's first entry. |
+| `entries[].degraded` | array of strings | Subsystems that did not apply cleanly when this revision applied. Empty for a fully applied revision. |
+
+`provenance` is a four-value vocabulary going forward, but this release can
+only ever emit `local_file` or `git`. What is stored is where the *base*
+document came from before any config-authority overlay merged into it, not
+whether an overlay was involved; distinguishing `authority` (fully
+authority-sourced) and `merged` (base plus an authority overlay) needs the
+per-leaf provenance map `GET /admin/config/effective` already computes to be
+threaded into the ring's write path, which has not happened yet. An
+authority-merged or `source:`-refreshed revision still records `local_file`
+or `git` here today, whichever the base document was.
+
+Read-only operators may call this.
+
+| Status | When |
+|---|---|
+| `200` | Ring read successfully. |
+| `404` | `proxy.config_history` is absent or `enabled: false`. Body: `{"error": "config history is not enabled"}`. |
+| `503` | The block is enabled but the ring failed to open at boot (an unwritable directory, or a shape it refuses to repair). Body: `{"error": "config history failed to open at boot: <reason>"}`. The proxy is otherwise running normally; only this ring is unavailable. Check the boot log for the same reason. |
+
+The ring is a local audit trail today. Nothing in this response promotes an
+entry, and nothing here moves the `lkg_revision` pointer; see
+[operator-runbook.md](operator-runbook.md#config-history-ring) for what the
+ring does and does not do yet.
+
+---
+
+### `GET /admin/config/history/{digest}`
+
+One ring entry in full, by its content digest: the entry's metadata, the
+stored pre-resolution YAML, and the rendered `plan()` diff against the
+config currently running.
+
+```json
+{
+  "entry": {
+    "revision": 42,
+    "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+    "provenance": "local_file",
+    "state": "applied",
+    "applied_at": "2026-08-16T10:15:32.456Z",
+    "actor": "admin",
+    "blast_radius": "reload",
+    "degraded": []
+  },
+  "document": "proxy:\n  http_bind_port: 8080\n...",
+  "plan_text": "~ origins.api.action.url: https://old -> https://new (reload)\n"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `entry` | object | Same shape as one element of `entries[]` in [`GET /admin/config/history`](#get-adminconfighistory). |
+| `document` | string | The stored pre-resolution YAML, byte-for-byte. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. |
+| `plan_text` | string | The same terraform-style text diff `sbproxy plan` renders by default, computed between this revision and the config running now. |
+
+Read-only operators may call this.
+
+| Status | When |
+|---|---|
+| `200` | Entry found. |
+| `404` | `proxy.config_history` is absent or `enabled: false` (`{"error": "config history is not enabled"}`), or `digest` names no entry in the ring (`{"error": "unknown digest"}`). |
+| `503` | The block is enabled but the ring failed to open at boot. Same body shape as [`GET /admin/config/history`](#get-adminconfighistory)'s `503`. |
 
 ### `GET`, `PUT` `/admin/log-level`
 

@@ -1645,6 +1645,12 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         validate_compression_state_local_path(local_path)?;
     }
 
+    if let Some(config_history) = config_file.proxy.config_history.as_ref() {
+        config_history
+            .validate()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+    }
+
     // WOR-1818: report interpolation leftovers. An unset `${VAR}` stays
     // literal, which for most fields degrades into a confusing runtime
     // failure. Warn once, listing every remaining reference with its
@@ -4108,6 +4114,18 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    #[test]
+    fn compile_rejects_a_config_history_keep_below_one() {
+        let yaml = "proxy:\n  config_history:\n    keep: 0\n";
+        let error = compile_config(yaml)
+            .err()
+            .expect("compile must run config_history validation");
+        assert!(
+            format!("{error:#}").contains("proxy.config_history.keep must be at least 1"),
+            "{error:#}"
+        );
     }
 
     #[test]

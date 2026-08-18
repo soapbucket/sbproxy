@@ -9,13 +9,14 @@ When `pii.enabled: true` is set on an AI proxy origin, the gateway redacts well-
 ## Run
 
 ```bash
+# The upstream must be up first so it can echo the redacted body back.
+python3 fixture.py &
+
 export OPENAI_API_KEY=...
 sbproxy serve -f sb.yml
 ```
 
-The example points the OpenAI provider at `https://test.sbproxy.dev/anything` so you can see the exact body the upstream would have received, with PII already redacted.
-
-**Known issue:** the shared `test.sbproxy.dev` fixture currently does not echo the request body under `/anything` (or `/post`): it only returns `method`, `url`, `headers`, `query`, and `timestamp`, so the `jq -r .json...` extraction below returns nothing against the real fixture. The redaction itself is not affected: pointing the same config at a local body-echoing target confirms the gateway still rewrites the request exactly as shown. Swap `base_url` for your own echo endpoint to see it directly.
+The example points the OpenAI provider at a local body-echoing fixture (`fixture.py`, `http://127.0.0.1:8098`) so you can see the exact body the upstream would have received, with PII already redacted. The shared `test.sbproxy.dev` fixture used to serve this role, but its `/anything` route stopped echoing the request body (it now returns only `method`, `url`, `headers`, `query`, and `timestamp`), so `jq .json` against it is always `null`. `fixture.py` is a stdlib-only stand-in that echoes any JSON body it receives back under `"json"`, matching the shape `/anything` used to return.
 
 ## Try it
 

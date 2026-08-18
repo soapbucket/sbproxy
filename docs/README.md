@@ -58,6 +58,7 @@ SBproxy's traditional reverse-proxy pillar: routing, load balancing, transforms,
 
 - [api-gateway.md](api-gateway.md) - the entry point for the traditional reverse-proxy pillar: routing, auth, rate limiting, WAF, load balancing, protocols, and OpenAPI, independent of any AI functionality. Start here if you're replacing Nginx, Envoy, or Kong.
 - [routing.md](routing.md) - the hub for how a request gets matched to an upstream: hostname matching, forward rules, load balancing algorithms, protocol-specific actions (GraphQL, gRPC, gRPC-Web, WebSocket), and failover.
+- [websocket.md](websocket.md) - the `websocket` action: config keys, upgrade semantics, what runs before the upgrade, and which of `subprotocols` / `max_message_size` are actually enforced.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
 - [transforms.md](transforms.md) - what a transform is, the common transform fields, chaining and order, and one section per shipped transform kind (JSON shaping, text/encoding, HTML/Markdown, scripting transforms, WASM, agent content-shaping).
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.

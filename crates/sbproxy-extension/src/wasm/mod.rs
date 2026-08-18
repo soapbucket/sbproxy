@@ -670,9 +670,28 @@ impl WasmRuntime {
     /// The `_function` argument is ignored for the WASI ABI; it is
     /// retained for source compatibility with the previous stub. A
     /// future ABI variant may dispatch on function names.
-    pub fn execute(&self, _function: &str, input: &[u8]) -> Result<Vec<u8>> {
+    pub fn execute(&self, function: &str, input: &[u8]) -> Result<Vec<u8>> {
+        self.execute_with_env(function, input, &[])
+    }
+
+    /// Same as [`Self::execute`], but sets the given WASI environment
+    /// variables for this invocation only.
+    ///
+    /// This is the channel the `wasm` transform's opt-in
+    /// `request_context: true` flag uses to carry the per-request `ctx`
+    /// JSON blob (see `sbproxy_modules::WasmTransform`): the body
+    /// contract stays raw bytes on stdin, so a module that never asks
+    /// for `request_context` sees byte-identical stdin whether or not
+    /// this method exists. `env` is empty on every call `execute` makes,
+    /// so that path is unaffected either way.
+    pub fn execute_with_env(
+        &self,
+        _function: &str,
+        input: &[u8],
+        env: &[(String, String)],
+    ) -> Result<Vec<u8>> {
         let start_ts = std::time::Instant::now();
-        let out = self.execute_inner(input);
+        let out = self.execute_inner(input, env);
         let elapsed = start_ts.elapsed().as_secs_f64();
         sbproxy_observe::metrics::record_script_duration("wasm", elapsed);
         let label = match &out {
@@ -696,7 +715,7 @@ impl WasmRuntime {
         out
     }
 
-    fn execute_inner(&self, input: &[u8]) -> Result<Vec<u8>> {
+    fn execute_inner(&self, input: &[u8], env: &[(String, String)]) -> Result<Vec<u8>> {
         let module = self
             .module
             .as_ref()
@@ -715,11 +734,17 @@ impl WasmRuntime {
         let stderr_capture = BoundedStderrPipe::new();
         let stderr: WritePipe<BoundedStderrPipe> = WritePipe::new(stderr_capture.clone());
 
-        let wasi = WasiCtxBuilder::new()
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder
             .stdin(Box::new(stdin))
             .stdout(Box::new(stdout.clone()))
-            .stderr(Box::new(stderr.clone()))
-            .build();
+            .stderr(Box::new(stderr.clone()));
+        if !env.is_empty() {
+            wasi_builder
+                .envs(env)
+                .map_err(|e| anyhow::anyhow!("setting WASM environment variables: {e}"))?;
+        }
+        let wasi = wasi_builder.build();
 
         let limits = StoreLimitsBuilder::new()
             .memory_size((self.config.max_pages() as usize).saturating_mul(64 * 1024))

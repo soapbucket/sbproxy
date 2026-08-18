@@ -896,6 +896,194 @@ impl ClusterRestartFingerprint {
             (None, None) => "the cluster fingerprint changed".to_string(),
         }
     }
+
+    /// A stable textual encoding of every field, used as the lineage key
+    /// for a config revision ring
+    /// ([`crate::revision_store::RevisionStore`]): two fingerprints that
+    /// produce the same key are the same installation, and any change to
+    /// this key's shape mints a new lineage for every fleet that upgrades
+    /// into it.
+    ///
+    /// Deliberately not [`std::fmt::Debug`]. `Debug`'s output follows
+    /// declaration order, so a routine field reorder in this struct
+    /// (it has changed field count more than once already) would
+    /// silently remint every node's lineage even though nothing about
+    /// the node's identity changed. This method destructures `self` with
+    /// `let Self { .. } = self` and **no `..` rest pattern**, so a field
+    /// added to this struct is a compile error here until it is folded
+    /// into the key below, or deliberately left out with a comment
+    /// saying why. Each field is then written in a fixed order behind an
+    /// explicit length prefix (`<byte length>:<value>;`), so a value's
+    /// own content, such as a seed that happens to contain this
+    /// encoding's delimiter, can never be misread as a field boundary.
+    ///
+    /// A later change to this encoding, including reordering the pushes
+    /// below (the destructure would still compile), is a lineage break
+    /// for every existing installation: treat it like a schema version
+    /// bump, not a refactor. A pinning test on this method's current
+    /// output exists precisely to turn such a change red.
+    #[must_use]
+    pub fn stable_lineage_key(&self) -> String {
+        let Self {
+            cluster_id,
+            node_id,
+            roles,
+            labels,
+            seeds,
+            gossip_port,
+            transport_port,
+            advertise_addr,
+            transport_advertise_addr,
+            model_bind,
+            model_endpoint,
+            state_dir,
+            dead_peer_gc_secs,
+            security,
+            key_derivation,
+            enrollment,
+            deployment_authority,
+            replication,
+        } = self;
+
+        let mut key = String::new();
+        push_field(&mut key, cluster_id);
+        push_option(&mut key, node_id.as_deref());
+        push_field(&mut key, &roles.len().to_string());
+        for role in roles {
+            push_field(&mut key, &format!("{role:?}"));
+        }
+        push_field(&mut key, &labels.len().to_string());
+        for (label_key, label_value) in labels {
+            push_field(&mut key, label_key);
+            push_field(&mut key, label_value);
+        }
+        push_field(&mut key, &seeds.len().to_string());
+        for seed in seeds {
+            push_field(&mut key, seed);
+        }
+        push_field(&mut key, &gossip_port.to_string());
+        push_field(&mut key, &transport_port.to_string());
+        push_option(&mut key, advertise_addr.as_deref());
+        push_option(&mut key, transport_advertise_addr.as_deref());
+        push_option(&mut key, model_bind.as_deref());
+        push_option(&mut key, model_endpoint.as_deref());
+        push_option(&mut key, state_dir.as_deref());
+        push_field(&mut key, &dead_peer_gc_secs.to_string());
+        push_field(&mut key, &format!("{security:?}"));
+        push_field(&mut key, &format!("{key_derivation:?}"));
+        push_field(&mut key, &format!("{enrollment:?}"));
+        push_field(&mut key, &format!("{deployment_authority:?}"));
+        push_field(&mut key, &format!("{replication:?}"));
+        key
+    }
+}
+
+/// Append one field to a [`ClusterRestartFingerprint::stable_lineage_key`]
+/// buffer as `<byte length>:<value>;`. The length prefix means a value
+/// containing this encoding's own delimiters cannot be misread as a
+/// field boundary: reconstructing the fields back out would need to
+/// know exactly how many bytes to consume, which only the prefix
+/// supplies.
+fn push_field(buffer: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    let _ = write!(buffer, "{}:{};", value.len(), value);
+}
+
+/// Append an optional field to a
+/// [`ClusterRestartFingerprint::stable_lineage_key`] buffer, distinguishing
+/// `None` from `Some("")`.
+fn push_option(buffer: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            buffer.push('S');
+            push_field(buffer, value);
+        }
+        None => buffer.push('N'),
+    }
+}
+
+#[cfg(test)]
+mod stable_lineage_key_tests {
+    use super::{push_field, ClusterRestartFingerprint, EffectiveClusterSecurity};
+    use crate::types::MeshKeyDerivation;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn fixed_fingerprint() -> ClusterRestartFingerprint {
+        ClusterRestartFingerprint {
+            cluster_id: "cluster-a".to_string(),
+            node_id: None,
+            roles: BTreeSet::new(),
+            labels: BTreeMap::new(),
+            seeds: Vec::new(),
+            gossip_port: 0,
+            transport_port: 0,
+            advertise_addr: None,
+            transport_advertise_addr: None,
+            model_bind: None,
+            model_endpoint: None,
+            state_dir: None,
+            dead_peer_gc_secs: 0,
+            security: EffectiveClusterSecurity::LegacyPlaintext,
+            key_derivation: MeshKeyDerivation::Sha256,
+            enrollment: None,
+            deployment_authority: None,
+            replication: None,
+        }
+    }
+
+    /// Reconstructed independently of `stable_lineage_key`'s own
+    /// `push_field`/`push_option` call sequence: `.len()` computes every
+    /// byte length (never a hand-counted numeral) and `format!("{v:?}")`
+    /// computes every Debug-encoded field (never a hand-typed variant
+    /// spelling), but the field order, the delimiter scheme, and which
+    /// fields carry a length prefix are all re-typed here on purpose. A
+    /// change to any of those in the real method, even one that leaves
+    /// the exhaustive destructure compiling, must turn this test red.
+    #[test]
+    fn stable_lineage_key_is_pinned_for_a_fixed_fingerprint() {
+        let fingerprint = fixed_fingerprint();
+
+        let mut expected = String::new();
+        push_field(&mut expected, "cluster-a"); // cluster_id
+        expected.push('N'); // node_id: None
+        push_field(&mut expected, "0"); // roles.len()
+        push_field(&mut expected, "0"); // labels.len()
+        push_field(&mut expected, "0"); // seeds.len()
+        push_field(&mut expected, "0"); // gossip_port
+        push_field(&mut expected, "0"); // transport_port
+        expected.push('N'); // advertise_addr
+        expected.push('N'); // transport_advertise_addr
+        expected.push('N'); // model_bind
+        expected.push('N'); // model_endpoint
+        expected.push('N'); // state_dir
+        push_field(&mut expected, "0"); // dead_peer_gc_secs
+        push_field(
+            &mut expected,
+            &format!("{:?}", EffectiveClusterSecurity::LegacyPlaintext),
+        );
+        push_field(&mut expected, &format!("{:?}", MeshKeyDerivation::Sha256));
+        push_field(&mut expected, "None"); // enrollment
+        push_field(&mut expected, "None"); // deployment_authority
+        push_field(&mut expected, "None"); // replication
+
+        assert_eq!(fingerprint.stable_lineage_key(), expected);
+    }
+
+    #[test]
+    fn stable_lineage_key_changes_when_a_field_does() {
+        let base = fixed_fingerprint();
+        let mut moved_node = fixed_fingerprint();
+        moved_node.node_id = Some("node-1".to_string());
+        let mut moved_port = fixed_fingerprint();
+        moved_port.gossip_port = 7946;
+
+        assert_ne!(base.stable_lineage_key(), moved_node.stable_lineage_key());
+        assert_ne!(base.stable_lineage_key(), moved_port.stable_lineage_key());
+        assert_ne!(
+            moved_node.stable_lineage_key(),
+            moved_port.stable_lineage_key()
+        );
+    }
 }
 
 impl EffectiveClusterConfig {

@@ -97,7 +97,11 @@ origins:
 rather than from anything the request supplied, which is the safe default. The
 enumeration block is the other half: it trips when one principal touches more
 distinct object ids than a real user would, which is what scraping looks like
-when every individual request is authorized.
+when every individual request is authorized. It does not need `object_rules`
+to work: without a rule to capture the object id explicitly, the detector
+falls back to the last numeric- or UUID-shaped path segment, so `enumeration:
+{ enabled: true }` on its own catches a BOLA sweep against a bare
+`/orders/{id}`-shaped API with no ownership rule declared.
 
 See [object-authz.md](object-authz.md) for the full matcher surface, including
 tenant claims and collection endpoints, and
@@ -280,12 +284,15 @@ field carries a key, matching against a list you supply as `passwords`,
 `dlp` handles the regulated-data case, and it has two limits worth knowing
 before you plan around it.
 
-It scans the **request URI and headers only, never a body**, request or
-response. Setting `direction: response` or `both` is accepted and then
-warned about at load, and the scan still runs against the URI and headers,
-not a body either way. Body scanning is on the roadmap; the `pii:` block on
-`ai_proxy` origins handles request-body redaction with the same detector
-catalog today.
+It scans **requests only** - the URI, the headers, and (on by default, capped
+at 16 KiB) the buffered body, which is where most of the shapes in the example
+above actually show up. Setting `direction: response` or `both` is accepted
+and then warned about at load; the request-side scan still runs regardless.
+That is not a scheduling gap that a future release closes: `dlp` runs through
+the same request-only policy-enforcement phase every built-in policy shares,
+so scanning a response would need a different phase entirely, the one the
+response transforms already run in. So `dlp` catches regulated data on the
+way in, not on the way out.
 
 Its actions are `tag` and `block`, not redact. `tag` marks the request for
 downstream handling and lets it through; `block` refuses it. Redact-and-continue

@@ -1,5 +1,5 @@
 # object_authz policy
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-17*
 
 The `object_authz` policy enforces object- and function-level authorization at the gateway, catching the two top OWASP API risks: BOLA (API1:2023, Broken Object Level Authorization) and BFLA (API5:2023, Broken Function Level Authorization). Alias: `bola`.
 
@@ -74,7 +74,7 @@ For an `object_rule`, the policy parses the matched path against the template, e
 
 For a `function_rule`, the policy checks the request's `method` is in the rule's set and the caller's roles include `require_role`. A missing role is the same fixed 403 (or an allow under `test_mode`).
 
-For `enumeration`, the policy keeps a per-principal sliding window of distinct object ids (the `object_param` captures). When `max_distinct` is exceeded inside `window_secs`, every subsequent request from that principal is blocked for the rest of the window. The tracker is bounded at 50,000 principals; a flood that exceeds the cap clears the map (brief detection gap, not a correctness problem).
+For `enumeration`, the policy keeps a per-principal sliding window of distinct object ids. When an `object_rule` matches and declares `object_param`, its captured value is the id. `object_rules` is not required: with none declared, or none matching the request, the policy falls back to the last numeric- or UUID-shaped path segment, so `enumeration.enabled` alone still catches a sweep against an API with no ownership rules configured. When `max_distinct` is exceeded inside `window_secs`, every subsequent request from that principal is blocked for the rest of the window. The tracker is bounded at 50,000 principals; a flood that exceeds the cap clears the map (brief detection gap, not a correctness problem).
 
 ## Calling it
 

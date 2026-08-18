@@ -409,6 +409,33 @@
 # landed on separate branches from the same 290 base; the union after the
 # merge is 294 (three federation `_for_test` seams + `authorize_provider_url`).
 
+# 2026-08-17 (WOR-2384 queue-full determinism): 294 -> 295. One new item:
+# `EventEgress::never_drained_for_test` in
+# `crates/sbproxy-observe/src/event_sink.rs`, a `#[doc(hidden)] pub fn`
+# named to match the `..._for_test` seams already in this file.
+#
+# It replaces a background flooding thread in
+# `action_dispatch.rs`'s
+# `wor_2384_queue_full_post_dispatch_evidence_failure_still_records_attribution`,
+# which raced a real file-sink worker thread for a capacity-1 queue's one
+# slot and flaked on CI (TRY 2 of an unrelated PR) whenever the worker's
+# drain won that race: the dispatch's own evidence emit then slipped into
+# the freed slot, delivery succeeded, and the fail-closed refusal the test
+# asserts never happened. The new constructor builds a queue with no
+# worker thread at all, so nothing ever drains it and one pre-fill publish
+# occupies its single slot permanently; every later publish, including the
+# dispatch's own, deterministically observes `QueueFull`.
+#
+# Not narrowable: `EventEgress` lives in `sbproxy-observe` and its only
+# consumer is a `sbproxy-core` test, a different crate's test module, so
+# `pub` is the only visibility that resolves. The crate's own
+# `#[cfg(test)] fn over_channel` already does the same "queue nothing
+# drains" trick for `sbproxy-observe`'s own tests, but `#[cfg(test)]`
+# items compile only into the crate that declares them and do not exist
+# in the `rlib` a different crate's tests link against, which is exactly
+# why this needed its own, always-compiled entry point rather than a
+# visibility change to the existing one.
+
 # 2026-08-17 (WOR-2491 pack skeleton): 294 -> 296. `PackItem` and
 # `PackItemState` (crates/sbproxy-config/src/owasp_api_pack.rs) are new
 # `pub enum`s named only from this file's own tests today; nothing

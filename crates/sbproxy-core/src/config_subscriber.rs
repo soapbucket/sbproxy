@@ -455,6 +455,14 @@ pub struct MergedCandidate {
     cursor: ConfigBundleCursor,
     revision: u64,
     signed: SignedConfigBundle,
+    /// Where the merge base (`base_yaml`) came from, computed once in
+    /// [`ConfigSubscriber::evaluate`] against the base this candidate was
+    /// actually merged over. Carried through to
+    /// [`ConfigSubscriber::apply`] rather than recomputed there: by then
+    /// only `merged_yaml` is in scope, a document with no `source:`
+    /// block of its own, so re-deriving an origin from it would
+    /// misreport a git-sourced base as [`BaseOrigin::Local`].
+    base_origin: BaseOrigin,
 }
 
 impl MergedCandidate {
@@ -826,9 +834,14 @@ impl ConfigSubscriber {
             return Err(CycleResult::VerifyFailed);
         }
 
+        // Computed once, from the base this candidate is actually merged
+        // over, and carried on the returned candidate: `merged.merged_yaml`
+        // has no `source:` block of its own, so deriving an origin from it
+        // later would misreport a git-sourced base as `BaseOrigin::Local`.
+        let base_origin = base_origin_for(base_yaml);
         let merged = match merge_config(
             base_yaml,
-            base_origin_for(base_yaml),
+            base_origin.clone(),
             &bundle.config_yaml,
             self.merge_mode,
         ) {
@@ -871,6 +884,7 @@ impl ConfigSubscriber {
             cursor: probe,
             revision: bundle.revision,
             signed: signed.clone(),
+            base_origin,
         })
     }
 
@@ -886,6 +900,7 @@ impl ConfigSubscriber {
             &self.config_path,
             &candidate.merged_yaml,
             "config_authority",
+            candidate.base_origin.clone(),
         ) {
             Ok(TryReloadOutcome::Applied(outcome)) => outcome,
             Ok(TryReloadOutcome::Busy) => {
