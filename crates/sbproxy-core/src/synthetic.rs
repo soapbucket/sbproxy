@@ -239,6 +239,7 @@ mod tests {
             outbound_web_bot_auth: false,
             observability: None,
             attestation: None,
+            owasp_pack_manifest: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);

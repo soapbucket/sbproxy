@@ -408,3 +408,18 @@
 # 2026-08-17 (WOR-2384 main-sync): 293/291 -> 294. The two entries above
 # landed on separate branches from the same 290 base; the union after the
 # merge is 294 (three federation `_for_test` seams + `authorize_provider_url`).
+
+# 2026-08-17 (WOR-2491 pack skeleton): 294 -> 296. `PackItem` and
+# `PackItemState` (crates/sbproxy-config/src/owasp_api_pack.rs) are new
+# `pub enum`s named only from this file's own tests today; nothing
+# outside the file calls them yet. Not narrowable to `pub(crate)`: both
+# are field types on `PackManifestEntry`, itself a field type on
+# `PackManifest`, which `CompiledOrigin::owasp_pack_manifest` (a `pub`
+# field on a `pub` struct in `sbproxy-config`, one of this workspace's
+# three public crates) carries specifically so a later task can surface
+# the pack's per-item outcome to an operator, most plausibly from a
+# different crate. Narrowing either enum would leak a private type
+# through that public field and trip `private_interfaces` under
+# `-D warnings`. Their real caller is task 4 of the WOR-2491 plan, which
+# has not landed yet; this is the same shape WOR-1898/WOR-1980 faced and
+# resolved by raising the baseline rather than wiring a consumer early.

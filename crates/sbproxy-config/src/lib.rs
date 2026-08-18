@@ -34,6 +34,7 @@ pub mod key_registry;
 pub mod listing;
 pub mod litellm;
 pub mod model_host;
+pub mod owasp_api_pack;
 pub mod payments;
 pub mod plan;
 pub mod raw;

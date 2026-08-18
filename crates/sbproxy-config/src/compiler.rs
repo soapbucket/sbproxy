@@ -3932,6 +3932,17 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         config.connection_pool.as_ref(),
     )?;
 
+    // WOR-2491: expand the `owasp_api_top10` pseudo-policy, if the
+    // origin has one, into concrete synthesized policy entries. This
+    // mutates `config.policies` in place: the pack entry itself is
+    // removed (so it never reaches `sbproxy-modules::compile.rs`'s
+    // type-string match arms below), and any items with synthesis
+    // wired append their policy JSON to the same list. Must run before
+    // `policy_configs: config.policies` moves the list into the
+    // compiled origin.
+    let owasp_pack_manifest =
+        crate::owasp_api_pack::expand_owasp_pack(hostname, &mut config.policies)?;
+
     let mut compiled = CompiledOrigin {
         hostname: CompactString::new(hostname),
         origin_id: CompactString::new(hostname),
@@ -4016,6 +4027,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         attestation: config.attestation,
         // WOR-1043 PR3: origin-scope observability overrides.
         observability: config.observability,
+        // WOR-2491: computed above, before `config.policies` moved
+        // into `policy_configs`.
+        owasp_pack_manifest,
     };
 
     // WOR-2407: name the config this origin's cached entries belong to,
@@ -10885,6 +10899,205 @@ origins:
       ttl_secs: 60
 "#;
         compile_config(yaml).expect("a cache block without methods must compile");
+    }
+
+    // --- WOR-2491: owasp_api_top10 pack expansion, wired at compile time ---
+
+    #[test]
+    fn owasp_pack_pseudo_type_never_reaches_module_compilation() {
+        // The pack entry must be consumed during expansion, never
+        // handed to `sbproxy-modules::compile.rs`'s type-string match
+        // arms. Proven here by compiling a full origin and checking
+        // the compiled chain: it holds the synthesized `object_authz`
+        // policy and no `owasp_api_top10` entry at all.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api1]
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+
+        let types: Vec<&str> = origin
+            .policy_configs
+            .iter()
+            .map(|p| p.get("type").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert!(
+            types.contains(&"object_authz"),
+            "compiled chain must hold the synthesized policy: {types:?}"
+        );
+        assert!(
+            !types.contains(&"owasp_api_top10"),
+            "the pseudo-policy must not reach the compiled chain: {types:?}"
+        );
+
+        let manifest = origin
+            .owasp_pack_manifest
+            .as_ref()
+            .expect("owasp_pack_manifest is populated when the origin has a pack entry");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api1)
+            .expect("api1 entry present");
+        // Plan-ledger ruling: api1's state is always needs_operator_input
+        // (empty object_rules means no real ownership check runs),
+        // not enforced/report_only.
+        assert_eq!(
+            entry.state,
+            crate::owasp_api_pack::PackItemState::NeedsOperatorInput
+        );
+    }
+
+    #[test]
+    fn owasp_pack_backs_off_when_operator_already_authors_object_authz() {
+        // An origin that already authors `object_authz` explicitly
+        // gets no second synthesized entry, and the manifest records
+        // why: `operator_authored`, not `report_only`/`enforced`.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api1]
+      - type: object_authz
+        test_mode: false
+        object_rules:
+          - path: /tenants/{owner}/orders/{order_id}
+            owner_param: owner
+            object_param: order_id
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+
+        let object_authz_count = origin
+            .policy_configs
+            .iter()
+            .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("object_authz"))
+            .count();
+        assert_eq!(
+            object_authz_count, 1,
+            "the operator's own object_authz survives; the pack adds no second one"
+        );
+
+        let manifest = origin
+            .owasp_pack_manifest
+            .as_ref()
+            .expect("manifest present");
+        let entry = manifest
+            .entry_for(crate::owasp_api_pack::PackItem::Api1)
+            .expect("api1 entry present");
+        assert_eq!(
+            entry.state,
+            crate::owasp_api_pack::PackItemState::OperatorAuthored
+        );
+    }
+
+    #[test]
+    fn owasp_pack_posture_report_only_threads_into_object_authz_test_mode() {
+        // `posture: report_only` must thread into `object_authz`'s own
+        // `test_mode` switch, the module's real report-only knob.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api1]
+        posture: report_only
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        let synthesized = origin
+            .policy_configs
+            .iter()
+            .find(|p| p.get("type").and_then(|v| v.as_str()) == Some("object_authz"))
+            .expect("synthesized object_authz present");
+        assert_eq!(
+            synthesized.get("test_mode").and_then(|v| v.as_bool()),
+            Some(true),
+            "report_only posture must set object_authz's own test_mode: true"
+        );
+    }
+
+    #[test]
+    fn owasp_pack_posture_enforce_threads_into_object_authz_test_mode() {
+        // The other direction of the same knob: `posture: enforce`
+        // sets `test_mode: false`, so this is a real threaded switch
+        // and not a value the synthesis hard-codes.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api1]
+        posture: enforce
+"#;
+        let compiled = compile_config(yaml).expect("owasp pack config must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        let synthesized = origin
+            .policy_configs
+            .iter()
+            .find(|p| p.get("type").and_then(|v| v.as_str()) == Some("object_authz"))
+            .expect("synthesized object_authz present");
+        assert_eq!(
+            synthesized.get("test_mode").and_then(|v| v.as_bool()),
+            Some(false),
+            "enforce posture must set object_authz's own test_mode: false"
+        );
+    }
+
+    #[test]
+    fn owasp_pack_unknown_item_name_fails_compilation() {
+        // Validation errors from `expand_owasp_pack` must surface as a
+        // real `compile_config` error, not get swallowed on the way
+        // out of `compile_origin`.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: owasp_api_top10
+        enable: [api1, api99]
+"#;
+        let err = compile_config(yaml).expect_err("unknown item name must be refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("api99"), "{message}");
+        assert!(
+            message.contains("api1, api2"),
+            "accepted list present: {message}"
+        );
+    }
+
+    #[test]
+    fn origin_without_owasp_pack_entry_has_no_manifest() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("plain origin must compile");
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert!(
+            origin.owasp_pack_manifest.is_none(),
+            "an origin with no owasp_api_top10 policy gets no manifest"
+        );
     }
 }
 
