@@ -817,12 +817,12 @@ mod tests {
         // belongs in the ring exactly like a clean apply, distinguished
         // only by which subsystems it names as not having applied.
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let mut store = store(temp.path(), 10);
+        let mut ring = store(temp.path(), 10);
         let degraded_metadata = AppendMetadata {
             degraded: vec!["key plane".to_string(), "sink dispatcher".to_string()],
             ..metadata(1_000)
         };
-        let entry = store
+        let entry = ring
             .append(b"origins: {}\n# degraded\n", degraded_metadata)
             .expect("append a degraded revision");
         assert_eq!(entry.state, RevisionState::Applied);
@@ -830,7 +830,7 @@ mod tests {
 
         // Persisted, not just held in memory: a fresh open must read the
         // same degradation back off disk.
-        drop(store);
+        drop(ring);
         let reopened = store(temp.path(), 10);
         assert_eq!(
             reopened.entries()[0].degraded,
