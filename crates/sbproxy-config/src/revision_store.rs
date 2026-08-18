@@ -196,6 +196,13 @@ pub struct AppendMetadata {
     pub actor: Option<String>,
     /// When this revision applied, in unix milliseconds.
     pub applied_at: u64,
+    /// Subsystems that did not apply cleanly, when this revision came up
+    /// degraded. Empty for a fully applied revision. A degraded revision
+    /// is still recorded as [`RevisionState::Applied`]: the pipeline did
+    /// publish, so the entry belongs in the ring the same as a clean
+    /// apply, and this field is what tells the two apart on inspection.
+    #[serde(default)]
+    pub degraded: Vec<String>,
 }
 
 /// One node-local, monotonic entry in the ring.
@@ -233,6 +240,12 @@ pub struct RevisionEntry {
     /// revision. Zero until boot-fallback logic starts incrementing it.
     #[serde(default)]
     pub boot_attempts: u32,
+    /// Subsystems that did not apply cleanly when this revision applied.
+    /// Empty for a fully applied revision. See
+    /// [`AppendMetadata::degraded`] for why this does not become a
+    /// distinct [`RevisionState`].
+    #[serde(default)]
+    pub degraded: Vec<String>,
 }
 
 /// Why a store operation failed.
@@ -456,6 +469,7 @@ impl RevisionStore {
             applied_at: metadata.applied_at,
             soak_verdict: None,
             boot_attempts: 0,
+            degraded: metadata.degraded,
         };
 
         let mut next = self.index.clone();
@@ -736,6 +750,7 @@ mod tests {
             secrets_fingerprint: Some("sha256:deadbeef".to_string()),
             actor: Some("test-operator".to_string()),
             applied_at,
+            degraded: Vec::new(),
         }
     }
 
@@ -794,6 +809,33 @@ mod tests {
         assert_eq!(
             store.read_blob(&second.digest).expect("read blob"),
             b"origins: {}\n# two\n"
+        );
+    }
+
+    #[test]
+    fn a_degraded_append_stays_applied_with_its_degradation_captured() {
+        // A degraded reload still published a pipeline: the entry
+        // belongs in the ring exactly like a clean apply, distinguished
+        // only by which subsystems it names as not having applied.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = store(temp.path(), 10);
+        let degraded_metadata = AppendMetadata {
+            degraded: vec!["key plane".to_string(), "sink dispatcher".to_string()],
+            ..metadata(1_000)
+        };
+        let entry = store
+            .append(b"origins: {}\n# degraded\n", degraded_metadata)
+            .expect("append a degraded revision");
+        assert_eq!(entry.state, RevisionState::Applied);
+        assert_eq!(entry.degraded, vec!["key plane", "sink dispatcher"]);
+
+        // Persisted, not just held in memory: a fresh open must read the
+        // same degradation back off disk.
+        drop(store);
+        let reopened = store(temp.path(), 10);
+        assert_eq!(
+            reopened.entries()[0].degraded,
+            vec!["key plane", "sink dispatcher"]
         );
     }
 
@@ -1003,6 +1045,7 @@ mod tests {
             applied_at: 2,
             soak_verdict: None,
             boot_attempts: 0,
+            degraded: Vec::new(),
         });
         let orphaned = evict_entries(store.keep, &mut next);
         assert_eq!(

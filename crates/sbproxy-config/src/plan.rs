@@ -424,6 +424,27 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Hitless,
         reason: "correlation-id policy is read per request",
     },
+    // --- Config history (WOR-2457): hitless on a different axis than
+    //     its neighbours above. The ring recorder is opened once at
+    //     boot, like `proxy.compression_state`, so a changed `dir` or
+    //     `keep` does not take effect without a restart either. But
+    //     unlike compression_state, nothing under this block is ever
+    //     read on the request path: it is an audit sink a rollback
+    //     reads later, not a setting any request's routing, auth, or
+    //     response depends on. A live process running with a stale
+    //     `config_history` value serves every request identically to
+    //     one that picked up the change, so there is no traffic-visible
+    //     difference to name Restart or Reload over. ---
+    BlastRadiusRule {
+        pattern: "proxy.config_history.**",
+        radius: BlastRadius::Hitless,
+        reason: "the revision ring is an audit sink; no request depends on it",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.config_history",
+        radius: BlastRadius::Hitless,
+        reason: "the revision ring is an audit sink; no request depends on it",
+    },
     BlastRadiusRule {
         pattern: "access_log.**",
         radius: BlastRadius::Hitless,
@@ -1649,6 +1670,14 @@ origins:
     fn matrix_lookup_metrics_is_hitless() {
         let (r, _) = lookup_blast_radius("proxy.metrics.scrape_endpoint");
         assert_eq!(r, BlastRadius::Hitless);
+    }
+
+    #[test]
+    fn matrix_lookup_config_history_is_hitless() {
+        let (r, _) = lookup_blast_radius("proxy.config_history.keep");
+        assert_eq!(r, BlastRadius::Hitless);
+        let (r2, _) = lookup_blast_radius("proxy.config_history");
+        assert_eq!(r2, BlastRadius::Hitless);
     }
 
     #[test]

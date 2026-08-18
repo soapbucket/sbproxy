@@ -519,6 +519,7 @@ impl SourcePoller {
             &self.config_path,
             &effective,
             "config_refresh_poller",
+            base_origin.clone(),
         );
         let cycle = match outcome {
             Ok(TryReloadOutcome::Applied(outcome)) => {
