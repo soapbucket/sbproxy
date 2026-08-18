@@ -1,9 +1,13 @@
 //! `${...}` interpolation engine for `type: local` MCP tools (WOR-2489).
 //!
 //! Shared by every compiled local-tool handler that needs to build a
-//! live value from the call's arguments: today that is `http` (the
-//! request URL, header values, and JSON body), and the step DAG a
-//! later task adds reuses the same engine over a wider context object.
+//! live value from the call's arguments: a standalone `http` handler
+//! (the request URL, header values, and JSON body) and a `steps`
+//! DAG's own per-step HTTP calls (WOR-2489 Task 4), which reuse this
+//! exact engine over a wider context object,
+//! `{"args": <arguments>, "steps": <step outputs so far>}`, built at
+//! the DAG executor's call site -- see the `steps.*` tests below for
+//! the exact shape a step's context entry takes.
 //!
 //! Fail closed. A `${...}` reference to a path that is not present in
 //! the context is a hard error, never an empty string: silently
@@ -31,13 +35,14 @@ use std::fmt;
 
 use serde_json::Value;
 
-/// Build the context object every `${...}` path in a local tool's
-/// `http` handler resolves against. Only `args` is populated today
-/// (the tool call's JSON-RPC arguments); a step DAG's `${steps.*}`
-/// root is a later task's addition, made by building a wider context
-/// object at that call site, not by changing this module -- path
-/// resolution below is generic over whatever keys the context object
-/// carries.
+/// Build the context object every `${...}` path in a standalone local
+/// `http` handler resolves against. Only `args` is populated here
+/// (the tool call's JSON-RPC arguments); a `steps` DAG's `${steps.*}`
+/// root (WOR-2489 Task 4) is a wider context object built at that
+/// executor's own call site instead, not by changing this function --
+/// path resolution below is generic over whatever keys the context
+/// object carries, which is what lets `steps.*` slot in with zero
+/// changes here.
 pub(crate) fn args_context(arguments: &Value) -> Value {
     serde_json::json!({ "args": arguments })
 }
@@ -415,5 +420,103 @@ mod tests {
         // must succeed even though `args.missing` does not resolve.
         let rendered = interpolate_json_tree(&body, &ctx).expect("keys are not interpolated");
         assert_eq!(rendered, json!({"${args.missing}": "value"}));
+    }
+
+    // --- `${steps.*}` context paths (WOR-2489 Task 4) ---
+    //
+    // The step DAG executor builds a wider context object,
+    // `{"args": <arguments>, "steps": <step outputs so far>}`, and
+    // passes it to the same functions above -- nothing in this module
+    // changes for that, since path resolution was always generic over
+    // whatever top-level keys the context carries (see the module
+    // doc). These tests pin that convergence: `${steps...}` is not a
+    // special case, just another root key.
+
+    /// A step's own document (built by
+    /// `run_local_http_call_with_resolver`) always has this shape:
+    /// `{"status": <u16>, "headers": {...}, "body": <parsed>}`.
+    fn steps_context(entries: Value) -> Value {
+        json!({ "args": {}, "steps": entries })
+    }
+
+    #[test]
+    fn steps_status_and_body_resolve_through_the_generic_engine() {
+        let ctx = steps_context(json!({
+            "fetch": {
+                "status": 200,
+                "headers": {"content-type": "application/json"},
+                "body": {"vendor_id": 42, "name": "widget"},
+            }
+        }));
+        assert_eq!(
+            interpolate_value("${steps.fetch.status}", &ctx).expect("resolves"),
+            json!(200)
+        );
+        assert_eq!(
+            interpolate_value("${steps.fetch.body.vendor_id}", &ctx).expect("resolves"),
+            json!(42)
+        );
+        assert_eq!(
+            interpolate_string("vendor-${steps.fetch.body.vendor_id}", &ctx).expect("resolves"),
+            "vendor-42"
+        );
+        // A whole-string splice of the body preserves its type (an
+        // object), the same "splice vs. stringify" rule any other
+        // context root follows.
+        assert_eq!(
+            interpolate_value("${steps.fetch.body}", &ctx).expect("resolves"),
+            json!({"vendor_id": 42, "name": "widget"})
+        );
+    }
+
+    /// A step recorded with only `continue_on_error`'s `error` entry
+    /// (WOR-2489 Task 4: a `Failed` step's `steps.<name>` context entry
+    /// carries *only* `error`, never `status`/`headers`/`body`) still
+    /// resolves `${steps.<name>.error}` -- but a later step reading
+    /// `.body` or `.status` off it fails closed with `MissingPath`,
+    /// exactly like reading into any other object that lacks that key.
+    /// This is what makes "only steps that have already completed are
+    /// in scope for `${steps...}`" (the DAG executor's own module doc)
+    /// true without any special-casing in this module.
+    #[test]
+    fn a_continue_on_error_step_exposes_only_error_not_body_or_status() {
+        let ctx = steps_context(json!({
+            "flaky": {"error": "mcp: local step 'flaky' returned non-success status 500"}
+        }));
+        assert_eq!(
+            interpolate_value("${steps.flaky.error}", &ctx).expect("resolves"),
+            json!("mcp: local step 'flaky' returned non-success status 500")
+        );
+        let err = interpolate_value("${steps.flaky.body}", &ctx).expect_err("must fail closed");
+        assert_eq!(
+            err,
+            InterpolationError::MissingPath {
+                path: "steps.flaky.body".to_string()
+            }
+        );
+        let err = interpolate_value("${steps.flaky.status}", &ctx).expect_err("must fail closed");
+        assert_eq!(
+            err,
+            InterpolationError::MissingPath {
+                path: "steps.flaky.status".to_string()
+            }
+        );
+    }
+
+    /// A skipped step (its `condition` evaluated false) gets no entry
+    /// in the `steps` object at all (WOR-2489 Task 4), so any read of
+    /// it -- the bare name or a nested path -- fails closed the same
+    /// way an unknown context root always has.
+    #[test]
+    fn a_skipped_step_has_no_context_entry_and_fails_closed() {
+        let ctx = steps_context(json!({}));
+        let err =
+            interpolate_value("${steps.skipped_step.status}", &ctx).expect_err("must fail closed");
+        assert_eq!(
+            err,
+            InterpolationError::MissingPath {
+                path: "steps.skipped_step.status".to_string()
+            }
+        );
     }
 }

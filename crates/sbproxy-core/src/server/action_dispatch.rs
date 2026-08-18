@@ -4912,6 +4912,9 @@ pub(super) async fn handle_mcp_action(
                                                 governed_server,
                                                 local_tool_name,
                                                 outbound_arguments,
+                                                &ctx.principal,
+                                                ctx.tenant_id.as_str(),
+                                                mcp_session_id.as_deref(),
                                             )
                                             .await
                                         } else {
@@ -13469,6 +13472,49 @@ mod mcp_catalog_snapshot_tests {
         addr
     }
 
+    /// Spawn a stub HTTP origin like [`spawn_local_http_stub`], but
+    /// also record each accepted connection's raw request text (the
+    /// request line, headers, and body as sent) into a shared,
+    /// lock-guarded log the caller can inspect after the call
+    /// completes. WOR-2489 Task 4's "drive through the real execute
+    /// path with a recording stub upstream" idiom: proving a later
+    /// DAG step's `${steps.<name>...}` read actually carried the
+    /// value another step's response produced, not just that
+    /// interpolation resolved to *something*.
+    fn spawn_recording_local_http_stub(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind recording http tool stub");
+        let addr = listener.local_addr().expect("stub address");
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_thread = recorded.clone();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                recorded_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (addr, recorded)
+    }
+
     /// Red-first: a `static` local tool must actually execute and
     /// return its configured value through the full JSON-RPC dispatch,
     /// with every governance gate still in the path -- before this
@@ -13791,38 +13837,63 @@ mod mcp_catalog_snapshot_tests {
         );
     }
 
-    /// Pins the `steps` handler's placeholder: WOR-2489 Task 3's scope
-    /// is `static`/`http` only, so a `steps` tool's call must fail
-    /// with a named internal error pointing at Task 4 -- the same
-    /// "name the gap, fail loudly" pattern Task 2 used for the
-    /// `static`/`http` gap this task just closed.
-    #[tokio::test]
-    async fn wor_2489_steps_local_tool_returns_a_clear_task_4_error() {
-        let action = McpAction::from_config(json!({
+    // --- `type: local` step DAG dispatch (WOR-2489 Task 4) ---
+    //
+    // Continues the section above: these drive a real DAG through the
+    // full JSON-RPC dispatch, proving execution order, `condition`
+    // skip, the dependency rule (and its natural-skip exception),
+    // `continue_on_error`, the whole-call budget, and the no-shaping
+    // default -- not just that a `steps` tool compiles.
+
+    /// Build a one-step `steps` DAG fixture (a single step that always
+    /// succeeds) with the given `response:` shaping config, shared by
+    /// the WOR-2489 Task 5 placeholder pin tests below.
+    fn steps_response_shaping_fixture(
+        addr: std::net::SocketAddr,
+        response: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
             "type": "mcp",
             "mode": "gateway",
-            "server_info": {"name": "wor2489-steps-fixture", "version": "1.0.0"},
+            "server_info": {"name": "wor2489-steps-response-shaping-fixture", "version": "1.0.0"},
             "federated_servers": [{
                 "type": "local",
                 "origin": "local.internal",
-                "prefix": "steps-local",
-                "egress": {},
+                "prefix": "steps-response-shaping-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
                 "tools": [{
                     "name": "workflow",
-                    "description": "a step DAG tool, not yet executed",
+                    "description": "a completed DAG whose response shaping has no engine yet",
                     "input_schema": {"type": "object", "properties": {}},
                     "steps": {
                         "steps": [{
-                            "name": "one",
-                            "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            "name": "only",
+                            "http": {"method": "GET", "url": format!("http://{addr}/")}
                         }],
-                        "response": {"template": "fixed"}
+                        "response": response
                     }
                 }]
             }]
-        }))
-        .expect("steps local-server fixture compiles");
+        })
+    }
 
+    /// Pins the `steps` handler's `response.template` placeholder:
+    /// WOR-2489 Task 4's scope is the DAG executor itself, so a
+    /// completed DAG with `response: {template: ...}` configured must
+    /// still fail with a named internal error, now pointing at Task 5
+    /// -- the same "name the gap, fail loudly" pattern earlier tasks
+    /// used for their own gaps. Before this task, this same shape
+    /// failed for an unrelated reason (`steps` had no executor at
+    /// all, WOR-2489 Task 4); now the DAG runs to completion and it is
+    /// specifically the shaping step that is still unimplemented.
+    #[tokio::test]
+    async fn wor_2489_steps_response_template_returns_a_clear_task_5_error() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+        let action = McpAction::from_config(steps_response_shaping_fixture(
+            addr,
+            json!({"template": "fixed"}),
+        ))
+        .expect("template response-shaping DAG fixture compiles");
         action
             .federation
             .refresh_tools()
@@ -13842,9 +13913,574 @@ mod mcp_catalog_snapshot_tests {
         let message = call["error"]["message"]
             .as_str()
             .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
+        assert!(message.contains("WOR-2489 Task 5"), "{message}");
+        assert!(message.contains("response.template"), "{message}");
+    }
+
+    /// Same pin as above, for `response.js`.
+    #[tokio::test]
+    async fn wor_2489_steps_response_js_returns_a_clear_task_5_error() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+        let action =
+            McpAction::from_config(steps_response_shaping_fixture(addr, json!({"js": "1"})))
+                .expect("js response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
+        assert!(message.contains("WOR-2489 Task 5"), "{message}");
+        assert!(message.contains("response.js"), "{message}");
+    }
+
+    /// Same pin as above, for `response.lua`.
+    #[tokio::test]
+    async fn wor_2489_steps_response_lua_returns_a_clear_task_5_error() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+        let action =
+            McpAction::from_config(steps_response_shaping_fixture(addr, json!({"lua": "1"})))
+                .expect("lua response-shaping DAG fixture compiles");
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
+        assert!(message.contains("WOR-2489 Task 5"), "{message}");
+        assert!(message.contains("response.lua"), "{message}");
+    }
+
+    /// Red-first: a DAG declared out of dependency order (`second`
+    /// lists `depends_on: [first]` but is declared *before* `first` in
+    /// `steps[]`) must still execute `first` before `second` -- and
+    /// `second`'s own `http.url` reads `${steps.first.status}` and
+    /// `${steps.first.body.value}`, so a buggy executor that ran
+    /// declaration order instead would fail this call on interpolation
+    /// (the missing `steps.first` root) before ever dialing `second`,
+    /// not just reorder harmlessly. The recording stub also proves the
+    /// exact interpolated values reached the outbound request, not
+    /// just that interpolation resolved to *something*.
+    #[tokio::test]
+    async fn wor_2489_steps_topological_order_ignores_declaration_order() {
+        let (addr, recorded) = spawn_recording_local_http_stub(vec![
+            (200, r#"{"value":42}"#),
+            (200, r#"{"ok":true}"#),
+        ]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-dag-order-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "dag-order-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "a two-step DAG declared out of dependency order",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "second",
+                                "depends_on": ["first"],
+                                "http": {
+                                    "method": "GET",
+                                    "url": format!(
+                                        "http://{addr}/second?status=${{steps.first.status}}&v=${{steps.first.body.value}}"
+                                    )
+                                }
+                            },
+                            {
+                                "name": "first",
+                                "http": {"method": "GET", "url": format!("http://{addr}/first")}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("dependency-ordered DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
         assert!(
-            message.contains("WOR-2489 Task 4"),
-            "a `steps` tool call must name the tracked follow-up, got: {message}"
+            call.get("error").is_none(),
+            "a dependency-ordered DAG must succeed even when declared out of order, got: {call:?}"
         );
+        assert_eq!(call["result"]["isError"], json!(false));
+
+        let recorded = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            recorded.len(),
+            2,
+            "both steps must have dialed the stub, got: {recorded:?}"
+        );
+        assert!(
+            recorded[0].starts_with("GET /first"),
+            "'first' must dial before 'second' despite declaration order, got: {recorded:?}"
+        );
+        assert!(
+            recorded[1].contains("GET /second?status=200&v=42"),
+            "'second' must read 'first''s real status and body through steps.*, got: {recorded:?}"
+        );
+    }
+
+    /// Red-first: a step whose `condition` evaluates `false` is
+    /// skipped, not attempted -- its `http.url` points at a port
+    /// nothing listens on, so if the executor ran it anyway the whole
+    /// call would fail on connection refused instead of the
+    /// always-on step's result winning.
+    #[tokio::test]
+    async fn wor_2489_steps_condition_false_skips_the_step_naturally() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"stage":"always"}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-condition-skip-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "condition-skip-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "one step whose condition is false, one always-on step",
+                    "input_schema": {"type": "object", "properties": {"run": {"type": "boolean"}}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "skip_me",
+                                "condition": "mcp.arguments.run == true",
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            },
+                            {
+                                "name": "always",
+                                "http": {"method": "GET", "url": format!("http://{addr}/")}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("condition-skip DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {"run": false}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "a false condition must skip the step, not fail the call, got: {call:?}"
+        );
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(
+            document["body"],
+            json!({"stage": "always"}),
+            "the default result must be the always-on step's own result, got: {document:?}"
+        );
+    }
+
+    /// Red-first: the ruled dependency rule's hard-error branch. A
+    /// step with `continue_on_error: true` fails (its own call never
+    /// reaches a listener), so the DAG continues past it -- but a
+    /// downstream step that `depends_on` it, with no `condition` of
+    /// its own to naturally skip, has nothing to run against and must
+    /// fail the whole tool call, naming the incomplete dependency.
+    #[tokio::test]
+    async fn wor_2489_steps_dependency_on_a_step_that_did_not_complete_is_a_tool_call_error() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-dependency-error-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "dependency-error-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "downstream depends on a step that failed with continue_on_error",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "flaky",
+                                "continue_on_error": true,
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            },
+                            {
+                                "name": "downstream",
+                                "depends_on": ["flaky"],
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("dependency-error DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a tool-call error, got: {call:?}"));
+        assert!(message.contains("depends on 'flaky'"), "{message}");
+        assert!(message.contains("did not complete"), "{message}");
+    }
+
+    /// Red-first: the ruled dependency rule's natural-skip exception.
+    /// Same shape as the test above -- `downstream` depends on
+    /// `flaky`, which fails with `continue_on_error: true` -- but this
+    /// time `downstream` also declares its own `condition`, which
+    /// evaluates `false`. That must skip `downstream` rather than
+    /// error the call, exactly the exception the plan's ruled
+    /// dependency rule carves out. A third, independent `finalizer`
+    /// step proves the DAG still completes and returns a real result.
+    #[tokio::test]
+    async fn wor_2489_steps_dependent_steps_own_false_condition_is_a_natural_skip() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"stage":"final"}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-natural-skip-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "natural-skip-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "downstream's own false condition rescues it from the dependency error",
+                    "input_schema": {"type": "object", "properties": {"proceed": {"type": "boolean"}}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "flaky",
+                                "continue_on_error": true,
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            },
+                            {
+                                "name": "downstream",
+                                "depends_on": ["flaky"],
+                                "condition": "mcp.arguments.proceed == true",
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            },
+                            {
+                                "name": "finalizer",
+                                "http": {"method": "GET", "url": format!("http://{addr}/")}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("natural-skip DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {"proceed": false}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "downstream's own false condition must skip it, not error the whole call, got: {call:?}"
+        );
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(
+            document["body"],
+            json!({"stage": "final"}),
+            "got: {document:?}"
+        );
+    }
+
+    /// Red-first: `continue_on_error: true` records the failure into
+    /// `steps.<name>.error` and the DAG continues -- proven by an
+    /// independent later step reading `${steps.flaky.error}` into its
+    /// own request body and a recording stub confirming the real
+    /// interpolated text reached the outbound request.
+    #[tokio::test]
+    async fn wor_2489_steps_continue_on_error_records_error_and_a_later_step_reads_it() {
+        let (addr, recorded) = spawn_recording_local_http_stub(vec![(200, r#"{"ok":true}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-continue-on-error-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "continue-on-error-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "an independent step reads a failed step's steps.<name>.error",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [
+                            {
+                                "name": "flaky",
+                                "continue_on_error": true,
+                                "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                            },
+                            {
+                                "name": "reporter",
+                                "http": {
+                                    "method": "POST",
+                                    "url": format!("http://{addr}/"),
+                                    "body": {"err": "${steps.flaky.error}"}
+                                }
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("continue-on-error DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "continue_on_error must let the DAG continue, got: {call:?}"
+        );
+        assert_eq!(call["result"]["isError"], json!(false));
+
+        let recorded = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            recorded.len(),
+            1,
+            "only 'reporter' dials the recording stub, got: {recorded:?}"
+        );
+        assert!(
+            recorded[0].contains("mcp: local http tool call to http://127.0.0.1:1/ failed"),
+            "'reporter' must have read flaky's recorded error through steps.flaky.error, got: {recorded:?}"
+        );
+    }
+
+    /// Red-first: the whole-call budget (`steps.timeout`) covers every
+    /// step, not any single step's own `http.timeout` -- a stalling
+    /// upstream with no per-step timeout configured must still fail
+    /// closed at the shorter whole-call budget.
+    #[tokio::test]
+    async fn wor_2489_steps_whole_call_budget_exceeded_fails_closed() {
+        let addr = spawn_stalling_local_http_stub(Duration::from_secs(5));
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-steps-budget-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "steps-budget-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "a single step whose upstream stalls past the whole-call budget",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [
+                            {"name": "slow", "http": {"method": "GET", "url": format!("http://{addr}/")}}
+                        ],
+                        "timeout": "150ms"
+                    }
+                }]
+            }]
+        }))
+        .expect("steps-budget DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let started = std::time::Instant::now();
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the whole-call budget must end the call well before the stub's 5s stall, took {:?}",
+            started.elapsed()
+        );
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a budget error, got: {call:?}"));
+        assert!(message.contains("steps budget"), "{message}");
+    }
+
+    /// Red-first: a `steps` tool with no `response:` configured
+    /// returns the last completed step's own result, unchanged --
+    /// the documented default (WOR-2489 Task 4) for a DAG that never
+    /// asked for shaping.
+    #[tokio::test]
+    async fn wor_2489_steps_no_response_shaping_returns_the_last_steps_result() {
+        let addr = spawn_local_http_stub(vec![(200, r#"{"hello":"world"}"#)]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-steps-default-response-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "steps-default-response-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "one step, no response shaping",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [
+                            {"name": "only", "http": {"method": "GET", "url": format!("http://{addr}/")}}
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .expect("default-response DAG fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(call.get("error").is_none(), "got: {call:?}");
+        assert_eq!(call["result"]["isError"], json!(false));
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(document["status"], json!(200));
+        assert_eq!(document["body"], json!({"hello": "world"}));
     }
 }

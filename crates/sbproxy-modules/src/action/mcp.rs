@@ -1118,6 +1118,13 @@ pub struct McpLocalStepsConfig {
     /// no shaping is configured (a later task defines the default).
     #[serde(default)]
     pub response: Option<McpLocalResponseConfig>,
+    /// Whole-call budget: the deadline covers every step in the DAG,
+    /// not any single step's own call. Accepts Go duration syntax
+    /// (`10s`, `500ms`); defaults to 30 seconds when unset
+    /// (WOR-2489 Task 4) and is refused at compile time past 5
+    /// minutes -- see [`compile_local_steps`].
+    #[serde(default, with = "duration_str")]
+    pub timeout: Option<Duration>,
     /// Named on purpose rather than left to fall through
     /// `deny_unknown_fields`'s generic "unknown field" refusal: an
     /// operator reaching for concurrent step execution gets a
@@ -2664,10 +2671,16 @@ impl std::fmt::Debug for CompiledLocalHttpCall {
 
 /// A compiled step DAG plus its response shaping.
 pub(crate) struct CompiledLocalSteps {
-    /// Steps in declaration order (not execution order; a future
-    /// task's executor derives that from `depends_on`).
+    /// Steps in declaration order (not execution order; the WOR-2489
+    /// Task 4 executor derives that from `depends_on` -- see
+    /// `local_steps_topological_order`).
     pub(crate) steps: Vec<CompiledLocalStep>,
     pub(crate) response: Option<CompiledLocalResponseShaping>,
+    /// Whole-call budget. `None` means the executor's own default
+    /// applies (see `DEFAULT_LOCAL_STEPS_BUDGET`); always `Some` and
+    /// `<= MAX_LOCAL_STEPS_BUDGET` when present, enforced by
+    /// [`compile_local_steps`].
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for CompiledLocalSteps {
@@ -2675,6 +2688,7 @@ impl std::fmt::Debug for CompiledLocalSteps {
         f.debug_struct("CompiledLocalSteps")
             .field("steps", &self.steps)
             .field("response", &self.response)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -2873,6 +2887,19 @@ fn compile_local_steps(
             cycle.join(" -> ")
         );
     }
+    // WOR-2489 Task 4: the whole-call budget is capped at 5 minutes,
+    // the same ceiling the Go implementation used -- a `steps` DAG
+    // dials real upstreams on the gateway's own request path, and an
+    // unbounded (or unreasonably long) budget there is a resource leak
+    // waiting to happen, not a knob an operator needs. `None` (the
+    // field omitted) is unrestricted at this check; the executor's own
+    // default (30s) applies at that point instead.
+    if let Some(timeout) = cfg.timeout {
+        anyhow::ensure!(
+            timeout <= MAX_LOCAL_STEPS_BUDGET,
+            "{site}: steps.timeout ({timeout:?}) exceeds the maximum whole-call budget of {MAX_LOCAL_STEPS_BUDGET:?}"
+        );
+    }
 
     let steps = cfg
         .steps
@@ -2908,7 +2935,11 @@ fn compile_local_steps(
         .map(|r| compile_local_response(site, r))
         .transpose()?;
 
-    Ok(CompiledLocalSteps { steps, response })
+    Ok(CompiledLocalSteps {
+        steps,
+        response,
+        timeout: cfg.timeout,
+    })
 }
 
 /// Find a dependency cycle among `steps[].depends_on`, if one exists.
@@ -3141,16 +3172,50 @@ async fn execute_local_http_call_with_resolver(
     arguments: &serde_json::Value,
     resolver: &dyn sbproxy_security::egress::HostResolver,
 ) -> anyhow::Result<serde_json::Value> {
+    let context = mcp_interpolate::args_context(arguments);
+    let (status, document) =
+        run_local_http_call_with_resolver(server, call, &context, resolver).await?;
+    Ok(serde_json::json!({
+        "content": [{"type": "text", "text": document.to_string()}],
+        "isError": !status.is_success(),
+    }))
+}
+
+/// The shared half of [`execute_local_http_call_with_resolver`]:
+/// interpolate, authorize/dial, retry, and build the
+/// `{"status", "headers", "body"}` document, but stop short of
+/// wrapping it as a tool-result envelope. A standalone `http` handler
+/// wraps this once (see [`execute_local_http_call_with_resolver`]); a
+/// `steps` handler's DAG (WOR-2489 Task 4) calls this once per step,
+/// reusing the exact same interpolation, egress, retry, and timeout
+/// machinery a standalone `http` tool gets, over a wider `context`
+/// that also carries `steps.*` (see [`run_local_steps_dag`]).
+///
+/// Returns `Ok((status, document))` for *any* completed HTTP response,
+/// success or not -- matching a standalone `http` tool's own
+/// not-an-error treatment of a non-2xx response (it renders as
+/// `isError: true` in the tool-result envelope, not an `Err`). A
+/// `steps` handler decides for itself whether a non-2xx response
+/// counts as a step failure (see [`run_local_step_with_resolver`]);
+/// this function does not bake that policy in, since it differs
+/// between callers. `Err` here is always a genuine failure to
+/// complete: interpolation, egress, or transport/timeout after
+/// `retry` is exhausted.
+async fn run_local_http_call_with_resolver(
+    server: &CompiledLocalMcpServer,
+    call: &CompiledLocalHttpCall,
+    context: &serde_json::Value,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
     use sbproxy_security::egress::{
         record_egress_refused, record_egress_seen, EgressPurpose, EgressSightingStatus,
     };
 
-    let context = mcp_interpolate::args_context(arguments);
-    let url = mcp_interpolate::interpolate_string(&call.url, &context)
+    let url = mcp_interpolate::interpolate_string(&call.url, context)
         .map_err(|e| anyhow::anyhow!("mcp: local http tool: url interpolation failed: {e}"))?;
     let mut headers: Vec<(String, String)> = Vec::with_capacity(call.headers.len());
     for (name, value) in &call.headers {
-        let rendered = mcp_interpolate::interpolate_string(value, &context).map_err(|e| {
+        let rendered = mcp_interpolate::interpolate_string(value, context).map_err(|e| {
             anyhow::anyhow!("mcp: local http tool: header '{name}' interpolation failed: {e}")
         })?;
         headers.push((name.clone(), rendered));
@@ -3158,7 +3223,7 @@ async fn execute_local_http_call_with_resolver(
     let body = call
         .body
         .as_ref()
-        .map(|b| mcp_interpolate::interpolate_json_tree(b, &context))
+        .map(|b| mcp_interpolate::interpolate_json_tree(b, context))
         .transpose()
         .map_err(|e| anyhow::anyhow!("mcp: local http tool: body interpolation failed: {e}"))?;
     let method = reqwest::Method::from_bytes(call.method.as_bytes()).map_err(|e| {
@@ -3284,10 +3349,418 @@ async fn execute_local_http_call_with_resolver(
         "headers": serde_json::Value::Object(response_headers),
         "body": body_value,
     });
-    Ok(serde_json::json!({
-        "content": [{"type": "text", "text": document.to_string()}],
-        "isError": !status.is_success(),
-    }))
+    Ok((status, document))
+}
+
+// --- `type: local` step DAG executor (WOR-2489 Task 4) ---
+//
+// A `steps` handler runs its DAG to completion (or a fail-closed
+// error) and shapes exactly one tool result from it. The dependency
+// rule below is the one subtlety in this section; everything else
+// (interpolation, egress, retry, per-call timeout) is
+// `run_local_http_call_with_resolver`, reused verbatim per step.
+//
+// ## Step DAG dependency rule
+//
+// A step's `condition` (compiled CEL, evaluated once per call against
+// the *same* context every step in this DAG shares -- see
+// [`McpAction::local_step_condition_context`]) is checked first,
+// independent of whether its `depends_on` steps completed:
+//
+// - `condition` evaluates `false` (or is a CEL `Violation`, in the
+//   [`McpArgumentPolicyEngineOutcome`] sense): the step is skipped.
+//   Always -- this is true whether or not its dependencies completed.
+//   Skipping is not itself an error.
+// - `condition` fails to evaluate (a CEL runtime error or panic): the
+//   whole tool call fails closed, exactly like an `argument_policies[]`
+//   rule that cannot prove itself.
+// - `condition` is absent, or evaluates `true`: the step *would* run,
+//   so its `depends_on` are now consulted. If every dependency
+//   completed (`Success`), it runs. If any dependency did **not**
+//   complete (`Skipped`, or `Failed` -- including a `Failed` step
+//   whose `continue_on_error` let the DAG continue past it), this step
+//   has nothing to run against: the whole tool call fails closed,
+//   naming the incomplete dependency.
+//
+// This is the plan's ruled ordering, restated precisely: "depends_on
+// on a step that did not complete = tool-call error, unless the
+// dependent step's own condition evaluates false (natural skip)."
+// `continue_on_error` does not soften this -- it only governs what
+// happens when *this* step's own call fails, not what happens when a
+// step it depends on already didn't run.
+//
+// ## `steps.<name>` context entries
+//
+// Only a `Success` step's entry carries `status`/`headers`/`body`; a
+// `Failed` step recorded via `continue_on_error` carries only `error`
+// (a string); a `Skipped` step gets no entry in the `steps` object at
+// all. `mcp_interpolate`'s existing fail-closed `MissingPath` handling
+// is what makes a later step's `${steps.<name>.body...}` read of an
+// incomplete step (skipped, or failed-but-continued) a clean error
+// with no code change needed in that module -- see its new tests for
+// the exact shape. This is also why the dependency rule above exists
+// at all: without it, a downstream step with no `depends_on` on the
+// incomplete step could still silently attempt to read
+// `${steps.<name>...}` and get a `MissingPath` failure with no
+// warning that its upstream never ran; declaring `depends_on` at least
+// lets the executor fail fast, before attempting any interpolation.
+
+/// Default whole-tool-call budget for a `steps` handler when its
+/// compiled `timeout:` is unset (WOR-2489 Task 4), mirroring the Go
+/// implementation's default.
+const DEFAULT_LOCAL_STEPS_BUDGET: Duration = Duration::from_secs(30);
+
+/// The step DAG whole-call budget's hard cap (WOR-2489 Task 4),
+/// mirroring the Go implementation's ceiling. Enforced at config
+/// compile time in [`compile_local_steps`], so a configured `timeout:`
+/// wider than this never reaches the executor.
+const MAX_LOCAL_STEPS_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// One DAG step's terminal outcome, tracked across a `steps` handler's
+/// whole run so later steps' `depends_on` checks (and the final
+/// default-response fallback) can consult what already happened
+/// without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalStepOutcome {
+    /// The step's own HTTP call completed with a success (2xx)
+    /// status. The only outcome that "completes" a dependency.
+    Success,
+    /// The step's `condition` evaluated `false`; it was never
+    /// attempted.
+    Skipped,
+    /// The step's own call failed (interpolation, egress, transport,
+    /// timeout, or a non-2xx response -- unlike a standalone `http`
+    /// tool, a `steps` DAG step treats a non-2xx response as a
+    /// failure, since a downstream step has no way to branch on
+    /// status via `condition`; see the module doc above) and
+    /// `continue_on_error: true` let the DAG continue past it. A
+    /// `Failed` step without `continue_on_error` is never recorded
+    /// here: the whole tool call already returned `Err` at that point.
+    Failed,
+}
+
+impl LocalStepOutcome {
+    /// The `mcp_audit` trace label for this outcome (WOR-2489 Task 4:
+    /// "step name, status, ms", never a body).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Emit one `mcp_audit` tracing event per DAG step outcome (WOR-2489
+/// Task 4): step name, its outcome label, and elapsed wall-clock
+/// milliseconds -- deliberately nothing else. No response body, no
+/// interpolated URL, no header value: a step's outcome is audit
+/// metadata, not a copy of what it carried. Reuses the `mcp_audit`
+/// tracing target `sbproxy-core::action_dispatch`'s own MCP dispatch
+/// audit trail already writes to, so an operator filtering on that
+/// target sees a tool call's step outcomes alongside its
+/// prompt/argument audit line.
+fn emit_local_step_audit(
+    server: &str,
+    tool: &str,
+    step: &str,
+    outcome: LocalStepOutcome,
+    elapsed: Duration,
+) {
+    tracing::debug!(
+        target: "mcp_audit",
+        mcp_server = %server,
+        mcp_tool = %tool,
+        mcp_step = %step,
+        mcp_step_status = %outcome.label(),
+        mcp_step_ms = elapsed.as_millis() as u64,
+        "mcp local tool step completed",
+    );
+}
+
+/// Deterministic execution order for a `steps` DAG: a topological sort
+/// of `depends_on`, breaking ties by declaration order among steps
+/// that are all currently ready (WOR-2489 Task 4). Returns indices
+/// into `steps`. The DAG is already known cycle-free (enforced at
+/// compile time by `detect_step_cycle`), so this always accounts for
+/// every step; the trailing defensive branch only guards against that
+/// invariant somehow not holding rather than expressing a real
+/// runtime possibility.
+fn local_steps_topological_order(steps: &[CompiledLocalStep]) -> Vec<usize> {
+    let n = steps.len();
+    let name_to_index: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    let mut indegree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, step) in steps.iter().enumerate() {
+        for dep in &step.depends_on {
+            if let Some(&dep_idx) = name_to_index.get(dep.as_str()) {
+                indegree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+    let mut ready: std::collections::BTreeSet<usize> =
+        (0..n).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    while let Some(&next) = ready.iter().next() {
+        ready.remove(&next);
+        order.push(next);
+        for &dependent in &dependents[next] {
+            indegree[dependent] -= 1;
+            if indegree[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if order.len() != n {
+        // Defensive only -- see doc comment above.
+        for i in 0..n {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+    order
+}
+
+/// Run one DAG step's HTTP call and decide whether it counts as
+/// complete. Unlike a standalone `http` tool (which never turns a
+/// non-2xx response into an `Err`), a `steps` DAG step does: a
+/// downstream step cannot branch on `${steps.<name>.status}` via
+/// `condition` (conditions only see the call-level `mcp.*` vocabulary,
+/// never `steps.*`; see the module doc above), so a non-2xx response
+/// has to be a failure here for `continue_on_error` and the dependency
+/// rule to have anything to act on.
+async fn run_local_step_with_resolver(
+    server: &CompiledLocalMcpServer,
+    step: &CompiledLocalStep,
+    context: &serde_json::Value,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let (status, document) =
+        run_local_http_call_with_resolver(server, &step.http, context, resolver).await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "mcp: local step '{}' returned non-success status {}",
+        step.name,
+        status.as_u16()
+    );
+    Ok(document)
+}
+
+/// Run a `steps` handler's DAG to completion and shape its final
+/// response. See the module doc above for the dependency rule and the
+/// `steps.<name>` context shape.
+async fn run_local_steps_dag(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    steps_cfg: &CompiledLocalSteps,
+    arguments: &serde_json::Value,
+    condition_ctx: &sbproxy_extension::cel::CelContext,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let order = local_steps_topological_order(&steps_cfg.steps);
+    let mut outcomes: HashMap<&str, LocalStepOutcome> =
+        HashMap::with_capacity(steps_cfg.steps.len());
+    let mut steps_context = serde_json::Map::with_capacity(steps_cfg.steps.len());
+    let mut last_success: Option<&str> = None;
+
+    for &idx in &order {
+        let step = &steps_cfg.steps[idx];
+        let started = std::time::Instant::now();
+
+        let condition_says_run = match &step.condition {
+            None => true,
+            Some(condition) => match evaluate_mcp_argument_expr(condition, condition_ctx) {
+                McpArgumentPolicyEngineOutcome::Compliant => true,
+                McpArgumentPolicyEngineOutcome::Violation => false,
+                McpArgumentPolicyEngineOutcome::Error
+                | McpArgumentPolicyEngineOutcome::Panicked => {
+                    return Err(anyhow::anyhow!(
+                        "mcp: local tool '{tool_name}' step '{}' condition failed to evaluate",
+                        step.name
+                    ));
+                }
+            },
+        };
+
+        if !condition_says_run {
+            outcomes.insert(step.name.as_str(), LocalStepOutcome::Skipped);
+            emit_local_step_audit(
+                &server.name,
+                tool_name,
+                &step.name,
+                LocalStepOutcome::Skipped,
+                started.elapsed(),
+            );
+            continue;
+        }
+
+        if let Some(missing) = step
+            .depends_on
+            .iter()
+            .find(|dep| !matches!(outcomes.get(dep.as_str()), Some(LocalStepOutcome::Success)))
+        {
+            // The dependency rule (see module doc): `condition` said
+            // "run", but a step this one depends on did not complete.
+            return Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' step '{}' depends on '{missing}', which did not complete",
+                step.name
+            ));
+        }
+
+        let call_context = serde_json::json!({
+            "args": arguments,
+            "steps": serde_json::Value::Object(steps_context.clone()),
+        });
+
+        match run_local_step_with_resolver(server, step, &call_context, resolver).await {
+            Ok(document) => {
+                outcomes.insert(step.name.as_str(), LocalStepOutcome::Success);
+                last_success = Some(step.name.as_str());
+                steps_context.insert(step.name.clone(), document);
+                emit_local_step_audit(
+                    &server.name,
+                    tool_name,
+                    &step.name,
+                    LocalStepOutcome::Success,
+                    started.elapsed(),
+                );
+            }
+            Err(e) if step.continue_on_error => {
+                outcomes.insert(step.name.as_str(), LocalStepOutcome::Failed);
+                steps_context.insert(
+                    step.name.clone(),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                emit_local_step_audit(
+                    &server.name,
+                    tool_name,
+                    &step.name,
+                    LocalStepOutcome::Failed,
+                    started.elapsed(),
+                );
+            }
+            Err(e) => {
+                emit_local_step_audit(
+                    &server.name,
+                    tool_name,
+                    &step.name,
+                    LocalStepOutcome::Failed,
+                    started.elapsed(),
+                );
+                return Err(e.context(format!(
+                    "mcp: local tool '{tool_name}' step '{}' failed",
+                    step.name
+                )));
+            }
+        }
+    }
+
+    match &steps_cfg.response {
+        // WOR-2489 Task 5 shapes a `steps` handler's response from
+        // `template`/`js`/`lua`; this task's scope is the DAG executor
+        // only. Mirrors the exact "name the gap, fail loudly" pattern
+        // Task 3 used for this same handler's placeholder.
+        Some(CompiledLocalResponseShaping::Template(_)) => Err(anyhow::anyhow!(
+            "mcp: local tool '{tool_name}' on server '{}' configures `steps.response.template`, \
+             which has no shaping engine yet (WOR-2489 Task 5); omit `response:` to get the \
+             last completed step's own result",
+            server.name
+        )),
+        Some(CompiledLocalResponseShaping::Js(_)) => Err(anyhow::anyhow!(
+            "mcp: local tool '{tool_name}' on server '{}' configures `steps.response.js`, \
+             which has no shaping engine yet (WOR-2489 Task 5); omit `response:` to get the \
+             last completed step's own result",
+            server.name
+        )),
+        Some(CompiledLocalResponseShaping::Lua(_)) => Err(anyhow::anyhow!(
+            "mcp: local tool '{tool_name}' on server '{}' configures `steps.response.lua`, \
+             which has no shaping engine yet (WOR-2489 Task 5); omit `response:` to get the \
+             last completed step's own result",
+            server.name
+        )),
+        // No shaping configured: the default is the last step (in
+        // execution order) that actually completed, returned exactly
+        // as its own `http` call would have been (WOR-2489 Task 4).
+        None => match last_success {
+            Some(name) => {
+                let document = steps_context
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": document.to_string()}],
+                    "isError": false,
+                }))
+            }
+            None => Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' on server '{}': no step completed, so there is no \
+                 result to return (every step was skipped)",
+                server.name
+            )),
+        },
+    }
+}
+
+/// [`run_local_steps_dag`] wrapped in the whole-call budget (WOR-2489
+/// Task 4): one deadline covers every step, not any single step's own
+/// call, defaulting to [`DEFAULT_LOCAL_STEPS_BUDGET`] and capped at
+/// [`MAX_LOCAL_STEPS_BUDGET`] (enforced at compile time). Exceeding it
+/// fails the whole tool call closed rather than returning a partial
+/// response from whichever steps happened to finish.
+async fn execute_local_steps_with_resolver(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    steps_cfg: &CompiledLocalSteps,
+    arguments: serde_json::Value,
+    condition_ctx: &sbproxy_extension::cel::CelContext,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    let budget = steps_cfg.timeout.unwrap_or(DEFAULT_LOCAL_STEPS_BUDGET);
+    match tokio::time::timeout(
+        budget,
+        run_local_steps_dag(
+            server,
+            tool_name,
+            steps_cfg,
+            &arguments,
+            condition_ctx,
+            resolver,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "mcp: local tool '{tool_name}' on server '{}' exceeded its steps budget of {}ms",
+            server.name,
+            budget.as_millis()
+        )),
+    }
+}
+
+/// [`execute_local_steps_with_resolver`] with the production resolver.
+async fn execute_local_steps(
+    server: &CompiledLocalMcpServer,
+    tool_name: &str,
+    steps_cfg: &CompiledLocalSteps,
+    arguments: serde_json::Value,
+    condition_ctx: &sbproxy_extension::cel::CelContext,
+) -> anyhow::Result<serde_json::Value> {
+    execute_local_steps_with_resolver(
+        server,
+        tool_name,
+        steps_cfg,
+        arguments,
+        condition_ctx,
+        &sbproxy_security::egress::SystemHostResolver,
+    )
+    .await
 }
 
 impl McpAction {
@@ -3312,11 +3785,22 @@ impl McpAction {
     /// not the possibly-namespaced advertised name a caller sent on
     /// the wire -- exactly the distinction `call_openapi_tool` already
     /// draws for the OpenAPI-backed dispatch path.
+    ///
+    /// `principal`/`tenant`/`session_id` are only consulted for a
+    /// `steps` handler, whose per-step `condition` is CEL compiled
+    /// under the same [`CelSurface::McpArgumentPolicy`] vocabulary
+    /// `argument_policies[]` uses -- evaluating it needs the same
+    /// caller-identity view `evaluate_argument_policies` already
+    /// builds from these three (WOR-2489 Task 4). `static` and `http`
+    /// handlers ignore them entirely.
     pub async fn execute_local_tool(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: serde_json::Value,
+        principal: &sbproxy_plugin::Principal,
+        tenant: &str,
+        session_id: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let server = self
             .local_servers
@@ -3336,12 +3820,61 @@ impl McpAction {
             CompiledLocalToolHandler::Http(call) => {
                 execute_local_http_call(server, call, &arguments).await
             }
-            CompiledLocalToolHandler::Steps(_) => Err(anyhow::anyhow!(
-                "mcp: local tool '{tool_name}' on server '{server_name}' uses a `steps` \
-                 handler, which has no executor yet (WOR-2489 Task 4); `static` and `http` \
-                 handlers are implemented"
-            )),
+            CompiledLocalToolHandler::Steps(steps_cfg) => {
+                let condition_ctx = self.local_step_condition_context(
+                    tool_name,
+                    server_name,
+                    tenant,
+                    session_id,
+                    principal,
+                    &arguments,
+                );
+                execute_local_steps(server, tool_name, steps_cfg, arguments, &condition_ctx).await
+            }
         }
+    }
+
+    /// Build the CEL context every step `condition` in a `steps` DAG
+    /// evaluates against (WOR-2489 Task 4): identical vocabulary to
+    /// `argument_policies[]` (WOR-2384, MCP05) -- `mcp.tool.name`,
+    /// `mcp.server`, `mcp.session.*`, `mcp.tenant`, `mcp.principal.*`,
+    /// `mcp.arguments` -- because [`CompiledLocalStep::condition`] is
+    /// compiled under the exact same [`CelSurface::McpArgumentPolicy`]
+    /// surface (see `compile_local_steps`); there is no `steps.*`
+    /// binding here (that vocabulary belongs to `${}` interpolation,
+    /// not CEL -- see the step DAG executor's module doc).
+    ///
+    /// Built once per tool call, not once per step: none of these
+    /// bindings change as steps run, so rebuilding it per step would
+    /// be wasted work without changing any evaluation's outcome.
+    /// `mcp.result` is always CEL `null` here, matching every
+    /// `argument_policies[]` evaluation -- a step condition runs
+    /// before this tool call has produced a result to bind.
+    fn local_step_condition_context(
+        &self,
+        tool_name: &str,
+        server_name: &str,
+        tenant: &str,
+        session_id: Option<&str>,
+        principal: &sbproxy_plugin::Principal,
+        arguments: &serde_json::Value,
+    ) -> sbproxy_extension::cel::CelContext {
+        let flow_labels = self.current_flow_labels(session_id);
+        let view = sbproxy_extension::cel::context::McpArgumentPolicyView {
+            tool_name,
+            server: server_name,
+            session_id,
+            tenant,
+            principal_sub: principal.sub.as_str(),
+            principal_team: principal.attrs.team.as_deref(),
+            principal_project: principal.attrs.project.as_deref(),
+            principal_user: principal.attrs.user.as_deref(),
+            arguments,
+            result: None,
+            session_integrity: flow_labels.integrity.as_str(),
+            session_sensitive_touched: flow_labels.sensitive_touched,
+        };
+        sbproxy_extension::cel::context::build_mcp_argument_policy_context(&view)
     }
 }
 
@@ -8473,6 +9006,104 @@ allow := false if {
         assert!(McpAction::from_config(value).is_err());
     }
 
+    /// WOR-2489 Task 4: `steps.timeout` is optional; an unset one
+    /// compiles to `None`, not a materialized default -- the
+    /// executor's own `DEFAULT_LOCAL_STEPS_BUDGET` applies at
+    /// execution time instead, mirroring how a plain `http` call's own
+    /// `timeout:` field already works.
+    #[test]
+    fn local_steps_timeout_defaults_to_none_when_unset() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("a steps tool with no timeout compiles");
+        match &action.local_servers[0].tools[0].handler {
+            CompiledLocalToolHandler::Steps(steps) => assert_eq!(steps.timeout, None),
+            other => panic!("expected a Steps handler, got {other:?}"),
+        }
+    }
+
+    /// WOR-2489 Task 4: a valid duration string parses to the right
+    /// `Duration`, using the same `duration_str` idiom every other
+    /// `timeout:` field in this module already uses.
+    #[test]
+    fn local_steps_timeout_parses_a_valid_duration() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ],
+                        "timeout": "45s"
+                    }
+                }]
+            }]
+        });
+        let action = McpAction::from_config(value).expect("a valid steps.timeout compiles");
+        match &action.local_servers[0].tools[0].handler {
+            CompiledLocalToolHandler::Steps(steps) => {
+                assert_eq!(steps.timeout, Some(Duration::from_secs(45)));
+            }
+            other => panic!("expected a Steps handler, got {other:?}"),
+        }
+    }
+
+    /// WOR-2489 Task 4: `steps.timeout` past the 5-minute cap is a
+    /// config-compile error naming both the configured value and the
+    /// cap, not a silently-accepted knob -- a `steps` DAG dials real
+    /// upstreams on the gateway's own request path, so an unbounded
+    /// whole-call budget is a resource leak waiting to happen.
+    #[test]
+    fn local_steps_timeout_over_five_minutes_is_refused_at_compile_time() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "egress": {"mode": "deny_by_default", "hosts": ["api.example.com"]},
+                "tools": [{
+                    "name": "lookup",
+                    "description": "look something up",
+                    "input_schema": {"type": "object"},
+                    "steps": {
+                        "steps": [
+                            {"name": "fetch", "http": {"method": "GET", "url": "https://api.example.com/a"}}
+                        ],
+                        "timeout": "6m"
+                    }
+                }]
+            }]
+        });
+        let err = McpAction::from_config(value)
+            .expect_err("a steps.timeout past the 5-minute cap must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("steps.timeout"), "{msg}");
+        assert!(msg.contains("exceeds the maximum"), "{msg}");
+    }
+
     #[test]
     fn compiled_local_types_exhaustive_shape() {
         // Documents the full compiled contract Task 2 will consume by
@@ -8518,7 +9149,8 @@ allow := false if {
                                 "retry": {"max_attempts": 3}
                             }
                         ],
-                        "response": {"template": "{{ steps.enrich.body }}"}
+                        "response": {"template": "{{ steps.enrich.body }}"},
+                        "timeout": "45s"
                     }
                 }]
             }]
@@ -8547,13 +9179,18 @@ allow := false if {
         assert!(input_schema.is_object());
 
         let mut steps = match handler {
-            CompiledLocalToolHandler::Steps(CompiledLocalSteps { steps, response }) => {
+            CompiledLocalToolHandler::Steps(CompiledLocalSteps {
+                steps,
+                response,
+                timeout: steps_timeout,
+            }) => {
                 match response.expect("response shaping was configured") {
                     CompiledLocalResponseShaping::Template(t) => {
                         assert_eq!(t, "{{ steps.enrich.body }}");
                     }
                     other => panic!("expected Template, got {other:?}"),
                 }
+                assert_eq!(steps_timeout, Some(Duration::from_secs(45)));
                 steps
             }
             other => panic!("expected a Steps handler, got {other:?}"),
