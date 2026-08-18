@@ -1856,6 +1856,209 @@ fn handle_config_write(
     handle_reload(state)
 }
 
+// --- /admin/config/history ---
+
+/// `GET /admin/config/history`: every recorded config revision, newest
+/// first, alongside this ring's lineage identity and last-known-good
+/// revision.
+///
+/// `404`s with `{"error":"config history is not enabled"}` when
+/// `proxy.config_history.enabled` is off or the block is absent, which
+/// is exactly when
+/// [`crate::config_history::current_config_history_recorder`] reports
+/// `None`. The UI matches this exact string
+/// (`isConfigHistoryDisabled` in `ui/src/lib/config-history.ts`) to
+/// render an opt-in empty state instead of an error toast, so the
+/// wording is part of the contract, not incidental.
+fn handle_config_history_list() -> (u16, &'static str, String) {
+    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
+        return (
+            404,
+            "application/json",
+            r#"{"error":"config history is not enabled"}"#.to_string(),
+        );
+    };
+    let mut entries = recorder.entries();
+    // The ring stores oldest first; the response contract is newest
+    // first, matching the order an operator scanning for a rollback
+    // target actually wants.
+    entries.reverse();
+    let entries: Vec<serde_json::Value> = entries.iter().map(config_history_entry_json).collect();
+    let body = serde_json::json!({
+        "lineage": recorder.lineage(),
+        "lkg_revision": recorder.lkg().map(|entry| entry.revision),
+        "entries": entries,
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// `GET /admin/config/history/{digest}`: the stored pre-resolution
+/// document for one ring entry, plus a `plan()` diff of that document
+/// against what this node is running right now.
+///
+/// `404`s the same way as the list route when config history is not
+/// enabled, and additionally with `{"error":"unknown digest"}` when no
+/// entry in the ring names `digest`.
+///
+/// `document` is returned byte for byte as the ring stored it: the raw
+/// text read before `${VAR}` / `vault://` / `secret://` interpolation
+/// ran, never resolved here or anywhere upstream of here. `plan_text`
+/// treats the stored document as the rollback candidate and the
+/// currently running config as the baseline, so it reads as "what
+/// would change if this were applied now", the question an operator
+/// browsing history is actually asking.
+fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'static str, String) {
+    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
+        return (
+            404,
+            "application/json",
+            r#"{"error":"config history is not enabled"}"#.to_string(),
+        );
+    };
+    let Some(entry) = recorder
+        .entries()
+        .into_iter()
+        .find(|entry| entry.digest == digest)
+    else {
+        return (
+            404,
+            "application/json",
+            r#"{"error":"unknown digest"}"#.to_string(),
+        );
+    };
+    let document_bytes = match recorder.read_blob(&entry.digest) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                format!(
+                    r#"{{"error":"read stored revision: {}"}}"#,
+                    error.to_string().replace('"', "'")
+                ),
+            )
+        }
+    };
+    let document = String::from_utf8_lossy(&document_bytes).into_owned();
+    let plan_text = config_history_plan_text(state, &document);
+    let body = serde_json::json!({
+        "entry": config_history_entry_json(&entry),
+        "document": document,
+        "plan_text": plan_text,
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// Best-effort `plan()` diff of `stored_document` (the rollback
+/// candidate) against this node's running config (the baseline),
+/// rendered the same way the CLI's `plan` and `apply` commands render
+/// one (see [`sbproxy_config::render_text`]). "Running" is the same
+/// merged, pre-resolution document `GET /admin/config/effective`
+/// answers with, not the raw on-disk file: a git-sourced or
+/// authority-owned node's own file may be nothing but a `source:`
+/// pointer.
+///
+/// Never fails the detail response over this: a node with no
+/// `config_path` wired, an unreadable file, a merge failure, or either
+/// side failing to parse as [`sbproxy_config::ConfigFile`] all degrade
+/// to a one-line explanation instead, because the stored document is
+/// still worth returning even when a diff against "now" cannot be
+/// computed.
+fn config_history_plan_text(state: &AdminState, stored_document: &str) -> String {
+    let Some(path) = state.config_path.as_ref() else {
+        return "plan unavailable: admin server has no config_path wired".to_string();
+    };
+    let local = match std::fs::read_to_string(path) {
+        Ok(local) => local,
+        Err(error) => return format!("plan unavailable: read running config: {error}"),
+    };
+    let layers = crate::config_effective::current_layers(&local);
+    let running = match crate::config_effective::effective_config(&layers) {
+        Ok(effective) => effective,
+        Err(error) => return format!("plan unavailable: {error}"),
+    };
+    let baseline = match serde_yaml::from_str::<sbproxy_config::ConfigFile>(&running.yaml) {
+        Ok(config) => config,
+        Err(error) => return format!("plan unavailable: parse running config: {error}"),
+    };
+    let proposed = match serde_yaml::from_str::<sbproxy_config::ConfigFile>(stored_document) {
+        Ok(config) => config,
+        Err(error) => return format!("plan unavailable: parse stored revision: {error}"),
+    };
+    sbproxy_config::render_text(&sbproxy_config::plan(&baseline, &proposed))
+}
+
+/// Render one [`sbproxy_config::RevisionEntry`] as the JSON shape
+/// `ui/src/api.ts`'s `ConfigHistoryEntry` binds to. Hand-built rather
+/// than derived from the entry's own `Serialize` impl: that impl also
+/// carries `soak_verdict` and `boot_attempts`, which are not part of
+/// this contract and nothing writes yet, and it would emit `applied_at`
+/// as a JSON number where the contract is a string.
+fn config_history_entry_json(entry: &sbproxy_config::RevisionEntry) -> serde_json::Value {
+    serde_json::json!({
+        "revision": entry.revision,
+        "digest": entry.digest,
+        "provenance": config_history_provenance_label(&entry.provenance),
+        "state": config_history_state_label(entry.state),
+        "applied_at": entry.applied_at.to_string(),
+        "actor": entry.actor.clone().unwrap_or_default(),
+        "blast_radius": entry.blast_radius.map(config_history_blast_radius_label),
+        "degraded": entry.degraded,
+    })
+}
+
+/// Provenance label in the four-way vocabulary
+/// (`local_file` | `git` | `authority` | `merged`) the admin UI's
+/// history table renders.
+///
+/// Only two of those four are reachable from what a ring entry
+/// actually stores. [`sbproxy_config::RevisionEntry::provenance`] (and
+/// the [`sbproxy_config::AppendMetadata::provenance`] that fills it) is
+/// a [`BaseOrigin`], which names only where the *base* document was
+/// read from before any config-authority merge ran: `Local` or `Git`.
+/// It carries no bit for "an authority overlay was also applied to
+/// this revision". `record_applied_config_revision` in
+/// `crate::server::lifecycle` passes through whatever `BaseOrigin` the
+/// caller resolved for the base document, and that function's own doc
+/// comment explains why re-deriving provenance from the merged content
+/// at record time is deliberately avoided (it risks misreporting a
+/// git-sourced base as `Local`). So an authority-merged reload still
+/// records `Local` or `Git` here, whichever the base document was, and
+/// this function maps honestly to what the stored data can actually
+/// say rather than inventing a fifth signal. Distinguishing `authority`
+/// and `merged` would need the per-leaf
+/// [`sbproxy_config::config_merge::Provenance`] map threaded into
+/// `AppendMetadata` at record time, which is out of scope here.
+fn config_history_provenance_label(origin: &BaseOrigin) -> &'static str {
+    match origin {
+        BaseOrigin::Local => "local_file",
+        BaseOrigin::Git { .. } => "git",
+    }
+}
+
+/// `snake_case` label for one [`sbproxy_config::RevisionState`],
+/// matching the contract's `applied | good | failed | reverted`.
+fn config_history_state_label(state: sbproxy_config::RevisionState) -> &'static str {
+    match state {
+        sbproxy_config::RevisionState::Applied => "applied",
+        sbproxy_config::RevisionState::Good => "good",
+        sbproxy_config::RevisionState::Failed => "failed",
+        sbproxy_config::RevisionState::Reverted => "reverted",
+    }
+}
+
+/// Lowercase label for one [`sbproxy_config::BlastRadius`], matching
+/// the contract's `hitless | reload | restart | breaking` and
+/// [`sbproxy_config::render_text`]'s own labels for the same enum.
+fn config_history_blast_radius_label(radius: sbproxy_config::BlastRadius) -> &'static str {
+    match radius {
+        sbproxy_config::BlastRadius::Hitless => "hitless",
+        sbproxy_config::BlastRadius::Reload => "reload",
+        sbproxy_config::BlastRadius::Restart => "restart",
+        sbproxy_config::BlastRadius::Breaking => "breaking",
+    }
+}
+
 // --- /admin/drift ---
 
 /// Compare the on-disk config file at [`AdminState::config_path`]
@@ -2973,6 +3176,29 @@ pub fn handle_admin_request(
         }
         if method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("POST") {
             return handle_config_write(state, body, rl_query_param(path, "if_match"));
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2457: the applied-config audit trail. `proxy.config_history`
+    // is opt-in, so both routes 404 with the same "not enabled" body
+    // when no recorder is installed; see `handle_config_history_list`.
+    if path_only == "/admin/config/history" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_history_list();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    if let Some(digest) = path_only.strip_prefix("/admin/config/history/") {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_history_detail(state, digest);
         }
         return (
             405,
@@ -6511,6 +6737,217 @@ mod tests {
                 handle_admin_request(method, "/admin/config/effective", &state, Some(&auth), None);
             assert_eq!(status, 405, "{method} should not be accepted");
         }
+    }
+
+    // --- /admin/config/history (WOR-2456/2457) ---
+
+    /// Installs an enabled config-history recorder rooted at `dir` as the
+    /// process-wide recorder these routes read through
+    /// `crate::config_history::current_config_history_recorder`. Pair with
+    /// `crate::config_history::clear_config_history_recorder()` once the
+    /// test is done, matching the teardown `config_history.rs`'s own
+    /// tests use for the same process-global slot.
+    fn install_test_history_recorder(
+        dir: &std::path::Path,
+    ) -> std::sync::Arc<crate::config_history::ConfigHistoryRecorder> {
+        let history = sbproxy_config::ConfigHistoryConfig {
+            enabled: true,
+            dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let recorder = crate::config_history::ConfigHistoryRecorder::from_config(Some(&history))
+            .expect("no error opening an enabled block")
+            .expect("an enabled block opens a recorder");
+        let recorder = std::sync::Arc::new(recorder);
+        crate::config_history::install_config_history_recorder(recorder.clone());
+        recorder
+    }
+
+    fn history_metadata(actor: &str) -> sbproxy_config::AppendMetadata {
+        sbproxy_config::AppendMetadata {
+            provenance: BaseOrigin::Local,
+            blast_radius: None,
+            secrets_fingerprint: None,
+            actor: Some(actor.to_string()),
+            applied_at: 1_700_000_000_000,
+            degraded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_history_routes_require_auth() {
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/config/history", &state, None, None);
+        assert_eq!(status, 401);
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/config/history/deadbeef", &state, None, None);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn config_history_404s_with_the_exact_disabled_body_when_no_recorder_is_installed() {
+        crate::config_history::clear_config_history_recorder();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/history", &state, Some(&auth), None);
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/admin/config/history/deadbeef",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+    }
+
+    #[test]
+    fn config_history_only_answers_get() {
+        crate::config_history::clear_config_history_recorder();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for method in ["PUT", "POST", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/history", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+    }
+
+    #[test]
+    fn config_history_list_shape_matches_the_contract_field_for_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        recorder.record(
+            b"origins: {}\n# one\n",
+            sbproxy_config::AppendMetadata {
+                blast_radius: None,
+                ..history_metadata("first")
+            },
+        );
+        recorder.record(
+            b"origins: {}\n# two\n",
+            sbproxy_config::AppendMetadata {
+                blast_radius: Some(sbproxy_config::BlastRadius::Restart),
+                ..history_metadata("second")
+            },
+        );
+
+        let (status, _, body) = handle_config_history_list();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let top: std::collections::BTreeSet<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            top,
+            ["lineage", "lkg_revision", "entries"].into_iter().collect(),
+        );
+        assert_eq!(parsed["lkg_revision"], serde_json::Value::Null);
+        assert!(parsed["lineage"].as_str().is_some_and(|s| !s.is_empty()));
+
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2);
+        // Newest first: the ring itself stores oldest first.
+        assert_eq!(entries[0]["revision"], 2);
+        assert_eq!(entries[1]["revision"], 1);
+
+        let expected_keys: std::collections::BTreeSet<&str> = [
+            "revision",
+            "digest",
+            "provenance",
+            "state",
+            "applied_at",
+            "actor",
+            "blast_radius",
+            "degraded",
+        ]
+        .into_iter()
+        .collect();
+        for entry in entries {
+            let keys: std::collections::BTreeSet<&str> = entry
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, expected_keys, "entry: {entry}");
+            assert!(
+                entry["applied_at"].is_string(),
+                "applied_at must be a string: {entry}"
+            );
+            assert!(
+                entry["actor"].is_string(),
+                "actor must be a string: {entry}"
+            );
+            assert_eq!(entry["state"], "applied");
+            assert_eq!(entry["provenance"], "local_file");
+        }
+        assert_eq!(entries[0]["actor"], "second");
+        assert_eq!(entries[0]["blast_radius"], "restart");
+        assert_eq!(entries[1]["actor"], "first");
+        assert_eq!(
+            entries[1]["blast_radius"],
+            serde_json::Value::Null,
+            "no blast radius was recorded for the first entry"
+        );
+    }
+
+    #[test]
+    fn config_history_detail_returns_the_document_verbatim_and_a_plan_text() {
+        let _guard = config_layer_guard();
+        let history_dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(history_dir.path());
+        let stored = "proxy:\n  http_bind_port: 9999\n# credential: ${FAKE_VAR_NOT_SET}\n";
+        recorder.record(stored.as_bytes(), history_metadata("operator"));
+        let digest = recorder.entries().last().expect("one entry").digest.clone();
+
+        let (_dir, state) = owned_config_state("proxy:\n  http_bind_port: 8080\n");
+
+        let (status, _, body) = handle_config_history_detail(&state, &digest);
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(
+            parsed["document"].as_str().unwrap(),
+            stored,
+            "the stored document must round-trip byte for byte, unresolved: {body}"
+        );
+        assert_eq!(parsed["entry"]["digest"].as_str(), Some(digest.as_str()));
+
+        let plan_text = parsed["plan_text"].as_str().expect("plan_text is a string");
+        assert!(
+            !plan_text.starts_with("plan unavailable"),
+            "expected a real plan diff, got: {plan_text}"
+        );
+        assert!(
+            plan_text.contains("restart"),
+            "changing http_bind_port is a restart-class change: {plan_text}"
+        );
+    }
+
+    #[test]
+    fn config_history_detail_404s_for_an_unknown_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        recorder.record(b"proxy: {}\n", history_metadata("operator"));
+        let state = make_state();
+
+        let (status, _, body) = handle_config_history_detail(&state, "not-a-real-digest");
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"unknown digest"}"#);
     }
 
     #[test]
