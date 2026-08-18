@@ -42,6 +42,7 @@
         "cluster": null,
         "compression_state": null,
         "config_authority": null,
+        "config_history": null,
         "correlation_id": {
           "echo_response": true,
           "enabled": true,
@@ -681,6 +682,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/CompressionStateRuntimeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "config_history": {
+          "description": "Durable last-known-good config history (WOR-2456): the ring of every config this proxy has applied, kept on local disk so a rollback has somewhere to restore from. Absent (the default) keeps the proxy's existing behavior exactly; no ring is written. See [`ConfigHistoryConfig`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigHistoryConfig"
             },
             {
               "type": "null"
@@ -5776,6 +5789,37 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConfigHistoryConfig": {
+      "description": "Durable last-known-good config history (WOR-2456): every config this proxy applies is kept as a content-addressed entry on local disk, so a rollback can restore a prior revision without depending on git history or any other external system being reachable at the moment it is needed.\n\nDisabled by default. An example elsewhere may show `enabled: true`, but that is the example, not this build's shipping default; every other opt-in proxy-level block in this schema defaults the same way.\n\nOnce enabled, the block names process-owned local storage, which is why [`crate::config_merge::AUTHORITY_DENIED_PATHS`] carries `proxy.config_history` for the same reason it carries `proxy.compression_state`: the ring's directory is a fact about this machine, not something a fleet-wide authority document should be able to repoint.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Disabled by default so an existing deployment does not start writing config revisions to local disk without an explicit opt-in.",
+          "default": false,
+          "type": "boolean"
+        },
+        "dir": {
+          "description": "Directory the revision ring lives in. Defaults to `/var/lib/sbproxy/config-history`.",
+          "default": "/var/lib/sbproxy/config-history",
+          "type": "string"
+        },
+        "keep": {
+          "description": "Number of applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1; see [`Self::validate`]. Defaults to 20.",
+          "default": 20,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "keep_rejected": {
+          "description": "Number of rejected entries the ring retains for operator inspection. Defaults to 10.",
+          "default": 10,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false
