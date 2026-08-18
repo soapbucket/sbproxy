@@ -1640,9 +1640,9 @@ ring does and does not do yet.
 
 ### `GET /admin/config/history/{digest}`
 
-One ring entry in full, by its content digest: the entry's metadata, the
-stored pre-resolution YAML, and the rendered `plan()` diff against the
-config currently running.
+One ring entry in full, by its content digest: the entry's metadata, a
+secret-redacted view of the stored pre-resolution YAML, and the rendered
+`plan()` diff against the config currently running, redacted the same way.
 
 ```json
 {
@@ -1664,8 +1664,8 @@ config currently running.
 | Field | Type | Description |
 |---|---|---|
 | `entry` | object | Same shape as one element of `entries[]` in [`GET /admin/config/history`](#get-adminconfighistory). |
-| `document` | string | The stored pre-resolution YAML, byte-for-byte. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. |
-| `plan_text` | string | The same terraform-style text diff `sbproxy plan` renders by default, computed between this revision and the config running now. |
+| `document` | string | A secret-redacted view of the stored pre-resolution YAML. `${VAR}` and `vault://`/`secret://` references appear exactly as written; nothing is resolved. A literal secret an operator typed directly into the file (an inline API key, a password field) is masked as `[REDACTED]`, the same redaction pass [`GET /admin/config`](#get-put-adminconfig) applies. This is display redaction only: the ring file on disk still holds the original bytes (a rollback needs them), protected by the ring directory's owner-only filesystem permissions (`0700`/`0600`), not by this response. |
+| `plan_text` | string | The same terraform-style text diff `sbproxy plan` renders by default, computed between this revision and the config running now, then redacted the same way `document` is. |
 
 Read-only operators may call this.
 
