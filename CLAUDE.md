@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-18*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -88,9 +88,12 @@ bypassed and lists the paths.
 ### Running the gate
 
 The local runner is `scripts/check.sh`. The default path mirrors the
-required PR lane: non-e2e workspace tests in the dev profile plus
-doctests. This keeps the local target directory materially smaller than
-full release/e2e runs.
+required PR lane's workspace jobs: non-e2e workspace tests in the dev
+profile plus doctests. This keeps the local target directory materially
+smaller than full release/e2e runs. The required e2e subset (see "A
+small e2e subset is required per PR" below) is not in the default path;
+`SBPROXY_CHECK_E2E=1` covers it, as does the five-file command in that
+section.
 
 | Variable | Effect |
 |---|---|
@@ -254,6 +257,51 @@ cargo test -p sbproxy-e2e --locked --no-fail-fast \
 parallelism (WOR-2295). Build that binary once and `SBPROXY_CHECK_E2E=1
 bash scripts/check.sh` picks both files up on every later gate. Without
 it the gate lists them under `SKIPPED PHASES`.
+
+### A small e2e subset is required per PR (WOR-2469)
+
+The rest of the e2e suite is scheduled, but a small set of offline e2e
+files runs on every code PR as the required `e2e subset (required)`
+lane in `ci.yml`, single-threaded, against a debug proxy the job builds
+itself. The lane's own comment block carries the authoritative list and
+the reason each file is there; at this writing it is `static_action`,
+`body_routing`, `sessions`, `admin_reload`, and `transform_json`.
+
+Why: PR #1049 changed 425 lines across `request_phase.rs` and
+`proxy_http.rs`, merged with every required check green, altered four
+documented end-to-end behaviors, and broke a shipped example outright
+(WOR-2468). The only tests that would have caught any of it ran weekly,
+so the break sat on main for three days. WOR-2469 weighed four
+remedies: a required subset, making a scheduled red block the next
+merge, path-triggered e2e for the shared request-path files, and
+accepting the risk in writing. The subset shipped because it is the
+only one that checks behavior before the merge instead of after, and it
+runs on every code PR rather than behind a path filter because
+end-to-end behavior breaks from modules, transport, and config
+compilation just as well as from the two files #1049 touched.
+
+The bar for adding a file to the subset: offline (MockUpstream or
+static actions on loopback; no mesh, no websockets, no Redis, no
+special binaries), absent from the known load-flake roster, and
+covering a behavior a shipped example documents. `model_cluster_control`
+stays out until its root-cause fix (#1142) has a quiet scheduled
+history behind it.
+
+What is still accepted, in writing: a red weekly e2e sweep or nightly
+payments run files an issue and does not block merges. The full sweep
+includes load-sensitive tests, and a merge gate that a known flake can
+close is a repo-wide stop nobody ordered. Everything outside the subset
+keeps the file-an-issue posture, and this paragraph is the record of
+that decision.
+
+Reproduce the lane locally:
+
+```bash
+cargo build --workspace --locked
+cargo test --workspace --locked \
+  --test static_action --test body_routing --test sessions \
+  --test admin_reload --test transform_json -- --test-threads=1
+```
 
 ## Code review
 
