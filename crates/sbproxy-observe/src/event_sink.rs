@@ -388,6 +388,22 @@ impl EventEgress {
     /// slow one) still drains the instant it gets scheduled, and a
     /// caller cannot control when that happens.
     ///
+    /// The receiver half is deliberately kept alive rather than
+    /// dropped: an `mpsc` channel reports `Disconnected` (mapped to
+    /// [`EventPublishError::WorkerStopped`]) once its receiver is gone,
+    /// even if the buffer itself has room, so a first version of this
+    /// function that let the receiver fall out of scope at the end of
+    /// the function body made the very first publish fail closed for
+    /// the wrong reason -- disconnection, not fullness -- rather than
+    /// queuing at all. `Box::leak` fixes that with the least surface:
+    /// the receiver is never read from (so nothing here can ever drain
+    /// the fullness this constructor exists to guarantee) and never
+    /// dropped (so the channel never reports disconnected), which is
+    /// exactly "connected and undrained." Leaking is fine for a
+    /// test-only, once-per-test-process handle: nothing ever needs the
+    /// receiver back, and it is one bounded, small allocation for the
+    /// rest of the process's life either way.
+    ///
     /// This exists as its own function, rather than exposing
     /// `over_channel` itself, because `#[cfg(test)]` items compile only
     /// into the crate that declares them: `sbproxy-observe`'s own test
@@ -417,7 +433,11 @@ impl EventEgress {
         sink_label: &'static str,
         queue_capacity: usize,
     ) -> Self {
-        let (tx, _rx) = sync_channel::<ProxyEvent>(queue_capacity);
+        let (tx, rx) = sync_channel::<ProxyEvent>(queue_capacity);
+        // Keep the channel connected without ever draining it: see the
+        // doc comment above for why leaking (rather than dropping, or
+        // storing and later reading) is the correct choice here.
+        Box::leak(Box::new(rx));
         Self {
             tx: Some(tx),
             handle: None,
