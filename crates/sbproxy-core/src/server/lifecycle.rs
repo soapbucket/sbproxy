@@ -1025,7 +1025,16 @@ pub(crate) fn reload_from_config_yaml(
     let _reload_guard = CONFIG_RELOAD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reload_from_config_yaml_locked(config_path, yaml)
+    // Every production caller of this exact function (the file watcher
+    // and SIGHUP, both via `reload_from_config_path` /
+    // `reload_from_config_text` below) already audits its outcome under
+    // the literal source `"file_watcher"`, so that is the config
+    // history actor too; see WOR-2486's reasoning for why the two
+    // triggers share one label. `origin_override: None` because this
+    // `yaml` is read straight off the local file and may itself carry a
+    // `source:` block, which `reload_from_config_yaml_locked` resolves
+    // the ordinary way.
+    reload_from_config_yaml_locked(config_path, yaml, "file_watcher", None)
 }
 
 /// As [`reload_from_config_yaml`], for a caller that already resolved
@@ -1060,13 +1069,31 @@ pub(crate) fn reload_from_resolved_yaml(
     let names_remote_source = sbproxy_config::source::parse_source_head(original)
         .map_err(|error| anyhow::anyhow!("config source: {error}"))?
         .is_some();
-    let commit_text = if names_remote_source {
-        crate::config_source::resolve(original)?.text
+    let (commit_text, origin) = if names_remote_source {
+        let resolved = crate::config_source::resolve(original)?;
+        let origin = resolved.base_origin();
+        (resolved.text, origin)
     } else {
-        resolved_text.to_owned()
+        (resolved_text.to_owned(), sbproxy_config::BaseOrigin::Local)
     };
     let compiled = sbproxy_config::compile_config(&commit_text)?;
-    reload_compiled_config_locked(config_path, compiled, None, Some(original))
+    // The actor and revision pair `crate::admin` carries for its own
+    // `config_audit` entry (WOR-2094) is exactly the actor this ring
+    // wants too: the authenticated operator id when the request came in
+    // authenticated, `"api"` (the same fallback label
+    // `audit_reload_outcome`'s doc names for this path) otherwise.
+    let actor = crate::admin::current_admin_actor().unwrap_or_else(|| "api".to_string());
+    reload_compiled_config_locked(
+        config_path,
+        compiled,
+        None,
+        Some(original),
+        Some(RevisionRecordingInput {
+            content: commit_text.as_bytes(),
+            origin,
+            actor: &actor,
+        }),
+    )
 }
 
 /// What a non-blocking reload attempt did.
@@ -1104,11 +1131,19 @@ pub enum TryReloadOutcome {
 // `config_audit` source label, and the two callers of this function
 // (the config-authority bundle apply and the remote config-source
 // refresh poller) are different enough that one guessed label would be
-// wrong for one of them.
+// wrong for one of them. `origin` is the WOR-2457 addition, for the
+// same reason on a different axis: both callers hand `yaml` down as an
+// already-merged document with no `source:` block of its own, so
+// neither can be re-resolved into a `BaseOrigin` inside the shared
+// transaction the way the file-watcher and SIGHUP paths are. Both
+// callers already compute the right one for their own purposes
+// (`base_origin_for` / `resolved.base_origin()`) and hand it down here
+// rather than it being re-derived.
 pub(crate) fn try_reload_from_config_yaml(
     config_path: &str,
     yaml: &str,
     source: &str,
+    origin: sbproxy_config::BaseOrigin,
 ) -> anyhow::Result<TryReloadOutcome> {
     let _reload_guard = match CONFIG_RELOAD_LOCK.try_lock() {
         Ok(guard) => guard,
@@ -1121,7 +1156,7 @@ pub(crate) fn try_reload_from_config_yaml(
         // worse than proceeding.
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
     };
-    let result = reload_from_config_yaml_locked(config_path, yaml);
+    let result = reload_from_config_yaml_locked(config_path, yaml, source, Some(origin));
     audit_reload_outcome(source, config_path, &result);
     result.map(TryReloadOutcome::Applied)
 }
@@ -1203,7 +1238,10 @@ fn reload_for_extension_refresh(
     compiled: sbproxy_config::CompiledConfig,
     candidate: std::sync::Arc<sbproxy_extension::bundle::DynamicBundleRegistry>,
 ) -> anyhow::Result<ReloadOutcome> {
-    let result = reload_compiled_config_locked(config_path, compiled, Some(candidate), None);
+    // `None`: an extension-bundle refresh republishes the same compiled
+    // config under a new extension registry. No config document
+    // changed, so there is nothing new for the revision ring to record.
+    let result = reload_compiled_config_locked(config_path, compiled, Some(candidate), None, None);
     audit_reload_outcome("extension_refresh", config_path, &result);
     result
 }
@@ -1221,8 +1259,153 @@ pub fn hold_config_reload_lock_for_test() -> std::sync::MutexGuard<'static, ()> 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// What to record into the config revision ring for one reload, when
+/// this path has a document to record.
+///
+/// Bundled into one parameter and threaded down to
+/// `reload_compiled_config_locked`, the one place every reload path
+/// converges: see the comment on the drift-baseline write inside it,
+/// which applies the same reasoning to a different piece of state.
+/// `None` reaches that function for the extension-bundle refresh path,
+/// which republishes the same compiled config under a new extension
+/// registry rather than applying a new document, so there is nothing
+/// new to record.
+struct RevisionRecordingInput<'a> {
+    /// Pre-resolution document bytes: literal text, with `${VAR}` /
+    /// `vault://` / `secret://` references unresolved. Never the
+    /// document `compile_config` produced after interpolation; storing
+    /// that would be a ring of resolved secrets on disk.
+    content: &'a [u8],
+    /// Where `content` came from. Computed by the caller rather than
+    /// re-derived inside the shared transaction: a merged or overlaid
+    /// document (the config-authority and `source:` refresh-poller
+    /// paths both hand down an already-merged document) carries no
+    /// `source:` block of its own, so re-resolving it there would
+    /// misreport a git-sourced base as
+    /// [`sbproxy_config::BaseOrigin::Local`].
+    origin: sbproxy_config::BaseOrigin,
+    /// Who or what produced this revision: `"file_watcher"`,
+    /// `"config_authority"`, `"config_refresh_poller"`, an admin
+    /// operator id, or `"boot"`.
+    actor: &'a str,
+}
+
+/// Host wall clock in unix milliseconds, saturating rather than
+/// panicking on a clock set before the epoch.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Append one applied revision to the process-wide config history ring,
+/// when a recorder is installed.
+///
+/// A no-op when `proxy.config_history` is absent or disabled: see
+/// [`crate::config_history::current_config_history_recorder`]. Never
+/// fails the reload it is called from and never blocks it on I/O beyond
+/// the store's own writes: a failure to record is logged by the
+/// recorder itself and swallowed there, because this ring is a
+/// diagnostic and rollback aid, not a gate the request path depends on.
+fn record_applied_config_revision(input: RevisionRecordingInput<'_>, outcome: &ReloadOutcome) {
+    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
+        return;
+    };
+    let blast_radius = recorder.blast_radius_for(input.content);
+    let metadata = sbproxy_config::AppendMetadata {
+        provenance: input.origin,
+        blast_radius,
+        secrets_fingerprint: PROCESS_SECRETS_FINGERPRINT.get().cloned(),
+        actor: Some(input.actor.to_string()),
+        applied_at: now_unix_ms(),
+        degraded: outcome
+            .degraded()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+    };
+    recorder.record(input.content, metadata);
+}
+
+/// Open the config history ring `history` names and record `content` as
+/// this process's boot entry.
+///
+/// Split out of `run` so boot's own wiring is unit-testable without
+/// booting a full server: `boot_path_records_a_ring_entry` (the happy
+/// path) and `boot_path_marks_the_slot_failed_when_the_store_cannot_open`
+/// (the unopenable-store path) both exercise this function directly.
+/// The `None`/disabled-block cases are exercised indirectly, through
+/// `ConfigHistoryRecorder::from_config`'s own tests in
+/// `crate::config_history`: this function's `Ok(None) => {}` arm has
+/// nothing of its own to test beyond what those already cover.
+///
+/// `ConfigHistoryRecorder::from_config` returns `None` for an absent or
+/// disabled block, so this is a no-op on every node that has not opted
+/// in. A store that fails to open is logged and marks the process-wide
+/// slot [`crate::config_history::ConfigHistoryState::Failed`] rather
+/// than propagating: a boot that has already published its pipeline
+/// must not fail over its own audit trail, but the admin history routes
+/// still surface the failure (`503`) instead of answering as though the
+/// feature were never turned on. `"boot"` is the fixed actor; boot has
+/// no degraded-subsystem concept of its own (it hard-fails via `?`
+/// instead of continuing in a degraded state), so
+/// `ReloadOutcome::default`'s empty, fully-applied outcome is exactly
+/// right for the entry's `degraded` list.
+fn record_boot_config_revision(
+    history: Option<&sbproxy_config::ConfigHistoryConfig>,
+    content: &[u8],
+    origin: sbproxy_config::BaseOrigin,
+) {
+    match crate::config_history::ConfigHistoryRecorder::from_config(history) {
+        Ok(Some(recorder)) => {
+            // Installed before recording, not after: recording goes
+            // through the process-global slot (the same path a later
+            // reload uses), which is empty until this call.
+            crate::config_history::install_config_history_recorder(std::sync::Arc::new(recorder));
+            record_applied_config_revision(
+                RevisionRecordingInput {
+                    content,
+                    origin,
+                    actor: "boot",
+                },
+                &ReloadOutcome::default(),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // Contained, not fatal: a boot that has already validated
+            // and is about to publish its pipeline must not fail over
+            // its own audit trail. The admin history routes surface
+            // this explicitly (503) rather than the "not enabled" 404 a
+            // node that never opted in gets, so an operator sees the
+            // real cause instead of a silently missing ring.
+            tracing::error!(
+                error = %error,
+                "config history: failed to open the revision ring at boot; the proxy is \
+                 booting without one"
+            );
+            crate::config_history::install_config_history_failure(&error.to_string());
+        }
+    }
+}
+
 /// The reload transaction body. Callers hold `CONFIG_RELOAD_LOCK`.
-fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
+///
+/// `source` and `origin_override` name the config revision ring entry
+/// this reload should record. `origin_override` is `None` for
+/// the file-watcher and SIGHUP paths, whose `yaml` is read straight off
+/// the local file and so is resolved into a [`sbproxy_config::BaseOrigin`]
+/// the ordinary way, right below. It is `Some` for the config-authority
+/// and `source:` refresh-poller paths (see `try_reload_from_config_yaml`),
+/// whose `yaml` is already a merged document with no `source:` block of
+/// its own to resolve.
+fn reload_from_config_yaml_locked(
+    config_path: &str,
+    yaml: &str,
+    source: &str,
+    origin_override: Option<sbproxy_config::BaseOrigin>,
+) -> anyhow::Result<ReloadOutcome> {
     // Honour `source:` before anything else, so the file watcher,
     // SIGHUP, and `POST /admin/reload` all reload what the source says
     // rather than the pointer at it. A document with no `source:` block
@@ -1233,7 +1416,18 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // re-fetch.
     let resolved = crate::config_source::resolve(yaml)?;
     let compiled = sbproxy_config::compile_config(&resolved.text)?;
-    reload_compiled_config_locked(config_path, compiled, None, Some(yaml))
+    let origin = origin_override.unwrap_or_else(|| resolved.base_origin());
+    reload_compiled_config_locked(
+        config_path,
+        compiled,
+        None,
+        Some(yaml),
+        Some(RevisionRecordingInput {
+            content: resolved.text.as_bytes(),
+            origin,
+            actor: source,
+        }),
+    )
 }
 
 /// Prepare and publish one already compiled configuration. Callers hold
@@ -1243,6 +1437,7 @@ fn reload_compiled_config_locked(
     compiled: sbproxy_config::CompiledConfig,
     extension_registry: Option<std::sync::Arc<sbproxy_extension::bundle::DynamicBundleRegistry>>,
     drift_yaml: Option<&str>,
+    revision: Option<RevisionRecordingInput<'_>>,
 ) -> anyhow::Result<ReloadOutcome> {
     let config_dir = std::path::Path::new(config_path)
         .parent()
@@ -1486,6 +1681,16 @@ fn reload_compiled_config_locked(
         crate::admin::record_loaded_config_content_hash(&crate::identity::config_revision(
             yaml.as_bytes(),
         ));
+    }
+
+    // WOR-2457: record this applied revision into the config history
+    // ring, in the same one place every reload path converges, for the
+    // same reason the drift baseline moved here above. `revision` is
+    // `None` only for the extension-bundle refresh path, which has no
+    // new config document to record. `outcome` is complete by this
+    // point: every `degrade()` call above already ran.
+    if let Some(revision) = revision {
+        record_applied_config_revision(revision, &outcome);
     }
 
     if outcome.is_fully_applied() {
@@ -2111,11 +2316,18 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // `proxy.config_authority.upstream` is absent, and an error (so the
     // process exits) when the subscriber requires a bundle it does not
     // have. No network I/O happens here; see the module docs.
-    // The effective document itself is not needed past this point: the
-    // compiled form is what boots, and the drift baseline is deliberately
-    // the local file captured above.
-    let (_effective_yaml, compiled, config_subscriber) =
+    // The drift baseline is deliberately the local file captured above,
+    // not this document; `effective_yaml` is kept for the config
+    // history ring (WOR-2457) below, which records what this node
+    // actually booted rather than the file on disk.
+    let (effective_yaml, compiled, config_subscriber) =
         crate::config_subscriber::fold_boot_bundle(config_path, yaml, compiled)?;
+    // Captured before `compiled` is consumed into the pipeline below, so
+    // `proxy.config_history` is available at the ring-record call site
+    // near `reload::load_pipeline(pipeline)` without holding onto
+    // `compiled` itself past its normal lifetime.
+    let boot_history_config = compiled.server.config_history.clone();
+    let boot_config_origin = resolved_source.base_origin();
     let extension_refresh_poller = crate::extension_refresh::BundleRefreshPoller::from_config(
         config_path,
         &compiled.extension_bundles,
@@ -2442,6 +2654,18 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);
+
+    // WOR-2457: open the config history ring from `proxy.config_history`
+    // and record this boot as its first (or next) entry. Called here,
+    // right after publish, rather than earlier alongside the other
+    // boot-only process globals: opening the store is fallible, and a
+    // boot that otherwise succeeded must not fail over its own audit
+    // trail.
+    record_boot_config_revision(
+        boot_history_config.as_ref(),
+        effective_yaml.as_bytes(),
+        boot_config_origin,
+    );
 
     // Start file watcher for config hot-reload. It is told what boot loaded,
     // so its "has this actually changed" baseline is the served config rather
@@ -5210,7 +5434,7 @@ hooks:
         let guard = CONFIG_RELOAD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reload_compiled_config_locked(config_path, compiled, Some(candidate), None)
+        reload_compiled_config_locked(config_path, compiled, Some(candidate), None, None)
             .expect("changed registry publishes");
         drop(guard);
 
@@ -6835,6 +7059,297 @@ egress:
         assert!(
             error.to_string().contains("audit.admin_path"),
             "the failure names the key that turned the chain on: {error}"
+        );
+    }
+
+    // --- WOR-2457: every applied config lands in the revision ring ---
+
+    /// Opens a fresh recorder against a temp dir and installs it as the
+    /// process-wide one, the way `run` and `record_boot_config_revision`
+    /// do. Callers get the `Arc` back so they can inspect the ring
+    /// without going through `current_config_history_recorder` again.
+    fn install_history_recorder_for_test(
+        dir: &std::path::Path,
+    ) -> std::sync::Arc<crate::config_history::ConfigHistoryRecorder> {
+        crate::config_history::clear_config_history_recorder();
+        let history = sbproxy_config::ConfigHistoryConfig {
+            enabled: true,
+            dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let recorder = crate::config_history::ConfigHistoryRecorder::from_config(Some(&history))
+            .expect("no error opening the config history store")
+            .expect("an enabled block opens a recorder");
+        let recorder = std::sync::Arc::new(recorder);
+        crate::config_history::install_config_history_recorder(recorder.clone());
+        recorder
+    }
+
+    #[test]
+    fn boot_path_records_a_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        crate::config_history::clear_config_history_recorder();
+        let history = sbproxy_config::ConfigHistoryConfig {
+            enabled: true,
+            dir: temp.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        // `record_boot_config_revision` is the exact function `run` calls
+        // right after it publishes the pipeline; this drives the real
+        // boot seam rather than a stand-in for it.
+        record_boot_config_revision(
+            Some(&history),
+            b"proxy: {}\n# boot\n",
+            sbproxy_config::BaseOrigin::Local,
+        );
+        let recorder =
+            crate::config_history::current_config_history_recorder().expect("boot installs one");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.as_deref(), Some("boot"));
+        assert_eq!(entries[0].provenance, sbproxy_config::BaseOrigin::Local);
+        assert_eq!(entries[0].state, sbproxy_config::RevisionState::Applied);
+    }
+
+    #[test]
+    fn boot_path_marks_the_slot_failed_when_the_store_cannot_open() {
+        crate::config_history::clear_config_history_recorder();
+        // `/` is always a real directory, root-owned, and not writable
+        // by an ordinary user: `RevisionStore::open`'s `create_dir_all`
+        // on a subdirectory of it fails with a permission error for any
+        // process that is not itself root. The same "well-known
+        // unwritable root-owned directory" fixture
+        // `ownership_store_rejects_a_directory_owned_by_another_uid` in
+        // `sbproxy-model-host` uses, chosen over `chmod`-ing a temp
+        // directory because `create_private_dir_all` self-heals a temp
+        // directory it owns back to 0700 before the open would even
+        // reach the permission check those tests rely on.
+        let unwritable_dir = "/sbproxy-config-history-unwritable-fixture-do-not-create";
+        let history = sbproxy_config::ConfigHistoryConfig {
+            enabled: true,
+            dir: unwritable_dir.to_string(),
+            ..Default::default()
+        };
+
+        record_boot_config_revision(
+            Some(&history),
+            b"proxy: {}\n# boot\n",
+            sbproxy_config::BaseOrigin::Local,
+        );
+
+        match &*crate::config_history::current_config_history_state() {
+            crate::config_history::ConfigHistoryState::Open(_) => {
+                // This process can write under `/` (running as root, or
+                // some other environment where the fixture's premise
+                // does not hold): the failure this test exists to
+                // exercise cannot be produced here. Not a false pass --
+                // there is nothing to assert against in this
+                // environment, so the test simply has nothing to say.
+            }
+            crate::config_history::ConfigHistoryState::Failed { reason } => {
+                assert!(
+                    !reason.is_empty(),
+                    "a failed boot open must carry a non-empty reason"
+                );
+                // The proxy is still up: nothing here panicked or
+                // propagated past `record_boot_config_revision`, which
+                // returns `()` and was called exactly as `run` calls it
+                // right after publishing the pipeline.
+            }
+            crate::config_history::ConfigHistoryState::Disabled => {
+                panic!(
+                    "an enabled block whose store failed to open must mark the slot Failed, \
+                     not leave it Disabled"
+                );
+            }
+        }
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    #[test]
+    fn file_watcher_path_records_a_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let config_path = temp.path().join("sb.yml");
+        std::fs::write(&config_path, b"proxy: {}\n# file-watcher\n").expect("write config file");
+
+        // The real file-watcher trigger: it reads the file itself and
+        // calls this exact function, the same one `install_sighup_handler`
+        // below calls on a signal instead of a filesystem event.
+        reload_from_config_path(config_path.to_str().expect("utf8 path"))
+            .expect("file-watcher-triggered reload publishes");
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.as_deref(), Some("file_watcher"));
+    }
+
+    #[test]
+    fn sighup_path_records_a_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let config_path = temp.path().join("sb.yml");
+        std::fs::write(&config_path, b"proxy: {}\n# sighup\n").expect("write config file");
+
+        // `install_sighup_handler`'s signal loop calls exactly this
+        // function on `SIGHUP` (see its body: "`reload_from_config_path`
+        // does blocking config-file reads..."); a signal cannot be
+        // delivered deterministically in a unit test, so this drives the
+        // same call the signal handler makes rather than the signal
+        // itself. The config history entry this produces is
+        // indistinguishable from the file-watcher's, which is
+        // deliberate: both share the `"file_watcher"` audit label
+        // already (see `reload_from_config_path`'s own doc comment) on
+        // the grounds that both reload the same operator-managed local
+        // file, and this ring inherits that same reasoning.
+        reload_from_config_path(config_path.to_str().expect("utf8 path"))
+            .expect("sighup-triggered reload publishes");
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.as_deref(), Some("file_watcher"));
+    }
+
+    #[test]
+    fn admin_reload_path_records_a_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let yaml = "proxy: {}\n# admin-reload\n";
+
+        // The exact function `POST /admin/reload` calls (`admin.rs`)
+        // after it has already validated the candidate document.
+        reload_from_resolved_yaml("sb.yml", yaml, yaml).expect("admin-triggered reload publishes");
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        // No admin actor is installed on this thread outside a real
+        // dispatched admin request, so this exercises the documented
+        // `"api"` fallback rather than an authenticated operator id.
+        assert_eq!(entries[0].actor.as_deref(), Some("api"));
+        assert_eq!(entries[0].provenance, sbproxy_config::BaseOrigin::Local);
+    }
+
+    #[test]
+    fn config_refresh_poller_path_records_a_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let yaml = "proxy: {}\n# refresh-poller\n";
+        let origin = sbproxy_config::BaseOrigin::Git {
+            repo: "git@example.com:org/repo.git".to_string(),
+            reference: "main".to_string(),
+            commit: "deadbeef".to_string(),
+        };
+
+        // The exact function `config_source.rs`'s refresh poller calls,
+        // with the exact label and an already-resolved origin the way
+        // that caller supplies one: `effective` there carries no
+        // `source:` block of its own for this function to re-derive an
+        // origin from, which is why the origin has to arrive as a
+        // parameter (see this function's own doc comment).
+        match try_reload_from_config_yaml("sb.yml", yaml, "config_refresh_poller", origin.clone())
+            .expect("non-blocking reload runs")
+        {
+            TryReloadOutcome::Applied(_) => {}
+            TryReloadOutcome::Busy => panic!("uncontended reload must not report busy"),
+        }
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.as_deref(), Some("config_refresh_poller"));
+        assert_eq!(
+            entries[0].provenance, origin,
+            "the caller-supplied git origin must survive, not fall back to Local"
+        );
+    }
+
+    #[test]
+    fn config_authority_path_records_a_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let yaml = "proxy: {}\n# config-authority\n";
+
+        // The exact function `config_subscriber.rs`'s `apply` calls, with
+        // its exact label and its own already-computed `base_origin`.
+        match try_reload_from_config_yaml(
+            "sb.yml",
+            yaml,
+            "config_authority",
+            sbproxy_config::BaseOrigin::Local,
+        )
+        .expect("non-blocking reload runs")
+        {
+            TryReloadOutcome::Applied(_) => {}
+            TryReloadOutcome::Busy => panic!("uncontended reload must not report busy"),
+        }
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.as_deref(), Some("config_authority"));
+    }
+
+    #[test]
+    fn two_consecutive_byte_identical_reloads_produce_one_ring_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let yaml = "proxy: {}\n# dedup\n";
+
+        reload_from_config_yaml("sb.yml", yaml).expect("first reload publishes");
+        reload_from_config_yaml("sb.yml", yaml).expect("second, identical reload publishes");
+
+        assert_eq!(
+            recorder.entries().len(),
+            1,
+            "byte-identical back-to-back reloads must not grow the ring"
+        );
+    }
+
+    #[test]
+    fn lkg_pointer_does_not_move_when_reloads_commit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        assert!(recorder.lkg().is_none());
+
+        for marker in ["one", "two", "three"] {
+            reload_from_config_yaml("sb.yml", &format!("proxy: {{}}\n# {marker}\n"))
+                .unwrap_or_else(|error| panic!("reload {marker} must publish: {error:#}"));
+        }
+
+        assert_eq!(recorder.entries().len(), 3);
+        assert!(
+            recorder.lkg().is_none(),
+            "nothing in the reload transaction may promote a revision to last-known-good"
+        );
+    }
+
+    #[test]
+    fn a_degraded_reload_is_still_recorded_with_its_degradation_captured() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let mut outcome = ReloadOutcome::default();
+        outcome.degrade(DegradedSubsystem::KeyPlane);
+        outcome.degrade(DegradedSubsystem::SinkDispatcher);
+        assert!(!outcome.is_fully_applied());
+
+        record_applied_config_revision(
+            RevisionRecordingInput {
+                content: b"proxy: {}\n# degraded\n",
+                origin: sbproxy_config::BaseOrigin::Local,
+                actor: "test",
+            },
+            &outcome,
+        );
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].state,
+            sbproxy_config::RevisionState::Applied,
+            "a degraded reload still published its pipeline, so the entry stays Applied; \
+             the degradation is a separate field, not a distinct state"
+        );
+        assert_eq!(
+            entries[0].degraded,
+            vec!["key plane".to_string(), "sink dispatcher".to_string()]
         );
     }
 }

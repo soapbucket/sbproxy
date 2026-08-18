@@ -601,9 +601,20 @@ fn apply_transform_with_ctx(
             }
             Ok(())
         }
+        Transform::Lua(t) => t.apply_with_context(body, script_modifier_context(ctx)),
         Transform::LuaJson(t) => t.apply_with_context(body, script_modifier_context(ctx)),
         Transform::JavaScript(t) => t.apply_with_context(body, script_modifier_context(ctx)),
         Transform::JsJson(t) => t.apply_with_context(body, script_modifier_context(ctx)),
+        // WOR-2493 item 5: `request_context: true` is an explicit,
+        // per-transform cacheability opt-in (see
+        // `Transform::request_dependent`), so this arm only reaches
+        // the ctx-carrying path when the operator asked for it. The
+        // ctx-off default keeps hitting the wildcard arm below and
+        // stays byte-identical to the pre-existing stdin-only
+        // contract.
+        Transform::Wasm(t) if t.request_context => {
+            t.apply_with_context(body, script_modifier_context(ctx))
+        }
         Transform::CelScript(t) => {
             // Wave 5 day-6 Item 1: typed dispatch for the CEL response
             // transform. The per-header `headers:` rules evaluate

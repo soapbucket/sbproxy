@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -54,7 +54,11 @@ origins:
 rather than from anything the request supplied, which is the safe default. The
 enumeration block is the other half: it trips when one principal touches more
 distinct object ids than a real user would, which is what scraping looks like
-when every individual request is authorized.
+when every individual request is authorized. It does not need `object_rules`
+to work: without a rule to capture the object id explicitly, the detector
+falls back to the last numeric- or UUID-shaped path segment, so `enumeration:
+{ enabled: true }` on its own catches a BOLA sweep against a bare
+`/orders/{id}`-shaped API with no ownership rule declared.
 
 See [object-authz.md](object-authz.md) for the full matcher surface, including
 tenant claims and collection endpoints, and

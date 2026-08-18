@@ -1299,6 +1299,7 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("transform", "json_envelope"),
     deferred("transform", "json_projection"),
     deferred("transform", "json_schema"),
+    deferred("transform", "lua"),
     deferred("transform", "lua_json"),
     deferred("transform", "markdown"),
     deferred("transform", "noop"),

@@ -29,11 +29,17 @@
 #
 #   curl -i -H 'Host: sri.local' http://127.0.0.1:8080/
 #
-#   # Inspect the metric:
-#   curl -s http://127.0.0.1:9091/api/metrics | grep sbproxy_policy_triggers_total
+#   # Inspect the metric (admin API, basic auth):
+#   curl -s -u admin:changeme http://127.0.0.1:9091/metrics | grep sbproxy_policy_triggers_total
 
 proxy:
   http_bind_port: 8080
+
+  # Metrics-only admin surface for the second Test command above.
+  admin:
+    enabled: true
+    port: 9091
+    # username/password default to admin / changeme; override in real configs.
 
 origins:
   "sri.local":

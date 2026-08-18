@@ -269,6 +269,15 @@ answer "does it compile, lint, and pass"; the rubric answers "is this
 going to be a problem in six months", and this repository has merged
 nothing without both since the protocol landed.
 
+Running the rubric is not optional, and neither is acting on it: every
+finding it produces gets fixed in the same loop that surfaced it,
+Critical through Minor and nits included, before the PR merges. Do not
+park a finding as a ticket unless its remedy is a separate product
+feature (new scope rather than a defect in the change under review),
+and record why in the PR body when that happens. A finding surfaced
+after a merge gets fixed immediately on a fresh branch rather than
+queued.
+
 ## Workspace layout
 
 ```

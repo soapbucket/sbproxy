@@ -120,6 +120,11 @@ use serde_yaml::{Mapping, Value};
 ///   state is a correctness hazard, so this channel declines it.
 /// - `proxy.compression_state`: the embedded database path names local
 ///   machine storage and can only be selected by the process owner.
+/// - `proxy.config_history` (WOR-2456): the durable last-known-good
+///   config ring's directory names local machine storage, exactly like
+///   `proxy.compression_state` above. It is also the record of every
+///   config this subscriber has applied; an authority able to redirect
+///   or disable that ring could cover its own tracks.
 /// - `source`: the authority overlays the base document. It does not get
 ///   to choose which repository the base document comes from, which
 ///   would let it swap out its own input.
@@ -132,6 +137,7 @@ pub const AUTHORITY_DENIED_PATHS: &[&str] = &[
     "proxy.config_authority",
     "proxy.model_host",
     "proxy.compression_state",
+    "proxy.config_history",
     "source",
 ];
 
@@ -927,6 +933,59 @@ origins:
             assert_eq!(
                 at(&tree, "proxy.admin.port"),
                 Some(&Value::from(9090)),
+                "{mode:?} with remote {remote:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_config_history_is_denied_and_restored_from_base() {
+        // Hardcoded to the literal path rather than driven from
+        // AUTHORITY_DENIED_PATHS, unlike the sweeps above: if
+        // `proxy.config_history` were missing from the list, this test
+        // would fail instead of silently skipping the case.
+        let base = "\
+proxy:
+  http_bind_port: 8080
+  config_history:
+    enabled: true
+    dir: /var/lib/sbproxy/config-history
+    keep: 20
+    keep_rejected: 10
+";
+
+        // Naming the path outright is a total rejection, same as every
+        // other entry on the list.
+        let naming_it = "proxy:\n  config_history:\n    dir: /tmp/evil\n";
+        for mode in MODES {
+            let error = merge_config(base, local(), naming_it, mode)
+                .expect_err("proxy.config_history must be denied to the authority");
+            assert_eq!(
+                denied_paths(error),
+                vec!["proxy.config_history".to_string()],
+                "{mode:?}"
+            );
+        }
+
+        // Wiping the ancestor does not wipe the subscriber's own ring:
+        // `restore_denied` puts it back from the base, matching the
+        // `proxy.admin` case above.
+        let cases = [
+            (MergeMode::Overlay, "proxy: null\n"),
+            (MergeMode::Replace, "proxy: null\n"),
+            (MergeMode::Replace, "proxy:\n  http_bind_port: 9999\n"),
+        ];
+        for (mode, remote) in cases {
+            let outcome = merge(base, remote, mode);
+            let tree = merged_tree(&outcome);
+            assert_eq!(
+                at(&tree, "proxy.config_history.dir"),
+                Some(&Value::from("/var/lib/sbproxy/config-history")),
+                "{mode:?} with remote {remote:?}"
+            );
+            assert_eq!(
+                at(&tree, "proxy.config_history.keep"),
+                Some(&Value::from(20)),
                 "{mode:?} with remote {remote:?}"
             );
         }

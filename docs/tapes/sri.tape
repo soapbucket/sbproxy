@@ -24,7 +24,7 @@ Type `curl -i -H 'Host: sri.local' http://127.0.0.1:8080/`
 Enter
 Sleep 1.6s
 
-Type `curl -s http://127.0.0.1:9091/api/metrics | grep sbproxy_policy_triggers_total`
+Type `curl -s -u admin:changeme http://127.0.0.1:9091/metrics | grep sbproxy_policy_triggers_total`
 Enter
 Sleep 1.6s
 

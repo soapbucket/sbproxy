@@ -92,6 +92,23 @@ config_port() {
   printf '%s\n' "${port:-8080}"
 }
 
+config_admin_enabled() {
+  local cfg="$1"
+  # Every config in this repo that opens proxy.admin: writes its enabled:
+  # flag as the line immediately below `admin:` (see examples/*/sb.yml and
+  # docs/tapes/configs/*.yml), so this mirrors config_port's single-purpose
+  # sed idiom rather than a real YAML parse.
+  sed -n '/^[[:space:]]*admin:[[:space:]]*$/{n;p;q;}' "$cfg" | grep -qE 'enabled:[[:space:]]*true'
+}
+
+config_admin_port() {
+  local cfg="$1" port
+  # `port:` is only ever written under proxy.admin: in this config corpus,
+  # so the same first-match idiom as config_port applies.
+  port="$(sed -n 's/^[[:space:]]*port:[[:space:]]*//p' "$cfg" | head -n1)"
+  printf '%s\n' "${port:-9090}"
+}
+
 reject_occupied_port() {
   local port="$1" owners
   owners="$(lsof -ti "tcp:$port" 2>/dev/null || true)"
@@ -139,13 +156,26 @@ record() {
     return 1
   fi
 
-  # Examples bind the data listener on http_bind_port (default 8080) and do
-  # not start the optional admin server, so readiness is probed on the data
-  # port: any HTTP response (even a 404) means the listener is accepting.
+  # Examples bind the data listener on http_bind_port (default 8080); any
+  # HTTP response (even a 404) means that listener is accepting. Admin bind
+  # failure is non-fatal in the proxy itself (it logs and keeps serving data
+  # traffic), so a config that turns on proxy.admin: also needs its own
+  # readiness wait and stale-occupant check on the admin port -- otherwise a
+  # leftover process on that port silently blanks every admin payoff in the
+  # recording (curl -s prints nothing on connect failure, and jq on empty
+  # stdin exits 0 without complaint).
   local port aux_port=""
   port="$(config_port "$cfg")"
   if [ -n "$aux_cfg" ]; then
     aux_port="$(config_port "$aux_cfg")"
+  fi
+
+  local admin_port="" aux_admin_port=""
+  if config_admin_enabled "$cfg"; then
+    admin_port="$(config_admin_port "$cfg")"
+  fi
+  if [ -n "$aux_cfg" ] && config_admin_enabled "$aux_cfg"; then
+    aux_admin_port="$(config_admin_port "$aux_cfg")"
   fi
 
   # A tape may raise the proxy log level (e.g. the fallback demo greps the
@@ -162,6 +192,12 @@ record() {
     fi
     reject_occupied_port "$aux_port" || return 1
   fi
+  if [ -n "$admin_port" ]; then
+    reject_occupied_port "$admin_port" || return 1
+  fi
+  if [ -n "$aux_admin_port" ]; then
+    reject_occupied_port "$aux_admin_port" || return 1
+  fi
 
   local workspace main_log aux_log start_index workspace_start main_pid aux_pid
   workspace="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-record.XXXXXX")"
@@ -177,12 +213,18 @@ record() {
   aux_log="$workspace/aux.log"
   start_index=${#ACTIVE_PIDS[@]}
 
-  echo "==> $tape   (config: $cfg, port: $port, log: $loglevel)"
+  echo "==> $tape   (config: $cfg, port: $port${admin_port:+, admin: $admin_port}, log: $loglevel)"
   if [ -n "$aux_cfg" ]; then
     start_proxy "$aux_cfg" "$aux_log" "$loglevel"
     aux_pid="${ACTIVE_PIDS[${#ACTIVE_PIDS[@]} - 1]}"
     if ! wait_ready "$aux_pid" "$aux_port"; then
       echo "error: auxiliary proxy never became ready on port $aux_port for $aux_cfg" >&2
+      stop_active_from "$start_index"
+      remove_workspaces_from "$workspace_start"
+      return 1
+    fi
+    if [ -n "$aux_admin_port" ] && ! wait_ready "$aux_pid" "$aux_admin_port"; then
+      echo "error: auxiliary proxy's admin server never became ready on port $aux_admin_port for $aux_cfg" >&2
       stop_active_from "$start_index"
       remove_workspaces_from "$workspace_start"
       return 1
@@ -193,6 +235,12 @@ record() {
   main_pid="${ACTIVE_PIDS[${#ACTIVE_PIDS[@]} - 1]}"
   if ! wait_ready "$main_pid" "$port"; then
     echo "error: proxy never became ready on port $port for $cfg" >&2
+    stop_active_from "$start_index"
+    remove_workspaces_from "$workspace_start"
+    return 1
+  fi
+  if [ -n "$admin_port" ] && ! wait_ready "$main_pid" "$admin_port"; then
+    echo "error: proxy's admin server never became ready on port $admin_port for $cfg" >&2
     stop_active_from "$start_index"
     remove_workspaces_from "$workspace_start"
     return 1

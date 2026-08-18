@@ -107,6 +107,10 @@ pub mod config_effective;
 /// pulls on the hint instead of waiting out its poll interval. Never a
 /// correctness requirement; polling alone already converges.
 pub mod config_gossip;
+/// The process-owned handle onto the durable config revision ring:
+/// every config this process applies, recorded once by the shared
+/// reload transaction, and read back by the admin history surface.
+pub mod config_history;
 /// Honouring `source:`: resolve the config document from a git
 /// repository (or an overlay chain over one), keep it fresh on a timer,
 /// and hand the result to the shared reload transaction.

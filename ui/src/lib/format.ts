@@ -73,6 +73,13 @@ export function toDate(value: unknown): Date | null {
     return new Date(value < 1e12 ? value * 1000 : value);
   }
   if (typeof value === "string") {
+    // Numeric-looking strings (epoch seconds or millis, as a string)
+    // take this branch. An RFC 3339 string like config history's
+    // `applied_at` does not: `Number("2026-08-16T10:15:32.456Z")` is
+    // NaN, so it falls through to `new Date(value)` below instead,
+    // which parses ISO 8601 natively. Both shapes end up correct; this
+    // branch exists for callers that still hand toDate a bare epoch
+    // number as a string.
     const asNum = Number(value);
     if (!Number.isNaN(asNum) && value.trim() !== "") {
       return new Date(asNum < 1e12 ? asNum * 1000 : asNum);
