@@ -112,11 +112,15 @@ pub struct OpenApiBacking {
 /// struct therefore carries only what catalog registration needs: the
 /// same `name`/`description`/`inputSchema` documents `OpenApiBacking`
 /// carries for the identical reason. Dispatch resolution is a marker,
-/// not a mechanism: `call_tool_with_policy_cause_and_headers_from_held_tool`
+/// not a mechanism, and stays that way even after WOR-2489 Task 3:
+/// `call_tool_with_policy_cause_and_headers_from_held_tool` still
 /// matches on `McpServerConfig::local`'s presence exactly like it
-/// matches on `openapi`'s, but until WOR-2489's Task 3 lands an
-/// executor, a call that reaches that branch returns a named internal
-/// error rather than executing anything.
+/// matches on `openapi`'s, but the real executor lives one crate over
+/// (`sbproxy-modules::action::mcp::McpAction::execute_local_tool`),
+/// reached from `sbproxy-core::action_dispatch` before this function
+/// is ever called for a local tool. The branch here is unreachable
+/// through that path and stays only as a defensive fallback; see its
+/// doc comment below.
 #[derive(Debug, Clone)]
 pub struct LocalBacking {
     /// Tools declared for this server (`name`/`description`/
@@ -2794,20 +2798,36 @@ impl McpFederation {
                 .await;
         }
 
-        // WOR-2489: a `local` server's tool has already cleared every
-        // governance gate above this point (policy hooks; and, in the
-        // caller at `sbproxy-core::action_dispatch`, RBAC, argument
-        // policies, quota, the versioning gate, content filters -- the
-        // whole reason this tool was resolvable through the shared
-        // catalog at all). What runs it does not exist yet: the
-        // executor is WOR-2489's Task 3. Bail loudly and name the gap
-        // rather than silently succeed with nothing executed or fall
-        // through into the plain-MCP dispatch below (which would send
-        // a real `tools/call` to a URL nothing is listening on).
+        // WOR-2489 Task 3: a `local` server's tool call no longer
+        // reaches this function on the normal request path.
+        // `sbproxy-core::action_dispatch` resolves and executes a
+        // local tool's compiled handler (`static`/`http`) directly
+        // against `McpAction::local_servers`
+        // (`McpAction::execute_local_tool`) at the exact point in its
+        // gate chain this dispatch seam sits at: AFTER every
+        // governance gate above (policy hooks) and every gate the
+        // caller in `action_dispatch` already ran (RBAC, argument
+        // policies, quota, the versioning gate, content filters), but
+        // BEFORE it ever calls
+        // `call_tool_with_upstream_headers_from_snapshot` (which is
+        // what reaches here). `sbproxy-extension` cannot host that
+        // executor itself -- `LocalBacking` cannot carry the compiled
+        // `CompiledLocalToolHandler` types `sbproxy-modules` defines,
+        // since the dependency runs the other way -- so this branch is
+        // unreachable through the real request path and is kept only
+        // as a defensive fallback: a hypothetical caller that reaches
+        // this function directly, bypassing `action_dispatch`'s
+        // local-server check, must still fail closed here rather than
+        // silently succeed with nothing executed or fall through to a
+        // plain `tools/call` against a URL nothing is listening on
+        // (`server.url` is a nominal placeholder for a local server,
+        // never dialed on any real path).
         if server.local.is_some() {
             anyhow::bail!(
-                "mcp: local tool '{}' on server '{}' has no executor yet (WOR-2489 Task 3); \
-                 catalog registration and governance are wired, dispatch is not implemented",
+                "mcp: local tool '{}' on server '{}' reached the federation dispatch path, \
+                 which never executes a local tool; dispatch happens in \
+                 sbproxy-core::action_dispatch before this function is called (WOR-2489 \
+                 Task 3) -- this is a defensive internal error, not an expected failure mode",
                 federated.name,
                 server.name
             );

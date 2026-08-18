@@ -84,6 +84,8 @@ use sbproxy_extension::mcp::{
 use sbproxy_extension::rego::CompiledRego;
 use serde::Deserialize;
 
+use super::mcp_interpolate;
+
 // --- Wire format ---
 
 /// Top-level MCP action config as parsed from YAML.
@@ -2987,6 +2989,358 @@ fn compile_local_response(
             anyhow::bail!(
                 "{site}: response sets more than one of template, js, lua; pick exactly one"
             )
+        }
+    }
+}
+
+// --- `type: local` tool dispatch (WOR-2489 Task 3) ---
+//
+// The seam this section implements: `sbproxy-extension::mcp::LocalBacking`
+// (what `McpFederation` holds for a `local` server) cannot carry the
+// `CompiledLocal*` types just above -- the dependency runs the other
+// way, `sbproxy-modules` depends on `sbproxy-extension`, not back --
+// so a resolved local tool cannot be dispatched from inside
+// `McpFederation` the way an `openapi`-backed one is. Instead,
+// `sbproxy-core::action_dispatch` (which already depends on
+// `sbproxy-modules`) checks `McpAction::is_local_server` at the exact
+// point in its gate chain where it would otherwise call
+// `federation.call_tool_with_upstream_headers_from_snapshot`, i.e.
+// after every governance gate (RBAC, argument policies, quota, the
+// versioning gate, content filters) has already run, and calls
+// `McpAction::execute_local_tool` instead. `McpFederation`'s own
+// `local`-backing branch (federation.rs) is unreachable through that
+// path and stays only as a defensive fallback; see its doc comment.
+
+/// Default connect timeout for a local `http` tool's dial, mirroring
+/// `McpFederation`'s own default (`FederationIoSettings`). A local
+/// tool has no per-action IO settings to inherit -- each tool call
+/// builds its own one-shot client -- so this is a fixed constant
+/// rather than a configurable field; `timeout:` on the `http` config
+/// governs the overall request instead (see
+/// [`DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT`]).
+const DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default overall request timeout for a local `http` tool call when
+/// its compiled `timeout:` is unset.
+const DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A local `http` call's send-and-wait outcome that is not a plain
+/// upstream response: either the send itself failed (connection
+/// refused, DNS failure, reset, ...) or the per-attempt timeout
+/// elapsed first. Kept distinct from `reqwest::Error` so a timeout
+/// (which never produces one) still has a `retry_condition` and a
+/// safe display message.
+enum LocalHttpFailure {
+    Transport(reqwest::Error),
+    Timeout,
+}
+
+impl LocalHttpFailure {
+    /// The `retry.retry_on` condition string this failure matches, if
+    /// any (`RetryConfig::allows` compares case-insensitively against
+    /// exactly these two strings plus numeric status codes, which
+    /// only a real response -- not a failure -- can match).
+    fn retry_condition(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport(e) if e.is_timeout() => "timeout",
+            Self::Transport(e) if e.is_connect() => "connect_error",
+            Self::Transport(_) => "",
+        }
+    }
+
+    fn into_anyhow(self, url: &str) -> anyhow::Error {
+        match self {
+            Self::Timeout => anyhow::anyhow!("mcp: local http tool call to {url} timed out"),
+            Self::Transport(e) => {
+                anyhow::anyhow!("mcp: local http tool call to {url} failed: {e}")
+            }
+        }
+    }
+}
+
+/// Build the tool-result document for a `static` handler: always
+/// `isError: false`, since a `static` value never fails. A string
+/// value is used as the content text verbatim; any other JSON type is
+/// rendered as its compact JSON text, matching how an `http` handler's
+/// JSON body renders below.
+fn local_static_tool_result(value: &serde_json::Value) -> serde_json::Value {
+    let text = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": false,
+    })
+}
+
+/// Build the client for one dial of a local `http` tool call
+/// (WOR-2080). A pinned destination (an enforced `egress:` policy
+/// recorded pins) gets a per-dial client whose resolver override
+/// carries exactly the verified pin set, so a DNS answer that changed
+/// since authorization is refused before this connect rather than
+/// silently re-resolved; an unpinned destination (legacy
+/// allow-by-default egress records no pins) gets a plain client.
+/// Mirrors `McpFederation::openapi_dial_client` (`sbproxy-extension`)
+/// exactly, since local tools reuse the same `EgressPurpose::OpenApiTool`
+/// (see the WOR-2489 Task 3 report for why).
+fn local_http_dial_client(
+    egress: &EgressPolicy,
+    dest: &sbproxy_security::egress::AuthorizedDestination,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<reqwest::Client> {
+    let Some(addrs) = egress
+        .verified_dial_addrs(dest, resolver)
+        .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?
+    else {
+        return reqwest::Client::builder()
+            .connect_timeout(DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| anyhow::anyhow!("mcp: local http tool client construction failed: {e}"));
+    };
+    let host = dest
+        .url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("mcp: local http tool: authorized URL lost its host"))?;
+    reqwest::Client::builder()
+        .connect_timeout(DEFAULT_LOCAL_HTTP_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .map_err(|e| anyhow::anyhow!("mcp: pinned local http tool client construction failed: {e}"))
+}
+
+/// Execute one `http` handler: interpolate `url`/`headers`/`body`
+/// against the call's arguments, authorize and DNS-pin the dial
+/// (WOR-2080), send with `retry`/`timeout` honored, and shape the
+/// response into an MCP tool-result document.
+async fn execute_local_http_call(
+    server: &CompiledLocalMcpServer,
+    call: &CompiledLocalHttpCall,
+    arguments: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    execute_local_http_call_with_resolver(
+        server,
+        call,
+        arguments,
+        &sbproxy_security::egress::SystemHostResolver,
+    )
+    .await
+}
+
+/// [`execute_local_http_call`] with an injectable resolver, so tests
+/// can simulate a DNS answer that changes between authorize and dial
+/// (WOR-2080) without live DNS. Production always calls
+/// [`execute_local_http_call`], which passes
+/// [`sbproxy_security::egress::SystemHostResolver`].
+async fn execute_local_http_call_with_resolver(
+    server: &CompiledLocalMcpServer,
+    call: &CompiledLocalHttpCall,
+    arguments: &serde_json::Value,
+    resolver: &dyn sbproxy_security::egress::HostResolver,
+) -> anyhow::Result<serde_json::Value> {
+    use sbproxy_security::egress::{
+        record_egress_refused, record_egress_seen, EgressPurpose, EgressSightingStatus,
+    };
+
+    let context = mcp_interpolate::args_context(arguments);
+    let url = mcp_interpolate::interpolate_string(&call.url, &context)
+        .map_err(|e| anyhow::anyhow!("mcp: local http tool: url interpolation failed: {e}"))?;
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(call.headers.len());
+    for (name, value) in &call.headers {
+        let rendered = mcp_interpolate::interpolate_string(value, &context).map_err(|e| {
+            anyhow::anyhow!("mcp: local http tool: header '{name}' interpolation failed: {e}")
+        })?;
+        headers.push((name.clone(), rendered));
+    }
+    let body = call
+        .body
+        .as_ref()
+        .map(|b| mcp_interpolate::interpolate_json_tree(b, &context))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("mcp: local http tool: body interpolation failed: {e}"))?;
+    let method = reqwest::Method::from_bytes(call.method.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "mcp: local http tool: invalid HTTP method {}: {e}",
+            call.method
+        )
+    })?;
+
+    // WOR-2489: local `http` tools reuse `EgressPurpose::OpenApiTool`
+    // rather than minting `EgressPurpose::LocalTool`. Both are the
+    // identical shape (an MCP action dispatching one HTTP call on the
+    // gateway's own behalf, gated by a per-server `EgressPolicy`), and
+    // a distinct purpose would need its own admin-inventory doc
+    // language and the purpose-count prose in
+    // `docs/admin-api-reference.md` updated in the same commit. See
+    // the WOR-2489 Task 3 report for the full decision.
+    let egress = server.egress.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "mcp: local server '{}' has an http tool but no compiled egress policy \
+             (this should already be refused at config compile time)",
+            server.name
+        )
+    })?;
+    let is_gated = egress.mode.is_enforce();
+    let dest = match egress.authorize(EgressPurpose::OpenApiTool, &url, resolver) {
+        Ok(dest) => {
+            record_egress_seen(
+                EgressPurpose::OpenApiTool,
+                &url,
+                &server.name,
+                if is_gated {
+                    EgressSightingStatus::Allowed
+                } else {
+                    EgressSightingStatus::Ungated
+                },
+                None,
+            );
+            dest
+        }
+        Err(e) => {
+            record_egress_seen(
+                EgressPurpose::OpenApiTool,
+                &url,
+                &server.name,
+                EgressSightingStatus::Denied,
+                Some(e),
+            );
+            record_egress_refused(EgressPurpose::OpenApiTool, e, "", &server.name);
+            anyhow::bail!("egress denied: {e:?}");
+        }
+    };
+
+    let retry = call.retry.clone().unwrap_or_default();
+    let request_timeout = call.timeout.unwrap_or(DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT);
+    let mut retries_used: u32 = 0;
+    let response = loop {
+        // WOR-2080: re-verify this attempt's dial addresses against
+        // the pins recorded at authorize time immediately before
+        // connect, on every attempt including retries.
+        let client = local_http_dial_client(egress, &dest, resolver)?;
+        let mut builder = client.request(method.clone(), dest.url.clone());
+        for (name, value) in &headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = &body {
+            builder = builder.json(body);
+        }
+        let outcome = match tokio::time::timeout(request_timeout, builder.send()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(LocalHttpFailure::Transport(e)),
+            Err(_elapsed) => Err(LocalHttpFailure::Timeout),
+        };
+
+        match outcome {
+            Ok(resp)
+                if retry.enabled()
+                    && retry.allows_status(resp.status().as_u16())
+                    && retry.attempts_remaining(retries_used) =>
+            {
+                tokio::time::sleep(Duration::from_millis(
+                    retry.backoff_for_attempt(retries_used),
+                ))
+                .await;
+                retries_used += 1;
+            }
+            Ok(resp) => break resp,
+            Err(failure) => {
+                let retryable = retry.enabled()
+                    && retry.allows(failure.retry_condition())
+                    && retry.attempts_remaining(retries_used);
+                if !retryable {
+                    return Err(failure.into_anyhow(&url));
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    retry.backoff_for_attempt(retries_used),
+                ))
+                .await;
+                retries_used += 1;
+            }
+        }
+    };
+
+    let status = response.status();
+    let mut response_headers = serde_json::Map::new();
+    if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+        if let Ok(v) = content_type.to_str() {
+            response_headers.insert(
+                "content-type".to_string(),
+                serde_json::Value::String(v.to_string()),
+            );
+        }
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("mcp: local http tool: failed reading response body: {e}"))?;
+    let body_value = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string()));
+
+    let document = serde_json::json!({
+        "status": status.as_u16(),
+        "headers": serde_json::Value::Object(response_headers),
+        "body": body_value,
+    });
+    Ok(serde_json::json!({
+        "content": [{"type": "text", "text": document.to_string()}],
+        "isError": !status.is_success(),
+    }))
+}
+
+impl McpAction {
+    /// True when `server_name` names a compiled `type: local` server
+    /// (WOR-2489). `sbproxy-core::action_dispatch` calls this at the
+    /// same point in the gate chain where it would otherwise call into
+    /// `federation`'s dispatch, after every governance gate has
+    /// already run, to decide whether to resolve the tool here instead.
+    pub fn is_local_server(&self, server_name: &str) -> bool {
+        self.local_servers.iter().any(|s| s.name == server_name)
+    }
+
+    /// Execute a resolved local tool's handler and return the MCP
+    /// tool-result document (`{"content": [...], "isError": bool}`),
+    /// the same shape `McpFederation`'s OpenAPI and plain-MCP dispatch
+    /// paths already return, so this slots into `action_dispatch.rs`'s
+    /// existing `anyhow::Result<serde_json::Value>` outcome handling
+    /// unchanged.
+    ///
+    /// `server_name`/`tool_name` must both be resolved, unprefixed
+    /// names (`FederatedTool::server_name` / `FederatedTool::upstream_name`),
+    /// not the possibly-namespaced advertised name a caller sent on
+    /// the wire -- exactly the distinction `call_openapi_tool` already
+    /// draws for the OpenAPI-backed dispatch path.
+    pub async fn execute_local_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let server = self
+            .local_servers
+            .iter()
+            .find(|s| s.name == server_name)
+            .ok_or_else(|| anyhow::anyhow!("mcp: local server '{server_name}' not found"))?;
+        let tool = server
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("mcp: local tool '{tool_name}' not found on server '{server_name}'")
+            })?;
+
+        match &tool.handler {
+            CompiledLocalToolHandler::Static(value) => Ok(local_static_tool_result(value)),
+            CompiledLocalToolHandler::Http(call) => {
+                execute_local_http_call(server, call, &arguments).await
+            }
+            CompiledLocalToolHandler::Steps(_) => Err(anyhow::anyhow!(
+                "mcp: local tool '{tool_name}' on server '{server_name}' uses a `steps` \
+                 handler, which has no executor yet (WOR-2489 Task 4); `static` and `http` \
+                 handlers are implemented"
+            )),
         }
     }
 }

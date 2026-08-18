@@ -4879,14 +4879,52 @@ pub(super) async fn handle_mcp_action(
                                         .map(|t| t.server_name.as_str())
                                         .unwrap_or("unknown"),
                                 );
+                                // WOR-2489 Task 3: a `type: local`
+                                // server's tool is resolved and
+                                // executed HERE, in `sbproxy-core`,
+                                // rather than falling through to
+                                // `federation`'s dispatch --
+                                // `sbproxy-extension::mcp::LocalBacking`
+                                // cannot hold the compiled
+                                // `CompiledLocalToolHandler` types
+                                // `sbproxy-modules` defines (the
+                                // dependency runs the other way), so
+                                // the executor lives on `McpAction`
+                                // instead and is reached from this
+                                // exact seam: after every governance
+                                // gate above (RBAC, argument policies,
+                                // quota, the versioning gate, content
+                                // filters) has already run, at the
+                                // same point in the gate chain the
+                                // openapi/federated dispatch happens.
+                                // `federation`'s own `local`-backing
+                                // branch is unreachable through this
+                                // path and stays only as a defensive
+                                // fallback (see its doc comment).
+                                let local_tool_name = federated
+                                    .as_ref()
+                                    .map(|t| t.upstream_name.as_str())
+                                    .unwrap_or(name.as_str());
                                 let call = tracing::Instrument::instrument(
-                                    mcp.federation
-                                        .call_tool_with_upstream_headers_from_snapshot(
-                                            &tool_catalog,
-                                            &name,
-                                            outbound_arguments,
-                                            &upstream_headers,
-                                        ),
+                                    async {
+                                        if mcp.is_local_server(governed_server) {
+                                            mcp.execute_local_tool(
+                                                governed_server,
+                                                local_tool_name,
+                                                outbound_arguments,
+                                            )
+                                            .await
+                                        } else {
+                                            mcp.federation
+                                                .call_tool_with_upstream_headers_from_snapshot(
+                                                    &tool_catalog,
+                                                    &name,
+                                                    outbound_arguments,
+                                                    &upstream_headers,
+                                                )
+                                                .await
+                                        }
+                                    },
                                     tool_span.clone(),
                                 );
                                 let mut outcome = match timeout {
@@ -13373,5 +13411,440 @@ mod mcp_catalog_snapshot_tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- `type: local` tool dispatch (WOR-2489 Task 3) ---
+    //
+    // Unlike the catalog-registration tests above (which fake nothing:
+    // registration needs no network either), these drive a real HTTP
+    // origin -- a tiny stub bound on loopback -- so the assertions
+    // below prove the actual dial, retry, timeout, and egress gate,
+    // not just that the catalog and governance wiring accept a local
+    // server. ---
+
+    /// Spawn a stub HTTP/1.1 origin on a loopback port that serves
+    /// each accepted connection with the next `(status, body)` in
+    /// order, then stops accepting once the list is exhausted. Each
+    /// call site's `http` tool builds a fresh client per dial attempt
+    /// (WOR-2080 pin re-verification), so one list entry corresponds
+    /// to exactly one tool-call attempt, including retries.
+    fn spawn_local_http_stub(responses: Vec<(u16, &'static str)>) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind local http tool stub");
+        let addr = listener.local_addr().expect("stub address");
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// Spawn a stub HTTP origin that accepts one connection and then
+    /// stalls for `stall` without ever writing a response, so a
+    /// caller's own per-call timeout is what has to end the call.
+    fn spawn_stalling_local_http_stub(stall: Duration) -> std::net::SocketAddr {
+        use std::io::Read;
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalling http tool stub");
+        let addr = listener.local_addr().expect("stub address");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(stall);
+            }
+        });
+        addr
+    }
+
+    /// Red-first: a `static` local tool must actually execute and
+    /// return its configured value through the full JSON-RPC dispatch,
+    /// with every governance gate still in the path -- before this
+    /// task, `tools/call` against any local tool failed with the
+    /// WOR-2489-Task-3-placeholder internal error Task 2 left in
+    /// `federation.rs` (`has no executor yet`). No RBAC/draft gating
+    /// is configured here; Task 2's tests above already prove those
+    /// gates deny correctly, this proves the allow path actually
+    /// dispatches.
+    #[tokio::test]
+    async fn wor_2489_static_local_tool_round_trips_through_full_dispatch() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-static-dispatch-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "static-local",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        }))
+        .expect("static local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "a static local tool call must succeed, got: {call:?}"
+        );
+        assert_eq!(call["result"]["isError"], json!(false));
+        assert_eq!(
+            call["result"]["content"][0]["text"],
+            json!("{\"message\":\"pong\"}"),
+            "the static value must be returned as the tool result, got: {call:?}"
+        );
+    }
+
+    /// Red-first: an `http` local tool's URL host outside its server's
+    /// `egress:` allowlist must be refused before any connect, with
+    /// the denial recorded in the process-wide egress inventory --
+    /// mirroring how an `openapi`-backed tool's denial already does
+    /// (`openapi_tool_denies_unlisted_egress_host_before_io`,
+    /// `sbproxy-extension`), since a local `http` tool reuses
+    /// `EgressPurpose::OpenApiTool` (see the WOR-2489 Task 3 report
+    /// for why).
+    #[tokio::test]
+    async fn wor_2489_http_local_tool_egress_denied_host_refused_before_connect() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-egress-denied-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "egress-denied-local",
+                "egress": {
+                    "mode": "enforce",
+                    "hosts": ["allowed.invalid"]
+                },
+                "tools": [{
+                    "name": "fetch",
+                    "description": "calls an upstream outside the allowlist",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "http": {
+                        "method": "GET",
+                        "url": "https://wor2489-denied.invalid/data"
+                    }
+                }]
+            }]
+        }))
+        .expect("egress-gated local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a tools/call refusal, got: {call:?}"));
+        assert!(
+            message.contains("egress denied"),
+            "an unlisted host must be refused before connect, got: {message}"
+        );
+
+        let sighting = sbproxy_security::egress::egress_inventory_snapshot()
+            .into_iter()
+            .find(|s| {
+                s.purpose == sbproxy_security::egress::EgressPurpose::OpenApiTool.as_label()
+                    && s.host == "wor2489-denied.invalid"
+            })
+            .expect("a denied local http tool dial must be recorded in the egress inventory");
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.last_reason, Some("unlisted_host"));
+    }
+
+    /// Red-first: an `http` local tool whose `url` references a
+    /// `${args.*}` path the caller did not supply must fail the call
+    /// closed with a clean JSON-RPC error -- never a panic, and never
+    /// an empty-string splice into the outbound URL.
+    #[tokio::test]
+    async fn wor_2489_http_local_tool_missing_arg_path_fails_closed_with_clean_json_rpc_error() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-missing-arg-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "missing-arg-local",
+                "egress": {},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "requires an id argument the caller omits",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "http": {
+                        "method": "GET",
+                        "url": "http://127.0.0.1:1/items/${args.id}"
+                    }
+                }]
+            }]
+        }))
+        .expect("local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a clean JSON-RPC error, got: {call:?}"));
+        assert!(
+            message.contains("does not resolve against the call arguments"),
+            "a missing ${{args.*}} path must fail closed with a named reason, got: {message}"
+        );
+    }
+
+    /// Red-first: `retry:` on an `http` local tool must be honored --
+    /// a stub upstream that fails the first attempt (a status in
+    /// `retry_on`) then succeeds must have its second attempt's
+    /// response returned as the tool result. Also proves the
+    /// `{status, headers, body}` result shape: status as a number,
+    /// only `content-type` exposed in `headers`, and a JSON body
+    /// parsed rather than left as text.
+    #[tokio::test]
+    async fn wor_2489_http_local_tool_retry_honored_after_one_failure() {
+        let addr = spawn_local_http_stub(vec![
+            (500, r#"{"error":"try again"}"#),
+            (200, r#"{"ok":true}"#),
+        ]);
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-retry-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "retry-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "calls a flaky upstream",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "http": {
+                        "method": "GET",
+                        "url": format!("http://{addr}/"),
+                        "retry": {"max_attempts": 2, "retry_on": [500], "backoff_ms": 5},
+                        "timeout": "2s"
+                    }
+                }]
+            }]
+        }))
+        .expect("retry local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            call.get("error").is_none(),
+            "a retried call must eventually succeed, got: {call:?}"
+        );
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        let document: serde_json::Value =
+            serde_json::from_str(text).expect("tool result text is JSON");
+        assert_eq!(
+            document["status"],
+            json!(200),
+            "the retried (second) response must win, got: {document:?}"
+        );
+        assert_eq!(
+            document["headers"],
+            json!({"content-type": "application/json"}),
+            "only content-type is exposed, no other response headers"
+        );
+        assert_eq!(
+            document["body"],
+            json!({"ok": true}),
+            "a JSON body must be parsed, not left as text"
+        );
+        assert_eq!(call["result"]["isError"], json!(false));
+    }
+
+    /// Red-first: a per-call `timeout:` on an `http` local tool must
+    /// be honored -- an upstream that never responds within it must
+    /// fail the call closed (a clean JSON-RPC error) rather than hang.
+    #[tokio::test]
+    async fn wor_2489_http_local_tool_timeout_fails_closed() {
+        let addr = spawn_stalling_local_http_stub(Duration::from_secs(5));
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-timeout-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "timeout-local",
+                "egress": {"mode": "enforce", "hosts": ["127.0.0.1"], "allow_private": true},
+                "tools": [{
+                    "name": "fetch",
+                    "description": "calls a stalling upstream",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "http": {
+                        "method": "GET",
+                        "url": format!("http://{addr}/"),
+                        "timeout": "150ms"
+                    }
+                }]
+            }]
+        }))
+        .expect("timeout local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let started = std::time::Instant::now();
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "fetch", "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stalled upstream must fail the call closed well before the stub's 5s stall, took {:?}",
+            started.elapsed()
+        );
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a timeout error, got: {call:?}"));
+        assert!(
+            message.contains("timed out"),
+            "the failure must name a timeout, got: {message}"
+        );
+    }
+
+    /// Pins the `steps` handler's placeholder: WOR-2489 Task 3's scope
+    /// is `static`/`http` only, so a `steps` tool's call must fail
+    /// with a named internal error pointing at Task 4 -- the same
+    /// "name the gap, fail loudly" pattern Task 2 used for the
+    /// `static`/`http` gap this task just closed.
+    #[tokio::test]
+    async fn wor_2489_steps_local_tool_returns_a_clear_task_4_error() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-steps-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "steps-local",
+                "egress": {},
+                "tools": [{
+                    "name": "workflow",
+                    "description": "a step DAG tool, not yet executed",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "steps": {
+                        "steps": [{
+                            "name": "one",
+                            "http": {"method": "GET", "url": "http://127.0.0.1:1/"}
+                        }],
+                        "response": {"template": "fixed"}
+                    }
+                }]
+            }]
+        }))
+        .expect("steps local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workflow", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a named internal error, got: {call:?}"));
+        assert!(
+            message.contains("WOR-2489 Task 4"),
+            "a `steps` tool call must name the tracked follow-up, got: {message}"
+        );
     }
 }

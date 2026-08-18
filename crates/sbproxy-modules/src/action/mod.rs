@@ -9,6 +9,7 @@ pub mod grpc;
 pub mod grpc_web;
 mod loadbalancer;
 pub mod mcp;
+mod mcp_interpolate;
 pub mod routing;
 pub mod storage;
 pub mod versioning;
