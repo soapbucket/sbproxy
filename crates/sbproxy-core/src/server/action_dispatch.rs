@@ -13165,4 +13165,213 @@ mod mcp_catalog_snapshot_tests {
             "a successful DELETE must actually end the session"
         );
     }
+
+    // --- WOR-2489: local-server tools publish into the SAME catalog
+    // federated tools live in, so every existing governance gate must
+    // apply with zero server-type-specific wiring. Unlike a real
+    // federated upstream's equivalent tests above (which fake
+    // registration with `seed_tools_for_test` because a live MCP dial
+    // is not available in a unit test), a `local` server needs no
+    // network at all, so these tests drive the REAL registration path
+    // (`federation.refresh_tools().await`) end to end. ---
+
+    /// Red-first: mirrors
+    /// `wor_2384_server_approval_status_gates_tools_list_and_tools_call`'s
+    /// `draft` case, but for a `type: local` server whose tool catalog
+    /// is registered by the real `refresh_tools()` path this task adds,
+    /// not by seeding the catalog by hand.
+    #[tokio::test]
+    async fn wor_2489_draft_local_server_hides_and_refuses_its_tool() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-draft-local-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "draft-local",
+                "status": "draft",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        }))
+        .expect("draft local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let list = mcp_handler_exchange(
+            &action,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        assert!(
+            list["result"]["tools"]
+                .as_array()
+                .expect("tools/list result")
+                .iter()
+                .all(|tool| tool["name"] != "ping"),
+            "a draft local server's tool must not be listed, got: {list:?}"
+        );
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a tools/call refusal, got: {call:?}"));
+        assert!(
+            message.contains("draft"),
+            "a draft local server's tool call must be refused naming the status, got: {message}"
+        );
+    }
+
+    /// Red-first: RBAC default-deny (WOR-1066) applies to a local tool
+    /// exactly like a federated one. Before this task, `rbac:` on a
+    /// `type: local` server was validated at compile time (WOR-2314's
+    /// "every server needs a label once policies exist" check already
+    /// ran over every upstream, local included) but then silently
+    /// discarded: a local server never entered `prefixes`, so
+    /// `policy_for_server` could never resolve it and the label did
+    /// nothing at request time. This drives the real gate end to end:
+    /// a policy with no matching rule denies by default.
+    #[tokio::test]
+    async fn wor_2489_rbac_default_deny_gates_a_local_tool() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-rbac-local-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "deny_all": {"default_allow": false}
+            },
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "rbac-local",
+                "rbac": "deny_all",
+                "tools": [{
+                    "name": "ping",
+                    "description": "always returns pong",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        }))
+        .expect("rbac-labeled local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let list = mcp_handler_exchange(
+            &action,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        assert!(
+            list["result"]["tools"]
+                .as_array()
+                .expect("tools/list result")
+                .iter()
+                .all(|tool| tool["name"] != "ping"),
+            "an RBAC-denied local tool must not be listed, got: {list:?}"
+        );
+
+        let call = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "ping", "arguments": {}}
+            }),
+        )
+        .await;
+        let message = call["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a tools/call refusal, got: {call:?}"));
+        assert!(
+            message.contains("denied by RBAC policy"),
+            "a local tool must be refused by the same RBAC gate a federated tool is, got: {message}"
+        );
+    }
+
+    /// Red-first: the tool-versioning gate (WOR-1635) treats a `local`
+    /// tool's config-declared definition exactly like an upstream's
+    /// fetched contract. A lockfile pins `ping`'s original description;
+    /// the live config changes it with no declared version bump. In
+    /// `mode: block` that must trip the gate through the real
+    /// `refresh_tools()` path, the same digest-diff-against-lockfile
+    /// mechanism `version_gate_blocks_unbumped_change_in_block_mode`
+    /// (`sbproxy-extension`) proves at the federation layer directly.
+    #[tokio::test]
+    async fn wor_2489_locked_local_tool_definition_change_without_bump_trips_the_gate() {
+        let locked_contract = json!({
+            "name": "ping",
+            "description": "the original, locked description",
+            "inputSchema": {"type": "object", "properties": {}},
+        });
+        let digest = sbproxy_extension::mcp::compat::contract_digest(&locked_contract);
+        let lockfile_yaml = format!(
+            "version: 1\ngenerated_for: wor2489-test\ntools:\n  ping:\n    semver: \"1.0.0\"\n    contract_digest: \"{digest}\"\n"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-wor2489-local-lockfile-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, lockfile_yaml).expect("write lockfile fixture");
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2489-locked-local-fixture", "version": "1.0.0"},
+            "tool_versioning": {
+                "lockfile": path.to_string_lossy(),
+                "mode": "block"
+            },
+            "federated_servers": [{
+                "type": "local",
+                "origin": "local.internal",
+                "prefix": "locked-local",
+                "tools": [{
+                    "name": "ping",
+                    "description": "a changed description, no version bump declared",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "static": {"message": "pong"}
+                }]
+            }]
+        }))
+        .expect("locked local-server fixture compiles");
+
+        action
+            .federation
+            .refresh_tools()
+            .await
+            .expect("a local server's tools register with no network dial");
+
+        let blocked = action.federation.version_blocked();
+        assert!(
+            blocked.contains_key("ping"),
+            "a local tool's contract changed with no declared version bump must trip the \
+             versioning gate exactly like an upstream's would, got: {blocked:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

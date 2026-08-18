@@ -98,6 +98,33 @@ pub struct OpenApiBacking {
     pub headers: Vec<(String, String)>,
 }
 
+/// A locally served upstream (WOR-2489): the gateway serves its own
+/// tools, no MCP or REST dial to an origin at all. Sibling to
+/// [`OpenApiBacking`], the same WOR-1648 precedent this clones: tools
+/// are declared, not fetched, so `fetch_tools_from_server` publishes
+/// them into the same catalog every other upstream's tools live in
+/// with no network round trip.
+///
+/// The actual tool handlers (`static`/`http`/`steps`) are compiled and
+/// typed one crate over, in `sbproxy-modules` (`CompiledLocalMcpServer`
+/// et al.), which itself depends on this crate -- `sbproxy-extension`
+/// cannot hold that type without an illegal reverse dependency. This
+/// struct therefore carries only what catalog registration needs: the
+/// same `name`/`description`/`inputSchema` documents `OpenApiBacking`
+/// carries for the identical reason. Dispatch resolution is a marker,
+/// not a mechanism: `call_tool_with_policy_cause_and_headers_from_held_tool`
+/// matches on `McpServerConfig::local`'s presence exactly like it
+/// matches on `openapi`'s, but until WOR-2489's Task 3 lands an
+/// executor, a call that reaches that branch returns a named internal
+/// error rather than executing anything.
+#[derive(Debug, Clone)]
+pub struct LocalBacking {
+    /// Tools declared for this server (`name`/`description`/
+    /// `inputSchema`), built once at config-compile time from each
+    /// tool's compiled definition.
+    pub tools: Vec<serde_json::Value>,
+}
+
 /// Configuration for one upstream MCP server.
 #[derive(Debug, Clone, Default)]
 pub struct McpServerConfig {
@@ -113,12 +140,20 @@ pub struct McpServerConfig {
     /// spec (tools derived locally, `tools/call` dispatched as REST)
     /// rather than by speaking MCP to `url`.
     pub openapi: Option<OpenApiBacking>,
+    /// WOR-2489: when set, this upstream serves its own tools with no
+    /// dial at all, rather than by speaking MCP to `url`. Mutually
+    /// exclusive with `openapi` (a server is one kind or the other).
+    pub local: Option<LocalBacking>,
     /// Deterministic egress policy for the base MCP dial itself
     /// (`EgressPurpose::McpUpstream`, WOR-2384 / MCP09), independent
     /// of any `OpenApiBacking::egress_policy` an `openapi`-backed
     /// server also carries for its REST calls. `stdio` servers carry
     /// a policy too (uniform construction) but it is never consulted:
-    /// stdio is a local process spawn, not a network dial.
+    /// stdio is a local process spawn, not a network dial. A `local`
+    /// server's tools are gated by their own compiled `egress` policy
+    /// instead (`CompiledLocalMcpServer::egress`, in `sbproxy-modules`);
+    /// this field is present for uniform construction but never
+    /// consulted on the local path either.
     pub egress_policy: EgressPolicy,
 }
 
@@ -288,6 +323,22 @@ impl FederatedTool {
             document,
             server_name,
             streaming,
+            LegacyMetaProjection::Omit,
+        )
+    }
+
+    /// Construct a `type: local` tool (WOR-2489). Built the same way
+    /// an OpenAPI-derived tool is: no upstream ever produced `_meta`
+    /// for a config-declared tool either, so the legacy projection
+    /// omits it for the identical reason `from_openapi_document` does.
+    /// This is what makes a local tool's contract, digest, and
+    /// tool-versioning-gate treatment identical in kind to an
+    /// upstream's -- the same function builds both.
+    fn from_local_document(document: Value, server_name: String) -> Result<Self, McpContractError> {
+        Self::from_document_with_legacy_meta(
+            document,
+            server_name,
+            false,
             LegacyMetaProjection::Omit,
         )
     }
@@ -1621,6 +1672,22 @@ impl McpFederation {
             return Ok(federated);
         }
 
+        // WOR-2489: a `local` server serves tools from its own
+        // compiled config, no MCP round-trip either -- the same "no
+        // network fetch" shape as the OpenAPI arm above, reusing the
+        // same contract-building function under a name that documents
+        // why (`from_local_document`).
+        if let Some(backing) = &server.local {
+            let federated = backing
+                .tools
+                .iter()
+                .filter_map(|t| {
+                    FederatedTool::from_local_document(t.clone(), server.name.clone()).ok()
+                })
+                .collect();
+            return Ok(federated);
+        }
+
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/list".to_string(),
@@ -1841,10 +1908,11 @@ impl McpFederation {
     /// before [`Self::refresh_resources`] (which reads `mcpApps` out of
     /// it) and [`Self::refresh_prompts`] (which reads `prompts`).
     ///
-    /// OpenAPI-backed upstreams are skipped: they speak REST, not MCP,
-    /// so there is no handshake to run and no capability to read.
-    /// Per-upstream failures log and continue; an upstream missing from
-    /// the snapshot simply declares nothing.
+    /// OpenAPI-backed and local (WOR-2489) upstreams are skipped: an
+    /// OpenAPI server speaks REST, not MCP, and a local server dials
+    /// nothing at all, so neither has a handshake to run or a
+    /// capability to read. Per-upstream failures log and continue; an
+    /// upstream missing from the snapshot simply declares nothing.
     ///
     /// Returns the number of upstreams that answered.
     pub async fn refresh_server_capabilities(&self) -> usize {
@@ -1867,7 +1935,7 @@ impl McpFederation {
             (*self.server_protocol_versions.load_full()).clone();
         let mut auth_required: HashMap<String, bool> = HashMap::new();
         for server in &self.servers {
-            if server.openapi.is_some() {
+            if server.openapi.is_some() || server.local.is_some() {
                 continue;
             }
             match self.fetch_server_capabilities(server).await {
@@ -2724,6 +2792,25 @@ impl McpFederation {
                     upstream_headers,
                 )
                 .await;
+        }
+
+        // WOR-2489: a `local` server's tool has already cleared every
+        // governance gate above this point (policy hooks; and, in the
+        // caller at `sbproxy-core::action_dispatch`, RBAC, argument
+        // policies, quota, the versioning gate, content filters -- the
+        // whole reason this tool was resolvable through the shared
+        // catalog at all). What runs it does not exist yet: the
+        // executor is WOR-2489's Task 3. Bail loudly and name the gap
+        // rather than silently succeed with nothing executed or fall
+        // through into the plain-MCP dispatch below (which would send
+        // a real `tools/call` to a URL nothing is listening on).
+        if server.local.is_some() {
+            anyhow::bail!(
+                "mcp: local tool '{}' on server '{}' has no executor yet (WOR-2489 Task 3); \
+                 catalog registration and governance are wired, dispatch is not implemented",
+                federated.name,
+                server.name
+            );
         }
 
         // WOR-2384: the upstream never learned the advertised
@@ -4642,6 +4729,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         }
     }
@@ -4974,6 +5062,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            local: None,
             egress_policy: EgressPolicy::default(),
         }]);
 
@@ -6399,6 +6488,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
@@ -7907,6 +7997,7 @@ mod tests {
             transport: "sse".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         assert_eq!(config.transport, "sse");
@@ -7950,6 +8041,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
@@ -8035,6 +8127,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::Always,
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
@@ -8103,6 +8196,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
 
@@ -8154,6 +8248,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         fed.authorize_mcp_upstream_dial(&ungated)
@@ -8168,6 +8263,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["127.0.0.1".to_string()],
@@ -8189,6 +8285,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["127.0.0.1".to_string()],
@@ -8237,6 +8334,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["127.0.0.1".to_string()],
@@ -8288,6 +8386,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 // allow_private so the loopback fixture pins authorize.
                 mode: crate::mcp::EgressMode::Enforce,
@@ -8343,6 +8442,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["mcp-pin-rebind.invalid".to_string()],
@@ -8401,6 +8501,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy {
                 mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["mcp-redirect.invalid".to_string()],
@@ -8488,6 +8589,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
 
@@ -8574,6 +8676,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            local: None,
             egress_policy: EgressPolicy::default(),
         }
     }
@@ -9426,6 +9529,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            local: None,
             egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);

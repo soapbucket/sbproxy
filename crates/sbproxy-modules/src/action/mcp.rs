@@ -1046,9 +1046,10 @@ fn default_federated_protocol() -> String {
 //     response from the step outputs.
 //
 // This section is config structs and compile-time validation only.
-// The compiled representation lands on `McpAction::local_servers`,
-// ready for a later task's catalog registration; nothing here
-// dispatches a request.
+// The compiled representation lands on `McpAction::local_servers` and
+// is published into the shared tool catalog by `from_parsed` (WOR-2489
+// Task 2, via `sbproxy_extension::mcp::LocalBacking`); nothing here
+// dispatches a request -- that is Task 3's job.
 
 /// One locally served tool on a `type: local` federated server
 /// (WOR-2489). `handler` is exactly one of `static`, `http`, or
@@ -1816,9 +1817,13 @@ pub struct McpAction {
     /// Compiled `type: local` federated servers' tool catalogs
     /// (WOR-2489), one entry per local server, empty when none are
     /// configured. Validated and compiled at config-compile time by
-    /// [`compile_local_server`]; nothing in this crate dispatches a
-    /// call against these yet -- wiring them into the tool catalog is
-    /// a later task's job.
+    /// [`compile_local_server`]. Each server's tools are also
+    /// published into `federation`'s shared catalog as ordinary
+    /// [`sbproxy_extension::mcp::FederatedTool`] entries (via
+    /// `McpServerConfig::local`), so every existing governance gate
+    /// (RBAC, draft/deprecated approval, the tool-versioning gate,
+    /// `tools/list` filtering) applies unchanged; nothing dispatches a
+    /// call against a resolved local tool yet, which is Task 3's job.
     pub(crate) local_servers: Vec<CompiledLocalMcpServer>,
 }
 
@@ -2553,8 +2558,12 @@ fn compile_mcp_result_policy(
 
 /// Compiled `tools[]` catalog for one `type: local` federated server.
 /// Built once at config-compile time by [`compile_local_server`] and
-/// stored on `McpAction::local_servers`. Nothing in this crate reads
-/// it yet; wiring it into the tool catalog is a later task.
+/// stored on `McpAction::local_servers`. `from_parsed` also derives a
+/// JSON tool-document list from this (name/description/inputSchema)
+/// and hands it to `federation` as a `LocalBacking`, which is what
+/// actually publishes these tools into the shared catalog (WOR-2489).
+/// Nothing dispatches a call against a resolved local tool yet, which
+/// is Task 3's job.
 ///
 /// `Debug` is hand-written, not derived, on every `CompiledLocal*` type
 /// in this section: rustc's dead-code pass explicitly and deliberately
@@ -3108,10 +3117,10 @@ impl McpAction {
             .egress
             .clone()
             .unwrap_or_else(|| EgressPolicy::allow_all("action"));
-        // WOR-2489: `type: local` servers never dial an upstream, so
-        // they are diverted out of the loop below before any of the
-        // MCP/REST-dial bookkeeping and land here instead. See
-        // `compile_local_server`.
+        // WOR-2489: every `type: local` server's compiled tool
+        // handlers, one entry per server, populated inside the loop
+        // below alongside its `McpServerConfig`/`prefixes` entries.
+        // See `compile_local_server`.
         let mut local_servers: Vec<CompiledLocalMcpServer> = Vec::new();
 
         for upstream in cfg.federated_servers {
@@ -3189,16 +3198,6 @@ impl McpAction {
                     upstream.origin
                 );
             }
-            // A `local` server serves its own tools -- no MCP or REST
-            // dial, so it never enters `server_configs`, `prefixes`,
-            // or the peer-profile/protocol-negotiation bookkeeping
-            // below, all of which exist for an upstream this gateway
-            // actually contacts. Its compiled tools land on
-            // `local_servers` instead.
-            if is_local {
-                local_servers.push(compile_local_server(&name, &upstream)?);
-                continue;
-            }
             // WOR-2384 (MCP09): computed once per server so both the
             // `openapi` REST-call gate (`OpenApiBacking::egress_policy`,
             // pre-existing) and the base MCP dial gate
@@ -3207,14 +3206,51 @@ impl McpAction {
             // action-level default over allow-all -- regardless of
             // which kind of upstream this is. `stdio` servers get one
             // too (uniform construction) but it is never consulted:
-            // stdio is a local process spawn, not a network dial.
+            // stdio is a local process spawn, not a network dial. A
+            // `local` server's tools are gated by their own compiled
+            // `CompiledLocalMcpServer::egress` instead (below); this
+            // value is stored on its `McpServerConfig` too, for the
+            // same uniform-construction reason, but is equally inert.
             let server_egress_policy = upstream
                 .egress
                 .clone()
                 .unwrap_or_else(|| action_egress.clone())
                 .with_scope(format!("server:{name}"));
 
-            let (url, openapi) = if is_stdio {
+            // WOR-2489: a `local` server serves its own tools -- no
+            // MCP or REST dial -- but it still publishes into the SAME
+            // catalog every other upstream's tools live in
+            // (`server_configs`, via `LocalBacking`) and the same
+            // per-server table every other upstream's RBAC label and
+            // approval status resolve through (`prefixes`, below). That
+            // is what makes RBAC, draft/deprecated status, and the
+            // tool-versioning gate apply to a local tool with zero
+            // server-type-specific code at any of those call sites:
+            // they all key on `server_name`, never on transport kind.
+            // `url`/`transport` are nominal placeholders nothing ever
+            // dials; `compile_local_server` (unchanged from Task 1) is
+            // still what validates `tools[]` and produces the compiled
+            // handlers Task 3's executor will consume.
+            let (url, openapi, local) = if is_local {
+                let compiled = compile_local_server(&name, &upstream)?;
+                let tool_docs: Vec<serde_json::Value> = compiled
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        })
+                    })
+                    .collect();
+                local_servers.push(compiled);
+                (
+                    format!("local://{name}"),
+                    None,
+                    Some(sbproxy_extension::mcp::LocalBacking { tools: tool_docs }),
+                )
+            } else if is_stdio {
                 let command = upstream.command.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "mcp action: stdio server '{}' needs command",
@@ -3223,6 +3259,7 @@ impl McpAction {
                 })?;
                 (
                     sbproxy_extension::mcp::encode_stdio_url(command, &upstream.args),
+                    None,
                     None,
                 )
             } else if is_openapi {
@@ -3252,9 +3289,10 @@ impl McpAction {
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect(),
                     }),
+                    None,
                 )
             } else {
-                (normalize_origin(&upstream.origin)?, None)
+                (normalize_origin(&upstream.origin)?, None, None)
             };
 
             server_configs.push(McpServerConfig {
@@ -3263,6 +3301,7 @@ impl McpAction {
                 transport,
                 namespace: upstream.namespace,
                 openapi,
+                local,
                 egress_policy: server_egress_policy,
             });
             // WOR-2384: computed before `upstream.protocol` /
