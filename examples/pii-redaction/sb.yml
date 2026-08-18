@@ -49,6 +49,9 @@ origins:
         - name: openai
           api_key: "${OPENAI_API_KEY:-stub-key}"
           base_url: "http://127.0.0.1:8098/anything"
+          # Only because the demo fixture runs on this machine: the
+          # provider dial guard refuses a private base_url otherwise.
+          allow_private_base_url: true
       routing:
         strategy: round_robin
 
