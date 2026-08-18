@@ -11952,31 +11952,76 @@ mod mcp_catalog_snapshot_tests {
     /// read zero after the call below -- this is the exact caller-
     /// facing shape a call that already ran (and, in a real
     /// deployment, already cost money) must not lose attribution for.
+    ///
+    /// The queue-full condition below is deterministic, not a race
+    /// (fixed after this test flaked on CI TRY 2 of an unrelated PR).
+    /// An earlier version kept the dedicated egress's one queue slot
+    /// full with a background thread that looped `publish_checked`
+    /// calls until the dispatch below finished, racing the real file
+    /// worker for the slot the instant it drained one: the flooder
+    /// usually refilled it first, but whenever the worker's drain won
+    /// that race, this dispatch's own evidence emit slipped into the
+    /// freed slot instead, delivery succeeded, and the fail-closed
+    /// refusal this test asserts never happened. `EventEgress::
+    /// never_drained_for_test` (WOR-2384) removes the race instead of
+    /// trying to win it: it builds a queue with no worker at all, so
+    /// nothing ever drains it, and the one pre-fill publish below
+    /// occupies the queue's single slot permanently. The dispatch's own
+    /// publish is then provably the second attempt against an
+    /// already-full queue, with no thread, no timing window, and no
+    /// dependence on how a scheduler happens to interleave anything.
     #[tokio::test]
     async fn wor_2384_queue_full_post_dispatch_evidence_failure_still_records_attribution() {
         const TOOL_NAME: &str = "wor-2384-queue-full-attribution-tool";
         const SERVER: &str = "queue-full-attribution-server";
 
-        // A dedicated, tiny-capacity event egress, distinct from the
+        // A dedicated, capacity-1 event egress, distinct from the
         // shared, capacity-64 one
         // `wor_2384_governance_evidence_across_rbac_and_peer_downgrade_scenarios`
         // installs above: nextest runs each test function in its own
         // process, so a second `install_event_egress` call here is a
         // fresh process-global slot, not a conflict with that test's.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let events_path = dir.path().join("queue-full-events.ndjson");
-        let egress = sbproxy_observe::event_sink::EventEgress::start(
-            sbproxy_observe::event_sink::EventSinkTarget::File {
-                path: events_path.clone(),
-            },
+        //
+        // No real file sink and no worker thread here
+        // (`EventEgress::never_drained_for_test`, WOR-2384): see this
+        // test's doc comment above for why a background flooding
+        // thread racing a real drain loop used to flake, and why a
+        // queue nothing ever drains removes the race instead of
+        // trying to win it. Nothing gets written anywhere, so there is
+        // no temp path to make unique across nextest's per-process
+        // isolation or a serial fallback either -- there is no file at
+        // all for two runs to collide on.
+        let egress = sbproxy_observe::event_sink::EventEgress::never_drained_for_test(
             sbproxy_observe::event_sink::EventTypeMask::from_types(&[
                 sbproxy_observe::events::EventType::McpGovernanceDecision,
             ]),
+            "file",
             1,
-        )
-        .expect("dedicated file egress starts");
+        );
         sbproxy_observe::install_event_egress(egress)
             .expect("this test's own event egress installs exactly once in its own process");
+
+        // Occupy the queue's one slot before dispatch runs. Nothing
+        // ever drains this queue, so this permanently fills it: the
+        // dispatch's own evidence emit below is provably the second
+        // attempt against an already-full queue, not a race against
+        // anything.
+        assert!(
+            sbproxy_observe::event_sink::publish_proxy_event_checked(
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+                || {
+                    sbproxy_observe::events::ProxyEvent::new(
+                        sbproxy_observe::events::EventType::McpGovernanceDecision,
+                        "prefill.test".to_string(),
+                        "prefill-tenant".to_string(),
+                        json!({}),
+                    )
+                },
+            )
+            .is_ok(),
+            "the queue's one slot must accept this pre-fill publish; if this fails, the \
+             egress's queue_capacity above no longer matches this test's arithmetic"
+        );
 
         // A pipeline whose only job here is to carry
         // `events.fail_closed`: `mcp_governance_fail_closed` reads
@@ -12018,30 +12063,6 @@ mod mcp_catalog_snapshot_tests {
             .create("__default__")
             .minted()
             .expect("mint below the cap");
-
-        // Keep the dedicated egress's single queue slot continuously
-        // full for as long as the dispatch below is in flight: a
-        // one-shot burst only guarantees `Full` for the microseconds
-        // the burst itself takes, not for a real async round trip,
-        // since the channel drains the instant the file worker (a
-        // real, separate OS thread) gets scheduled and catches up.
-        let stop_flooding = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flood_stop = Arc::clone(&stop_flooding);
-        let flooder = std::thread::spawn(move || {
-            while !flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = sbproxy_observe::event_sink::publish_proxy_event_checked(
-                    sbproxy_observe::events::EventType::McpGovernanceDecision,
-                    || {
-                        sbproxy_observe::events::ProxyEvent::new(
-                            sbproxy_observe::events::EventType::McpGovernanceDecision,
-                            "flood.test".to_string(),
-                            "flood-tenant".to_string(),
-                            json!({}),
-                        )
-                    },
-                );
-            }
-        });
 
         async fn raw_tools_call_exchange(
             action: &McpAction,
@@ -12120,9 +12141,6 @@ mod mcp_catalog_snapshot_tests {
             events_pipeline,
         )
         .await;
-
-        stop_flooding.store(true, std::sync::atomic::Ordering::Relaxed);
-        flooder.join().expect("flooding thread joins");
 
         assert_eq!(
             call["error"]["message"].as_str().unwrap_or_default(),

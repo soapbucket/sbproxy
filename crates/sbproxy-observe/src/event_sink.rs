@@ -374,6 +374,57 @@ impl EventEgress {
             sink_label,
         }
     }
+
+    /// Test-only: an egress whose queue nothing ever drains (WOR-2384).
+    ///
+    /// `handle` stays `None`, exactly like `over_channel` above: no
+    /// worker thread is spawned, so nothing ever calls `recv` on the
+    /// receiving half and `queue_capacity` publishes permanently occupy
+    /// the channel's slots. Every publish after that observes `Full`
+    /// straight from `std::sync::mpsc`'s own bounded-queue bookkeeping,
+    /// not from a race against a real drain loop, which is what makes
+    /// the resulting [`EventPublishError::QueueFull`] deterministic
+    /// rather than a timing bet -- a real worker (even an artificially
+    /// slow one) still drains the instant it gets scheduled, and a
+    /// caller cannot control when that happens.
+    ///
+    /// This exists as its own function, rather than exposing
+    /// `over_channel` itself, because `#[cfg(test)]` items compile only
+    /// into the crate that declares them: `sbproxy-observe`'s own test
+    /// binary can already see `over_channel`, but a *different* crate's
+    /// tests link against the normal (non-test) `rlib`, where a
+    /// `#[cfg(test)]` item simply does not exist. `sbproxy-core`'s
+    /// WOR-2384 queue-full dispatch test needs exactly this shape from
+    /// across that boundary.
+    ///
+    /// A literal permanently-parked worker *thread* was the other way
+    /// to get a queue that never drains, and was rejected: [`Drop`]
+    /// joins `handle` unconditionally once `tx` clears, and a thread
+    /// whose loop is only `std::thread::park()` never returns, so the
+    /// join -- and the whole test process -- would hang at teardown.
+    /// Spawning no thread at all sidesteps that hazard entirely, the
+    /// same way `over_channel` already does for this crate's own tests.
+    ///
+    /// `#[doc(hidden)]`: a cross-crate test seam, not part of the
+    /// supported API surface (this crate is internal to begin with; see
+    /// the workspace `CLAUDE.md`'s public-surface list). Named to match
+    /// the `..._for_test` seams `sbproxy_extension::mcp::federation`
+    /// exposes for the same reason (`seed_tools_for_test` and
+    /// siblings).
+    #[doc(hidden)]
+    pub fn never_drained_for_test(
+        types: EventTypeMask,
+        sink_label: &'static str,
+        queue_capacity: usize,
+    ) -> Self {
+        let (tx, _rx) = sync_channel::<ProxyEvent>(queue_capacity);
+        Self {
+            tx: Some(tx),
+            handle: None,
+            types,
+            sink_label,
+        }
+    }
 }
 
 impl Drop for EventEgress {
