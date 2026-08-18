@@ -553,7 +553,7 @@ mod tests {
         // Moving it inside the cap makes it detected again, proving the
         // cap - not the detector - was why the first case was clean.
         let mut body_within_cap = b"AKIAIOSFODNN7EXAMPLE".to_vec();
-        body_within_cap.extend_from_slice(&vec![b' '; 40]);
+        body_within_cap.extend_from_slice(&[b' '; 40]);
         match policy.scan_body(&body_within_cap) {
             DlpScanResult::Hit { detectors } => {
                 assert!(detectors.contains(&"aws_access".to_string()));
