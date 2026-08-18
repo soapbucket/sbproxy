@@ -75,6 +75,15 @@
 //! never evicted, however far behind it has fallen. A rollback target
 //! that eviction quietly deleted would be worse than no bound at all.
 //!
+//! Eviction persists the shrunk index before it unlinks any blob. Doing
+//! it the other way round would reopen the same crash window this
+//! module's repair story exists to close: a blob deleted first, then a
+//! crash before the index that stopped naming it is durable, leaves
+//! `index.json` naming a digest with no file, which `open` refuses as
+//! corrupt. Persisting first means the only possible crash-window
+//! residue is an index that no longer names an entry plus a blob
+//! nothing names, an ordinary orphan `open` already tolerates.
+//!
 //! # The lkg pointer is written, never auto-advanced, here
 //!
 //! [`RevisionStore::mark_good`] is the only thing that moves the `lkg`
@@ -452,9 +461,19 @@ impl RevisionStore {
         let mut next = self.index.clone();
         next.high_water_revision = revision;
         next.entries.push(entry.clone());
-        self.evict(&mut next);
+        let orphaned = evict_entries(self.keep, &mut next);
+        // The index that stops naming `orphaned`'s digests must be durable
+        // before those blobs are unlinked: unlinking first would leave a
+        // crash window where `index.json` (still the old, pre-persist
+        // version on disk) names a digest whose blob is already gone, and
+        // this store's own `open` would then refuse a directory its own
+        // eviction damaged. Persisting first means the only crash-window
+        // residue possible is an index that no longer names an entry plus
+        // a blob nothing names, which `open` already tolerates as an
+        // ordinary orphan.
         self.save_index(&next)?;
         self.index = next;
+        self.remove_orphaned_blobs(&orphaned);
         Ok(entry)
     }
 
@@ -527,35 +546,15 @@ impl RevisionStore {
         Ok(content)
     }
 
-    /// Evict the oldest non-`lkg` entries in `next` until at most
-    /// `self.keep` of those remain. The entry `next.lkg` names is not
-    /// part of that budget: it survives as an addition to it, however far
-    /// behind it has fallen, so `keep` bounds how much *browsable* history
-    /// is retained without ever costing the ring its rollback target.
-    /// Removes the blob for an evicted digest only when no remaining
-    /// entry still references it, which is what keeps an A-to-B-to-A
-    /// flap's shared blob alive.
-    fn evict(&self, next: &mut RevisionIndex) {
-        let lkg = next.lkg.clone();
-        let is_lkg = |entry: &RevisionEntry| Some(entry.digest.as_str()) == lkg.as_deref();
-        loop {
-            let non_lkg_count = next.entries.iter().filter(|entry| !is_lkg(entry)).count();
-            if non_lkg_count <= self.keep {
-                break;
-            }
-            let Some(victim) = next.entries.iter().position(|entry| !is_lkg(entry)) else {
-                // Every remaining entry is the lkg entry; nothing more can
-                // be evicted without dropping the rollback target.
-                break;
-            };
-            let removed = next.entries.remove(victim);
-            let still_referenced = next
-                .entries
-                .iter()
-                .any(|entry| entry.digest == removed.digest);
-            if !still_referenced {
-                let _ = std::fs::remove_file(blob_path(&self.directory, &removed.digest));
-            }
+    /// Unlink blob files for digests no live entry references any more.
+    ///
+    /// Call only after the index that stopped naming `digests` has been
+    /// durably persisted (see the ordering note in [`Self::append`]).
+    /// Best-effort: a failed unlink here just leaves an ordinary orphan
+    /// blob behind, which [`Self::open`] already tolerates.
+    fn remove_orphaned_blobs(&self, digests: &[String]) {
+        for digest in digests {
+            let _ = std::fs::remove_file(blob_path(&self.directory, digest));
         }
     }
 
@@ -583,6 +582,44 @@ fn blob_path(directory: &Path, digest: &str) -> PathBuf {
         .join(format!("{digest}{BLOB_SUFFIX}"))
 }
 
+/// Evict the oldest non-`lkg` entries in `next` until at most `keep` of
+/// those remain, and return the digests no surviving entry references any
+/// more. Touches only `next`, never the filesystem: the caller unlinks
+/// the returned digests' blobs itself, and only after `next` is durable
+/// (see the ordering note in [`RevisionStore::append`]).
+///
+/// The entry `next.lkg` names is not part of the `keep` budget: it
+/// survives as an addition to it, however far behind it has fallen, so
+/// `keep` bounds how much *browsable* history is retained without ever
+/// costing the ring its rollback target. A digest is reported orphaned
+/// only when no remaining entry still references it, which is what keeps
+/// an A-to-B-to-A flap's shared blob alive.
+fn evict_entries(keep: usize, next: &mut RevisionIndex) -> Vec<String> {
+    let lkg = next.lkg.clone();
+    let is_lkg = |entry: &RevisionEntry| Some(entry.digest.as_str()) == lkg.as_deref();
+    let mut orphaned = Vec::new();
+    loop {
+        let non_lkg_count = next.entries.iter().filter(|entry| !is_lkg(entry)).count();
+        if non_lkg_count <= keep {
+            break;
+        }
+        let Some(victim) = next.entries.iter().position(|entry| !is_lkg(entry)) else {
+            // Every remaining entry is the lkg entry; nothing more can be
+            // evicted without dropping the rollback target.
+            break;
+        };
+        let removed = next.entries.remove(victim);
+        let still_referenced = next
+            .entries
+            .iter()
+            .any(|entry| entry.digest == removed.digest);
+        if !still_referenced {
+            orphaned.push(removed.digest);
+        }
+    }
+    orphaned
+}
+
 /// A fresh, randomly minted lineage identity.
 fn new_lineage() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -595,13 +632,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// A stable digest of a [`ClusterRestartFingerprint`], used to detect a
 /// change across restarts without this crate needing the type to
-/// implement `Serialize`. The type's `Debug` output is deterministic
-/// (its collections are all ordered), so this is stable for as long as
-/// the type's field set and `Debug` derive do not change; a false-positive
-/// lineage remint on an unrelated internal change is an acceptable cost
-/// for not needing a hand-maintained canonical encoding here.
+/// implement `Serialize`. Hashes
+/// [`ClusterRestartFingerprint::stable_lineage_key`] rather than the
+/// type's `Debug` output: `Debug` follows declaration order, so a
+/// routine field reorder in that actively developed struct would
+/// silently remint every node's lineage on upgrade, and
+/// `stable_lineage_key`'s exhaustive destructure exists specifically to
+/// close that gap.
 fn fingerprint_digest_of(fingerprint: &ClusterRestartFingerprint) -> String {
-    sha256_hex(format!("{fingerprint:?}").as_bytes())
+    sha256_hex(fingerprint.stable_lineage_key().as_bytes())
 }
 
 /// Read a bounded file. `Ok(None)` means it does not exist yet.
@@ -806,6 +845,37 @@ mod tests {
     }
 
     #[test]
+    fn an_orphan_blob_is_reused_rather_than_overwritten_by_a_matching_append() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(store(temp.path(), 10));
+
+        // Plant an orphan under the exact digest a later append of this
+        // content will land on, but with bytes that are NOT a real
+        // compressed encoding of it, so any overwrite is detectable.
+        let content: &[u8] = b"origins: {}\n# would-be-appended-later\n";
+        let digest = sha256_hex(content);
+        let orphan_path = blob_path(temp.path(), &digest);
+        let marker: &[u8] = b"not a real compressed blob, just a marker";
+        std::fs::write(&orphan_path, marker).expect("write orphan blob");
+
+        let mut reopened = RevisionStore::open(temp.path(), 10, None)
+            .expect("an unnamed blob is adopted, not refused");
+        assert!(reopened.entries().is_empty());
+
+        // Appending the same content must find the blob already there
+        // by digest and skip the write, not overwrite the orphan with a
+        // fresh compression.
+        reopened
+            .append(content, metadata(1))
+            .expect("append matching the orphan's digest");
+        let on_disk = std::fs::read(&orphan_path).expect("read blob after append");
+        assert_eq!(
+            on_disk, marker,
+            "matching content must reuse the adopted blob's bytes untouched",
+        );
+    }
+
+    #[test]
     fn eviction_is_oldest_first_and_never_evicts_the_lkg_entry() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let keep = 3usize;
@@ -841,6 +911,124 @@ mod tests {
             store.lkg().expect("lkg").digest,
             good.digest,
             "the lkg pointer itself is untouched by eviction",
+        );
+    }
+
+    #[test]
+    fn the_store_reopens_cleanly_after_an_eviction_triggering_append() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let keep = 1usize;
+        {
+            let mut store = store(temp.path(), keep);
+            store
+                .append(b"origins: {}\n# one\n", metadata(1))
+                .expect("append");
+            store
+                .append(b"origins: {}\n# two\n", metadata(2))
+                .expect("append triggers eviction");
+        }
+        let reopened = RevisionStore::open(temp.path(), keep, None)
+            .expect("a store that just evicted must still reopen cleanly");
+        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.entries()[0].applied_at, 2);
+    }
+
+    #[test]
+    fn a_failed_index_persist_during_an_evicting_append_leaves_every_previously_named_blob_untouched(
+    ) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let keep = 1usize;
+        let mut store = store(temp.path(), keep);
+        let first = store
+            .append(b"origins: {}\n# one\n", metadata(1))
+            .expect("append");
+
+        // Force the next index persist to fail deterministically and
+        // portably: renaming a regular file onto an existing directory
+        // always fails regardless of permission bits, unlike chmod-ing
+        // the store directory read-only, which `create_private_dir_all`
+        // would self-heal back to 0700 before the write even attempts to
+        // run.
+        let index_path = temp.path().join(INDEX_FILE);
+        std::fs::remove_file(&index_path).expect("remove index.json");
+        std::fs::create_dir(&index_path).expect("shadow index.json with a directory");
+
+        let result = store.append(b"origins: {}\n# two\n", metadata(2));
+        assert!(
+            result.is_err(),
+            "a shadowed index.json must fail the persist, not silently succeed",
+        );
+        assert!(
+            blob_path(temp.path(), &first.digest).is_file(),
+            "the previously named blob must survive a failed persist untouched: \
+             eviction only unlinks a blob after the index that stops naming it \
+             is durable",
+        );
+        assert_eq!(
+            store.entries().len(),
+            1,
+            "the in-memory index must not advance past what is actually on disk",
+        );
+    }
+
+    #[test]
+    fn a_crash_between_persisting_the_evicted_index_and_unlinking_orphans_leaves_an_adoptable_blob()
+    {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let keep = 1usize;
+        let mut store = store(temp.path(), keep);
+        let first = store
+            .append(b"origins: {}\n# one\n", metadata(1))
+            .expect("append");
+
+        // Manually drive the same sequence `append` uses, stopping right
+        // after the index persists and before the orphaned blob is
+        // unlinked: that gap is the crash window this test proves is
+        // safe to land in.
+        let second_content: &[u8] = b"origins: {}\n# two\n";
+        let second_digest = sha256_hex(second_content);
+        store
+            .write_blob_if_absent(&second_digest, second_content)
+            .expect("write second blob");
+        let mut next = store.index.clone();
+        next.high_water_revision += 1;
+        next.entries.push(RevisionEntry {
+            digest: second_digest.clone(),
+            revision: next.high_water_revision,
+            provenance: BaseOrigin::Local,
+            state: RevisionState::Applied,
+            blast_radius: None,
+            secrets_fingerprint: None,
+            actor: None,
+            applied_at: 2,
+            soak_verdict: None,
+            boot_attempts: 0,
+        });
+        let orphaned = evict_entries(store.keep, &mut next);
+        assert_eq!(
+            orphaned,
+            vec![first.digest.clone()],
+            "the first entry is the only eviction candidate here",
+        );
+        store.save_index(&next).expect("persist the evicted index");
+        // Simulate the crash: the blob-unlink step never runs.
+
+        assert!(
+            blob_path(temp.path(), &first.digest).is_file(),
+            "the crash window leaves the orphaned blob in place",
+        );
+
+        let reopened = RevisionStore::open(temp.path(), keep, None)
+            .expect("a dangling orphan blob must open cleanly, not refuse");
+        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.entries()[0].digest, second_digest);
+        // This module adopts an orphan (leaves it in place) rather than
+        // sweeping it at open; a later GC pass, not open itself, is the
+        // right place to reclaim it, matching every other blob nothing
+        // names.
+        assert!(
+            blob_path(temp.path(), &first.digest).is_file(),
+            "the orphan left by the crash window is adopted, not swept, at open",
         );
     }
 
