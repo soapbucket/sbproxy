@@ -239,7 +239,7 @@ impl ConfigHistoryRecorder {
     }
 
     /// Blast radius of `content` against this ring's most recent entry,
-    /// via [`sbproxy_config::plan`].
+    /// via [`sbproxy_config::plan()`].
     ///
     /// `None` for an empty ring (nothing to diff against, matching
     /// [`AppendMetadata::blast_radius`]'s own documented meaning for a
