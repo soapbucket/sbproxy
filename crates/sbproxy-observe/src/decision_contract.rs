@@ -125,11 +125,18 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
         note: "`guardrail` names the one that blocked and is absent on an allow, because no \
                single guardrail owns a decision they all passed. `flagged_count` carries the \
                near-miss signal on both, which is what makes an allow record worth storing. \
-               `guardrail_spans` (WOR-2492) is the deciding guardrail's bounded detection \
-               positions -- entity type, byte offset, byte length -- over the scanned \
-               pre-redaction text; never the matched value, and only the `pii` guardrail \
-               populates it today. Capped at 32 spans per record; `guardrail_spans_dropped` \
-               is the count past the cap.",
+               `guardrail_spans` (WOR-2492) is the blocking guardrail instance's bounded \
+               detection positions -- entity type, byte offset, byte length -- over the \
+               scanned pre-redaction text; never the matched value, and only the `pii` \
+               guardrail populates it today. On this event the offsets index the guardrail \
+               pipeline's own message-text extraction, not the raw request body: the text \
+               content parts of the parsed `messages`, joined with newlines, which excludes \
+               non-text multimodal parts, unparseable message elements, the top-level \
+               `system` field, and tool-call arguments. Non-chat surfaces scan the surface's \
+               input text field (`prompt`, `input`, or `query`) instead. Neither record \
+               carries the scanned text, so an offset locates a match only within that \
+               derived text. Capped at 32 spans per record; `guardrail_spans_dropped` is the \
+               count past the cap.",
     },
     FieldContract {
         event: DecisionEvent::AiGuardrailOutput,
@@ -139,9 +146,11 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
             "guardrail_spans",
             "guardrail_spans_dropped",
         ],
-        note: "As the input event. Not published for a non-2xx response, because the \
-               evaluator returns before inspecting one and a record there would claim an \
-               allow no guardrail issued.",
+        note: "As the input event, with one coordinate-space difference: here the \
+               `guardrail_spans` offsets index the raw response body bytes the consumer \
+               holds (a body that is not valid UTF-8 yields no spans). Not published for a \
+               non-2xx response, because the evaluator returns before inspecting one and a \
+               record there would claim an allow no guardrail issued.",
     },
     FieldContract {
         event: DecisionEvent::AiToolCall,

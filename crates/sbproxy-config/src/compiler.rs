@@ -133,26 +133,36 @@ const ACCESS_LOG_BARE_VARS: &[&str] = &[
 ];
 
 /// True when a `${...}` placeholder's name (the part before an optional
-/// `:-` default) can name an environment variable at all.
+/// `:-` default) is an environment reference this pre-parse pass owns.
 ///
-/// A POSIX environment variable name never contains a dot, while every
-/// dotted `${...}` form belongs to a later consumer: the MCP local-tool
-/// interpolation vocabulary (`${args.id}`, `${steps.fetch.body.x}`; see
-/// docs/mcp-compose.md) and template literals inside embedded JS
-/// scripts. A dotted placeholder is therefore never an env reference:
-/// the substitution pass leaves it byte-for-byte literal even when a
-/// same-named process variable exists, and the hazard scan does not
-/// report it as unresolved (reporting it would tell the operator to
-/// export a variable that would break the tool if they did, and the
-/// config-authority subscriber would refuse the whole bundle over it).
+/// The one carve-out is the MCP local-tool interpolation vocabulary
+/// (docs/mcp-compose.md), whose engine defines exactly two roots:
+/// `args.` (the tool call's JSON-RPC arguments) and `steps.` (prior
+/// step outputs). Those placeholders belong to the executor at call
+/// time, so the substitution pass leaves them byte-for-byte literal
+/// even when a same-named process variable exists, and the hazard scan
+/// does not report them as unresolved (reporting one would tell the
+/// operator to export a variable that would break the tool if they
+/// did, and the config-authority subscriber would refuse the whole
+/// bundle over it).
+///
+/// Every other name, dotted or not, gets the full env treatment:
+/// attempted resolution, `:-` default support, and the
+/// unresolved-reference report that the config-authority path upgrades
+/// to a refusal. A broader "any name containing a dot" carve-out
+/// shipped briefly and silently disabled that fail-closed gate for
+/// forms like `${secret.OPENAI_KEY}` while also breaking
+/// `${dotted.name:-default}` resolution; the allowlist keeps the
+/// detector exactly as wide as the enforcer.
 /// The bare access-log names in [`ACCESS_LOG_BARE_VARS`] are excluded
-/// by exact match for the same reason.
+/// by exact match for the same reason: they are per-request vocabulary
+/// resolved by `custom_log.rs`, never env references.
 fn placeholder_is_env_reference(var_name: &str) -> bool {
     if ACCESS_LOG_BARE_VARS.contains(&var_name) {
         return false;
     }
     let name = var_name.split_once(":-").map_or(var_name, |(name, _)| name);
-    !name.contains('.')
+    !(name.starts_with("args.") || name.starts_with("steps."))
 }
 
 /// Interpolate `${VAR_NAME}` patterns in a string with environment variables.
@@ -163,12 +173,29 @@ fn placeholder_is_env_reference(var_name: &str) -> bool {
 /// output), which `scan_yaml_hazards` reports after parsing. A
 /// placeholder whose name is not a possible environment variable name
 /// (see [`placeholder_is_env_reference`]) is not touched at all.
+///
+/// `$$` escapes: `$${VAR}` is never substituted (docs/mcp-compose.md
+/// documents it as rendering the literal text `${VAR}`). This pass
+/// consumes `$` in pairs, greedily from the left, so an odd run leaves
+/// a live placeholder (`$$${VAR}` is one escaped pair, then a real
+/// substitution) -- the same rule the MCP engine's scanner applies. The
+/// pass strips nothing: the `$$` bytes stay in the output for the
+/// runtime consumer that owns the unescape.
 fn interpolate_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '$' {
+            if chars.peek() == Some(&'$') {
+                // `$$` escape: consume the pair so a `${` right after
+                // it never opens a placeholder here, but emit the
+                // bytes untouched -- the downstream consumer (the MCP
+                // local-tool engine) owns the unescape.
+                chars.next();
+                result.push_str("$$");
+                continue;
+            }
             if chars.peek() == Some(&'{') {
                 chars.next(); // consume '{'
                 let mut var_name = String::new();
@@ -181,9 +208,9 @@ fn interpolate_env_vars(input: &str) -> String {
                     var_name.push(c);
                 }
                 if found_close && !var_name.is_empty() {
-                    // Not an env reference (a dotted runtime-vocabulary
-                    // path): keep the placeholder byte-for-byte, even
-                    // when a colliding process variable exists.
+                    // Not an env reference (an MCP `args.`/`steps.`
+                    // runtime path): keep the placeholder byte-for-byte,
+                    // even when a colliding process variable exists.
                     if !placeholder_is_env_reference(&var_name) {
                         result.push_str("${");
                         result.push_str(&var_name);
@@ -249,11 +276,26 @@ fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
             let tail = &rest[start..];
             match tail.find('}') {
                 Some(end) => {
-                    // Only a placeholder that could name an environment
-                    // variable is an unresolved env reference; a dotted
-                    // runtime-vocabulary path (`${args.id}`) is left
-                    // for its own consumer and never reported here.
-                    if placeholder_is_env_reference(&tail[2..end]) {
+                    // `$${...}` is the documented escape: the
+                    // placeholder never opens, so it is not an
+                    // unresolved reference. An odd-length `$` run
+                    // before the placeholder's own `$` escapes it;
+                    // an even run leaves it live (`$$${VAR}` is one
+                    // escaped pair, then a real reference) -- the
+                    // same pair-parity rule `interpolate_env_vars`
+                    // and the MCP engine's scanner apply.
+                    let escaping_dollars = rest[..start]
+                        .chars()
+                        .rev()
+                        .take_while(|&c| c == '$')
+                        .count();
+                    let escaped = escaping_dollars % 2 == 1;
+                    // A placeholder in the MCP local-tool vocabulary
+                    // (`${args.id}`, `${steps.x.y}`) is left for its
+                    // own consumer and never reported here; every
+                    // other unescaped name is an unresolved env
+                    // reference.
+                    if !escaped && placeholder_is_env_reference(&tail[2..end]) {
                         out.push(&tail[..=end]);
                     }
                     rest = &tail[end + 1..];
@@ -4649,13 +4691,12 @@ flags:
         );
     }
 
-    // WOR-2489 review: a dotted `${...}` placeholder is runtime
+    // WOR-2489: an `args.`/`steps.` placeholder is MCP runtime
     // interpolation vocabulary (`${args.id}`, `${steps.fetch.body.x}`),
-    // never an env reference -- no POSIX environment variable name
-    // contains a dot. It must survive the pre-parse substitution
+    // not an env reference. It must survive the pre-parse substitution
     // byte-for-byte even when a same-named process variable exists.
     #[test]
-    fn dotted_placeholder_survives_interpolation_even_with_a_colliding_env_var() {
+    fn mcp_vocabulary_placeholder_survives_interpolation_even_with_a_colliding_env_var() {
         let _env = crate::test_env::EnvVarGuard::set(&[
             ("args.user_id", Some("spliced-from-env-would-be-a-bug")),
             ("SBPROXY_TEST_SET_XYZ", Some("live")),
@@ -4674,14 +4715,14 @@ flags:
         );
     }
 
-    // WOR-2489 review: the hazard scan must not report a dotted
-    // placeholder as an unresolved env reference. Before this fix, a
-    // `type: local` MCP tool carrying `${args.user_id}` in its
+    // WOR-2489: the hazard scan must not report an `args.`/`steps.`
+    // placeholder as an unresolved env reference. Before the carve-out,
+    // a `type: local` MCP tool carrying `${args.user_id}` in its
     // `http.url` produced a misleading boot warning, and the
     // config-authority subscriber refused any bundle carrying it
     // fleet-wide (config_subscriber.rs's hard-refusal path).
     #[test]
-    fn dotted_placeholders_are_not_reported_as_unresolved_env_references() {
+    fn mcp_vocabulary_placeholders_are_not_reported_as_unresolved_env_references() {
         let yaml = r#"
 proxy:
   http_bind_port: 8080
@@ -4707,7 +4748,7 @@ origins:
         assert_eq!(
             unresolved_env_references(yaml),
             Vec::<String>::new(),
-            "dotted placeholders are runtime vocabulary, not env references"
+            "args./steps. placeholders are MCP runtime vocabulary, not env references"
         );
         // The config also compiles (the executor, not the env layer,
         // owns those placeholders from here on).
@@ -4777,6 +4818,117 @@ proxy:
         // default syntax, so this form was never access-log vocabulary
         // and its v1.12 shell-default treatment is preserved.
         assert_eq!(interpolate_env_vars("${method:-GET}"), "GET");
+
+    // v1.13.0 phase-2 review: the WOR-2489 carve-out must be scoped to
+    // the MCP local-tool vocabulary (an `args.` or `steps.` root), not
+    // to "any name containing a dot". A dotted name outside that
+    // vocabulary is a plain env reference: resolution is attempted,
+    // `:-` defaults work, and a miss stays literal for the hazard scan.
+    #[test]
+    fn non_mcp_dotted_placeholder_gets_env_resolution_and_defaults() {
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("dotted.name", None),
+            ("otel.endpoint", Some("https://collector.internal:4317")),
+        ]);
+        // `${dotted.name:-default}` keeps its v1.12 shell semantics.
+        assert_eq!(interpolate_env_vars("${dotted.name:-default}"), "default");
+        // A set dotted variable resolves; the pass attempts the lookup
+        // rather than skipping the placeholder.
+        assert_eq!(
+            interpolate_env_vars("${otel.endpoint}"),
+            "https://collector.internal:4317"
+        );
+        // Unset with no default: literal, so the hazard scan reports it.
+        assert_eq!(interpolate_env_vars("${dotted.name}"), "${dotted.name}");
+    }
+
+    // v1.13.0 phase-2 review: a dotted name outside the MCP vocabulary
+    // must be REPORTED unresolved, because `unresolved_env_references`
+    // is the predicate the config-authority subscriber uses to refuse a
+    // bundle. With the global dotted carve-out, `${secret.OPENAI_KEY}`
+    // applied fleet-wide as literal text with nothing logged.
+    #[test]
+    fn non_mcp_dotted_placeholder_is_reported_as_unresolved() {
+        let _env = crate::test_env::EnvVarGuard::set(&[("secret.OPENAI_KEY", None)]);
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "${secret.OPENAI_KEY}"
+"#;
+        let refs = unresolved_env_references(yaml);
+        assert_eq!(refs.len(), 1, "got: {refs:?}");
+        assert!(refs[0].contains("${secret.OPENAI_KEY}"), "got: {refs:?}");
+    }
+
+    // docs/mcp-compose.md documents `$$` as the escape that renders a
+    // literal `${...}` at MCP call time. The pre-parse env layer must
+    // honor it: before this fix, `$${OPENAI_API_KEY}` had the live
+    // value spliced into the config text at compile time -- the exact
+    // leak the escape exists to prevent. The env layer strips nothing;
+    // the MCP engine (mcp_interpolate.rs) owns the `$$` unescape.
+    #[test]
+    fn escaped_placeholder_survives_env_interpolation() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "OPENAI_API_KEY",
+            Some("sk-live-splice-would-leak"),
+        )]);
+        // `$${...}`: escaped. Byte-for-byte untouched, value never read.
+        assert_eq!(
+            interpolate_env_vars("$${OPENAI_API_KEY}"),
+            "$${OPENAI_API_KEY}"
+        );
+        // `$$$...`: one escaped `$` pair, then a LIVE placeholder --
+        // the same greedy pair-parity rule the MCP engine's scanner
+        // applies.
+        assert_eq!(
+            interpolate_env_vars("$$${OPENAI_API_KEY}"),
+            "$$sk-live-splice-would-leak"
+        );
+        // `$$` not followed by `{` stays what it always was.
+        assert_eq!(interpolate_env_vars("cost: $$5"), "cost: $$5");
+    }
+
+    // The escape must also silence the hazard scan (an escaped
+    // placeholder never opens, so there is nothing unresolved), and the
+    // untouched bytes must reach the compiled config for the runtime
+    // consumer to unescape.
+    #[test]
+    fn escaped_placeholder_reaches_the_compiled_config_and_is_not_reported() {
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("OPENAI_API_KEY", Some("sk-live-splice-would-leak")),
+            ("SBPROXY_TEST_UNSET_ESCAPED", None),
+        ]);
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "key=$${OPENAI_API_KEY} other=$${SBPROXY_TEST_UNSET_ESCAPED}"
+"#;
+        // Neither the set-variable nor the unset-variable escape is an
+        // unresolved reference, so a config authority does not refuse
+        // the bundle over the escape.
+        assert_eq!(
+            unresolved_env_references(yaml),
+            Vec::<String>::new(),
+            "escaped placeholders are not env references"
+        );
+        let compiled = compile_config(yaml).expect("escaped placeholders compile");
+        assert_eq!(
+            compiled.origins[0].action_config["body"],
+            serde_json::json!("key=$${OPENAI_API_KEY} other=$${SBPROXY_TEST_UNSET_ESCAPED}"),
+            "the escape bytes reach the compiled config untouched"
+        );
     }
 
     // WOR-1817: custom YAML tags are stripped by the parser, so

@@ -33,7 +33,7 @@
 use anyhow::Result;
 use regex::Regex;
 use sbproxy_security::pii::PiiRule;
-use sbproxy_security::span::{cap_spans, DetectionSpan};
+use sbproxy_security::span::{cap_spans, DetectionSpan, MAX_DETECTION_SPANS};
 use serde::Deserialize;
 
 /// Maximum bytes of a buffered request body scanned by
@@ -89,11 +89,25 @@ pub enum DlpScanResult {
         /// Detector names that matched, deduplicated, in match order.
         detectors: Vec<String>,
         /// Bounded detection spans (WOR-2492 item 6): entity type, byte
-        /// offset, and byte length of every match in the scanned URI or
-        /// header text. Never the matched value -- a span is a
-        /// position, not the regulated data it flagged. Capped at
-        /// [`sbproxy_security::span::MAX_DETECTION_SPANS`]; anything
-        /// past the cap is counted in `spans_dropped`, not carried.
+        /// offset, and byte length of every match. Never the matched
+        /// value -- a span is a position, not the regulated data it
+        /// flagged.
+        ///
+        /// Matches come from up to three segments, each with its own
+        /// coordinate space: the request URI (offsets into the
+        /// path + raw query string), a request header (offsets into
+        /// the individual header value that matched), and the request
+        /// body (offsets into the capped, lossily decoded body text;
+        /// see [`DlpPolicy::scan_body`]). A span does not name its
+        /// segment, so treat an offset as evidence within one of
+        /// those coordinate spaces, not a position in the raw
+        /// request.
+        ///
+        /// Capped at [`sbproxy_security::span::MAX_DETECTION_SPANS`]
+        /// across the whole scan, filled round-robin across the
+        /// segments so no one segment can evict the others' spans
+        /// (see `fair_merge_spans`); anything past the cap is counted
+        /// in `spans_dropped`, not carried.
         spans: Vec<DetectionSpan>,
         /// Count of matches past the span cap.
         spans_dropped: usize,
@@ -240,18 +254,21 @@ impl DlpPolicy {
         }
     }
 
-    /// Scan the request URI + headers and return any matching detectors.
-    ///
-    /// Detection spans (WOR-2492 item 6) are positions in the scanned
-    /// URI or header value, never the matched text, and are bounded at
-    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`] across the whole
-    /// scan so a pathologically long URI or header set cannot bloat a
-    /// record.
-    pub fn scan(&self, uri: &str, headers: &http::HeaderMap) -> DlpScanResult {
+    /// Scan the request URI and headers into per-segment span lists,
+    /// uncapped. Returns the deduplicated detector names plus the URI
+    /// segment's spans and the header segment's spans separately, so
+    /// the callers can apply one fair (round-robin) cap across every
+    /// segment they scanned.
+    fn scan_uri_headers_raw(
+        &self,
+        uri: &str,
+        headers: &http::HeaderMap,
+    ) -> (Vec<String>, Vec<DetectionSpan>, Vec<DetectionSpan>) {
         let mut hits: Vec<String> = Vec::new();
-        let mut found_spans: Vec<DetectionSpan> = Vec::new();
+        let mut uri_spans: Vec<DetectionSpan> = Vec::new();
+        let mut header_spans: Vec<DetectionSpan> = Vec::new();
         // URI: path + raw query.
-        self.scan_text_into(uri, &mut hits, &mut found_spans);
+        self.scan_text_into(uri, &mut hits, &mut uri_spans);
         // Headers: skip auth-class headers from being self-flagged.
         // They typically carry tokens by design and are noise here.
         for (name, value) in headers.iter() {
@@ -260,18 +277,49 @@ impl DlpPolicy {
                 continue;
             }
             let Ok(s) = value.to_str() else { continue };
-            self.scan_text_into(s, &mut hits, &mut found_spans);
+            self.scan_text_into(s, &mut hits, &mut header_spans);
         }
+        (hits, uri_spans, header_spans)
+    }
+
+    /// Scan the request URI + headers and return any matching detectors.
+    ///
+    /// Detection spans (WOR-2492 item 6) are positions in the scanned
+    /// URI or the individual header value that matched, never the
+    /// matched text, and are bounded at
+    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`] across the whole
+    /// scan so a pathologically long URI or header set cannot bloat a
+    /// record. The cap is filled fairly, URI and header matches
+    /// interleaved round-robin, so neither segment can crowd the other
+    /// out of it.
+    pub fn scan(&self, uri: &str, headers: &http::HeaderMap) -> DlpScanResult {
+        let (hits, uri_spans, header_spans) = self.scan_uri_headers_raw(uri, headers);
         if hits.is_empty() {
             DlpScanResult::Clean
         } else {
-            let (spans, spans_dropped) = cap_spans(found_spans);
+            let (spans, spans_dropped) = fair_merge_spans([uri_spans, header_spans]);
             DlpScanResult::Hit {
                 detectors: hits,
                 spans,
                 spans_dropped,
             }
         }
+    }
+
+    /// Scan the buffered body into an uncapped span list. Shared by
+    /// [`Self::scan_body`] (which caps it alone) and
+    /// [`Self::scan_request`] (which fair-merges it with the URI and
+    /// header segments before capping).
+    fn scan_body_raw(&self, body: &[u8]) -> (Vec<String>, Vec<DetectionSpan>) {
+        if !self.scan_body || body.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let decoded = String::from_utf8_lossy(body);
+        let capped = sbproxy_util::truncate_utf8(&decoded, self.body_max_bytes);
+        let mut hits: Vec<String> = Vec::new();
+        let mut found_spans: Vec<DetectionSpan> = Vec::new();
+        self.scan_text_into(capped, &mut hits, &mut found_spans);
+        (hits, found_spans)
     }
 
     /// Scan a buffered request body and return any matching detectors.
@@ -287,14 +335,7 @@ impl DlpPolicy {
     /// Detection span offsets are byte positions relative to the
     /// capped, lossily decoded body text, not the raw byte stream.
     pub fn scan_body(&self, body: &[u8]) -> DlpScanResult {
-        if !self.scan_body || body.is_empty() {
-            return DlpScanResult::Clean;
-        }
-        let decoded = String::from_utf8_lossy(body);
-        let capped = sbproxy_util::truncate_utf8(&decoded, self.body_max_bytes);
-        let mut hits: Vec<String> = Vec::new();
-        let mut found_spans: Vec<DetectionSpan> = Vec::new();
-        self.scan_text_into(capped, &mut hits, &mut found_spans);
+        let (hits, found_spans) = self.scan_body_raw(body);
         if hits.is_empty() {
             DlpScanResult::Clean
         } else {
@@ -315,46 +356,75 @@ impl DlpPolicy {
     /// `PolicyEnforcer::enforce` signature (`req.body()`) and simply
     /// hands it through.
     ///
-    /// Detection spans from the two scans are merged in scan order
-    /// (URI + headers first, body second) and [`cap_spans`] runs once
-    /// over the merged list, so `spans_dropped` is the total dropped
-    /// across every scanned segment. A body span's offset stays
-    /// relative to the capped decoded body, exactly as [`DlpPolicy::scan_body`]
-    /// reported it.
+    /// Detection spans from the three segments are merged fairly:
+    /// one span from the URI, one from the headers, one from the
+    /// body, round-robin, until the shared
+    /// [`sbproxy_security::span::MAX_DETECTION_SPANS`] cap is full
+    /// (see `fair_merge_spans` for why encounter order was not good
+    /// enough). `spans_dropped` is the total dropped across every
+    /// scanned segment. Each span's offset stays relative to its own
+    /// segment: the URI text, the matching header's value, or the
+    /// capped decoded body exactly as [`DlpPolicy::scan_body`]
+    /// reports it.
     pub fn scan_request(&self, uri: &str, headers: &http::HeaderMap, body: &[u8]) -> DlpScanResult {
-        let (mut hits, mut found_spans, mut dropped) = match self.scan(uri, headers) {
-            DlpScanResult::Hit {
-                detectors,
-                spans,
-                spans_dropped,
-            } => (detectors, spans, spans_dropped),
-            DlpScanResult::Clean => (Vec::new(), Vec::new(), 0),
-        };
-        if let DlpScanResult::Hit {
-            detectors,
-            spans,
-            spans_dropped,
-        } = self.scan_body(body)
-        {
-            for d in detectors {
-                if !hits.contains(&d) {
-                    hits.push(d);
-                }
+        let (mut hits, uri_spans, header_spans) = self.scan_uri_headers_raw(uri, headers);
+        let (body_hits, body_spans) = self.scan_body_raw(body);
+        for d in body_hits {
+            if !hits.contains(&d) {
+                hits.push(d);
             }
-            found_spans.extend(spans);
-            dropped += spans_dropped;
         }
         if hits.is_empty() {
             DlpScanResult::Clean
         } else {
-            let (spans, merged_dropped) = cap_spans(found_spans);
+            let (spans, spans_dropped) = fair_merge_spans([uri_spans, header_spans, body_spans]);
             DlpScanResult::Hit {
                 detectors: hits,
                 spans,
-                spans_dropped: dropped + merged_dropped,
+                spans_dropped,
             }
         }
     }
+}
+
+/// Merge per-segment span lists into one capped list, fairly.
+///
+/// Sources interleave round-robin in the order given (URI, header,
+/// body for [`DlpPolicy::scan_request`]): one span from each source
+/// in turn, skipping exhausted sources, until
+/// [`MAX_DETECTION_SPANS`] spans are kept or every source runs out.
+/// Fairness is the point (v1.13 phase-2 review): the previous
+/// first-N-in-encounter-order cap scanned the URI and headers first,
+/// so a client could stuff [`MAX_DETECTION_SPANS`] decoy matches into
+/// the query string and deterministically evict every body span from
+/// the record, and the body is where the shapes this policy targets
+/// actually live (see the `scan_body` field docs). Round-robin
+/// guarantees every segment a share of the cap, so no segment a
+/// client controls can starve another. The dropped count stays total
+/// minus kept.
+fn fair_merge_spans<const N: usize>(
+    sources: [Vec<DetectionSpan>; N],
+) -> (Vec<DetectionSpan>, usize) {
+    let total: usize = sources.iter().map(Vec::len).sum();
+    let mut kept: Vec<DetectionSpan> = Vec::with_capacity(total.min(MAX_DETECTION_SPANS));
+    let mut iters = sources.map(Vec::into_iter);
+    while kept.len() < MAX_DETECTION_SPANS {
+        let mut any = false;
+        for iter in &mut iters {
+            if let Some(span) = iter.next() {
+                kept.push(span);
+                any = true;
+                if kept.len() == MAX_DETECTION_SPANS {
+                    break;
+                }
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+    let dropped = total - kept.len();
+    (kept, dropped)
 }
 
 #[cfg(test)]
@@ -638,8 +708,23 @@ mod tests {
             other => panic!("expected aws_access hit in body, got {:?}", other),
         }
         match policy.scan_request(uri, &headers, body) {
-            DlpScanResult::Hit { detectors, .. } => {
+            DlpScanResult::Hit {
+                detectors,
+                spans,
+                spans_dropped,
+            } => {
                 assert!(detectors.contains(&"aws_access".to_string()));
+                // The body's span must survive the merge into the
+                // request-level result (the #1125/#1126 hand-merge
+                // seam): one span, from the body's coordinate space.
+                assert_eq!(spans_dropped, 0);
+                assert_eq!(spans.len(), 1, "the body match's span: {spans:?}");
+                assert_eq!(spans[0].entity_type, "aws_access");
+                let body_text = std::str::from_utf8(body).unwrap();
+                assert_eq!(
+                    &body_text[spans[0].offset..spans[0].offset + spans[0].len],
+                    "AKIAIOSFODNN7EXAMPLE"
+                );
             }
             other => panic!(
                 "expected scan_request to union in the body hit, got {:?}",
@@ -665,6 +750,125 @@ mod tests {
                 assert_eq!(detectors.iter().filter(|d| *d == "aws_access").count(), 1);
             }
             other => panic!("expected a unioned hit, got {:?}", other),
+        }
+    }
+
+    /// Red-first (v1.13 phase-2 review): a client controls the query
+    /// string, so 32 decoy matches there must not be able to evict the
+    /// body's span from the capped merge. The merge is fair across
+    /// sources (URI, header, body, round-robin), so at least one body
+    /// span survives no matter how many decoys precede it.
+    #[test]
+    fn a_query_string_of_decoys_cannot_evict_the_body_span() {
+        let policy = DlpPolicy::from_config(serde_json::json!({
+            "detectors": ["aws_access", "us_ssn"],
+        }))
+        .unwrap();
+        let mut uri = String::from("/x?");
+        for i in 0..32 {
+            // Zero-padded to exactly 16 digits so every key matches
+            // `\bAKIA[0-9A-Z]{16}\b` regardless of `i`'s width.
+            uri.push_str(&format!("k{i}=AKIA{i:016}&"));
+        }
+        let body = br#"{"ssn":"123-45-6789"}"#;
+        match policy.scan_request(&uri, &http::HeaderMap::new(), body) {
+            DlpScanResult::Hit {
+                spans,
+                spans_dropped,
+                ..
+            } => {
+                assert!(
+                    spans.iter().any(|s| s.entity_type == "us_ssn"),
+                    "32 query-string decoys must not evict the body span; kept {spans:?}"
+                );
+                assert_eq!(spans.len(), 32, "the cap itself is unchanged");
+                assert_eq!(spans_dropped, 1, "dropped stays total minus kept");
+            }
+            other => panic!("expected a hit, got {:?}", other),
+        }
+    }
+
+    /// The `scan_request` span-threading seam (v1.13 phase-2 review):
+    /// one result carrying spans from both the URI and the body, each
+    /// offset relative to its own source text. Deleting the body-span
+    /// merge inside `scan_request` turns this red.
+    #[test]
+    fn scan_request_reports_uri_and_body_spans_with_per_source_offsets() {
+        let policy = DlpPolicy::from_config(serde_json::json!({
+            "detectors": ["aws_access", "us_ssn"],
+        }))
+        .unwrap();
+        let uri = "/build?key=AKIAIOSFODNN7EXAMPLE";
+        let body = br#"{"ssn":"123-45-6789"}"#;
+        match policy.scan_request(uri, &http::HeaderMap::new(), body) {
+            DlpScanResult::Hit {
+                spans,
+                spans_dropped,
+                ..
+            } => {
+                assert_eq!(spans_dropped, 0);
+                assert_eq!(spans.len(), 2, "one URI span plus one body span: {spans:?}");
+                let aws = spans
+                    .iter()
+                    .find(|s| s.entity_type == "aws_access")
+                    .expect("URI span present");
+                assert_eq!(
+                    &uri[aws.offset..aws.offset + aws.len],
+                    "AKIAIOSFODNN7EXAMPLE",
+                    "URI span offsets index the URI text"
+                );
+                let ssn = spans
+                    .iter()
+                    .find(|s| s.entity_type == "us_ssn")
+                    .expect("body span present");
+                let body_text = std::str::from_utf8(body).unwrap();
+                assert_eq!(
+                    &body_text[ssn.offset..ssn.offset + ssn.len],
+                    "123-45-6789",
+                    "body span offsets index the capped decoded body, not the URI"
+                );
+            }
+            other => panic!("expected a hit, got {:?}", other),
+        }
+    }
+
+    /// The fair merge interleaves sources round-robin: URI, header,
+    /// body, repeat. Three disjoint detectors, two matches each, make
+    /// the order observable.
+    #[test]
+    fn merged_spans_interleave_uri_header_and_body_round_robin() {
+        let policy = DlpPolicy::from_config(serde_json::json!({
+            "detectors": ["aws_access", "slack_token", "us_ssn"],
+        }))
+        .unwrap();
+        let uri = "/x?a=AKIA0000000000000001&b=AKIA0000000000000002";
+        let h = headers_with(
+            "x-debug",
+            "xoxb-1234567890-first-token and xoxb-1234567890-second-token",
+        );
+        let body = b"ssns 123-45-6789 and 987-65-4321";
+        match policy.scan_request(uri, &h, body) {
+            DlpScanResult::Hit {
+                spans,
+                spans_dropped,
+                ..
+            } => {
+                assert_eq!(spans_dropped, 0);
+                let order: Vec<&str> = spans.iter().map(|s| s.entity_type.as_str()).collect();
+                assert_eq!(
+                    order,
+                    vec![
+                        "aws_access",
+                        "slack_token",
+                        "us_ssn",
+                        "aws_access",
+                        "slack_token",
+                        "us_ssn"
+                    ],
+                    "spans must interleave URI, header, body, round-robin"
+                );
+            }
+            other => panic!("expected a hit, got {:?}", other),
         }
     }
 

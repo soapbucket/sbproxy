@@ -411,12 +411,23 @@ impl GuardrailPipeline {
     /// `cp_conflicting_directive` rule; every other guardrail uses
     /// the flat text view of the concatenated message bodies.
     pub fn check_input(&self, messages: &[Message]) -> Option<GuardrailBlock> {
+        self.check_input_indexed(messages).map(|(_, block)| block)
+    }
+
+    /// [`Self::check_input`], plus the blocking guardrail's index into
+    /// [`Self::input`]. The index is what lets a decision-record site
+    /// attribute positional detail (detection spans) to the exact
+    /// instance whose verdict it records: two `pii` entries with
+    /// different pattern sets are a legal pipeline, both carry the
+    /// block name `"pii"`, so the name alone cannot say which one
+    /// blocked.
+    pub fn check_input_indexed(&self, messages: &[Message]) -> Option<(usize, GuardrailBlock)> {
         // WOR-1692: extract the prompt text once and hand it to every
         // text guard, instead of each guard re-joining the whole prompt.
         let content = extract_text_from_messages(messages);
-        for guard in &self.input {
+        for (index, guard) in self.input.iter().enumerate() {
             if let Some(block) = guard.check_with_text(&content, messages) {
-                return Some(block);
+                return Some((index, block));
             }
         }
         None
@@ -441,9 +452,17 @@ impl GuardrailPipeline {
     /// surface-specific and lives in
     /// [`crate::handler::extract_input_text`].
     pub fn check_input_text(&self, content: &str) -> Option<GuardrailBlock> {
-        for guard in &self.input {
+        self.check_input_text_indexed(content)
+            .map(|(_, block)| block)
+    }
+
+    /// [`Self::check_input_text`], plus the blocking guardrail's index
+    /// into [`Self::input`]. See [`Self::check_input_indexed`] for why
+    /// the index exists.
+    pub fn check_input_text_indexed(&self, content: &str) -> Option<(usize, GuardrailBlock)> {
+        for (index, guard) in self.input.iter().enumerate() {
             if let Some(block) = guard.check(content) {
-                return Some(block);
+                return Some((index, block));
             }
         }
         None
@@ -483,8 +502,15 @@ impl GuardrailPipeline {
     /// `assistant_response_text`; every other guard inspects the raw
     /// body.
     pub fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
+        self.check_output_indexed(content).map(|(_, block)| block)
+    }
+
+    /// [`Self::check_output`], plus the blocking guardrail's index into
+    /// [`Self::output`]. See [`Self::check_input_indexed`] for why the
+    /// index exists.
+    fn check_output_indexed(&self, content: &str) -> Option<(usize, GuardrailBlock)> {
         let canonical_subject = assistant_response_text(content);
-        for guard in &self.output {
+        for (index, guard) in self.output.iter().enumerate() {
             let block = match guard {
                 Guardrail::SafetyClassifier(classifier) => match canonical_subject.as_deref() {
                     Some(subject) => classifier.check_output(subject),
@@ -517,7 +543,7 @@ impl GuardrailPipeline {
                 _ => guard.check(content),
             };
             if let Some(block) = block {
-                return Some(block);
+                return Some((index, block));
             }
         }
         None
@@ -526,27 +552,45 @@ impl GuardrailPipeline {
     /// Check a buffered output body without treating invalid UTF-8 as a
     /// harmless non-classifier response.
     pub fn check_output_bytes(&self, content: &[u8]) -> Option<GuardrailBlock> {
+        self.check_output_bytes_indexed(content)
+            .map(|(_, block)| block)
+    }
+
+    /// [`Self::check_output_bytes`], plus the blocking guardrail's
+    /// index into [`Self::output`]. See [`Self::check_input_indexed`]
+    /// for why the index exists.
+    pub fn check_output_bytes_indexed(&self, content: &[u8]) -> Option<(usize, GuardrailBlock)> {
         match std::str::from_utf8(content) {
-            Ok(content) => self.check_output(content),
-            Err(_) => self.output.iter().find_map(|guard| match guard {
-                Guardrail::SafetyClassifier(classifier) => Some(GuardrailBlock {
-                    name: classifier.name().to_string(),
-                    reason: format!(
-                        "{} classifier could not decode a canonical assistant response; failed closed",
-                        classifier.name()
-                    ),
+            Ok(content) => self.check_output_indexed(content),
+            Err(_) => self
+                .output
+                .iter()
+                .enumerate()
+                .find_map(|(index, guard)| match guard {
+                    Guardrail::SafetyClassifier(classifier) => Some((
+                        index,
+                        GuardrailBlock {
+                            name: classifier.name().to_string(),
+                            reason: format!(
+                                "{} classifier could not decode a canonical assistant response; failed closed",
+                                classifier.name()
+                            ),
+                        },
+                    )),
+                    // WOR-2174: invalid UTF-8 can never hold the valid
+                    // JSON a schema guard expects; fail closed rather
+                    // than treating it as a harmless non-match.
+                    Guardrail::Schema(_) => Some((
+                        index,
+                        GuardrailBlock {
+                            name: "schema".to_string(),
+                            reason: "schema guardrail could not decode a canonical assistant \
+                                     response; failed closed"
+                                .to_string(),
+                        },
+                    )),
+                    _ => None,
                 }),
-                // WOR-2174: invalid UTF-8 can never hold the valid
-                // JSON a schema guard expects; fail closed rather
-                // than treating it as a harmless non-match.
-                Guardrail::Schema(_) => Some(GuardrailBlock {
-                    name: "schema".to_string(),
-                    reason: "schema guardrail could not decode a canonical assistant response; \
-                             failed closed"
-                        .to_string(),
-                }),
-                _ => None,
-            }),
         }
     }
 }
@@ -1570,6 +1614,73 @@ mod tests {
         assert_eq!(pipeline.output.len(), 1);
         assert!(pipeline.has_input());
         assert!(pipeline.has_output());
+    }
+
+    /// Two `pii` entries with disjoint pattern sets are a legal
+    /// pipeline, and both blocks are named `"pii"`. The indexed check
+    /// must report the instance that actually blocked (the second:
+    /// the first logs and allows), because a decision-record site
+    /// attributes detection spans by this index.
+    #[test]
+    fn check_input_indexed_reports_the_blocking_instance_not_the_first() {
+        let config = GuardrailsConfig {
+            input: vec![
+                serde_json::json!({"type": "pii", "patterns": ["ssn"], "action": "log"}),
+                serde_json::json!({"type": "pii", "patterns": ["email"], "action": "block"}),
+            ],
+            output: vec![],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let pipeline = compile_pipeline(&config).unwrap();
+        let messages = vec![make_msg("my ssn is 123-45-6789, reach me at a@b.co")];
+        let (index, block) = pipeline
+            .check_input_indexed(&messages)
+            .expect("the second pii entry blocks on the email");
+        assert_eq!(index, 1, "the blocking instance is the second entry");
+        assert_eq!(block.name, "pii");
+        assert!(block.reason.contains("email"), "reason: {}", block.reason);
+    }
+
+    /// Same property on the raw-text path non-chat surfaces use.
+    #[test]
+    fn check_input_text_indexed_reports_the_blocking_instance() {
+        let config = GuardrailsConfig {
+            input: vec![
+                serde_json::json!({"type": "pii", "patterns": ["ssn"], "action": "log"}),
+                serde_json::json!({"type": "pii", "patterns": ["email"], "action": "block"}),
+            ],
+            output: vec![],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let pipeline = compile_pipeline(&config).unwrap();
+        let (index, block) = pipeline
+            .check_input_text_indexed("write to a@b.co")
+            .expect("the second pii entry blocks on the email");
+        assert_eq!(index, 1);
+        assert_eq!(block.name, "pii");
+    }
+
+    /// The output-side indexed check reports the blocker's index in
+    /// `output`, which the output decision funnel attributes spans by.
+    #[test]
+    fn check_output_bytes_indexed_reports_the_blocking_instance() {
+        let config = GuardrailsConfig {
+            input: vec![],
+            output: vec![
+                serde_json::json!({"type": "pii", "patterns": ["ssn"], "action": "log"}),
+                serde_json::json!({"type": "pii", "patterns": ["email"], "action": "block"}),
+            ],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let pipeline = compile_pipeline(&config).unwrap();
+        let (index, block) = pipeline
+            .check_output_bytes_indexed(b"reply to a@b.co")
+            .expect("the second pii entry blocks on the email");
+        assert_eq!(index, 1);
+        assert_eq!(block.name, "pii");
     }
 
     // --- Go-compatible guardrail config tests ---
