@@ -201,7 +201,6 @@ pub struct AppendMetadata {
     /// is still recorded as [`RevisionState::Applied`]: the pipeline did
     /// publish, so the entry belongs in the ring the same as a clean
     /// apply, and this field is what tells the two apart on inspection.
-    #[serde(default)]
     pub degraded: Vec<String>,
 }
 
