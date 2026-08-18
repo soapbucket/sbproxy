@@ -55,10 +55,11 @@ rather than from anything the request supplied, which is the safe default. The
 enumeration block is the other half: it trips when one principal touches more
 distinct object ids than a real user would, which is what scraping looks like
 when every individual request is authorized. It does not need `object_rules`
-to work: without a rule to capture the object id explicitly, the detector
-falls back to the last numeric- or UUID-shaped path segment, so `enumeration:
-{ enabled: true }` on its own catches a BOLA sweep against a bare
-`/orders/{id}`-shaped API with no ownership rule declared.
+to work: with none declared at all, `enumeration: { enabled: true }` on its
+own catches a sweep against a bare `/orders/{id}`-shaped API, via a heuristic
+that requires an identified caller and never blocks on its own guess (see
+[object-authz.md](object-authz.md) for exactly what that fallback covers and
+where it does not apply).
 
 See [object-authz.md](object-authz.md) for the full matcher surface, including
 tenant claims and collection endpoints, and
