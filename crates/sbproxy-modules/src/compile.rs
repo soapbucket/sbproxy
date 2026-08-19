@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use sbproxy_config::extract_type;
 use sbproxy_extension::bundle::{
     build_javascript_action, build_javascript_auth, build_javascript_policy,
-    build_javascript_transform, build_rego_policy, build_wasm_action, build_wasm_policy,
-    build_wasm_transform, BundleRegistry, LoadedBundleHook,
+    build_javascript_transform, build_rego_policy, build_rego_transform, build_wasm_action,
+    build_wasm_policy, build_wasm_transform, BundleRegistry, LoadedBundleHook,
 };
 
 use crate::action::{
@@ -241,8 +241,9 @@ fn compile_bundle_auth(hook: &LoadedBundleHook, config: serde_json::Value) -> Re
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide auth hooks")
         }
-        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
-        // at manifest validation; this arm is the defensive backstop.
+        // Rego bundle hooks are `kind: policy` and `kind: transform` only
+        // (WOR-2482, WOR-2493 item 6); other kinds are refused at manifest
+        // validation, so this arm is the defensive backstop.
         sbproxy_config::BundleRuntime::Rego => {
             anyhow::bail!("rego bundles cannot provide auth hooks")
         }
@@ -553,11 +554,11 @@ fn compile_bundle_transform(
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide transform hooks")
         }
-        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
-        // at manifest validation; this arm is the defensive backstop.
-        sbproxy_config::BundleRuntime::Rego => {
-            anyhow::bail!("rego bundles cannot provide transform hooks")
-        }
+        // WOR-2493 item 6: a signed extension bundle's Rego module can
+        // provide transform hooks through the same verify-then-activate
+        // flow its policy hooks ride (WOR-2482); see
+        // `sbproxy_extension::bundle::rego`.
+        sbproxy_config::BundleRuntime::Rego => Box::new(build_rego_transform(hook, config)?),
     };
     Ok(Transform::Plugin(crate::PluginTransform::dynamic(
         handler,
@@ -574,8 +575,9 @@ fn compile_bundle_action(hook: &LoadedBundleHook, config: serde_json::Value) -> 
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide action hooks")
         }
-        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
-        // at manifest validation; this arm is the defensive backstop.
+        // Rego bundle hooks are `kind: policy` and `kind: transform` only
+        // (WOR-2482, WOR-2493 item 6); other kinds are refused at manifest
+        // validation, so this arm is the defensive backstop.
         sbproxy_config::BundleRuntime::Rego => {
             anyhow::bail!("rego bundles cannot provide action hooks")
         }
@@ -867,6 +869,83 @@ hooks:
                 body: Bytes::from_static(b"dynamic action"),
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extension_registry_compiles_a_rego_bundle_transform() {
+        // WOR-2493 item 6: before this landed, the Rego arm of
+        // `compile_bundle_transform` was an unconditional
+        // "rego bundles cannot provide transform hooks" bail, and the
+        // manifest itself was refused at candidate load.
+        let directory = TempDir::new().expect("temporary bundle directory");
+        let bundle = directory.path().join("rego-transform-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(
+            bundle.join("transform.rego"),
+            r#"
+package sbproxy
+
+transform := base64.encode("rewritten") if {
+    input.body.content_type == "text/plain"
+}
+"#,
+        )
+        .expect("write rego module");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: rego-transform-fixture
+version: 1.0.0
+runtime: rego
+entry: transform.rego
+hooks:
+  - kind: transform
+    type: rego_compile_transform
+    execution:
+      body_mode: buffered
+"#,
+        )
+        .expect("write bundle manifest");
+        let config = ExtensionBundlesConfig {
+            bundles_dir: Some(directory.path().display().to_string()),
+            sources: Vec::new(),
+            grants: Default::default(),
+        };
+        let registry = DynamicBundleRegistry::load(&config, directory.path(), &BTreeSet::new())
+            .expect("load rego transform fixture");
+
+        let transform = compile_transform_with_registry(
+            &serde_json::json!({"type": "rego_compile_transform"}),
+            registry.as_ref(),
+        )
+        .expect("rego bundle transform should compile");
+        // Cacheability: a bundle transform is arbitrary out-of-tree
+        // logic, so it is conservatively request-dependent like every
+        // other `Transform::Plugin`, and the cached-origin refusal in
+        // `sbproxy-core`'s pipeline compiler applies to it the same way
+        // it does to the JS and Lua transform surfaces.
+        assert!(transform.request_dependent());
+        let Transform::Plugin(transform) = transform else {
+            panic!("rego bundle transform should use plugin dispatch");
+        };
+        let metadata = transform
+            .dynamic_hook()
+            .expect("rego bundle transform should retain bundle execution metadata");
+        assert_eq!(metadata.bundle_id(), "rego-transform-fixture");
+        assert_eq!(metadata.hook_type(), "rego_compile_transform");
+        assert_eq!(metadata.body_mode(), BundleBodyMode::Buffered);
+        let mut body = BytesMut::from(&b"original"[..]);
+        transform
+            .handler()
+            .apply(
+                &mut body,
+                Some("text/plain"),
+                &TransformContext::new("fixture.example"),
+            )
+            .await
+            .expect("rego bundle transform should run");
+        assert_eq!(&body[..], b"rewritten");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

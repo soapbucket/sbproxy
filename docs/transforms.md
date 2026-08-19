@@ -1,6 +1,6 @@
 # Transforms
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 A transform edits a response body before it reaches the client. Reach for one when the shape an upstream returns is not the shape a caller needs: trimming fields from a JSON payload, converting HTML to Markdown for an LLM, capping a body size, or running a sandboxed script or WASM module over the bytes. Transforms never touch the request; for that, see the request modifier and forward-rule sections of [configuration.md](configuration.md).
 
@@ -41,7 +41,7 @@ Transforms run in the order they're listed. Each one reads the buffer the previo
 
 Two things gate whether a transform runs at all on a given response, independent of its own fields: the `content_types` filter above, and `disabled: true`.
 
-**Response cache and request-dependent transforms.** An origin with `response_cache` enabled stores each cached entry's *transformed* body, not the raw upstream response, and a stale-while-revalidate refresh reruns the chain with no request in scope. That's only sound for a transform whose output is a pure function of the response body, its content type, and its own static config. A transform that reads request state (the scripted transforms `lua_json` / `javascript` / `js_json`, the content-negotiation family `html_to_markdown` / `citation_block` / `json_envelope`, `cel`, and `a2a_agent_card_rewrite`) is refused at config load when combined with `response_cache` on the same origin; the load error names the transform. Move it to an origin without `response_cache`, or drop it from the chain, to keep the pairing.
+**Response cache and request-dependent transforms.** An origin with `response_cache` enabled stores each cached entry's *transformed* body, not the raw upstream response, and a stale-while-revalidate refresh reruns the chain with no request in scope. That's only sound for a transform whose output is a pure function of the response body, its content type, and its own static config. A transform that reads request state (the scripted transforms `lua` / `lua_json` / `javascript` / `js_json`, the content-negotiation family `html_to_markdown` / `citation_block` / `json_envelope`, `cel`, `a2a_agent_card_rewrite`, and every linked-plugin or extension-bundle transform, whatever the bundle runtime) is refused at config load when combined with `response_cache` on the same origin; the load error names the transform. Move it to an origin without `response_cache`, or drop it from the chain, to keep the pairing.
 
 ## JSON shaping
 
