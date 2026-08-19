@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# MCP federation over stdio: one supervised persistent child process.
+#
+# Federates a local MCP server the gateway launches itself
+# (`transport: stdio`). The child (server.py, stdlib Python) is
+# spawned once, lazily, on the first exchange that needs it, and then
+# held as a session: requests are newline-delimited JSON on its
+# stdin, responses are correlated back by id, an MCP `ping` probes it
+# while idle, and a crashed child is respawned under bounded backoff
+# with in-flight calls failing closed. That is one process for the
+# life of the config, not one process per call, so server-side state
+# survives between calls and the startup cost is paid once.
+#
+# The child's one tool, `session_info`, returns its PID and how many
+# tools/call exchanges the process has answered, which makes the
+# session reuse directly observable: call it twice, same PID, counter
+# goes up.
+#
+# stdio servers never consult `egress` (there is no network dial) and
+# refuse `run_as_user_auth` (there are no headers to mint into).
+#
+# Run (from this directory, so the child's script path resolves):
+#   cd examples/mcp-stdio
+#   sbproxy serve -f sb.yml
+#
+# Test (initialize, complete the handshake, then call the tool twice;
+# see README.md for the full transcript):
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' | jq .
+#
+#   curl -sS -o /dev/null -w '%{http_code}\n' \
+#     -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+#
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"local.session_info","arguments":{}}}' | jq .
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: stdio-demo
+        version: "1.0.0"
+      federated_servers:
+        # `origin` is the server's label here; with `transport: stdio`
+        # the gateway launches `command` instead of dialing anything.
+        - origin: session-info
+          transport: stdio
+          command: python3
+          # Relative to the gateway's working directory, hence the
+          # `cd` in the Run block.
+          args: [server.py]
+          prefix: local
+          namespace: always
