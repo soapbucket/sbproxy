@@ -3,16 +3,25 @@
 //! Path classification lives in [`crate::handler::classify_surface`],
 //! which is what the dispatch path calls. This module answers the
 //! second question only: given a classified surface, does this
-//! provider expose it, or must the gateway return 501.
+//! provider expose it, or must the gateway return 501. Capability is
+//! keyed on the provider type ([`crate::ProviderConfig::effective_provider_type`]),
+//! never on the entry's display name (WOR-2485).
 
-/// Check whether a provider supports the OpenAI Realtime API.
+/// Check whether a provider entry supports the OpenAI Realtime API.
 ///
 /// Convenience wrapper for the [`provider_supports_surface`] lookup
 /// for the Realtime surface specifically; the dispatch path uses
 /// this to decide whether to attempt a WebSocket upgrade or return
-/// 501 immediately. Today the matrix returns true only for `openai`.
-pub fn provider_supports_realtime(provider: &str) -> bool {
-    provider_supports_surface(provider, &crate::handler::AiSurface::Realtime)
+/// 501 immediately. Takes the whole [`crate::ProviderConfig`] so
+/// every caller keys the lookup on
+/// [`crate::ProviderConfig::effective_provider_type`] by construction
+/// rather than by convention (WOR-2485). Today the matrix returns
+/// true only for the `openai` type, whatever the entry is named.
+pub fn provider_supports_realtime(provider: &crate::ProviderConfig) -> bool {
+    provider_supports_surface(
+        provider.effective_provider_type(),
+        &crate::handler::AiSurface::Realtime,
+    )
 }
 
 /// Check whether a provider supports a given AI surface.
@@ -25,6 +34,19 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 ///
 /// The dispatch path uses this matrix to decide whether to return 501
 /// Not Implemented before any upstream call is made.
+///
+/// ## Key
+///
+/// The lookup keys on the provider TYPE: callers pass
+/// [`crate::ProviderConfig::effective_provider_type`] (the explicit
+/// `provider_type`, falling back to the entry `name` when no type is
+/// configured), never the display name alone. An operator entry such
+/// as `name: team-openai, provider_type: openai` carries the full
+/// openai row. Keying on the display name silently demoted renamed
+/// entries to the unknown-provider default and 501'd every
+/// non-universal surface (WOR-2485). The column headers below are
+/// therefore provider types, and `other` is any type absent from the
+/// provider catalog.
 ///
 /// ## Contract matrix
 ///
@@ -62,7 +84,7 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 /// normalisation would mislead callers. The gateway instead lists only the
 /// public logical names it is configured to serve and adds bounded aggregate
 /// availability for managed deployments without exposing topology.
-pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
+pub fn provider_supports_surface(provider_type: &str, surface: &crate::handler::AiSurface) -> bool {
     // Per-provider narrowings: the wire-format default would admit
     // more surfaces than the upstream actually exposes. Listed
     // ahead of the format dispatch so the narrowing is the first
@@ -70,7 +92,7 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
     // the upstream's surface set is narrower than the format's
     // default.
     use crate::handler::AiSurface;
-    match (provider, surface) {
+    match (provider_type, surface) {
         // Bedrock has no chat-completions-shaped embeddings,
         // image, audio, reranking, or moderations endpoint.
         // Titan embeddings exist but require the legacy
@@ -129,10 +151,10 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
 
         _ => {
             // Default path: dispatch on the provider's wire format.
-            // Unknown providers (not in the catalog) get the
+            // Unknown provider types (not in the catalog) get the
             // most-restrictive answer (chat + models only). The
             // catalog lookup is cached so this stays cheap.
-            let format = crate::providers::get_provider_info(provider).map(|info| info.format);
+            let format = crate::providers::get_provider_info(provider_type).map(|info| info.format);
             match format {
                 Some(f) => provider_format_supports_surface(f, surface),
                 None => matches!(
@@ -147,8 +169,8 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
     }
 }
 
-/// Whether a provider handles `surface`, consulting a served model's
-/// modality (WOR-1908).
+/// Whether a provider entry handles `surface`, consulting a served
+/// model's modality (WOR-1908).
 ///
 /// A locally served (`serve:`) provider is not in the provider catalog,
 /// so [`provider_supports_surface`] falls to the unknown-provider default
@@ -157,17 +179,21 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
 /// `served_modality` is `Some`, the surfaces its task implies are also
 /// handled (an embedder answers embeddings, a reranker answers
 /// reranking, and so on). `None` (not a served provider, or an unknown
-/// task) keeps the name-based default unchanged.
+/// task) keeps the type-based default unchanged. Like every matrix
+/// entry point this keys on
+/// [`crate::ProviderConfig::effective_provider_type`], not the display
+/// name, and takes the whole config entry so a caller cannot pass the
+/// wrong string (WOR-2485).
 pub fn provider_supports_surface_for_modality(
-    provider: &str,
+    provider: &crate::ProviderConfig,
     surface: &crate::handler::AiSurface,
     served_modality: Option<sbproxy_model_host::Modality>,
 ) -> bool {
     use crate::handler::AiSurface;
     use sbproxy_model_host::Modality;
-    // The name-based matrix already covers the universal surfaces and any
+    // The type-based matrix already covers the universal surfaces and any
     // real provider format; only widen it for a served non-chat task.
-    if provider_supports_surface(provider, surface) {
+    if provider_supports_surface(provider.effective_provider_type(), surface) {
         return true;
     }
     match served_modality {
@@ -253,46 +279,81 @@ pub fn provider_format_supports_surface(
 mod tests {
     use super::*;
 
+    fn provider(json: serde_json::Value) -> crate::ProviderConfig {
+        serde_json::from_value(json).expect("provider fixture")
+    }
+
     #[test]
     fn served_modality_makes_a_non_chat_surface_legal() {
         use crate::handler::AiSurface;
         use sbproxy_model_host::Modality;
+        let local_embedder = provider(serde_json::json!({"name": "local-embedder"}));
+        let local_reranker = provider(serde_json::json!({"name": "local-reranker"}));
+        let local_chat = provider(serde_json::json!({"name": "local-chat"}));
         // A served provider (unknown to the provider catalog) 501s
-        // embeddings by name alone.
+        // embeddings by its type alone.
         assert!(!provider_supports_surface_for_modality(
-            "local-embedder",
+            &local_embedder,
             &AiSurface::Embeddings,
             None
         ));
         // Declaring the served modality lifts exactly its own surface.
         assert!(provider_supports_surface_for_modality(
-            "local-embedder",
+            &local_embedder,
             &AiSurface::Embeddings,
             Some(Modality::Embedding)
         ));
         assert!(provider_supports_surface_for_modality(
-            "local-reranker",
+            &local_reranker,
             &AiSurface::Reranking,
             Some(Modality::Rerank)
         ));
         // It does not over-widen: an embedder does not gain reranking.
         assert!(!provider_supports_surface_for_modality(
-            "local-embedder",
+            &local_embedder,
             &AiSurface::Reranking,
             Some(Modality::Embedding)
         ));
-        // A served chat model keeps the name-based default (no embeddings).
+        // A served chat model keeps the type-based default (no embeddings).
         assert!(!provider_supports_surface_for_modality(
-            "local-chat",
+            &local_chat,
             &AiSurface::Embeddings,
             Some(Modality::Chat)
         ));
         // Universal surfaces stay universal regardless of modality.
         assert!(provider_supports_surface_for_modality(
-            "local-embedder",
+            &local_embedder,
             &AiSurface::ChatCompletions,
             Some(Modality::Embedding)
         ));
+    }
+
+    // WOR-2485: the config-taking wrappers key on the entry's effective
+    // provider type, so a display name neither narrows nor widens the
+    // answer.
+    #[test]
+    fn config_wrappers_key_on_the_effective_provider_type() {
+        use crate::handler::AiSurface;
+        let renamed_openai = provider(serde_json::json!({
+            "name": "team-openai", "provider_type": "openai"
+        }));
+        assert!(provider_supports_realtime(&renamed_openai));
+        assert!(provider_supports_surface_for_modality(
+            &renamed_openai,
+            &AiSurface::AudioTranscription,
+            None
+        ));
+        // Without a type, the name IS the type key (the built-in
+        // spelling keeps working).
+        let plain_openai = provider(serde_json::json!({"name": "openai"}));
+        assert!(provider_supports_realtime(&plain_openai));
+        let plain_anthropic = provider(serde_json::json!({"name": "anthropic"}));
+        assert!(!provider_supports_realtime(&plain_anthropic));
+        // A renamed non-realtime type stays non-realtime.
+        let renamed_anthropic = provider(serde_json::json!({
+            "name": "team-claude", "provider_type": "anthropic"
+        }));
+        assert!(!provider_supports_realtime(&renamed_anthropic));
     }
 
     // --- WOR-752: full surface x provider contract matrix ---

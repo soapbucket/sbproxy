@@ -161,9 +161,8 @@ pub(super) async fn handle_action(
                 // 501 gate: at least one configured provider must support
                 // realtime. Identity-specific provider selection happens
                 // after credential policy is resolved below.
-                let any_realtime_provider = ai.config.providers.iter().any(|p| {
-                    p.enabled && sbproxy_ai::api_routes::provider_supports_realtime(&p.name)
-                });
+                let any_realtime_provider =
+                    any_enabled_provider_supports_realtime(&ai.config.providers);
                 if !any_realtime_provider {
                     warn!(
                         ai.surface = surface_label,
@@ -1455,6 +1454,55 @@ fn split_plugin_action_response_headers(
         }
     }
     (content_type, extras)
+}
+
+/// The realtime pre-credential 501 gate: at least one enabled provider
+/// must support the Realtime surface before any credential resolution
+/// runs. Extracted as a free function so the gate's provider iteration
+/// is unit-testable (WOR-2485: the gate must key the capability lookup
+/// the same way the admission path in `ai_dispatch` does).
+fn any_enabled_provider_supports_realtime(providers: &[sbproxy_ai::ProviderConfig]) -> bool {
+    providers
+        .iter()
+        .any(|p| p.enabled && sbproxy_ai::api_routes::provider_supports_realtime(p))
+}
+
+#[cfg(test)]
+mod realtime_gate_tests {
+    use super::*;
+
+    fn providers(json: serde_json::Value) -> Vec<sbproxy_ai::ProviderConfig> {
+        serde_json::from_value(json).expect("provider fixture")
+    }
+
+    // WOR-2485: a renamed entry keeps its type's realtime support; the
+    // gate must key on the effective provider type, not the display
+    // name.
+    #[test]
+    fn renamed_openai_provider_passes_the_realtime_gate() {
+        assert!(any_enabled_provider_supports_realtime(&providers(
+            serde_json::json!([
+                {"name": "team-openai", "provider_type": "openai", "api_key": "k"}
+            ])
+        )));
+    }
+
+    #[test]
+    fn disabled_or_incapable_providers_do_not_satisfy_the_realtime_gate() {
+        // Disabled openai: capability without eligibility.
+        assert!(!any_enabled_provider_supports_realtime(&providers(
+            serde_json::json!([
+                {"name": "openai", "api_key": "k", "enabled": false}
+            ])
+        )));
+        // Enabled anthropic type: eligibility without capability, and
+        // the rename must not change that answer either.
+        assert!(!any_enabled_provider_supports_realtime(&providers(
+            serde_json::json!([
+                {"name": "team-claude", "provider_type": "anthropic", "api_key": "k"}
+            ])
+        )));
+    }
 }
 
 #[cfg(test)]

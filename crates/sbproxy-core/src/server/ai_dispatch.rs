@@ -1235,9 +1235,7 @@ pub(super) async fn realtime_budget_gate(
         .flatten();
     let provider = config.providers.iter().find(|provider| {
         provider.enabled
-            && sbproxy_ai::api_routes::provider_supports_realtime(
-                provider.effective_provider_type(),
-            )
+            && sbproxy_ai::api_routes::provider_supports_realtime(provider)
             && sbproxy_ai::routing::provider_allowed_by_policy(
                 provider.name.as_str(),
                 allowed_providers,
@@ -2580,10 +2578,14 @@ fn any_allowed_provider_supports_surface(
     allowed: &[String],
     blocked: &[String],
 ) -> bool {
+    // WOR-2485: eligibility (allow/block policy) keys on the config
+    // entry NAME; capability keys on the effective provider TYPE. The
+    // matrix helper takes the whole config entry so the type keying
+    // holds by construction.
     providers.iter().any(|provider| {
         provider_allowed_for_request(provider, allowed, blocked)
             && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
-                &provider.name,
+                provider,
                 surface,
                 served_provider_modality(provider, surface),
             )
@@ -17741,6 +17743,84 @@ mod request_policy_tests {
             &sbproxy_ai::handler::AiSurface::ImageGeneration,
             &allowed,
             &blocked,
+        ));
+    }
+
+    fn renamed_providers() -> Vec<sbproxy_ai::ProviderConfig> {
+        serde_json::from_value(serde_json::json!([
+            {"name": "team-openai", "provider_type": "openai", "api_key": "test"}
+        ]))
+        .expect("renamed provider fixture")
+    }
+
+    // WOR-2485: the surface matrix keys on the provider TYPE
+    // (`effective_provider_type`), so an operator's display name must
+    // not cost the entry its surface set. Keying on the name demoted
+    // `name: team-openai, provider_type: openai` to the
+    // unknown-provider default and 501'd every non-universal surface.
+    #[test]
+    fn renamed_provider_keeps_its_surface_support() {
+        assert!(any_allowed_provider_supports_surface(
+            &renamed_providers(),
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &[],
+            &[],
+        ));
+    }
+
+    // WOR-2485: a provider NAMED like a narrowed catalog entry but
+    // TYPED as openai follows its type. The wire shape actually spoken
+    // is the type's, so the name's narrowing arm must not fire.
+    #[test]
+    fn provider_type_wins_a_name_collision_in_the_surface_gate() {
+        let providers: Vec<sbproxy_ai::ProviderConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "bedrock", "provider_type": "openai", "api_key": "test"}
+            ]))
+            .expect("collision fixture");
+        assert!(any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &[],
+            &[],
+        ));
+    }
+
+    // WOR-2485: the per-provider narrowing arms key on the type too. A
+    // renamed bedrock entry stays narrowed; the rename neither drops it
+    // to the unknown default nor widens it past its upstream.
+    #[test]
+    fn renamed_provider_inherits_its_types_narrowing() {
+        let providers: Vec<sbproxy_ai::ProviderConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "prod-bedrock", "provider_type": "bedrock", "api_key": "test"}
+            ]))
+            .expect("narrowed fixture");
+        assert!(!any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::Embeddings,
+            &[],
+            &[],
+        ));
+    }
+
+    // WOR-2485: capability keys on the type; the allow/block policy
+    // lists keep keying on the config entry NAME that credentials
+    // reference. Both axes must hold at once.
+    #[test]
+    fn surface_gate_policy_lists_stay_keyed_on_the_config_name() {
+        let providers = renamed_providers();
+        assert!(any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &["team-openai".to_string()],
+            &[],
+        ));
+        assert!(!any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &[],
+            &["team-openai".to_string()],
         ));
     }
 

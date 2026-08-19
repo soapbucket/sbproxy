@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1707,7 +1707,7 @@ Marking an alias `deprecated` keeps it serving while making its use visible. Eve
 
 Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
 
-Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface`. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
+Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface` and keys on the provider type: the entry's `provider_type`, falling back to `name` when no type is set. A custom-named entry such as `name: team-openai` with `provider_type: openai` therefore keeps the full OpenAI surface set; the display name never narrows or widens capability. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
@@ -2098,8 +2098,10 @@ on mismatch, independent of whatever the provider did with
 Assistants, threads, batches, image generation, audio, and fine-tuning remain
 live passthrough surfaces. `classify_surface(method, path)` in
 `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface`,
-and `provider_supports_surface(provider, surface)` in
-`crates/sbproxy-ai/src/api_routes.rs` answers whether that provider exposes it.
+and `provider_supports_surface(provider_type, surface)` in
+`crates/sbproxy-ai/src/api_routes.rs` answers whether that provider exposes it,
+keyed on the provider's effective type (`provider_type`, falling back to
+`name`), never on the display name alone.
 Those two are the whole path: a surface the classifier names is a surface the
 matrix answers for. The gateway forwards the request to an eligible provider;
 it does not emulate those provider APIs locally, and there are no per-surface
@@ -2450,7 +2452,7 @@ for chunk in stream:
 
 ## Realtime
 
-The AI gateway routes OpenAI Realtime API WebSocket sessions through the same dispatch path as the rest of the surface set. A client opens `GET /v1/realtime` with `Upgrade: websocket` against the proxy, the gateway runs its standard pre-upgrade gating, picks an enabled provider that supports Realtime (today: OpenAI), and lets Pingora forward bytes between the client and the provider after the `101 Switching Protocols` handshake.
+The AI gateway routes OpenAI Realtime API WebSocket sessions through the same dispatch path as the rest of the surface set. A client opens `GET /v1/realtime` with `Upgrade: websocket` against the proxy, the gateway runs its standard pre-upgrade gating, picks an enabled provider whose effective provider type supports Realtime (today: the `openai` type, whatever the entry is named), and lets Pingora forward bytes between the client and the provider after the `101 Switching Protocols` handshake.
 
 What runs before the upgrade:
 - Surface classification stamps `ai.surface = "realtime"` on the request span and the access log.
