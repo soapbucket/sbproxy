@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 ![Two requests carrying injection-style instructions: one tagged, one blocked](assets/prompt-injection-v2.gif)
 
@@ -22,6 +22,15 @@ behavior as the default detector while exposing a richer interface:
 - Score in `[0.0, 1.0]` plus a label (`Clean`, `Suspicious`,
   `Injection`).
 - Three actions: `tag` (default), `block`, `log`.
+- An optional `enforcement` key in the shared vocabulary
+  (`block` / `observe`), overriding the block-versus-admit half of
+  `action` without touching its side-effect flavor. `enforcement:
+  observe` is the whole-policy rollout switch: a `block` action
+  downgrades to `log`, `tag` keeps tagging, and the agent-boundary
+  depth escalation observes too, which no combination of the other
+  keys can say in one place. `enforcement: block` flips the same
+  policy to enforcing. An explicit `a2a.root_action: log` survives
+  `enforcement: block`.
 - Pluggable detector slot. Configs reference detectors by name; the
   inventory registry rejects unknown names at compile time.
 

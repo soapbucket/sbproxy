@@ -251,6 +251,14 @@ fn default_cache_dir() -> PathBuf {
 // --- Bundle types ---
 
 /// Action a rule applies on match. Mirrors the publisher contract.
+///
+/// This is the *wire* spelling of the did-decide axis. The shared
+/// vocabulary is `sbproxy_config::types::EnforcementMode`, where the
+/// permissive value is spelled `observe`; published bundles spell it
+/// `log`, and that contract is pinned by shipped publishers, so the
+/// wire enum stays and maps through [`Self::enforcement`]. The same
+/// wire-compat treatment `QuotaPoolFailureMode` got on the cannot-decide
+/// axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FeedRuleAction {
@@ -260,6 +268,20 @@ pub enum FeedRuleAction {
     Block,
     /// Log a warning but pass the request through.
     Log,
+}
+
+impl FeedRuleAction {
+    /// This rule's action in the shared enforcement vocabulary.
+    ///
+    /// The evaluation path in [`crate::policy::WafPolicy::check_request`]
+    /// speaks only the shared enum; the wire spelling converts here, in
+    /// one place, rather than being re-matched per call site.
+    pub fn enforcement(self) -> sbproxy_config::types::EnforcementMode {
+        match self {
+            Self::Block => sbproxy_config::types::EnforcementMode::Block,
+            Self::Log => sbproxy_config::types::EnforcementMode::Observe,
+        }
+    }
 }
 
 /// Severity tag from the publisher. Used for log enrichment only;
@@ -1143,5 +1165,17 @@ mod tests {
         let rs = RuleSet::from_bundle(bundle);
         assert_eq!(rs.rules.len(), 1, "invalid regex should be dropped");
         assert_eq!(rs.rules[0].id, "good");
+    }
+
+    /// The wire spelling maps onto the shared enforcement vocabulary:
+    /// `block` is `Block`, `log` is `Observe`. The publisher contract
+    /// keeps its own spelling; the evaluation path speaks the shared
+    /// enum only.
+    #[test]
+    fn feed_rule_action_maps_onto_the_shared_enforcement_vocabulary() {
+        use sbproxy_config::types::EnforcementMode;
+
+        assert_eq!(FeedRuleAction::Block.enforcement(), EnforcementMode::Block);
+        assert_eq!(FeedRuleAction::Log.enforcement(), EnforcementMode::Observe);
     }
 }
