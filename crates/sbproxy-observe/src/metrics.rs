@@ -4785,9 +4785,13 @@ pub fn record_mcp_tool_version_call(
 
 /// Record an MCP upstream IO failure on
 /// `sbproxy_mcp_upstream_io_failures_total{kind}`. `kind` is one of
-/// `timeout`, `connect`, `response_cap`, `other`. Lets an operator
-/// see hung or oversized upstreams that the per-request deadlines
-/// and byte caps are absorbing.
+/// `timeout`, `connect`, `response_cap`, `other` for the HTTP
+/// transports, plus `stdio_spawn`, `stdio_backoff`, and
+/// `stdio_session_closed` from the supervised stdio session
+/// (`timeout` is shared; a hung stdio child records it too). Lets an
+/// operator see hung or oversized upstreams that the per-request
+/// deadlines and byte caps are absorbing, and stdio children that
+/// are crash-looping or probe-deaf.
 pub fn record_mcp_upstream_io_failure(kind: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

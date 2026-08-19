@@ -20,7 +20,8 @@
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
 //! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
 //! - [`auth`] - Run-as-user upstream credential minting (WOR-1792).
-//! - [`stdio`] - Supervised local stdio MCP transport.
+//! - [`stdio`] - Supervised persistent stdio sessions for local MCP
+//!   servers (one child per configured server, WOR-2453).
 //! - [`peer_profile`] - Per-tenant downgrade-resistant negotiation
 //!   profiles for federated peers (WOR-2384).
 

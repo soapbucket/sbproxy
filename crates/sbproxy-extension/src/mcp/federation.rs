@@ -1287,8 +1287,11 @@ pub struct McpFederation {
     /// Maximum upstream response bytes buffered per exchange
     /// (WOR-1639); passed to every transport send.
     max_response_bytes: usize,
-    /// Supervision deadline for local stdio MCP exchanges.
-    stdio_timeout: std::time::Duration,
+    /// Supervised persistent stdio sessions, one child per configured
+    /// `transport: stdio` server (WOR-2453). Dropping the federation
+    /// (config removal, hot reload) drops the pool and kills every
+    /// child.
+    stdio_sessions: super::stdio::StdioSessionPool,
     /// TCP connect deadline, kept so per-dial pinned OpenAPI clients
     /// (WOR-2080) carry the same bounds as the shared clients.
     connect_timeout: std::time::Duration,
@@ -1432,7 +1435,10 @@ impl McpFederation {
             client,
             openapi_client,
             max_response_bytes: io.max_response_bytes,
-            stdio_timeout: io.request_timeout,
+            stdio_sessions: super::stdio::StdioSessionPool::new(
+                io.max_response_bytes,
+                io.request_timeout,
+            ),
             connect_timeout: io.connect_timeout,
             request_timeout: io.request_timeout,
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -3236,13 +3242,14 @@ impl McpFederation {
                         "run-as-user credentials cannot be delivered over stdio transport"
                     );
                 }
-                super::stdio::send_via_stdio(
-                    &server.url,
-                    req,
-                    self.max_response_bytes,
-                    self.stdio_timeout,
-                )
-                .await
+                // WOR-2453: one supervised persistent child per
+                // configured stdio server, not one process per
+                // exchange. The pool owns spawn, restart backoff,
+                // health probing, and wire-id correlation.
+                self.stdio_sessions
+                    .send(&server.name, &server.url, req)
+                    .await
+                    .map_err(anyhow::Error::from)
             }
             // Default to streamable HTTP for "streamable_http" or unknown.
             _ => {
@@ -4227,6 +4234,12 @@ fn urlencoding_encode(s: &str) -> String {
 /// recognised by its marker string since it crosses the transport
 /// module boundary as `anyhow`.
 fn classify_io_failure(e: &anyhow::Error) -> &'static str {
+    // WOR-2453: supervised stdio failures are typed; classify them
+    // by their own kind vocabulary (`timeout` is shared with the
+    // HTTP transports' label).
+    if let Some(se) = e.downcast_ref::<super::stdio::StdioSessionError>() {
+        return se.metric_kind();
+    }
     if let Some(re) = e.downcast_ref::<reqwest::Error>() {
         if re.is_timeout() {
             return "timeout";
@@ -9677,6 +9690,60 @@ mod tests {
         assert!(
             !captured.to_ascii_lowercase().contains("traceparent"),
             "no traceparent should appear on any surface of an untraced call, got:\n{captured}"
+        );
+    }
+
+    /// WOR-2453: two sequential exchanges to one configured stdio
+    /// server must be served by ONE supervised child process, not one
+    /// child per exchange. Red before the supervised session pool
+    /// landed: the per-exchange transport spawned a fresh process for
+    /// every JSON-RPC line, so the two pids below always differed.
+    #[tokio::test]
+    async fn stdio_dispatch_reuses_one_supervised_child() {
+        // A loop server: answers every request line with its own pid.
+        let script = "import sys, os, json\n\
+            for line in sys.stdin:\n    \
+            req = json.loads(line)\n    \
+            sys.stdout.write(json.dumps({\"jsonrpc\": \"2.0\", \"result\": {\"pid\": os.getpid()}, \"id\": req.get(\"id\")}) + \"\\n\")\n    \
+            sys.stdout.flush()\n";
+        let server = McpServerConfig {
+            name: "stdio-up".to_string(),
+            url: super::super::stdio::encode_stdio_url(
+                "python3",
+                &["-c".to_string(), script.to_string()],
+            ),
+            transport: "stdio".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            local: None,
+            egress_policy: EgressPolicy::default(),
+        };
+        let fed = McpFederation::new(vec![server]);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "ping".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+
+        let mut pids = Vec::new();
+        for attempt in 0..2 {
+            let resp = fed
+                .dispatch_request(&fed.servers[0], &req, &[])
+                .await
+                .unwrap_or_else(|e| panic!("stdio exchange {attempt} failed: {e}"));
+            let pid = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("pid"))
+                .and_then(|p| p.as_u64())
+                .expect("pid in stdio response");
+            pids.push(pid);
+        }
+        assert_eq!(
+            pids[0], pids[1],
+            "sequential stdio exchanges must share one supervised child, got pids {} and {}",
+            pids[0], pids[1]
         );
     }
 }

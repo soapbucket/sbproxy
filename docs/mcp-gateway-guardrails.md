@@ -302,9 +302,30 @@ is reaching before deciding to lock it down.
 ### Supervised local stdio MCP
 
 Local stdio MCP servers use `transport: stdio`, a required `command`,
-and optional `args`. The gateway supervises one process per exchange,
-writes one JSON-RPC request line to stdin, reads one response line from
-stdout, and kills the child on timeout or oversized output.
+and optional `args`. The gateway holds one persistent supervised child
+process per configured server for the lifetime of the loaded config,
+writes JSON-RPC requests as newline-delimited lines to its stdin, and
+correlates response lines back to their callers, so server-side state
+survives between calls and process startup is paid once per child
+rather than once per exchange.
+
+The supervisor's contract:
+
+- The child is spawned on first use and health-checked with an MCP
+  `ping` while idle. A child that stops answering the probe is killed
+  and replaced on the next call.
+- A crashed child is restarted under a bounded exponential backoff.
+  Calls that arrive while the child is down fail closed with a typed
+  error instead of hanging; nothing queues behind a dead process.
+- A crash loses the child's in-memory state. The gateway replays the
+  MCP `initialize` handshake on the replacement child, so protocol
+  state is restored, but tool-side state is not.
+- A call that exceeds its deadline is treated as a hung child: the
+  call fails closed, the child is killed, and the next call respawns
+  it. An oversized or malformed response line closes the session the
+  same way, since line framing cannot be trusted past it.
+- Removing the server from configuration, or any config reload, kills
+  the child.
 
 ```yaml
 action:
@@ -318,6 +339,14 @@ action:
       args: [--stdio]
       timeout: 5s
 ```
+
+Governance coverage for a stdio server is otherwise identical to the
+other transports: its tools sit in the same federated catalog and pass
+the same RBAC labels, quotas, allowlists, versioning gates, and
+guardrails as every other server's tools. What the gateway cannot see
+is the child's own behavior on the machine: it is a local process,
+outside egress control, and the gateway does not attest the binary it
+launched.
 
 ### Run-as-user MCP auth
 
