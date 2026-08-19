@@ -12,15 +12,55 @@
 //!    the cookie value is rejected with 403.
 //! 5. Paths listed in `exempt_paths` bypass the check entirely.
 //!
-//! Why a real proxy upstream rather than `static`: the CSRF cookie
-//! is appended in `response_filter`, which only runs on the proxy
-//! flow. Static actions short-circuit before that phase. We use
-//! `MockUpstream` for the safe-method path that needs the cookie,
-//! and rely on the proxy's deny-path which short-circuits cleanly
-//! for the rejection assertions.
+//! The CSRF cookie is appended in `response_filter` on the proxy flow
+//! and by the generated-response application (WOR-2496) on `static` /
+//! `mock` / `echo` / `beacon` / `redirect` actions, matching
+//! `examples/csrf` (a `static` action). Most tests here use
+//! `MockUpstream`; the static-origin test pins the generated-response
+//! cookie issuance.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+
+#[test]
+fn safe_get_issues_csrf_cookie_on_a_static_origin() {
+    // The examples/csrf shape. Before WOR-2496 the enforcer staged the
+    // cookie on the request context but the static write path never
+    // read it, so no Set-Cookie reached the client.
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "csrf.localhost":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: "{\"ok\":true}"
+    policies:
+      - type: csrf
+        secret_key: "dev-csrf-secret-change-me"
+        cookie_name: csrf_token
+        header_name: X-CSRF-Token
+        methods: [POST, PUT, DELETE, PATCH]
+        safe_methods: [GET, HEAD, OPTIONS]
+        cookie_path: /
+        cookie_same_site: Lax
+"#;
+    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+
+    let resp = harness.get("/", "csrf.localhost").expect("GET");
+    assert_eq!(resp.status, 200);
+    let cookie = resp
+        .headers
+        .get("set-cookie")
+        .map(String::as_str)
+        .expect("safe GET on a static origin must issue the csrf cookie");
+    assert!(
+        cookie.starts_with("csrf_token="),
+        "cookie name must match config, got: {cookie}"
+    );
+}
 
 fn config(upstream_base: &str) -> String {
     format!(

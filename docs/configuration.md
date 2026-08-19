@@ -2983,7 +2983,7 @@ policies:
 | `report_to_group` | string | unset | When set, the policy also emits `report-to <name>` for the modern Reporting API. |
 | `respect_upstream` | bool | `false` | When `true` and the upstream already emits a CSP header, the policy yields and does not write its own. |
 
-The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and returns `204 No Content`. The header is applied to proxied responses; static / redirect / mock actions short-circuit before the response-header phase and bypass injection.
+The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and returns `204 No Content`. The header is applied to proxied responses and to generated ones alike: `static`, `mock`, `echo`, `beacon`, and `redirect` actions carry it the same way a proxied origin does. Actions with their own protocol write paths (`mcp`, `storage`, `ai_proxy`, plugin actions) do not.
 
 ### dlp
 

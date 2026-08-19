@@ -89,9 +89,10 @@ five states, never a silent no-op: `enforced`, `report_only`,
   this item would have synthesized; the pack backs off and leaves it
   exactly as configured.
 - **not_covered** - no synthesis is wired for this item in this pack
-  version, it has no gateway control at all, or (`api8` on a
-  non-response-phase action) this origin's action type cannot run the
-  control that would apply. The reason says which.
+  version, it has no gateway control at all, or (`api8` on an action
+  that never applies response-phase policies, such as `mcp` or
+  `storage`) this origin's action type cannot run the control that
+  would apply. The reason says which.
 
 ## api1: Broken Object Level Authorization
 
@@ -366,17 +367,17 @@ control characters in header values; hard-coded, no tunable fields).
 A managed `waf` (Core Rule Set) default is deliberately not part of
 this item in this pack version; configure `waf` directly for that.
 
-**`security_headers` needs a response-phase action.** `security_headers`
-takes effect in Pingora's response-phase filter, which only runs for
-an action that actually dials an upstream: `proxy`, `load_balancer`,
-`websocket`, `a2a`, `graphql`, and `grpc`. An origin whose action
-answers entirely inside the request phase - `static`, `mock`, `echo`,
-`beacon`, `redirect`, `mcp`, `noop`, `ai_proxy`, `storage`, or a
-plugin action - never reaches that filter, so `security_headers` is
-not synthesized there; the manifest names the gap by action type
-instead of claiming coverage nothing runs. `http_framing` runs at
-request phase, independent of action type, and always synthesizes
-regardless.
+**`security_headers` needs an action that applies response-phase
+policies.** That covers the proxied actions (`proxy`, `load_balancer`,
+`websocket`, `a2a`, `graphql`, `grpc`) and the generated-response
+actions (`static`, `mock`, `echo`, `beacon`, `redirect`), which carry
+response-phase policy headers the same way a proxied origin does. An
+origin whose action answers through its own protocol write path -
+`mcp`, `noop`, `ai_proxy`, `storage`, or a plugin action - does not,
+so `security_headers` is not synthesized there; the manifest names the
+gap by action type instead of claiming coverage nothing runs.
+`http_framing` runs at request phase, independent of action type, and
+always synthesizes regardless.
 
 **Default posture and why.** `enforced` whenever at least one piece
 lands (which `http_framing` always does), unconditionally. Neither
@@ -388,12 +389,12 @@ item and it reports `not_covered` instead.
 
 **report_only -> enforce.** No-op for this item.
 
-**Operator input needed.** None for baseline coverage on a
-`proxy`/`load_balancer`/etc. origin. On a `static`/`mock`/other
-request-phase-only origin, `security_headers` needs to be configured
-on the app itself (or the route moved to a proxy/load_balancer
-action) if response headers matter for it. Layer `waf` on top yourself
-for broader misconfiguration coverage; see
+**Operator input needed.** None for baseline coverage on a proxied or
+generated-response origin. On an `mcp`/`storage`/other
+own-write-path origin, `security_headers` needs to be configured on
+the app itself (or the route moved to a covered action type) if
+response headers matter for it. Layer `waf` on top yourself for
+broader misconfiguration coverage; see
 [waf-options.md](waf-options.md).
 
 ## api9: Improper Inventory Management

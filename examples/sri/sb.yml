@@ -21,10 +21,9 @@
 # default. Inline scripts and non-stylesheet `<link>` tags
 # (preconnect, dns-prefetch, icon, ...) are also out of scope.
 #
-# The scan hooks into Pingora's upstream `response_filter`, which only
-# runs for a genuinely proxied (`type: proxy`) origin, so this example
-# proxies to a small local fixture instead of serving a `static` body
-# (see fixture.py for why).
+# The scan covers proxied responses and generated (static/mock) ones
+# alike; this example proxies to a small local fixture so the audit
+# runs against real upstream HTML (see fixture.py).
 #
 # Run (the upstream must be up first so it can serve the HTML sri.local
 # proxies to; see fixture.py):
@@ -60,8 +59,8 @@ origins:
   "sri.local":
     action:
       type: proxy
-      # The example ships its own upstream so the response actually flows
-      # through response_filter: python3 fixture.py
+      # The example ships its own upstream so the audit runs against
+      # real upstream HTML: python3 fixture.py
       url: http://127.0.0.1:8097
 
     policies:
