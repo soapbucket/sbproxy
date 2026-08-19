@@ -57,12 +57,6 @@ const AI_RESILIENCE_CONSUMER: &str = "sbproxy_ai::handler::AiHandlerConfig::rout
 /// every `JsEngine::new()` then reads (WOR-2319).
 const JS_SANDBOX_CONSUMER: &str = "sbproxy_core::server::lifecycle::install_js_sandbox_limits";
 
-const LB_ZONE_NOTE: &str =
-    "Target selection is not locality aware. This label has exactly one reader in the \
-     workspace, the admin target-health view behind `GET /api/health/targets`, so zoning your \
-     targets renders a column and does not make the proxy prefer a same-zone target. Tracked \
-     by WOR-2328.";
-
 /// Where the load balancer parses and validates its own config block.
 const LB_CONFIG_CONSUMER: &str =
     "sbproxy_modules::action::loadbalancer::LoadBalancerAction::from_config_for_origin";
@@ -148,7 +142,8 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // `compile_config` rather than pinned, which is the better answer and
     // the only available one: the key is `routing`, the key is read, and it
     // was one accepted *value* of it that did nothing, a shape no
-    // reader-based check can see. Target zones are the remaining pin.
+    // reader-based check can see. Target zones were the remaining pin
+    // until WOR-2498 flipped them to the refusal route too (see below).
     //
     // Two more keys took the refusal route for the same reason (WOR-2319).
     // Both live under `origins.*.transforms[]`, which `ConfigFile` types as
@@ -252,7 +247,12 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // refuses an authored block at config compile with a message naming
     // `algorithm: ring_hash` as the replacement, so an entry here would
     // classify a field that no longer parses.
-    config_only("origins.*.action.targets[].zone", LB_ZONE_NOTE),
+    //
+    // `origins.*.action.targets[].zone` is deliberately absent for the
+    // same reason (WOR-2498). It was the last `config_only` pin on this
+    // surface: a label that read as zone-aware routing and steered
+    // nothing. `from_config_for_origin` refuses an authored `zone:` at
+    // config compile with a message naming the algorithms that do ship.
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",
         "Nothing signs an Agent Skills response, so there is no freshness header for this \
@@ -1141,7 +1141,9 @@ const fn rooted(kind: &'static str, name: &'static str) -> ModuleCoverage {
 /// re-derive it:
 ///
 /// * `origins.*.action`: every key had a live reader except `targets[].zone`,
-///   which stays pinned above under WOR-2328. Two looked dead and are not.
+///   which was pinned under WOR-2328 until WOR-2498 removed the field and
+///   made the load balancer refuse it at config compile, the `sticky:`
+///   treatment. Two looked dead and are not.
 ///   `targets[].host_override` reads in `sbproxy_core`'s upstream-host
 ///   selection rather than in the load balancer, so a search scoped to
 ///   `loadbalancer.rs` misses it. `lb_method` is read only by the

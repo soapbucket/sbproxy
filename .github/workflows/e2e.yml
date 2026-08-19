@@ -1,11 +1,13 @@
 # E2E tests for SBproxy. Runs on tag pushes, on a weekly schedule,
 # and on manual dispatch. The PR-required CI lane (`ci.yml`) excludes
-# `sbproxy-e2e` because the harness spawns the proxy binary, listens
-# on real ports, and exercises the network stack; on shared GitHub
-# runners that pattern produces startup-timeout flakiness that does
-# not reflect a real regression. Gating e2e out of PRs keeps PR
-# feedback fast while still validating the full stack before a
-# release ships.
+# the bulk of `sbproxy-e2e` because the harness spawns the proxy
+# binary, listens on real ports, and exercises the network stack; on
+# shared GitHub runners the heavier tests (mesh gossip, websocket
+# upgrade) produce startup-timeout flakiness that does not reflect a
+# real regression. A small offline subset IS required on every code
+# PR (the `e2e-subset` job in ci.yml, WOR-2469); this workflow stays
+# the full sweep that validates the whole stack before a release
+# ships.
 
 name: e2e
 

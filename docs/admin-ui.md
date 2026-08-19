@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -568,14 +568,21 @@ with, and see the response, token usage, cost, and latency.
 
 - **Shows:** `GET /admin/api/playground/endpoints` (every AI origin
   the live pipeline serves, with each provider's declared models).
-- **Mutations:** `POST /admin/api/playground/chat`, which requires the
-  `admin` role (a `read_only` operator gets `403` here even though the
-  endpoint list is read-only). Calls the same AI client the data plane
-  uses, so usage, cost, and latency are real, but it does **not**
-  traverse the data-plane pipeline: per-origin guardrails, transforms,
-  and routing policy do not apply here. A debug toggle adds a
-  `request_id` and the config revision to the response for
-  server-log correlation.
+- **Mutations:** `POST /admin/api/playground/dispatch`, which requires
+  the `admin` role (a `read_only` operator gets `403` here even though
+  the endpoint list is read-only). The page has you pick an active
+  virtual key, and the request then runs through the real data-plane
+  pipeline as that key: key policy, governance, routing, and
+  guardrails all apply exactly as they would for the key's own
+  traffic. Plain-HTTP AI origins only; an origin with `force_ssl`
+  answers `501`. A debug toggle adds a `request_id` and the config
+  revision to the response for server-log correlation.
+- **Not used by the UI:** `POST /admin/api/playground/chat`, the
+  direct engine call that skips the pipeline entirely. It refuses to
+  run unless the body carries `bypass_governance: true`, and every
+  completion it does run is audited. See
+  [admin-api-reference.md](admin-api-reference.md#chat-playground)
+  before scripting against it.
 - **Empty/error notes:** no AI origins configured is an empty state
   ("nothing to talk to yet"); an upstream failure surfaces the
   provider's error, not a generic one.
