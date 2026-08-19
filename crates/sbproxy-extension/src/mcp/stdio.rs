@@ -39,7 +39,7 @@
 //!
 //! A crashed, hung, or protocol-violating child loses everything: the
 //! session is closed, the child is killed, and every in-flight call on
-//! it fails closed with a typed [`StdioSessionError`] rather than
+//! it fails closed with a typed `StdioSessionError` rather than
 //! hanging. Server-side state the child held (in-memory caches, open
 //! handles) is gone; the supervisor replays the MCP `initialize`
 //! handshake on the replacement child so protocol state is restored,

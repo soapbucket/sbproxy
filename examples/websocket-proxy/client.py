@@ -50,15 +50,21 @@ def recv_exact(sock: socket.socket, count: int) -> bytes:
     return buf
 
 
-def decode_frame(sock: socket.socket) -> bytes:
-    """Read one WebSocket frame and return its payload.
+def decode_frame(sock: socket.socket):
+    """Read one WebSocket frame and return its payload, or None.
 
     Handles the 7-bit, 16-bit (126), and 64-bit (127) length encodings
     from RFC 6455 6.2, unlike a raw `header[1] & 0x7F` read, which
     treats 126/127 as if they were the literal payload length and
     misreads any frame whose payload is 126 bytes or larger.
+
+    Returns None when the connection closes before a frame arrives,
+    which is what the gateway's `max_message_size` enforcement looks
+    like from the client's side: an abrupt teardown, no Close frame.
     """
     header = recv_exact(sock, 2)
+    if len(header) < 2:
+        return None
     length = header[1] & 0x7F
     if length == 126:
         length = int.from_bytes(recv_exact(sock, 2), "big")
@@ -98,8 +104,16 @@ def main() -> None:
         if " 101 " not in status_line:
             return
         print()
-        sock.sendall(encode_frame(message.encode()))
-        payload = decode_frame(sock)
+        try:
+            sock.sendall(encode_frame(message.encode()))
+            payload = decode_frame(sock)
+        except (BrokenPipeError, ConnectionResetError):
+            # The gateway may close mid-send when the frame header
+            # already declares a payload over `max_message_size`.
+            payload = None
+        if payload is None:
+            print("connection closed by the gateway (no frame received)")
+            return
         text = payload.decode(errors="replace")
         if len(payload) > 200:
             # A frame this size is unreadable dumped whole; show enough to

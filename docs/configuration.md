@@ -1427,6 +1427,8 @@ origins:
 
 The `sticky:` block was removed. It parsed (`cookie_name`, `ttl`) and did nothing: no affinity cookie was ever issued. A config that still sets it fails to compile with an error naming the replacement. For cookie-based session affinity, use `ring_hash` keyed on the cookie your application already issues, as above.
 
+The `targets[].zone` label was removed the same way. Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone; a config that sets it fails to compile. Zone-aware routing is not implemented. To tell replicas apart, use `metadata:`, which promises nothing about selection.
+
 When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
 
 The production registry includes `first-healthy`, `lora`, `lora-aware`, `gpu-aware`, and `bandit`. `lora-aware` reads the adapter from `X-LoRA-Adapter` or `?adapter=` and matches it against `targets[].metadata.loaded_adapters`. `gpu-aware` selects the lowest valid numeric `targets[].metadata.gpu_utilization` in `[0.0, 1.0]`; it does not poll GPUs. `bandit` records real success and latency outcomes, with successful reward `1 / (1 + latency_seconds)` and failure reward `0`; it does not fabricate cost data. Empty request hints and hints over 256 bytes are ignored.
@@ -1442,7 +1444,6 @@ Target fields:
 | `backup` | bool | false | Reserved for fallback. Excluded from normal selection. |
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
-| `zone` | string | | Availability zone or region label. An operator-visible tag only: the admin API reports it as `origins[].targets[].zone`, and target selection does not read it. Tagging targets with zones does not keep traffic local to one. |
 | `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
@@ -1498,8 +1499,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend WebSocket URL (ws:// or wss://) |
-| `subprotocols` | list | | Subprotocols this origin is meant to support. Accepted by config; not currently read anywhere the gateway negotiates or filters on `Sec-WebSocket-Protocol`. |
-| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB). Accepted by config; not currently enforced, frames larger than this pass through unmodified. |
+| `subprotocols` | list | | Allowlist for `Sec-WebSocket-Protocol` negotiation. Empty leaves negotiation to the client and upstream; non-empty filters the client's offer, refuses an offer with no allowed subprotocol (`400`), and refuses an upstream selection outside the negotiated set (`502`). |
+| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB), enforced in both directions on the upgraded tunnel. A message declaring more payload than this closes the connection. |
 
 ### grpc
 

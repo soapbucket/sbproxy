@@ -8,6 +8,16 @@
 use super::*;
 use sbproxy_config::types::FailureMode;
 
+/// Whether the inbound request asks for a WebSocket upgrade.
+fn is_websocket_upgrade_request(request: &pingora_http::RequestHeader) -> bool {
+    request
+        .headers
+        .get(http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("websocket"))
+        .unwrap_or(false)
+}
+
 /// Handle non-proxy actions directly in request_filter.
 /// Returns Ok(true) if the action was handled (short-circuit), Ok(false) for Proxy.
 pub(super) async fn handle_action(
@@ -18,7 +28,48 @@ pub(super) async fn handle_action(
     ctx: &mut RequestContext,
 ) -> Result<bool> {
     match action {
-        Action::Proxy(_) | Action::LoadBalancer(_) | Action::WebSocket(_) | Action::A2a(_) => {
+        Action::Proxy(_) | Action::LoadBalancer(_) | Action::A2a(_) => Ok(false),
+
+        Action::WebSocket(ws) => {
+            // WOR-2490: enforce the `subprotocols` allowlist before any
+            // upstream connection exists. A client that offers only
+            // subprotocols this origin does not support gets a 400 here;
+            // the offer that does go upstream is filtered to the
+            // configured set in `upstream_request_filter`, and the
+            // upstream's selection is checked against the same set when
+            // the 101 comes back.
+            if !ws.subprotocols.is_empty() {
+                let request = session.req_header();
+                if is_websocket_upgrade_request(request) {
+                    let offered =
+                        sbproxy_modules::action::websocket::parse_subprotocol_header_values(
+                            request
+                                .headers
+                                .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+                                .iter()
+                                .filter_map(|value| value.to_str().ok()),
+                        );
+                    // No offer at all passes: the allowlist constrains what
+                    // gets negotiated, it does not require negotiation.
+                    if !offered.is_empty()
+                        && ws
+                            .permitted_subprotocols(&offered)
+                            .is_some_and(|permitted| permitted.is_empty())
+                    {
+                        debug!(
+                            offered = offered.len(),
+                            "websocket upgrade refused: no offered subprotocol is configured for this origin"
+                        );
+                        send_error(
+                            session,
+                            400,
+                            "websocket subprotocol negotiation failed: no offered subprotocol is enabled for this origin",
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                }
+            }
             Ok(false)
         }
 
@@ -55,6 +106,59 @@ pub(super) async fn handle_action(
                     return Ok(true);
                 };
                 ctx.graphql_request_body = Some(body);
+            }
+
+            // WOR-2490: refuse an invalid request here, before any upstream
+            // connection is attempted. The validation in
+            // `upstream_request_filter` runs after Pingora has connected, so
+            // an invalid query against a down upstream used to surface as
+            // the connect failure's 502 instead of this 400.
+            //
+            // Only possible when the outbound request is already final: a
+            // request modifier can rewrite the method, URI, headers, or
+            // body in `upstream_request_filter`, and the modified request
+            // is the one the GraphQL contract holds. With any modifier
+            // configured for this route, validation stays exclusively at
+            // the post-modifier seam.
+            let route_is_final = origin_idx.is_some_and(|idx| {
+                super::proxy_http::request_modifiers_for_route(pipeline, idx, ctx.forward_rule_idx)
+                    .is_empty()
+            });
+            if route_is_final {
+                let request = session.req_header();
+                let inbound_body_present = ctx
+                    .graphql_request_body
+                    .as_ref()
+                    .is_some_and(|body| !body.is_empty());
+                let validation_result = match request.method {
+                    http::Method::GET => {
+                        if inbound_body_present {
+                            Err("validated GraphQL GET requests must not contain a body"
+                                .to_string())
+                        } else {
+                            graphql.validate_get_query(request.uri.query())
+                        }
+                    }
+                    http::Method::POST => {
+                        let content_type = request
+                            .headers
+                            .get(http::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok());
+                        let body = ctx.graphql_request_body.clone().unwrap_or_default();
+                        graphql.validate_post_body(content_type, &body)
+                    }
+                    _ => Err("validated GraphQL actions accept GET or POST only".to_string()),
+                };
+                if let Err(detail) = validation_result {
+                    debug!(detail = %detail, "GraphQL request validation failed");
+                    let body = serde_json::json!({
+                        "error": "GraphQL request validation failed",
+                        "detail": detail,
+                    })
+                    .to_string();
+                    send_response(session, 400, "application/json", body.as_bytes()).await?;
+                    return Ok(true);
+                }
             }
             Ok(false)
         }
@@ -130,13 +234,7 @@ pub(super) async fn handle_action(
             // transparent forwarding flow.
             let method = session.req_header().method.clone();
             let path = session.req_header().uri.path().to_string();
-            let is_websocket_upgrade = session
-                .req_header()
-                .headers
-                .get("upgrade")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_ascii_lowercase().contains("websocket"))
-                .unwrap_or(false);
+            let is_websocket_upgrade = is_websocket_upgrade_request(session.req_header());
             let surface_for_check = sbproxy_ai::handler::classify_surface(method.as_str(), &path);
             if method == http::Method::GET
                 && is_websocket_upgrade

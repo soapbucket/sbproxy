@@ -10,6 +10,7 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+<<<<<<< HEAD
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised
@@ -25,6 +26,29 @@ the next version cut.
   request and exit keep working: a child that dies after serving is
   respawned on the next call. See the stdio section of
   [docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md).
+=======
+### Fixed
+
+- **The `websocket` action's `max_message_size` and `subprotocols` are
+  enforced.** Both fields parsed and did nothing. `max_message_size`
+  (default 10 MB, now enforced including the default) closes the
+  upgraded tunnel as soon as a message in either direction declares
+  more payload than the cap; frame headers are scanned, payloads are
+  never read or buffered. A non-empty `subprotocols` list now
+  allowlists `Sec-WebSocket-Protocol` negotiation: the client's offer
+  is filtered to it before going upstream, an offer with no allowed
+  entry is refused with a `400` before any upstream connection, and an
+  upstream selection outside the negotiated set fails the upgrade with
+  a `502`.
+- **GraphQL validation refuses before connecting upstream.** On a
+  validated `graphql` origin without `request_modifiers`, an invalid
+  document now gets its `400` in the request phase, before any upstream
+  connection is attempted; previously validation ran only after the
+  connect, so an invalid query against a down upstream surfaced as a
+  `502`. Routes with `request_modifiers` still validate at the
+  post-modifier seam, since the modified request is the one the
+  contract holds.
+>>>>>>> origin/main
 
 ## [1.13.0] - 2026-08-18
 

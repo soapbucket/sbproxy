@@ -43,11 +43,11 @@ When the document passes, the exact validated bytes are forwarded, so the upstre
 
 ## Where validation runs, and the two consequences
 
-Validation runs late, after every request modifier has produced the final outbound method, URI, headers, and body. That placement is deliberate: validating the inbound bytes and then letting a modifier rewrite them would let a benign document pass and a forbidden one ship. It has two visible consequences.
+The document a request modifier produces is the one the GraphQL contract holds, so the authoritative validation runs after every modifier has produced the final outbound method, URI, headers, and body. Validating only the inbound bytes and then letting a modifier rewrite them would let a benign document pass and a forbidden one ship. On a route with no `request_modifiers`, which is to say the common case, the inbound request already is the final request, and the gateway validates it in the request phase instead, before any upstream connection is attempted. Two visible consequences:
 
-**Bodies are capped at 64 KiB.** A validated body has to be buffered and replayed byte-for-byte to the upstream after the check, and the replay buffer is a fixed 64 KiB. A larger body is refused with a bare `413` (`validated GraphQL request body exceeds the 64 KiB replay limit`) before it is parsed, before a route is even resolved. This is the one refusal that is fully independent of the upstream.
+**Bodies are capped at 64 KiB.** A validated body has to be buffered and replayed byte-for-byte to the upstream after the check, and the replay buffer is a fixed 64 KiB. A larger body is refused with a bare `413` (`validated GraphQL request body exceeds the 64 KiB replay limit`) before it is parsed, before a route is even resolved.
 
-**An unreachable upstream answers `502`, not `400`.** The parse runs in the phase that builds the upstream request, which only exists once the upstream connection has been established. If the upstream is down, the connect failure wins and the client sees `502 Bad Gateway`; the validation code never runs for that request. Do not read a `502` on a malformed query as validation being off: with the upstream healthy, the same query gets its `400`. [`examples/graphql-gateway/`](../examples/graphql-gateway/) demonstrates both sides of this with a stopped and a running fixture.
+**Refusals do not wait for the upstream, except behind modifiers.** Without `request_modifiers` on the route, an invalid document gets its `400` whether or not the upstream is reachable; only a document that passes validation goes on to the connect, where a dead upstream is still a `502 Bad Gateway`. A route that does configure `request_modifiers` validates only at the post-modifier seam, which runs on an established connection, so there an invalid query against a down upstream surfaces as the connect failure's `502` instead.
 
 ## Honest limits
 

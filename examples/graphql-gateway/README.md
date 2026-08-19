@@ -27,7 +27,7 @@ content-type: application/json
 {"data": {"viewer": {"login": "octoproxy", "receivedQueryBytes": 20}}}
 ```
 
-Everything below this line is a refusal. **This is the one step in this walkthrough that needs the fixture up for its passing outcome**; the refusals below are all gateway-side, but as the section at the end explains, most of them still need the fixture reachable to return their documented status instead of a connect failure.
+Everything below this line is a refusal. **This is the one step in this walkthrough that needs the fixture up**; the refusals below are all gateway-side and come back the same with the fixture stopped, as the section at the end explains.
 
 **Malformed syntax.** An unclosed selection set fails to parse.
 
@@ -106,12 +106,12 @@ That one comes back as a bare `413`, not the `{"detail":...,"error":"GraphQL req
 
 ## Which refusals need the fixture running
 
-This is the one genuinely non-obvious part of how this action is wired, so it is worth being precise about it instead of waving at "validation happens gateway-side."
+None of them. Every refusal in this walkthrough is gateway-side:
 
-- **Oversized body → 413**: fully gateway-side. It is enforced in the same phase that first sees the request, before routing or any upstream connection attempt. Stop `fixture.py` and this refusal still returns `413` unchanged.
-- **Malformed syntax, introspection, depth, batch, and persisted-query refusals → 400**: the parsing that produces these runs *after* the proxy has already picked an upstream and opened a connection to it, so it can validate the exact request a modifier chain would have sent. If `fixture.py` is not running, the same malformed query gets a `502 Bad Gateway` (a connect failure) instead of the `400` shown above, because the connection attempt fails before validation code ever runs. Keep the fixture up for every refusal case in this walkthrough except the oversized-body one, or you will see a `502` and wrongly conclude the refusal itself changed.
+- **Oversized body → 413**: enforced in the same phase that first sees the request, before routing or any upstream connection attempt.
+- **Malformed syntax, introspection, depth, batch, and persisted-query refusals → 400**: this config has no `request_modifiers`, so the inbound request is already the final request and the gateway validates it in the request phase, before any connect. Stop `fixture.py` and each refusal still comes back exactly as shown above; only a query that *passes* validation then needs the fixture, and gets a `502 Bad Gateway` connect failure without it.
 
-Both follow from "validate after modifiers, forward byte-for-byte": the proxy needs a resolved upstream connection before it can hand `upstream_request_filter` a fully-built outbound request to validate against, so that connection has to succeed first.
+One caveat worth knowing when you add `request_modifiers` to a validated `graphql` origin: the document a modifier produces is the one the contract holds, so validation moves to the post-modifier seam, which runs on an established upstream connection. On such a route, an invalid query against a down upstream surfaces as the connect failure's `502` instead of the `400`.
 
 ## What this exercises
 

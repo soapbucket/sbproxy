@@ -2237,6 +2237,11 @@ export interface PlaygroundEndpoints {
 export interface PlaygroundChatRequest {
   origin: string;
   request: Record<string, unknown>;
+  /** The server refuses `/chat` without this exact value: the route
+   *  skips key policy, budgets, and guardrails, so the bypass must be
+   *  explicit. The UI never sets it; the Playground page dispatches
+   *  through `playgroundDispatch` instead. */
+  bypass_governance: true;
   debug?: boolean;
 }
 export interface PlaygroundChatResult {
@@ -2758,6 +2763,9 @@ export const api = {
   // Playground
   playgroundEndpoints: () =>
     getJson<PlaygroundEndpoints>("/admin/api/playground/endpoints"),
+  // Ungoverned engine call, kept for scripting only: the server refuses
+  // it unless the body carries `bypass_governance: true`, and audits
+  // every completion. The UI does not call this.
   playgroundChat: (body: PlaygroundChatRequest) =>
     sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/chat", body),
   // Real dispatch: runs the request through the actual data-plane pipeline

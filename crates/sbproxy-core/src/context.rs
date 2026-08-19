@@ -762,6 +762,14 @@ pub struct RequestContext {
     /// so that the body filter phase can swap it in before sending upstream.
     pub replacement_request_body: Option<bytes::Bytes>,
 
+    // --- WebSocket tunnel enforcement ---
+    /// Message-size scanner for an upgraded `websocket`-action tunnel.
+    /// Armed in `response_filter` when the upstream answers
+    /// `101 Switching Protocols`, then fed every tunnel chunk by the two
+    /// body filters. `None` for everything that is not an accepted
+    /// `websocket`-action upgrade.
+    pub websocket_tunnel: Option<sbproxy_modules::action::websocket::WebSocketTunnelGuard>,
+
     // --- GraphQL validation state ---
     /// Whether the resolved GraphQL action requires validation of the final
     /// outbound request after request modifiers have run.
@@ -1728,6 +1736,7 @@ impl RequestContext {
             fallback_body: None,
             csrf_cookie: None,
             replacement_request_body: None,
+            websocket_tunnel: None,
             graphql_validation_pending: false,
             graphql_request_body: None,
             graphql_validated_request_body: None,

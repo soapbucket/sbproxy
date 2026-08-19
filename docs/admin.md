@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -290,7 +290,7 @@ surface covers:
 | Cache | Response-cache status/purge, semantic-cache decisions, key-policy cache invalidation. |
 | Prompts | The runtime prompt-overlay snapshot, versioning, and pinning. |
 | Observability | `/metrics`, the request log and its live stream, spend, audit, and rate-limit budget state. |
-| Chat playground | Run a chat completion against any configured AI endpoint from the dashboard, either straight against the AI client or impersonating a virtual key through the real request pipeline. |
+| Chat playground | Run a chat completion against any configured AI endpoint from the dashboard, impersonating a virtual key through the real request pipeline. A direct engine call exists for scripting but requires an explicit, audited `bypass_governance: true`. |
 
 Two things worth calling out here because they affect how you read the config
 reference below:
@@ -362,9 +362,12 @@ before using it over anything but loopback.
   through key policy, governance, routing, and guardrails exactly like
   that key's own traffic, instead of calling the AI client directly.
   Plain-HTTP AI origins only; an origin requiring TLS is not yet
-  supported from the playground. The direct, bypass-everything call is
-  still available as its own API route (`POST
-  /admin/api/playground/chat`) for scripting.
+  supported from the playground. The direct, bypass-everything call
+  (`POST /admin/api/playground/chat`) remains available for scripting,
+  but it no longer runs by accident: the body must carry
+  `bypass_governance: true` or the call returns `400` pointing at
+  `/dispatch`, and every completion it does run emits an admin audit
+  event naming the operator, origin, and model.
 
 See [admin-ui.md](admin-ui.md) for a page-by-page reference: what each
 page shows, what it can mutate, and which API paths back it.

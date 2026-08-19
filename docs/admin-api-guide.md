@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-18*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -268,8 +268,10 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/keys" \
 ```
 
 **Run a chat completion through the playground** (the same AI client
-the data plane uses, bypassing per-origin policy. See
-[admin-api-reference.md](admin-api-reference.md#chat-playground)):
+the data plane uses, bypassing per-origin policy. The bypass must be
+explicit: without `"bypass_governance": true` the call returns `400`,
+and every completion is audited with the operator, origin, and model.
+See [admin-api-reference.md](admin-api-reference.md#chat-playground)):
 
 ```bash
 # See what AI origins/models are configured.
@@ -281,7 +283,8 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" -X POST \
   -H 'Content-Type: application/json' \
   -d '{
     "origin": "ai.example.com",
-    "request": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}
+    "request": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]},
+    "bypass_governance": true
   }' | jq '{status, model, usage, cost_usd, latency_ms}'
 ```
 
