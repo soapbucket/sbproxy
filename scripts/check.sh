@@ -37,12 +37,38 @@
 #   SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1  permit the serial cargo test fallback
 #   SBPROXY_CHECK_PRIVATE_DOCS=1         extra rustdoc pass over private items
 #                                        (stricter than CI; see that phase)
+#   SBPROXY_SKIP_CARGO=1                 dev-only: stop before the first
+#                                        cargo compile phase so the script
+#                                        phases can be exercised end to end
+#                                        on their own. A run with this set
+#                                        is not a gate result; the skipped
+#                                        lanes are reprinted in the SKIPPED
+#                                        PHASES block.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Per-phase wall-clock. Each `step` call closes out the previous phase
+# with its duration, and `finish_step` closes the last one before the
+# summary, so every serial phase's cost is visible in the log. Phases
+# inside a parallel batch are timed by run_batch instead.
+STEP_STARTED=''
+STEP_LABEL=''
+
+finish_step() {
+  if [ -n "$STEP_STARTED" ]; then
+    printf '\033[2m    (%ss: %s)\033[0m\n' \
+      "$(( $(date +%s) - STEP_STARTED ))" "$STEP_LABEL"
+  fi
+  STEP_STARTED=''
+  STEP_LABEL=''
+}
+
 step() {
+  finish_step
+  STEP_STARTED="$(date +%s)"
+  STEP_LABEL="$*"
   printf '\n\033[1;34m==>\033[0m %s\n' "$*"
 }
 
@@ -70,11 +96,93 @@ print_skip_summary() {
 }
 
 cleanup() {
+  if [ -n "${BATCH_DIR:-}" ]; then
+    rm -rf "$BATCH_DIR"
+  fi
   if [ "${SBPROXY_CLEAN_AFTER_BUILD:-1}" != "0" ]; then
     "$ROOT/scripts/cleanup-build-artifacts.sh"
   fi
 }
 trap cleanup EXIT
+
+# --- Parallel batches for the pure-script phases ------------------------
+#
+# The phases that only read the tree run concurrently in small ordered
+# batches instead of one long serial line. The rules:
+#
+#   * Only phases proven read-only against the repository are batched.
+#     Every batched script was read before it was grouped; anything that
+#     regenerates a file, writes even a temp sandbox, or binds a port
+#     (the doc-generator tests have leaked a listener on 18091 before)
+#     stays serial, exactly where it was.
+#   * The batches themselves stay ordered cheapest first. Cheapest-first
+#     fail-fast is lost inside a batch, but held between batches.
+#   * Each member writes to its own file under BATCH_DIR and is printed
+#     as one contiguous block after the batch settles, so a failure
+#     surfaces under its own phase name with its output intact instead
+#     of interleaved with its neighbors'.
+#   * Every member is waited on individually and exit codes aggregate:
+#     any failure fails the gate, after every member has reported.
+#
+# The EXIT trap above is process-scoped and does not fire when a
+# subshell ends, so all cleanup stays in this shell: batch members
+# install no traps and clean up nothing. None of them calls note_skip
+# either, which could not propagate out of a subshell; every phase that
+# can record a skip stays serial.
+
+BATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-gate-batch.XXXXXX")"
+
+# run_batch "<title>" <fn> "<phase name>" [<fn> "<phase name>"]...
+run_batch() {
+  local title="$1"
+  shift
+
+  local -a fns=() labels=() pids=()
+  while [ "$#" -gt 0 ]; do
+    fns+=("$1")
+    labels+=("$2")
+    shift 2
+  done
+
+  step "$title (${#fns[@]} checks in parallel)"
+
+  local i out
+  for i in "${!fns[@]}"; do
+    out="$BATCH_DIR/${fns[$i]}"
+    # shellcheck disable=SC2030  # rc/start are deliberately subshell-local
+    (
+      start="$(date +%s)"
+      set +e
+      ( set -e; "${fns[$i]}" ) >"$out.log" 2>&1
+      rc=$?
+      printf '%s' "$(( $(date +%s) - start ))" >"$out.time"
+      exit "$rc"
+    ) &
+    pids+=("$!")
+  done
+
+  local rc elapsed failed=''
+  for i in "${!fns[@]}"; do
+    rc=0
+    # shellcheck disable=SC2031  # rc here is the parent's, set from wait
+    wait "${pids[$i]}" || rc=$?
+    out="$BATCH_DIR/${fns[$i]}"
+    elapsed="$(cat "$out.time" 2>/dev/null || printf '?')"
+    if [ "$rc" -eq 0 ]; then
+      printf '\n  \033[1;34m*\033[0m %s (%ss)\n' "${labels[$i]}" "$elapsed"
+    else
+      printf '\n  \033[1;31m* FAILED:\033[0m %s (exit %s after %ss)\n' \
+        "${labels[$i]}" "$rc" "$elapsed"
+      failed="${failed}  * ${labels[$i]}"$'\n'
+    fi
+    sed 's/^/    /' "$out.log"
+  done
+
+  if [ -n "$failed" ]; then
+    printf '\n\033[1;31mFAILED in this batch:\033[0m\n%s' "$failed" >&2
+    exit 1
+  fi
+}
 
 # --- Working-tree guard, part 1 of 2 -----------------------------------
 #
@@ -123,21 +231,109 @@ fi
 
 # =======================================================================
 # Phase 1: seconds each. No cargo, no compile.
+#
+# The read-only scans run as one parallel batch. Each script named in
+# the batch was read and proven not to write inside the repository
+# before it was grouped:
+#
+#   * tracker placeholders, spec citations, env mutation: grep only.
+#   * pub-item and unwrap ratchets: python scans over the source plus a
+#     read of their committed baselines; the scanners write nothing.
+#   * NOTICE coverage: `cargo metadata --locked`, which refuses to
+#     rewrite Cargo.lock rather than regenerating it.
+#   * secret-resolver drift: python source scan.
+#   * doc drift: grep/sed plus a python read of the generated schema.
+#
+# The rest of this phase stays serial: the llms-full guard regenerates
+# the corpus into a temp file when the branch carries it, the helper
+# self-tests build mktemp sandboxes, the installer test builds a fake
+# release and runs the installer against it, and `make tapes-check`
+# runs the doc-generator test module, which binds listeners (it has
+# leaked one on port 18091 before). Writers and port binders are not
+# batched.
 # =======================================================================
 
 # CI: ci.yml lint lane, "no internal tracker placeholders". A literal
 # WOR-XXX is an unfinished TODO that announces incomplete work without
 # making it trackable.
-step "no internal tracker placeholders"
-if grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'; then
-  printf '\nWOR-XXX placeholders are not allowed in crates/.\n' >&2
-  printf 'Open a real ticket and cite it by full URL, or rewrite the line\n' >&2
-  printf 'as prose. Reproduce with:\n\n' >&2
-  printf "  grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'\n" >&2
-  exit 1
-fi
-printf 'no WOR-XXX placeholders under crates/\n'
+batch_tracker_placeholders() {
+  if grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'; then
+    printf '\nWOR-XXX placeholders are not allowed in crates/.\n' >&2
+    printf 'Open a real ticket and cite it by full URL, or rewrite the line\n' >&2
+    printf 'as prose. Reproduce with:\n\n' >&2
+    printf "  grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'\n" >&2
+    exit 1
+  fi
+  printf 'no WOR-XXX placeholders under crates/\n'
+}
 
+# CI: ci.yml test lane, "no new pub items whose only consumer is a test".
+# Pure python, a few seconds, and the highest value per second in this
+# file: dead_code cannot see a pub item inside a pub mod, so write-only
+# code otherwise lands with a green build.
+batch_pub_item_ratchet() {
+  bash "$ROOT/scripts/check-pub-item-ratchet.sh"
+}
+
+# Each of these ends the process on a path a caller cannot catch, which in a
+# proxy means a dropped request rather than an error a client can act on.
+# Clippy's equivalent lints cannot express this: the lint lane runs with
+# -D warnings, so warn and deny are one level and there is no ratchet to
+# hold, and all three fire in test code where they are the correct thing to
+# write. See the script header.
+batch_unwrap_ratchet() {
+  bash "$ROOT/scripts/check-unwrap-ratchet.sh"
+}
+
+# CI: docs-ci.yml, "spec citation hygiene".
+batch_spec_citations() {
+  bash "$ROOT/scripts/check-spec-citations.sh"
+}
+
+# CI: ci.yml lint lane, "no process-global env mutation outside test
+# helpers" (WOR-646). Pure grep. Production code must not call
+# std::env::set_var / remove_var; tests go through the per-crate
+# EnvVarGuard in src/test_env.rs.
+batch_env_mutation() {
+  bash "$ROOT/scripts/check-env-mutation.sh"
+}
+
+# WOR-2449: Apache 2.0 section 4(d) attribution for Apache-2.0-only
+# crates. cargo metadata, no compile. Shares one script with the CI
+# lint lane. The CLAUDE.md / AGENTS.md snippet is no longer the check.
+batch_notice_coverage() {
+  bash "$ROOT/scripts/check-notice.sh"
+}
+
+# WOR-2287: guardrail for the WOR-2282 secret-resolver convergence. Pure
+# python source scan, no CI job of its own yet (not currently mirrored in
+# .github/workflows/ci.yml), so this local gate is presently the only
+# place it runs. Refuses a hand-rolled env:/file:/provider-URI scheme
+# match outside crates/sbproxy-vault/src/, and a secret-shaped function
+# whose fallback hands a parameter back unchanged without first calling a
+# reference-shape guard -- the bug class WOR-2283 fixed.
+batch_secret_resolver_drift() {
+  python3 "$ROOT/scripts/check-secret-resolver-drift.py"
+}
+
+# CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
+# unimplemented-feature claims in user-facing docs.
+batch_doc_drift() {
+  bash "$ROOT/scripts/check-doc-drift.sh"
+}
+
+run_batch "read-only source and doc scans" \
+  batch_tracker_placeholders "no internal tracker placeholders" \
+  batch_pub_item_ratchet "pub items whose only consumer is a test (ratchet)" \
+  batch_unwrap_ratchet "unwrap/expect/panic in production code (ratchet)" \
+  batch_spec_citations "spec citation hygiene" \
+  batch_env_mutation "no process-global env mutation outside test helpers" \
+  batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
+  batch_secret_resolver_drift "secret-resolver drift (no new ad-hoc secret parsers)" \
+  batch_doc_drift "doc drift"
+
+# Serial: regen-llms-full.sh --check rebuilds the corpus into a temp
+# file when the branch carries it, and this phase can record a skip.
 # CI: docs-ci.yml, "llms-full.txt is current if carried". A branch may
 # carry the corpus, and the rule is that it has to be what the generator
 # produces rather than a hand edit. Nothing rejects the file any more:
@@ -167,49 +363,7 @@ else
   fi
 fi
 
-# CI: ci.yml test lane, "no new pub items whose only consumer is a test".
-# Pure python, a few seconds, and the highest value per second in this
-# file: dead_code cannot see a pub item inside a pub mod, so write-only
-# code otherwise lands with a green build.
-step "pub items whose only consumer is a test (ratchet)"
-bash "$ROOT/scripts/check-pub-item-ratchet.sh"
-
-# Each of these ends the process on a path a caller cannot catch, which in a
-# proxy means a dropped request rather than an error a client can act on.
-# Clippy's equivalent lints cannot express this: the lint lane runs with
-# -D warnings, so warn and deny are one level and there is no ratchet to
-# hold, and all three fire in test code where they are the correct thing to
-# write. See the script header.
-step "unwrap/expect/panic in production code (ratchet)"
-bash "$ROOT/scripts/check-unwrap-ratchet.sh"
-
-# CI: docs-ci.yml, "spec citation hygiene".
-step "spec citation hygiene"
-bash "$ROOT/scripts/check-spec-citations.sh"
-
-# CI: ci.yml lint lane, "no process-global env mutation outside test
-# helpers" (WOR-646). Pure grep. Production code must not call
-# std::env::set_var / remove_var; tests go through the per-crate
-# EnvVarGuard in src/test_env.rs.
-step "no process-global env mutation outside test helpers"
-bash "$ROOT/scripts/check-env-mutation.sh"
-
-# WOR-2449: Apache 2.0 section 4(d) attribution for Apache-2.0-only
-# crates. cargo metadata, no compile. Shares one script with the CI
-# lint lane. The CLAUDE.md / AGENTS.md snippet is no longer the check.
-step "NOTICE covers Apache-2.0-only crates"
-bash "$ROOT/scripts/check-notice.sh"
-
-# WOR-2287: guardrail for the WOR-2282 secret-resolver convergence. Pure
-# python source scan, no CI job of its own yet (not currently mirrored in
-# .github/workflows/ci.yml), so this local gate is presently the only
-# place it runs. Refuses a hand-rolled env:/file:/provider-URI scheme
-# match outside crates/sbproxy-vault/src/, and a secret-shaped function
-# whose fallback hands a parameter back unchanged without first calling a
-# reference-shape guard -- the bug class WOR-2283 fixed.
-step "secret-resolver drift (no new ad-hoc secret parsers)"
-python3 "$ROOT/scripts/check-secret-resolver-drift.py"
-
+# Serial: each self-test builds and tears down a mktemp sandbox.
 # These helpers steer the gate around expensive or destructive work, so run
 # their branch tests before any Cargo build or CI-equivalent cleanup.
 step "gate helper self-tests"
@@ -220,11 +374,9 @@ python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
 python3 "$ROOT/scripts/tests/test_notice_coverage.py"
 
-# CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
-# unimplemented-feature claims in user-facing docs.
-step "doc drift"
-bash "$ROOT/scripts/check-doc-drift.sh"
-
+# Serial: the test_doc_generators module binds listeners and has
+# leaked one on port 18091 before; nothing that opens a port runs
+# concurrently with anything else in this gate.
 # CI: docs-ci.yml, "generated tapes and GIF wiring are current", which
 # is `make tapes-check`. That target is three commands, the last of
 # which is the whole scripts.tests.test_doc_generators module. This gate
@@ -241,22 +393,30 @@ if ! command -v make >/dev/null 2>&1; then
 fi
 make tapes-check
 
+# The three generator --check drift scans only read the tree. Each was
+# read before it was grouped: check-doc-assets.py never writes,
+# sync-doc-configs.py writes only when --check is absent, and
+# gen-examples-catalog.py --check compares in memory and writes nothing.
+
 # CI: ci.yml lint lane and docs-ci.yml, "every promised doc asset exists".
-# The step above keeps each tape in sync with its example's config and
-# never looks in docs/assets/, and wire-example-gifs.py only inserts an
-# image that is already on disk. So neither of them can see a tape whose
-# recording was never run, or a README embed pointing at the GIF that
-# recording would have produced. Both shipped that way before this ran.
-step "every promised doc asset exists"
-PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-doc-assets.py"
+# The tapes step above keeps each tape in sync with its example's config
+# and never looks in docs/assets/, and wire-example-gifs.py only inserts
+# an image that is already on disk. So neither of them can see a tape
+# whose recording was never run, or a README embed pointing at the GIF
+# that recording would have produced. Both shipped that way before this
+# ran.
+batch_doc_assets() {
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-doc-assets.py"
+}
 
 # CI: docs-ci.yml, "documentation configs match canonical examples".
 # The `every_oss_example_compiles` half of that CI step is covered by
 # the workspace test lane below; do not add a `-p sbproxy-config`
 # invocation here, because a narrow package selection resolves a
 # different feature union than CI and reports failures CI never sees.
-step "documentation configs match canonical examples"
-PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
+batch_doc_configs() {
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
+}
 
 # Not a CI lane, because there isn't one. examples/README.md is generated
 # by gen-examples-catalog.py, which has supported --check since it was
@@ -264,9 +424,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
 # Makefile. It had silently drifted by two rows on main. A generated file
 # with a drift checker nobody invokes is the same failure as having no
 # checker at all.
-step "examples catalog is current"
-PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
+batch_examples_catalog() {
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
+}
 
+run_batch "generator --check drift scans" \
+  batch_doc_assets "every promised doc asset exists" \
+  batch_doc_configs "documentation configs match canonical examples" \
+  batch_examples_catalog "examples catalog is current"
+
+# Serial: the opt-in replay path spawns fixture and proxy processes on
+# real ports, and the phase records a skip on the default path.
 # Captures are the output blocks a doc shows under a CAPTURE marker. The
 # structural half runs here always: every marker has a block, and no
 # block is empty. Both are cheap and both have caught real defects, since
@@ -286,6 +454,8 @@ else
   note_skip "replaying documented commands (set SBPROXY_CHECK_CAPTURES=1, with a payments-featured binary in SBPROXY_CAPTURE_BIN, to re-run each captured command and diff it against the block the doc shows)"
 fi
 
+# Serial: builds a fake release under mktemp and runs the installer
+# against it.
 # CI: ci.yml test lane. No network, no cargo.
 step "install.sh verifies its download"
 sh "$ROOT/scripts/tests/install_verify.sh"
@@ -305,19 +475,58 @@ fi
 # =======================================================================
 # Phase 2: seconds to about a minute. Resolves or type-checks, but does
 # not compile the workspace.
+#
+# fmt --check, the tape-secrets scan, the nested-lockfile guard, and the
+# npm audit only read the tree, so they run as one batch:
+# `cargo fmt -- --check` rewrites nothing, the lockfile guard runs
+# `cargo metadata --locked` (which refuses to update a lockfile), and
+# `npm audit --package-lock-only` resolves from ui/package-lock.json
+# without installing anything. cargo-deny stays serial: it refreshes its
+# advisory database on disk and resolves the full graph. The UI phase
+# stays serial too: `npm ci` deletes and reinstalls node_modules when
+# the lockfile moved, and vitest spawns its own worker pool.
 # =======================================================================
 
-step "cargo fmt --check"
-cargo fmt --all -- --check
+batch_cargo_fmt() {
+  cargo fmt --all -- --check
+}
+
+# Reads docs/tapes/*.tape and nothing else; see the script header for
+# the credential-rendering bug class it guards against.
+batch_tape_secrets() {
+  bash "$ROOT/scripts/check-tape-secrets.sh"
+}
 
 # CI: ci.yml lint lane. The bench harnesses and the config-source
 # fixture are their own workspaces that path-depend on this one, so a
 # dependency added here leaves their lockfiles stale. No cargo step in
 # this gate opens them, which is why that drift used to reach CI
 # untouched.
-step "standalone workspace lockfiles are current"
-bash "$ROOT/scripts/check-tape-secrets.sh"
-bash "$ROOT/scripts/check-nested-lockfiles.sh"
+batch_nested_lockfiles() {
+  bash "$ROOT/scripts/check-nested-lockfiles.sh"
+}
+
+# CI: ci.yml supply-chain lane, second step. cargo-deny cannot see the
+# admin SPA's npm graph, so a high-severity advisory there used to pass
+# every gate in this file. `--package-lock-only` resolves the tree from
+# ui/package-lock.json without installing anything, so this runs before
+# the UI phase below and does not depend on node_modules existing.
+# `--audit-level=high` matches CI; see SUPPLY-CHAIN.md section 4.3 for
+# why the threshold sits there. Unconditional, because CI requires it and
+# the UI phase below already hard-fails when npm is missing.
+batch_npm_audit() {
+  if ! command -v npm >/dev/null 2>&1; then
+    printf 'npm not found on PATH; install Node.js (https://nodejs.org) to run the npm audit gate. This step is required by CI, so it cannot be skipped here.\n' >&2
+    exit 1
+  fi
+  (cd ui && npm audit --package-lock-only --audit-level=high)
+}
+
+run_batch "fmt, lockfiles, npm audit" \
+  batch_cargo_fmt "cargo fmt --check" \
+  batch_tape_secrets "tapes do not render credentials" \
+  batch_nested_lockfiles "standalone workspace lockfiles are current" \
+  batch_npm_audit "supply chain (npm audit, admin UI)"
 
 # CI: ci.yml supply-chain lane, EmbarkStudios/cargo-deny-action with
 # command `check` and arguments `--all-features`, which composes to
@@ -332,21 +541,6 @@ if command -v cargo-deny >/dev/null 2>&1; then
 else
   note_skip "supply chain (cargo-deny not on PATH; advisories, bans, licenses, and sources are unchecked locally). Install with 'cargo install cargo-deny --locked'."
 fi
-
-# CI: ci.yml supply-chain lane, second step. cargo-deny cannot see the
-# admin SPA's npm graph, so a high-severity advisory there used to pass
-# every gate in this file. `--package-lock-only` resolves the tree from
-# ui/package-lock.json without installing anything, so this runs before
-# the UI phase below and does not depend on node_modules existing.
-# `--audit-level=high` matches CI; see SUPPLY-CHAIN.md section 4.3 for
-# why the threshold sits there. Unconditional, because CI requires it and
-# the UI phase below already hard-fails when npm is missing.
-step "supply chain (npm audit, admin UI)"
-if ! command -v npm >/dev/null 2>&1; then
-  printf 'npm not found on PATH; install Node.js (https://nodejs.org) to run the npm audit gate. This step is required by CI, so it cannot be skipped here.\n' >&2
-  exit 1
-fi
-(cd ui && npm audit --package-lock-only --audit-level=high)
 
 # CI: ci.yml ui lane.
 step "ui typecheck and test"
@@ -365,7 +559,18 @@ fi
 
 # =======================================================================
 # Phase 3: minutes. Compiles the workspace.
+#
+# SBPROXY_SKIP_CARGO=1 skips everything from here to the working-tree
+# re-check: every cargo compile/test/doc invocation, the generated
+# artifact checks that exec built binaries, and the payments lane. It
+# exists so a change to this script's cheap phases can be exercised end
+# to end without paying a workspace build. It is never a substitute for
+# the gate, and the skip is reprinted in the SKIPPED PHASES block.
 # =======================================================================
+
+if [ "${SBPROXY_SKIP_CARGO:-0}" = "1" ]; then
+  note_skip "cargo build/test/doctest/clippy/doc, the generated-artifact checks, and the payments lane (SBPROXY_SKIP_CARGO=1 is a dev-only switch for exercising the script phases; a run with it set is not a gate result)"
+else
 
 # One package selection for every cargo invocation below, which is the
 # invariant ci.yml holds: under resolver = "2" the feature union is
@@ -644,6 +849,9 @@ else
   note_skip "payment settlement features (set SBPROXY_CHECK_PAYMENTS=1 to run it). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI requires this lane."
 fi
 
+# Closes the SBPROXY_SKIP_CARGO guard around every cargo phase.
+fi
+
 # =======================================================================
 # Phase 4: what will actually be pushed.
 # =======================================================================
@@ -712,6 +920,7 @@ check_clean_tree() {
 
 step "working tree matches HEAD"
 check_clean_tree
+finish_step
 
 print_skip_summary
 
