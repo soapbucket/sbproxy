@@ -1046,10 +1046,15 @@ origins:
         )
         .expect("send malformed query");
     assert_eq!(malformed.status, 400);
-    assert_eq!(
+    // This route has no request modifiers, so since WOR-2490 the refusal
+    // happens in the request phase, before any upstream selection. A
+    // pre-connect 400 leaves no upstream state to poison, so the client
+    // connection stays reusable; only the post-selection path (modifier
+    // routes) must advertise close.
+    assert_ne!(
         malformed.headers.get("connection").map(String::as_str),
         Some("close"),
-        "a rejection after upstream selection must advertise that HTTP/1.1 cannot be reused"
+        "a pre-connect rejection must not tear down a reusable client connection"
     );
 
     let valid_batch_body = json!([
