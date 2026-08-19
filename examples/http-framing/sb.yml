@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# HTTP framing policy: request-smuggling defense.
+#
+# The http_framing policy rejects requests whose body framing is
+# ambiguous in ways a wire-level parser lets through: a request
+# carrying both Content-Length and Transfer-Encoding, duplicate
+# Content-Length headers, a Transfer-Encoding value that is not
+# exactly `chunked`, duplicate Transfer-Encoding headers, and control
+# characters smuggled inside header values. Each violation maps to a
+# known desync primitive that no legitimate client produces, so the
+# policy has no tunable knobs.
+#
+# The policy is the semantic-ambiguity layer on top of Pingora's own
+# parser, and the division of labor matters for what you can observe:
+# Pingora's HTTP/1.1 parser already rejects a malformed or duplicate
+# Content-Length at the wire (a bare `400`, `Server: Pingora`) and
+# already resolves a dual Content-Length + Transfer-Encoding by
+# honoring the chunked encoding, so those never reach the policy. The
+# case the policy owns end to end, and the one this example
+# demonstrates, is a DUPLICATE Transfer-Encoding header: the classic
+# TE.TE attack where one proxy honors the first and another the last.
+# When the policy rejects it, `sbproxy_http_framing_blocks_total`
+# increments with the `reason` label, which the wire-parser rejections
+# do not touch.
+#
+# A normal client cannot send a duplicate header, which is the point,
+# so the violating request below is raw bytes over netcat.
+#
+# Run:
+#   make run CONFIG=examples/http-framing/sb.yml
+#
+# Test:
+#   # 200 - a normal request passes untouched
+#   curl -i -H 'Host: framing.local' http://127.0.0.1:8080/
+#
+#   # 400 - duplicate Transfer-Encoding, rejected by the policy (TE.TE)
+#   printf 'GET / HTTP/1.1\r\nHost: framing.local\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n' \
+#     | nc 127.0.0.1 8080
+#
+#   # The policy's block counter, tagged by reason (admin API, basic auth):
+#   curl -s -u admin:changeme http://127.0.0.1:9091/metrics | grep sbproxy_http_framing_blocks_total
+
+proxy:
+  http_bind_port: 8080
+
+  # Metrics-only admin surface so the block counter above is readable.
+  admin:
+    enabled: true
+    port: 9091
+    # username/password default to admin / changeme; override in real configs.
+
+origins:
+  "framing.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {"framing": "unambiguous", "note": "this body is only reachable through a well-framed request"}
+
+    policies:
+      # No fields: the defense set is hard-coded. See
+      # crates/sbproxy-modules/src/policy/http_framing.rs for the five
+      # violation classes and the metric labels.
+      - type: http_framing

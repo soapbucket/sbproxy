@@ -102,7 +102,10 @@ fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
     assert!(workflow.contains("cargo clippy --manifest-path"));
     assert!(workflow.contains("cargo run --manifest-path"));
     assert!(workflow.matches("--locked").count() >= 3);
-    assert!(workflow.matches("timeout-minutes: 35").count() >= 2);
+    // Every job must carry a bounded timeout. The values themselves move
+    // with cache policy (35 warm, 60 cold since the caches went
+    // restore-only), so pin the property, not the number.
+    assert!(workflow.matches("timeout-minutes:").count() >= 2);
     assert!(!workflow.contains("--input-budget-tokens"));
     assert!(!workflow.contains("--completion-reserve-tokens"));
     assert!(workflow.contains(" check"));

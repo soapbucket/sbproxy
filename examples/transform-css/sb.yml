@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# CSS transform.
+#
+# Rewrites stylesheet responses at the edge: removes the rule blocks
+# for named selectors, appends injected rules, and optionally minifies
+# the result. Useful for stripping a debug or staging banner out of a
+# stylesheet you do not control, or pinning a brand override without
+# redeploying the origin.
+#
+# All three knobs run in one pass, in this order: remove_selectors,
+# then inject, then minify.
+#
+# A `static` action seeds the stylesheet so the example is
+# self-contained. The seeded body carries a comment, a `.debug-banner`
+# rule (removed), and a `body` rule (kept); the transform appends a
+# `.footer` rule and minifies, so the comment disappears too.
+#
+# Run:
+#   make run CONFIG=examples/transform-css/sb.yml
+#
+# Test (no .debug-banner, no comment, one appended .footer rule,
+# single minified line):
+#   curl -i -H 'Host: css.local' http://127.0.0.1:8080/styles.css
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "css.local":
+    action:
+      type: static
+      status: 200
+      content_type: text/css
+      body: |
+        /* site stylesheet, staging build */
+        body {
+          font-family: system-ui, sans-serif;
+          color: #0a1733;
+        }
+        .debug-banner {
+          background: red;
+          color: white;
+          position: fixed;
+          top: 0;
+        }
+
+    transforms:
+      - type: css
+        remove_selectors:
+          - ".debug-banner"
+        inject:
+          - ".footer { color: #555; font-size: 12px; }"
+        minify: true
