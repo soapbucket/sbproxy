@@ -1,0 +1,15 @@
+# Minimal ADRF v0 rule pack for the headless-detection example.
+#
+# The headless indicators themselves are computed by the header-only
+# extractor, not by these rules; agent detection just has to be live
+# for the extractor to run, and a rule pack is the cheapest way to
+# install it. The one rule here names the obvious case so the example
+# also demonstrates a rule-pack hit: a User-Agent that admits to being
+# headless Chromium.
+version: 0
+agents:
+  - id: headless-chromium
+    match:
+      user_agent_pattern: 'HeadlessChrome'
+    provenance: unsigned-named
+    score: 95

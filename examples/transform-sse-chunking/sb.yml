@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# SSE chunking transform.
+#
+# Reframes a plain line-oriented response body as Server-Sent Events:
+# every non-empty line gets the `data: ` prefix and events are
+# separated by blank lines, which is the framing an EventSource client
+# expects. Lines that already carry the prefix are left alone, so the
+# transform is safe to apply to a body that is partially SSE already.
+#
+# `line_prefix` overrides the prefix (default `data: `), for backends
+# that expect a custom field name.
+#
+# A `static` action seeds a three-line body so the example is
+# self-contained; in production this sits in front of an upstream that
+# emits newline-delimited output (log tails, NDJSON feeds) that a
+# browser should consume as an event stream.
+#
+# Run:
+#   make run CONFIG=examples/transform-sse-chunking/sb.yml
+#
+# Test (each input line comes back as one `data:` event):
+#   curl -i -H 'Host: sse.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "sse.local":
+    action:
+      type: static
+      status: 200
+      # The transform rewrites the body, not the headers, so the
+      # content type is declared here.
+      content_type: text/event-stream
+      body: |
+        build started
+        build passed
+        deploy queued
+
+    transforms:
+      - type: sse_chunking
+        # line_prefix: 'data: '   # the default; set to change the field

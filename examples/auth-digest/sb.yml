@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# HTTP Digest authentication (RFC 7616).
+#
+# One user behind a SHA-256 digest challenge. The stored password is
+# not the password itself but the HA1 hash, H(username:realm:password),
+# so the config file never carries the plaintext credential. Here the
+# user is `alice`, the realm is `sbproxy`, the password is `secret`,
+# and the stored value is:
+#
+#   printf 'alice:sbproxy:secret' | shasum -a 256
+#
+# SHA-256 is the default algorithm (RFC 7616 deprecates MD5). Set
+# `algorithm: MD5` only for a legacy client or an HA1 table that
+# cannot be recomputed; the compile step refuses an HA1 whose length
+# does not match the selected algorithm.
+#
+# The provider also enforces RFC 7616 nonce-count monotonicity: a
+# replayed Authorization header (same nonce, same nc) is refused even
+# though the digest itself is valid.
+#
+# Run:
+#   make run CONFIG=examples/auth-digest/sb.yml
+#
+# Test:
+#   # 401 + WWW-Authenticate challenge - no credentials
+#   curl -i -H 'Host: digest.local' http://127.0.0.1:8080/
+#
+#   # 200 - curl answers the challenge (two requests on the wire)
+#   curl -i --digest -u alice:secret -H 'Host: digest.local' http://127.0.0.1:8080/
+#
+#   # 401 - wrong password never matches the stored HA1
+#   curl -i --digest -u alice:wrong -H 'Host: digest.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "digest.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {"authenticated": true, "note": "served after a valid RFC 7616 digest response"}
+
+    authentication:
+      type: digest
+      realm: sbproxy
+      # SHA-256 is the default; spelled out here so the HA1 recipe
+      # above is unambiguous.
+      algorithm: SHA-256
+      users:
+        # HA1 = SHA-256("alice:sbproxy:secret"); the plaintext password
+        # is `secret` and appears only in this comment and the curl.
+        - username: alice
+          password: 666cbbd429e28a3f29a4276b9a3e9c62ddd997fa47a251dcff1a4c63b435cd3f
