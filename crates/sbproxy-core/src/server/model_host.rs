@@ -2218,7 +2218,11 @@ pub enum ManagedDistributedError {
     #[error("managed model has no ready replica; cold-start policy requires provider fallback")]
     ColdStartFallback {
         /// Candidate filtering trace with no executed attempts.
-        trace: crate::model_plane::ManagedRouteTrace,
+        ///
+        /// Boxed for the same reason as `ManagedDispatchFailure::trace`:
+        /// it is the widest thing this enum carries and it exists only
+        /// on the path that failed.
+        trace: Box<crate::model_plane::ManagedRouteTrace>,
     },
     /// Every safe current replica attempt failed.
     #[error(transparent)]
@@ -2233,8 +2237,8 @@ impl ManagedDistributedError {
     pub fn trace(&self) -> Option<&crate::model_plane::ManagedRouteTrace> {
         match self {
             Self::Resolution(_) => None,
-            Self::ColdStartFallback { trace } => Some(trace),
-            Self::Dispatch(failure) => Some(&failure.trace),
+            Self::ColdStartFallback { trace } => Some(trace.as_ref()),
+            Self::Dispatch(failure) => Some(failure.trace.as_ref()),
             Self::Quota(_) => None,
         }
     }
@@ -2738,7 +2742,9 @@ pub async fn distributed_managed_upstream(
                 "cold_start_fallback",
             );
             record_managed_route_trace(request.provider.name.as_str(), &deployment_id, &trace);
-            return Err(ManagedDistributedError::ColdStartFallback { trace });
+            return Err(ManagedDistributedError::ColdStartFallback {
+                trace: Box::new(trace),
+            });
         }
         crate::model_plane::ManagedColdStartDecision::Unavailable(selection) => {
             let trace = empty_managed_route_trace(
@@ -2751,7 +2757,7 @@ pub async fn distributed_managed_upstream(
             return Err(ManagedDistributedError::Dispatch(
                 crate::model_plane::ManagedDispatchFailure {
                     source: crate::model_plane::ModelPlaneError::NoEligibleReplica,
-                    trace,
+                    trace: Box::new(trace),
                 },
             ));
         }

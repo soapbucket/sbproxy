@@ -21,6 +21,11 @@ use serde_json::json;
 // `<package>.rs` into `OUT_DIR`; the proto package is
 // `sbproxy_e2e.echo`.
 pub mod echo_pb {
+    // The generated `Echo` service returns `Result<_, tonic::Status>`,
+    // and `tonic::Status` is 176 bytes, over the lint's threshold.
+    // `tonic-build` re-emits this file on every build, so the signature
+    // is not ours to reshape. Same call as `judge_rpc.rs`.
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("sbproxy_e2e.echo");
 }
 

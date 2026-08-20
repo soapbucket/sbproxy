@@ -4,6 +4,13 @@
 //! different subset of the helpers.
 
 #![allow(dead_code)]
+// tungstenite fixes the handshake error to a full HTTP response, so every
+// dial helper in this module returns an `Err` whose size is not this file's
+// to shrink, the same reason the callback at `accept_hdr_async` below already
+// carries its own allow. Test support has no hot path, so the width costs
+// nothing that matters here. Module-wide rather than per-signature to keep the
+// footprint to one line: this file is also edited on another branch.
+#![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
