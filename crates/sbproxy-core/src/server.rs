@@ -2991,6 +2991,50 @@ async fn check_auth_with_tls_outcome(
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
             AuthTrustOutcome::Allowed,
         ),
+        // WOR-2519: LDAP directory bind. Like forward_auth, this is an
+        // outbound dial on the inbound path, but the provider needs only
+        // the request headers, so it dispatches through this function
+        // like every non-forward-auth type. An unreachable directory
+        // fails closed with a 503 (mirroring forward_auth's
+        // "auth service unavailable") and stays trust-neutral: a backend
+        // failure is not evidence about the caller.
+        Auth::Ldap(a) => {
+            use sbproxy_modules::auth::ldap::LdapBindOutcome;
+            match a.authenticate(headers).await {
+                LdapBindOutcome::Allowed { username } => {
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: username.clone(),
+                        source: sbproxy_plugin::PrincipalSource::Ldap,
+                        virtual_key: None,
+                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: Some(username),
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                LdapBindOutcome::NoCredentials => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                LdapBindOutcome::InvalidCredentials => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    AuthTrustOutcome::InvalidProof,
+                ),
+                LdapBindOutcome::DirectoryUnavailable => (
+                    AuthResult::Deny(503, "auth directory unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+            }
+        }
         Auth::BotAuth(b) => {
             use sbproxy_modules::auth::BotAuthVerdict;
             // Synthesize a minimal http::Request the verifier can read

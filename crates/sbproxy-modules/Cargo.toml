@@ -177,6 +177,15 @@ tokio-util = { workspace = true }
 redis = { workspace = true }
 sbproxy-vault = { version = "0.1.0", path = "../sbproxy-vault" }
 
+# WOR-2519: LDAP client for the `ldap_auth` directory-bind provider
+# (auth/ldap.rs). Dual MIT/Apache-2.0, Tokio-native, and its TLS goes
+# through the same rustls 0.23 / tokio-rustls 0.26 pair the workspace
+# already resolves (`tls-rustls-ring` selects the ring provider the
+# root `rustls` dependency pins), so no second TLS stack ships.
+# Default features stay off: they would pull `native-tls` and a
+# blocking `sync` API this crate never calls.
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+
 # WOR-194: archive parsing for the Agent Skills v0.2.0 projection.
 # `tar` plus `flate2` cover `.tar.gz` bundles; `zip` covers `.zip`.
 # The parser is defensive: it caps decompression ratio, entry count,

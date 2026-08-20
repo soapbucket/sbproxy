@@ -16,6 +16,8 @@ pub mod dpop;
 /// WOR-1071: RFC 9449 outbound DPoP proof minting (companion to `dpop`).
 pub mod dpop_outbound;
 pub mod jwks;
+/// WOR-2519: LDAP directory-bind authentication (`ldap_auth`).
+pub mod ldap;
 /// WOR-1072: RFC 8705 mTLS-bound access token validation.
 pub mod mtls_bound;
 pub mod oidc;
@@ -159,6 +161,11 @@ pub enum Auth {
     Digest(DigestAuth),
     /// Forward auth to an external service.
     ForwardAuth(ForwardAuthProvider),
+    /// WOR-2519: LDAP directory-bind authentication. HTTP Basic
+    /// credentials from the request are bound against a directory
+    /// via an LDAP simple bind; the bind result is the only signal
+    /// used. See [`ldap::LdapAuthProvider`].
+    Ldap(ldap::LdapAuthProvider),
     /// Web Bot Auth: RFC 9421 message signature against an agent
     /// directory.
     BotAuth(crate::auth::bot_auth::BotAuthProvider),
@@ -190,6 +197,7 @@ impl Auth {
             Self::Jwt(_) => "jwt",
             Self::Digest(_) => "digest",
             Self::ForwardAuth(_) => "forward_auth",
+            Self::Ldap(_) => "ldap_auth",
             Self::BotAuth(_) => "bot_auth",
             Self::Cap(_) => "cap",
             Self::Oidc(_) => "oidc",
@@ -208,6 +216,7 @@ impl std::fmt::Debug for Auth {
             Self::Jwt(a) => f.debug_tuple("Jwt").field(a).finish(),
             Self::Digest(a) => f.debug_tuple("Digest").field(a).finish(),
             Self::ForwardAuth(a) => f.debug_tuple("ForwardAuth").field(a).finish(),
+            Self::Ldap(a) => f.debug_tuple("Ldap").field(a).finish(),
             Self::BotAuth(a) => f.debug_tuple("BotAuth").field(a).finish(),
             Self::Cap(a) => f.debug_tuple("Cap").field(a).finish(),
             Self::Oidc(a) => f.debug_tuple("Oidc").field(a).finish(),

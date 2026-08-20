@@ -186,6 +186,9 @@ fn compile_auth_with_optional_registry(
         "forward_auth" | "forward" => Ok(Auth::ForwardAuth(ForwardAuthProvider::from_config(
             config.clone(),
         )?)),
+        "ldap_auth" | "ldap" => Ok(Auth::Ldap(
+            crate::auth::ldap::LdapAuthProvider::from_config(config.clone())?,
+        )),
         "bot_auth" | "web_bot_auth" => {
             Ok(Auth::BotAuth(BotAuthProvider::from_config(config.clone())?))
         }
@@ -1326,6 +1329,36 @@ hooks:
         });
         let auth = compile_auth(&json).unwrap();
         assert_eq!(auth.auth_type(), "forward_auth");
+    }
+
+    /// WOR-2519: `ldap_auth` compiles through the built-in arm (with
+    /// `ldap` accepted as an alias) instead of falling through to the
+    /// plugin registry.
+    #[test]
+    fn compile_auth_ldap() {
+        for type_name in ["ldap_auth", "ldap"] {
+            let json = serde_json::json!({
+                "type": type_name,
+                "url": "ldaps://directory.example.org:636",
+                "base_dn": "ou=users,dc=example,dc=org",
+            });
+            let auth = compile_auth(&json).unwrap();
+            assert_eq!(auth.auth_type(), "ldap_auth");
+        }
+    }
+
+    /// WOR-2519: the provider's config-load refusals surface through
+    /// `compile_auth`, so an insecure directory URL stops the whole
+    /// config from compiling rather than failing at request time.
+    #[test]
+    fn compile_auth_ldap_insecure_url_refused() {
+        let json = serde_json::json!({
+            "type": "ldap_auth",
+            "url": "ldap://directory.example.org:389",
+            "base_dn": "ou=users,dc=example,dc=org",
+        });
+        let err = compile_auth(&json).unwrap_err();
+        assert!(err.to_string().contains("allow_insecure"), "{err}");
     }
 
     #[test]

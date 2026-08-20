@@ -5487,3 +5487,64 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
         );
     }
 }
+
+// --- WOR-2519: ldap_auth dispatch mapping ---
+
+/// An unreachable directory maps to Deny(503), never an allow: the
+/// auth boundary fails closed on backend failure. The port comes from
+/// a listener that is bound and immediately dropped so nothing
+/// answers.
+#[tokio::test]
+async fn ldap_auth_unreachable_directory_denies_with_503() {
+    let port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let auth = Auth::Ldap(
+        sbproxy_modules::auth::ldap::LdapAuthProvider::from_config(serde_json::json!({
+            "type": "ldap_auth",
+            "url": format!("ldap://127.0.0.1:{port}"),
+            "base_dn": "ou=users,dc=example,dc=org",
+            "allow_insecure": true,
+            "timeout_secs": 2,
+        }))
+        .unwrap(),
+    );
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        // base64("alice:s3cret")
+        "Basic YWxpY2U6czNjcmV0".parse().unwrap(),
+    );
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::Deny(503, _)),
+        "directory unreachable must refuse with 503, got {result:?}"
+    );
+    assert!(principal.is_none());
+}
+
+/// Missing credentials deny with 401 without dialing the directory:
+/// the URL here points at a dropped listener, so any dial would have
+/// burned the 2s timeout and a failed connect, and the outcome would
+/// still have to be a refusal.
+#[tokio::test]
+async fn ldap_auth_missing_credentials_denies_with_401() {
+    let auth = Auth::Ldap(
+        sbproxy_modules::auth::ldap::LdapAuthProvider::from_config(serde_json::json!({
+            "type": "ldap_auth",
+            "url": "ldaps://directory.example.org:636",
+            "base_dn": "ou=users,dc=example,dc=org",
+        }))
+        .unwrap(),
+    );
+    let headers = http::HeaderMap::new();
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::Deny(401, _)),
+        "missing credentials must refuse with 401, got {result:?}"
+    );
+    assert!(principal.is_none());
+}

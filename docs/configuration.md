@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2259,7 +2259,7 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships ten built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships eleven built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `ldap_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
@@ -2522,6 +2522,44 @@ origins:
 | `trust_headers` | list | | Headers from the auth response to inject into the upstream request |
 | `success_status` | int \| list | 200 | Status code(s) that mean "authenticated". A list is accepted, but only the first element is used. |
 
+### ldap_auth
+
+Authenticate against an LDAP or Active Directory server with a directory bind. The client sends HTTP Basic credentials; the proxy composes a bind DN as `<uid_attribute>=<username>,<base_dn>` and attempts an LDAP simple bind with the supplied password. A successful bind authenticates the request and attributes it to the username. The password is used for the bind only: never stored, never forwarded upstream, never logged. `ldap` is accepted as an alias for the `type` value.
+
+```yaml
+origins:
+  "intranet.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: ldap_auth
+      url: ldaps://directory.internal:636
+      base_dn: ou=users,dc=example,dc=org
+      uid_attribute: uid
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `ldap_auth` (alias: `ldap`) |
+| `url` | string | required | Directory URL: `ldap://host[:port]` or `ldaps://host[:port]` |
+| `base_dn` | string | required | Base DN the user RDN is appended to, e.g. `ou=users,dc=example,dc=org` |
+| `uid_attribute` | string | `cn` | Attribute the username is bound under when composing the DN |
+| `use_tls` | bool | `false` | Upgrade an `ldap://` connection with StartTLS before the bind |
+| `tls_verify` | bool | `true` | Verify the directory's TLS certificate. When verifying, the `url` host must match the certificate's host. |
+| `allow_insecure` | bool | `false` | Accept a plaintext `ldap://` connection with no StartTLS |
+| `timeout_secs` | int | 5 | Deadline in seconds for the connect + bind exchange |
+
+Three behaviors are deliberate:
+
+- **Plaintext is refused at config load.** An `ldap://` URL with neither `use_tls: true` nor `allow_insecure: true` fails config validation, because a simple bind sends the password in the clear. TLS (both `ldaps://` and StartTLS) runs on the same rustls stack as the rest of the proxy.
+- **Directory unreachable fails closed.** A dial failure, TLS failure, or timeout refuses the request with a `503`; wrong credentials get a `401`. An LDAP outage therefore reads as an outage, and requests are never admitted unchecked.
+- **Empty passwords are refused locally.** RFC 4513 defines a name-plus-empty-password simple bind as an *unauthenticated* bind, which many directories answer with success; the proxy refuses it without consulting the directory.
+
+Like `forward_auth`, and unlike the static-credential providers, this adds one network round-trip to the directory per request. Bind results are not cached: a cached bind would keep accepting a password the directory has already revoked or rotated. Budget `timeout_secs` for the directory's real latency.
+
+See [examples/auth-ldap/](../examples/auth-ldap/) for a runnable setup, including a local OpenLDAP fixture.
+
 ### bot_auth
 
 Verify RFC 9421 HTTP Message Signatures from known agents. Configure an inline
@@ -2700,7 +2738,7 @@ authentication:
     team: platform
 ```
 
-The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
+The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `ldap_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
 
 ---
 

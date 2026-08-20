@@ -122,6 +122,10 @@ pub enum PrincipalSource {
     ForwardAuth,
     /// Out-of-tree auth plugin registered via `AuthProvider`.
     Plugin,
+    /// WOR-2519: LDAP directory bind accepted the request's HTTP
+    /// Basic credentials. Added at the end of the enum per the
+    /// serialized-form stability note above.
+    Ldap,
 }
 
 impl PrincipalSource {
@@ -139,6 +143,7 @@ impl PrincipalSource {
             Self::Cap => "cap",
             Self::ForwardAuth => "forward_auth",
             Self::Plugin => "plugin",
+            Self::Ldap => "ldap_auth",
         }
     }
 }
