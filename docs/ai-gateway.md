@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1713,7 +1713,7 @@ Provider capability is the source of truth for which surfaces a configured provi
 |---|---|---|---|
 | `chat_completions` | POST | `/v1/chat/completions` | All |
 | `messages` | POST | `/v1/messages` | All |
-| `responses` | POST | `/v1/responses` | All |
+| `responses` | POST | `/v1/responses` | All, with stateless boundaries (see "Responses API boundaries" below) |
 | `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
 | `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
 | `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
@@ -1753,6 +1753,20 @@ An Anthropic client calling `/v1/messages` can bypass the internal format round 
 The bypass is deliberately narrow. Every request content and control field must have a lossless representation in the governed canonical tree. Unknown extensions and unsupported blocks such as `document` and `search_result` use the normal hub path, so the gateway never forwards content its policies could not inspect. The bypass is also disabled for streaming requests and whenever request processing changes content, including request PII redaction, prompt or tool injection, policy redaction, compression, and reasoning controls.
 
 A request with `stream: true` enters the SSE relay only when the upstream returns a successful `text/event-stream` response. Provider errors keep their original status, content type, and body. A successful buffered JSON response uses the normal provider translation and returns in the client's inbound shape. Both buffered paths have a bounded body read and can be replayed by idempotency.
+
+#### Responses API boundaries
+
+`/v1/responses` is served for every provider by translating the request into the canonical chat shape, so routing, guardrails, budgets, and cost tracking all apply. Translation covers `input` in all three wire shapes (string, content parts, message list), `instructions`, sampling controls, and `function` tools in both the Responses-native flat shape and the Chat-style nested shape. Replies come back as Responses objects, and streaming re-emits typed `response.*` SSE frames.
+
+What the gateway does not do is hold server-side response state, and it refuses rather than pretending:
+
+- `previous_response_id` and `conversation` are refused with a 400. Honoring either would return a response that silently lacks the prior turns it references. Resend the full conversation history in `input` instead.
+- `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
+- An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
+- Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, and logged with a warning naming the dropped type.
+- A `prompt` template reference is dropped and logged the same way; the gateway does not resolve server-side prompt objects, so the request runs on its `input` alone.
+
+The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
 
 ### Method coverage
 

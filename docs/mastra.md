@@ -1,6 +1,6 @@
 # Mastra with SBproxy
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 A Mastra agent normally reaches providers directly: the model comes from the AI SDK provider layer and calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the Mastra side the change is a base URL on the model and one server entry for tools.
 
@@ -29,7 +29,7 @@ const result = await agent.generate("In one sentence, what does an AI gateway do
 console.log(result.text);
 ```
 
-Save it as `agent.mjs` and run `node agent.mjs`. The `.chat()` call is deliberate: the bare form `openai("gpt-4o-mini")` builds a model for OpenAI's Responses API, which the gateway does not serve. `openai.chat("gpt-4o-mini")` speaks `/v1/chat/completions`, the wire format SBproxy translates for every provider it fronts. If you prefer a provider with no OpenAI-specific behavior, `@ai-sdk/openai-compatible` (validated at 3.0.7) works the same way: `createOpenAICompatible({ name: "sbproxy", baseURL, apiKey }).chatModel("gpt-4o-mini")`.
+Save it as `agent.mjs` and run `node agent.mjs`. The `.chat()` call is deliberate: the bare form `openai("gpt-4o-mini")` builds a model for OpenAI's Responses API. The gateway serves `/v1/responses` for stateless requests, streaming included, but it refuses anything that leans on OpenAI-side state: `previous_response_id`, `conversation`, and `store: true` each return a 400 rather than silently running without the state they reference, and only `function` tools are forwarded (see the [Responses API boundaries](ai-gateway.md#responses-api-boundaries) in the AI gateway guide). `openai.chat("gpt-4o-mini")` speaks `/v1/chat/completions`, the wire format SBproxy translates for every provider it fronts, and avoids those boundaries entirely. If you prefer a provider with no OpenAI-specific behavior, `@ai-sdk/openai-compatible` (validated at 3.0.7) works the same way: `createOpenAICompatible({ name: "sbproxy", baseURL, apiKey }).chatModel("gpt-4o-mini")`.
 
 The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml` and start the gateway with `sbproxy sb.yml`:
 
