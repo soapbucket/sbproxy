@@ -243,6 +243,37 @@ describe("request observability contracts", () => {
   });
 });
 
+describe("api.routingDecisions (WOR-2575)", () => {
+  it("builds the snake_case server-side filter query", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.routingDecisions({
+      origin: "ai-gateway",
+      strategy: "fallback_chain",
+      provider: "anthropic",
+      model: "gpt-5",
+      since: "2026-08-20T10:30:00+00:00",
+      limit: 50,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/routing-decisions?origin=ai-gateway&strategy=fallback_chain&provider=anthropic&model=gpt-5&since=2026-08-20T10%3A30%3A00%2B00%3A00&limit=50",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("omits the query string entirely when nothing is filtered", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.routingDecisions();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/routing-decisions",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
+
 describe("extension inventory contract", () => {
   it("loads the authoritative running snapshot from the authenticated API", async () => {
     const snapshot: ExtensionInventorySnapshot = {

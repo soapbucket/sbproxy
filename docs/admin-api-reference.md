@@ -1,10 +1,10 @@
 # Admin API reference
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
+lifecycle, the running extension inventory, the request log and its live stream, routing decisions, recent sessions, alert
 operations, per-target health, spend and audit, attested-metering summary/receipts/verify, config read/write and hot reload/drift, the local config-revision
 history ring, model-host catalog and deployment lifecycle, the
 response/semantic/key-policy caches, cluster status and the replicated-state
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, routing decisions, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -584,6 +584,119 @@ does not accept query filters. Each event has the same enriched
 ```bash
 curl -N -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/api/requests/stream"
 ```
+
+### `GET /api/routing-decisions`
+
+Recent routing decisions, newest first: why each routed request went
+where it went. One entry per request that a routing plane actually
+decided (AI dispatch or a load-balanced origin); plain proxied requests
+that never routed record nothing. This is the record behind the admin
+console's [Routing decisions view](admin-ui.md#routing-decisions-routing-decisions).
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | RFC 3339 timestamp of request completion. |
+| `origin` | string | Origin name that handled the request. |
+| `request_id` | string | Correlation id shared with the request log, access log, and trace. |
+| `tenant_id` | string | Origin-scoped tenant label (`__default__` when unset). |
+| `strategy` | string | What decided the request: a built-in strategy name (`round_robin`, `fallback_chain`, `cascade`, ...), `ai_routing_policy` when an operator plan dispatched, or the generic load balancer's selection method. |
+| `requested_model` | string | Model the caller asked for, after alias resolution. |
+| `selected_provider` | string | Provider that served (or last attempted) the request. |
+| `selected_model` | string | Model that served the request, when known. |
+| `reason` | string | The routing plane's own reason: an operator plan's `reason` string or the `ai_policy route_to` override note. Absent for built-in strategies. |
+| `candidates` | array | Ordered `{provider, model?}` candidates the router weighed: a plan's tiers, a cascade's tiers, or the strategy's eligible provider order. |
+| `attempted` | array | Providers actually attempted, in dispatch order: the fallback chain as traversed, not as planned. Capped at 16 hops. |
+| `attempts` | number | Provider calls actually made. |
+| `failover_engaged` | boolean | Whether fallback or provider failover engaged. |
+| `failover_from` | string | First provider that handed off, when one did. |
+| `failover_to` | string | Last provider selected by failover, when one was. |
+| `status` | number | HTTP status the request finished with. |
+| `latency_ms` | number | End-to-end request latency in milliseconds. |
+| `detail` | object | Open, additive detail map. Later explanatory columns (typed fallback triggers, data-posture eligibility results, price-ceiling exclusions, semantic-match scores) appear as namespaced keys here rather than as schema changes, so a reader that tolerates unknown keys never breaks. |
+
+Every field except `timestamp`, `origin`, `strategy`, `attempts`,
+`failover_engaged`, `status`, and `latency_ms` is omitted from the wire
+when absent. Treat the shape as additive: new keys may appear in
+`detail` (and, rarely, as new top-level optional fields) without notice.
+
+Query parameters: `origin`, `strategy`, and `provider` (exact),
+`model` (exact, matching the requested or the selected side of a
+substitution), `since` and `until` (RFC 3339, inclusive; a malformed
+value is a `400` naming the parameter), `offset`, and `limit` (both
+defaulting to the ring's own bounds).
+
+A fallback chain whose primary is down produces the trace this route
+exists for. With an `ai_proxy` origin like:
+
+```yaml
+routing:
+  strategy: fallback_chain
+providers:
+  - name: primary-unreachable
+    provider_type: openai
+    base_url: http://127.0.0.1:9/v1   # closed port: simulated outage
+    allow_private_base_url: true
+    priority: 1
+  - name: local-backup
+    provider_type: openai
+    base_url: http://127.0.0.1:18591/v1
+    allow_private_base_url: true
+    priority: 2
+```
+
+one chat completion through the chain records (output captured from a
+live gateway):
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/routing-decisions?strategy=fallback_chain&limit=1" \
+  | python3 -m json.tool
+```
+
+```json
+[
+    {
+        "timestamp": "2026-08-20T14:03:16.486110+00:00",
+        "origin": "ai.local",
+        "request_id": "01a01f7bb6847ab0870bbc05228649e4",
+        "tenant_id": "__default__",
+        "strategy": "fallback_chain",
+        "requested_model": "demo-model",
+        "selected_provider": "local-backup",
+        "selected_model": "demo-model",
+        "candidates": [
+            {
+                "provider": "primary-unreachable"
+            },
+            {
+                "provider": "local-backup"
+            }
+        ],
+        "attempted": [
+            "primary-unreachable",
+            "local-backup"
+        ],
+        "attempts": 2,
+        "failover_engaged": true,
+        "failover_from": "primary-unreachable",
+        "failover_to": "local-backup",
+        "status": 200,
+        "latency_ms": 2.025167
+    }
+]
+```
+
+The row reads as a sentence: the chain weighed two candidates, the
+primary was attempted and handed off, the backup served the requested
+model, and the whole detour cost two attempts and two milliseconds. An
+`ai_routing_policy` row additionally carries the plan's `reason` and a
+`model` on each candidate tier.
+
+This is a bounded in-memory sample for runtime diagnosis: the ring
+shares the `proxy.admin.max_log_entries` cap (default 1000) with the
+request log and clears on restart. For durable routing history, publish
+the `route.decide` decision audit records to your log pipeline instead
+(see [decision-records.md](decision-records.md)).
 
 ### `GET /api/health`
 

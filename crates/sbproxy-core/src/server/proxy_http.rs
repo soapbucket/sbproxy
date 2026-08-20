@@ -7008,6 +7008,40 @@ impl ProxyHttp for SbProxy {
                 policy_decisions: ctx.policy_decisions.clone(),
                 deny_reason: ctx.deny_reason.clone(),
             });
+
+            // WOR-2575: mirror the routing decision into its own ring so
+            // the routing-decisions view can answer "why was this request
+            // routed here". Only requests a routing plane actually
+            // decided (AI dispatch or a load-balanced origin) produce a
+            // row; a plain proxied request records nothing.
+            if let Some(strategy) = ctx.admin_load_balancer_strategy.clone() {
+                admin.log_routing_decision(crate::admin::RoutingDecisionEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    origin: hostname.clone(),
+                    request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+                    tenant_id: ctx.tenant_id.to_string(),
+                    strategy,
+                    requested_model: ctx
+                        .ai_logical_model
+                        .clone()
+                        .or_else(|| ctx.ai_model.clone()),
+                    selected_provider: ctx
+                        .ai_provider
+                        .clone()
+                        .or_else(|| ctx.admin_load_balancer_target.clone()),
+                    selected_model: ctx.ai_model.clone(),
+                    reason: ctx.ai_route_reason.clone(),
+                    candidates: ctx.ai_route_candidates.clone(),
+                    attempted: ctx.ai_route_attempted.clone(),
+                    attempts: ctx.admin_ai_attempts,
+                    failover_engaged: ctx.admin_failover_engaged(),
+                    failover_from: ctx.admin_failover_from.clone(),
+                    failover_to: ctx.admin_failover_to.clone(),
+                    status: status_u16,
+                    latency_ms: latency_secs * 1000.0,
+                    detail: ctx.ai_route_detail.clone(),
+                });
+            }
         }
 
         // Record latency on the hostname-only histogram (legacy view).

@@ -480,6 +480,123 @@ pub struct RequestLogFilter<'a> {
     pub session_id: Option<&'a str>,
 }
 
+/// One provider (and optionally model) the router weighed for a request
+/// (WOR-2575). Ordered as the router saw them: a routing plan's tier
+/// order, a cascade's tier order, or the eligible provider order of the
+/// configured strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoutingDecisionCandidate {
+    /// Provider name as configured under the origin's provider list.
+    pub provider: String,
+    /// Model the candidate would serve, when the routing source names
+    /// one. Plan and cascade tiers do; strategy orderings serve the
+    /// requested model and leave this empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Recent routing decision stored in a ring buffer (WOR-2575): why one
+/// request was routed where it was.
+///
+/// The shape is additive by design. Features that explain more of a
+/// decision (typed fallback triggers, eligibility filter results,
+/// price-ceiling exclusions, semantic-match scores) add namespaced keys
+/// to the open `detail` map via `RequestContext::ai_route_detail`
+/// rather than redesigning this struct, and every optional column is
+/// omitted from the wire when absent, so readers never break when a
+/// field they do not know about appears.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RoutingDecisionEntry {
+    /// RFC 3339 timestamp marking when the request completed.
+    pub timestamp: String,
+    /// Origin name that handled the request.
+    pub origin: String,
+    /// Request id, correlating the decision with the request-log row,
+    /// the access log line, and the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Origin-scoped tenant label (`__default__` when unset).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tenant_id: String,
+    /// Closed strategy name that decided the request: a built-in
+    /// strategy label (`round_robin`, `fallback_chain`, `cascade`, ...),
+    /// `ai_routing_policy` when an operator plan dispatched, or the
+    /// generic load balancer's selection method.
+    pub strategy: String,
+    /// Model the caller asked for, after alias resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Provider that served (or last attempted) the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<String>,
+    /// Model that served the request, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_model: Option<String>,
+    /// Reason the routing plane gave for its decision: an operator
+    /// plan's `reason` string or the `ai_policy route_to` override
+    /// note. Absent for built-in strategies, which decide by their
+    /// name's own criterion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Ordered candidates the router weighed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<RoutingDecisionCandidate>,
+    /// Providers actually attempted, in dispatch order: the fallback
+    /// chain as traversed, not as planned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempted: Vec<String>,
+    /// Number of provider calls actually made.
+    pub attempts: u32,
+    /// Whether fallback or provider failover engaged.
+    pub failover_engaged: bool,
+    /// First provider that handed off to another provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_from: Option<String>,
+    /// Last provider selected by failover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_to: Option<String>,
+    /// HTTP response status the request finished with.
+    pub status: u16,
+    /// End-to-end request latency in milliseconds.
+    pub latency_ms: f64,
+    /// Open, additive decision detail carried verbatim from
+    /// `RequestContext::ai_route_detail`. Consumers add namespaced
+    /// keys here without a schema change.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub detail: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Filters for [`AdminState::query_routing_decisions`] (WOR-2575).
+/// Every field is optional; `None` means the dimension is not
+/// filtered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoutingDecisionFilter<'a> {
+    /// Exact origin name match.
+    pub origin: Option<&'a str>,
+    /// Exact strategy name match.
+    pub strategy: Option<&'a str>,
+    /// Exact selected-provider match.
+    pub provider: Option<&'a str>,
+    /// Exact model match against the requested or the selected model,
+    /// so a substitution is findable from either side.
+    pub model: Option<&'a str>,
+    /// Keep decisions at or after this instant.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep decisions at or before this instant.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Parse a routing-decision ring entry's RFC 3339 timestamp for
+/// time-range filtering (WOR-2575). The writer always emits
+/// `chrono::Utc::now().to_rfc3339()`, so a parse failure marks a
+/// hand-built entry, which a time-bounded query excludes rather than
+/// guesses about.
+fn routing_entry_time(entry: &RoutingDecisionEntry) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 // --- Admin State ---
 
 /// Per-revision cached rendering of the emitted OpenAPI document.
@@ -511,6 +628,10 @@ impl OpenApiCache {
 pub struct AdminState {
     /// Ring buffer of the most recent request log entries.
     pub recent_requests: Mutex<VecDeque<RequestLogEntry>>,
+    /// Ring buffer of the most recent routing decisions (WOR-2575).
+    /// Shares the `max_log_entries` cap with `recent_requests` so
+    /// operators size one retention knob.
+    pub recent_routing_decisions: Mutex<VecDeque<RoutingDecisionEntry>>,
     /// Admin server configuration in effect.
     pub config: AdminConfig,
     /// Revision-keyed cache of the rendered OpenAPI document.
@@ -587,6 +708,7 @@ impl AdminState {
     pub fn new(config: AdminConfig) -> Self {
         Self {
             recent_requests: Mutex::new(VecDeque::new()),
+            recent_routing_decisions: Mutex::new(VecDeque::new()),
             config,
             openapi_cache: Mutex::new(OpenApiCache::empty()),
             config_path: None,
@@ -852,6 +974,70 @@ impl AdminState {
                 filter
                     .session_id
                     .is_none_or(|id| e.session_id.as_deref() == Some(id))
+            })
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Add a routing decision to its ring (drops oldest when full;
+    /// WOR-2575).
+    ///
+    /// See [`RoutingDecisionFilter`] for the matching query surface. A
+    /// poisoned lock drops the record rather than panicking: the ring
+    /// is a runtime sample, and the panic that poisoned the lock is
+    /// the incident worth surfacing, not this write.
+    pub fn log_routing_decision(&self, entry: RoutingDecisionEntry) {
+        let Ok(mut log) = self.recent_routing_decisions.lock() else {
+            return;
+        };
+        if log.len() >= self.config.max_log_entries {
+            log.pop_front();
+        }
+        log.push_back(entry);
+    }
+
+    /// Query the recent routing decisions (newest first) with optional
+    /// filters and pagination (WOR-2575). `offset`/`limit` paginate the
+    /// filtered result.
+    pub fn query_routing_decisions(
+        &self,
+        filter: &RoutingDecisionFilter<'_>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<RoutingDecisionEntry> {
+        let Ok(log) = self.recent_routing_decisions.lock() else {
+            return Vec::new();
+        };
+        log.iter()
+            .rev()
+            .filter(|e| filter.origin.is_none_or(|o| e.origin == o))
+            .filter(|e| filter.strategy.is_none_or(|s| e.strategy == s))
+            .filter(|e| {
+                filter
+                    .provider
+                    .is_none_or(|p| e.selected_provider.as_deref() == Some(p))
+            })
+            // The model dimension matches what the caller asked for or
+            // what was served, so "every decision that touched this
+            // model" works without the operator knowing which side of a
+            // substitution it was on.
+            .filter(|e| {
+                filter.model.is_none_or(|m| {
+                    e.requested_model.as_deref() == Some(m)
+                        || e.selected_model.as_deref() == Some(m)
+                })
+            })
+            .filter(|e| {
+                filter
+                    .since
+                    .is_none_or(|since| routing_entry_time(e).is_some_and(|t| t >= since))
+            })
+            .filter(|e| {
+                filter
+                    .until
+                    .is_none_or(|until| routing_entry_time(e).is_some_and(|t| t <= until))
             })
             .skip(offset)
             .take(limit)
@@ -2602,6 +2788,27 @@ fn decoded_query_param(path: &str, key: &str) -> Option<String> {
         .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
 }
 
+/// Parse an optional RFC 3339 query param into UTC, or a `400` naming
+/// the parameter when it is present and malformed (WOR-2575). `key` is
+/// always a code-supplied literal, never caller input, so interpolating
+/// it into the error body is safe.
+fn parse_rfc3339_param(
+    path: &str,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (u16, &'static str, String)> {
+    match decoded_query_param(path, key) {
+        None => Ok(None),
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(&raw) {
+            Ok(t) => Ok(Some(t.with_timezone(&chrono::Utc))),
+            Err(_) => Err((
+                400,
+                "application/json",
+                format!(r#"{{"error":"{key} must be an RFC 3339 timestamp"}}"#),
+            )),
+        },
+    }
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -3149,6 +3356,61 @@ pub fn handle_admin_request(
                 api_key_id: api_key_id_f.as_deref(),
                 key_mode: key_mode_f.as_deref(),
                 session_id: session_id_f.as_deref(),
+            },
+            offset,
+            limit,
+        );
+        return match serde_json::to_string(&entries) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-2575: recent routing decisions with filters + pagination, for
+    // the admin console's routing-decisions view. Query params: `origin`,
+    // `strategy`, `provider` (exact), `model` (matches the requested or
+    // the selected side of a substitution), `since`/`until` (RFC 3339,
+    // inclusive), `offset`, `limit`. GET-only by construction, so RBAC
+    // needs no extra gating: read routes are open to every
+    // authenticated role.
+    if path_only == "/api/routing-decisions" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let origin_f = decoded_query_param(path, "origin");
+        let strategy_f = decoded_query_param(path, "strategy");
+        let provider_f = decoded_query_param(path, "provider");
+        let model_f = decoded_query_param(path, "model");
+        let since_f = match parse_rfc3339_param(path, "since") {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let until_f = match parse_rfc3339_param(path, "until") {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let offset = rl_query_param(path, "offset")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let limit = rl_query_param(path, "limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(state.config.max_log_entries)
+            .min(state.config.max_log_entries);
+        let entries = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                origin: origin_f.as_deref(),
+                strategy: strategy_f.as_deref(),
+                provider: provider_f.as_deref(),
+                model: model_f.as_deref(),
+                since: since_f,
+                until: until_f,
             },
             offset,
             limit,
@@ -6312,6 +6574,45 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     }
 
+    /// WOR-2575: the routing-decisions view is a read surface, so a
+    /// read-only operator session passes the role gate.
+    #[tokio::test]
+    async fn routing_decisions_endpoint_allows_a_read_only_operator() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        state.log_routing_decision(sample_routing_decision(
+            "2026-08-20T12:00:00+00:00",
+            "ai-gateway",
+            "round_robin",
+        ));
+        let (token, _) = state
+            .session_signer
+            .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /api/routing-decisions HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("round_robin"), "{response}");
+    }
+
     #[tokio::test]
     async fn alerts_test_route_keeps_read_only_and_browser_csrf_gates() {
         let read_only_state = AdminState::new(AdminConfig {
@@ -7356,6 +7657,228 @@ mod tests {
         assert_eq!(ct, "application/json");
         // Empty log returns JSON array.
         assert_eq!(body, "[]");
+    }
+
+    /// WOR-2575: a routing-decision entry with only the dimensions a
+    /// test cares about; everything else stays at its default.
+    fn sample_routing_decision(
+        timestamp: &str,
+        origin: &str,
+        strategy: &str,
+    ) -> RoutingDecisionEntry {
+        RoutingDecisionEntry {
+            timestamp: timestamp.to_string(),
+            origin: origin.to_string(),
+            strategy: strategy.to_string(),
+            status: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn routing_decisions_endpoint_returns_recorded_decisions() {
+        let state = make_state();
+        let mut detail = serde_json::Map::new();
+        detail.insert(
+            "fallback_trigger".to_string(),
+            serde_json::Value::String("context_window".to_string()),
+        );
+        state.log_routing_decision(RoutingDecisionEntry {
+            timestamp: "2026-08-20T12:00:00+00:00".to_string(),
+            origin: "ai-gateway".to_string(),
+            request_id: Some("req-1".to_string()),
+            tenant_id: "acme".to_string(),
+            strategy: "fallback_chain".to_string(),
+            requested_model: Some("gpt-5".to_string()),
+            selected_provider: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-5".to_string()),
+            reason: Some("primary quota exhausted".to_string()),
+            candidates: vec![
+                RoutingDecisionCandidate {
+                    provider: "openai".to_string(),
+                    model: Some("gpt-5".to_string()),
+                },
+                RoutingDecisionCandidate {
+                    provider: "anthropic".to_string(),
+                    model: Some("claude-sonnet-5".to_string()),
+                },
+            ],
+            attempted: vec!["openai".to_string(), "anthropic".to_string()],
+            attempts: 2,
+            failover_engaged: true,
+            failover_from: Some("openai".to_string()),
+            failover_to: Some("anthropic".to_string()),
+            status: 200,
+            latency_ms: 812.4,
+            detail,
+        });
+
+        let auth = basic_auth("admin", "secret");
+        let (status, ct, body) =
+            handle_admin_request("GET", "/api/routing-decisions", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(ct, "application/json");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let row = &rows[0];
+        assert_eq!(row["strategy"], "fallback_chain");
+        assert_eq!(row["requested_model"], "gpt-5");
+        assert_eq!(row["selected_provider"], "anthropic");
+        assert_eq!(row["reason"], "primary quota exhausted");
+        assert_eq!(row["candidates"][1]["provider"], "anthropic");
+        assert_eq!(row["attempted"], serde_json::json!(["openai", "anthropic"]));
+        assert_eq!(row["failover_from"], "openai");
+        // The open detail map rides along verbatim: WOR-2556, WOR-2557,
+        // WOR-2559, and WOR-2564 each add a key here, not a column.
+        assert_eq!(row["detail"]["fallback_trigger"], "context_window");
+    }
+
+    #[test]
+    fn routing_decisions_endpoint_is_get_only() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) =
+            handle_admin_request("POST", "/api/routing-decisions", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn routing_decisions_ring_drops_oldest_when_full() {
+        // make_state caps the ring at 5 entries.
+        let state = make_state();
+        for i in 0..7 {
+            state.log_routing_decision(sample_routing_decision(
+                "2026-08-20T12:00:00+00:00",
+                &format!("origin-{i}"),
+                "round_robin",
+            ));
+        }
+        let rows = state.query_routing_decisions(&RoutingDecisionFilter::default(), 0, 100);
+        assert_eq!(rows.len(), 5);
+        // Newest first; the two oldest fell off the front.
+        assert_eq!(rows[0].origin, "origin-6");
+        assert_eq!(rows[4].origin, "origin-2");
+    }
+
+    #[test]
+    fn query_routing_decisions_filters_and_paginates() {
+        let state = make_state();
+        state.log_routing_decision(RoutingDecisionEntry {
+            requested_model: Some("gpt-5".to_string()),
+            selected_provider: Some("openai".to_string()),
+            selected_model: Some("gpt-5".to_string()),
+            ..sample_routing_decision("2026-08-20T10:00:00+00:00", "ai-gateway", "round_robin")
+        });
+        state.log_routing_decision(RoutingDecisionEntry {
+            requested_model: Some("gpt-5".to_string()),
+            selected_provider: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-5".to_string()),
+            ..sample_routing_decision("2026-08-20T11:00:00+00:00", "ai-gateway", "fallback_chain")
+        });
+        state.log_routing_decision(sample_routing_decision(
+            "2026-08-20T12:00:00+00:00",
+            "web",
+            "least_connections",
+        ));
+
+        let all = state.query_routing_decisions(&RoutingDecisionFilter::default(), 0, 100);
+        assert_eq!(all.len(), 3);
+
+        let by_origin = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                origin: Some("ai-gateway"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(by_origin.len(), 2);
+
+        let by_strategy = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                strategy: Some("fallback_chain"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(by_strategy.len(), 1);
+        assert_eq!(
+            by_strategy[0].selected_provider.as_deref(),
+            Some("anthropic")
+        );
+
+        // The model filter matches the requested side and the selected
+        // side, so a substituted request is findable from either name.
+        for model in ["gpt-5", "claude-sonnet-5"] {
+            let by_model = state.query_routing_decisions(
+                &RoutingDecisionFilter {
+                    model: Some(model),
+                    ..Default::default()
+                },
+                0,
+                100,
+            );
+            assert!(
+                by_model
+                    .iter()
+                    .any(|e| e.selected_model.as_deref() == Some("claude-sonnet-5")),
+                "model={model} missed the substituted decision"
+            );
+        }
+
+        let by_provider = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                provider: Some("openai"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(by_provider.len(), 1);
+
+        let since = "2026-08-20T10:30:00+00:00"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let until = "2026-08-20T11:30:00+00:00"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let windowed = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                since: Some(since),
+                until: Some(until),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0].strategy, "fallback_chain");
+
+        let paged = state.query_routing_decisions(&RoutingDecisionFilter::default(), 1, 1);
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].strategy, "fallback_chain");
+    }
+
+    #[test]
+    fn routing_decisions_endpoint_validates_filters() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            "/api/routing-decisions?since=yesterday",
+            "/api/routing-decisions?until=not-a-time",
+        ] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "{path}: {body}");
+            assert!(body.contains("RFC 3339"), "{path}: {body}");
+        }
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/routing-decisions?since=2026-08-20T10:30:00%2B00:00&strategy=round_robin&limit=10",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
     }
 
     #[test]

@@ -57,6 +57,12 @@ const routes = [
     meta: { title: "Session detail", documentation: "admin-ui" },
   },
   {
+    path: "/routing-decisions",
+    name: "routing-decisions",
+    component: () => import("./views/RoutingDecisionsView.vue"),
+    meta: { title: "Routing decisions", documentation: "admin-ui" },
+  },
+  {
     path: "/metrics",
     name: "metrics",
     component: () => import("./views/MetricsView.vue"),

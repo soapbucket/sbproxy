@@ -12,6 +12,7 @@ const nav = [
   { to: "/extensions", label: "extensions" },
   { to: "/logs", label: "logs" },
   { to: "/sessions", label: "sessions" },
+  { to: "/routing-decisions", label: "routing decisions" },
   { to: "/metrics", label: "metrics" },
   { to: "/spend", label: "spend" },
   { to: "/meter", label: "meter" },

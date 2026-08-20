@@ -413,6 +413,27 @@ pub struct RequestContext {
     pub admin_load_balancer_strategy: Option<String>,
     /// Selected generic host:port or latest attempted AI provider.
     pub admin_load_balancer_target: Option<String>,
+    /// Ordered candidate set the router weighed for this request
+    /// (WOR-2575): a routing plan's tiers, a cascade's tiers, or the
+    /// eligible provider order of the configured strategy. Snapshotted
+    /// by the AI dispatch path once the dispatch order is settled;
+    /// empty for non-AI traffic and for paths that never materialize a
+    /// candidate list. Read once at end of request by the logging hook
+    /// into the admin routing-decisions ring.
+    pub ai_route_candidates: Vec<crate::admin::RoutingDecisionCandidate>,
+    /// Providers actually attempted, in dispatch order (WOR-2575): the
+    /// fallback chain as traversed, not as planned. Fed by
+    /// [`Self::record_admin_ai_attempt`]; bounded to
+    /// [`MAX_ROUTE_ATTEMPT_TRAIL`] entries.
+    pub ai_route_attempted: Vec<String>,
+    /// Open, additive routing-decision detail (WOR-2575). Features
+    /// that explain more of a routing decision (typed fallback
+    /// triggers, eligibility filter results, price-ceiling exclusions,
+    /// semantic-match scores) insert namespaced keys here, and the
+    /// admin routing-decisions ring carries the map verbatim. Writers
+    /// keep every value small and already-redacted: this map reaches
+    /// the admin API unfiltered.
+    pub ai_route_detail: serde_json::Map<String, serde_json::Value>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -1543,6 +1564,13 @@ pub enum HeadlessSignal {
     NotDetected,
 }
 
+/// Upper bound on the traversed-provider trail recorded per request
+/// (WOR-2575). Failover cannot visit more distinct providers than are
+/// configured, but retries re-visit; the cap keeps a pathological retry
+/// loop from growing the context, and a truncated trail still names the
+/// first sixteen hops, which is more than any configured chain today.
+pub const MAX_ROUTE_ATTEMPT_TRAIL: usize = 16;
+
 impl RequestContext {
     /// Record a cache outcome without allowing a weaker later observation to
     /// hide a hit from another cache layer.
@@ -1550,7 +1578,8 @@ impl RequestContext {
         self.admin_cache_status.record(status);
     }
 
-    /// Record one actual AI provider attempt and derive bounded handoff state.
+    /// Record one actual AI provider attempt and derive bounded handoff
+    /// state, including the traversed-provider trail (WOR-2575).
     pub fn record_admin_ai_attempt(&mut self, provider: &str) {
         if let Some(previous) = self.admin_last_ai_provider.as_deref() {
             if previous != provider {
@@ -1559,6 +1588,9 @@ impl RequestContext {
                 }
                 self.admin_failover_to = Some(provider.to_string());
             }
+        }
+        if self.ai_route_attempted.len() < MAX_ROUTE_ATTEMPT_TRAIL {
+            self.ai_route_attempted.push(provider.to_string());
         }
         self.admin_load_balancer_target = Some(provider.to_string());
         self.admin_last_ai_provider = Some(provider.to_string());
@@ -1668,6 +1700,9 @@ impl RequestContext {
             admin_last_ai_provider: None,
             admin_load_balancer_strategy: None,
             admin_load_balancer_target: None,
+            ai_route_candidates: Vec::new(),
+            ai_route_attempted: Vec::new(),
+            ai_route_detail: serde_json::Map::new(),
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
@@ -2015,9 +2050,23 @@ mod tests {
         assert_eq!(ctx.admin_failover_from.as_deref(), Some("openai"));
         assert_eq!(ctx.admin_failover_to.as_deref(), Some("bedrock"));
         assert_eq!(ctx.admin_load_balancer_target.as_deref(), Some("bedrock"));
+        // WOR-2575: the traversed trail keeps every hop, not just the
+        // first/latest pair the failover columns collapse to.
+        assert_eq!(ctx.ai_route_attempted, ["openai", "anthropic", "bedrock"]);
 
         ctx.retry_count = 4;
         assert_eq!(ctx.admin_retry_count(), 4);
+    }
+
+    #[test]
+    fn route_attempt_trail_is_bounded() {
+        let mut ctx = RequestContext::new();
+        for i in 0..(MAX_ROUTE_ATTEMPT_TRAIL + 4) {
+            ctx.record_admin_ai_attempt(&format!("p{i}"));
+        }
+        // The trail saturates; the attempt counter keeps counting.
+        assert_eq!(ctx.ai_route_attempted.len(), MAX_ROUTE_ATTEMPT_TRAIL);
+        assert_eq!(ctx.admin_ai_attempts as usize, MAX_ROUTE_ATTEMPT_TRAIL + 4);
     }
 
     #[test]

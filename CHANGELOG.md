@@ -12,6 +12,20 @@ the next version cut.
 
 ### Added
 
+- **Routing decision traces: `GET /api/routing-decisions` and the
+  admin console's Routing decisions view.** Every routed request
+  (AI dispatch or a load-balanced origin) now records a per-request
+  decision trace: the strategy or operator plan that decided, the
+  ordered candidates it weighed, the winner, the reason, the fallback
+  chain actually traversed, and timing. The record's open `detail`
+  map is additive by design so later explanatory columns land as
+  keys, not schema changes. Bounded in-memory ring sharing
+  `proxy.admin.max_log_entries` with the request log; server-side
+  filters by origin, strategy, model (either side of a substitution),
+  provider, and time range. See the routing-decisions sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,
