@@ -655,20 +655,33 @@ fn check_unknown_types(
     }
 
     if let Some(auth) = &origin.authentication {
-        if let Some(t) = type_of(auth) {
-            if !known_auth(t, opts) {
-                out.push(PlanFinding {
-                    // `Warn` because compile_auth falls through to
-                    // the inventory plugin registry at runtime; an
-                    // unknown name here may resolve in an enterprise
-                    // build with extra plugins linked in.
-                    severity: Severity::Warn,
-                    rule_id: "unknown-auth-type".to_string(),
-                    path: format!("origins.{host}.authentication"),
-                    message: format!(
-                        "origin '{host}' uses auth type '{t}' which is not in the OSS catalog (will fail at runtime if no plugin registers it)"
-                    ),
-                });
+        // The scalar form is one entry at the block's own path; the
+        // list-form composition (WOR-2517) checks each entry at its
+        // indexed path.
+        let entries: Vec<(String, &serde_json::Value)> = match auth.as_array() {
+            Some(list) => list
+                .iter()
+                .enumerate()
+                .map(|(idx, entry)| (format!("origins.{host}.authentication[{idx}]"), entry))
+                .collect(),
+            None => vec![(format!("origins.{host}.authentication"), auth)],
+        };
+        for (path, entry) in entries {
+            if let Some(t) = type_of(entry) {
+                if !known_auth(t, opts) {
+                    out.push(PlanFinding {
+                        // `Warn` because compile_auth falls through to
+                        // the inventory plugin registry at runtime; an
+                        // unknown name here may resolve in an enterprise
+                        // build with extra plugins linked in.
+                        severity: Severity::Warn,
+                        rule_id: "unknown-auth-type".to_string(),
+                        path,
+                        message: format!(
+                            "origin '{host}' uses auth type '{t}' which is not in the OSS catalog (will fail at runtime if no plugin registers it)"
+                        ),
+                    });
+                }
             }
         }
     }
@@ -1265,6 +1278,34 @@ origins:
             .collect();
         assert_eq!(unknown.len(), 1, "got findings: {findings:?}");
         assert_eq!(unknown[0].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn unknown_auth_inside_a_composition_list_is_flagged_at_its_index() {
+        // WOR-2517: a list-form `authentication:` block checks each
+        // entry; only the unknown one warns, at its indexed path.
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    authentication:
+      - type: api_key
+        api_keys:
+          - key-one
+      - type: saml
+        idp_url: https://idp.example.com
+"#;
+        let cfg = parse(yaml);
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let unknown: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "unknown-auth-type")
+            .collect();
+        assert_eq!(unknown.len(), 1, "got findings: {findings:?}");
+        assert_eq!(unknown[0].severity, Severity::Warn);
+        assert_eq!(unknown[0].path, "origins.api.example.com.authentication[1]");
     }
 
     #[test]

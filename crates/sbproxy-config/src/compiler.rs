@@ -8087,6 +8087,42 @@ origins:
     }
 
     #[test]
+    fn parse_auth_composition_list_round_trips_to_snapshot() {
+        // WOR-2517: a list-form `authentication:` block is stored
+        // opaque like the scalar form; the modules crate compiles it
+        // into the OR composition at pipeline build. Entry order is
+        // load-bearing (first success wins), so it must survive the
+        // round trip.
+        let yaml = r#"
+origins:
+  "composed.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      - type: api_key
+        api_keys:
+          - key-one
+      - type: bearer
+        tokens:
+          - tok-one
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("composed.test").unwrap();
+        let auth = origin.auth_config.as_ref().unwrap();
+        let entries = auth.as_array().expect("list form must stay a list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].get("type").and_then(|v| v.as_str()),
+            Some("api_key")
+        );
+        assert_eq!(
+            entries[1].get("type").and_then(|v| v.as_str()),
+            Some("bearer")
+        );
+    }
+
+    #[test]
     fn parse_go_compression_with_enable() {
         let yaml = r#"
 origins:

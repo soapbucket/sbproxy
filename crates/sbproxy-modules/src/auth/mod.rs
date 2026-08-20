@@ -198,6 +198,21 @@ pub enum Auth {
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
     Plugin(Box<dyn AuthProvider>),
+    /// OR-composition over two or more providers (WOR-2517). Compiled
+    /// from a YAML list under `authentication:`. Providers are tried
+    /// in declared order; the first success wins and its principal is
+    /// the one bound to the request. When every provider rejects, the
+    /// response carries the first provider's status and message with
+    /// every provider's `WWW-Authenticate` challenge merged onto it
+    /// (RFC 7235 allows multiple challenges on one 401).
+    ///
+    /// Construction (`compile_auth`) guarantees the list holds at
+    /// least two providers and never contains `noop` (a slot that
+    /// admits everything would make the other slots decorative),
+    /// `forward_auth` (evaluated as an out-of-band subrequest the
+    /// composition path cannot run), `oidc` (its login flow needs the
+    /// origin-level callback wiring), or another list.
+    AnyOf(Vec<Auth>),
 }
 
 impl Auth {
@@ -217,6 +232,7 @@ impl Auth {
             Self::Oidc(_) => "oidc",
             Self::Noop => "noop",
             Self::Plugin(p) => p.auth_type(),
+            Self::AnyOf(_) => "any_of",
         }
     }
 }
@@ -237,6 +253,7 @@ impl std::fmt::Debug for Auth {
             Self::Oidc(a) => f.debug_tuple("Oidc").field(a).finish(),
             Self::Noop => write!(f, "Noop"),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
+            Self::AnyOf(providers) => f.debug_tuple("AnyOf").field(providers).finish(),
         }
     }
 }

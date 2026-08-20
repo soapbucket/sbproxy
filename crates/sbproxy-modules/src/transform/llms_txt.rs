@@ -462,10 +462,25 @@ fn collect_access(origin: &sbproxy_config::CompiledOrigin) -> Vec<String> {
 
     match &origin.auth_config {
         Some(auth) => {
-            let kind = auth
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("custom");
+            // A list-form block (WOR-2517) accepts any one of its
+            // providers, so name them all rather than the composite.
+            let kind = match auth.as_array() {
+                Some(entries) => entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("custom")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                None => auth
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom")
+                    .to_string(),
+            };
             lines.push(format!("Authentication required: {kind}."));
         }
         None => lines.push("Authentication: open access.".to_string()),

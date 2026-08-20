@@ -2265,6 +2265,36 @@ The `authentication` block is a sibling of `action`, not nested inside it. It co
 
 Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
 
+### Accepting more than one provider
+
+`authentication` also takes a list of two or more provider blocks. Providers run in declared order and the first one that accepts the request wins. This is the shape of a credential migration (keep accepting legacy API keys while callers move to JWTs on the same origin) and of mixed-client origins (services present tokens, crawlers present signatures).
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      - type: api_key
+        api_keys:
+          - ${LEGACY_API_KEY}
+      - type: jwt
+        jwks_url: https://auth.example.com/.well-known/jwks.json
+        issuer: https://auth.example.com
+```
+
+How the list behaves:
+
+- Order matters. Put the provider most callers use first; every request walks the list from the top and stops at the first success.
+- The winner binds the request. Audit events, decision records, and the auth metric name the provider that authenticated the request, and principal attribution (project, user, team, `key_id`) comes from the winning entry's own config. Nothing is merged across providers.
+- When every provider rejects, the response carries the first provider's status and message, with each provider's `WWW-Authenticate` challenge merged onto it ([RFC 7235](https://www.rfc-editor.org/rfc/rfc7235) permits several challenges on one response). A client that failed both then sees every scheme the origin accepts.
+- A provider that fails, whatever the reason, loses only its own slot. The next provider still runs, and a request no provider accepts is rejected.
+- A one-entry list is refused at config load; write a single provider as a plain mapping.
+- Three types are refused inside a list. `noop` would admit every request and make the other entries decorative. `forward_auth` runs as a separate subrequest and only works as an origin's sole provider. `oidc` needs the login-callback endpoint that only a sole `oidc` block wires up.
+
+See [examples/auth-composition/](../examples/auth-composition/) for a runnable two-provider config.
+
 ### api_key
 
 Authenticate requests with an API key. Keys are checked in the `X-Api-Key` header by default; an optional `query_param` lets clients pass keys via the URL. Typical fit: machine-to-machine API access.
