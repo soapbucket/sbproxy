@@ -59,7 +59,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `origins.<host>.response_cache.key_event`, field `source` | Lua or JavaScript | Returns `{vary, skip_lookup, reason}` before the cache lookup; adds dimensions to the cache key |
 | `origins.<host>.response_cache.admit_event`, field `source` | Lua or JavaScript | Returns `{store, ttl_secs, reason}` once the response body is complete; decides whether it is stored |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
-| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` only) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` hook reads `input.request.*` and `input.config` and returns a Rego boolean |
+| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` and `transforms[]`) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` policy hook reads `input.request.*` and `input.config` and returns a Rego boolean, and a `runtime: rego` transform hook reads `input.body.*` and `input.config` and returns a base64 string replacement body (or is undefined to decline) |
 | `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
 | `mcp` action `federated_servers[].argument_policies[]` / `result_policies[]` | CEL or Rego | Allow/deny over one tool call's `mcp.*` context, before dispatch (arguments) and after it (result); see the context note below the table |
 | `federated_servers[] type: local`, step `condition` | CEL | Boolean gate per DAG step, same `mcp.*` vocabulary as the argument policies; an expression that fails to evaluate fails the tool call closed ([mcp-compose.md](mcp-compose.md)) |
@@ -627,7 +627,7 @@ Reach for it to run a policy pasted from an older OPA install rather than rewrit
 
 ### `print()` capture
 
-A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior of Rego evaluation itself, not something each call site opts into, so it covers every surface that compiles a Rego module: `policy: rego`, `ai_routing_policy` `engine: rego`, a [request/response modifier's](#rego-modifiers) `rego_module`, and a signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook.
+A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior of Rego evaluation itself, not something each call site opts into, so it covers every surface that compiles a Rego module: `policy: rego`, `ai_routing_policy` `engine: rego`, a [request/response modifier's](#rego-modifiers) `rego_module`, and a signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy and transform hooks.
 
 ### Rego modifiers
 

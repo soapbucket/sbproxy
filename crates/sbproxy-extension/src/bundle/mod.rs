@@ -40,7 +40,7 @@ pub use proxy_wasm::{
 pub use registry::{
     BundleConfigValidationError, BundleProvenance, BundleRegistry, LoadedBundleHook,
 };
-pub use rego::{build_rego_policy, RegoPolicyAdapter};
+pub use rego::{build_rego_policy, build_rego_transform, RegoPolicyAdapter, RegoTransformAdapter};
 pub use response_semantics::{
     status_forbids_body, validate_extension_response, ExtensionResponseError,
 };
