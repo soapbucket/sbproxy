@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -510,6 +510,7 @@ Response body: an array of `RequestLogEntry`:
 | `failover_engaged` | bool | Whether fallback or AI provider failover ran. |
 | `failover_from`, `failover_to` | string | First failed and final selected provider or target, when known. |
 | `load_balancer_strategy`, `load_balancer_target` | string | Bounded routing strategy and selected target. |
+| `zone_locality` | string | Zone-locality verdict for the selected target: `local` (narrowed to the proxy's own zone) or `spilled` (no same-zone target was healthy, selection widened across zones). Absent when the stage did not engage. |
 | `provider`, `model` | string | AI provider and model when the AI gateway handled the request. |
 | `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
 | `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
@@ -608,10 +609,12 @@ diagnose why a load balancer is short on candidates.
 ```json
 {
   "config_revision": "abc123...",
+  "proxy_zone": "us-east-1a",
   "origins": [
     {
       "hostname": "api.example.com",
       "origin_id": "api",
+      "local_zone": "us-east-1a",
       "targets": [
         {
           "index": 0,
@@ -622,7 +625,8 @@ diagnose why a load balancer is short on candidates.
           "circuit_breaker_state": "closed",
           "weight": 10,
           "backup": false,
-          "group": null
+          "group": null,
+          "zone": "us-east-1a"
         }
       ]
     }
@@ -644,11 +648,16 @@ diagnose why a load balancer is short on candidates.
 | `origins[].targets[].weight` | int | Authored weight. |
 | `origins[].targets[].backup` | bool | True when this is a backup target. |
 | `origins[].targets[].group` | string \| null | Authored group tag, if any. |
+| `origins[].targets[].zone` | string \| null | Authored zone label, if any. A live routing input: same-zone targets are preferred while the pipeline's `proxy_zone` is set. |
+| `proxy_zone` | string \| null | The zone this proxy resolved for itself (`proxy.zone`, else `SB_ZONE`). Null means the zone-locality stage never engages. |
+| `origins[].local_zone` | string \| null | The zone bound to this origin's load balancer; matches `proxy_zone` on the live pipeline. |
 
-A `zone` field used to appear here, echoing the load balancer's
-`targets[].zone` label. That config key is refused at config compile
-now (target selection was never locality aware), so the response no
-longer carries it.
+The `zone` field disappeared from this response for a stretch: the
+label was display-only decoration, then refused at config compile,
+and it returned when zone-aware selection shipped and made it a
+routing input. Read it together with `proxy_zone`: a labeled target
+list under a null `proxy_zone` is exactly the shape the boot warning
+about an unzoned proxy points at.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.

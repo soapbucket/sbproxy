@@ -413,6 +413,12 @@ pub struct RequestContext {
     pub admin_load_balancer_strategy: Option<String>,
     /// Selected generic host:port or latest attempted AI provider.
     pub admin_load_balancer_target: Option<String>,
+    /// Zone-locality verdict of the load balancer selection
+    /// (WOR-2328): `"local"` when selection narrowed to the proxy's
+    /// own zone, `"spilled"` when no same-zone target was healthy and
+    /// selection widened across zones, `None` when the locality stage
+    /// did not engage.
+    pub admin_zone_locality: Option<&'static str>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -1668,6 +1674,7 @@ impl RequestContext {
             admin_last_ai_provider: None,
             admin_load_balancer_strategy: None,
             admin_load_balancer_target: None,
+            admin_zone_locality: None,
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),

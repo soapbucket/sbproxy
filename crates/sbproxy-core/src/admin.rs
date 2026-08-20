@@ -383,6 +383,12 @@ pub struct RequestLogEntry {
     /// Selected bounded target, such as host:port or provider name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_balancer_target: Option<String>,
+    /// Zone-locality verdict of the target selection (WOR-2328):
+    /// `"local"` when selection stayed in the proxy's own zone,
+    /// `"spilled"` when no same-zone target was healthy and selection
+    /// widened across zones. Absent when the stage did not engage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_locality: Option<String>,
     /// AI provider that served the request, when the AI gateway did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -1028,9 +1034,10 @@ fn render_target_health() -> String {
                     sbproxy_platform::CircuitState::HalfOpen => "half_open",
                 });
             let eligible = healthy && !outlier_ejected && breaker_state != Some("open");
-            // `zone` was rendered here while the config still parsed it;
-            // the key is refused at config compile now (WOR-2498), so
-            // there is no label left to echo.
+            // `zone` disappeared from this response while the config
+            // refused the label (WOR-2498) and returned when WOR-2328
+            // made it a live routing input. `local_zone` below is what
+            // it routes against.
             targets.push(serde_json::json!({
                 "index": t_idx,
                 "url": target.url,
@@ -1041,16 +1048,23 @@ fn render_target_health() -> String {
                 "weight": target.weight,
                 "backup": target.backup,
                 "group": target.group,
+                "zone": target.zone,
             }));
         }
         origins.push(serde_json::json!({
             "hostname": origin.hostname.as_str(),
             "origin_id": origin.origin_id.as_str(),
+            "local_zone": lb.local_zone(),
             "targets": targets,
         }));
     }
     serde_json::json!({
         "config_revision": pipeline.config_revision,
+        // The zone the pipeline resolved for itself (WOR-2328):
+        // `proxy.zone`, else `SB_ZONE`. Null means the zone-locality
+        // stage never engages, which beside a zoned target list is
+        // the misconfiguration the boot warning names.
+        "proxy_zone": pipeline.config.server.resolve_zone(),
         "origins": origins,
     })
     .to_string()
@@ -7454,6 +7468,13 @@ mod tests {
         assert!(
             parsed.get("config_revision").is_some(),
             "missing 'config_revision': {body}"
+        );
+        // WOR-2328: the proxy's resolved zone rides beside the target
+        // list so an operator can see whether locality is active. Null
+        // here (no proxy.zone, no SB_ZONE) but the key must exist.
+        assert!(
+            parsed.get("proxy_zone").is_some(),
+            "missing 'proxy_zone': {body}"
         );
     }
 

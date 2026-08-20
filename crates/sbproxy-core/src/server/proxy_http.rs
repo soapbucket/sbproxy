@@ -422,6 +422,11 @@ fn begin_load_balancer_attempt(
     });
     ctx.admin_load_balancer_strategy = Some(selection.selection_method.clone());
     ctx.admin_load_balancer_target = Some(format!("{}:{}", selection.host, selection.port));
+    // WOR-2328: per-attempt zone-locality verdict, so a retry that
+    // spills after a local first attempt reports the spill.
+    ctx.admin_zone_locality = selection
+        .zone_locality
+        .map(sbproxy_modules::action::ZoneLocality::as_str);
 }
 
 fn capture_load_balancer_upstream_response(
@@ -1775,6 +1780,7 @@ impl ProxyHttp for SbProxy {
                     tls = %selection.tls,
                     target_idx = %selection.target_index,
                     selection_method = %selection.selection_method,
+                    zone_locality = ctx.admin_zone_locality.unwrap_or("off"),
                     "load balancer routing request to upstream"
                 );
 
@@ -6985,6 +6991,7 @@ impl ProxyHttp for SbProxy {
                 failover_to: ctx.admin_failover_to.clone(),
                 load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
                 load_balancer_target: ctx.admin_load_balancer_target.clone(),
+                zone_locality: ctx.admin_zone_locality.map(str::to_string),
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
@@ -8265,6 +8272,7 @@ origins:
             tls: true,
             target_index,
             selection_method: selection_method.to_string(),
+            zone_locality: None,
         }
     }
 

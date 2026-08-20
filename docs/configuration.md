@@ -394,6 +394,7 @@ proxy:
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Not supported. Setting it fails config load. See [messenger_settings](#messenger_settings). |
+| `zone` | string | unset | The availability zone this proxy considers itself in, e.g. `us-east-1a`. Load balancer targets labeled with a matching `targets[].zone` are preferred; see [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). When unset, the `SB_ZONE` environment variable fills in (config wins). Unset both and selection ignores zone labels entirely. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honored. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
@@ -1429,6 +1430,7 @@ origins:
 | `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
+| `locality` | object | `{min_pool_size: 2}` | Zone-locality tuning. `min_pool_size` deactivates the same-zone preference when fewer eligible targets remain (the same guard as Envoy's `min_cluster_size`); the stage itself needs no block, only `proxy.zone` (or `SB_ZONE`) plus `targets[].zone` labels. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). |
 
 Algorithms:
 
@@ -1461,7 +1463,7 @@ origins:
 
 The `sticky:` block was removed. It parsed (`cookie_name`, `ttl`) and did nothing: no affinity cookie was ever issued. A config that still sets it fails to compile with an error naming the replacement. For cookie-based session affinity, use `ring_hash` keyed on the cookie your application already issues, as above.
 
-The `targets[].zone` label was removed the same way. Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone; a config that sets it fails to compile. Zone-aware routing is not implemented. To tell replicas apart, use `metadata:`, which promises nothing about selection.
+The `targets[].zone` label routes. When the proxy knows its own zone (`proxy.zone`, or `SB_ZONE` when that is unset), selection prefers same-zone targets and spills across zones only when no same-zone target is healthy; a proxy with no zone identity ignores the labels and warns at boot. The label went through a removal on the way here: it originally parsed as display-only decoration, was refused at config compile once that became clear, and was re-introduced together with the enforcement. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action) for the semantics and [`examples/multi-zone/`](../examples/multi-zone/) for a runnable drill.
 
 When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
 
@@ -1478,6 +1480,7 @@ Target fields:
 | `backup` | bool | false | Reserved for fallback. Excluded from normal selection. |
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
+| `zone` | string | unset | Availability zone label, e.g. `us-east-1a`. When the proxy's own zone (`proxy.zone` or `SB_ZONE`) matches, this target is preferred; when no same-zone target is healthy, requests spill across zones. Ignored, with a boot warning, when the proxy has no zone identity. |
 | `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |

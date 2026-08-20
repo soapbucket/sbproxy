@@ -1181,6 +1181,21 @@ pub struct ProxyServerConfig {
     /// reach the listener, not what they may do once they reach it.
     #[serde(default)]
     pub bind_address: Option<String>,
+    /// The availability zone this proxy considers itself in, e.g.
+    /// `"us-east-1a"` (WOR-2328).
+    ///
+    /// Load balancer targets whose `targets[].zone` label matches are
+    /// preferred by target selection, with per-request spillover across
+    /// zones when no same-zone target is healthy. When unset, the
+    /// `SB_ZONE` environment variable fills in at pipeline compile
+    /// time (see [`Self::resolve_zone`]), which is how a Kubernetes
+    /// deployment feeds in the node's `topology.kubernetes.io/zone`
+    /// label. Config wins over the environment so a deployment that
+    /// states its zone here can never be re-zoned by a stray variable.
+    /// With neither set, target selection ignores zone labels entirely
+    /// and warns at boot when labels are authored anyway.
+    #[serde(default)]
+    pub zone: Option<String>,
     /// Enable HTTP/2 cleartext (h2c) on the plain HTTP listener.
     ///
     /// When `true`, the proxy detects the HTTP/2 connection preface on
@@ -1979,6 +1994,34 @@ impl ProxyServerConfig {
         }
         Ok(())
     }
+
+    /// The zone this proxy considers itself in (WOR-2328).
+    ///
+    /// `proxy.zone` when set, otherwise the `SB_ZONE` environment
+    /// variable, the knob a Kubernetes deployment populates from the
+    /// node's `topology.kubernetes.io/zone` label. `None` means the
+    /// proxy has no zone identity and load balancer target selection
+    /// ignores `targets[].zone` labels entirely.
+    ///
+    /// Read once per pipeline compilation, never on the request path.
+    pub fn resolve_zone(&self) -> Option<String> {
+        Self::resolve_zone_from(
+            self.zone.as_deref(),
+            std::env::var("SB_ZONE").ok().as_deref(),
+        )
+    }
+
+    /// Precedence core of [`Self::resolve_zone`], separated from the
+    /// process environment so tests can drive both inputs without
+    /// mutating shared state: config wins, blank values on either side
+    /// count as unset, and the winner is trimmed.
+    pub fn resolve_zone_from(config_zone: Option<&str>, env_zone: Option<&str>) -> Option<String> {
+        config_zone
+            .map(str::trim)
+            .filter(|zone| !zone.is_empty())
+            .or_else(|| env_zone.map(str::trim).filter(|zone| !zone.is_empty()))
+            .map(str::to_string)
+    }
 }
 
 impl Default for ProxyServerConfig {
@@ -1986,6 +2029,7 @@ impl Default for ProxyServerConfig {
         Self {
             http_bind_port: default_http_port(),
             bind_address: None,
+            zone: None,
             http2_cleartext: false,
             https_bind_port: None,
             tls_cert_file: None,
@@ -9287,6 +9331,50 @@ pub enum IdempotencyBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- proxy.zone resolution (WOR-2328) ---
+    //
+    // Driven through the pure precedence core rather than the
+    // env-reading wrapper so no test mutates the process environment.
+
+    #[test]
+    fn zone_resolution_prefers_config_over_env() {
+        assert_eq!(
+            ProxyServerConfig::resolve_zone_from(Some("us-east-1a"), Some("us-west-2a")),
+            Some("us-east-1a".to_string()),
+            "a config that states its zone must never be re-zoned by SB_ZONE"
+        );
+    }
+
+    #[test]
+    fn zone_resolution_falls_back_to_env() {
+        assert_eq!(
+            ProxyServerConfig::resolve_zone_from(None, Some("us-west-2a")),
+            Some("us-west-2a".to_string())
+        );
+        assert_eq!(
+            ProxyServerConfig::resolve_zone_from(Some("   "), Some("us-west-2a")),
+            Some("us-west-2a".to_string()),
+            "a blank proxy.zone counts as unset"
+        );
+    }
+
+    #[test]
+    fn zone_resolution_trims_and_treats_blank_as_unset() {
+        assert_eq!(
+            ProxyServerConfig::resolve_zone_from(Some(" us-east-1a "), None),
+            Some("us-east-1a".to_string())
+        );
+        assert_eq!(ProxyServerConfig::resolve_zone_from(None, Some("  ")), None);
+        assert_eq!(ProxyServerConfig::resolve_zone_from(None, None), None);
+    }
+
+    #[test]
+    fn proxy_zone_parses_and_defaults_to_none() {
+        let proxy: ProxyServerConfig = serde_yaml::from_str("zone: eu-central-1a").unwrap();
+        assert_eq!(proxy.zone.as_deref(), Some("eu-central-1a"));
+        assert!(ProxyServerConfig::default().zone.is_none());
+    }
 
     #[test]
     fn parse_observability_log_block() {
