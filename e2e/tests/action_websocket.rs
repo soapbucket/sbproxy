@@ -307,3 +307,95 @@ fn websocket_upstream_selecting_outside_the_negotiated_set_is_refused() {
         }
     });
 }
+
+#[test]
+fn websocket_mid_tunnel_upstream_failure_closes_without_http_bytes() {
+    // WOR-2551: after the 101 commits, the downstream connection
+    // speaks WebSocket frames. A mid-tunnel upstream failure used to
+    // fall through to the generic upstream-error tail and write a
+    // synthesized "HTTP/1.1 502 ... bad gateway" into the frame
+    // stream. This drives a raw TCP client (tungstenite would hide the
+    // injected bytes behind a framing error) against an upstream that
+    // echoes one frame and then RSTs, and asserts the bytes on the
+    // wire after the upgrade are frames only: a clean close, no HTTP.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let upstream = websocket_common::spawn_ws_server_aborting_after_first_frame().await;
+        let harness =
+            ProxyHarness::start_with_yaml(&ws_config(upstream.websocket_url())).expect("start");
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port()))
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: ws.localhost:{}\r\nConnection: Upgrade\r\n\
+                     Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                    harness.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write upgrade request");
+
+        // Read the upgrade response headers.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut byte))
+                .await
+                .expect("101 header timeout")
+                .expect("101 header read");
+            assert!(n > 0, "connection ended inside the upgrade response");
+            head.extend_from_slice(&byte);
+            assert!(head.len() < 16 * 1024, "unbounded upgrade response");
+        }
+        let head_text = String::from_utf8_lossy(&head);
+        assert!(
+            head_text.starts_with("HTTP/1.1 101"),
+            "expected 101 Switching Protocols, got: {head_text}"
+        );
+
+        // One masked text frame ("hello", zero mask so the payload
+        // bytes read plainly). The upstream echoes it and then RSTs.
+        stream
+            .write_all(&[0x81, 0x85, 0, 0, 0, 0, b'h', b'e', b'l', b'l', b'o'])
+            .await
+            .expect("write frame");
+
+        // Everything from here to EOF is post-upgrade wire content.
+        let mut tunnel_bytes = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => tunnel_bytes.extend_from_slice(&buf[..n]),
+                // The teardown may surface as a reset rather than EOF;
+                // either way the wire content so far is what counts.
+                Ok(Err(_)) => break,
+                Err(_) => panic!(
+                    "connection survived the upstream failure (timeout waiting for teardown)"
+                ),
+            }
+        }
+
+        assert!(
+            tunnel_bytes.windows(5).any(|w| w == b"hello"),
+            "the echoed frame must reach the client before the teardown: {tunnel_bytes:?}"
+        );
+        let lowered = tunnel_bytes.to_ascii_lowercase();
+        for forbidden in [&b"http/1."[..], &b"bad gateway"[..], &b"content-length"[..]] {
+            assert!(
+                !lowered
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "HTTP bytes were written into the upgraded tunnel: {:?}",
+                String::from_utf8_lossy(&tunnel_bytes)
+            );
+        }
+    });
+}
