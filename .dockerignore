@@ -7,3 +7,9 @@ target/
 .git/
 .github/
 *.log
+
+# Container builds take their Rust version from their `FROM rust:<version>`
+# tag. Shipping the repo-root pin into the context would make rustup
+# override that tag inside the image and pull a second toolchain on every
+# build, so the declared base image would stop being what built the binary.
+rust-toolchain.toml

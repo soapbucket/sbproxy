@@ -1,0 +1,36 @@
+# The Rust toolchain this repository builds with.
+#
+# Every CI lane used to resolve its compiler from
+# `dtolnay/rust-toolchain@stable`, which floats. On 2026-08-20 stable
+# advanced to 1.98.0, two lints new in that release fired in
+# sbproxy-classifiers, and the lint lane went red on every open PR,
+# none of which had touched the code that failed. A toolchain that
+# moves without a commit is not pinned, and the breakage it causes
+# lands on whoever happened to push that morning.
+#
+# This file is the single source of truth for the version.
+# `.github/actions/rust-setup` parses `channel` out of it and hands it
+# to `dtolnay/rust-toolchain@master`, because that action reads no
+# toolchain file of its own: it selects purely from the `@rev` it is
+# called by. Raising the pin here raises it for every lane routed
+# through that composite, in one reviewable commit, and the new
+# release's lints get fixed in that same PR instead of in someone
+# else's.
+#
+# Pinned to current stable, not to the MSRV. `rust-version` in
+# Cargo.toml (1.95) is the floor we promise to compile on and msrv.yml
+# is the lane that proves it. Pinning stable to the floor would leave
+# nothing testing the compiler our users actually run.
+#
+# rustup honors this file for every cargo invocation inside the repo,
+# which outranks `rustup default`. Lanes that must run on a different
+# toolchain say so with RUSTUP_TOOLCHAIN, which outranks this file:
+# msrv.yml (the declared MSRV), wave4-fuzz.yml (nightly, for
+# cargo-fuzz), and release.yml's cross-target build (the toolchain the
+# release targets were installed into). Container builds pin through
+# their `FROM rust:<version>` tag, so this file is kept out of the
+# docker context in .dockerignore.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

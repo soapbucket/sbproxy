@@ -1,7 +1,7 @@
 # Shared Rust + system-package setup for SBproxy CI lanes.
 #
 # Bundles the four steps every Rust job in this repo otherwise
-# repeats: disk cleanup, stable toolchain, rust-cache, and the apt
+# repeats: disk cleanup, the pinned toolchain, rust-cache, and the apt
 # packages the workspace's transitive deps need. Centralising them
 # means future runner-image churn (clang headers, protoc location,
 # disk policy) is fixed once instead of in every workflow.
@@ -19,7 +19,7 @@
 # stays a setup primitive, not a workflow.
 
 name: rust-setup
-description: Stable Rust toolchain, rust-cache, and system packages for SBproxy CI.
+description: Pinned Rust toolchain, rust-cache, and system packages for SBproxy CI.
 
 inputs:
   cache-key:
@@ -58,9 +58,32 @@ runs:
       shell: bash
       run: bash "${{ github.action_path }}/reclaim-disk.sh"
 
+    # rust-toolchain.toml is the single source of truth for the version,
+    # but dtolnay/rust-toolchain does not read it. That action selects
+    # purely from the `@rev` it is called by, which is how `@stable`
+    # floated onto 1.98.0 mid-week and turned the lint lane red on PRs
+    # that had touched none of the failing code. Parse the channel here
+    # and pass it explicitly, so the file governs CI as well as rustup.
+    # Do not inline the version: two copies drift, and the copy CI
+    # believes would be the one nobody edits.
+    - name: read the pinned toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$pin" | head -n1)"
+        if [ -z "$channel" ]; then
+          echo "::error::no channel found in rust-toolchain.toml; every Rust lane resolves its compiler from that file"
+          exit 1
+        fi
+        echo "pinned toolchain: $channel"
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
     - name: install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: ${{ steps.toolchain.outputs.channel }}
         components: ${{ inputs.components }}
 
     - name: rust-cache

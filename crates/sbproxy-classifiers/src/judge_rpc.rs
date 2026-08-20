@@ -59,6 +59,13 @@ pub mod proto {
     #![allow(missing_docs)]
     #![allow(clippy::doc_markdown)]
     #![allow(rustdoc::broken_intra_doc_links)]
+    // Every generated service method returns `Result<_, tonic::Status>`,
+    // and `tonic::Status` is 176 bytes, over the lint's threshold. The
+    // signature is tonic's, produced fresh by `tonic-build` on every
+    // build, so it cannot be reshaped here and an edit to the emitted
+    // file would not survive the next regeneration. Boxing is the lint's
+    // suggested remedy and is not ours to apply to a third-party type.
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("sbproxy.classifier.judge.v1");
 }
 
