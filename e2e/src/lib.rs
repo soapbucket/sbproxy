@@ -58,6 +58,69 @@ fn startup_timeout() -> Duration {
         .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
 }
 
+/// How many times a `start_*` constructor re-picks a fresh port and
+/// respawns the proxy after a startup failure classified as a port
+/// collision, before surfacing the error.
+///
+/// The pick-a-port dance is inherently racy across processes: the
+/// reservation listener must be dropped for the child to bind, and a
+/// different, concurrently-starting test's child can bind the same
+/// number first (WOR-2295). The identity token already stops the loser
+/// from silently talking to the winner's proxy; this retry stops the
+/// loser from failing its whole test over it. Each attempt uses a
+/// freshly picked port, and a dead child is detected in milliseconds
+/// (see `wait_for_ready`), so retries are cheap.
+const STOLEN_PORT_START_ATTEMPTS: usize = 4;
+
+/// Substring of the proxy's fatal bind error on both Linux (os error
+/// 98) and macOS (os error 48). Startup failures whose child exited
+/// with this in stderr are classified as WOR-2295 port collisions.
+const PORT_COLLISION_STDERR_MARKER: &str = "Address already in use";
+
+/// Marker attached to a startup error when the spawned proxy exited
+/// because some port in its config was already bound, i.e. a
+/// different, concurrently-starting process won the pick-a-port race
+/// (WOR-2295).
+///
+/// The harness's own `start_*` constructors already retry the public
+/// port on this classification. Tests that bake additional
+/// self-picked ports into their YAML (cluster gossip / transport /
+/// admin ports) should check [`error_is_port_collision`] and rebuild
+/// with fresh ports rather than treating the failure as real.
+#[derive(Debug)]
+pub struct PortCollision {
+    /// Public port the harness picked for the failed attempt.
+    pub port: u16,
+}
+
+impl std::fmt::Display for PortCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a concurrently-starting process bound a port in this proxy's config first \
+             (harness public port {}; WOR-2295 port collision)",
+            self.port
+        )
+    }
+}
+
+impl std::error::Error for PortCollision {}
+
+/// Whether `error` (or any of its layers) carries the [`PortCollision`]
+/// marker, meaning the proxy child died to a WOR-2295 pick-a-port race
+/// rather than a real startup failure.
+///
+/// Checks both anyhow's layered downcast (which sees context values
+/// attached with `.context(...)`) and the source chain, so callers may
+/// wrap the harness error in further `with_context` layers without
+/// hiding the marker.
+pub fn error_is_port_collision(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PortCollision>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<PortCollision>().is_some())
+}
+
 const DEFAULT_BINARY_ENV: &str = "SBPROXY_E2E_BIN";
 const NO_DEFAULT_FEATURES_BINARY_ENV: &str = "SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN";
 const PAYMENTS_BINARY_ENV: &str = "SBPROXY_E2E_PAYMENTS_BIN";
@@ -259,10 +322,7 @@ impl ProxyHarness {
     /// caller's `proxy.http_bind_port` (if any) is overridden with
     /// an ephemeral port chosen by the harness.
     pub fn start_with_yaml(yaml: &str) -> anyhow::Result<Self> {
-        let port_reservation = pick_free_port()?;
-        let port = port_reservation.local_addr()?.port();
-        let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml(&final_yaml, port, None, port_reservation)
+        Self::start_with_raw_yaml_using_binary(yaml, ProxyBinaryFlavor::Default, None, &[])
     }
 
     /// Start the proxy with a config built from a YAML string, adding
@@ -272,21 +332,11 @@ impl ProxyHarness {
     /// test can exercise an env-read path in the proxy without mutating
     /// the test runner's own process environment (WOR-646).
     pub fn start_with_yaml_and_env(yaml: &str, env: &[(&str, &str)]) -> anyhow::Result<Self> {
-        let port_reservation = pick_free_port()?;
-        let port = port_reservation.local_addr()?.port();
-        let final_yaml = inject_port(yaml, port)?;
         let owned: Vec<(&str, String)> = env
             .iter()
             .map(|(name, value)| (*name, (*value).to_string()))
             .collect();
-        Self::start_with_resolved_yaml_using_binary(
-            &final_yaml,
-            port,
-            ProxyBinaryFlavor::Default,
-            None,
-            &owned,
-            port_reservation,
-        )
+        Self::start_with_raw_yaml_using_binary(yaml, ProxyBinaryFlavor::Default, None, &owned)
     }
 
     /// Start the proxy with a test-specific graceful shutdown budget.
@@ -294,10 +344,12 @@ impl ProxyHarness {
         yaml: &str,
         shutdown_grace_ms: u64,
     ) -> anyhow::Result<Self> {
-        let port_reservation = pick_free_port()?;
-        let port = port_reservation.local_addr()?.port();
-        let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml(&final_yaml, port, Some(shutdown_grace_ms), port_reservation)
+        Self::start_with_raw_yaml_using_binary(
+            yaml,
+            ProxyBinaryFlavor::Default,
+            Some(shutdown_grace_ms),
+            &[],
+        )
     }
 
     /// Start the proxy using a binary compiled with
@@ -307,16 +359,11 @@ impl ProxyHarness {
     /// e2e suite. Build the binary into `target/no-default-features/`
     /// or set `SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN`.
     pub fn start_no_default_features_with_yaml(yaml: &str) -> anyhow::Result<Self> {
-        let port_reservation = pick_free_port()?;
-        let port = port_reservation.local_addr()?.port();
-        let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml_using_binary(
-            &final_yaml,
-            port,
+        Self::start_with_raw_yaml_using_binary(
+            yaml,
             ProxyBinaryFlavor::NoDefaultFeatures,
             None,
             &[],
-            port_reservation,
         )
     }
 
@@ -332,17 +379,7 @@ impl ProxyHarness {
         yaml: &str,
         envs: &[(&str, String)],
     ) -> anyhow::Result<Self> {
-        let port_reservation = pick_free_port()?;
-        let port = port_reservation.local_addr()?.port();
-        let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml_using_binary(
-            &final_yaml,
-            port,
-            ProxyBinaryFlavor::Payments,
-            None,
-            envs,
-            port_reservation,
-        )
+        Self::start_with_raw_yaml_using_binary(yaml, ProxyBinaryFlavor::Payments, None, envs)
     }
 
     /// Start the proxy with the YAML file at `path`, rewriting its
@@ -355,18 +392,41 @@ impl ProxyHarness {
         Self::start_with_yaml(&yaml)
     }
 
-    fn start_with_resolved_yaml(
+    /// Pick a fresh public port, inject it into `yaml`, and spawn the
+    /// proxy, retrying with another fresh port when the attempt fails
+    /// to a WOR-2295 port collision (see [`PortCollision`]). Any other
+    /// startup failure surfaces immediately.
+    fn start_with_raw_yaml_using_binary(
         yaml: &str,
-        port: u16,
+        binary: ProxyBinaryFlavor,
         shutdown_grace_ms: Option<u64>,
-        port_reservation: TcpListener,
+        envs: &[(&str, String)],
     ) -> anyhow::Result<Self> {
+        for _ in 1..STOLEN_PORT_START_ATTEMPTS {
+            let port_reservation = pick_free_port()?;
+            let port = port_reservation.local_addr()?.port();
+            let final_yaml = inject_port(yaml, port)?;
+            match Self::start_with_resolved_yaml_using_binary(
+                &final_yaml,
+                port,
+                binary,
+                shutdown_grace_ms,
+                envs,
+                port_reservation,
+            ) {
+                Err(error) if error_is_port_collision(&error) => continue,
+                outcome => return outcome,
+            }
+        }
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
+        let final_yaml = inject_port(yaml, port)?;
         Self::start_with_resolved_yaml_using_binary(
-            yaml,
+            &final_yaml,
             port,
-            ProxyBinaryFlavor::Default,
+            binary,
             shutdown_grace_ms,
-            &[],
+            envs,
             port_reservation,
         )
     }
@@ -433,7 +493,7 @@ impl ProxyHarness {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
-        let harness = Self {
+        let mut harness = Self {
             child,
             port,
             token,
@@ -531,6 +591,24 @@ impl ProxyHarness {
         shutdown_grace_ms: Option<u64>,
         env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
+        // Same WOR-2295 retry contract as `start_with_raw_yaml_using_binary`:
+        // a startup failure classified as a port collision re-picks the
+        // public port and rebuilds the workspace; everything else surfaces.
+        for _ in 1..STOLEN_PORT_START_ATTEMPTS {
+            match Self::start_with_workspace_bytes_attempt(yaml, files, shutdown_grace_ms, env) {
+                Err(error) if error_is_port_collision(&error) => continue,
+                outcome => return outcome,
+            }
+        }
+        Self::start_with_workspace_bytes_attempt(yaml, files, shutdown_grace_ms, env)
+    }
+
+    fn start_with_workspace_bytes_attempt(
+        yaml: &str,
+        files: &[(&str, &[u8])],
+        shutdown_grace_ms: Option<u64>,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
         let port_reservation = pick_free_port()?;
         let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
@@ -586,7 +664,7 @@ impl ProxyHarness {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
-        let harness = Self {
+        let mut harness = Self {
             child,
             port,
             token,
@@ -600,12 +678,24 @@ impl ProxyHarness {
         Ok(harness)
     }
 
-    fn wait_for_ready_with_diagnostics(&self, timeout: Duration) -> anyhow::Result<()> {
-        self.wait_for_ready(timeout).map_err(|error| {
-            let stdout = self.stdout_contents();
-            let stderr = std::fs::read_to_string(self._stderr.path())
-                .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
-            anyhow::anyhow!("{error:#}\nchild stdout:\n{stdout}\nchild stderr:\n{stderr}")
+    fn wait_for_ready_with_diagnostics(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        let Err(error) = self.wait_for_ready(timeout) else {
+            return Ok(());
+        };
+        // `try_wait` rather than `child_is_running`: a startup-failed
+        // child is a zombie until reaped, and `kill(pid, 0)` counts a
+        // zombie as alive, which would misread every early exit as a
+        // still-starting proxy.
+        let exited = matches!(self.child.try_wait(), Ok(Some(_)));
+        let stdout = self.stdout_contents();
+        let stderr = std::fs::read_to_string(self._stderr.path())
+            .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
+        let collision = exited && stderr.contains(PORT_COLLISION_STDERR_MARKER);
+        let error = anyhow::anyhow!("{error:#}\nchild stdout:\n{stdout}\nchild stderr:\n{stderr}");
+        Err(if collision {
+            error.context(PortCollision { port: self.port })
+        } else {
+            error
         })
     }
 
@@ -689,7 +779,7 @@ impl ProxyHarness {
     /// (WOR-2295). Requiring the `x-sbproxy-e2e-harness-token` header
     /// to match the token this harness generated and handed to its own
     /// child via `SBPROXY_E2E_HARNESS_TOKEN` closes that gap; see
-    /// `http_probe_with_token`.
+    /// `http_probe_with_token_once`.
     ///
     /// The probe uses a raw `TcpStream` + hand-written HTTP/1.1 GET
     /// rather than `reqwest::blocking` to stay safe inside async
@@ -698,16 +788,43 @@ impl ProxyHarness {
     /// `Runtime::block_on()` call (as the gRPC and WebSocket e2e tests
     /// do) panics in tokio 1.52+ with "Cannot drop a runtime in a
     /// context where blocking is not allowed".
-    fn wait_for_ready(&self, timeout: Duration) -> anyhow::Result<()> {
-        http_probe_with_token(self.port, timeout, &self.token).map_err(|_| {
-            anyhow::anyhow!(
-                "proxy did not respond to HTTP on 127.0.0.1:{} within {:?} carrying this \
-                 harness's identity token (x-sbproxy-e2e-harness-token); a different, \
-                 concurrently-started test's proxy may have won a same-port race (WOR-2295)",
-                self.port,
-                timeout
-            )
-        })
+    fn wait_for_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let conn_timeout = std::cmp::min(
+                Duration::from_millis(500),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            if !conn_timeout.is_zero()
+                && http_probe_with_token_once(self.port, conn_timeout, &self.token)
+            {
+                return Ok(());
+            }
+            // Fail fast once the child is gone: no amount of further
+            // polling can produce a response carrying this harness's
+            // token, and the 30s wait used to be the whole cost of a
+            // lost WOR-2295 port race. `try_wait` also reaps the child,
+            // which `Drop` tolerates.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                anyhow::bail!(
+                    "proxy child exited during startup ({status}) before responding on \
+                     127.0.0.1:{} with this harness's identity token \
+                     (x-sbproxy-e2e-harness-token); a different, concurrently-started \
+                     test's proxy may have won a same-port race (WOR-2295)",
+                    self.port
+                );
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "proxy did not respond to HTTP on 127.0.0.1:{} within {:?} carrying this \
+                     harness's identity token (x-sbproxy-e2e-harness-token); a different, \
+                     concurrently-started test's proxy may have won a same-port race (WOR-2295)",
+                    self.port,
+                    timeout
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Base URL for the running proxy.
@@ -1081,20 +1198,20 @@ fn http_probe(port: u16, timeout: Duration) -> anyhow::Result<()> {
     anyhow::bail!("timeout");
 }
 
-/// Poll `127.0.0.1:<port>` until a raw HTTP/1.1 GET receives a
-/// response whose `x-sbproxy-e2e-harness-token` header matches
-/// `expected_token`, or the deadline expires.
+/// Issue one raw HTTP/1.1 GET against `127.0.0.1:<port>` and report
+/// whether the response carried an `x-sbproxy-e2e-harness-token`
+/// header matching `expected_token`.
 ///
 /// This is `http_probe`'s stricter sibling, used only by
-/// `wait_for_ready` for the harness's own primary port (WOR-2295). A
-/// bare "any HTTP response" check (what `http_probe` does) cannot
-/// distinguish this harness's own child from a different,
+/// `wait_for_ready`'s polling loop for the harness's own primary port
+/// (WOR-2295). A bare "any HTTP response" check (what `http_probe`
+/// does) cannot distinguish this harness's own child from a different,
 /// concurrently-starting harness's child that won a same-port race in
 /// the brief window `pick_free_port` leaves between releasing its
 /// reservation and this process's child binding it. Requiring the
 /// child's own token on the response closes that gap. A response
 /// without the matching header is treated exactly like "not ready
-/// yet": the loop reconnects and tries again rather than reporting a
+/// yet": the caller reconnects and tries again rather than reporting a
 /// false success against the wrong process.
 ///
 /// The proxy only ever sets this header when `SBPROXY_E2E_HARNESS_TOKEN`
@@ -1108,63 +1225,48 @@ fn http_probe(port: u16, timeout: Duration) -> anyhow::Result<()> {
 /// Shares `http_probe`'s raw-socket, runtime-free constraints: safe to
 /// call from inside a tokio `block_on` (the gRPC and WebSocket e2e
 /// tests do this).
-fn http_probe_with_token(port: u16, timeout: Duration, expected_token: &str) -> anyhow::Result<()> {
+fn http_probe_with_token_once(port: u16, conn_timeout: Duration, expected_token: &str) -> bool {
     use std::io::BufRead;
 
     let addr = format!("127.0.0.1:{port}");
-    let deadline = Instant::now() + timeout;
     let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
 
-    while Instant::now() < deadline {
-        let conn_timeout = std::cmp::min(
-            Duration::from_millis(500),
-            deadline.saturating_duration_since(Instant::now()),
-        );
-        if conn_timeout.is_zero() {
-            break;
-        }
-        if let Ok(mut stream) =
-            TcpStream::connect_timeout(&addr.parse().expect("addr parse"), conn_timeout)
-        {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.write_all(request.as_bytes());
-            let mut reader = std::io::BufReader::new(&stream);
-            let mut status_line = String::new();
-            if reader.read_line(&mut status_line).is_ok() && status_line.starts_with("HTTP/") {
-                // Read the header block (a blank line terminates it,
-                // matching every other HTTP/1.1 response) looking for
-                // this harness's own token.
-                let mut token_matches = false;
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim_end();
-                            if trimmed.is_empty() {
-                                break;
-                            }
-                            if let Some((name, value)) = trimmed.split_once(':') {
-                                if name
-                                    .trim()
-                                    .eq_ignore_ascii_case("x-sbproxy-e2e-harness-token")
-                                    && value.trim() == expected_token
-                                {
-                                    token_matches = true;
-                                }
-                            }
-                        }
-                        Err(_) => break,
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&addr.parse().expect("addr parse"), conn_timeout)
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.write_all(request.as_bytes());
+    let mut reader = std::io::BufReader::new(&stream);
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line).is_err() || !status_line.starts_with("HTTP/") {
+        return false;
+    }
+    // Read the header block (a blank line terminates it, matching every
+    // other HTTP/1.1 response) looking for this harness's own token.
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false,
+            Ok(_) => {
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    return false;
+                }
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name
+                        .trim()
+                        .eq_ignore_ascii_case("x-sbproxy-e2e-harness-token")
+                        && value.trim() == expected_token
+                    {
+                        return true;
                     }
                 }
-                if token_matches {
-                    return Ok(());
-                }
             }
+            Err(_) => return false,
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    anyhow::bail!("timeout");
 }
 
 /// Rewrite `proxy.http_bind_port` in the supplied YAML to the
@@ -2062,6 +2164,22 @@ mod tests {
         // real, non-zero port.
         assert!(a.local_addr().unwrap().port() > 0);
         assert!(b.local_addr().unwrap().port() > 0);
+    }
+
+    #[test]
+    fn port_collision_marker_survives_context_wrapping() {
+        // The cluster tests classify a failed node start through however
+        // many `with_context` layers their start helpers add, so the
+        // typed marker must stay downcastable through wrapping.
+        let error = anyhow::anyhow!("bind() failed on 0.0.0.0:4242")
+            .context(PortCollision { port: 4242 })
+            .context("start worker-b");
+        assert!(error_is_port_collision(&error));
+        // Classification is typed, never textual: an error that merely
+        // mentions the bind failure is not a collision verdict.
+        assert!(!error_is_port_collision(&anyhow::anyhow!(
+            "Address already in use (os error 48)"
+        )));
     }
 
     #[test]

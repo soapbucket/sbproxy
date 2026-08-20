@@ -3959,7 +3959,19 @@ mod tests {
                 Path::new("/bin/sh"),
                 &[
                     "-c".to_string(),
-                    "echo BEFORE-RUNTIME-DROP >&2; while [ ! -f \"$1\" ]; do sleep 0.01; done; echo AFTER-RUNTIME-DROP >&2; sleep 5"
+                    // `exec sleep 5`, not `sleep 5`: the test calls
+                    // `shutdown` the moment AFTER-RUNTIME-DROP appears,
+                    // which lands the group SIGTERM exactly while the
+                    // shell would be forking a `sleep` child. A child
+                    // born inside that fork misses the group signal, the
+                    // reaped shell can no longer prove group ownership,
+                    // and `shutdown` fail-closes with "ownership was
+                    // retained" while the orphan sleeps out its full
+                    // five seconds (the recurring ~5.1s gate flake).
+                    // `exec` keeps the group a single process whose
+                    // identity (pid + start fingerprint) survives the
+                    // exec, so every shutdown phase stays provable.
+                    "echo BEFORE-RUNTIME-DROP >&2; while [ ! -f \"$1\" ]; do sleep 0.01; done; echo AFTER-RUNTIME-DROP >&2; exec sleep 5"
                         .to_string(),
                     "sbproxy-stderr-fixture".to_string(),
                     release_arg,

@@ -67,20 +67,34 @@ struct ThreeNodeCluster {
     fallback_upstream: Option<MockUpstream>,
 }
 
-fn reserve_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve TCP port")
-        .local_addr()
-        .expect("reserved TCP address")
-        .port()
+/// A picked port whose socket stays bound until just before the node
+/// that will re-bind it is spawned. Dropping the reservation at the
+/// last moment shrinks the WOR-2295 window in which another process
+/// can be handed the same number; `error_is_port_collision` plus the
+/// cluster-level rebuild in `start_with_policy` covers the residue.
+struct PortLease {
+    _tcp: Option<TcpListener>,
+    _udp: Option<UdpSocket>,
 }
 
-fn reserve_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .expect("reserve UDP port")
-        .local_addr()
-        .expect("reserved UDP address")
-        .port()
+fn reserve_tcp_port(leases: &mut Vec<PortLease>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+    let port = listener.local_addr().expect("reserved TCP address").port();
+    leases.push(PortLease {
+        _tcp: Some(listener),
+        _udp: None,
+    });
+    port
+}
+
+fn reserve_udp_port(leases: &mut Vec<PortLease>) -> u16 {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("reserve UDP port");
+    let port = socket.local_addr().expect("reserved UDP address").port();
+    leases.push(PortLease {
+        _tcp: None,
+        _udp: Some(socket),
+    });
+    port
 }
 
 fn node_spec(
@@ -88,19 +102,21 @@ fn node_spec(
     node_id: &'static str,
     role: &'static str,
     zone: &'static str,
-) -> NodeSpec {
+) -> (NodeSpec, Vec<PortLease>) {
     let node_root = root.join(node_id);
-    NodeSpec {
+    let mut leases = Vec::new();
+    let spec = NodeSpec {
         node_id,
         role,
         zone,
-        gossip_port: reserve_udp_port(),
-        transport_port: reserve_tcp_port(),
-        admin_port: reserve_tcp_port(),
-        model_port: (role == "worker").then(reserve_tcp_port),
+        gossip_port: reserve_udp_port(&mut leases),
+        transport_port: reserve_tcp_port(&mut leases),
+        admin_port: reserve_tcp_port(&mut leases),
+        model_port: (role == "worker").then(|| reserve_tcp_port(&mut leases)),
         state_dir: node_root.join("state"),
         cache_dir: node_root.join("models"),
-    }
+    };
+    (spec, leases)
 }
 
 fn write_model_fixture(root: &Path) -> Result<PathBuf> {
@@ -296,14 +312,54 @@ impl ThreeNodeCluster {
         fallback_upstream: Option<MockUpstream>,
         placeable: bool,
     ) -> Result<Self> {
+        // Rebuild the whole cluster (fresh tempdir, fresh ports) when a
+        // node dies to a WOR-2295 port collision: the stolen port is
+        // baked into every node's config, so the harness's own
+        // public-port retry cannot recover a stolen gossip, transport,
+        // admin, or model port. Any other failure surfaces immediately.
+        const CLUSTER_START_ATTEMPTS: usize = 3;
+        for _ in 1..CLUSTER_START_ATTEMPTS {
+            match Self::start_with_policy_attempt(
+                cold_start,
+                routing,
+                &fallback_upstream,
+                placeable,
+            ) {
+                Err(error) if sbproxy_e2e::error_is_port_collision(&error) => continue,
+                Ok(mut cluster) => {
+                    cluster.fallback_upstream = fallback_upstream;
+                    return Ok(cluster);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut cluster =
+            Self::start_with_policy_attempt(cold_start, routing, &fallback_upstream, placeable)?;
+        cluster.fallback_upstream = fallback_upstream;
+        Ok(cluster)
+    }
+
+    fn start_with_policy_attempt(
+        cold_start: &str,
+        routing: &str,
+        fallback_upstream: &Option<MockUpstream>,
+        placeable: bool,
+    ) -> Result<Self> {
         let root = tempfile::tempdir().context("create model dispatch fixture")?;
         let catalog_path = write_model_fixture(root.path())?;
         let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
-        let nodes = vec![
+        let mut node_leases: BTreeMap<&'static str, Vec<PortLease>> = BTreeMap::new();
+        let nodes = [
             node_spec(root.path(), "gateway-a", "gateway", "edge"),
             node_spec(root.path(), "worker-a", "worker", "zone-a"),
             node_spec(root.path(), "worker-b", "worker", "zone-b"),
-        ];
+        ]
+        .into_iter()
+        .map(|(spec, leases)| {
+            node_leases.insert(spec.node_id, leases);
+            spec
+        })
+        .collect::<Vec<_>>();
         let gateway_gossip_port = nodes[0].gossip_port;
         let fallback_url = fallback_upstream.as_ref().map(MockUpstream::base_url);
         let policy = NodeConfigPolicy {
@@ -347,6 +403,10 @@ impl ThreeNodeCluster {
 
         let mut processes = BTreeMap::new();
         for (node, config) in nodes.iter().zip(&configs) {
+            // Release this node's port reservations only now, so the
+            // WOR-2295 window is the spawn itself rather than the whole
+            // fixture build and config validation above.
+            drop(node_leases.remove(node.node_id));
             processes.insert(
                 node.node_id,
                 ProxyHarness::start_with_workspace_and_shutdown_grace(config, &[], 1_000)
@@ -368,7 +428,9 @@ impl ThreeNodeCluster {
             engine_ports: BTreeMap::new(),
             primary_worker: None,
             failover_prompt: None,
-            fallback_upstream,
+            // Installed by `start_with_policy` once the attempt sticks;
+            // attempts only borrow the upstream for its URL.
+            fallback_upstream: None,
         };
         cluster.wait_for_assignments(usize::from(placeable), Duration::from_secs(40))?;
         Ok(cluster)

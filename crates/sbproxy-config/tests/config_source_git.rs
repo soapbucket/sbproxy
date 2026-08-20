@@ -302,14 +302,31 @@ fn a_missing_git_binary_is_a_named_preflight_failure() {
 fn write_hanging_git(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join("git");
-    // `sleep 20` rather than something enormous: killing the shell leaves
+    // ~20 seconds rather than something enormous: killing the shell leaves
     // the `sleep` it spawned as an orphan, and an orphan that goes away on
     // its own is better manners in CI than one that lingers for minutes.
     // Any value comfortably above the one-second timeout under test works.
+    // The fractional digits make the duration unique to this fixture
+    // directory (see `fixture_nap_duration`), so the orphan's own `ps`
+    // command line carries a token no concurrent test reproduces.
+    // Matching on a bare `sleep 20` instead let a concurrent test's
+    // fixture (this file's sibling timeout test runs the same script in
+    // its own process) appear between the leak test's before and after
+    // snapshots and read as a leak, which is exactly the load-only flake
+    // that test kept producing in the gate. A copy of the system `sleep`
+    // inside the tempdir would carry the marker too, but macOS SIGKILLs
+    // platform binaries executed from outside the sealed system volume,
+    // so the marker rides in the argument instead.
+    // The trailing `exit` keeps the shell from exec-replacing itself with
+    // the final command, so the sleeper is always a grandchild, which is
+    // the process this fixture exists to orphan.
     std::fs::write(
         &path,
-        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'git version 2.99.0'; exit 0;;\nesac\n\
-         sleep 20\n",
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'git version 2.99.0'; exit 0;;\nesac\n\
+             sleep {}\nexit 0\n",
+            fixture_nap_duration(dir)
+        ),
     )
     .expect("write fake git");
     let mut permissions = std::fs::metadata(&path)
@@ -360,14 +377,35 @@ fn a_hanging_fetch_leaves_no_orphaned_grandchild() {
     );
 }
 
-/// Pids of `sleep` processes spawned by the fake git in `scratch`.
+/// Sleep duration unique to the fixture at `dir`.
 ///
-/// Matches on the fixture's own directory so this cannot observe another
-/// test's fixture. Returns an empty set when `ps` is unavailable rather
-/// than failing, since the assertion above is about what is left over.
+/// Derived from the fixture directory with a fixed-key hasher, so
+/// `write_hanging_git` and `sleeping_pids_under` compute the same value
+/// while no concurrent test (which owns a different tempdir) can
+/// produce it. This is what lets the leak sweep recognize the orphaned
+/// `sleep` by its own command line, which otherwise carries no trace of
+/// the fixture that spawned it.
+#[cfg(unix)]
+fn fixture_nap_duration(dir: &Path) -> String {
+    use std::hash::{Hash, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    format!("20.{:09}", hasher.finish() % 1_000_000_000)
+}
+
+/// Pids of processes spawned by the fake git in `scratch`.
+///
+/// Matches only on tokens unique to this fixture: the fixture's own
+/// directory, which the shell carries in its command line (it runs the
+/// script at `<scratch>/git`), and the fixture-unique nap duration the
+/// orphaned `sleep` carries in its argument. A concurrent test's
+/// fixture reproduces neither. Returns an empty set when `ps` is
+/// unavailable rather than failing, since the assertion above is about
+/// what is left over.
 #[cfg(unix)]
 fn sleeping_pids_under(scratch: &Path) -> std::collections::BTreeSet<u32> {
     let marker = scratch.to_string_lossy().to_string();
+    let nap = format!("sleep {}", fixture_nap_duration(scratch));
     let out = Command::new("ps")
         .args(["-eo", "pid=,ppid=,command="])
         .output();
@@ -376,7 +414,7 @@ fn sleeping_pids_under(scratch: &Path) -> std::collections::BTreeSet<u32> {
     };
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|line| line.contains("sleep 20") || line.contains(&marker))
+        .filter(|line| line.contains(&marker) || line.contains(&nap))
         .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
         .collect()
 }

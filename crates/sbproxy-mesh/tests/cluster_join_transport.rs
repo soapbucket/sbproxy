@@ -7,20 +7,34 @@ use sbproxy_mesh::bootstrap::{bootstrap, BootstrapConfig};
 use sbproxy_mesh::discovery::{seeds::SeedDiscovery, Discovery};
 use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterNodeRole, ClusterStateRead};
 
-fn reserve_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .expect("reserve UDP port")
-        .local_addr()
-        .expect("UDP address")
-        .port()
+/// A picked port whose socket stays bound until just before the node
+/// that will re-bind it calls `bootstrap`. Dropping the reservation at
+/// the last moment shrinks the window in which a concurrently starting
+/// test process can be handed the same number and steal the port
+/// (the WOR-2295 pick-a-port race; a stolen transport port degrades
+/// the mesh to gossip-only and the route waits then time out).
+struct PortLease {
+    port: u16,
+    _tcp: Option<TcpListener>,
+    _udp: Option<UdpSocket>,
 }
 
-fn reserve_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve TCP port")
-        .local_addr()
-        .expect("TCP address")
-        .port()
+fn reserve_udp_port() -> PortLease {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("reserve UDP port");
+    PortLease {
+        port: socket.local_addr().expect("UDP address").port(),
+        _tcp: None,
+        _udp: Some(socket),
+    }
+}
+
+fn reserve_tcp_port() -> PortLease {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+    PortLease {
+        port: listener.local_addr().expect("TCP address").port(),
+        _tcp: Some(listener),
+        _udp: None,
+    }
 }
 
 fn config(gossip_port: u16, transport_port: u16) -> BootstrapConfig {
@@ -77,18 +91,26 @@ async fn wait_for_route(handle: &ClusterHandle, peer_id: &str, expected: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joining_nodes_exchange_stable_ids_and_typed_state_over_transport() {
-    let gossip_a = reserve_udp_port();
-    let gossip_b = reserve_udp_port();
-    let transport_a = reserve_tcp_port();
-    let transport_b = reserve_tcp_port();
+    let gossip_a_lease = reserve_udp_port();
+    let gossip_b_lease = reserve_udp_port();
+    let transport_a_lease = reserve_tcp_port();
+    let transport_b_lease = reserve_tcp_port();
+    let gossip_a = gossip_a_lease.port;
+    let gossip_b = gossip_b_lease.port;
+    let transport_a = transport_a_lease.port;
+    let transport_b = transport_b_lease.port;
 
     let none: Vec<Box<dyn Discovery>> = Vec::new();
+    // Release node A's reservations only now, immediately before the
+    // bootstrap that re-binds them.
+    drop((gossip_a_lease, transport_a_lease));
     let node_a = bootstrap(&none, &config(gossip_a, transport_a), "node-a".to_string())
         .await
         .expect("bootstrap node A");
     let seeds: Vec<Box<dyn Discovery>> = vec![Box::new(SeedDiscovery::new(vec![format!(
         "127.0.0.1:{gossip_a}"
     )]))];
+    drop((gossip_b_lease, transport_b_lease));
     let node_b = bootstrap(&seeds, &config(gossip_b, transport_b), "node-b".to_string())
         .await
         .expect("bootstrap node B");
@@ -127,14 +149,23 @@ async fn joining_nodes_exchange_stable_ids_and_typed_state_over_transport() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn seed_join_flood_converges_three_nodes_on_one_stable_ring() {
-    let gossip_a = reserve_udp_port();
-    let gossip_b = reserve_udp_port();
-    let gossip_c = reserve_udp_port();
-    let transport_a = reserve_tcp_port();
-    let transport_b = reserve_tcp_port();
-    let transport_c = reserve_tcp_port();
+    let gossip_a_lease = reserve_udp_port();
+    let gossip_b_lease = reserve_udp_port();
+    let gossip_c_lease = reserve_udp_port();
+    let transport_a_lease = reserve_tcp_port();
+    let transport_b_lease = reserve_tcp_port();
+    let transport_c_lease = reserve_tcp_port();
+    let gossip_a = gossip_a_lease.port;
+    let gossip_b = gossip_b_lease.port;
+    let gossip_c = gossip_c_lease.port;
+    let transport_a = transport_a_lease.port;
+    let transport_b = transport_b_lease.port;
+    let transport_c = transport_c_lease.port;
 
     let none: Vec<Box<dyn Discovery>> = Vec::new();
+    // Each node's reservations are released only immediately before the
+    // bootstrap that re-binds them; see `PortLease`.
+    drop((gossip_a_lease, transport_a_lease));
     let node_a = bootstrap(&none, &config(gossip_a, transport_a), "node-a".to_string())
         .await
         .expect("bootstrap node A");
@@ -143,6 +174,7 @@ async fn seed_join_flood_converges_three_nodes_on_one_stable_ring() {
             "127.0.0.1:{gossip_a}"
         )]))]
     };
+    drop((gossip_b_lease, transport_b_lease));
     let node_b = bootstrap(
         &seed_a(),
         &config(gossip_b, transport_b),
@@ -150,6 +182,7 @@ async fn seed_join_flood_converges_three_nodes_on_one_stable_ring() {
     )
     .await
     .expect("bootstrap node B");
+    drop((gossip_c_lease, transport_c_lease));
     let node_c = bootstrap(
         &seed_a(),
         &config(gossip_c, transport_c),
