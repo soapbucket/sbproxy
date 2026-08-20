@@ -322,6 +322,19 @@ batch_doc_drift() {
   bash "$ROOT/scripts/check-doc-drift.sh"
 }
 
+# A merge that commits its own conflict markers ships corrupted files;
+# one reached main's CHANGELOG on 2026-08-19 through a gate that never
+# looked. Scan every tracked text surface a merge can mangle. The
+# pattern is anchored and paired so scripts discussing markers (like
+# this one) do not self-trip. Read-only git grep, so it batches.
+batch_conflict_markers() {
+  if git grep -nE '^(<{7} |={7}$|>{7} )' -- ':!*.lock' ':!docs/llms-full.txt'; then
+    printf '\ncommitted merge-conflict markers found; resolve the merge for real.\n' >&2
+    return 1
+  fi
+  printf 'no conflict markers in tracked files\n'
+}
+
 run_batch "read-only source and doc scans" \
   batch_tracker_placeholders "no internal tracker placeholders" \
   batch_pub_item_ratchet "pub items whose only consumer is a test (ratchet)" \
@@ -335,18 +348,6 @@ run_batch "read-only source and doc scans" \
 
 # Serial: regen-llms-full.sh --check rebuilds the corpus into a temp
 # file when the branch carries it, and this phase can record a skip.
-# A merge that commits its own conflict markers ships corrupted files;
-# one reached main's CHANGELOG on 2026-08-19 through a gate that never
-# looked. Scan every tracked text surface a merge can mangle. The
-# pattern is anchored and paired so scripts discussing markers (like
-# this one) do not self-trip. Read-only git grep, so it batches.
-batch_conflict_markers() {
-  if git grep -nE '^(<{7} |={7}$|>{7} )' -- ':!*.lock' ':!docs/llms-full.txt'; then
-    printf '\ncommitted merge-conflict markers found; resolve the merge for real.\n' >&2
-    return 1
-  fi
-  printf 'no conflict markers in tracked files\n'
-}
 
 # CI: docs-ci.yml, "llms-full.txt is current if carried". A branch may
 # carry the corpus, and the rule is that it has to be what the generator
