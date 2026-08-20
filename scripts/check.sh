@@ -37,17 +37,6 @@
 #   SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1  permit the serial cargo test fallback
 #   SBPROXY_CHECK_PRIVATE_DOCS=1         extra rustdoc pass over private items
 #                                        (stricter than CI; see that phase)
-#   SBPROXY_CHECK_FUZZ=1                 run the cargo-fuzz harnesses now,
-#                                        ignoring the cadence
-#   SBPROXY_CHECK_FUZZ=0                 do not run them, ignoring the cadence.
-#                                        Unset honors the cadence: the phase
-#                                        runs itself when the last clean pass
-#                                        is older than SBPROXY_FUZZ_MAX_AGE_DAYS
-#                                        (default 7). Needs nightly and
-#                                        cargo-fuzz; without them the phase
-#                                        prints the install commands and skips.
-#                                        scripts/lib/fuzz-cadence.sh carries the
-#                                        rest of the knobs and the paths.
 #   SBPROXY_SKIP_CARGO=1                 dev-only: stop before the first
 #                                        cargo compile phase so the script
 #                                        phases can be exercised end to end
@@ -100,10 +89,9 @@ print_skip_summary() {
   else
     printf '\033[1;33mSKIPPED PHASES (these did NOT run):\033[0m\n'
     printf '%s' "$SKIPPED"
-    printf '\033[1;33mEvery one of these is checked somewhere else, or nowhere at\n'
-    printf 'all: CI runs all of them except the fuzz harnesses, and since\n'
-    printf 'that lane was deleted nothing runs those but this gate. A skip\n'
-    printf 'here is a lane you have not checked on this machine.\033[0m\n'
+    printf '\033[1;33mA skip here is a lane you have not actually checked on\n'
+    printf 'this machine. Most of these have a CI lane behind them; do not\n'
+    printf 'assume all of them do.\033[0m\n'
   fi
   printf '\033[1;33m========================================================\033[0m\n'
 }
@@ -397,7 +385,6 @@ fi
 step "gate helper self-tests"
 bash "$ROOT/scripts/tests/workspace_bin_test.sh"
 bash "$ROOT/scripts/tests/runner_disk_test.sh"
-bash "$ROOT/scripts/tests/fuzz_cadence_test.sh"
 python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
@@ -598,7 +585,7 @@ fi
 # =======================================================================
 
 if [ "${SBPROXY_SKIP_CARGO:-0}" = "1" ]; then
-  note_skip "cargo build/test/doctest/clippy/doc, the generated-artifact checks, the payments lane, and the fuzz cadence (SBPROXY_SKIP_CARGO=1 is a dev-only switch for exercising the script phases; a run with it set is not a gate result)"
+  note_skip "cargo build/test/doctest/clippy/doc, the generated-artifact checks, and the payments lane (SBPROXY_SKIP_CARGO=1 is a dev-only switch for exercising the script phases; a run with it set is not a gate result)"
 else
 
 # One package selection for every cargo invocation below, which is the
@@ -877,174 +864,6 @@ if [ "${SBPROXY_CHECK_PAYMENTS:-0}" = "1" ]; then
 else
   note_skip "payment settlement features (set SBPROXY_CHECK_PAYMENTS=1 to run it). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI requires this lane."
 fi
-
-# CI: none, and that is the point of this phase.
-#
-# The harnesses used to run in .github/workflows/wave4-fuzz.yml, whose job
-# condition was `workflow_dispatch || contains(labels, 'run-fuzz')`. The
-# `run-fuzz` label was never created in this repository, so the
-# pull-request arm of that condition was always false and the lane only
-# ever ran when somebody fired it by hand. It sat on the workflow list
-# reading like coverage and delivered none. The workflow file is deleted;
-# the harnesses run here instead, on a clock.
-#
-# Occasional, not every run, and automatic rather than remembered: a stamp
-# outside the repository records the last clean pass, and a pass older than
-# the cadence makes the next gate run the harnesses. scripts/lib/fuzz-cadence.sh
-# owns the cadence, the prerequisite probe, and every path involved, and
-# explains why the stamp and the fuzz target directory live per machine
-# rather than per worktree.
-#
-# Last of the cargo phases because it is the most expensive thing here when
-# it fires, so every cheaper failure above is found first. It shares no
-# build artifact with anything above it either: cargo-fuzz is nightly-only
-# and compiles with sanitizer instrumentation into its own target
-# directory, which is exactly why it must not point at the workspace
-# `target/` the rest of this gate reuses.
-#
-# Wall clock when it fires: ten targets at 15 libfuzzer seconds each is
-# about two and a half minutes of fuzzing, plus cargo. Warm, cargo is an
-# incremental rebuild of whatever moved plus ten relinks, so budget five to
-# ten minutes for a weekly run. The first run on a machine builds the whole
-# proxy graph (pingora, tract-onnx, tokenizers) from scratch under nightly:
-# a quarter of an hour and several gigabytes. That directory sits outside
-# the repository and is shared by every worktree, so it is one copy of the
-# gigabytes rather than one per branch, and neither `cargo clean` nor
-# scripts/cleanup-build-artifacts.sh will ever reclaim it. `rm -rf` it when
-# the disk matters.
-#
-# The target list comes from `cargo fuzz list` rather than a list written
-# down here. The CI matrix it replaces named nine targets by hand while
-# fuzz/Cargo.toml declared ten, so `cel_script` was never fuzzed anywhere.
-# A hand-maintained list is a detector narrower than the thing it checks.
-#
-# Read this before concluding a failure here is yours (WOR-2594). The
-# targets have never been observed passing anywhere. The label made the CI
-# lane unreachable on pull requests, and the two manual dispatches that
-# have ever been run, one on `main` and one on a branch, failed all nine
-# matrix targets identically inside `cargo fuzz run`:
-#
-#     error: sanitizer is incompatible with statically linked libc,
-#            disable it using `-C target-feature=-crt-static`
-#     error[E0463]: can't find crate for `std`
-#
-# `main` fails that way with no local change involved, so it is
-# pre-existing rot rather than anything this phase introduced, and whether
-# it reproduces on macOS is unknown: nobody has had a nightly toolchain on
-# a Mac to try. If your first run dies on crt-static, that is the known
-# state of the harnesses, not a break you caused. WOR-2594 owns the fix
-# (the usual remedies are an explicit `--target` or
-# `-C target-feature=-crt-static` in the fuzz RUSTFLAGS, and it wants the
-# failure reproduced before either is applied). This phase deliberately
-# does not carry a speculative workaround: a guess that silences the error
-# without being verified is how the lane became decorative in the first
-# place.
-#
-# CARGO_BUILD_JOBS=2 for the reason the rest of this gate uses it: the
-# build OOMs at 6.
-step "fuzz harnesses (occasional)"
-
-# shellcheck source=scripts/lib/fuzz-cadence.sh
-. "$ROOT/scripts/lib/fuzz-cadence.sh"
-
-fuzz_plan="$(fuzz_phase_plan)"
-fuzz_verdict="${fuzz_plan%%|*}"
-fuzz_detail="${fuzz_plan#*|}"
-
-case "$fuzz_verdict" in
-  skip-off)
-    note_skip "fuzz harnesses ($fuzz_detail turned the phase off, so none of the ten cargo-fuzz targets in fuzz/ ran. Nothing else in this gate or in CI fuzzes them; unset the variable to return to the cadence)"
-    ;;
-
-  skip-fresh)
-    # Not a note_skip. On six runs out of seven this is the phase working
-    # as designed, and a SKIPPED entry every time would train everybody to
-    # scroll past the block that has to stay readable.
-    printf '%s\n' "$fuzz_detail"
-    ;;
-
-  skip-missing)
-    # Due and unable to run. This is the case that must never read like a
-    # pass, so it prints the install commands in full and files a skip that
-    # says the phase was due. It repeats on every gate run until the
-    # toolchain is installed or SBPROXY_CHECK_FUZZ=0 turns the phase off,
-    # because the stamp only advances on a clean pass.
-    fuzz_prereq_hint "$fuzz_detail"
-    note_skip "fuzz harnesses were DUE and could not run: $fuzz_detail is missing. cargo-fuzz is nightly-only. Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh, then rustup toolchain install nightly, then cargo install cargo-fuzz (and put ~/.cargo/bin ahead of Homebrew on PATH). Nothing else in this gate or in CI fuzzes fuzz/, so all ten targets are unchecked until this is fixed or SBPROXY_CHECK_FUZZ=0 records the decision to skip them."
-    ;;
-
-  run)
-    fuzz_build_dir="$(fuzz_target_dir)"
-    fuzz_corpus_root="$(fuzz_corpus_dir)"
-    fuzz_seconds="$(fuzz_seconds_per_target)"
-    printf '%s\n' "$fuzz_detail"
-    printf 'target dir: %s\ncorpus dir: %s\nbudget:     %ss per target\n' \
-      "$fuzz_build_dir" "$fuzz_corpus_root" "$fuzz_seconds"
-    printf '\nNOTE: these harnesses have never been observed passing anywhere.\n'
-    printf 'The CI lane they came from could not run on a pull request, and the\n'
-    printf 'only manual dispatches of it failed every target on crt-static (see\n'
-    printf 'this phase in scripts/check.sh, and WOR-2594). A failure below may\n'
-    printf 'well be that, and is not something you just broke.\n'
-    mkdir -p "$fuzz_build_dir" "$fuzz_corpus_root"
-
-    while IFS= read -r fuzz_target; do
-      [ -n "$fuzz_target" ] || continue
-      mkdir -p "$fuzz_corpus_root/$fuzz_target"
-
-      # Corpus arguments, in this order. libfuzzer writes newly interesting
-      # inputs into the first directory and only reads the rest, so the
-      # growing corpus lands on the per-machine cache and the committed
-      # seeds under fuzz/corpus/ stay read-only. cargo-fuzz's default is to
-      # write into fuzz/corpus/<target>/, which exists for cel_script and
-      # nothing else: a default run would create nine untracked directories
-      # inside the repository and grow the tenth, and this gate's own
-      # working-tree guard would then fail the run that had just passed.
-      #
-      # The writable directory seeds the array rather than being appended to
-      # it, so the array is never empty. Under `set -u`, bash 3.2 (which is
-      # still what /bin/bash is on macOS) treats "${arr[@]}" on an empty
-      # array as an unbound variable and aborts.
-      fuzz_corpus_args=("$fuzz_corpus_root/$fuzz_target")
-      if [ -d "$ROOT/fuzz/corpus/$fuzz_target" ]; then
-        fuzz_corpus_args+=("$ROOT/fuzz/corpus/$fuzz_target")
-      fi
-
-      if ! (
-        cd "$ROOT/fuzz" &&
-          CARGO_BUILD_JOBS=2 cargo +nightly fuzz run \
-            --target-dir "$fuzz_build_dir" \
-            "$fuzz_target" \
-            "${fuzz_corpus_args[@]}" \
-            -- -max_total_time="$fuzz_seconds"
-      ); then
-        printf '\nfuzz target %s failed.\n\n' "$fuzz_target" >&2
-        printf 'If the error above is "sanitizer is incompatible with statically\n' >&2
-        # shellcheck disable=SC2016  # the backticks are prose, not a subshell
-        printf 'linked libc" or a missing `std` crate, that is the known\n' >&2
-        printf 'pre-existing break in these harnesses, not a bug in the code you\n' >&2
-        printf 'are gating: WOR-2594 owns it. Anything else is a real finding, and\n' >&2
-        printf 'the reproducer libfuzzer wrote is under fuzz/artifacts/%s/\n' "$fuzz_target" >&2
-        printf '(gitignored). Re-run just this target with:\n\n' >&2
-        printf '  cd fuzz && cargo +nightly fuzz run --target-dir %s %s\n\n' \
-          "$fuzz_build_dir" "$fuzz_target" >&2
-        printf 'and replay the reproducer with:\n\n' >&2
-        printf '  cd fuzz && cargo +nightly fuzz run --target-dir %s %s artifacts/%s/<file>\n' \
-          "$fuzz_build_dir" "$fuzz_target" "$fuzz_target" >&2
-        exit 1
-      fi
-    done < <(cd "$ROOT/fuzz" && cargo +nightly fuzz list)
-
-    # Only after every target came back clean, so a crash re-runs on the
-    # next gate rather than resetting the clock.
-    fuzz_record_pass
-    printf '\nall fuzz targets clean; cadence stamp refreshed at %s\n' "$(fuzz_stamp_path)"
-    ;;
-
-  *)
-    printf 'fuzz phase: unrecognized plan %s\n' "$fuzz_plan" >&2
-    exit 1
-    ;;
-esac
 
 # Closes the SBPROXY_SKIP_CARGO guard around every cargo phase.
 fi

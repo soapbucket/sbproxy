@@ -8,12 +8,11 @@ target/
 # is tracked; standalone helper crates lock their own deps locally).
 fuzz/Cargo.lock
 
-# Crash reproducers libfuzzer writes when a target finds one. They are
-# the useful output of a failed fuzz run and belong in a bug report, not
-# in git: the gate's working-tree guard would otherwise fail every run
-# after the first crash until somebody deleted them by hand. The growing
-# corpus is kept out of the tree a different way, per machine rather than
-# per worktree; see scripts/lib/fuzz-cadence.sh.
+# Crash reproducers libfuzzer writes when a fuzz target finds one. They
+# are the useful output of a failed run and belong in a bug report, not
+# in git: check.sh's working-tree guard would otherwise fail every run
+# after the first crash until somebody deleted them by hand.
+# scripts/README.md covers running the harnesses.
 fuzz/artifacts/
 
 # Generated test material under examples/ (cert generation scripts emit

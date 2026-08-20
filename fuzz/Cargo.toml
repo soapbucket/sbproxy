@@ -14,22 +14,17 @@
 # The 10-second smoke pass is what landed in the commit message for
 # this change.
 #
-# These targets do not run in CI. They ran in a label-gated workflow,
-# `.github/workflows/wave4-fuzz.yml`, whose label was never created, so
-# the lane skipped on every pull request it was ever attached to. That
-# file is deleted. The harnesses now run from the local gate on a
-# cadence: `scripts/check.sh` fuzzes every target in this manifest when
-# the last clean pass on the machine is more than a week old, and
-# `SBPROXY_CHECK_FUZZ=1 bash scripts/check.sh` forces a run. The cadence,
-# the paths, and the nightly prerequisites are in
-# `scripts/lib/fuzz-cadence.sh`.
+# Nothing runs these targets automatically. They had a CI lane,
+# `.github/workflows/wave4-fuzz.yml`, gated on a `run-fuzz` pull
+# request label that was never created in this repository, so the lane
+# skipped on every run it ever had. That file is deleted, and the local
+# gate does not run them either. Run them by hand; scripts/README.md
+# carries the prerequisites and the working-tree caveats.
 #
-# Be warned before you trust a run: no target here has been observed
-# passing anywhere. The only manual dispatches of the old CI lane failed
-# every target inside `cargo fuzz run` with "sanitizer is incompatible
-# with statically linked libc" and a missing `std` crate, on `main` as
-# well as on a branch. WOR-2594 tracks the fix. Whether the same break
-# reproduces on macOS is not yet known.
+# No target here has been observed passing anywhere. The only manual
+# dispatches of the old lane, one on `main` and one on a branch, failed
+# every target on "sanitizer is incompatible with statically linked
+# libc" and a missing `std` crate. WOR-2594 owns the fix.
 #
 # G4.6 (llms.txt projection, WOR-130) has landed; the
 # `llms_txt_parser` target drives the public
