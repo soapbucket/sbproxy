@@ -21,6 +21,7 @@
 #   # 401 - neither credential
 #   curl -i -H 'Host: api.local' http://127.0.0.1:8080/get
 
+# sbproxy-docs:begin
 proxy:
   http_bind_port: 8080
 
@@ -41,3 +42,4 @@ origins:
       - type: bearer
         tokens:
           - new-token-1
+# sbproxy-docs:end
