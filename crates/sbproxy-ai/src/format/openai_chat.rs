@@ -59,8 +59,12 @@ impl ChatFormat for OpenAiChatFormat {
                 .map(|f| f as f32),
             top_p: obj.get("top_p").and_then(|v| v.as_f64()).map(|f| f as f32),
             top_k: obj.get("top_k").and_then(|v| v.as_u64()).map(|n| n as u32),
+            // `max_completion_tokens` is OpenAI's current spelling of
+            // the budget knob (`max_tokens` is the legacy one); honor
+            // either, legacy first for stability (WOR-2554 sweep).
             max_tokens: obj
                 .get("max_tokens")
+                .or_else(|| obj.get("max_completion_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
             stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -148,6 +152,20 @@ impl ChatFormat for OpenAiChatFormat {
         if let Some(rf) = obj.get("response_format").cloned() {
             hub.extensions.insert("openai.response_format".into(), rf);
         }
+
+        // No catch-all note loop here, deliberately. `/v1/chat/completions`
+        // is the canonical path: the gateway forwards the client's own
+        // bytes and never builds a body from this parse, so a note
+        // saying `seed` was dropped would be a claim about behavior
+        // that does not happen. The drops that DO happen on this
+        // surface belong to the outbound provider translators
+        // (`translators::anthropic` and friends remove `seed`,
+        // `logit_bias`, and the penalties before an Anthropic or
+        // Gemini upstream sees them) and are a different set from
+        // anything this function could compute, because it runs before
+        // the provider is chosen. A sweep for this surface is a sweep
+        // of those translators, and it lands when a chat translate
+        // seam exists to report it (WOR-2554 review).
 
         let ctx = BridgeContext {
             inbound_format: self.id().into(),
@@ -584,5 +602,55 @@ mod tests {
                 .unwrap(),
         );
         assert!(frames.iter().any(|f| f.contains("[DONE]")));
+    }
+
+    // --- WOR-2554: the chat parser stops dropping silently too ---
+
+    #[test]
+    fn max_completion_tokens_is_honored_as_max_tokens() {
+        // Red-first: OpenAI's current spelling of the budget knob was
+        // never read, so a hub consumer saw no budget at all.
+        let req = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 128
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.max_tokens, Some(128));
+        assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
+    }
+
+    #[test]
+    fn legacy_max_tokens_wins_over_max_completion_tokens() {
+        let req = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "max_completion_tokens": 128
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.max_tokens, Some(64));
+    }
+
+    #[test]
+    fn the_canonical_chat_parse_records_no_lossiness() {
+        // The counterpart of the removed catch-all loop. This surface
+        // forwards the client's own bytes, so a note here would claim
+        // a drop that does not happen; the assertion pins that.
+        let req = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": 7,
+            "logit_bias": {"1": 2},
+            "presence_penalty": 0.5,
+            "user": "u-1",
+            "n": 2
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(
+            hub.lossiness.is_empty(),
+            "the canonical path forwards these fields verbatim: {:?}",
+            hub.lossiness
+        );
     }
 }

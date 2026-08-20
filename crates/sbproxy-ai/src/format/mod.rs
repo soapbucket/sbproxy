@@ -248,6 +248,125 @@ pub fn native_bypass_for(
     }
 }
 
+/// Sanitize a client-supplied `type` string for use in a
+/// `LossinessNote` field and the warn log at a translate seam:
+/// anything outside `[A-Za-z0-9_.-]` becomes `_`, the empty string
+/// becomes `unknown`, and the result is capped at 64 characters.
+pub(crate) fn sanitize_type_label(ty: &str) -> String {
+    if ty.is_empty() {
+        return "unknown".to_string();
+    }
+    ty.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Name a JSON value's type for a lossiness note about a field whose
+/// shape the translator cannot represent. Shared by every inbound
+/// parser so the same wrong-shape body reads the same way whichever
+/// surface it arrived on.
+pub(crate) fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Push an `Unsupported` lossiness note for a dropped wire-level value.
+/// `metric_label` is the note's bounded class for the drop counter and
+/// is a compile-time string on purpose: `field` may end in a sanitized
+/// client-derived segment, `metric_label` never does.
+pub(crate) fn note_drop(
+    lossiness: &mut Vec<LossinessNote>,
+    metric_label: &'static str,
+    field: String,
+    note: String,
+) {
+    lossiness.push(LossinessNote {
+        field,
+        metric_label: metric_label.to_string(),
+        direction: LossinessDirection::Unsupported,
+        note,
+    });
+}
+
+/// Cap on the distinct `field` labels one aggregated lossiness warn
+/// lists. Everything past the cap is still counted (`dropped` carries
+/// the full total and the counter every note), just not named.
+pub(crate) const LOSSINESS_WARN_FIELD_CAP: usize = 8;
+
+/// Report every lossiness note from one inbound translation: tick
+/// `sbproxy_ai_translation_dropped_total{surface, field}` once per
+/// note and emit ONE aggregated warn for the whole request.
+///
+/// `surface` is the inbound surface label from
+/// `AiSurface::label` (`messages`, `responses`), so the counter joins
+/// `sbproxy_ai_surface_requests_total` on the same `surface` values
+/// and a drop-rate panel has a denominator. `origin` and `tenant`
+/// carry the attribution an operator needs to find the caller
+/// producing the drop; they ride the warn only, so neither can mint
+/// metric series.
+///
+/// One warn per request rather than per note, deliberately: the note
+/// count is bounded only by body size, so a per-note loop handed any
+/// client a log-flood primitive (a 1 MiB body of unknown blocks is
+/// tens of thousands of warn lines) while no counter moved. The
+/// counter writes are folded per distinct class for the same reason:
+/// the note count is client-controlled, so one limiter round trip and
+/// one `inc_by` per class keeps a hostile body from turning into
+/// hundreds of thousands of metric writes on the request path. The
+/// counter is what dashboards alert on; the warn lists the first few
+/// distinct field labels plus the total so the log line stays
+/// grep-able without scaling with the body.
+pub(crate) fn report_translation_lossiness(
+    surface: &'static str,
+    origin: &str,
+    tenant: Option<&str>,
+    notes: &[LossinessNote],
+) {
+    if notes.is_empty() {
+        return;
+    }
+    // Fold first: `metric_label` is a bounded compile-time class, so
+    // this map is small no matter how large the body was.
+    let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for note in notes {
+        *counts.entry(note.metric_label.as_str()).or_insert(0) += 1;
+    }
+    for (label, count) in counts {
+        crate::ai_metrics::record_translation_dropped(surface, label, count);
+    }
+    let mut listed: Vec<&str> = Vec::new();
+    for note in notes {
+        if !listed.contains(&note.field.as_str()) {
+            if listed.len() == LOSSINESS_WARN_FIELD_CAP {
+                break;
+            }
+            listed.push(note.field.as_str());
+        }
+    }
+    tracing::warn!(
+        surface,
+        origin,
+        tenant = tenant.unwrap_or(""),
+        dropped = notes.len(),
+        fields = %listed.join(", "),
+        first_note = %notes[0].note,
+        "AI proxy: request fields dropped in translation"
+    );
+}
+
 /// A bidirectional translator between a wire format and the hub.
 ///
 /// The trait is method-style and uses the names called out in the
@@ -321,6 +440,99 @@ pub(crate) fn parse_role(
         other => Err(ChatError::bad_request(format!(
             "unsupported message role: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod lossiness_report_tests {
+    use super::{report_translation_lossiness, LossinessDirection, LossinessNote};
+
+    fn note(metric_label: &str, field: &str) -> LossinessNote {
+        LossinessNote {
+            field: field.to_string(),
+            metric_label: metric_label.to_string(),
+            direction: LossinessDirection::Unsupported,
+            note: "dropped".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct GrabWarns(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    struct Fields<'a>(&'a mut Vec<String>);
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={v:?}", f.name()));
+        }
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GrabWarns {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut fields = Vec::new();
+            event.record(&mut Fields(&mut fields));
+            if let Ok(mut sink) = self.0.lock() {
+                sink.push(fields.join(" "));
+            }
+        }
+    }
+
+    #[test]
+    fn notes_fold_per_class_and_the_warn_names_the_origin_and_tenant() {
+        // Red-first on two counts (WOR-2535 review): the counter loop
+        // wrote once per note, which a client-sized body turns into
+        // hundreds of thousands of limiter round trips on the request
+        // path, and neither the warn nor the counter said which origin
+        // or tenant produced the drop, so an alert had nowhere to go
+        // but raw body capture in production.
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let notes = vec![
+            note("anthropic.messages.content", "anthropic.messages.content.x"),
+            note("anthropic.messages.content", "anthropic.messages.content.y"),
+            note("anthropic.metadata", "anthropic.metadata"),
+        ];
+        let before_content =
+            crate::ai_metrics::translation_dropped_value("messages", "anthropic.messages.content");
+        let before_metadata =
+            crate::ai_metrics::translation_dropped_value("messages", "anthropic.metadata");
+
+        let warns: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let subscriber =
+            tracing_subscriber::registry().with(GrabWarns(std::sync::Arc::clone(&warns)));
+        tracing::subscriber::with_default(subscriber, || {
+            report_translation_lossiness("messages", "ai.example.com", Some("acme"), &notes);
+        });
+
+        let after_content =
+            crate::ai_metrics::translation_dropped_value("messages", "anthropic.messages.content");
+        let after_metadata =
+            crate::ai_metrics::translation_dropped_value("messages", "anthropic.metadata");
+        // Folding must not change the value: two notes of one class
+        // count two, whether that is two writes or one `inc_by(2)`.
+        assert!(
+            after_content - before_content >= 2,
+            "{before_content} -> {after_content}"
+        );
+        assert!(
+            after_metadata - before_metadata >= 1,
+            "{before_metadata} -> {after_metadata}"
+        );
+
+        let warns = warns.lock().expect("warn sink");
+        assert_eq!(warns.len(), 1, "one warn per request: {warns:?}");
+        assert!(warns[0].contains("ai.example.com"), "{}", warns[0]);
+        assert!(warns[0].contains("acme"), "{}", warns[0]);
+        assert!(warns[0].contains("dropped=3"), "{}", warns[0]);
+    }
+
+    #[test]
+    fn an_empty_note_list_writes_nothing() {
+        report_translation_lossiness("messages", "ai.example.com", None, &[]);
     }
 }
 
@@ -537,11 +749,15 @@ mod parity_tests {
             expected
         );
         assert_eq!(
-            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            super::anthropic_messages::parse_anthropic_message(
+                &obj(input.clone()),
+                &mut Vec::new()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
-            super::openai_responses::parse_responses_message(&obj(input)).unwrap(),
+            super::openai_responses::parse_responses_message(&obj(input), &mut Vec::new()).unwrap(),
             expected
         );
     }
@@ -560,11 +776,15 @@ mod parity_tests {
             expected
         );
         assert_eq!(
-            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            super::anthropic_messages::parse_anthropic_message(
+                &obj(input.clone()),
+                &mut Vec::new()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
-            super::openai_responses::parse_responses_message(&obj(input)).unwrap(),
+            super::openai_responses::parse_responses_message(&obj(input), &mut Vec::new()).unwrap(),
             expected
         );
     }
@@ -582,10 +802,13 @@ mod parity_tests {
         })))
         .unwrap();
         // Anthropic: inline `tool_use` block, `input` already structured.
-        let anthropic = super::anthropic_messages::parse_anthropic_message(&obj(json!({
-            "role": "assistant",
-            "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
-        })))
+        let anthropic = super::anthropic_messages::parse_anthropic_message(
+            &obj(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
+            })),
+            &mut Vec::new(),
+        )
         .unwrap();
         let expected = HubMessage {
             role: Role::Assistant,

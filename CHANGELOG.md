@@ -41,6 +41,32 @@ the next version cut.
   section of [docs/configuration.md](docs/configuration.md) and
   [examples/auth-hmac/](examples/auth-hmac/).
 
+- **`POST /v1/responses` resolves an object-valued `prompt` against the
+  gateway prompt store.** A request carrying
+  `{"prompt": {"id": "...", "version": "...", "variables": {...}}}`
+  previously had the whole object dropped in translation. The `id` now
+  maps onto a stored prompt name and `version` onto a stored version
+  label, an absent version takes the pinned default, and caller
+  `variables` render into the template before guardrails scan the
+  result. One stored prompt serves every configured provider, which is
+  the part a dashboard-hosted template cannot do. An unknown reference
+  answers `404`, a malformed object or a failed render answers `400`,
+  and nothing falls through to the raw input. Caller-supplied
+  `variables` override an operator's static `variables:` on a version,
+  so a constraint that must hold regardless of the caller belongs in
+  the template text; see the prompt-object section of
+  [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **`sbproxy_ai_translation_dropped_total{surface, field}` counts every
+  request field lost in translation.** `/v1/messages` and
+  `/v1/responses` now push a note for each unrepresented top-level
+  field, each dropped content block, and each extension attribute on a
+  block they keep, then emit one aggregated warn per request naming at
+  most eight distinct fields. `surface` uses the same `messages` and
+  `responses` values as `sbproxy_ai_surface_requests_total`, so a
+  drop-rate query joins the two. The log line to grep is
+  `AI proxy: request fields dropped in translation`, and it carries the
+  origin and tenant.
 - **Key-lifecycle events reach the SIEM feed.** The `events:` type
   list grows to eighteen declared types with five key-lifecycle kinds.
   `key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` bridge
@@ -97,6 +123,23 @@ the next version cut.
   request and exit keep working: a child that dies after serving is
   respawned on the next call. See the stdio section of
   [docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md).
+
+- **`tool_choice` is honored end to end, and `top_k` is now stripped
+  for OpenAI-format upstreams.** `/v1/messages` used to parse neither
+  field, so both were dropped silently and a forced-tool request came
+  back as an ordinary completion. Both are honored now, and each
+  provider translator rewrites `tool_choice` into that provider's own
+  spelling: `{"type": "any" | "none" | "tool"}` for Anthropic,
+  `toolConfig.functionCallingConfig` for Gemini, and Bedrock already
+  mapped it. `top_k` has no OpenAI Chat Completions equivalent, so the
+  OpenAI arm drops it rather than forwarding an argument
+  `api.openai.com` answers with a `400`. Check this one before you
+  upgrade if you point an origin with `format: openai` at an
+  OpenAI-compatible upstream that does honor `top_k`, such as Together
+  or a self-hosted vLLM: that value used to be forwarded and is now
+  removed, and sampling will change. `format: custom` byte-forwards the
+  body and is the escape hatch. See the translation section of
+  [docs/ai-gateway.md](docs/ai-gateway.md).
 
 ### Fixed
 
