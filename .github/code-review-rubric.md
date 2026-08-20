@@ -111,6 +111,13 @@ past capacity" is.
   operators to ignore the channel.
 - **No log line is the only record of a decision.** Logs are lossy and
   rotate; a decision that matters needs a structured record too.
+- **Per-item log loops are bounded per request.** A warn emitted once
+  per element of caller-controlled input hands a single request a
+  log-flood primitive. Aggregate: one line per request with a count and
+  a capped sample of labels.
+- **Caller-controlled strings are sanitized before they reach a log
+  line.** An unsanitized id or field name in a warn is newline log
+  forging; run it through the label sanitizer first.
 
 ## 4. Metrics and observability
 
@@ -134,6 +141,15 @@ past capacity" is.
   made, and it needs its own alert.
 - **Drops are counted.** A silently lossy audit or event feed is worse
   than none: it reads as evidence of absence.
+- **Refusals and enforcement decisions reach the SIEM feed.** If a
+  comparable surface publishes a typed event (`events:`) for its
+  refusals, the new surface must too; a decision that exists only in a
+  local log or metric is invisible to the pipeline operators actually
+  watch. Absence of the event is a finding, not a follow-up.
+- **New observable behavior is scrapeable.** A feature whose activation
+  an operator would alert on (a new refusal path, a fallback taken, a
+  degradation) needs a counter or gauge from day one; "we can add the
+  metric later" ships a blind spot.
 
 ## 5. Correctness and behavior change
 
