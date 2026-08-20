@@ -507,6 +507,31 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Current active connections.",
         dead_reason: None,
     },
+    // WOR-2578: the admin request-log export is the one route that
+    // returns the operational log in bulk, so its rate and its volume
+    // are what an operator alerts on for exfiltration.
+    MetricCapability {
+        name: "sbproxy_admin_request_export_rows_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admin_request_export"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["format"],
+        description: "Rows written by admin request-log exports, by format.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_admin_request_exports_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admin_request_export"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["format"],
+        description: "Admin request-log exports served, by format.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_agent_budget_decisions_total",
         kind: MetricKind::Counter,

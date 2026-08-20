@@ -241,6 +241,32 @@ describe("request observability contracts", () => {
       expect.objectContaining({ method: "GET" }),
     );
   });
+
+  // WOR-2578: the report and the export ride the same filter surface
+  // as the snapshot, so one filter state describes all three.
+  it("builds the multi-dimension report path from the shared filter surface", async () => {
+    const fetchMock = stubFetch(
+      '{"schema_version":1,"group_by":["model"],"rows":[],"totals":{"requests":0,"tokens_in":0,"tokens_out":0,"cost_usd_micros":0}}',
+    );
+
+    await api.requestsReport(["model", "api_key_id", "tenant", "user"], {
+      model: "claude-sonnet-4",
+      tenant: "acme",
+      user: "dev@acme.test",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests/report?model=claude-sonnet-4&tenant=acme&user=dev%40acme.test&group_by=model%2Capi_key_id%2Ctenant%2Cuser",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("builds export URLs that carry the current filtered view", () => {
+    expect(api.requestsExportUrl("csv", { model: "gpt-5", tenant: "acme" })).toBe(
+      "/api/requests/export?model=gpt-5&tenant=acme&format=csv",
+    );
+    expect(api.requestsExportUrl("jsonl")).toBe("/api/requests/export?format=jsonl");
+  });
 });
 
 describe("extension inventory contract", () => {

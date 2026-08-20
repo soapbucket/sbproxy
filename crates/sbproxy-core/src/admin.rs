@@ -478,6 +478,70 @@ pub struct RequestLogFilter<'a> {
     pub key_mode: Option<&'a str>,
     /// Exact session id match (WOR-2093; previously client-side only).
     pub session_id: Option<&'a str>,
+    /// Exact AI model match (WOR-2578), one of the report dimensions.
+    pub model: Option<&'a str>,
+    /// Exact origin-scoped tenant label match (WOR-2578).
+    pub tenant: Option<&'a str>,
+    /// Exact resolved end-user id match (WOR-2578): the human subject
+    /// behind the call, sbproxy's equivalent of OpenRouter's "Creator".
+    pub user: Option<&'a str>,
+}
+
+impl RequestLogFilter<'_> {
+    /// Returns `true` when `entry` passes every dimension this filter
+    /// sets. `None` on a dimension means it is not filtered.
+    ///
+    /// This is the single predicate behind `/api/requests`,
+    /// `/api/requests/report`, and `/api/requests/export`
+    /// ([`AdminState::query_requests`] and `for_each_request` both call
+    /// it), so the three routes cannot drift into selecting different
+    /// rows for the same query string. A dimension added here is
+    /// filtered on all three.
+    fn matches(&self, entry: &RequestLogEntry) -> bool {
+        self.status.is_none_or(|s| entry.status == s)
+            && self
+                .method
+                .is_none_or(|m| entry.method.eq_ignore_ascii_case(m))
+            && self.path_sub.is_none_or(|p| entry.path.contains(p))
+            // WOR-1874: exact-match filters on the guardrail columns so
+            // the Guardrails admin view can deep-link to blocked rows.
+            && self
+                .guardrail_action
+                .is_none_or(|a| entry.guardrail_action.as_deref() == Some(a))
+            && self
+                .guardrail_category
+                .is_none_or(|c| entry.guardrail_category.as_deref() == Some(c))
+            && self
+                .cache_status
+                .is_none_or(|status| entry.cache_status == status)
+            && self
+                .retried
+                .is_none_or(|retried| (entry.retry_count > 0) == retried)
+            && match (self.property_key, self.property_value) {
+                (None, _) => true,
+                (Some(key), None) => entry.properties.contains_key(key),
+                (Some(key), Some(value)) => entry.properties.get(key).is_some_and(|v| v == value),
+            }
+            // WOR-2093: key-accountability filters so the Keys view can
+            // deep-link to one credential's traffic, and session rows
+            // resolve server-side instead of client-side.
+            && self
+                .api_key_id
+                .is_none_or(|id| entry.api_key_id.as_deref() == Some(id))
+            && self.key_mode.is_none_or(|mode| entry.key_mode == mode)
+            && self
+                .session_id
+                .is_none_or(|id| entry.session_id.as_deref() == Some(id))
+            // WOR-2578: the four report dimensions, filterable exactly
+            // so a grouped row drills through to the rows behind it.
+            && self
+                .model
+                .is_none_or(|model| entry.model.as_deref() == Some(model))
+            && self.tenant.is_none_or(|tenant| entry.tenant_id == tenant)
+            && self
+                .user
+                .is_none_or(|user| entry.user_id.as_deref() == Some(user))
+    }
 }
 
 // --- Admin State ---
@@ -793,70 +857,55 @@ impl AdminState {
     /// Query the recent-request log (newest first) with optional
     /// filters and pagination (WOR-1718 / WOR-1874). `offset`/`limit`
     /// paginate the filtered result.
+    ///
+    /// This is `for_each_request` collecting into a `Vec`, and both run
+    /// the same private `RequestLogFilter` predicate, so the
+    /// aggregating and exporting routes select exactly the rows this
+    /// one returns.
     pub fn query_requests(
         &self,
         filter: &RequestLogFilter<'_>,
         offset: usize,
         limit: usize,
     ) -> Vec<RequestLogEntry> {
+        let mut out = Vec::new();
+        self.for_each_request(filter, offset, limit, |entry| out.push(entry.clone()));
+        out
+    }
+
+    /// Visit the filtered recent-request log (newest first) one entry
+    /// at a time, without materializing the matching set (WOR-2578).
+    ///
+    /// The aggregation and export routes fold or serialize each row as
+    /// it is visited, so nothing holds a second copy of the result:
+    /// peak memory is the ring itself, which
+    /// `proxy.admin.max_log_entries` already bounds, plus one row's
+    /// worth of encoding. `query_requests` is this function collecting
+    /// into a `Vec`, which is why the two can never disagree about
+    /// which rows a filter selects.
+    ///
+    /// `visit` runs while the ring lock is held, so it must not call
+    /// back into the log. Both in-tree callers only write into a
+    /// `String` or a `BTreeMap`. Deliberately private: the report and
+    /// the export live in this module, and a callback that borrows the
+    /// ring lock is not a shape to hand to another crate.
+    fn for_each_request(
+        &self,
+        filter: &RequestLogFilter<'_>,
+        offset: usize,
+        limit: usize,
+        mut visit: impl FnMut(&RequestLogEntry),
+    ) {
         let log = self
             .recent_requests
             .lock()
             .expect("admin log mutex poisoned");
         log.iter()
             .rev()
-            .filter(|e| filter.status.is_none_or(|s| e.status == s))
-            .filter(|e| {
-                filter
-                    .method
-                    .is_none_or(|m| e.method.eq_ignore_ascii_case(m))
-            })
-            .filter(|e| filter.path_sub.is_none_or(|p| e.path.contains(p)))
-            // WOR-1874: exact-match filters on the guardrail columns so
-            // the Guardrails admin view can deep-link to blocked rows.
-            .filter(|e| {
-                filter
-                    .guardrail_action
-                    .is_none_or(|a| e.guardrail_action.as_deref() == Some(a))
-            })
-            .filter(|e| {
-                filter
-                    .guardrail_category
-                    .is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
-            })
-            .filter(|e| {
-                filter
-                    .cache_status
-                    .is_none_or(|status| e.cache_status == status)
-            })
-            .filter(|e| {
-                filter
-                    .retried
-                    .is_none_or(|retried| (e.retry_count > 0) == retried)
-            })
-            .filter(|e| match (filter.property_key, filter.property_value) {
-                (None, _) => true,
-                (Some(key), None) => e.properties.contains_key(key),
-                (Some(key), Some(value)) => e.properties.get(key).is_some_and(|v| v == value),
-            })
-            // WOR-2093: key-accountability filters so the Keys view can
-            // deep-link to one credential's traffic, and session rows
-            // resolve server-side instead of client-side.
-            .filter(|e| {
-                filter
-                    .api_key_id
-                    .is_none_or(|id| e.api_key_id.as_deref() == Some(id))
-            })
-            .filter(|e| filter.key_mode.is_none_or(|mode| e.key_mode == mode))
-            .filter(|e| {
-                filter
-                    .session_id
-                    .is_none_or(|id| e.session_id.as_deref() == Some(id))
-            })
+            .filter(|e| filter.matches(e))
             .skip(offset)
             .take(limit)
-            .cloned()
-            .collect()
+            .for_each(&mut visit);
     }
 
     /// Validate basic auth credentials using constant-time comparison.
@@ -2602,6 +2651,587 @@ fn decoded_query_param(path: &str, key: &str) -> Option<String> {
         .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
 }
 
+// --- Request-log filter surface, report, and export (WOR-2578) ---
+
+/// An admin route's `(status, content_type, body)` triple.
+type AdminResponse = (u16, &'static str, String);
+
+/// One JSON error response, ready to return from a route.
+fn admin_error(status: u16, message: &str) -> AdminResponse {
+    (
+        status,
+        "application/json",
+        serde_json::json!({ "error": message }).to_string(),
+    )
+}
+
+/// The owned result of parsing the `/api/requests` query string
+/// (WOR-2578).
+///
+/// [`RequestLogFilter`] borrows its values, and every filter arrives as
+/// a decoded `String`, so something has to own them for the length of
+/// the request. Parsing lives here rather than inline in the route so
+/// `/api/requests`, `/api/requests/report`, and `/api/requests/export`
+/// share one parser: a value the snapshot refuses is refused
+/// identically by the aggregation and the export, and a dimension added
+/// here is filterable on all three the day it lands.
+struct ParsedRequestFilter {
+    status: Option<u16>,
+    method: Option<String>,
+    path_sub: Option<String>,
+    guardrail_action: Option<String>,
+    guardrail_category: Option<String>,
+    cache_status: Option<String>,
+    retried: Option<bool>,
+    property_key: Option<String>,
+    property_value: Option<String>,
+    api_key_id: Option<String>,
+    key_mode: Option<String>,
+    session_id: Option<String>,
+    model: Option<String>,
+    tenant: Option<String>,
+    user: Option<String>,
+    /// Rows to skip, from the caller's `offset` (0 when absent).
+    offset: usize,
+    /// Rows to take, defaulted to and clamped at `max_log_entries`.
+    limit: usize,
+}
+
+impl ParsedRequestFilter {
+    /// Parse the whole filter surface out of `path`'s query string, or
+    /// return the `400` the caller should get.
+    ///
+    /// `limit` is defaulted to and clamped at `max_log_entries` rather
+    /// than trusted: the ring holds at most that many rows, so a larger
+    /// number can only describe rows that do not exist, and clamping
+    /// keeps the export bounded by configuration instead of by what a
+    /// caller asks for.
+    fn from_query(path: &str, max_log_entries: usize) -> Result<Self, AdminResponse> {
+        let cache_status = decoded_query_param(path, "cache_status");
+        if cache_status
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "disabled" | "miss" | "hit" | "semantic_hit"))
+        {
+            return Err(admin_error(
+                400,
+                "cache_status must be disabled, miss, hit, or semantic_hit",
+            ));
+        }
+        let retried = match decoded_query_param(path, "retried").as_deref() {
+            None => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(_) => return Err(admin_error(400, "retried must be true or false")),
+        };
+        let property_key = decoded_query_param(path, "property_key");
+        let property_value = decoded_query_param(path, "property_value");
+        if property_value.is_some() && property_key.as_deref().is_none_or(str::is_empty) {
+            return Err(admin_error(400, "property_value requires property_key"));
+        }
+        let key_mode = decoded_query_param(path, "key_mode");
+        if key_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "none" | "minted" | "native"))
+        {
+            return Err(admin_error(400, "key_mode must be none, minted, or native"));
+        }
+        Ok(Self {
+            status: rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok()),
+            method: decoded_query_param(path, "method"),
+            path_sub: decoded_query_param(path, "path"),
+            guardrail_action: decoded_query_param(path, "guardrail_action"),
+            guardrail_category: decoded_query_param(path, "guardrail_category"),
+            cache_status,
+            retried,
+            property_key,
+            property_value,
+            api_key_id: decoded_query_param(path, "api_key_id"),
+            key_mode,
+            session_id: decoded_query_param(path, "session_id"),
+            model: decoded_query_param(path, "model"),
+            tenant: decoded_query_param(path, "tenant"),
+            user: decoded_query_param(path, "user"),
+            offset: rl_query_param(path, "offset")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            limit: rl_query_param(path, "limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(max_log_entries)
+                .min(max_log_entries),
+        })
+    }
+
+    /// Borrow the parsed values as a [`RequestLogFilter`].
+    fn filter(&self) -> RequestLogFilter<'_> {
+        RequestLogFilter {
+            status: self.status,
+            method: self.method.as_deref(),
+            path_sub: self.path_sub.as_deref(),
+            guardrail_action: self.guardrail_action.as_deref(),
+            guardrail_category: self.guardrail_category.as_deref(),
+            cache_status: self.cache_status.as_deref(),
+            retried: self.retried,
+            property_key: self.property_key.as_deref(),
+            property_value: self.property_value.as_deref(),
+            api_key_id: self.api_key_id.as_deref(),
+            key_mode: self.key_mode.as_deref(),
+            session_id: self.session_id.as_deref(),
+            model: self.model.as_deref(),
+            tenant: self.tenant.as_deref(),
+            user: self.user.as_deref(),
+        }
+    }
+
+    /// Comma-joined names of the dimensions this query actually
+    /// filtered on, or `none`.
+    ///
+    /// Names only, never values: this string goes into an audit record
+    /// and a log line, and the names are a closed compile-time set
+    /// while the values are operator-typed text of any length. That
+    /// keeps the export's audit trail bounded by construction rather
+    /// than by a truncation helper, and it still answers the question
+    /// an incident asks, which is what shape of export ran.
+    fn applied_dimensions(&self) -> String {
+        let mut names = Vec::new();
+        let mut note = |set: bool, name: &'static str| {
+            if set {
+                names.push(name);
+            }
+        };
+        note(self.status.is_some(), "status");
+        note(self.method.is_some(), "method");
+        note(self.path_sub.is_some(), "path");
+        note(self.guardrail_action.is_some(), "guardrail_action");
+        note(self.guardrail_category.is_some(), "guardrail_category");
+        note(self.cache_status.is_some(), "cache_status");
+        note(self.retried.is_some(), "retried");
+        note(self.property_key.is_some(), "property_key");
+        note(self.property_value.is_some(), "property_value");
+        note(self.api_key_id.is_some(), "api_key_id");
+        note(self.key_mode.is_some(), "key_mode");
+        note(self.session_id.is_some(), "session_id");
+        note(self.model.is_some(), "model");
+        note(self.tenant.is_some(), "tenant");
+        note(self.user.is_some(), "user");
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(",")
+        }
+    }
+}
+
+/// The four dimensions `/api/requests/report` groups on (WOR-2578), in
+/// canonical order.
+///
+/// A caller's `group_by` is resolved against this table and the
+/// `&'static str` from *here* is what gets echoed and used as a JSON
+/// key, so no caller-supplied byte ever becomes an object key in the
+/// response.
+const REPORT_DIMENSIONS: [&str; 4] = ["model", "api_key_id", "tenant", "user"];
+
+/// Resolve `group_by` into an ordered dimension list, or the `400` the
+/// caller should get.
+///
+/// `group_by` is required. It is the whole point of the route, so an
+/// absent or empty one is an error rather than a silent default that
+/// would hand back a shape the caller did not ask for. Duplicates are
+/// refused too: `model,model` would otherwise emit one JSON key twice
+/// and produce a response whose parse depends on the reader.
+fn parse_report_dimensions(path: &str) -> Result<Vec<&'static str>, AdminResponse> {
+    let raw = decoded_query_param(path, "group_by").unwrap_or_default();
+    if raw.is_empty() {
+        return Err(admin_error(
+            400,
+            "group_by is required: any comma-separated mix of model, api_key_id, tenant, user",
+        ));
+    }
+    let mut dimensions: Vec<&'static str> = Vec::new();
+    for name in raw.split(',') {
+        let Some(known) = REPORT_DIMENSIONS.iter().find(|d| **d == name) else {
+            return Err(admin_error(
+                400,
+                "group_by dimensions are model, api_key_id, tenant, user",
+            ));
+        };
+        if dimensions.contains(known) {
+            return Err(admin_error(400, "group_by dimensions must be distinct"));
+        }
+        dimensions.push(known);
+    }
+    Ok(dimensions)
+}
+
+/// One composite group's running totals (WOR-2578).
+#[derive(Default)]
+struct ReportTotals {
+    requests: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    cost_usd_micros: u64,
+}
+
+impl ReportTotals {
+    /// Fold one row in. Saturating throughout: these operands come from
+    /// an upstream usage parser, and a report is not worth an overflow
+    /// panic in the admin server.
+    fn add(&mut self, entry: &RequestLogEntry) {
+        self.requests = self.requests.saturating_add(1);
+        self.tokens_in = self.tokens_in.saturating_add(entry.tokens_in.unwrap_or(0));
+        self.tokens_out = self
+            .tokens_out
+            .saturating_add(entry.tokens_out.unwrap_or(0));
+        self.cost_usd_micros = self
+            .cost_usd_micros
+            .saturating_add(entry.cost_usd_micros.unwrap_or(0));
+    }
+
+    /// The four measures as a JSON object.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requests": self.requests,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "cost_usd_micros": self.cost_usd_micros,
+        })
+    }
+}
+
+/// This row's value on one report dimension. A row that lacks the
+/// dimension (an unkeyed call, an anonymous user) reads as the empty
+/// string, which groups those rows together instead of dropping them.
+fn report_dimension_value(entry: &RequestLogEntry, dimension: &str) -> String {
+    match dimension {
+        "model" => entry.model.clone().unwrap_or_default(),
+        "api_key_id" => entry.api_key_id.clone().unwrap_or_default(),
+        "tenant" => entry.tenant_id.clone(),
+        "user" => entry.user_id.clone().unwrap_or_default(),
+        // Unreachable: `parse_report_dimensions` resolves every name
+        // against REPORT_DIMENSIONS before it reaches this function.
+        _ => String::new(),
+    }
+}
+
+/// Aggregate the filtered ring into one row per composite group.
+///
+/// Bounded by construction: every group needs at least one row behind
+/// it, so the map can never hold more entries than the ring, which
+/// `proxy.admin.max_log_entries` caps. Rows are folded as they are
+/// visited, so the matching set is never materialized.
+fn request_report_response(
+    state: &AdminState,
+    parsed: &ParsedRequestFilter,
+    dimensions: &[&'static str],
+) -> AdminResponse {
+    let mut groups: BTreeMap<Vec<String>, ReportTotals> = BTreeMap::new();
+    let mut totals = ReportTotals::default();
+    // The caller's offset/limit page the GROUPED rows below; the scan
+    // itself always covers the whole filtered set so `totals` reads
+    // against the true denominators even on page two.
+    state.for_each_request(&parsed.filter(), 0, state.config.max_log_entries, |entry| {
+        let key = dimensions
+            .iter()
+            .map(|d| report_dimension_value(entry, d))
+            .collect();
+        groups.entry(key).or_default().add(entry);
+        totals.add(entry);
+    });
+
+    let mut ordered: Vec<(Vec<String>, ReportTotals)> = groups.into_iter().collect();
+    // Highest spend first, because "who spent what" is the question;
+    // request count then group key break ties so equal reports sort
+    // identically run to run.
+    ordered.sort_by(|(a_key, a), (b_key, b)| {
+        b.cost_usd_micros
+            .cmp(&a.cost_usd_micros)
+            .then_with(|| b.requests.cmp(&a.requests))
+            .then_with(|| a_key.cmp(b_key))
+    });
+
+    let rows: Vec<serde_json::Value> = ordered
+        .into_iter()
+        .skip(parsed.offset)
+        .take(parsed.limit)
+        .map(|(key, group_totals)| {
+            let group: serde_json::Map<String, serde_json::Value> = dimensions
+                .iter()
+                .zip(key)
+                .map(|(name, value)| ((*name).to_string(), serde_json::Value::String(value)))
+                .collect();
+            let mut row = group_totals.to_json();
+            if let Some(object) = row.as_object_mut() {
+                object.insert("group".to_string(), serde_json::Value::Object(group));
+            }
+            row
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "group_by": dimensions,
+        "rows": rows,
+        "totals": totals.to_json(),
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// Encoding for `/api/requests/export` (WOR-2578).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    /// One `RequestLogEntry` JSON object per line: the raw shape, and
+    /// the default.
+    Jsonl,
+    /// The same rows flattened under [`EXPORT_CSV_COLUMNS`].
+    Csv,
+}
+
+impl ExportFormat {
+    /// Closed-enum label for the metric and the audit record.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Csv => "csv",
+        }
+    }
+
+    /// Response content type.
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Jsonl => "application/x-ndjson",
+            Self::Csv => "text/csv",
+        }
+    }
+}
+
+/// Fixed CSV column order for `format=csv` (WOR-2578).
+///
+/// `RequestLogEntry`'s declaration order with the two structured
+/// fields moved to the end, so the header reads `timestamp` through
+/// `properties` and a future scalar field appends rather than shifting
+/// the column index a spreadsheet or a billing importer has already
+/// bound to. Unlike the JSONL shape, a CSV row is positional, so the
+/// order is part of the contract.
+const EXPORT_CSV_COLUMNS: [&str; 36] = [
+    "timestamp",
+    "origin",
+    "method",
+    "path",
+    "status",
+    "latency_ms",
+    "client_ip",
+    "request_id",
+    "trace_id",
+    "session_id",
+    "parent_session_id",
+    "cache_status",
+    "retry_count",
+    "failover_engaged",
+    "failover_from",
+    "failover_to",
+    "load_balancer_strategy",
+    "load_balancer_target",
+    "provider",
+    "model",
+    "tokens_in",
+    "tokens_out",
+    "cost_usd_micros",
+    "guardrail_category",
+    "guardrail_action",
+    "api_key_id",
+    "key_mode",
+    "key_provider",
+    "tenant_id",
+    "user_id",
+    "error_class",
+    "config_revision",
+    "policy_version",
+    "deny_reason",
+    "policy_decisions",
+    "properties",
+];
+
+/// One row's value in `column`, as text.
+///
+/// The two structured columns carry JSON so flattening stays lossless.
+/// Neither can fail to encode (`BTreeMap<String, String>` and
+/// `Vec<String>` are always representable), and an encoder that
+/// somehow disagreed yields an empty container rather than taking the
+/// export down.
+fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
+    let text = |value: &Option<String>| value.clone().unwrap_or_default();
+    let number = |value: &Option<u64>| value.map(|v| v.to_string()).unwrap_or_default();
+    match column {
+        "timestamp" => entry.timestamp.clone(),
+        "origin" => entry.origin.clone(),
+        "method" => entry.method.clone(),
+        "path" => entry.path.clone(),
+        "status" => entry.status.to_string(),
+        "latency_ms" => entry.latency_ms.to_string(),
+        "client_ip" => entry.client_ip.clone(),
+        "request_id" => text(&entry.request_id),
+        "trace_id" => text(&entry.trace_id),
+        "session_id" => text(&entry.session_id),
+        "parent_session_id" => text(&entry.parent_session_id),
+        "cache_status" => entry.cache_status.clone(),
+        "retry_count" => entry.retry_count.to_string(),
+        "failover_engaged" => entry.failover_engaged.to_string(),
+        "failover_from" => text(&entry.failover_from),
+        "failover_to" => text(&entry.failover_to),
+        "load_balancer_strategy" => text(&entry.load_balancer_strategy),
+        "load_balancer_target" => text(&entry.load_balancer_target),
+        "provider" => text(&entry.provider),
+        "model" => text(&entry.model),
+        "tokens_in" => number(&entry.tokens_in),
+        "tokens_out" => number(&entry.tokens_out),
+        "cost_usd_micros" => number(&entry.cost_usd_micros),
+        "guardrail_category" => text(&entry.guardrail_category),
+        "guardrail_action" => text(&entry.guardrail_action),
+        "api_key_id" => text(&entry.api_key_id),
+        "key_mode" => entry.key_mode.clone(),
+        "key_provider" => text(&entry.key_provider),
+        "tenant_id" => entry.tenant_id.clone(),
+        "user_id" => text(&entry.user_id),
+        "error_class" => text(&entry.error_class),
+        "config_revision" => entry.config_revision.clone(),
+        "policy_version" => text(&entry.policy_version),
+        "deny_reason" => text(&entry.deny_reason),
+        "policy_decisions" => {
+            serde_json::to_string(&entry.policy_decisions).unwrap_or_else(|_| "[]".to_string())
+        }
+        "properties" => {
+            serde_json::to_string(&entry.properties).unwrap_or_else(|_| "{}".to_string())
+        }
+        // Unreachable: every caller iterates EXPORT_CSV_COLUMNS.
+        _ => String::new(),
+    }
+}
+
+/// Encode one CSV field per RFC 4180, after neutralizing a leading
+/// spreadsheet formula character.
+///
+/// Several columns (`path`, `user_id`, `properties`, `model`) carry
+/// text a caller of the *data plane* influenced, and a spreadsheet
+/// evaluates a cell that opens with `=`, `+`, `-`, `@`, tab, or CR as a
+/// formula. That is OWASP's CSV-injection case: an attacker who can
+/// name a model or set a property gets code execution in whichever
+/// finance laptop opens the export. A leading apostrophe forces the
+/// cell to text; it is applied before quoting so the apostrophe lands
+/// inside the quotes where the spreadsheet looks for it. No fixed
+/// numeric column can trip the guard, because every numeric column in
+/// [`EXPORT_CSV_COLUMNS`] is unsigned or a non-negative duration.
+fn csv_field(value: &str) -> String {
+    let guarded = if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// Append one CSV record (fields plus the trailing newline) to `out`.
+fn write_csv_record(out: &mut String, fields: impl Iterator<Item = String>) {
+    let mut first = true;
+    for field in fields {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&csv_field(&field));
+    }
+    out.push('\n');
+}
+
+/// Export the filtered view as CSV or JSONL.
+///
+/// Rows are encoded one at a time as the ring is visited, so the only
+/// full copy that exists is the response itself, and that is capped by
+/// `proxy.admin.max_log_entries` (the parser clamps `limit` to it) no
+/// matter what the caller asks for. Every export is audited: a bulk
+/// read of the operational log is the exfiltration shape of this
+/// surface, and the row count is the number an operator alerts on.
+fn request_export_response(
+    state: &AdminState,
+    parsed: &ParsedRequestFilter,
+    format: ExportFormat,
+) -> AdminResponse {
+    let mut body = String::new();
+    if format == ExportFormat::Csv {
+        write_csv_record(
+            &mut body,
+            EXPORT_CSV_COLUMNS.iter().map(|c| (*c).to_string()),
+        );
+    }
+    let mut rows: u64 = 0;
+    let mut encode_error: Option<String> = None;
+    state.for_each_request(&parsed.filter(), parsed.offset, parsed.limit, |entry| {
+        if encode_error.is_some() {
+            return;
+        }
+        match format {
+            ExportFormat::Jsonl => match serde_json::to_string(entry) {
+                Ok(line) => {
+                    body.push_str(&line);
+                    body.push('\n');
+                    rows = rows.saturating_add(1);
+                }
+                Err(error) => encode_error = Some(error.to_string()),
+            },
+            ExportFormat::Csv => {
+                write_csv_record(
+                    &mut body,
+                    EXPORT_CSV_COLUMNS
+                        .iter()
+                        .map(|column| export_csv_cell(entry, column)),
+                );
+                rows = rows.saturating_add(1);
+            }
+        }
+    });
+    if let Some(error) = encode_error {
+        return (
+            500,
+            "application/json",
+            format!(r#"{{"error":"serialization failed: {error}"}}"#),
+        );
+    }
+
+    // Same posture as `inspect_request_content`: the operator read data
+    // in bulk, so the read is itself a security-relevant event and
+    // lands on the admin audit chain, not only in a local log line.
+    // `filters` names the dimensions that were set and never their
+    // values, so nothing operator-typed reaches the record.
+    let operator = current_admin_actor().unwrap_or_default();
+    let filters = parsed.applied_dimensions();
+    tracing::info!(
+        target: "sbproxy::admin::audit",
+        operator = %operator,
+        format = format.label(),
+        rows,
+        filters = %filters,
+        action = "export_request_log",
+        "admin request log export"
+    );
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "export_request_log",
+        Some(operator),
+        None,
+        None,
+        None,
+        Some(format!(
+            "format={} rows={rows} filters={filters}",
+            format.label()
+        )),
+    )
+    .emit();
+    sbproxy_observe::metrics::record_admin_request_export(format.label(), rows);
+
+    (200, format.content_type(), body)
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -3073,86 +3703,13 @@ pub fn handle_admin_request(
     // WOR-1718: recent request log with filters + pagination. Query params:
     // `status` (exact), `method` (case-insensitive), `path` (substring),
     // `offset`, `limit`. No params returns the newest entries, unchanged.
+    // WOR-2578: the same parser serves the report and the export below.
     if path_only == "/api/requests" {
-        let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
-        let method_f = decoded_query_param(path, "method");
-        let path_f = decoded_query_param(path, "path");
-        // WOR-1874: guardrail-column filters.
-        let guardrail_action_f = decoded_query_param(path, "guardrail_action");
-        let guardrail_category_f = decoded_query_param(path, "guardrail_category");
-        let cache_status_f = decoded_query_param(path, "cache_status");
-        if cache_status_f
-            .as_deref()
-            .is_some_and(|status| !matches!(status, "disabled" | "miss" | "hit" | "semantic_hit"))
-        {
-            return (
-                400,
-                "application/json",
-                r#"{"error":"cache_status must be disabled, miss, hit, or semantic_hit"}"#
-                    .to_string(),
-            );
-        }
-        let retried_raw = decoded_query_param(path, "retried");
-        let retried_f = match retried_raw.as_deref() {
-            None => None,
-            Some("true") => Some(true),
-            Some("false") => Some(false),
-            Some(_) => {
-                return (
-                    400,
-                    "application/json",
-                    r#"{"error":"retried must be true or false"}"#.to_string(),
-                );
-            }
+        let parsed = match ParsedRequestFilter::from_query(path, state.config.max_log_entries) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
         };
-        let property_key_f = decoded_query_param(path, "property_key");
-        let property_value_f = decoded_query_param(path, "property_value");
-        if property_value_f.is_some() && property_key_f.as_deref().is_none_or(str::is_empty) {
-            return (
-                400,
-                "application/json",
-                r#"{"error":"property_value requires property_key"}"#.to_string(),
-            );
-        }
-        // WOR-2093: key-accountability filters.
-        let api_key_id_f = decoded_query_param(path, "api_key_id");
-        let key_mode_f = decoded_query_param(path, "key_mode");
-        if key_mode_f
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "none" | "minted" | "native"))
-        {
-            return (
-                400,
-                "application/json",
-                r#"{"error":"key_mode must be none, minted, or native"}"#.to_string(),
-            );
-        }
-        let session_id_f = decoded_query_param(path, "session_id");
-        let offset = rl_query_param(path, "offset")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let limit = rl_query_param(path, "limit")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(state.config.max_log_entries)
-            .min(state.config.max_log_entries);
-        let entries = state.query_requests(
-            &RequestLogFilter {
-                status,
-                method: method_f.as_deref(),
-                path_sub: path_f.as_deref(),
-                guardrail_action: guardrail_action_f.as_deref(),
-                guardrail_category: guardrail_category_f.as_deref(),
-                cache_status: cache_status_f.as_deref(),
-                retried: retried_f,
-                property_key: property_key_f.as_deref(),
-                property_value: property_value_f.as_deref(),
-                api_key_id: api_key_id_f.as_deref(),
-                key_mode: key_mode_f.as_deref(),
-                session_id: session_id_f.as_deref(),
-            },
-            offset,
-            limit,
-        );
+        let entries = state.query_requests(&parsed.filter(), parsed.offset, parsed.limit);
         return match serde_json::to_string(&entries) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
@@ -3161,6 +3718,55 @@ pub fn handle_admin_request(
                 format!(r#"{{"error":"serialization failed: {e}"}}"#),
             ),
         };
+    }
+    // WOR-2578: multi-dimension aggregation over the same filtered ring.
+    // `group_by` is required and takes any mix of the four dimensions at
+    // once, which is the "who spent what on which model" question the
+    // per-dimension breakdowns on /api/usage/spend cannot answer.
+    if path_only == "/api/requests/report" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let dimensions = match parse_report_dimensions(path) {
+            Ok(dimensions) => dimensions,
+            Err(error) => return error,
+        };
+        let parsed = match ParsedRequestFilter::from_query(path, state.config.max_log_entries) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
+        };
+        return request_report_response(state, &parsed, &dimensions);
+    }
+    // WOR-2578: raw export of the current filtered view, for the
+    // spreadsheet or the billing pipeline rather than another dashboard.
+    if path_only == "/api/requests/export" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let format = match decoded_query_param(path, "format").as_deref() {
+            None | Some("") | Some("jsonl") => ExportFormat::Jsonl,
+            Some("csv") => ExportFormat::Csv,
+            Some(_) => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"format must be csv or jsonl"}"#.to_string(),
+                );
+            }
+        };
+        let parsed = match ParsedRequestFilter::from_query(path, state.config.max_log_entries) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
+        };
+        return request_export_response(state, &parsed, format);
     }
     if path_only == "/api/extensions" {
         if !method.eq_ignore_ascii_case("GET") {
@@ -5964,6 +6570,466 @@ mod tests {
         assert_eq!(status, 200, "encoded path filter must succeed: {body}");
         let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    }
+
+    /// One attributed AI request row for the reporting tests (WOR-2578).
+    fn reporting_entry(
+        model: &str,
+        key: &str,
+        tenant: &str,
+        user: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost_usd_micros: u64,
+    ) -> RequestLogEntry {
+        RequestLogEntry {
+            timestamp: "2026-08-20T00:00:00Z".to_string(),
+            origin: "ai.local".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            model: Some(model.to_string()),
+            api_key_id: Some(key.to_string()),
+            tenant_id: tenant.to_string(),
+            user_id: Some(user.to_string()),
+            tokens_in: Some(tokens_in),
+            tokens_out: Some(tokens_out),
+            cost_usd_micros: Some(cost_usd_micros),
+            ..Default::default()
+        }
+    }
+
+    /// Split one RFC 4180 CSV record into its fields, honoring quoted
+    /// fields and doubled quotes. Test-side only; the production side
+    /// writes CSV and never parses it.
+    fn split_csv_record(line: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut chars = line.chars().peekable();
+        let mut quoted = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted => {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        quoted = false;
+                    }
+                }
+                '"' => quoted = true,
+                ',' if !quoted => fields.push(std::mem::take(&mut field)),
+                other => field.push(other),
+            }
+        }
+        fields.push(field);
+        fields
+    }
+
+    #[test]
+    fn requests_endpoint_filters_by_model_tenant_and_user() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "acme",
+            "ops@acme.test",
+            10,
+            1,
+            50,
+        ));
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_gamma",
+            "globex",
+            "dev@globex.test",
+            20,
+            2,
+            100,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        for (query, expected) in [
+            ("model=claude-sonnet-4", 2),
+            ("tenant=acme", 2),
+            ("user=dev%40acme.test", 1),
+            ("model=claude-sonnet-4&tenant=globex", 1),
+        ] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests?{query}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{query}: {body}");
+            let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(rows.as_array().map(Vec::len), Some(expected), "{query}");
+        }
+    }
+
+    #[test]
+    fn requests_report_groups_simultaneously_across_dimensions() {
+        let state = make_state();
+        // Two rows in one composite group, one in a second group that
+        // shares every dimension except the key and user.
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            50,
+            5,
+            250,
+        ));
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_beta",
+            "acme",
+            "ops@acme.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/report?group_by=model,api_key_id,tenant,user",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            report["group_by"],
+            serde_json::json!(["model", "api_key_id", "tenant", "user"])
+        );
+        let rows = report["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "one row per composite group: {body}");
+        // Highest spend first.
+        assert_eq!(rows[0]["group"]["model"], "claude-sonnet-4");
+        assert_eq!(rows[0]["group"]["api_key_id"], "sbk_alpha");
+        assert_eq!(rows[0]["group"]["tenant"], "acme");
+        assert_eq!(rows[0]["group"]["user"], "dev@acme.test");
+        assert_eq!(rows[0]["requests"], 2);
+        assert_eq!(rows[0]["tokens_in"], 150);
+        assert_eq!(rows[0]["tokens_out"], 15);
+        assert_eq!(rows[0]["cost_usd_micros"], 750);
+        assert_eq!(rows[1]["group"]["api_key_id"], "sbk_beta");
+        assert_eq!(report["totals"]["requests"], 3);
+        assert_eq!(report["totals"]["tokens_in"], 160);
+        assert_eq!(report["totals"]["cost_usd_micros"], 800);
+    }
+
+    #[test]
+    fn requests_report_validates_group_dimensions() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            // The dimension list is the whole point of the route, so a
+            // missing or empty one is an error, not a default.
+            "/api/requests/report",
+            "/api/requests/report?group_by=",
+            "/api/requests/report?group_by=flavor",
+            "/api/requests/report?group_by=model,model",
+        ] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "{path}: {body}");
+        }
+    }
+
+    #[test]
+    fn requests_report_applies_the_shared_request_filters() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "globex",
+            "ops@globex.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/report?group_by=model&tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = report["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["group"]["model"], "claude-sonnet-4");
+        assert_eq!(report["totals"]["requests"], 1);
+
+        // An invalid shared filter fails exactly as it does on
+        // `/api/requests`; the two routes parse one filter surface.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/report?group_by=model&cache_status=warm",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn requests_export_jsonl_round_trips_the_filtered_view() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "globex",
+            "ops@globex.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, content_type, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl&tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(content_type, "application/x-ndjson");
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+
+        // Round trip: the exported line IS the snapshot row, so an
+        // export can always be re-read as `RequestLogEntry` JSON.
+        let (_, _, snapshot) = handle_admin_request(
+            "GET",
+            "/api/requests?tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        let snapshot_rows: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(row, snapshot_rows[0]);
+
+        // Omitting `format` exports JSONL: the raw shape is the default.
+        let (status, content_type, default_body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/x-ndjson");
+        assert_eq!(default_body, body);
+    }
+
+    #[test]
+    fn requests_export_csv_round_trips_the_filtered_view() {
+        let state = make_state();
+        let mut entry = reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        );
+        // A path with a comma and a quote proves RFC 4180 escaping
+        // round-trips instead of splitting the record.
+        entry.path = "/v1/chat?note=\"a,b\"".to_string();
+        entry
+            .properties
+            .insert("tier".to_string(), "gold".to_string());
+        state.log_request(entry);
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "globex",
+            "ops@globex.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, content_type, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=csv&tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(content_type, "text/csv");
+        let mut lines = body.lines();
+        let header = split_csv_record(lines.next().expect("header row"));
+        let col = |name: &str| {
+            header
+                .iter()
+                .position(|c| c == name)
+                .unwrap_or_else(|| panic!("missing column {name}: {header:?}"))
+        };
+        let row = split_csv_record(lines.next().expect("one data row"));
+        assert_eq!(lines.next(), None, "the globex row is filtered out");
+        assert_eq!(row[col("model")], "claude-sonnet-4");
+        assert_eq!(row[col("tenant_id")], "acme");
+        assert_eq!(row[col("user_id")], "dev@acme.test");
+        assert_eq!(row[col("api_key_id")], "sbk_alpha");
+        assert_eq!(row[col("path")], "/v1/chat?note=\"a,b\"");
+        assert_eq!(row[col("tokens_in")], "100");
+        assert_eq!(row[col("tokens_out")], "10");
+        assert_eq!(row[col("cost_usd_micros")], "500");
+        // Structured columns carry JSON so nothing is lossy.
+        let properties: serde_json::Value = serde_json::from_str(&row[col("properties")]).unwrap();
+        assert_eq!(properties["tier"], "gold");
+    }
+
+    #[test]
+    fn requests_export_clamps_limit_to_the_ring_bound() {
+        let state = make_state(); // max_log_entries: 5
+        for i in 0..7 {
+            let mut entry = reporting_entry(
+                "claude-sonnet-4",
+                "sbk_alpha",
+                "acme",
+                "dev@acme.test",
+                1,
+                1,
+                1,
+            );
+            entry.path = format!("/v1/chat/{i}");
+            state.log_request(entry);
+        }
+        let auth = basic_auth("admin", "secret");
+
+        // An absurd limit clamps to the ring bound rather than trusting
+        // the caller.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl&limit=999999",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body.lines().count(), 5);
+
+        // An explicit small limit is honored, newest first.
+        let (_, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl&limit=2",
+            &state,
+            Some(&auth),
+            None,
+        );
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let newest: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(newest["path"], "/v1/chat/6");
+    }
+
+    #[test]
+    fn requests_report_and_export_reject_bad_methods_and_formats() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            "/api/requests/report?group_by=model",
+            "/api/requests/export",
+        ] {
+            let (status, _, body) = handle_admin_request("POST", path, &state, Some(&auth), None);
+            assert_eq!(status, 405, "{path}: {body}");
+        }
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=xml",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn requests_export_csv_neutralizes_spreadsheet_formula_prefixes() {
+        // Caller-controlled text lands in these cells; a leading `=`,
+        // `+`, `-`, `@`, or tab would execute as a formula when the
+        // export opens in a spreadsheet, so those cells gain a leading
+        // apostrophe (the OWASP CSV-injection guard).
+        let state = make_state();
+        let mut entry = reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            1,
+            1,
+            1,
+        );
+        entry.path = "=HYPERLINK(\"http://evil.test\")".to_string();
+        state.log_request(entry);
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=csv",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let mut lines = body.lines();
+        let header = split_csv_record(lines.next().expect("header row"));
+        let path_col = header.iter().position(|c| c == "path").unwrap();
+        let row = split_csv_record(lines.next().expect("one data row"));
+        assert_eq!(row[path_col], "'=HYPERLINK(\"http://evil.test\")");
     }
 
     #[test]

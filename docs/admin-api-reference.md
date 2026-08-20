@@ -1,10 +1,10 @@
 # Admin API reference
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
+lifecycle, the running extension inventory, the request log with its live stream, report, and export, recent sessions, alert
 operations, per-target health, spend and audit, attested-metering summary/receipts/verify, config read/write and hot reload/drift, the local config-revision
 history ring, model-host catalog and deployment lifecycle, the
 response/semantic/key-policy caches, cluster status and the replicated-state
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream + report + export, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -533,12 +533,18 @@ Supported query parameters: `status` (exact match), `method`
 (case-insensitive), `path` (substring), `guardrail_action`,
 `guardrail_category`, `cache_status`, `retried`, `property_key`,
 `property_value`, `api_key_id` (exact canonical key id), `key_mode`
-(`none`, `minted`, or `native`), `session_id` (exact ULID), `offset`,
-and `limit` (defaults to and is clamped at
+(`none`, `minted`, or `native`), `session_id` (exact ULID), `model`
+(exact), `tenant` (exact label), `user` (exact resolved end-user id),
+`offset`, and `limit` (defaults to and is clamped at
 `max_log_entries`). `cache_status` accepts the four values listed above.
 `retried` accepts only `true` or `false`. Property matching is exact after
 URL decoding; `property_value` requires `property_key`. No parameters returns
 the newest entries.
+
+The same filter set drives [`/api/requests/report`](#get-apirequestsreport)
+and [`/api/requests/export`](#get-apirequestsexport): one parser serves
+all three routes, so a filter that selects rows here selects exactly the
+same rows in the aggregation and the export.
 
 To answer "what did this key do", filter by `api_key_id`; every row a
 governed request produced carries the same canonical id across this
@@ -584,6 +590,367 @@ does not accept query filters. Each event has the same enriched
 ```bash
 curl -N -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/api/requests/stream"
 ```
+
+### `GET /api/requests/report`
+
+Multi-dimension spend and usage aggregation over the same ring
+`GET /api/requests` serves: one row per composite group, so "who spent
+what on which model" is a single call. `group_by` is required and takes
+a comma-separated subset of four dimensions, selectable simultaneously
+rather than one at a time:
+
+| Dimension | Groups on |
+|---|---|
+| `model` | AI model that served the request. |
+| `api_key_id` | Canonical public id of the governing key. |
+| `tenant` | Origin-scoped tenant label. |
+| `user` | Resolved end-user identifier: the human subject behind the call (`X-Sb-User-Id` header, JWT `sub`, or forward-auth user, in that order). |
+
+One parser reads the filter surface for all three request-log routes,
+which is what makes a grouped number drillable: the same query string
+selects the same rows on the snapshot, the report, and the export.
+
+```mermaid
+flowchart TD
+    A["GET /api/requests*?<filters>"] --> B[Parse the shared filter surface]
+    B -->|bad cache_status, retried, key_mode,<br/>or property_value without property_key| C["400, identical on all three routes"]
+    B -->|filters valid| D{Which route?}
+    D -->|/api/requests| E["Rows, newest first, offset+limit"]
+    D -->|/api/requests/report| F{group_by present,<br/>known, distinct?}
+    D -->|/api/requests/export| G{format is csv,<br/>jsonl, or absent?}
+    F -->|no| H["400: group_by is required and<br/>its dimensions must be distinct"]
+    F -->|yes| I["Fold every matching row into<br/>one accumulator per composite group"]
+    I --> J["rows sorted by spend, plus totals<br/>over the whole filtered set"]
+    G -->|no| K["400: format must be csv or jsonl"]
+    G -->|yes| L["Encode each matching row as it is visited"]
+    L --> M["Audit: export_request_log on the admin chain"]
+    M --> N["sbproxy_admin_request_exports_total and<br/>sbproxy_admin_request_export_rows_total"]
+```
+
+Every `GET /api/requests` filter applies unchanged, so the report always
+aggregates exactly the rows the snapshot would return. A request that
+lacks a dimension (an unkeyed call, an anonymous user) groups under the
+empty string; the admin UI renders that as `(unattributed)`.
+
+The response carries `schema_version`, the echoed `group_by`, a `rows`
+array sorted by spend then request count then group key, and `totals`
+over the whole filtered set. Each row holds the `group` map plus
+`requests`, `tokens_in`, `tokens_out`, and `cost_usd_micros`. `offset`
+and `limit` page the grouped rows (top spenders first); `totals` always
+covers the whole filtered set, so a paged view still reads against the
+true denominators. The result is bounded by construction: there can
+never be more rows than ring entries, and the ring caps at
+`proxy.admin.max_log_entries`.
+
+An unknown, duplicate, missing, or empty `group_by` is a `400`; so is
+any filter value `/api/requests` itself would refuse.
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=flavor"
+```
+
+```json
+{"error":"group_by dimensions are model, api_key_id, tenant, user"}
+```
+
+#### Worked example: who spent what
+
+Config: [`examples/admin-reporting/`](../examples/admin-reporting/), two
+tenants (`acme`, `globex`) over one `ai_proxy` origin each, three
+governed keys, two models, and four named human callers. Every output
+below is captured from that config running against a local
+OpenAI-shaped fixture, driven by the five calls the example's README
+lists.
+
+Group by all four dimensions at once. Nothing else in the admin API
+answers this in one call: `/api/usage/spend` breaks down one dimension
+at a time, so "which human, on which key, on which model" takes four
+queries and a join.
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=model,api_key_id,tenant,user" \
+  | python3 -m json.tool
+```
+
+```json
+{
+    "group_by": [
+        "model",
+        "api_key_id",
+        "tenant",
+        "user"
+    ],
+    "rows": [
+        {
+            "cost_usd_micros": 5250,
+            "group": {
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+                "model": "gpt-4o",
+                "tenant": "acme",
+                "user": "ops@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 900,
+            "tokens_out": 300
+        },
+        {
+            "cost_usd_micros": 84,
+            "group": {
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+                "model": "gpt-4o-mini",
+                "tenant": "acme",
+                "user": "dev@acme.test"
+            },
+            "requests": 2,
+            "tokens_in": 240,
+            "tokens_out": 80
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-research",
+                "model": "gpt-4o-mini",
+                "tenant": "acme",
+                "user": "sci@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "api_key_id": "cfg:6:globex:15:globex.ai.local:globex-platform",
+                "model": "gpt-4o-mini",
+                "tenant": "globex",
+                "user": "dev@globex.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        }
+    ],
+    "schema_version": 1,
+    "totals": {
+        "cost_usd_micros": 5418,
+        "requests": 5,
+        "tokens_in": 1380,
+        "tokens_out": 460
+    }
+}
+```
+
+Row one is the answer: one `gpt-4o` call from `ops@acme.test` on the
+`acme-platform` key is 97% of the window's spend, and it cost 125 times
+what a `gpt-4o-mini` call did. Spend-first sorting is why that row is
+first rather than buried under the three cheap ones.
+
+Drop dimensions to widen the grouping. The same five requests by model
+and human only, which is the cut a cost review usually wants:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=model,user" | python3 -m json.tool
+```
+
+```json
+{
+    "group_by": [
+        "model",
+        "user"
+    ],
+    "rows": [
+        {
+            "cost_usd_micros": 5250,
+            "group": {
+                "model": "gpt-4o",
+                "user": "ops@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 900,
+            "tokens_out": 300
+        },
+        {
+            "cost_usd_micros": 84,
+            "group": {
+                "model": "gpt-4o-mini",
+                "user": "dev@acme.test"
+            },
+            "requests": 2,
+            "tokens_in": 240,
+            "tokens_out": 80
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "model": "gpt-4o-mini",
+                "user": "dev@globex.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "model": "gpt-4o-mini",
+                "user": "sci@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        }
+    ],
+    "schema_version": 1,
+    "totals": {
+        "cost_usd_micros": 5418,
+        "requests": 5,
+        "tokens_in": 1380,
+        "tokens_out": 460
+    }
+}
+```
+
+`totals` is identical across both calls, because grouping changes how
+the same filtered set is cut, never which rows are in it. Add a filter
+and `totals` moves with it: `&tenant=acme` reports four requests and
+5376 micro-USD from this window.
+
+### `GET /api/requests/export`
+
+Raw export of the current filtered view, for the spreadsheet or the
+billing pipeline rather than another dashboard. `format` selects the
+encoding:
+
+- `jsonl` (the default): one `RequestLogEntry` JSON object per line,
+  exactly the rows `GET /api/requests` returns, so an export re-reads
+  with any JSON tool. `Content-Type: application/x-ndjson`.
+- `csv`: the same rows flattened under a fixed header of 36 named
+  columns (`timestamp` through `properties`). The `properties` and
+  `policy_decisions` cells carry JSON so the two structured columns
+  survive flattening without loss. `Content-Type: text/csv`.
+
+Every request-log filter applies, plus `offset` and `limit`. `limit`
+defaults to and is clamped at `proxy.admin.max_log_entries`, so no
+export can exceed the bounded ring regardless of what the caller asks
+for. Rows are encoded one at a time as the ring is read, so the
+matching set is never held twice, and the worst-case response is the
+ring itself (default 1000 rows): memory stays bounded by configuration
+rather than by caller behavior. For unbounded durable exports, ship the
+structured access log to your pipeline instead (see
+[access-log.md](access-log.md)); this route exports the operational
+sample the console is looking at.
+
+Every export is an audited admin action. It writes an
+`export_request_log` record to the admin audit chain and the audit ring
+alongside `inspect_request_content`, naming the operator, the format,
+the row count, and which filter dimensions were set (names only, never
+operator-typed values, so the record stays bounded). It also increments
+`sbproxy_admin_request_exports_total{format}` and
+`sbproxy_admin_request_export_rows_total{format}`. A bulk read of the
+operational log is the exfiltration shape of the admin surface, so
+export rate and export volume are both alertable from the day the route
+ships.
+
+CSV cells that begin with `=`, `+`, `-`, `@`, a tab, or a carriage
+return gain a leading apostrophe before quoting (the OWASP defense
+against CSV formula injection): several columns carry text a data-plane
+caller influenced, such as `path`, `model`, `user_id`, and
+`properties`, and an export opened in a spreadsheet must not execute
+it. Any other `format` value is a `400`. The response sets no
+`Content-Disposition`; name the file client-side (`-o requests.csv`, or
+the admin UI's export links).
+
+#### Worked example: hand over the rows
+
+Same config and same five requests as the report above. CSV, filtered
+to one tenant, header plus the first two rows:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/export?format=csv&tenant=acme" | head -3
+```
+
+```text
+timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
+2026-08-20T19:47:14.657182+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.374375,127.0.0.1:57863,01a020b6a05f7e12b2b3f6efbb1a5ddf,02a99aadba6a4a60a59c6b8135d91971,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
+2026-08-20T19:47:14.643759+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.953542,127.0.0.1:57862,01a020b6a05174a3ab6449c93aae65e8,0dcff27495d744dda98b3af634a4b024,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
+```
+
+The `globex` row is absent because the filter removed it, not because
+the export truncated. The last cell shows both structured-column rules
+at once: `properties` is JSON, and RFC 4180 doubles its inner quotes so
+the record still splits into 36 fields.
+
+JSONL, filtered to one human, first line only:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/export?format=jsonl&user=dev@acme.test" \
+  | head -1 | python3 -m json.tool
+```
+
+```json
+{
+    "timestamp": "2026-08-20T19:47:14.630011+00:00",
+    "origin": "acme.ai.local",
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "status": 200,
+    "latency_ms": 1.991792,
+    "client_ip": "127.0.0.1:57861",
+    "request_id": "01a020b6a04371329c3279a3e40cfb8b",
+    "trace_id": "90f8435c47a144939199bcbd740061a7",
+    "properties": {
+        "feature": "summarize"
+    },
+    "cache_status": "disabled",
+    "retry_count": 0,
+    "failover_engaged": false,
+    "load_balancer_strategy": "round_robin",
+    "load_balancer_target": "openai",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "tokens_in": 120,
+    "tokens_out": 40,
+    "cost_usd_micros": 42,
+    "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+    "key_mode": "minted",
+    "tenant_id": "acme",
+    "user_id": "dev@acme.test",
+    "config_revision": "8cb4b33d8ffc",
+    "policy_version": "c:8cb4b33d8ffc:cd949575bc0dca2d"
+}
+```
+
+That line is byte-identical to the row `GET /api/requests` returns, so
+an export round-trips through any JSON tool without a schema of its
+own. It also carries `request_id`, `trace_id`, `config_revision`, and
+`policy_version`, which is what turns an exported cost row back into
+the specific request, trace, and config generation that produced it.
+
+Reading the metrics after those two exports:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/metrics" \
+  | grep admin_request_export
+```
+
+```text
+# HELP sbproxy_admin_request_export_rows_total Rows written by admin request-log exports, by format
+# TYPE sbproxy_admin_request_export_rows_total counter
+sbproxy_admin_request_export_rows_total{format="csv"} 4
+sbproxy_admin_request_export_rows_total{format="jsonl"} 2
+# HELP sbproxy_admin_request_exports_total Admin request-log exports served, by format
+# TYPE sbproxy_admin_request_exports_total counter
+sbproxy_admin_request_exports_total{format="csv"} 1
+sbproxy_admin_request_exports_total{format="jsonl"} 1
+```
+
+Two exports, six rows total, split by format: 4 CSV rows for the
+`tenant=acme` cut and 2 JSONL rows for the `user=dev@acme.test` cut.
 
 ### `GET /api/health`
 

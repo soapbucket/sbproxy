@@ -2036,6 +2036,34 @@ export interface RequestFilters {
   // WOR-2093: server-side key accountability filters.
   apiKeyId?: string;
   keyMode?: "none" | "minted" | "native";
+  // WOR-2578: reporting-dimension filters (exact matches).
+  model?: string;
+  tenant?: string;
+  user?: string;
+}
+
+// WOR-2578: multi-dimension aggregation of the request ring.
+export interface RequestReportRow {
+  /** Dimension name to value; an empty value means unattributed. */
+  group: Record<string, string>;
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+}
+
+export interface RequestReportTotals {
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+}
+
+export interface RequestReportResponse {
+  schema_version: number;
+  group_by: string[];
+  rows: RequestReportRow[];
+  totals: RequestReportTotals;
 }
 
 export type AlertRuleState = "inactive" | "ok" | "firing";
@@ -2503,7 +2531,7 @@ export interface MeterVerifyResult {
   verified_at: string;
 }
 
-function requestsPath(filters: RequestFilters = {}): string {
+function requestsParams(filters: RequestFilters = {}): URLSearchParams {
   const params = new URLSearchParams();
   if (filters.method) params.set("method", filters.method);
   if (filters.status && /^\d{3}$/.test(filters.status)) {
@@ -2531,8 +2559,29 @@ function requestsPath(filters: RequestFilters = {}): string {
   if (filters.sessionId) params.set("session_id", filters.sessionId);
   if (filters.apiKeyId) params.set("api_key_id", filters.apiKeyId);
   if (filters.keyMode) params.set("key_mode", filters.keyMode);
-  const query = params.toString();
+  // WOR-2578: reporting-dimension filters, shared verbatim by the
+  // snapshot, the report, and the export.
+  if (filters.model) params.set("model", filters.model);
+  if (filters.tenant) params.set("tenant", filters.tenant);
+  if (filters.user) params.set("user", filters.user);
+  return params;
+}
+
+function requestsPath(filters: RequestFilters = {}): string {
+  const query = requestsParams(filters).toString();
   return query ? `/api/requests?${query}` : "/api/requests";
+}
+
+function requestsReportPath(groupBy: string[], filters: RequestFilters = {}): string {
+  const params = requestsParams(filters);
+  params.set("group_by", groupBy.join(","));
+  return `/api/requests/report?${params.toString()}`;
+}
+
+function requestsExportPath(format: "csv" | "jsonl", filters: RequestFilters = {}): string {
+  const params = requestsParams(filters);
+  params.set("format", format);
+  return `/api/requests/export?${params.toString()}`;
 }
 
 export const api = {
@@ -2681,6 +2730,14 @@ export const api = {
   // Logs
   requests: (filters: RequestFilters = {}) =>
     getJson<RequestLog[]>(requestsPath(filters)),
+  // WOR-2578: multi-dimension aggregation of the same filtered ring.
+  requestsReport: (groupBy: string[], filters: RequestFilters = {}) =>
+    getJson<RequestReportResponse>(requestsReportPath(groupBy, filters)),
+  // WOR-2578: raw export of the filtered view. Returns a URL rather
+  // than fetching: the browser downloads it directly (same-origin
+  // session cookie carries auth), so the SPA never buffers the file.
+  requestsExportUrl: (format: "csv" | "jsonl", filters: RequestFilters = {}) =>
+    requestsExportPath(format, filters),
   // WOR-1870: operator UI settings (trace deep-link template).
   uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
   // WOR-1870: SSE live tail of the request ring. EventSource sends the

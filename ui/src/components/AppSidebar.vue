@@ -14,6 +14,7 @@ const nav = [
   { to: "/sessions", label: "sessions" },
   { to: "/metrics", label: "metrics" },
   { to: "/spend", label: "spend" },
+  { to: "/reports", label: "reports" },
   { to: "/meter", label: "meter" },
   { to: "/ai-performance", label: "ai performance" },
   { to: "/guardrails", label: "guardrails" },
