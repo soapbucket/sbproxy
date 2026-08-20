@@ -10,7 +10,7 @@
 //!
 //! When the feature is off, the same paths return a one-line 404 so
 //! operators see exactly what to run to enable the embedded UI. The
-//! default cargo build does not require a prior `npm build`.
+//! default cargo build does not require a prior `pnpm build`.
 //!
 //! `dispatch_bytes` returns `(status, content_type, Vec<u8>)` so the
 //! admin server can serve a real Vite bundle: binary assets (woff2
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(status, 404);
         assert_eq!(ct, "text/plain; charset=utf-8");
         assert!(body.contains("Admin UI not built"));
-        assert!(body.contains("npm build"));
+        assert!(body.contains("pnpm build"));
         assert!(body.contains("embed-admin-ui"));
     }
 
