@@ -653,6 +653,14 @@ longer carries it.
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.
 
+The same per-target verdict is exported to Prometheus as
+`sbproxy_target_health_state{origin, target}` (0 healthy, 1 degraded
+with the breaker half-open, 2 excluded from selection). Both surfaces
+render from one pipeline walk, so a dashboard on the gauge and a
+`curl` against this endpoint always agree; graph the gauge instead of
+polling this endpoint. See
+[observability.md](observability.md#budget-headroom-and-target-health).
+
 ### `GET /api/stats`
 
 Basic counters summary.

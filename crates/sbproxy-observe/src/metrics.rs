@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use prometheus::{
@@ -284,6 +284,118 @@ fn refresh_cardinality_gauges() {
         budget
             .with_label_values(&[label.as_str()])
             .set(limiter.cap_for_label(&label) as i64);
+    }
+}
+
+// --- Target health tri-state gauge (WOR-2560) ---
+
+/// `sbproxy_target_health_state` value for a target that is fully
+/// healthy: probe passing, not outlier-ejected, circuit breaker closed.
+pub const TARGET_HEALTH_HEALTHY: i64 = 0;
+
+/// `sbproxy_target_health_state` value for a target that is degraded
+/// but still selectable: the circuit breaker is half-open, so it is
+/// carrying trial traffic while recovery is confirmed.
+pub const TARGET_HEALTH_DEGRADED: i64 = 1;
+
+/// `sbproxy_target_health_state` value for a target excluded from
+/// selection: probe-unhealthy, outlier-ejected, or breaker open.
+pub const TARGET_HEALTH_EXCLUDED: i64 = 2;
+
+/// One load-balancer target's health, as reported by the callback
+/// installed with [`set_target_health_source`].
+///
+/// `state` uses the 0/1/2 scale LiteLLM's deployment-state gauge
+/// established, so Grafana panels built against that convention port
+/// over unchanged: [`TARGET_HEALTH_HEALTHY`] (0),
+/// [`TARGET_HEALTH_DEGRADED`] (1), [`TARGET_HEALTH_EXCLUDED`] (2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHealthSample {
+    /// Configured origin id the target belongs to. Never the request
+    /// `Host`, so the label stays bounded by the operator's config.
+    pub origin: String,
+    /// Target URL exactly as configured under the origin's load
+    /// balancer. Config-bounded for the same reason.
+    pub target: String,
+    /// Tri-state health; one of the three `TARGET_HEALTH_*` constants.
+    pub state: i64,
+}
+
+/// The callback that samples per-target health for the gauge.
+type TargetHealthSource = Box<dyn Fn() -> Vec<TargetHealthSample> + Send + Sync>;
+
+/// Installed target-health source. An `RwLock<Option<..>>` rather than
+/// a `OnceLock` so every pipeline publication (and every test) can
+/// install afresh; [`refresh_target_health_gauge`] takes the read side
+/// once per scrape.
+static TARGET_HEALTH_SOURCE: RwLock<Option<TargetHealthSource>> = RwLock::new(None);
+
+/// Install (or replace) the callback that samples per-target health
+/// for the `sbproxy_target_health_state` gauge.
+///
+/// The proxy installs one at every pipeline publication
+/// (`reload::load_pipeline` in `sbproxy-core`) that walks the live
+/// pipeline exactly as `GET /api/health/targets` does, so the
+/// Prometheus view and the admin view cannot disagree. Until a source
+/// is installed the family is absent from the scrape, which is the
+/// honest shape for "nothing is load-balancing yet": absent, not zero.
+pub fn set_target_health_source(
+    source: impl Fn() -> Vec<TargetHealthSample> + Send + Sync + 'static,
+) {
+    *TARGET_HEALTH_SOURCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(source));
+}
+
+/// The `sbproxy_target_health_state` gauge, registered on the
+/// `ProxyMetrics` registry on first use. Best-effort registration for
+/// the same reason as the cardinality gauges above: a duplicate
+/// registration across `ProxyMetrics::new()` calls in tests is ignored
+/// and the local copy is used.
+static TARGET_HEALTH_GAUGE: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
+fn target_health_gauge() -> &'static prometheus::IntGaugeVec {
+    TARGET_HEALTH_GAUGE.get_or_init(|| {
+        let gauge = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "sbproxy_target_health_state",
+                "Per-target tri-state health: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open)",
+            ),
+            &["origin", "target"],
+        )
+        .expect("target health gauge constructs");
+        let _ = metrics().registry.register(Box::new(gauge.clone()));
+        gauge
+    })
+}
+
+/// Refresh the target-health gauge from the installed source.
+///
+/// Driven from [`ProxyMetrics::render`] beside
+/// [`refresh_cardinality_gauges`], and for the same reason: the truth
+/// lives elsewhere (the load balancer's probe, ejection, and breaker
+/// state), it only needs to be a gauge when someone scrapes, and
+/// sampling it at scrape time keeps the per-request path free of gauge
+/// writes it would otherwise have to maintain between scrapes. The vec
+/// is reset before the fresh samples are applied so a target removed by
+/// a config reload drops out of the scrape instead of serving its last
+/// pre-reload value forever.
+fn refresh_target_health_gauge() {
+    let source = TARGET_HEALTH_SOURCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(source) = source.as_ref() else {
+        return;
+    };
+    let samples = source();
+    let gauge = target_health_gauge();
+    gauge.reset();
+    for sample in &samples {
+        let origin = sanitize_label("origin", &sample.origin);
+        let target = sanitize_label("target", &sample.target);
+        gauge
+            .with_label_values(&[origin.as_str(), target.as_str()])
+            .set(sample.state);
     }
 }
 
@@ -1038,6 +1150,10 @@ impl ProxyMetrics {
         // snapshot them before gathering. A scrape is exactly when
         // someone wants them current.
         refresh_cardinality_gauges();
+        // Same shape for target health: the truth is the load
+        // balancer's probe/ejection/breaker state, sampled through the
+        // installed source when a scrape wants it as a gauge.
+        refresh_target_health_gauge();
         let encoder = TextEncoder::new();
         let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
@@ -7638,6 +7754,68 @@ mod tests {
                     && *value >= 1.0
             }),
             "sbproxy_mcp_flow_total did not carry flow_pair_block: {counted:?}"
+        );
+    }
+
+    /// WOR-2560: the target-health gauge is a scrape-time sample of the
+    /// installed source, on the LiteLLM 0/1/2 scale.
+    ///
+    /// Three assertions, each a distinct failure mode:
+    /// 1. installing a source and scraping surfaces the series (red
+    ///    until `render()` calls `refresh_target_health_gauge`);
+    /// 2. a health change in the source moves the value on the next
+    ///    scrape, with no recorder call in between;
+    /// 3. a target the source stops reporting (config reload shrank the
+    ///    pool) leaves the scrape instead of freezing at its last value.
+    #[test]
+    fn target_health_gauge_follows_the_installed_source() {
+        set_target_health_source(|| {
+            vec![
+                TargetHealthSample {
+                    origin: "wor2560-origin".to_string(),
+                    target: "http://127.0.0.1:19601".to_string(),
+                    state: TARGET_HEALTH_HEALTHY,
+                },
+                TargetHealthSample {
+                    origin: "wor2560-origin".to_string(),
+                    target: "http://127.0.0.1:19602".to_string(),
+                    state: TARGET_HEALTH_EXCLUDED,
+                },
+            ]
+        });
+        let output = metrics().render();
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19601\"} 0"
+            ),
+            "healthy target missing from the scrape:\n{output}"
+        );
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19602\"} 2"
+            ),
+            "excluded target missing from the scrape:\n{output}"
+        );
+
+        // The pool shrinks to one target and that target recovers into
+        // half-open trial traffic. The next scrape must say exactly that.
+        set_target_health_source(|| {
+            vec![TargetHealthSample {
+                origin: "wor2560-origin".to_string(),
+                target: "http://127.0.0.1:19602".to_string(),
+                state: TARGET_HEALTH_DEGRADED,
+            }]
+        });
+        let output = metrics().render();
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19602\"} 1"
+            ),
+            "state change did not move the gauge:\n{output}"
+        );
+        assert!(
+            !output.contains("http://127.0.0.1:19601"),
+            "a target removed from the source is still being scraped:\n{output}"
         );
     }
 }

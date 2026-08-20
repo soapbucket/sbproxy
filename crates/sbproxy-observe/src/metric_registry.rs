@@ -3432,6 +3432,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_target_health_state",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("refresh_target_health_gauge"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "target"],
+        description: "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_telemetry_dropped_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_telemetry_dropped"),

@@ -171,6 +171,13 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // so the gap surfaces at load time instead of on the first
     // request that quietly fails over.
     crate::server::model_host::preflight_serve_warnings(&new_pipeline.actions);
+    // WOR-2560: point the `sbproxy_target_health_state` gauge at the
+    // live pipeline walk. The installed closure resolves
+    // `current_pipeline()` at scrape time, so installing before the
+    // swap below is fine; doing it at every publication (rather than
+    // once at startup) keeps the seam installed for library embedders
+    // that never run the binary's startup path.
+    crate::admin::install_target_health_metrics_source();
     // This is the only pipeline publisher. Hold the flag-store write lock
     // while the pipeline pointer is swapped, then install its matching flag
     // snapshot before CEL readers can resume. Direct/library callers therefore

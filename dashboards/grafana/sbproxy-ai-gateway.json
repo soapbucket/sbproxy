@@ -854,6 +854,85 @@
         }
       ],
       "description": "Redis lease contention, expiry, stale-version, and fencing events."
+    },
+    {
+      "id": 16,
+      "title": "Budget Utilization by Scope",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.95
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (scope) (sbproxy_ai_budget_utilization_ratio)",
+          "legendFormat": "{{scope}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Fraction of each budget scope's tightest cap consumed; 1.0 is the hard cap, and the same fraction warn_at/downgrade_at compare against. Headroom is 1 - this value. The pre-exhaustion alert in dashboards/prometheus/alerts.yml fires at 0.9. Runbook: docs/operator-runbook.md#ai-gateway. When a scope crosses the orange line, its next stop is soft-landing downgrade and then a 402."
     }
   ],
   "templating": {

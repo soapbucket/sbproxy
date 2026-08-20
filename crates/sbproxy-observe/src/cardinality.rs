@@ -123,6 +123,15 @@ pub fn budget_for_label(label_name: &str) -> usize {
         "exclusion_reason" => 20,
         "stage" => 8,
         "placement_reason" => 16,
+        // Load-balancer target URLs (`sbproxy_target_health_state`).
+        // Bounded by the operator's config: the value set is the union
+        // of every origin's configured target list, never anything
+        // request-derived. `origin` is capped at 200 above and each
+        // origin carries a handful of targets, so 500 is headroom, not
+        // an invitation. The mesh gossip families also carry a `target`
+        // label (peer node ids) but write it without the limiter, so
+        // this cap governs only the sanitized health gauge.
+        "target" => 500,
         // Default workspace cap when the label is not in the table.
         _ => 1000,
     }

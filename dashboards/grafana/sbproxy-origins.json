@@ -251,6 +251,86 @@
         }
       ],
       "description": "Measures Per-Origin Error Rate. Runbook: docs/operator-runbook.md#origins. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
+    },
+    {
+      "id": 4,
+      "title": "Target Health State",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 2,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "healthy",
+                  "index": 0
+                },
+                "1": {
+                  "text": "degraded",
+                  "index": 1
+                },
+                "2": {
+                  "text": "excluded",
+                  "index": 2
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_target_health_state",
+          "legendFormat": "{{origin}} {{target}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. Runbook: docs/operator-runbook.md#origins. When a target sits at 2, check /api/health/targets for which of the three mechanisms excluded it; when every target of an origin reads 2, the origin has no eligible upstream left."
     }
   ],
   "templating": {

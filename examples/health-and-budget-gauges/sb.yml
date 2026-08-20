@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Observability: budget utilization and target health as Prometheus gauges.
+#
+# Two gauges, one scrape. `sbproxy_ai_budget_utilization_ratio{scope}` is
+# the fraction of a budget scope's cap consumed, republished by the
+# enforcement path after every billing debit. `sbproxy_target_health_state
+# {origin, target}` is per-target tri-state health on LiteLLM's 0/1/2
+# scale (0 healthy, 1 degraded with the circuit breaker half-open,
+# 2 excluded from selection), sampled at scrape time from the same
+# pipeline walk that renders GET /api/health/targets.
+#
+# The config stages one scenario for each family:
+#
+#   * `lb.local` load-balances across a live local fixture (:19601) and a
+#     port nothing listens on (:19602). The dead target fails its probe
+#     three times in a row and is marked unhealthy roughly 4s after
+#     startup (tokio fires the first probe immediately, so the third
+#     failure lands at ~2x interval_secs). Its gauge series moves 0 -> 2.
+#
+#   * `ai.local` runs a token budget of 300 against an OpenAI-shaped
+#     fixture (:19603) that bills exactly the tokens the request asks for
+#     (`spend=100` in the message content). Three spend=100 calls walk the
+#     workspace gauge 0.33 -> 0.67 -> 1.0; the fourth request is refused
+#     with a 402.
+#
+# Run:
+#   python3 examples/health-and-budget-gauges/fixture.py &
+#   make run CONFIG=examples/health-and-budget-gauges/sb.yml
+#
+# Watch:
+#   curl -s http://127.0.0.1:8080/metrics | grep -E 'target_health_state|budget_utilization'
+#
+# The README walks both scenarios with captured output.
+
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo upstreams run on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at real targets does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+origins:
+  "lb.local":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        # Live: the fixture answers 200 on /up, so this target stays
+        # healthy and its gauge series stays 0.
+        - url: http://127.0.0.1:19601
+          health_check:
+            path: /up
+            interval_secs: 2
+            timeout_ms: 1000
+            unhealthy_threshold: 3
+            healthy_threshold: 2
+        # Dead: nothing listens on 19602. Every probe is refused, the
+        # third consecutive failure marks the target unhealthy, and the
+        # gauge series moves to 2 (excluded from selection).
+        - url: http://127.0.0.1:19602
+          health_check:
+            path: /up
+            interval_secs: 2
+            timeout_ms: 1000
+            unhealthy_threshold: 3
+            healthy_threshold: 2
+
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; OpenAI-shaped provider
+          # config carries one. Against the real provider this would be
+          # ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:19603/v1
+          allow_private_base_url: true
+          default_model: gpt-4o
+          models:
+            - gpt-4o
+
+      budget:
+        on_exceed: block
+        limits:
+          # `workspace` keys on the request Host, so every request to
+          # this origin shares one 300-token window. `total` never rolls
+          # over, which keeps the walk below reproducible; restart the
+          # process to reset it.
+          - scope: workspace
+            max_tokens: 300
+            period: total
