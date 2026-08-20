@@ -2024,8 +2024,8 @@ pub fn record_key_lookup_cache(kind: &'static str, outcome: &'static str) {
     }
 }
 
-/// Fold one key-management audit emission's real write result into
-/// `sbproxy_key_audit_write_failures_total{channel}` (WOR-2572).
+/// Fold one audit emission's real write result into
+/// `sbproxy_audit_write_failures_total{channel}` (WOR-2572).
 ///
 /// Modeled on Vault's audit-log failure counter, whose docs say a healthy
 /// system reads exactly zero, so the counter touches the channel's series
@@ -2036,18 +2036,31 @@ pub fn record_key_lookup_cache(kind: &'static str, outcome: &'static str) {
 /// difference between this counter and the `RB-AUDIT-WRITE-FAILURE`
 /// landmine WOR-2572 exists to avoid: an outcome label nothing can set to
 /// a failure value is an alert that structurally cannot fire. `channel`
-/// names the config key that turned the trail on: `key_path` or
-/// `admin_path` today, `key_access_path` reserved for the read-audit
-/// channel (WOR-2570). A deployment with no chain configured never calls
-/// this with `ok: false`, because it made no durability promise to break.
-pub fn record_key_audit_write_outcome(channel: &'static str, ok: bool) {
+/// names the config key that turned the trail on: `key_path` (the key and
+/// credential mutation trail) or `admin_path` (the admin-console action
+/// trail) today, `key_access_path` reserved for the read-audit channel
+/// (WOR-2570). The family is named for the signal rather than for the key
+/// plane because `admin_path` is a console channel, not a key-management
+/// one.
+///
+/// Two things can set `ok` to false, and they have different
+/// reachability. A deployment with no chain configured cannot reach the
+/// chain half at all: [`crate::audit::KeyAuditEntry::emit`] substitutes `true`
+/// for the append result when no chain is installed. The serialize half
+/// is independent of that and does reach this call site on its own, so it
+/// is unreachable today only because every field of a `KeyAuditEntry` is
+/// a `String`, an `Option<String>`, or a `serde_json::Value`, none of
+/// which can fail to encode. A field with a hand-written `Serialize`
+/// would change that, which is why the reason is written down rather than
+/// left as "no chain, no failures".
+pub fn record_audit_write_outcome(channel: &'static str, ok: bool) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
-            "sbproxy_key_audit_write_failures_total",
-            "Key-management audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0",
+            "sbproxy_audit_write_failures_total",
+            "Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0",
             &["channel"],
         )
         .ok()

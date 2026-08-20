@@ -318,8 +318,33 @@ fn rotation_policy() -> sbproxy_vault::RotationPolicy {
     sbproxy_vault::process_rotation()
 }
 
+/// One entry in a plane generation's resolved-secret cache: when the value
+/// was resolved, the value itself, and whether the stale-serving episode
+/// this entry is currently in has already been announced.
+///
+/// `stale_announced` is what keeps a grace-window serve announcing once per
+/// outage instead of once per request. The grace arm deliberately does not
+/// re-stamp `at`, because a re-stamp would make the value look fresh and
+/// defeat `stale_serve_deadline` entirely. So `at.elapsed()` keeps growing
+/// for as long as the backend is down, and every request retries the full
+/// path and lands back in the grace arm. Without this flag that arm would
+/// log a line and publish a `credential_resolved` event per request for the
+/// whole grace window, which on a busy origin is tens of thousands of events
+/// into a queue shared with `key_revoked`.
+///
+/// The flag lives on the entry rather than in a second map so it cannot fall
+/// out of step with the value it describes: a successful resolution replaces
+/// the whole entry and an invalidation drops it, and both clear the flag as a
+/// side effect. A later outage therefore announces again.
+#[derive(Clone)]
+struct ResolvedCredentialEntry {
+    at: std::time::Instant,
+    value: ResolvedCredential,
+    stale_announced: bool,
+}
+
 type ResolvedCredentialCache =
-    parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedCredential)>>;
+    parking_lot::Mutex<std::collections::HashMap<String, ResolvedCredentialEntry>>;
 
 /// Drop any cached resolved secret for `id`. Called from the admin mutation
 /// path alongside the record-cache invalidation.
@@ -345,6 +370,30 @@ impl KeyPlane {
     /// Drop every resolved upstream secret from this plane generation.
     pub(crate) fn invalidate_all_resolved_credentials(&self) {
         self.resolved_credentials.lock().clear();
+    }
+
+    /// Claim the right to announce one stale-serving episode for `id`.
+    ///
+    /// Returns `true` for the first request that falls into the grace window
+    /// and `false` for every later request riding the same stale value, so
+    /// the warn line and the `credential_resolved` event are bounded by
+    /// outages rather than by request rate. The read and the set happen under
+    /// one lock acquisition, so two concurrent requests cannot both claim the
+    /// same episode.
+    ///
+    /// A `false` for a missing entry is deliberate: an entry that was
+    /// invalidated between this request reading the cache and reaching here
+    /// has no episode left to announce, and the value being served is the
+    /// clone this request already holds.
+    fn claim_stale_announcement(&self, id: &str) -> bool {
+        let mut cache = self.resolved_credentials.lock();
+        match cache.get_mut(id) {
+            Some(entry) if !entry.stale_announced => {
+                entry.stale_announced = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Resolve a key's bound credential into the header the upstream carries.
@@ -375,7 +424,8 @@ impl KeyPlane {
         // the two sites that actually read or serve material, because the
         // two instrumentations have different widths on purpose: the
         // histogram observes every call including the per-request cache
-        // hit, the typed feed carries only real reads and grace serves.
+        // hit, the typed feed carries only real reads plus the
+        // transition into each grace-window episode.
         // Hoisting either one to the other's site is the merge defect to
         // watch for; see the return-path table on the inner function.
         let started = std::time::Instant::now();
@@ -411,17 +461,33 @@ impl KeyPlane {
     /// | return path | `cache` / `outcome` | typed event |
     /// |---|---|---|
     /// | fresh resolved-secret cache | `hit` / `ok` | none |
-    /// | grace window serves last known-good | `stale` / `ok` | `credential_resolved`, `outcome: stale_served` |
+    /// | grace window serves last known-good | `stale` / `ok` | `credential_resolved`, `outcome: stale_served`, once per episode |
     /// | record absent | `miss` / `refused` | none |
     /// | record revoked or blocked | `miss` / `refused` | none |
     /// | credential bound across tenants | `miss` / `refused` | none |
-    /// | store or vault down, no grace | `miss` / `error` | none |
+    /// | store or vault down, outside the grace window | `miss` / `error` | none |
+    /// | envelope will not open under the master key | `miss` / `error` | none |
+    /// | resolved material is not utf-8 | `miss` / `error` | none |
+    /// | vault-referenced credential with no resolver installed | `miss` / `error` | none |
     /// | full resolution succeeds | `miss` / `ok` | `credential_resolved`, `outcome: resolved` |
+    ///
+    /// Ten rows for ten returns, and the last three of the `error` rows
+    /// are the ones worth naming rather than folding into "the backend is
+    /// down". None of them reaches `serve_stale_on_failure` at all, and
+    /// that is a ruling, not an oversight: a master key that no longer
+    /// opens the envelopes, material that is not utf-8, and a
+    /// vault-referenced credential with no resolver installed are all
+    /// faults that will not fix themselves while a grace window runs
+    /// down. Serving a stale value there would hide a rotation or config
+    /// error behind an availability feature bought for a briefly
+    /// unreachable backend.
     ///
     /// The histogram is observed once per call by the wrapper, on every
     /// row. The typed feed carries only the two rows where material was
     /// actually read or served, which is why ordinary per-request
-    /// traffic riding the cache publishes nothing at all.
+    /// traffic riding the cache publishes nothing at all, and why an
+    /// outage that spans a five-minute grace window publishes once
+    /// rather than once per request.
     async fn resolve_credential_secret_inner(
         &self,
         id: &str,
@@ -433,10 +499,10 @@ impl KeyPlane {
         // served immediately, and a stale one is held so the grace window
         // below has something to fall back to when the backend is down.
         let cached = self.resolved_credentials.lock().get(id).cloned();
-        if let Some((at, value)) = &cached {
-            if at.elapsed() < policy.re_resolve_interval() {
+        if let Some(entry) = &cached {
+            if entry.at.elapsed() < policy.re_resolve_interval() {
                 *cache_layer = "hit";
-                return Ok(value.clone());
+                return Ok(entry.value.clone());
             }
         }
         // Serve the last known-good value when re-resolution fails and the
@@ -453,30 +519,46 @@ impl KeyPlane {
         // never reached by a config that did not ask for it.
         let serve_stale_on_failure =
             |cache_layer: &mut &'static str, err: CredentialResolveError| match &cached {
-                Some((at, value)) if at.elapsed() < policy.stale_serve_deadline() => {
+                Some(entry) if entry.at.elapsed() < policy.stale_serve_deadline() => {
                     *cache_layer = "stale";
-                    tracing::warn!(
-                        credential_id = %id,
-                        error = %err,
-                        age_secs = at.elapsed().as_secs(),
-                        grace_secs = policy.grace_period().as_secs(),
-                        "could not re-resolve a bound credential; serving the last known-good \
-                         value for the remainder of proxy.secrets.rotation.grace_period_secs"
-                    );
-                    // WOR-2571: a stale serve is still an actual use of
-                    // resolved material, and it is the one a SIEM most
-                    // wants to see, because it means the backend was down
-                    // and the credential kept working anyway. It sits
-                    // inside the grace arm, next to WOR-2572's
-                    // `cache_layer = "stale"`, so the two instrumentations
-                    // describe exactly the same set of serves: every
-                    // `cache=stale` observation has one `stale_served`
-                    // event and no other path publishes one.
-                    sbproxy_observe::publish_proxy_event(
-                        sbproxy_observe::EventType::CredentialResolved,
-                        || credential_resolved_event(id, tenant_id, "stale_served", None),
-                    );
-                    Ok(value.clone())
+                    // The two instrumentations part company here, on
+                    // purpose. `cache_layer = "stale"` is per serve,
+                    // because a rate is what an operator alerts on and a
+                    // histogram costs nothing per observation. The warn
+                    // line and the typed event are per *episode*: this arm
+                    // does not re-stamp the entry (a re-stamp would make
+                    // the value look fresh and defeat
+                    // `stale_serve_deadline`), so every request for the
+                    // whole grace window retries the full path and lands
+                    // back here. Announcing per request would put one log
+                    // line and one `credential_resolved` on the wire per
+                    // request carrying this credential, and the events
+                    // queue is shared with `key_revoked`, so the noise
+                    // would crowd out the signal during exactly the
+                    // incident the grace window exists for.
+                    if self.claim_stale_announcement(id) {
+                        tracing::warn!(
+                            credential_id = %id,
+                            error = %err,
+                            age_secs = entry.at.elapsed().as_secs(),
+                            grace_secs = policy.grace_period().as_secs(),
+                            "could not re-resolve a bound credential; serving the last known-good \
+                             value for the remainder of proxy.secrets.rotation.grace_period_secs"
+                        );
+                        // WOR-2571: a stale serve is still an actual use
+                        // of resolved material, and it is the one a SIEM
+                        // most wants to see, because it means the backend
+                        // was down and the credential kept working
+                        // anyway. One event marks the transition into
+                        // stale serving; the next successful resolution
+                        // clears the flag, so a second outage is a second
+                        // event.
+                        sbproxy_observe::publish_proxy_event(
+                            sbproxy_observe::EventType::CredentialResolved,
+                            || credential_resolved_event(id, tenant_id, "stale_served", None),
+                        );
+                    }
+                    Ok(entry.value.clone())
                 }
                 _ => Err(err),
             };
@@ -559,7 +641,13 @@ impl KeyPlane {
         };
         self.resolved_credentials.lock().insert(
             id.to_string(),
-            (std::time::Instant::now(), resolved.clone()),
+            ResolvedCredentialEntry {
+                at: std::time::Instant::now(),
+                value: resolved.clone(),
+                // A fresh resolution ends whatever stale-serving episode
+                // was running, so the next outage announces again.
+                stale_announced: false,
+            },
         );
         // WOR-2571: one typed event per actual resolution. The cached
         // fast path above returns before this point, so a request that
@@ -596,6 +684,15 @@ impl KeyPlane {
 /// rode the cached value, the same cardinality ruling that keeps
 /// `cache_hit` unwired on the typed feed. Resolution refusals publish
 /// nothing here either; the refusal surface is WOR-2567's.
+///
+/// `stale_served` holds the same line from the other side. A grace
+/// window can run for minutes while every request in it re-tries and
+/// falls back, so one event marks the *transition* into stale serving
+/// and the next successful resolution arms the next one. The
+/// per-serve count is on
+/// `sbproxy_credential_resolution_duration_seconds{cache="stale"}`,
+/// where a rate costs one histogram observation instead of an NDJSON
+/// line on a webhook.
 fn credential_resolved_event(
     id: &str,
     tenant_id: Option<&str>,
@@ -2961,7 +3058,7 @@ mod resolve_credential_secret_tests {
     /// written against a tree without the other. WOR-2572 wraps the
     /// resolution in a metrics wrapper; WOR-2571 publishes typed events
     /// from two sites inside it; the two are deliberately different
-    /// widths. One credential, one process, four claims:
+    /// widths. One credential, one process, six claims:
     ///
     /// - a full resolution is `cache=miss outcome=ok` and publishes one
     ///   `credential_resolved` with `outcome: resolved`;
@@ -2973,6 +3070,14 @@ mod resolve_credential_secret_tests {
     ///   one `credential_resolved` with `outcome: stale_served`, which is
     ///   the property a wrapper that swallowed the closure's early return
     ///   would silently destroy in the other direction;
+    /// - five serves inside one grace window are five histogram
+    ///   observations and still one event, because the grace arm does not
+    ///   re-stamp the entry, so without the episode gate every request
+    ///   for the length of the window publishes;
+    /// - a refusal (absent record, cross-tenant binding) is on the
+    ///   histogram and publishes nothing at all, which is the half of the
+    ///   contract a later "alert me when a revoked credential is still
+    ///   being presented" change would quietly widen;
     /// - and no resolved material reaches the feed on any of them.
     ///
     /// One egress install per process, the same shape as the two tests
@@ -3047,6 +3152,45 @@ mod resolve_credential_secret_tests {
             "a grace serve is cache=stale outcome=ok, never folded into hit"
         );
 
+        // Still inside the same outage. The grace arm does not re-stamp
+        // the entry, so each of these re-runs the full path, fails, and
+        // falls back again: the shape that published one event per
+        // request for the whole grace window before the episode gate.
+        for _ in 0..4 {
+            p.resolve_credential_secret("rotating", None)
+                .await
+                .expect("grace keeps serving the last known-good value");
+        }
+        assert_eq!(
+            resolution_count("stale", "ok"),
+            before_stale_ok + 5,
+            "the histogram stays per serve: a rate is what an operator alerts on"
+        );
+
+        // The other half of the two-column contract, stated in this
+        // function's return-path table and in `credential_resolved_event`'s
+        // rustdoc and pinned nowhere until now: a refusal publishes
+        // nothing on the feed. An absent record and a cross-tenant
+        // binding are the two refusals reachable without the vault.
+        let mut cross = credential(
+            "seam-cross-tenant",
+            CredentialMaterial::Plaintext {
+                value: "seam-cross-tenant-value".into(),
+            },
+        );
+        cross.tenant_id = Some("other-tenant".to_string());
+        put(&p, cross).await;
+        assert!(matches!(
+            p.resolve_credential_secret("seam-no-such-credential", None)
+                .await,
+            Err(CredentialResolveError::NotFound)
+        ));
+        assert!(matches!(
+            p.resolve_credential_secret("seam-cross-tenant", Some("acme"))
+                .await,
+            Err(CredentialResolveError::TenantMismatch)
+        ));
+
         // A plaintext marker resolves without the vault, so once its
         // event is on disk every earlier publish had its chance to land.
         put(
@@ -3073,8 +3217,16 @@ mod resolve_credential_secret_tests {
         assert_eq!(
             rotating.len(),
             2,
-            "one fresh resolution and one grace serve, and nothing at all \
-             from the cached serve between them: {content}"
+            "one fresh resolution and one grace-window episode, and nothing \
+             at all from the cached serve between them or from the four \
+             further requests inside the same episode: {content}"
+        );
+        assert_eq!(
+            content.lines().count(),
+            3,
+            "two `rotating` events and the marker, and nothing from either \
+             refusal: a resolution the plane refuses publishes nothing at \
+             all on this feed: {content}"
         );
 
         let fresh: serde_json::Value =

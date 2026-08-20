@@ -760,8 +760,11 @@ impl AdminActionAuditEntry {
         // WOR-2572: the dedicated audit-write-failure counter, fed from
         // the same real append result the histogram's outcome label
         // folds in. Touches the series on success too, so a healthy
-        // channel exports an explicit 0.
-        crate::metrics::record_key_audit_write_outcome("admin_path", chain_ok);
+        // channel exports an explicit 0. `admin_path` is the console
+        // action trail, not a key-management channel, which is why the
+        // family is `sbproxy_audit_write_failures_total` rather than
+        // being named for the key plane.
+        crate::metrics::record_audit_write_outcome("admin_path", chain_ok);
         crate::metrics::record_audit_emit_duration(
             "admin",
             outcome,
@@ -883,7 +886,7 @@ impl KeyAuditEntry {
         // means every sink this emission was promised was reached: the
         // tracing serialize succeeded AND a configured chain accepted
         // the append. Sourced from those real results, never a default.
-        crate::metrics::record_key_audit_write_outcome("key_path", outcome == "ok");
+        crate::metrics::record_audit_write_outcome("key_path", outcome == "ok");
         // WOR-2571: the `events:` egress sees the four alertable
         // lifecycle operations as typed events (`key_minted`,
         // `key_revoked`, `key_rotated`, `key_blocked`), the same bridge
@@ -949,9 +952,12 @@ fn key_lifecycle_event_type(op: &str) -> Option<crate::events::EventType> {
 /// fingerprints them rather than carrying them (see
 /// [`KeyAuditChainEntry`]), and a webhook sink ships these bytes off
 /// the box, so the SIEM copy carries strictly less than the local
-/// record, never more. This is the same posture as Vault's
-/// `audit_non_hmac_request_keys`: named non-secret fields in the
-/// clear by exception, everything unnamed withheld.
+/// record, never more. This is Vault's `audit_non_hmac_request_keys`
+/// posture read in reverse, and the qualifier matters: Vault HMACs
+/// everything and exempts a named list, while this carries a named
+/// list in the clear and withholds the rest. Same end state, opposite
+/// mechanism. Named non-secret fields cross by exception; everything
+/// unnamed is withheld rather than hashed.
 ///
 /// `outcome` is always `applied` today because [`KeyAuditEntry::emit`]
 /// runs only after the store accepted the mutation; refusals are owned

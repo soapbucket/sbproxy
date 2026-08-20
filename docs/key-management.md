@@ -571,14 +571,14 @@ See the runnable `examples/ai-dynamic-keys-cluster/` for a two-replica setup.
 
 ## Operational metrics
 
-Key management exports four Prometheus families on `/metrics`, modeled on the operational surface Vault publishes at `/v1/sys/metrics?format=prometheus`: operation rates, resolution latency, cache effectiveness, and an audit-write-failure counter whose healthy reading is exactly zero. Every label value is a compile-time constant chosen from the real result of the code path it describes. None is operator-supplied, so none passes through the cardinality limiter and the series counts are fixed; the caps live in the [cardinality budget table](observability.md#cardinality-budget).
+Key management exports four Prometheus families on `/metrics`, modeled on the operational surface Vault publishes at `/v1/sys/metrics?format=prometheus`: operation rates, resolution latency, cache effectiveness, and an audit-write-failure counter whose healthy reading is exactly zero. The fourth is the one that reaches past the key plane: it carries the admin-console action trail on the same family, because the signal is "an audit record did not reach a sink it was promised" regardless of which trail it was. Every label value is a compile-time constant chosen from the real result of the code path it describes. None is operator-supplied, so none passes through the cardinality limiter and the series counts are fixed; the caps live in the [cardinality budget table](observability.md#cardinality-budget).
 
 | Family | Labels | What moves it |
 |---|---|---|
 | `sbproxy_key_operations_total` | `operation` (mint\|update\|delete\|revoke\|block\|unblock\|rotate), `outcome` (ok\|refused\|error) | One increment per admin key-lifecycle call, counted at the dispatch seam from the status class the handler actually returned. `refused` is a 4xx the caller can fix (validation, revision conflict, rotating a revoked key); `error` means the store or governance backend failed. The two are never folded into one value, because a busy console and an outage are different facts. Keys only: `/admin/credentials` mutations are not counted on this family. |
 | `sbproxy_credential_resolution_duration_seconds` | `cache` (hit\|stale\|miss), `outcome` (ok\|refused\|error) | One observation per bound-credential resolution. `hit` is the per-generation resolved-secret cache answering fresh; `stale` is the `proxy.secrets.rotation` grace window serving the last known-good value after the backend failed to answer; `miss` ran the full keystore/vault path. `refused` covers absent, revoked/blocked, and cross-tenant records; `error` is the secret backend failing. |
 | `sbproxy_key_lookup_cache_total` | `kind` (key\|credential), `outcome` (hit\|negative_hit\|tier_hit\|miss\|error) | One increment per lookup through the TTL policy cache described above. `negative_hit` is the known-absent cache answering, reported as itself so a stampede of unknown keys stays visible. |
-| `sbproxy_key_audit_write_failures_total` | `channel` (key_path\|admin_path) | Key or admin audit emissions that did not reach a sink they were promised. The channel's series is touched at 0 on every emission, so an `increase()` alert has a baseline before the first failure; it increments only from the write path's actual result. Any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and the existing `SBPROXY-AUDIT-WRITE-FAILURE` page alert fires on the same condition across every audit channel. |
+| `sbproxy_audit_write_failures_total` | `channel` (key_path\|admin_path) | Key or admin-console audit emissions that did not reach a sink they were promised. The channel's series is touched at 0 on every emission, so an `increase()` alert has a baseline before the first failure; it increments only from the write path's actual result. Any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and the existing `SBPROXY-AUDIT-WRITE-FAILURE` page alert fires on the same condition across every audit channel. |
 
 Two caches sit on the credential path, and the two ratio metrics deliberately do not share a family, because they answer different capacity questions:
 
@@ -664,12 +664,12 @@ for i in 1 2 3; do
 done
 
 curl -s -u admin:change-me http://127.0.0.1:9090/metrics \
-  | grep -E '^sbproxy_key_(operations|lookup_cache|audit_write_failures)_total' | sort
+  | grep -E '^sbproxy_(audit_write_failures|key_(operations|lookup_cache))_total' | sort
 ```
 
 ```text
-sbproxy_key_audit_write_failures_total{channel="admin_path"} 0
-sbproxy_key_audit_write_failures_total{channel="key_path"} 0
+sbproxy_audit_write_failures_total{channel="admin_path"} 0
+sbproxy_audit_write_failures_total{channel="key_path"} 0
 sbproxy_key_lookup_cache_total{kind="key",outcome="miss"} 1
 sbproxy_key_lookup_cache_total{kind="key",outcome="negative_hit"} 2
 sbproxy_key_operations_total{operation="block",outcome="ok"} 1
@@ -684,7 +684,7 @@ Three things in that output are the whole design. The refused rotate sits on its
 
 The `sbproxy-security` Grafana dashboard (`dashboards/grafana/sbproxy-security.json`) ships a Key Operations rate panel, the resolution p95 with its should-read-zero stale and error series, both hit ratios, and the audit-write-failure counter.
 
-These four families are aggregate counters and histograms, and they are deliberately narrower than the per-event record. A metric tells you that three rotations happened in the last five minutes; it cannot tell you which key, under which tenant, at whose hands. For that, subscribe to the typed lifecycle events described under [the admin API](#the-admin-api), which carry the record id and the acting principal. The two surfaces watch the same seams on purpose: `sbproxy_credential_resolution_duration_seconds{cache="stale"}` and a `credential_resolved` event with `outcome: stale_served` count the same grace-window serves, one as a rate you alert on and one as a record you investigate with.
+These four families are aggregate counters and histograms, and they are deliberately narrower than the per-event record. A metric tells you that three rotations happened in the last five minutes; it cannot tell you which key, under which tenant, at whose hands. For that, subscribe to the typed lifecycle events described under [the admin API](#the-admin-api), which carry the record id and the acting principal. The two surfaces watch the same seam on purpose, at deliberately different widths: `sbproxy_credential_resolution_duration_seconds{cache="stale"}` counts every grace-window serve, and a `credential_resolved` event with `outcome: stale_served` marks each episode once. Alert on the rate; investigate with the record. The event is not per serve because the grace path does not refresh the cached value's timestamp, so a five-minute window on a busy origin would otherwise put one event on the feed per request, and that feed is shared with `key_revoked`.
 
 ## The security model
 

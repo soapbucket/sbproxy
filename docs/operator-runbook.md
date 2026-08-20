@@ -290,14 +290,17 @@ on this histogram, so the alert and the log line point at the same
 failure. A dropped `events:` record is a separate thing and increments
 `sbproxy_events_dropped_total` instead.
 
-The two key-management channels also carry
-`sbproxy_key_audit_write_failures_total{channel}`, which counts the same
-durability failures on a counter instead of a histogram. Use it
-to answer "is this happening right now, and is it still happening", because
-its series is touched at 0 on every emission, so a rate over it reads zero
-rather than absent while the system is healthy. Its `channel` label names
-the config key rather than the channel (`key_path`, `admin_path`), so a
-page on `channel="key"` here corresponds to `channel="key_path"` there.
+The key-mutation channel and the admin-console action channel also
+carry `sbproxy_audit_write_failures_total{channel}`, which counts the
+same durability failures on a counter instead of a histogram. Only two
+of the four channels are on it, and `admin_path` is the console action
+trail rather than a second key-management one. Use it to answer "is
+this happening right now, and is it still happening", because its
+series is touched at 0 on every emission, so a rate over it reads zero
+rather than absent while the system is healthy. Its `channel` label
+names the config key rather than the channel (`key_path`,
+`admin_path`), so a page on `channel="key"` here corresponds to
+`channel="key_path"` there.
 It does not replace the histogram: the histogram is what pages, and it is
 the only one of the two that covers `security` and `config`.
 

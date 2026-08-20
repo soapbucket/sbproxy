@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! WOR-2572: `sbproxy_key_audit_write_failures_total` increments on a
+//! WOR-2572: `sbproxy_audit_write_failures_total` increments on a
 //! REAL failed chain append, driven through the public emitters rather
 //! than by handing the recorder a hand-rolled `false`.
 //!
@@ -44,7 +44,7 @@ use sbproxy_observe::{AdminActionAuditEntry, KeyAuditEntry};
 fn failure_count(channel: &str) -> Option<f64> {
     let want = format!("channel={channel}");
     for family in prometheus::gather() {
-        if family.name() != "sbproxy_key_audit_write_failures_total" {
+        if family.name() != "sbproxy_audit_write_failures_total" {
             continue;
         }
         for metric in family.get_metric() {

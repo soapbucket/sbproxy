@@ -34,9 +34,11 @@ the next version cut.
   beside its audit-chain entry instead of a SIEM having to poll the
   admin API. `credential_resolved` fires once per actual resolution of
   an upstream credential's material (never per request), with
-  `outcome: stale_served` marking a value served through a secret
-  backend outage. Payloads are an explicit allowlist (`op`,
-  `resource`, the public id, actor, tenant, outcome, and closed
+  `outcome: stale_served` marking the start of a rotation grace window
+  serving through a secret-backend outage. That one is per outage, not
+  per request in the window; the per-serve count is the `cache="stale"`
+  series on the resolution histogram. Payloads are an explicit
+  allowlist (`op`, `resource`, the public id, actor, tenant, outcome, and closed
   status labels), never the `key_audit` diff, a token, or a hash;
   `events.types:` filters the new kinds like any other, and
   `sbproxy_events_dropped_total` covers them. See
@@ -53,10 +55,13 @@ the next version cut.
   folding it into `hit`. `sbproxy_key_lookup_cache_total{kind,
   outcome}` reports the keystore TTL cache, including `negative_hit` as
   its own value so a stampede of unknown keys stays visible. And
-  `sbproxy_key_audit_write_failures_total{channel}` counts audit
-  emissions that did not reach a sink they were promised, touching the
-  series at 0 on every emission so an `increase()` alert has a baseline
-  from the first scrape. Every label value is a compile-time constant,
+  `sbproxy_audit_write_failures_total{channel}` counts audit emissions
+  that did not reach a sink they were promised, touching the series at
+  0 on every emission so an `increase()` alert has a baseline from the
+  first scrape; its two channels are the key-mutation trail
+  (`key_path`) and the admin-console action trail (`admin_path`), which
+  is why it is named for the audit signal rather than for the key
+  plane. Every label value is a compile-time constant,
   so none passes through the cardinality limiter. The `sbproxy-security`
   Grafana dashboard gains the matching panels. See the operational
   metrics section of

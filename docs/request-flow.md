@@ -1,6 +1,6 @@
 # Request flow
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 Every request SBproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,

@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of eighteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -48,7 +48,7 @@ all.
 | `key_revoked` | A key or upstream credential was marked revoked, the terminal state. | Yes |
 | `key_rotated` | A key's secret was rotated; the prior secret keeps working for the grace window. | Yes |
 | `key_blocked` | A key or upstream credential was marked blocked. | Yes |
-| `credential_resolved` | An upstream credential's material was actually resolved (freshly, or served stale inside the rotation grace window), never once per request. | Yes |
+| `credential_resolved` | An upstream credential's material was actually resolved, or a rotation grace window started serving the last known-good value. Never once per request. | Yes |
 | `cache_hit` | A response was served from the response cache. | No |
 | `cache_miss` | The cache lookup found no usable entry. | No |
 
@@ -72,7 +72,7 @@ Four of the sixteen wired events are worth being explicit about, because "wired"
 - **`provider_selected`** fires on a provider failover or advance, never on the provider chosen for an ordinary first attempt. The data carries `from_provider`, `to_provider`, and the reason (`http_503`, `transport`, `content_policy`, `managed_cold_fallback`). A deployment with healthy providers and no failovers sees none of these, which is correct: routing choice by itself is not a security-relevant event, a transition off the configured plan is.
 - **`budget_exceeded`** fires once per request that actually crosses a configured cap and gets blocked, at the same site that already builds the 402 response body. It does not fire for a request that stays under budget, and it does not fire on a soft-landing downgrade, only on a hard block. The data carries `scope` (the limit's scope label), `reason`, `max_tokens`, `max_cost_usd`, and `window_secs`.
 - **`guardrail_triggered`** fires once per guardrail evaluation stage (input, RAG-augmented input, or output) that ends in a block, never per streamed chunk and never on an allow. The data carries `stage`, `guardrail` (which one blocked), `flagged_count` (how many others flagged without blocking), `spans`, and `spans_dropped`. The span fields are populated on a `pii` block: each span is an entity type plus a byte offset and length into the scanned text (positions, never the matched value), capped at 32 with `spans_dropped` counting anything past the cap; every other guardrail publishes them empty. See [observability.md](observability.md#decision-audit-records) for which text the offsets index on each stage.
-- **`credential_resolved`** fires once per actual resolution of an upstream credential's material (an envelope opened, a vault reference dereferenced, or a plaintext record read) and once per stale serve inside the rotation grace window, never on the per-request cache hit. The data carries `op`, `resource`, `id`, `outcome` (`resolved` or `stale_served`), and, on a fresh resolution only, `source` (`plaintext`, `envelope`, or `vault_ref`). A `stale_served` event is the one worth an alert rule: it means the secret backend was unreachable and the credential kept working from the last known-good value. A resolution *refusal* publishes nothing here; the request that needed it is refused, and that refusal is carried by the request-side channels.
+- **`credential_resolved`** fires once per actual resolution of an upstream credential's material (an envelope opened, a vault reference dereferenced, or a plaintext record read), never on the per-request cache hit. The data carries `op`, `resource`, `id`, `outcome` (`resolved` or `stale_served`), and, on a fresh resolution only, `source` (`plaintext`, `envelope`, or `vault_ref`). A `stale_served` event is the one worth an alert rule: it means the secret backend was unreachable and the credential kept working from the last known-good value. It fires **once per outage, not once per request in the grace window**: the grace path deliberately does not refresh the cached value's timestamp (a refresh would make it look fresh and cancel the grace deadline), so every request for the length of the window retries and falls back, and only the transition into stale serving publishes. The next successful resolution arms the next one. If you want the per-request count, `sbproxy_credential_resolution_duration_seconds{cache="stale"}` has it as a rate, which is the shape an alert wants anyway. A resolution *refusal* publishes nothing here; the request that needed it is refused, and that refusal is carried by the request-side channels.
 
 ## Decision-audit: the other eighteen
 
@@ -266,7 +266,7 @@ flowchart TD
     A["Admin key plane mutation:\nmint / revoke / rotate / block\n(POST /admin/keys, /admin/credentials)"] --> B["key_audit channel\n(tracing target + admin ring)"]
     B -->|"audit.key_path"| C["Hash-chained, Ed25519-signed file\n(fingerprinted diffs, survives the process)"]
     B -->|bridged| D["Typed event: key_minted /\nkey_revoked / key_rotated / key_blocked"]
-    R["Upstream credential resolution\n(material actually read, or stale-served)"] --> E["Typed event:\ncredential_resolved"]
+    R["Upstream credential resolution\n(material actually read, or a\ngrace window opening)"] --> E["Typed event:\ncredential_resolved"]
     D --> F["events: sink\n(NDJSON file or signed webhook batch)"]
     E --> F
     F --> G["SIEM"]

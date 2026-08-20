@@ -625,7 +625,7 @@
     },
     {
       "id": 9,
-      "title": "Key Audit Write Failures",
+      "title": "Audit Write Failures",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -667,7 +667,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (channel) (increase(sbproxy_key_audit_write_failures_total[5m]))",
+          "expr": "sum by (channel) (increase(sbproxy_audit_write_failures_total[5m]))",
           "legendFormat": "{{channel}}",
           "datasource": {
             "type": "prometheus",
@@ -675,7 +675,7 @@
           }
         }
       ],
-      "description": "Key-management audit emissions that did not reach a sink they were promised, by channel (audit.key_path, audit.admin_path). Reads exactly zero in a healthy system; any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and SBPROXY-AUDIT-WRITE-FAILURE pages on the same condition across all audit channels. Runbook: docs/operator-runbook.md#rb-audit-write."
+      "description": "Audit emissions that did not reach a sink they were promised, by channel: audit.key_path is the key and credential mutation trail, audit.admin_path is the admin-console action trail. Reads exactly zero in a healthy system; any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and SBPROXY-AUDIT-WRITE-FAILURE pages on the same condition across all audit channels. Runbook: docs/operator-runbook.md#rb-audit-write."
     }
   ],
   "templating": {
