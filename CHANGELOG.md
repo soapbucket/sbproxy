@@ -44,6 +44,13 @@ the next version cut.
 
 ### Fixed
 
+- **Prompts admin page "Add version" now sends the field the backend
+  expects.** The form built a `content` key while
+  `POST /admin/prompts/<host>/<name>/versions` deserializes into a
+  required `template` field with no alias, so every submission 400ed.
+  The form now sends `template`; the same operation already worked via
+  the raw admin API.
+
 - **The `websocket` action's `max_message_size` and `subprotocols` are
   enforced.** Both fields parsed and did nothing. `max_message_size`
   (default 10 MB, now enforced including the default) closes the

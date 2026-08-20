@@ -2747,7 +2747,13 @@ export const api = {
 
   // Prompts
   prompts: () => getJson<unknown>("/admin/prompts"),
-  addPromptVersion: (host: string, name: string, body: unknown) =>
+  addPromptVersion: (
+    host: string,
+    name: string,
+    // Typed to the endpoint's AddVersionBody so a field rename on either
+    // side fails the typecheck lane instead of 400ing at runtime.
+    body: { version: string; template: string; variables?: Record<string, unknown> },
+  ) =>
     sendJson<unknown>(
       "POST",
       `/admin/prompts/${encodeURIComponent(host)}/${encodeURIComponent(name)}/versions`,

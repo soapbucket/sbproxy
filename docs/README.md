@@ -169,6 +169,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - the eight gateway-layer controls no published list covers, and a row-by-row OWASP LLM Top 10 (2026) mapping, each claim backed by a named test or signal and every limit paired with its rationale.
 - [mcp-security-coverage.md](mcp-security-coverage.md) - a row-by-row OWASP MCP Top 10 mapping, coverage stated as full, partial, or out of gateway scope, each claim backed by a named test or config example.
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).
+- [authentication.md](authentication.md) - the chooser over all twelve inbound auth providers: which fits which caller, accepting several on one origin (credential migrations), and what the gateway does with the resulting identity.
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
 - [cap.md](cap.md) - the `cap` provider: verifying Crawler Authorization Protocol capability tokens (path globs, rate grants, agent binding) against an issuer's JWKS.

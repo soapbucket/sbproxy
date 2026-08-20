@@ -60,7 +60,7 @@ Everything above assumes plain HTTP/1.1. SBproxy also terminates HTTP/2 and prox
 
 ## Authentication and authorization
 
-Ten built-in auth types cover the common cases: API key, Basic, Bearer, JWT (with JWKS), Digest, Forward Auth, mTLS, Web Bot Auth, CAP, and OIDC. Configure one per origin under `auth:`.
+Twelve built-in auth types cover the common cases: API key, Basic, Bearer, JWT (with JWKS and JWE), Digest, HMAC signed requests, LDAP bind, Forward Auth, mTLS, Web Bot Auth, CAP, and OIDC. Configure one per origin under `auth:`, or accept several at once with a composition list; [authentication.md](authentication.md) is the chooser.
 
 - [auth-oidc.md](auth-oidc.md) - the OIDC relying-party flow: authorization-code + PKCE, sealed session cookie, RP-initiated logout.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, rotate at runtime, hashed at rest.
