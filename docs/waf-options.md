@@ -1,6 +1,6 @@
 # WAF options
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-18*
 
 ![A request denied by the WAF baseline inside a layered ip_filter -> ddos -> waf -> dlp stack](assets/waf-layered.gif)
 
@@ -41,7 +41,7 @@ policies:
       enabled: true
       managed_bundle: true
     paranoia: 2
-    action_on_match: block
+    enforcement: block
     failure_posture: closed
 ```
 
@@ -99,7 +99,9 @@ newlines and matched against every rule, so a pattern can match across a
 header boundary, and a long bearer token or session cookie can trip a
 signature that a real attack never would. A header value that is not
 valid UTF-8 is read as empty and skipped entirely. This is a false
-positive source worth measuring in `test_mode: true` before you enforce.
+positive source worth measuring in `enforcement: observe` (the one-key
+rollout switch; the legacy `test_mode: true` spelling still parses)
+before you enforce.
 
 None of that makes the baseline useless. It stops opportunistic scanner
 traffic and unsophisticated injection attempts at the edge, cheaply, with
@@ -335,7 +337,7 @@ policies:
       enabled: true
       managed_bundle: true
     paranoia: 2
-    action_on_match: block
+    enforcement: block
     failure_posture: closed
     feed:
       enabled: true

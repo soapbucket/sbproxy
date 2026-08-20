@@ -64,10 +64,20 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      # Restore-only. This key held ~1.6 GB and its sibling below ~2.0 GB
+      # against the repo's 10 GB Actions cache budget, and with no save-if
+      # it saved on pull_request runs too, against the caches-write-on-
+      # non-PR-triggers rule (ci.yml, #834). Together with release.yml's
+      # certify key, these lines kept evicting the per-PR keys (payments,
+      # release, e2e), which is what the budget arithmetic in ci.yml's
+      # header reclaims. This lane is path-filtered and off the PR critical
+      # path, so it pays its own rebuild: it restores while an old entry
+      # survives and runs cold once GitHub expires it.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: context-compression-eval
           workspaces: sbproxy-bench/harness/context_compression_eval
+          save-if: 'false'
 
       - name: install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
@@ -123,13 +133,20 @@ jobs:
   compression-request-path:
     name: production request-path smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Was 35 with a warm cache. The cache below is restore-only now, and a
+    # cold run compiles the sbproxy binary and the e2e test union from
+    # scratch; 60 covers that honestly.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
+      # Restore-only, same reasoning as the rust-cache step in the job
+      # above: this key held ~2.0 GB of the 10 GB budget that ci.yml's
+      # header arithmetic gives back to the per-PR keys.
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: context-compression-request-path
+          cache-save: 'false'
 
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked

@@ -246,16 +246,15 @@ pub struct Target {
     /// Read from `X-Priority` header when not set here; defaults to 5.
     #[serde(default = "default_priority")]
     pub priority: u8,
-    /// Availability zone or region label, e.g. `"us-east-1a"`.
-    ///
-    /// A label, not a routing input (WOR-2246). Its one reader is the
-    /// admin API, which echoes it back as
-    /// `origins[].targets[].zone` so an operator can tell replicas
-    /// apart in the target listing. `select_target_for_request` never
-    /// consults it, so tagging targets with zones does not keep traffic
-    /// local to one.
-    #[serde(default)]
-    pub zone: Option<String>,
+    // WOR-2246 pinned `zone` here as a display label and not a routing
+    // input; WOR-2498 removed it. Operators coming from Envoy/Nginx
+    // zone-aware balancing read `zone:` as locality routing, which
+    // `select_target_for_request` never implemented, and a label whose
+    // name promises routing is a foot-gun rather than a convenience.
+    // Unknown keys under `action:` are not rejected, so
+    // `from_config_for_origin` refuses an authored `zone:` explicitly,
+    // the same way it refuses `sticky:`. Tell replicas apart with
+    // `metadata:` entries, which promise nothing about selection.
     /// Active health-check configuration for this target. When set,
     /// the proxy probes the target on a background timer and ejects it
     /// from selection on consecutive probe failures. See
@@ -507,6 +506,26 @@ impl LoadBalancerAction {
              on `cookie`, `header`, `ip`, or `uri` (a ketama ring; removing one of N \
              targets remaps ~1/N of keys). The `cookie_hash`, `header_hash`, and `ip_hash` \
              modulus algorithms also remain available."
+        );
+
+        // WOR-2498: `targets[].zone` parsed as a display label and
+        // steered nothing, which read as zone-aware routing to anyone
+        // arriving from a balancer that has it. Refused for the same
+        // reason `sticky:` is: unknown keys under `action:` are not
+        // rejected, so deleting the field alone would demote the
+        // documented limitation to silence.
+        let zone_authored = value
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|targets| targets.iter().any(|target| target.get("zone").is_some()));
+        anyhow::ensure!(
+            !zone_authored,
+            "load_balancer `targets[].zone` was removed: target selection is not locality \
+             aware and never consulted the label, so zoned targets still received traffic \
+             from every zone. Remove the key; to tell replicas apart, use `metadata:`. The \
+             selection algorithms that ship are `round_robin`, `weighted_random`, \
+             `least_connections`, `ip_hash`, `uri_hash`, `header_hash`, `cookie_hash`, and \
+             `ring_hash`; see docs/routing.md."
         );
 
         let config: LoadBalancerConfig = serde_json::from_value(value)?;
@@ -1273,7 +1292,9 @@ async fn run_health_probe_loop(
 // existed solely to make `targets[].zone` look like a routing input.
 // Deleted rather than wired: zone-aware routing is a feature nobody has
 // asked for, and leaving a plausible-looking helper in the module is how
-// the docs came to promise locality routing in the first place.
+// the docs came to promise locality routing in the first place. The
+// `zone` label itself followed under WOR-2498: it is refused at config
+// compile in `from_config_for_origin` rather than accepted as inert.
 
 // --- Consistent-hash ring (ring_hash) ---
 
@@ -1834,6 +1855,50 @@ mod tests {
             "targets": [{"url": "http://a:8080"}]
         }));
         assert_eq!(lb.targets.len(), 1);
+    }
+
+    // --- targets[].zone is removed and refused (WOR-2328 / WOR-2498) ---
+    //
+    // WOR-2246 pinned `zone` as a display label; WOR-2498 removed it.
+    // Operators coming from zone-aware balancers read the key as
+    // locality routing, which the selection path never implemented, so
+    // the field now fails config compilation the same way `sticky:`
+    // does rather than sitting inert behind a boot warning.
+
+    #[test]
+    fn zone_on_a_target_is_refused_at_config_compile() {
+        let error = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "us-east-1a"},
+                {"url": "http://b:8080"}
+            ]
+        }))
+        .expect_err("an authored targets[].zone must fail config compilation, not sit inert");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("zone"),
+            "the error must name the removed key: '{message}'"
+        );
+        assert!(
+            message.contains("not locality aware"),
+            "the error must say selection never consulted the label: '{message}'"
+        );
+        assert!(
+            message.contains("routing.md"),
+            "the error must point at the algorithms that do ship: '{message}'"
+        );
+    }
+
+    #[test]
+    fn omitting_zone_compiles_cleanly() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080"},
+                {"url": "http://b:8080"}
+            ]
+        }));
+        assert_eq!(lb.targets.len(), 2);
     }
 
     #[test]
@@ -2867,37 +2932,11 @@ mod tests {
 
     // WOR-2246: four locality_filter tests stood here. They were the
     // only callers the helper ever had, which is how a routing input
-    // nothing routed on kept looking covered. The helper is gone; what
-    // is pinned now is that `zone` does not steer selection.
-
-    #[test]
-    fn zone_does_not_steer_target_selection() {
-        // Two targets in different zones, no zone-aware anything. Both
-        // must take traffic, because `zone` is a label the admin API
-        // echoes and nothing in the selection path reads it.
-        let lb = make_lb(serde_json::json!({
-            "targets": [
-                {"url": "http://a:8080", "zone": "us-east-1a"},
-                {"url": "http://b:8080", "zone": "us-west-2a"}
-            ],
-            "algorithm": "round_robin"
-        }));
-
-        let headers = empty_headers();
-        let visited: std::collections::BTreeSet<usize> = (0..6)
-            .map(|_| {
-                lb.select_target(Some("203.0.113.7"), "/", &headers)
-                    .expect("a two-target pool always selects")
-                    .3
-            })
-            .collect();
-
-        assert_eq!(
-            visited,
-            std::collections::BTreeSet::from([0, 1]),
-            "zone tags must not keep traffic inside one zone"
-        );
-    }
+    // nothing routed on kept looking covered. The helper is gone, and a
+    // `zone_does_not_steer_target_selection` test pinned the label as
+    // inert until WOR-2498 removed the field; the refusal tests above
+    // (`zone_on_a_target_is_refused_at_config_compile`) pin the removal
+    // now.
 
     // --- ring_hash tests ---
 
@@ -3091,21 +3130,5 @@ mod tests {
             0,
             "the key must return to its owner when health returns"
         );
-    }
-
-    #[test]
-    fn target_zone_field_defaults_to_none() {
-        let lb = make_lb(serde_json::json!({
-            "targets": [{"url": "http://a:8080"}]
-        }));
-        assert!(lb.targets[0].zone.is_none());
-    }
-
-    #[test]
-    fn target_zone_field_deserializes() {
-        let lb = make_lb(serde_json::json!({
-            "targets": [{"url": "http://a:8080", "zone": "us-east-1a"}]
-        }));
-        assert_eq!(lb.targets[0].zone.as_deref(), Some("us-east-1a"));
     }
 }

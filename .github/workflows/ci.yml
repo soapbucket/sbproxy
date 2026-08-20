@@ -10,7 +10,10 @@ name: CI
 #   lint           (~4 min) fmt, clippy, rustdoc
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
 #                           (three test targets; see the job for why)
-#   payments      (~13 min) clippy + tests under the settlement feature union
+#   e2e-subset     (~6 min) five offline e2e files against a spawned proxy,
+#                           required on every code PR (WOR-2469)
+#   payments       (~8 min) tests under the settlement feature union
+#   payments-clippy (~4 min) clippy under the same union, as a parallel job
 #   ui             (~40 s)  node typecheck + vitest
 #   supply-chain   (~60 s)  cargo-deny (crates) + npm audit (admin UI)
 #   embed-admin-ui (~6 min) SPA build + the release binary's feature union
@@ -28,6 +31,42 @@ name: CI
 #   2. A lane that genuinely needs a different package selection (e2e) gets
 #      its own job and its own cache key rather than paying that rebuild
 #      inline on the critical path.
+#
+# --- Actions cache budget (10 GB per repo, LRU; inventoried 2026-08-18) ---
+# Every rust-cache key a PR restores must still exist when the PR runs, or
+# the lane pays a cold build. The repo held ~12 GB of entries against the
+# 10 GB limit, so the least-recently-restored keys (payments, release, e2e)
+# kept getting evicted between a main-push save and the next PR restore;
+# that churn is the whole median-vs-worst spread in lane times (payments
+# 10m49 median vs 20m36 worst, and a 24m18 lint outlier that spent 15m30
+# inside cache restore). The lines below are the steady-state writers and
+# their approximate sizes; entries marked (est.) were already evicted at
+# inventory time and are sized from their feature unions.
+#
+#   test                    ~1.3 GB
+#   lint                    ~0.8 GB
+#   e2e                     ~2.0 GB (est.; obs-budgets + e2e-subset share
+#                                    it, e2e.yml's weekly run refreshes it)
+#   payments                ~1.5 GB (est.; written by the payments test
+#                                    job only, never by payments-clippy)
+#   embed-admin-ui          ~0.8 GB
+#   release                 ~2.0 GB (est.; release-profile deps, -p sbproxy)
+#   msrv                    ~0.8 GB (msrv.yml; pruned to one generation there)
+#   codeql overlays + node  ~0.1 GB
+#   ----------------------------------
+#   total                   ~9.3 GB, ~0.7 GB headroom for estimate error
+#
+# The sum fits only because three scheduled/tag lanes that held ~6.2 GB
+# are restore-only now: certify-model-host-deterministic (~2.6 GB,
+# release.yml) and the two context-compression keys (~2.0 GB + ~1.6 GB,
+# context-compression-eval.yml). Do not add a cache key, and do not
+# re-enable one of those saves, without redoing this arithmetic; the
+# budget has no room for another multi-GB line. A Cargo.lock bump briefly
+# doubles some lines with a second generation; a superseded generation is
+# never restored again once the newer one exists, so LRU evicts it first
+# and the set self-corrects. Tag and nightly workflows (release.yml's
+# build matrix, release-checks.yml) still write occasional lines outside
+# this budget; whatever those evict re-saves on the next push to main.
 #
 on:
   push:
@@ -59,6 +98,43 @@ env:
   # ever reads.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # WOR-2222: before the payments lane existed, no cargo invocation anywhere
+  # in this repository, in scripts/check.sh, or in any other workflow ever
+  # enabled a payment feature. The only `--all-features` in the repo is
+  # cargo-deny's, and cargo-deny reads metadata instead of compiling. So the
+  # whole settlement path built nowhere: sbproxy-core's inline settle gate,
+  # the recovery worker and reconciliation sweep in billing_runtime, the
+  # usage bridge's runtime half, and every one of sbproxy-billing's
+  # feature-gated modules, which is most of that crate. Roughly 217 tests,
+  # including eleven of its twelve integration test files, compiled into
+  # nothing and reported as passing.
+  #
+  # One feature selection, named once here at workflow level and used
+  # verbatim by the two payments jobs below. Two per-job literals that
+  # drifted by a single rail would resolve two feature unions behind one
+  # cache key, which is both the recompile this file's whole shape exists
+  # to avoid and a lint pass quietly checking a different union than the
+  # tests run.
+  #
+  # Selected through the `sbproxy` binary's flags rather than
+  # `sbproxy-core`'s, so the union is the one a real payments release
+  # produces: everything the `test` lane already resolves (rag-full,
+  # agent-class, inprocess-*, tls-fingerprint, gpu-*) plus settlement.
+  # That makes this union a strict superset of the `test` lane's. Picking
+  # `-p sbproxy-core` instead, as the smallest thing that covers the gated
+  # modules, would resolve FEWER features than CI does and report dead-code
+  # failures CI never sees, and it would miss sbproxy-billing's test targets
+  # entirely. See CLAUDE.md, "A per-crate lint can fail while the workspace
+  # lint passes".
+  #
+  # All six rails at once, `payment-lightning-lnd` included. Every rail
+  # implies `payments`, so naming the rails is enough. The resolved
+  # dependency graph under this union is identical to the default one,
+  # crate for crate and version for version: rusqlite, tokio, rand,
+  # reqwest, and aes-gcm are all already pulled in by something else in the
+  # workspace. The extra rails therefore cost compile units, not a wider
+  # supply chain.
+  PAYMENT_FEATURES: sbproxy/payment-mpp,sbproxy/payment-stripe,sbproxy/payment-x402,sbproxy/payment-lightning-cln,sbproxy/payment-lightning-lnd
 
 jobs:
   changes:
@@ -137,14 +213,15 @@ jobs:
       - name: build workspace
         run: cargo build --workspace --exclude sbproxy-e2e --locked
 
-      # E2E tests are intentionally OUT OF SCOPE for the PR-required CI
-      # lane. They spin up the full proxy binary, listen on real ports,
-      # and exercise the network stack; on shared CI runners this leads
-      # to startup-timeout flakiness (mesh gossip, websocket upgrade)
-      # that does not signal a real regression. Run them locally with
-      # `cargo test --workspace` after building the binary, or run them
-      # nightly via the release-checks lane. The cardinality and redaction
-      # canaries are the exception and run in the obs-budgets job.
+      # The bulk of the e2e suite is intentionally OUT OF SCOPE for this
+      # job. Those tests spin up the full proxy binary, listen on real
+      # ports, and exercise the network stack; on shared CI runners the
+      # heavier ones (mesh gossip, websocket upgrade) hit startup-timeout
+      # flakiness that does not signal a real regression. Run them locally
+      # with `cargo test --workspace` after building the binary, or rely
+      # on the scheduled lanes. Two narrow slices are the exception: the
+      # cardinality and redaction canaries in the obs-budgets job, and the
+      # required offline subset in the e2e-subset job (WOR-2469).
       - name: test (excludes e2e)
         run: cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
 
@@ -376,6 +453,100 @@ jobs:
           cargo test --workspace --locked
           --test cardinality --test metrics_per_agent --test redaction
 
+  e2e-subset:
+    name: e2e subset (required)
+    needs: changes
+    # WOR-2469: PR #1049 changed 425 lines across request_phase.rs and
+    # proxy_http.rs, merged with every required check green, and altered
+    # four documented end-to-end behaviors, one of them an outright break
+    # of a shipped example (WOR-2468). The only tests that assert
+    # end-to-end observable behavior ran weekly, so the break sat on main
+    # for three days. This lane closes that false green: a small offline
+    # slice of the e2e suite runs on every code PR, and it is required.
+    #
+    # The broad `code` filter, deliberately, and not an allowlist of the
+    # two files #1049 touched, for the same reason the payments lane
+    # documents below: what this lane guards is assembled end-to-end
+    # behavior, and that breaks from sbproxy-modules, sbproxy-transport,
+    # config compilation, and the pingora glue just as well as from
+    # request_phase.rs. A lane that does not fire on the change that
+    # breaks it reports success while doing nothing.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # The harness's documented override for an unusually slow host
+      # (e2e/src/lib.rs). Shared runners need more startup headroom than
+      # a quiet dev machine; e2e.yml sets the same value.
+      SBPROXY_E2E_STARTUP_TIMEOUT_SECS: '60'
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same package selection and cache key as obs-budgets: sbproxy-e2e
+      # widens the feature union past the `test` lane's, so its artifacts
+      # live behind the `e2e` key. On a push to main both jobs may reach
+      # the save step for this key; the second save finds the entry
+      # already present and skips, so sharing the key is cheaper than a
+      # third multi-GB cache line against the 10 GB per-repo limit.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: e2e
+
+      # `--workspace` rather than `-p sbproxy-e2e` so both calls in this
+      # job agree on the feature union and the build is paid once. cargo
+      # cannot infer that the harness spawns the sbproxy binary at
+      # runtime, so the build step produces it explicitly.
+      - name: build sbproxy binary (for the e2e harness)
+        run: cargo build --workspace --locked
+
+      # The subset, five files, retracing three of #1049's four silent
+      # behavior changes plus the response-phase class the sessions
+      # example documents (the fourth, MCP session-id freshness, lives in
+      # the MCP stream tests, which are too heavy for the offline bar):
+      #
+      #   static_action  - harness smoke; "if this fails everything else
+      #                    is suspect" (its own module doc)
+      #   body_routing   - JSON-body forward_rules routing, the exact
+      #                    shipped-example shape #1049 broke (WOR-2468)
+      #   sessions       - session-cookie issuance in the proxied response
+      #                    filter, the shipped sessions example's
+      #                    contract; response-filter injection is the
+      #                    rubric's recurring silent-no-op class
+      #   admin_reload   - POST /admin/reload swaps the live pipeline;
+      #                    #1049 changed the rejected-reload status
+      #   transform_json - response-transform contracts including the
+      #                    fail_on_error failure path, whose status
+      #                    semantics #1049 changed undocumented
+      #
+      # Selection bar, in order: offline (MockUpstream or static actions
+      # on loopback; no mesh, no websockets, no Redis, no payments or
+      # no-default-features binary), absent from the known load-flake
+      # roster, and covering a behavior a shipped example documents.
+      # model_cluster_control is deliberately NOT here: its root-cause
+      # fix (#1142) is a day old, and a test earns a place in a required
+      # lane by a quiet scheduled history first. Grow the list under the
+      # same bar; one timing-sensitive test flaking here would burn trust
+      # in exactly the lane that exists to restore it.
+      #
+      # --test-threads=1 for the same reason e2e.yml runs the full suite
+      # single-threaded: every test spawns its own proxy process with a
+      # multi-core tokio runtime, and parallel harnesses oversubscribe
+      # the runner. A handful of tests; the serialization costs seconds.
+      # SBPROXY_E2E_BIN pins the harness to the binary this job just
+      # built, because the harness prefers target/release/sbproxy when
+      # one is present and nothing restored from cache may shadow the
+      # code under test.
+      - name: e2e subset (shipped-example behavior)
+        env:
+          SBPROXY_E2E_BIN: ${{ github.workspace }}/target/debug/sbproxy
+        run: >-
+          cargo test --workspace --locked
+          --test static_action --test body_routing --test sessions
+          --test admin_reload --test transform_json
+          -- --test-threads=1
+
   payments:
     name: payments (settlement features)
     needs: changes
@@ -389,82 +560,47 @@ jobs:
     # on the change that breaks it is worse than no lane, because it reports
     # success while doing nothing, which is the exact failure WOR-2222 is
     # about.
+    #
+    # This job and payments-clippy below are one lane in two halves. They
+    # used to be two serial steps of one job, but the two compiles share no
+    # artifacts (clippy-driver's output cannot be linked by a test build), so
+    # serial cost clippy + test where the split costs max(clippy, test):
+    # about 2m30 off the lane, which was the PR critical path on the runs
+    # where it came back cold. Both halves use the same package selection,
+    # the same PAYMENT_FEATURES union (defined once, at workflow level), and
+    # the same cache key, and both are in the `build / test` aggregator's
+    # needs list.
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
-    env:
-      # WOR-2222: before this lane existed, no cargo invocation anywhere in
-      # this repository, in scripts/check.sh, or in any other workflow ever
-      # enabled a payment feature. The only `--all-features` in the repo is
-      # cargo-deny's, and cargo-deny reads metadata instead of compiling. So
-      # the whole settlement path built nowhere: sbproxy-core's inline settle
-      # gate, the recovery worker and reconciliation sweep in
-      # billing_runtime, the usage bridge's runtime half, and every one of
-      # sbproxy-billing's feature-gated modules, which is most of that crate.
-      # Roughly 217 tests, including eleven of its twelve integration test
-      # files, compiled into nothing and reported as passing.
-      #
-      # One feature selection, named once and used verbatim by both cargo
-      # calls below. Two literals that drifted by a single rail would resolve
-      # two feature unions inside one job, which is the recompile this file's
-      # whole shape exists to avoid.
-      #
-      # Selected through the `sbproxy` binary's flags rather than
-      # `sbproxy-core`'s, so the union is the one a real payments release
-      # produces: everything the `test` lane already resolves (rag-full,
-      # agent-class, inprocess-*, tls-fingerprint, gpu-*) plus settlement.
-      # That makes this union a strict superset of the `test` lane's. Picking
-      # `-p sbproxy-core` instead, as the smallest thing that covers the gated
-      # modules, would resolve FEWER features than CI does and report
-      # dead-code failures CI never sees, and it would miss sbproxy-billing's
-      # test targets entirely. See CLAUDE.md, "A per-crate lint can fail while
-      # the workspace lint passes".
-      #
-      # All six rails at once, `payment-lightning-lnd` included. Every rail
-      # implies `payments`, so naming the rails is enough. The resolved
-      # dependency graph under this union is identical to the default one,
-      # crate for crate and version for version: rusqlite, tokio, rand,
-      # reqwest, and aes-gcm are all already pulled in by something else in
-      # the workspace. The extra rails therefore cost compile units, not a
-      # wider supply chain.
-      PAYMENT_FEATURES: sbproxy/payment-mpp,sbproxy/payment-stripe,sbproxy/payment-x402,sbproxy/payment-lightning-cln,sbproxy/payment-lightning-lnd
     steps:
       - uses: actions/checkout@v5
 
-      # Its own job with its own cache key, per the one-package-selection rule
-      # in CLAUDE.md. The package selection here matches the `test` lane's
-      # exactly and only the feature union differs, but a different union is a
-      # different fingerprint, so folding these two steps into that job would
-      # recompile the graph on the critical path for every PR.
+      # Its own cache key, per the one-package-selection rule in CLAUDE.md:
+      # the package selection matches the `test` lane's exactly and only the
+      # feature union differs, but a different union is a different
+      # fingerprint. This job is the payments key's ONLY writer:
+      # payments-clippy restores the same key read-only, so a push to main
+      # has exactly one save and the two halves cannot race on it. The saved
+      # entry still serves both halves, because cargo clippy sends only
+      # workspace members through clippy-driver; the dependency graph
+      # compiles under plain rustc either way, so the dependency artifacts
+      # saved here are exactly what the clippy job restores.
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: payments
 
       - uses: taiki-e/install-action@nextest
 
-      # clippy runs first because it compiles every target in the selection,
-      # so a type error or a lint in code nothing has ever built is reported
-      # before the run pays for codegen. clippy-driver's artifacts cannot be
-      # linked by the test step below, which is why this job compiles the
-      # graph twice and why the two steps are worth the runner minutes: this
-      # is the only place either pass happens for payment-gated code.
-      #
-      # -D warnings also promotes the `#![warn(missing_docs)]` at the top of
-      # sbproxy-billing to an error, so undocumented public items in the
-      # gated modules fail here rather than at the next release.
-      - name: clippy (payment settlement features)
-        run: |
-          cargo clippy --workspace --exclude sbproxy-e2e --all-targets --locked \
-            --features "${PAYMENT_FEATURES}" -- -D warnings
-
       # Narrow the tests, never the packages. The build stays
       # `--workspace --exclude sbproxy-e2e` so the feature union is the one
-      # clippy just checked, and the filterset selects the three crates that
-      # carry payment-gated code. Re-running the other ~8500 workspace tests
-      # under a union that differs only in payment features would buy a second
-      # roll against the same known flakes and nothing else.
+      # the payments-clippy job lints, and the filterset selects the three
+      # crates that carry payment-gated code. Re-running the other ~8500
+      # workspace tests under a union that differs only in payment features
+      # would buy a second roll against the same known flakes and nothing
+      # else.
       #
       # `package(...)` rather than a list of module or binary names on
       # purpose: a payment test added to a module nobody remembered to add to
@@ -483,6 +619,46 @@ jobs:
           cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
             --features "${PAYMENT_FEATURES}" \
             -E 'package(sbproxy-billing) + package(sbproxy-core) + package(sbproxy-modules)'
+
+  payments-clippy:
+    name: payments clippy (settlement features)
+    needs: changes
+    # Same broad `code` filter as the payments test half, for the reason
+    # documented there: the union this lane guards breaks from outside the
+    # payment files.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same cache key as the payments test job: same package selection, same
+      # feature union, same fingerprint, so per the unions-define-cache-keys
+      # rule the two halves share one entry rather than holding two multi-GB
+      # lines against the budget in this file's header. Restore-only
+      # (cache-save: 'false') so the test half stays the key's only writer.
+      # The restored dependency artifacts are fully reusable here: only
+      # workspace members compile under clippy-driver, so this job recompiles
+      # the workspace crates each run and nothing else.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: payments
+          cache-save: 'false'
+
+      # The only clippy pass anywhere that compiles payment-gated code. It is
+      # worth its own compile of the graph rather than being folded into the
+      # lint lane, because a different feature union is a different
+      # fingerprint and the lint lane's cache could not absorb it.
+      #
+      # -D warnings also promotes the `#![warn(missing_docs)]` at the top of
+      # sbproxy-billing to an error, so undocumented public items in the
+      # gated modules fail here rather than at the next release.
+      - name: clippy (payment settlement features)
+        run: |
+          cargo clippy --workspace --exclude sbproxy-e2e --all-targets --locked \
+            --features "${PAYMENT_FEATURES}" -- -D warnings
 
   ui:
     name: ui
@@ -668,19 +844,28 @@ jobs:
   # The single required status check. Keeping the `build / test` name means
   # branch protection needs no change while the work underneath it fans out
   # across parallel jobs. A lane skipped by its path filter is not a failure;
-  # anything else is.
+  # anything else is. Every lane job in this file must be added to the
+  # needs list below in the same commit that adds the job: a required
+  # aggregate that does not need a lane reports green while that lane
+  # fails, so the lane's red goes unreported.
   #
-  # `payments` is in this list rather than left advisory. An advisory lane on
+  # `payments` and `payments-clippy` are in this list rather than left
+  # advisory. An advisory lane on
   # the settlement path is a lane whose red is a notification, and the reason
   # WOR-2222 exists is that nobody was watching a signal that was never sent
   # in the first place. A second one that can be scrolled past is not an
   # improvement. The cost of being wrong in the two directions is not
   # symmetric either: a false red here is a rerun, while a false green ships
   # code that moves money.
+  #
+  # `e2e-subset` is in the list on the same asymmetry: a false red is a
+  # rerun, while a false green is a behavior change or an outright break
+  # sitting on main until the weekly sweep notices, which is how WOR-2468
+  # went out and stayed out for three days (WOR-2469).
   required:
     name: build / test
     if: always()
-    needs: [changes, test, lint, obs-budgets, payments, ui, supply-chain, embed-admin-ui]
+    needs: [changes, test, lint, obs-budgets, e2e-subset, payments, payments-clippy, ui, supply-chain, embed-admin-ui]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

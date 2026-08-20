@@ -3,7 +3,10 @@
 //! Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 //! policy splits *detection* from *enforcement*: a swappable detector
 //! returns a score in `[0.0, 1.0]` plus a categorical label, and the
-//! policy maps the score onto an action (`tag`, `block`, `log`).
+//! policy maps the score onto an action (`tag`, `block`, `log`). An
+//! optional `enforcement` key in the shared vocabulary overrides the
+//! block-versus-admit half of that action; see
+//! [`PromptInjectionV2Policy::action`] for the resolution.
 //!
 //! The OSS build ships heuristic, in-process ONNX, and sidecar
 //! detectors. When `detector` is omitted, a complete verified local
@@ -35,6 +38,7 @@ pub use sidecar::{SidecarDetector, SIDECAR_DETECTOR_NAME};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use sbproxy_config::types::EnforcementMode;
 use serde::Deserialize;
 
 /// What the policy does when the detector flags a prompt.
@@ -206,6 +210,12 @@ struct RawConfig {
     /// Action on a hit. Defaults to `tag`.
     #[serde(default)]
     action: PromptInjectionAction,
+    /// Optional override for the did-decide axis, in the shared
+    /// `EnforcementMode` vocabulary. See
+    /// [`PromptInjectionV2Policy::action`] for how it resolves against
+    /// `action`.
+    #[serde(default)]
+    enforcement: Option<EnforcementMode>,
     /// Header that carries the numeric score when `action: tag`.
     /// Defaults to `x-prompt-injection-score`.
     #[serde(default = "default_score_header")]
@@ -269,6 +279,7 @@ pub struct PromptInjectionV2Policy {
     detector_name: String,
     threshold: f64,
     action: PromptInjectionAction,
+    enforcement: Option<EnforcementMode>,
     score_header: String,
     label_header: String,
     block_body: String,
@@ -283,6 +294,7 @@ impl std::fmt::Debug for PromptInjectionV2Policy {
             .field("detector", &self.detector_name)
             .field("threshold", &self.threshold)
             .field("action", &self.action)
+            .field("enforcement", &self.enforcement)
             .field("score_header", &self.score_header)
             .field("label_header", &self.label_header)
             .finish()
@@ -347,6 +359,7 @@ impl PromptInjectionV2Policy {
             detector_name,
             threshold: raw.threshold,
             action: raw.action,
+            enforcement: raw.enforcement,
             score_header: raw.score_header,
             label_header: raw.label_header,
             block_body: raw.block_body,
@@ -366,6 +379,7 @@ impl PromptInjectionV2Policy {
             detector_name: name,
             threshold: DEFAULT_THRESHOLD,
             action: PromptInjectionAction::Tag,
+            enforcement: None,
             score_header: DEFAULT_SCORE_HEADER.to_string(),
             label_header: DEFAULT_LABEL_HEADER.to_string(),
             block_body: DEFAULT_BLOCK_BODY.to_string(),
@@ -386,9 +400,35 @@ impl PromptInjectionV2Policy {
         self
     }
 
-    /// Configured action.
+    /// Effective action on a hit.
+    ///
+    /// The configured three-way `action`, resolved against the
+    /// optional `enforcement` override (the shared did-decide
+    /// vocabulary, [`EnforcementMode`]):
+    ///
+    /// - Absent: the configured action, unchanged.
+    /// - `enforcement: block`: [`PromptInjectionAction::Block`],
+    ///   whatever observe flavor `action` names. Flipping this one key
+    ///   takes a tuned policy from rollout to enforcing.
+    /// - `enforcement: observe`: a blocking action downgrades to
+    ///   [`PromptInjectionAction::Log`], recording the refusal the
+    ///   policy would have issued; `tag` stays `tag`, because tagging
+    ///   already admits and the key removes refusals rather than the
+    ///   side effect the operator asked for.
+    ///
+    /// Every consumer reads the action through here, so the key cannot
+    /// be decoration on one dispatch path and live on another.
     pub fn action(&self) -> PromptInjectionAction {
-        self.action
+        match self.enforcement {
+            None => self.action,
+            Some(EnforcementMode::Block) => PromptInjectionAction::Block,
+            Some(EnforcementMode::Observe) => match self.action {
+                PromptInjectionAction::Tag => PromptInjectionAction::Tag,
+                PromptInjectionAction::Block | PromptInjectionAction::Log => {
+                    PromptInjectionAction::Log
+                }
+            },
+        }
     }
 
     /// Score threshold. The policy fires when `score >= threshold`.
@@ -451,11 +491,22 @@ impl PromptInjectionV2Policy {
     /// rather than left for an operator to discover from an absence of
     /// headers.
     ///
+    /// An explicit `enforcement: observe` on the policy wins over
+    /// everything here, including an explicit `root_action: block`: it
+    /// is the policy-wide rollout switch, and a switch one surface can
+    /// escape is not one. `enforcement: block` does *not* steamroll an
+    /// explicit `root_action: log`; a surface-level permissive override
+    /// survives it, mirroring how a WAF rule-level `log` survives the
+    /// same key.
+    ///
     /// [`action`]: Self::action
     pub fn a2a_root_action(&self) -> A2AInjectionAction {
+        if matches!(self.enforcement, Some(EnforcementMode::Observe)) {
+            return A2AInjectionAction::Log;
+        }
         match self.a2a.root_action {
             Some(explicit) => explicit,
-            None => match self.action {
+            None => match self.action() {
                 PromptInjectionAction::Block => A2AInjectionAction::Block,
                 PromptInjectionAction::Tag | PromptInjectionAction::Log => A2AInjectionAction::Log,
             },
@@ -471,8 +522,15 @@ impl PromptInjectionV2Policy {
     ///
     /// Above `a2a.block_above_delegation_depth` the answer is always
     /// [`A2AInjectionAction::Block`], on the reasoning that supervision
-    /// thins with distance from the human who started the chain.
+    /// thins with distance from the human who started the chain,
+    /// unless the policy carries an explicit `enforcement: observe`.
+    /// The escalation blocks by default, so before that key existed no
+    /// single setting put the whole policy in observe; the key is that
+    /// setting, and the depth rule must not escape it.
     pub fn a2a_action_for_depth(&self, delegation_depth: u32) -> A2AInjectionAction {
+        if matches!(self.enforcement, Some(EnforcementMode::Observe)) {
+            return A2AInjectionAction::Log;
+        }
         if let Some(limit) = self.a2a.block_above_delegation_depth {
             if delegation_depth > limit {
                 return A2AInjectionAction::Block;
@@ -925,5 +983,124 @@ mod tests {
             Some(DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH)
         );
         assert_eq!(DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, 0);
+    }
+
+    // --- Enforcement mode (the did-decide axis) ---
+
+    /// `enforcement: observe` on a block-configured policy records the
+    /// hit instead of refusing it: the resolved action is `log`, the
+    /// observe flavor that needs nothing from the request phase.
+    #[test]
+    fn enforcement_observe_downgrades_a_block_action_to_log() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "block",
+            "enforcement": "observe",
+        }));
+        assert_eq!(p.action(), PromptInjectionAction::Log);
+    }
+
+    /// `enforcement: observe` on a tag-configured policy keeps
+    /// tagging. Tag already admits; the key only removes refusals, it
+    /// does not strip the side effect the operator asked for.
+    #[test]
+    fn enforcement_observe_keeps_the_tag_flavor() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "tag",
+            "enforcement": "observe",
+        }));
+        assert_eq!(p.action(), PromptInjectionAction::Tag);
+    }
+
+    /// `enforcement: block` forces a hit to refuse whatever observe
+    /// flavor `action` names, so flipping one key takes a tuned policy
+    /// from rollout to enforcing.
+    #[test]
+    fn enforcement_block_forces_a_hit_to_block() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "tag",
+            "enforcement": "block",
+        }));
+        assert_eq!(p.action(), PromptInjectionAction::Block);
+    }
+
+    /// An absent key changes nothing: the three-way `action` keeps
+    /// resolving exactly as it always has.
+    #[test]
+    fn enforcement_absent_leaves_the_configured_action_untouched() {
+        for (action, expected) in [
+            ("tag", PromptInjectionAction::Tag),
+            ("block", PromptInjectionAction::Block),
+            ("log", PromptInjectionAction::Log),
+        ] {
+            let p = a2a_policy(serde_json::json!({
+                "detector": "heuristic-v1",
+                "action": action,
+            }));
+            assert_eq!(p.action(), expected, "action: {action}");
+        }
+    }
+
+    /// `enforcement: observe` is policy-wide. The a2a depth escalation
+    /// blocks by default, and before this key existed there was no
+    /// single switch that put the whole policy in observe; this is that
+    /// switch, so the escalation must not escape it.
+    #[test]
+    fn enforcement_observe_downgrades_the_a2a_depth_escalation() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "block",
+            "enforcement": "observe",
+        }));
+        assert_eq!(p.a2a_action_for_depth(0), A2AInjectionAction::Log);
+        assert_eq!(p.a2a_action_for_depth(5), A2AInjectionAction::Log);
+    }
+
+    /// An explicit `a2a.root_action: log` is a surface-level override
+    /// in the permissive direction and survives `enforcement: block`,
+    /// mirroring how a WAF rule-level `log` survives the same key. The
+    /// depth escalation still blocks delegated hops.
+    #[test]
+    fn enforcement_block_leaves_an_explicit_a2a_log_root_action_alone() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "enforcement": "block",
+            "a2a": { "root_action": "log" },
+        }));
+        assert_eq!(p.a2a_root_action(), A2AInjectionAction::Log);
+        assert_eq!(p.a2a_action_for_depth(0), A2AInjectionAction::Log);
+        assert_eq!(p.a2a_action_for_depth(1), A2AInjectionAction::Block);
+    }
+
+    /// `enforcement: block` projects into the chain root when no
+    /// explicit `root_action` is set, the same way `action: block`
+    /// always has.
+    #[test]
+    fn enforcement_block_carries_into_the_chain_root() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "tag",
+            "enforcement": "block",
+        }));
+        assert_eq!(p.a2a_action_for_depth(0), A2AInjectionAction::Block);
+    }
+
+    /// The key takes only the shared vocabulary. `tag` is an observe
+    /// flavor, not an enforcement mode; accepting it here would tangle
+    /// the two axes this key exists to keep apart.
+    #[test]
+    fn enforcement_rejects_an_action_flavor_as_a_mode() {
+        let err = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "heuristic-v1",
+            "enforcement": "tag",
+        }))
+        .expect_err("`enforcement: tag` must not compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("observe"),
+            "the error must name the accepted spellings: {msg}"
+        );
     }
 }

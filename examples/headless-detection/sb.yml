@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Headless and stealth-browser detection from headers alone.
+#
+# With `proxy.extensions.agent_detect` enabled, every request gets a
+# deterministic 0-100 headless score computed from the request headers:
+# automation markers in the User-Agent, a Chrome UA missing the
+# `Sec-Ch-Ua` client-hint family, a Chrome UA missing `Sec-Fetch-*`
+# fetch metadata, a missing `Accept-Language`, and an anomalous
+# `Accept-Encoding` order. No model, no client-side JavaScript, no
+# session state. See docs/headless-detection.md for the indicator
+# weights.
+#
+# The score is exposed to CEL as `request.agent.headless_score` (and
+# the fired indicator names as `request.agent.headless_indicators`),
+# so blocking is one expression policy. Real Firefox and Safari
+# requests do not trip the Chrome-only indicators; the check is gated
+# on a Chrome vendor token in the UA.
+#
+# The rule pack (agents.yml, one rule) is what turns detection on;
+# the headless extractor runs alongside whatever rules are loaded.
+#
+# Run (from this directory, so the rule-pack path resolves):
+#   cd examples/headless-detection
+#   sbproxy serve -f sb.yml
+#
+# Test:
+#   # 403 - vanilla headless announces itself in the UA (score 60+)
+#   curl -i -H 'Host: secure.local' \
+#     -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/126.0.0.0 Safari/537.36' \
+#     http://127.0.0.1:8080/
+#
+#   # 403 - stealth shape: claims Chrome but sends no Sec-Ch-Ua and no
+#   # Sec-Fetch-* headers, which every real Chrome navigation sends
+#   curl -i -H 'Host: secure.local' \
+#     -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+#     http://127.0.0.1:8080/
+#
+#   # 200 - a client that does not claim to be Chrome trips none of the
+#   # Chrome-gated indicators
+#   curl -i -H 'Host: secure.local' -H 'Accept-Language: en-US' \
+#     http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+  extensions:
+    agent_detect:
+      enabled: true
+      # One-rule ADRF pack, see agents.yml. Relative to the process
+      # working directory, hence the `cd` in the Run block.
+      rule_pack_path: agents.yml
+
+origins:
+  "secure.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {"page": "protected", "note": "you look like a real browser or an honest client"}
+
+    policies:
+      - type: expression
+        expression: 'request.agent.headless_score < 50'
+        deny_status: 403
+        deny_message: "automation suspected"

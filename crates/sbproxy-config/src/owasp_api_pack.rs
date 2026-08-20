@@ -35,12 +35,14 @@
 //!
 //! `api8`'s `security_headers` piece is additionally
 //! `response_phase_gated` (WOR-2491 review round, M1): it only takes
-//! effect in Pingora's response-phase filter, which an origin whose
-//! action responds entirely inside the request phase (`static`,
-//! `mock`, and friends - see `action_runs_response_phase`) never
-//! reaches, so it is not synthesized there and the gap is named in the
-//! reason instead of claimed. `http_framing` runs at request phase
-//! unconditionally and stays ungated.
+//! effect where response-phase policies apply - Pingora's response
+//! filter for proxied actions, and the generated-response application
+//! for `static`/`mock`/`echo`/`beacon`/`redirect` since WOR-2496 (see
+//! `action_applies_response_phase_policies`). An origin whose action
+//! writes its own response without that surface (`mcp`, `storage`,
+//! `ai_proxy`, `noop`, plugin actions) does not get the piece, and the
+//! gap is named in the reason instead of claimed. `http_framing` runs
+//! at request phase unconditionally and stays ungated.
 //!
 //! `api7` has an empty `pieces` list but is not `NotCovered`: its
 //! control (the proxy's outbound SSRF guard) already runs
@@ -530,25 +532,26 @@ struct SynthPiece {
     /// True when this piece's policy only takes effect during
     /// response-phase processing (WOR-2491 review round, M1): today
     /// only `api8`'s `security_headers` piece. See
-    /// `action_runs_response_phase` for which action types reach
-    /// that phase; every other piece leaves this `false`.
+    /// `action_applies_response_phase_policies` for which action types
+    /// apply that surface; every other piece leaves this `false`.
     response_phase_gated: bool,
     /// Synthesizes this one policy entry.
     synth: fn(PackPosture) -> PieceSynthesis,
 }
 
-/// True when an origin whose action has this `type:` string reaches
-/// Pingora's response-phase filter (`server/proxy_http.rs::response_filter`),
-/// where `api8`'s `security_headers` piece takes effect.
+/// True when an origin whose action has this `type:` string applies
+/// response-phase policies - where `api8`'s `security_headers` piece
+/// takes effect - through either of the two paths that exist for it.
 ///
 /// The principle (WOR-2491 review round): this asks whether the
-/// action's *normal, successful* traffic reaches `response_filter`,
-/// not whether every possible code path for that action type does.
-/// Verified against `action_dispatch.rs::handle_action`'s own match:
+/// action's *normal, successful* traffic gets the response-phase
+/// policy surface, not whether every possible code path for that
+/// action type does. Verified against
+/// `action_dispatch.rs::handle_action`'s own match:
 ///
 /// - `Action::Proxy`, `Action::LoadBalancer`, `Action::WebSocket`, and
 ///   `Action::A2a` always return `Ok(false)` (fall through to
-///   `upstream_peer`/`response_filter`).
+///   `upstream_peer`/`response_filter`, where the policies run).
 /// - `Action::GraphQL` and `Action::Grpc` also return `Ok(false)` for
 ///   their normal path. Both have early `Ok(true)` returns, but only
 ///   on request-validation failure - GraphQL's body-too-large (413)
@@ -556,30 +559,45 @@ struct SynthPiece {
 ///   (404) - the same shape every action's own error handling takes;
 ///   an ordinary, valid request for either always reaches
 ///   `response_filter`, so both belong in this allowlist.
-/// - `Action::AiProxy` does not, and this is the genuine asymmetry
-///   with GraphQL/Grpc above: its normal, successful path calls
+/// - `Action::Static`, `Action::Redirect`, `Action::Echo`,
+///   `Action::Mock`, and `Action::Beacon` answer inside the request
+///   phase, and since WOR-2496 `handle_action` runs
+///   `apply_generated_response_phases` on each generated response
+///   before writing it, so security_headers (with page_shield, sri,
+///   assertion, and session cookies) takes effect there exactly as it
+///   does on a proxied response.
+/// - `Action::AiProxy` does not: its normal, successful path calls
 ///   `handle_ai_proxy(...).await?; Ok(true)` unconditionally - every
-///   ordinary AI proxy request (not just error cases) is answered
-///   entirely inside `request_filter` and never reaches
-///   `response_filter` at all. Only a narrow realtime-WebSocket-upgrade
-///   sub-case returns `Ok(false)`. Since a compile-time decision
-///   cannot see which sub-path a given request will take, `ai_proxy`
-///   is treated as not-guaranteed here rather than claiming coverage
-///   most requests will not get.
-/// - Every other action type (`static`, `redirect`, `echo`, `mock`,
-///   `beacon`, `noop`, `mcp`, `storage`, any plugin action, or an
-///   unrecognized string) responds from inside `request_filter`
-///   unconditionally and never reaches `response_filter`.
+///   ordinary AI proxy request is answered entirely inside
+///   `request_filter` through its own dispatch path, which does not
+///   run the generated-response application either. Only a narrow
+///   realtime-WebSocket-upgrade sub-case returns `Ok(false)`. Since a
+///   compile-time decision cannot see which sub-path a given request
+///   will take, `ai_proxy` is treated as not-guaranteed here rather
+///   than claiming coverage most requests will not get.
+/// - `noop`, `mcp`, `storage`, any plugin action, and unrecognized
+///   strings respond from inside `request_filter` through their own
+///   write paths without the response-phase surface.
 ///
-/// `action_runs_response_phase_matches_the_verified_action_set` (this
-/// module's own tests) pins the exact allowlist against a hardcoded
-/// expectations list; a future edit to `handle_action`'s match arms
-/// that changes which actions short-circuit must also touch that test,
-/// so drift is a conscious two-place edit rather than a silent one.
-fn action_runs_response_phase(action_type: &str) -> bool {
+/// `action_applies_response_phase_policies_matches_the_verified_action_set`
+/// (this module's own tests) pins the exact allowlist against a
+/// hardcoded expectations list; a future edit to `handle_action`'s
+/// match arms that changes either set must also touch that test, so
+/// drift is a conscious two-place edit rather than a silent one.
+fn action_applies_response_phase_policies(action_type: &str) -> bool {
     matches!(
         action_type,
-        "proxy" | "load_balancer" | "websocket" | "a2a" | "graphql" | "grpc"
+        "proxy"
+            | "load_balancer"
+            | "websocket"
+            | "a2a"
+            | "graphql"
+            | "grpc"
+            | "static"
+            | "redirect"
+            | "echo"
+            | "mock"
+            | "beacon"
     )
 }
 
@@ -1254,9 +1272,10 @@ const API5_PIECES: [SynthPiece; 1] = [SynthPiece {
 /// in here. Configure `waf` directly for CRS-based coverage today.
 ///
 /// `security_headers` is `response_phase_gated: true` (WOR-2491
-/// review round, M1): it only takes effect in Pingora's response
-/// filter, so it is not synthesized on an origin whose action never
-/// reaches that filter (see `action_runs_response_phase`).
+/// review round, M1): it only takes effect where response-phase
+/// policies apply, so it is not synthesized on an origin whose action
+/// answers without that surface (see
+/// `action_applies_response_phase_policies`).
 /// `http_framing` runs at request phase instead, via the
 /// `check_policies` enforcer registry every origin goes through
 /// before any action dispatch decision, independent of action type -
@@ -1466,11 +1485,13 @@ fn parse_enable(hostname: &str, raw: &RawEnable) -> anyhow::Result<Vec<PackItem>
 /// when absent or not yet known, which resolves the same as any other
 /// unrecognized string: no response-phase piece is synthesized). Used
 /// only by `api8`'s `security_headers` piece (WOR-2491 review round,
-/// M1): that policy takes effect in Pingora's response-phase filter,
-/// which only runs for actions that dial a real upstream peer, so an
-/// action handled entirely in the request phase (`static`, `mock`,
-/// and friends) gets the reason named instead of a claim nothing
-/// enforces. See `action_runs_response_phase`.
+/// M1): that policy takes effect where response-phase policies apply
+/// (Pingora's response filter for proxied actions; the
+/// generated-response application for static/mock/echo/beacon/redirect
+/// since WOR-2496), so an action that answers without that surface
+/// (`mcp`, `storage`, and friends) gets the reason named instead of a
+/// claim nothing enforces. See
+/// `action_applies_response_phase_policies`.
 ///
 /// Returns `Ok(None)` when the origin has no `owasp_api_top10` entry -
 /// `transforms` and `*expose_openapi` are left untouched in that case.
@@ -1693,14 +1714,16 @@ pub(crate) fn expand_owasp_pack(
             // branches below: an action that skips response-phase
             // enforcement skips it regardless of what an earlier item
             // in this same pass already synthesized.
-            if piece.response_phase_gated && !action_runs_response_phase(action_type) {
+            if piece.response_phase_gated && !action_applies_response_phase_policies(action_type) {
                 any_phase_gapped = true;
                 fragments.push(format!(
-                    "{} is response-phase only (it takes effect in Pingora's response filter) \
-                     and this origin's action ('{}') never reaches that filter: only proxy, \
-                     load_balancer, websocket, a2a, graphql, and grpc actions do. Not \
-                     synthesized here; configure it directly on the app behind this origin, or \
-                     move this route to a proxy/load_balancer action.",
+                    "{} is response-phase only and this origin's action ('{}') answers through \
+                     its own write path that never applies response-phase policies: proxied \
+                     actions (proxy, load_balancer, websocket, a2a, graphql, grpc) and generated \
+                     responses (static, redirect, echo, mock, beacon) do, while mcp, storage, \
+                     ai_proxy, noop, and plugin actions do not. Not synthesized here; configure \
+                     it directly on the app behind this origin, or move this route to a covered \
+                     action type.",
                     piece
                         .backoff_types
                         .first()
@@ -2606,15 +2629,12 @@ mod tests {
     }
 
     #[test]
-    fn api8_security_headers_not_synthesized_on_a_static_action() {
-        // WOR-2491 review round, M1: `static` never reaches Pingora's
-        // response-phase filter (`action_dispatch.rs::handle_action`'s
-        // own match returns `Ok(true)` unconditionally for it), so
-        // security_headers - which only takes effect there - is not
-        // synthesized. http_framing runs at request phase regardless
-        // of action type and still synthesizes. The item stays
-        // Enforced (http_framing is real coverage); the reason names
-        // the phase gap explicitly.
+    fn api8_security_headers_synthesized_on_a_static_action() {
+        // WOR-2496: a static action's generated response now runs the
+        // response-phase policy surface (`apply_generated_response_phases`
+        // in `sbproxy-core`), so security_headers takes effect there and
+        // the pack synthesizes it exactly as it does for a proxied
+        // origin.
         let mut policies = owasp_policy(serde_json::json!({
             "type": "owasp_api_top10",
             "enable": ["api8"],
@@ -2626,40 +2646,26 @@ mod tests {
         assert_eq!(entry.state, PackItemState::Enforced);
         assert_eq!(
             entry.synthesized_types,
-            vec!["http_framing"],
-            "security_headers is not synthesized on a static action"
+            vec!["security_headers", "http_framing"],
+            "both api8 pieces synthesize on a static action"
         );
         assert!(
-            entry.reason.contains("response-phase only"),
-            "the reason names the phase gap: {}",
-            entry.reason
-        );
-        assert!(
-            entry.reason.contains("'static'"),
-            "the reason names the actual action type: {}",
-            entry.reason
-        );
-        assert!(
-            !policies
+            policies
                 .iter()
                 .any(|p| config_type_is(p, "security_headers")),
-            "security_headers must not be synthesized on a static action"
+            "security_headers must be synthesized on a static action"
         );
         assert!(
             policies.iter().any(|p| config_type_is(p, "http_framing")),
-            "http_framing still synthesizes; it runs at request phase regardless of action type"
+            "http_framing synthesizes; it runs at request phase regardless of action type"
         );
     }
 
     #[test]
-    fn api8_security_headers_not_covered_at_all_when_operator_also_authors_http_framing_on_a_static_action(
-    ) {
-        // Both pieces end up with nothing added by the pack: http_framing
-        // because the operator already authors it, security_headers
-        // because the action can't run it. Neither is `OperatorAuthored`
-        // (the operator did not author security_headers) nor
-        // `Enforced` (nothing the pack contributed is actually
-        // running); `NotCovered` is the honest label.
+    fn api8_security_headers_synthesized_on_a_mock_action_when_operator_authors_http_framing() {
+        // WOR-2496: mock responses run the response-phase policy
+        // surface too, so security_headers synthesizes even though the
+        // operator's own http_framing makes that piece back off.
         let mut policies = vec![
             serde_json::json!({"type": "owasp_api_top10", "enable": ["api8"]}),
             serde_json::json!({"type": "http_framing"}),
@@ -2668,25 +2674,71 @@ mod tests {
             .expect("expand")
             .expect("some");
         let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
-        assert_eq!(entry.state, PackItemState::NotCovered);
-        assert!(entry.synthesized_types.is_empty());
+        assert_eq!(entry.state, PackItemState::Enforced);
+        assert_eq!(entry.synthesized_types, vec!["security_headers"]);
     }
 
     #[test]
-    fn action_runs_response_phase_matches_the_verified_action_set() {
+    fn api8_security_headers_not_synthesized_on_an_mcp_action() {
+        // The remaining honest gap: actions with their own protocol
+        // write paths (`mcp`, `storage`, `ai_proxy`, plugin actions,
+        // `noop`) still answer without the response-phase policy
+        // surface, so security_headers is not synthesized and the
+        // reason names the gap. http_framing runs at request phase
+        // regardless and still synthesizes, so the item stays
+        // Enforced on that piece's coverage.
+        let mut policies = owasp_policy(serde_json::json!({
+            "type": "owasp_api_top10",
+            "enable": ["api8"],
+        }));
+        let manifest = expand_owasp_pack("h", &mut policies, &mut Vec::new(), &mut false, "mcp")
+            .expect("expand")
+            .expect("some");
+        let entry = manifest.entry_for(PackItem::Api8).expect("api8 entry");
+        assert_eq!(entry.state, PackItemState::Enforced);
+        assert_eq!(
+            entry.synthesized_types,
+            vec!["http_framing"],
+            "security_headers is not synthesized on an mcp action"
+        );
+        assert!(
+            entry.reason.contains("response-phase only"),
+            "the reason names the phase gap: {}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("'mcp'"),
+            "the reason names the actual action type: {}",
+            entry.reason
+        );
+        assert!(
+            !policies
+                .iter()
+                .any(|p| config_type_is(p, "security_headers")),
+            "security_headers must not be synthesized on an mcp action"
+        );
+    }
+
+    #[test]
+    fn action_applies_response_phase_policies_matches_the_verified_action_set() {
         // WOR-2491 review round: this hardcoded list is the drift tie
         // against `crates/sbproxy-core/src/server/action_dispatch.rs`'s
-        // `handle_action` match. That function decides per action type
-        // whether NORMAL (not just any) traffic reaches
-        // `Ok(false)`/`response_filter`; `action_runs_response_phase`'s
-        // own doc comment records the exact reasoning per type,
-        // including why `graphql`/`grpc` (normal path proxies; only
-        // request-validation failures short-circuit) are included
-        // while `ai_proxy` (normal path never reaches it at all) is
-        // not. A future edit to `handle_action`'s match arms that
-        // changes which actions short-circuit must update this test
-        // too - that is the point of pinning it here rather than only
-        // asserting behavior indirectly through a pack test.
+        // `handle_action` match. The question per action type is
+        // whether NORMAL (not just any) traffic gets the response-phase
+        // policy surface, through either of its two paths: falling
+        // through to Pingora's `response_filter` (proxy and friends,
+        // including `graphql`/`grpc`, whose only short-circuits are
+        // request-validation failures) or the generated-response
+        // application `handle_action` runs before writing a
+        // self-answered response (WOR-2496: `static`, `redirect`,
+        // `echo`, `mock`, `beacon`). `ai_proxy` answers inside
+        // `request_filter` through its own dispatch path and takes
+        // neither; `mcp`, `storage`, `noop`, and plugin actions write
+        // their own responses without the surface too. A future edit
+        // to `handle_action`'s match arms that changes either set must
+        // update this test too - that is the point of pinning it here
+        // rather than only asserting behavior indirectly through a
+        // pack test.
         for t in [
             "proxy",
             "load_balancer",
@@ -2694,15 +2746,15 @@ mod tests {
             "a2a",
             "graphql",
             "grpc",
-        ] {
-            assert!(action_runs_response_phase(t), "{t}");
-        }
-        for t in [
             "static",
             "redirect",
             "echo",
             "mock",
             "beacon",
+        ] {
+            assert!(action_applies_response_phase_policies(t), "{t}");
+        }
+        for t in [
             "noop",
             "mcp",
             "storage",
@@ -2710,7 +2762,7 @@ mod tests {
             "",
             "some_plugin_action",
         ] {
-            assert!(!action_runs_response_phase(t), "{t}");
+            assert!(!action_applies_response_phase_policies(t), "{t}");
         }
     }
 

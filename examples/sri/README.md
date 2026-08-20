@@ -4,7 +4,7 @@
 
 ![Subresource Integrity (SRI) inspection](../../docs/assets/sri.gif)
 
-Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` responses, inspects every `<script src="https://...">` and `<link rel="stylesheet" href="https://...">` pointing at an external origin, and checks for an `integrity="..."` attribute that uses one of the configured algorithms (`sha384` or `sha512` here). Missing or mismatched references are logged at warn level and counted in the `sbproxy_policy_triggers_total{policy_type="sri"}` metric. The proxy does not modify the body; SRI is a browser-side mechanism and the proxy's value is alerting an operator that a page is missing integrity coverage. Same-origin references and inline scripts are skipped per the SRI spec. The origin lives on `127.0.0.1:8080` behind the `sri.local` Host header and proxies to a small local fixture (`fixture.py`) serving one violating `<link>` and one compliant `<script>`. The scan hooks into Pingora's upstream `response_filter`, which only runs for a genuinely proxied (`type: proxy`) origin, so the example cannot use a `static` action here.
+Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` responses, inspects every `<script src="https://...">` and `<link rel="stylesheet" href="https://...">` pointing at an external origin, and checks for an `integrity="..."` attribute that uses one of the configured algorithms (`sha384` or `sha512` here). Missing or mismatched references are logged at warn level and counted in the `sbproxy_policy_triggers_total{policy_type="sri"}` metric. The proxy does not modify the body; SRI is a browser-side mechanism and the proxy's value is alerting an operator that a page is missing integrity coverage. Same-origin references and inline scripts are skipped per the SRI spec. The origin lives on `127.0.0.1:8080` behind the `sri.local` Host header and proxies to a small local fixture (`fixture.py`) serving one violating `<link>` and one compliant `<script>`. The scan runs on proxied responses and on generated (`static`/`mock`) ones alike; the proxied fixture here shows the realistic flow of auditing an upstream's pages.
 
 ## Run
 
@@ -57,7 +57,7 @@ sbproxy_policy_triggers_total{origin="sri.local",policy_type="sri",action="viola
 - Detection of missing `integrity` on cross-origin `<script>` and `<link rel="stylesheet">` tags
 - Observation-only behaviour: the response body is unchanged and the response is not blocked
 - Metrics integration via `sbproxy_policy_triggers_total{policy_type="sri"}`
-- A `type: proxy` origin, required because the scan hooks into Pingora's upstream `response_filter`, which a `static` action never reaches
+- A `type: proxy` origin with a bundled fixture, so the audit runs against real upstream HTML (the scan also covers `static`/`mock` origins)
 
 ## See also
 

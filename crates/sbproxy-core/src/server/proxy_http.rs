@@ -24,7 +24,7 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
-fn request_modifiers_for_route(
+pub(super) fn request_modifiers_for_route(
     pipeline: &CompiledPipeline,
     origin_idx: usize,
     forward_rule_idx: Option<usize>,
@@ -2811,6 +2811,45 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-2490: websocket subprotocol offer filtering ---
+        //
+        // For a `websocket` action with a configured `subprotocols`
+        // allowlist, the offer that goes upstream is the client's offer
+        // filtered to the allowed set (client preference order kept). An
+        // upgrade whose whole offer is disallowed was already refused with
+        // a 400 in `handle_action`; a disallowed token appearing here
+        // (through a request modifier, or alongside allowed ones) is
+        // simply never presented to the upstream. Runs after every request
+        // modifier so the filtered offer is the final one.
+        {
+            let pipeline = ctx.pipeline.clone();
+            if let Some(Action::WebSocket(ws)) = active_action(&pipeline, ctx) {
+                if !ws.subprotocols.is_empty() {
+                    use sbproxy_modules::action::websocket::parse_subprotocol_header_values;
+                    let offered = parse_subprotocol_header_values(
+                        upstream_request
+                            .headers
+                            .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok()),
+                    );
+                    if !offered.is_empty() {
+                        if let Some(permitted) = ws.permitted_subprotocols(&offered) {
+                            if permitted.is_empty() {
+                                upstream_request
+                                    .remove_header(&http::header::SEC_WEBSOCKET_PROTOCOL);
+                            } else if permitted != offered {
+                                let _ = upstream_request.insert_header(
+                                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                                    permitted.join(", "),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Validate GraphQL only after every request modifier has produced the
         // outbound method, URI, headers, and replacement body. This closes the
         // gap where a benign client document could pass validation and then
@@ -3077,6 +3116,68 @@ impl ProxyHttp for SbProxy {
         crate::meter_runtime::capture_origin_headers(ctx, upstream_response);
 
         crate::proxy_wasm_http::filter_response_headers(session, upstream_response, ctx)?;
+
+        // --- WOR-2490: websocket upgrade acceptance ---
+        //
+        // The upstream answered `101 Switching Protocols` for a
+        // `websocket` action. Two enforcement duties before the tunnel
+        // opens: hold the upstream's subprotocol selection to what the
+        // client offered and this origin allows, and arm the
+        // `max_message_size` frame scanner for both directions.
+        if upstream_response.status.as_u16() == 101 {
+            let pipeline = ctx.pipeline.clone();
+            if let Some(Action::WebSocket(ws)) = active_action(&pipeline, ctx) {
+                if !ws.subprotocols.is_empty() {
+                    use sbproxy_modules::action::websocket::parse_subprotocol_header_values;
+                    let selected = parse_subprotocol_header_values(
+                        upstream_response
+                            .headers
+                            .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok()),
+                    );
+                    // A 101 without a selection is the upstream declining
+                    // subprotocols; the client decides what to do with
+                    // that. A selection must be a single token that the
+                    // client offered and the action allows.
+                    if !selected.is_empty() {
+                        let offered = parse_subprotocol_header_values(
+                            session
+                                .req_header()
+                                .headers
+                                .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+                                .iter()
+                                .filter_map(|value| value.to_str().ok()),
+                        );
+                        let acceptable = selected.len() == 1
+                            && ws.subprotocols.contains(&selected[0])
+                            && offered.contains(&selected[0]);
+                        if !acceptable {
+                            warn!(
+                                hostname = %ctx.hostname,
+                                "websocket upstream selected a subprotocol outside the negotiated set; refusing the upgrade"
+                            );
+                            let body = serde_json::json!({
+                                "error": "websocket subprotocol negotiation failed",
+                                "detail": "upstream selected a subprotocol that was not offered by the client and enabled for this origin",
+                            })
+                            .to_string();
+                            ctx.validator_failed =
+                                Some((502, body, "application/json".to_string()));
+                            return Err(pingora_error::Error::explain(
+                                pingora_error::ErrorType::HTTPStatus(502),
+                                "websocket subprotocol violation",
+                            ));
+                        }
+                    }
+                }
+                ctx.websocket_tunnel = Some(
+                    sbproxy_modules::action::websocket::WebSocketTunnelGuard::new(
+                        ws.max_message_size,
+                    ),
+                );
+            }
+        }
 
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
@@ -4300,6 +4401,33 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- WOR-2490: websocket max_message_size (client -> upstream) ---
+        //
+        // After a `websocket`-action upgrade, every chunk through this
+        // filter is raw tunnel bytes, i.e. WebSocket frames. Scan the
+        // frame headers against the configured cap; a violation tears the
+        // tunnel down (`fail_to_proxy` knows not to write an HTTP body
+        // into the upgraded stream). First on purpose: the scan reads the
+        // client's actual frames, before anything else can touch them.
+        if let Some(guard) = ctx.websocket_tunnel.as_mut() {
+            if let Some(chunk) = body.as_ref() {
+                if let Err(violation) = guard.scan_client_bytes(chunk) {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        observed = violation.observed,
+                        limit = violation.limit,
+                        direction = "client_to_upstream",
+                        "websocket message exceeds max_message_size; closing the tunnel"
+                    );
+                    *body = None;
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::Custom("websocket_message_too_large"),
+                        "websocket message exceeds max_message_size",
+                    ));
+                }
+            }
+        }
+
         crate::proxy_wasm_http::filter_request_body(body, end_of_stream, ctx)?;
 
         // For validated GraphQL POSTs, replace the inbound replay stream
@@ -5407,6 +5535,30 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- WOR-2490: websocket max_message_size (upstream -> client) ---
+        //
+        // Mirror of the scan in `request_body_filter`: after a
+        // `websocket`-action upgrade these chunks are the upstream's raw
+        // WebSocket frames, and the cap bounds what either peer may send.
+        if let Some(guard) = ctx.websocket_tunnel.as_mut() {
+            if let Some(chunk) = body.as_ref() {
+                if let Err(violation) = guard.scan_upstream_bytes(chunk) {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        observed = violation.observed,
+                        limit = violation.limit,
+                        direction = "upstream_to_client",
+                        "websocket message exceeds max_message_size; closing the tunnel"
+                    );
+                    *body = None;
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::Custom("websocket_message_too_large"),
+                        "websocket message exceeds max_message_size",
+                    ));
+                }
+            }
+        }
+
         // WOR-2145: the meter refused this response in `response_filter`
         // under `failure_mode: closed`. Drop every chunk so the buyer
         // receives none of the work the proxy cannot record.
@@ -6388,6 +6540,24 @@ impl ProxyHttp for SbProxy {
         if crate::proxy_wasm_http::response_stream_failed(ctx) {
             return FailToProxy {
                 error_code: 500,
+                can_reuse_downstream: false,
+            };
+        }
+
+        // --- WOR-2490: websocket tunnel torn down mid-stream ---
+        //
+        // The 101 already went downstream, so the client-facing connection
+        // speaks WebSocket frames now. An HTTP error body written here
+        // would be injected into the frame stream as garbage bytes; the
+        // enforcement is the teardown itself, already logged by the body
+        // filter that tripped the guard.
+        if ctx
+            .websocket_tunnel
+            .as_ref()
+            .is_some_and(|guard| guard.violated())
+        {
+            return FailToProxy {
+                error_code: 0,
                 can_reuse_downstream: false,
             };
         }

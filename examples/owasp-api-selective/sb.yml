@@ -19,11 +19,10 @@
 # covers it) before copying this value. See
 # docs/owasp-api-top10.md#api4-unrestricted-resource-consumption.
 #
-# api8's security_headers piece is not synthesized on this origin:
-# security_headers only takes effect in Pingora's response-phase
-# filter, and a `static` action answers entirely in the request phase
-# and never reaches it. http_framing (request-phase, action agnostic)
-# still synthesizes and still enforces. See README.md.
+# api8 synthesizes both pieces on this origin: http_framing runs at
+# request phase, and security_headers applies to the static action's
+# generated responses the same way it does to proxied ones. See
+# README.md.
 #
 # A self-contained `static` action seeds a four-field customer record so
 # the example runs offline; response_exclude_fields strips two of them

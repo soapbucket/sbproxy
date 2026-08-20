@@ -1028,6 +1028,9 @@ fn render_target_health() -> String {
                     sbproxy_platform::CircuitState::HalfOpen => "half_open",
                 });
             let eligible = healthy && !outlier_ejected && breaker_state != Some("open");
+            // `zone` was rendered here while the config still parsed it;
+            // the key is refused at config compile now (WOR-2498), so
+            // there is no label left to echo.
             targets.push(serde_json::json!({
                 "index": t_idx,
                 "url": target.url,
@@ -1038,7 +1041,6 @@ fn render_target_health() -> String {
                 "weight": target.weight,
                 "backup": target.backup,
                 "group": target.group,
-                "zone": target.zone,
             }));
         }
         origins.push(serde_json::json!({
@@ -4411,7 +4413,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         return;
     }
     if pg_path == crate::admin_playground::CHAT_PATH && method.eq_ignore_ascii_case("POST") {
-        if principal.is_none() {
+        let Some(operator) = principal.as_ref() else {
             let _ = write_admin_response_headed(
                 sock,
                 401,
@@ -4421,8 +4423,11 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             )
             .await;
             return;
-        }
-        let (status, ct, resp) = crate::admin_playground::handle_chat(body_owned.as_deref()).await;
+        };
+        // The operator username rides along for the bypass audit record
+        // every completed /chat emits (WOR-2497).
+        let (status, ct, resp) =
+            crate::admin_playground::handle_chat(body_owned.as_deref(), &operator.username).await;
         let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
         return;
     }

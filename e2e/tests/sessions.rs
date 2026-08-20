@@ -8,14 +8,74 @@
 //! Subsequent requests that present the cookie do not get a fresh
 //! `Set-Cookie`.
 //!
-//! The session-cookie injection path lives in the proxied response
-//! filter (`upstream_response.append_header`), so the tests here
-//! drive a proxy action against a [`MockUpstream`]; the static
-//! action follows a different early-return path that bypasses the
-//! filter chain.
+//! Session cookies are issued on proxied responses (the response
+//! filter's `upstream_response.append_header`) and on generated ones
+//! alike: since WOR-2496 a `static`, `mock`, `echo`, `beacon`, or
+//! `redirect` action applies the same response-phase surface before
+//! writing, so `examples/sessions` (a `static` action) issues its
+//! cookie exactly as documented. Most tests here drive a proxy action
+//! against a [`MockUpstream`]; the static-origin test pins the
+//! generated-response path end to end.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+
+#[test]
+fn static_origin_issues_session_cookie() {
+    // The examples/sessions shape: a session block on a static action.
+    // Before WOR-2496 this produced no Set-Cookie at all.
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "static-sess.localhost":
+    session:
+      cookie_name: sb_session
+      max_age: 3600
+      http_only: true
+      secure: false
+      same_site: Lax
+      allow_non_ssl: true
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: "{\"ok\":true}"
+"#;
+    let proxy = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+
+    let resp = proxy.get("/", "static-sess.localhost").expect("first GET");
+    assert_eq!(resp.status, 200);
+    let cookie = resp
+        .headers
+        .get("set-cookie")
+        .map(|s| s.as_str())
+        .expect("a static origin with a session block must issue Set-Cookie");
+    assert!(
+        cookie.starts_with("sb_session="),
+        "cookie name must match config, got: {cookie}"
+    );
+    assert!(
+        cookie.contains("Max-Age=3600"),
+        "missing Max-Age attribute: {cookie}"
+    );
+
+    // Presenting the cookie back suppresses re-issue, mirroring the
+    // proxied behavior.
+    let resp = proxy
+        .get_with_headers(
+            "/",
+            "static-sess.localhost",
+            &[("cookie", "sb_session=abc-123-existing")],
+        )
+        .expect("GET with cookie");
+    assert_eq!(resp.status, 200);
+    assert!(
+        !resp.headers.contains_key("set-cookie"),
+        "client-supplied cookie must not be overwritten on a static origin, got: {:?}",
+        resp.headers.get("set-cookie")
+    );
+}
 
 #[test]
 fn first_request_issues_session_cookie_with_documented_attributes() {

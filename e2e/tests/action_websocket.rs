@@ -15,7 +15,9 @@ use futures_util::{SinkExt, StreamExt};
 use sbproxy_e2e::ProxyHarness;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message};
 
-use websocket_common::{assert_text_echo, dial_websocket, spawn_echo_ws_server};
+use websocket_common::{
+    assert_text_echo, dial_websocket, spawn_echo_ws_server, spawn_echo_ws_server_selecting,
+};
 
 fn ws_config(upstream_ws_url: &str) -> String {
     format!(
@@ -140,5 +142,168 @@ fn websocket_passes_close_frame_in_both_directions() {
             close_observed,
             "proxy did not propagate the close handshake"
         );
+    });
+}
+
+// --- WOR-2490: `max_message_size` and `subprotocols` enforcement ---
+
+fn ws_config_with_action_fields(upstream_ws_url: &str, action_fields: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ws.localhost":
+    action:
+      type: websocket
+      url: "{upstream_ws_url}"
+{action_fields}
+"#
+    )
+}
+
+#[test]
+fn websocket_oversized_message_tears_down_the_tunnel() {
+    // WOR-2490: `max_message_size` used to be dead config; an oversized
+    // frame passed through unmodified. Now the gateway scans frame
+    // headers in both directions and closes the tunnel as soon as a
+    // message declares more payload than the cap.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let upstream = spawn_echo_ws_server().await;
+        let config =
+            ws_config_with_action_fields(upstream.websocket_url(), "      max_message_size: 1024");
+        let harness = ProxyHarness::start_with_yaml(&config).expect("start");
+        let (mut ws, response) = dial_websocket(&harness, "ws.localhost", "/", &[])
+            .await
+            .expect("ws upgrade");
+        assert_eq!(response.status().as_u16(), 101);
+
+        // A message under the cap still round-trips: the scan must not
+        // disturb conforming traffic.
+        assert_text_echo(&mut ws, "small enough").await;
+
+        // 4 KiB against a 1 KiB cap. The gateway refuses on the frame
+        // header, so the echo never arrives and the connection dies.
+        // The send itself may fail if the proxy tears the connection
+        // down while the client is still writing; either way, no echo
+        // may come back.
+        let _ = ws.send(Message::Text("x".repeat(4096))).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(3), ws.next()).await;
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(Message::Close(_)))) => {}
+            Ok(Some(Ok(frame))) => {
+                panic!("oversized message must not round-trip, got {frame:?}")
+            }
+            Err(_) => {
+                panic!("connection survived an oversized message (timeout waiting for teardown)")
+            }
+        }
+    });
+}
+
+#[test]
+fn websocket_subprotocol_offer_is_filtered_to_the_allowlist() {
+    // WOR-2490: with `subprotocols` configured, the client's
+    // `Sec-WebSocket-Protocol` offer is intersected with the allowlist
+    // before the upgrade goes upstream, and the upstream's selection
+    // from that filtered offer flows back to the client.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let upstream = spawn_echo_ws_server_selecting(Some("chat.v2")).await;
+        let config =
+            ws_config_with_action_fields(upstream.websocket_url(), "      subprotocols: [chat.v2]");
+        let harness = ProxyHarness::start_with_yaml(&config).expect("start");
+        let (mut ws, response) = dial_websocket(
+            &harness,
+            "ws.localhost",
+            "/",
+            &[("sec-websocket-protocol", "chat.v1, chat.v2")],
+        )
+        .await
+        .expect("ws upgrade");
+        assert_eq!(response.status().as_u16(), 101);
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("chat.v2"),
+            "upstream's selection must reach the client"
+        );
+
+        let captured = upstream.captured();
+        assert_eq!(captured.len(), 1, "one upstream handshake");
+        assert_eq!(
+            captured[0].header_values("sec-websocket-protocol"),
+            vec!["chat.v2"],
+            "the offer sent upstream must be filtered to the allowlist"
+        );
+
+        assert_text_echo(&mut ws, "negotiated").await;
+        ws.close(None).await.expect("close");
+    });
+}
+
+#[test]
+fn websocket_disallowed_subprotocol_offer_is_refused_before_connect() {
+    // WOR-2490: a client that offers only subprotocols outside the
+    // allowlist is refused with a 400 in the request phase, before any
+    // upstream connection exists. The upstream capture stays empty,
+    // which is the pre-connect proof.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let upstream = spawn_echo_ws_server().await;
+        let config =
+            ws_config_with_action_fields(upstream.websocket_url(), "      subprotocols: [chat.v2]");
+        let harness = ProxyHarness::start_with_yaml(&config).expect("start");
+        let result = dial_websocket(
+            &harness,
+            "ws.localhost",
+            "/",
+            &[("sec-websocket-protocol", "chat.v9")],
+        )
+        .await;
+        match result {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 400);
+            }
+            other => panic!("expected an HTTP 400 refusal, got {other:?}"),
+        }
+        assert!(
+            upstream.captured().is_empty(),
+            "a refused offer must never reach the upstream"
+        );
+    });
+}
+
+#[test]
+fn websocket_upstream_selecting_outside_the_negotiated_set_is_refused() {
+    // WOR-2490, third enforcement point: the subprotocol named on the
+    // upstream's 101 must be one the client offered and the allowlist
+    // permits. An upstream that answers with anything else is violating
+    // RFC 6455 negotiation, and the gateway fails the upgrade with a
+    // 502 instead of handing the client a protocol it never asked for.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let upstream = spawn_echo_ws_server_selecting(Some("chat.v9")).await;
+        let config =
+            ws_config_with_action_fields(upstream.websocket_url(), "      subprotocols: [chat.v2]");
+        let harness = ProxyHarness::start_with_yaml(&config).expect("start");
+        let result = dial_websocket(
+            &harness,
+            "ws.localhost",
+            "/",
+            &[("sec-websocket-protocol", "chat.v2")],
+        )
+        .await;
+        match result {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 502);
+            }
+            other => panic!("expected an HTTP 502 refusal, got {other:?}"),
+        }
     });
 }

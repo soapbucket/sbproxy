@@ -1427,6 +1427,8 @@ origins:
 
 The `sticky:` block was removed. It parsed (`cookie_name`, `ttl`) and did nothing: no affinity cookie was ever issued. A config that still sets it fails to compile with an error naming the replacement. For cookie-based session affinity, use `ring_hash` keyed on the cookie your application already issues, as above.
 
+The `targets[].zone` label was removed the same way. Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone; a config that sets it fails to compile. Zone-aware routing is not implemented. To tell replicas apart, use `metadata:`, which promises nothing about selection.
+
 When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
 
 The production registry includes `first-healthy`, `lora`, `lora-aware`, `gpu-aware`, and `bandit`. `lora-aware` reads the adapter from `X-LoRA-Adapter` or `?adapter=` and matches it against `targets[].metadata.loaded_adapters`. `gpu-aware` selects the lowest valid numeric `targets[].metadata.gpu_utilization` in `[0.0, 1.0]`; it does not poll GPUs. `bandit` records real success and latency outcomes, with successful reward `1 / (1 + latency_seconds)` and failure reward `0`; it does not fabricate cost data. Empty request hints and hints over 256 bytes are ignored.
@@ -1442,7 +1444,6 @@ Target fields:
 | `backup` | bool | false | Reserved for fallback. Excluded from normal selection. |
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
-| `zone` | string | | Availability zone or region label. An operator-visible tag only: the admin API reports it as `origins[].targets[].zone`, and target selection does not read it. Tagging targets with zones does not keep traffic local to one. |
 | `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
@@ -1498,8 +1499,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend WebSocket URL (ws:// or wss://) |
-| `subprotocols` | list | | Subprotocols this origin is meant to support. Accepted by config; not currently read anywhere the gateway negotiates or filters on `Sec-WebSocket-Protocol`. |
-| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB). Accepted by config; not currently enforced, frames larger than this pass through unmodified. |
+| `subprotocols` | list | | Allowlist for `Sec-WebSocket-Protocol` negotiation. Empty leaves negotiation to the client and upstream; non-empty filters the client's offer, refuses an offer with no allowed subprotocol (`400`), and refuses an upstream selection outside the negotiated set (`502`). |
+| `max_message_size` | int | 10485760 | Maximum message payload size in bytes (10 MB), enforced in both directions on the upgraded tunnel. A message declaring more payload than this closes the connection. |
 
 ### grpc
 
@@ -2982,7 +2983,7 @@ policies:
 | `report_to_group` | string | unset | When set, the policy also emits `report-to <name>` for the modern Reporting API. |
 | `respect_upstream` | bool | `false` | When `true` and the upstream already emits a CSP header, the policy yields and does not write its own. |
 
-The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and returns `204 No Content`. The header is applied to proxied responses; static / redirect / mock actions short-circuit before the response-header phase and bypass injection.
+The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and returns `204 No Content`. The header is applied to proxied responses and to generated ones alike: `static`, `mock`, `echo`, `beacon`, and `redirect` actions carry it the same way a proxied origin does. Actions with their own protocol write paths (`mcp`, `storage`, `ai_proxy`, plugin actions) do not.
 
 ### dlp
 
@@ -3051,6 +3052,7 @@ policies:
 | `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
 | `threshold` | float | `0.5` | Score threshold in `[0.0, 1.0]`; the policy fires when `score >= threshold`. |
 | `action` | string | `tag` | `tag` stamps the score / label headers on the upstream. `block` returns `403` with `block_body`. `log` writes a structured warn under `sbproxy::prompt_injection_v2`. |
+| `enforcement` | string | none | Optional override for the did-decide axis, shared vocabulary. `block` forces a hit to refuse whatever observe flavor `action` names. `observe` admits every hit: `action: block` downgrades to `log`, `tag` keeps tagging, and the `a2a` depth escalation is downgraded too, so this one key is the whole-policy rollout switch. An explicit `a2a.root_action: log` survives `enforcement: block`. Absent leaves `action` in charge. |
 | `score_header` | string | `x-prompt-injection-score` | Header carrying the numeric score (formatted as `"%.3f"`) on `action: tag`. |
 | `label_header` | string | `x-prompt-injection-label` | Header carrying `clean` / `suspicious` / `injection` on `action: tag`. |
 | `block_body` | string | `prompt injection detected` | Response body returned on `action: block`. |
@@ -3073,8 +3075,7 @@ policies:
     owasp_crs:
       enabled: true
       managed_bundle: true
-    action_on_match: block
-    test_mode: false
+    enforcement: block
     failure_posture: closed
     custom_rules: []
 ```
@@ -3083,8 +3084,9 @@ policies:
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `waf` |
 | `owasp_crs` | object | | CRS-style rule configuration. `enabled: true` turns on the built-in patterns; `managed_bundle: true` additionally compiles the vendored 12-rule bundle (independent toggles, either runs without the other); `paranoia_level` sets rule strictness (1-4, default 1) when the top-level `paranoia` field is absent. |
-| `action_on_match` | string | "block" | Action when a rule matches: `block`, `log`. |
-| `test_mode` | bool | false | If true, log matches but do not block. |
+| `enforcement` | string | `block` | What happens when a rule matches: `block` refuses with 403; `observe` admits and records every match, the rollout switch that no rule escapes. A per-rule `action: log` (inline, feed, or bundle) is a permissive override and keeps observing under `block`. Wins over `test_mode` and `action_on_match` in both directions. The second axis, `failure_posture`, covers a rule that could not run at all. |
+| `action_on_match` | string | `block` | Legacy spelling of the enforcement axis: `block` or `log`. `log` resolves to `observe`, but only as the default for rules that carry no `action` of their own; a custom rule spelling `action: block` explicitly still blocks. Used only when `enforcement` is absent. |
+| `test_mode` | bool | false | Legacy spelling of the enforcement axis: `true` means `enforcement: observe` (no rule blocks). Used only when `enforcement` is absent. |
 | `failure_posture` | string | `closed` | What happens to a request the WAF could not fully evaluate: `closed` refuses with 403, `open` admits and claims nothing, `degraded` admits while recording that the WAF guarantee was not made. `observe` is rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
 | `fail_open` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: open`, `false` means `closed`. Still parses and is used only when `failure_posture` is absent. |
 | `paranoia` | int | 1 | Rule strictness, 1 to 4, gating the built-in patterns, the managed bundle, and any feed rules at once. Only rules whose own paranoia level is at or below this value are evaluated. Level 1 runs 8 of the 16 baseline rules, level 2 runs 15, levels 3 and 4 run all 16. Wins over `owasp_crs.paranoia_level` when both are present. |
