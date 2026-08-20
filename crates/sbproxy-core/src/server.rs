@@ -2980,6 +2980,105 @@ async fn check_auth_with_tls_outcome(
                 )
             }
         }
+        Auth::Hmac(h) => {
+            use sbproxy_modules::auth::HmacVerdict;
+            // Synthesize the request shape the RFC 9421 verifier reads
+            // method / target-uri / headers from, mirroring bot_auth.
+            // The body is empty because auth runs before the body is
+            // buffered; the provider verifies with the safe-by-default
+            // form, so a signature covering `content-digest` on a
+            // body-bearing request fails closed rather than passing
+            // unverified (body-digest binding is the WOR-2518
+            // follow-up).
+            let target_uri = match query {
+                Some(q) if !q.is_empty() => format!("{}?{}", path, q),
+                _ => path.to_string(),
+            };
+            let builder = http::Request::builder().method(method);
+            let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
+                Ok(r) => r,
+                Err(_) => {
+                    return (
+                        AuthResult::Deny(500, "hmac_auth: bad request".to_string()),
+                        None,
+                        AuthTrustOutcome::BackendFailure,
+                    );
+                }
+            };
+            *req.headers_mut() = headers.clone();
+            // The challenge names the scheme and nothing else: no key
+            // id, no reason, and never any part of the credential.
+            let challenge_headers =
+                || vec![("WWW-Authenticate".to_string(), "Signature".to_string())];
+            match h.verify(&req) {
+                HmacVerdict::Verified { key_id } => {
+                    match h.principal_for(&key_id, tenant_id.clone()) {
+                        Some(principal) => {
+                            let sub = principal.sub.clone();
+                            (
+                                AuthResult::Allow {
+                                    sub: Some(sub),
+                                    source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                                },
+                                Some(principal),
+                                AuthTrustOutcome::Allowed,
+                            )
+                        }
+                        // Unreachable (a verified key_id is in the map),
+                        // but if the invariant ever breaks, fail closed.
+                        None => (
+                            AuthResult::DenyWithHeaders(
+                                401,
+                                "hmac_auth: verification failed".to_string(),
+                                challenge_headers(),
+                            ),
+                            None,
+                            AuthTrustOutcome::InvalidProof,
+                        ),
+                    }
+                }
+                HmacVerdict::Missing => (
+                    AuthResult::DenyWithHeaders(
+                        401,
+                        "hmac_auth: signature required".to_string(),
+                        challenge_headers(),
+                    ),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                HmacVerdict::UnknownKey { key_id } => {
+                    // The key id is an identifier the client itself
+                    // sent, safe to log; the client-facing message
+                    // stays generic so probes cannot enumerate the
+                    // configured key set.
+                    tracing::warn!(key_id = %key_id, "hmac_auth: unknown key id");
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "hmac_auth: verification failed".to_string(),
+                            challenge_headers(),
+                        ),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+                HmacVerdict::Failed { key_id, reason } => {
+                    // Log the failure, never the credential: `reason`
+                    // comes from the verifier's log-safe set and the
+                    // client sees only the generic message.
+                    tracing::warn!(key_id = %key_id, reason = %reason, "hmac_auth: verification failed");
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "hmac_auth: verification failed".to_string(),
+                            challenge_headers(),
+                        ),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+            }
+        }
         // ForwardAuth runs as a separate async subrequest in the
         // calling site; the result, including any trust headers
         // carrying the resolved user, lands on `ctx` after this

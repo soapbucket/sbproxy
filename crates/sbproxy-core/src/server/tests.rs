@@ -1180,6 +1180,165 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
         );
 }
 
+// --- hmac_auth dispatch tests (WOR-2518) ---
+//
+// These pin the `Auth::Hmac(_)` arm of `check_auth`: the seam between
+// the provider's verdict and the AuthResult / principal / challenge
+// the request phase acts on.
+
+fn build_hmac_auth_provider(key_id: &str, secret_hex: &str) -> sbproxy_modules::Auth {
+    let provider = sbproxy_modules::auth::HmacAuth::from_config(serde_json::json!({
+        "keys": [
+            {"key_id": key_id, "secret": secret_hex, "project": "billing"}
+        ]
+    }))
+    .expect("hmac provider builds");
+    sbproxy_modules::Auth::Hmac(provider)
+}
+
+/// Sign `GET <target_uri>` with a fresh `created` timestamp (the
+/// provider enforces a staleness window, so the fixed epoch the
+/// bot_auth helper uses would be refused here).
+fn hmac_sign_for_path(secret_hex: &str, key_id: &str, target_uri: &str) -> (String, String) {
+    use base64::Engine;
+    use hmac::{KeyInit, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = hmac::Hmac<Sha256>;
+
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let raw_input = format!(
+        "sig1=(\"@method\" \"@target-uri\");created={created};keyid=\"{key_id}\";alg=\"hmac-sha256\""
+    );
+    let entry = sbproxy_middleware::signatures::parse_signature_input(&raw_input)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+    let req_for_signing = http::Request::builder()
+        .method("GET")
+        .uri(target_uri)
+        .body(bytes::Bytes::new())
+        .unwrap();
+    let base =
+        sbproxy_middleware::signatures::build_signature_base(&req_for_signing, &entry).unwrap();
+    let key_bytes = hex::decode(secret_hex).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&key_bytes).unwrap();
+    mac.update(base.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig);
+    (raw_input, format!("sig1=:{}:", sig_b64))
+}
+
+#[tokio::test]
+async fn hmac_auth_accepts_valid_signature_and_binds_attribution() {
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let (sig_input, sig_value) = hmac_sign_for_path(secret_hex, key_id, "/api/invoices");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+
+    let (result, principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/invoices",
+        test_tenant(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, AuthResult::Allow { sub: Some(ref sub), .. } if sub == key_id),
+        "expected Allow bound to the key id; got {}",
+        auth_result_label(&result)
+    );
+    let principal = principal.expect("hmac allow returns principal");
+    assert_eq!(principal.sub, key_id);
+    assert_eq!(principal.source, sbproxy_plugin::PrincipalSource::Hmac);
+    assert_eq!(principal.attrs.project.as_deref(), Some("billing"));
+    assert_eq!(principal.attrs.key_id.as_deref(), Some(key_id));
+}
+
+#[tokio::test]
+async fn hmac_auth_rejects_signature_bound_to_different_path() {
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let (sig_input, sig_value) = hmac_sign_for_path(secret_hex, key_id, "/api/invoices");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+
+    let (result, principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/admin",
+        test_tenant(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, AuthResult::DenyWithHeaders(401, _, _)),
+        "a signature bound to another path must be refused; got {}",
+        auth_result_label(&result)
+    );
+    assert!(principal.is_none());
+}
+
+#[tokio::test]
+async fn hmac_auth_missing_signature_gets_challenge_without_credential_material() {
+    let auth = build_hmac_auth_provider("svc-billing", "00112233445566778899aabbccddeeff");
+    let headers = http::HeaderMap::new();
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    match result {
+        AuthResult::DenyWithHeaders(401, ref msg, ref extra) => {
+            assert_eq!(msg, "hmac_auth: signature required");
+            assert_eq!(
+                extra,
+                &vec![("WWW-Authenticate".to_string(), "Signature".to_string())],
+                "the challenge names the scheme and carries no key material"
+            );
+        }
+        other => panic!(
+            "expected DenyWithHeaders challenge, got {}",
+            auth_result_label(&other)
+        ),
+    }
+    assert!(principal.is_none());
+}
+
+#[tokio::test]
+async fn hmac_auth_unknown_key_id_is_refused_generically() {
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let auth = build_hmac_auth_provider("svc-billing", secret_hex);
+    // Signed correctly, but under a key id the provider does not know.
+    let (sig_input, sig_value) = hmac_sign_for_path(secret_hex, "svc-unknown", "/");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::DenyWithHeaders(401, ref msg, _) if msg == "hmac_auth: verification failed"),
+        "unknown key ids get the generic refusal; got {}",
+        auth_result_label(&result)
+    );
+    assert!(principal.is_none());
+}
+
 // --- Auth plugin dispatch tests ---
 //
 // These guard the OSS gap fixed in this commit: the

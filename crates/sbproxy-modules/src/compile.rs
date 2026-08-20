@@ -19,7 +19,7 @@ use crate::action::{
 };
 use crate::auth::{
     ApiKeyAuth, Auth, BasicAuthProvider, BearerAuth, BotAuthProvider, DigestAuth,
-    ForwardAuthProvider, JwtAuth,
+    ForwardAuthProvider, HmacAuth, JwtAuth,
 };
 use crate::policy::{
     AssertionPolicy, CsrfPolicy, DdosPolicy, ExpressionPolicy, IpFilterPolicy, Policy,
@@ -183,6 +183,7 @@ fn compile_auth_with_optional_registry(
         "bearer" | "bearer_token" => Ok(Auth::Bearer(BearerAuth::from_config(config.clone())?)),
         "jwt" => Ok(Auth::Jwt(JwtAuth::from_config(config.clone())?)),
         "digest" => Ok(Auth::Digest(DigestAuth::from_config(config.clone())?)),
+        "hmac_auth" => Ok(Auth::Hmac(HmacAuth::from_config(config.clone())?)),
         "forward_auth" | "forward" => Ok(Auth::ForwardAuth(ForwardAuthProvider::from_config(
             config.clone(),
         )?)),
@@ -1395,6 +1396,16 @@ hooks:
         });
         let auth = compile_auth(&json).unwrap();
         assert_eq!(auth.auth_type(), "digest");
+    }
+
+    #[test]
+    fn compile_auth_hmac() {
+        let json = serde_json::json!({
+            "type": "hmac_auth",
+            "keys": [{"key_id": "svc-a", "secret": "0011223344556677"}]
+        });
+        let auth = compile_auth(&json).unwrap();
+        assert_eq!(auth.auth_type(), "hmac_auth");
     }
 
     #[test]

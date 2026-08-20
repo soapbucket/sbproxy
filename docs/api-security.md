@@ -133,7 +133,11 @@ which one to attach:
 
 `oidc` runs a full relying-party login with authorization code and PKCE and a
 sealed session cookie ([auth-oidc.md](auth-oidc.md)). `api_key` and
-`bearer_token` cover machine callers.
+`bearer_token` cover machine callers. For machine callers that should prove
+possession of their secret on every request instead of sending it, `hmac_auth`
+verifies an RFC 9421 HMAC signature over the method, path, and a mandatory
+timestamp, so a captured request replays nowhere else and expires inside a
+configured window ([configuration.md](configuration.md)).
 
 Two options on `jwt` are worth turning on if your issuer supports them.
 `require_dpop: true` demands an RFC 9449 proof whose `jkt` matches the token's

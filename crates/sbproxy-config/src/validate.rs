@@ -132,6 +132,7 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "bearer_token",
     "jwt",
     "digest",
+    "hmac_auth",
     "forward_auth",
     "forward",
     "bot_auth",
