@@ -1,0 +1,140 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Admin reporting: who spent what, as a shareable link and a CSV.
+#
+# Two tenants, four governed keys, two models, and named human callers.
+# That is enough attribution for the admin API's reporting routes to
+# answer the question a finance thread actually asks: which person, on
+# which key, drove which model, and what did it cost.
+#
+# Three routes read the same in-memory ring, through one filter parser:
+#
+#   GET /api/requests          rows
+#   GET /api/requests/report   one row per composite group
+#   GET /api/requests/export   the same rows as CSV or JSONL
+#
+# A filter that selects rows on the first selects exactly the same rows
+# on the other two, so a grouped number always drills through to the
+# rows behind it. See docs/admin-api-reference.md.
+#
+# Setup (a local OpenAI-shaped fixture stands in for the provider, so
+# this runs with no upstream account):
+#   python3 - <<'PY' &
+#   import http.server, json
+#   class H(http.server.BaseHTTPRequestHandler):
+#       def do_POST(self):
+#           body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+#           out = json.dumps({
+#               "id": "chatcmpl-fixture", "object": "chat.completion",
+#               "model": body.get("model", "gpt-4o-mini"),
+#               "choices": [{"index": 0, "finish_reason": "stop",
+#                            "message": {"role": "assistant", "content": "ok"}}],
+#               "usage": {"prompt_tokens": 120, "completion_tokens": 40,
+#                         "total_tokens": 160},
+#           }).encode()
+#           self.send_response(200)
+#           self.send_header("content-type", "application/json")
+#           self.send_header("content-length", str(len(out)))
+#           self.end_headers()
+#           self.wfile.write(out)
+#       def log_message(self, *a): pass
+#   http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+#   PY
+#   make run CONFIG=examples/admin-reporting/sb.yml
+#
+# Drive attributed traffic. `X-Sb-User-Id` names the human behind the
+# call; the Authorization bearer selects the governed key; the Host
+# header selects the tenant:
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: acme.ai.local' \
+#     -H 'Authorization: Bearer vk-acme-platform' \
+#     -H 'X-Sb-User-Id: dev@acme.test' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
+#
+# Report on it, grouping by all four dimensions at once:
+#   curl -s -u "admin:${SB_ADMIN_PASSWORD:-demo-change-me}" \
+#     'http://127.0.0.1:9090/api/requests/report?group_by=model,api_key_id,tenant,user' \
+#     | python3 -m json.tool
+#
+# Export the same filtered view:
+#   curl -s -u "admin:${SB_ADMIN_PASSWORD:-demo-change-me}" \
+#     'http://127.0.0.1:9090/api/requests/export?format=csv&tenant=acme' \
+#     -o acme-requests.csv
+#
+# See README.md for the captured output of each of those calls.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    # Demo password for a loopback bind. Change before any other bind.
+    password: ${SB_ADMIN_PASSWORD:-demo-change-me}
+    # The reporting ring. Every report and export is bounded by this
+    # number, so it is also the ceiling on what one export can return.
+    max_log_entries: 1000
+
+  tenants:
+    - id: acme
+    - id: globex
+
+origins:
+  # Tenant one. The Host header picks the origin, and the origin
+  # stamps its tenant on every row the reporting routes group on.
+  "acme.ai.local":
+    tenant_id: acme
+    action:
+      type: ai_proxy
+      # Every request must present a governed key, so `api_key_id` is
+      # never empty and the by-key report has no `(unattributed)` row.
+      require_governed_key: true
+      routing: round_robin
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; the field exists because
+          # OpenAI-shaped provider configuration carries one. Against the
+          # real provider this would be ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o
+            - gpt-4o-mini
+    credentials:
+      - name: acme-platform
+        type: ai_provider
+        provider: openai
+        key: ${ACME_PLATFORM_KEY:-vk-acme-platform}
+      - name: acme-research
+        type: ai_provider
+        provider: openai
+        key: ${ACME_RESEARCH_KEY:-vk-acme-research}
+
+  # Tenant two, same shape. Two tenants is what makes the `tenant`
+  # dimension worth grouping on rather than a constant column.
+  "globex.ai.local":
+    tenant_id: globex
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      routing: round_robin
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o
+            - gpt-4o-mini
+    credentials:
+      - name: globex-platform
+        type: ai_provider
+        provider: openai
+        key: ${GLOBEX_PLATFORM_KEY:-vk-globex-platform}

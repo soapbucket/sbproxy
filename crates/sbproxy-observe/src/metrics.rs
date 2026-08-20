@@ -3910,6 +3910,64 @@ pub fn record_audit_emit_duration(channel: &str, outcome: &str, duration_secs: f
     );
 }
 
+/// Count one completed admin request-log export on
+/// `sbproxy_admin_request_exports_total{format}` and the rows it wrote
+/// on `sbproxy_admin_request_export_rows_total{format}` (WOR-2578).
+///
+/// `format` is the closed enum `csv|jsonl`, selected from a static
+/// match in the admin route; no caller string becomes a label.
+///
+/// Why an export needs a counter from day one: `GET
+/// /api/requests/export` is the one admin route that hands back the
+/// operational log in bulk, which makes it the exfiltration shape of
+/// the admin surface. The audit chain records that an export happened;
+/// this pair is what an operator alerts on, because "exports per hour
+/// tripled" and "one export wrote the whole ring" are rate questions
+/// an audit ring cannot answer. Two families rather than one so a
+/// dashboard can read rows-per-export without inventing a histogram
+/// over a low-frequency event.
+/// A registration failure warns once and leaves the family unscraped
+/// rather than ending the admin request: an operator who cannot see the
+/// export counter still gets the export, and still gets the audit
+/// record, which is the load-bearing half.
+pub fn record_admin_request_export(format: &'static str, rows: u64) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static EXPORTS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    static ROWS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let warn_failed = |name: &'static str, error: &prometheus::Error| {
+        tracing::warn!(
+            metric = name,
+            %error,
+            "admin export counter failed to register; export volume is not scrapeable"
+        );
+    };
+    let exports = EXPORTS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_request_exports_total",
+            "Admin request-log exports served, by format",
+            &["format"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_request_exports_total", error))
+        .ok()
+    });
+    if let Some(counter) = exports {
+        counter.with_label_values(&[format]).inc();
+    }
+    let row_counter = ROWS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_request_export_rows_total",
+            "Rows written by admin request-log exports, by format",
+            &["format"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_request_export_rows_total", error))
+        .ok()
+    });
+    if let Some(counter) = row_counter {
+        counter.with_label_values(&[format]).inc_by(rows);
+    }
+}
+
 // --- script-engine metrics (CEL / Lua / JS / WASM) -----------------------
 //
 // Four counters / histograms cover the script-engine lifecycle so an

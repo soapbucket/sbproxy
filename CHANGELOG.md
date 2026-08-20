@@ -26,6 +26,29 @@ the next version cut.
   [docs/admin-api-reference.md](docs/admin-api-reference.md) and
   [docs/admin-ui.md](docs/admin-ui.md).
 
+- **Reporting: multi-dimension spend aggregation and raw export on
+  the request log, with shareable filtered views.**
+  `GET /api/requests/report` aggregates the same filtered ring that
+  `GET /api/requests` serves into one row per composite group:
+  `group_by` takes any mix of `model`, `api_key_id`, `tenant`, and
+  `user` simultaneously, and each row carries request count, tokens
+  in/out, and estimated cost. `GET /api/requests/export` downloads
+  the filtered rows as CSV or JSONL, bounded by the ring cap and
+  hardened against spreadsheet formula injection. Every export is an
+  audited admin action (`export_request_log`, naming the format, the
+  row count, and which filter dimensions were set) and increments the
+  new `sbproxy_admin_request_exports_total{format}` and
+  `sbproxy_admin_request_export_rows_total{format}` counters, so a
+  bulk read of the operational log is both recorded and alertable.
+  All three routes share one filter surface, which gains exact
+  `model`, `tenant`, and `user` filters. The admin console's new
+  Reports view drives them and serializes filter and grouping state
+  into URL query params, so a filtered report is a shareable link.
+  See the reporting sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md), and the worked example in
+  [examples/admin-reporting/](examples/admin-reporting/).
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,

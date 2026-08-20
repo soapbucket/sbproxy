@@ -558,15 +558,70 @@ windowed history.
   response also advertises promoted property keys, which appear as
   `Property: <key>` groupings and query as `group_by=property:<key>`.
   Labels in the by-origin breakdown link through to Logs filtered to
-  that origin, which is the one spend dimension the request log can
-  filter on; the other breakdowns are deliberately not linked, because
-  landing on an unfiltered log is worse than no link.
+  that origin; the other breakdowns are deliberately not linked,
+  because landing on an unfiltered log is worse than no link. For
+  by-model, by-key, by-tenant, or by-user drill-down over the recent
+  ring, use [Reports](#reports-reports), which filters on exactly
+  those dimensions.
 - **Mutations:** none.
 - **Empty/error notes:** no AI traffic yet renders an empty state; a
   `window`/`group_by` combination with no matching rollup data renders
   an empty chart, not an error. If a selected property disappears in
   another window, the selector preserves it with an unavailable hint
   rather than changing the operator's query.
+
+## Reports (`/reports`)
+
+Spend and usage over the recent-request ring, grouped by any mix of
+model, API key, tenant, and user at once, with the whole view encoded
+in the URL and raw export a click away. OpenRouter's org exports group
+by model, key, or the human who made the call; LiteLLM persists its
+dashboard state in URL params so a filtered view travels as a link.
+This page does both at the same time, over data sbproxy already
+records on every request.
+
+- **Shows:** `GET /api/requests/report`: one row per composite group
+  with request count, tokens in/out, and estimated cost, sorted by
+  spend, plus filtered totals as stat tiles. The Group by row toggles
+  the four dimensions independently; grouped columns appear and
+  disappear as dimensions toggle. A dimension a request lacks (an
+  unkeyed call, an anonymous user) renders as `(unattributed)`.
+- **Filters:** model, API key id, tenant, and user, applied
+  server-side by the same parser that filters Logs, so a report and
+  the log rows behind it can never disagree.
+- **Shareable state:** every applied filter and the grouping selection
+  serialize into URL query params (`?tenant=acme&group_by=model,user`).
+  Copying the address bar shares the exact view; opening a shared link
+  restores filters and grouping before the first fetch. There is no
+  separate saved-filter object to manage: the URL is the saved filter.
+- **Export:** two links download the current filtered view (the raw
+  rows, not the grouped ones) via `GET /api/requests/export`, as CSV
+  for spreadsheets or JSONL for tooling. The export is bounded by the
+  ring cap and hardened against CSV formula injection; see the
+  [export reference](admin-api-reference.md#get-apirequestsexport).
+- **Mutations:** none.
+- **Empty/error notes:** no matching requests renders an empty state
+  naming the ring as the source. A hand-edited link whose `group_by`
+  names an unknown or repeated dimension is normalized before the
+  first fetch (unknown dropped, repeats collapsed, canonical order
+  restored) and falls back to the default grouping if nothing
+  survives, rather than rendering the API's `400`.
+- **Retention boundary:** the ring shares `proxy.admin.max_log_entries`
+  (default 1000) with Logs and clears on restart. For durable,
+  windowed spend history use [Spend](#spend-spend), whose rollups
+  survive restarts; this page answers "who spent what just now,
+  exactly, and let me hand you the rows."
+
+### Answering "who spent what" in one pass
+
+Finance asks why the morning's AI spend spiked. Open Reports, group by
+model and user simultaneously, and the spend-first sort puts the
+answer on row one: which human drove which model, with tokens and cost
+side by side. Filter to that user to confirm, copy the URL into the
+thread so everyone sees the same cut, and export CSV for the
+reconciliation sheet. The same questions through Logs would be a
+row-by-row scroll; through Spend, a windowed chart without the
+per-user cut.
 
 ## AI performance (`/ai-performance`)
 

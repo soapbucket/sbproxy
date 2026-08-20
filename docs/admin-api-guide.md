@@ -400,6 +400,15 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
 # winner, traversed fallback chain):
 curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/routing-decisions?strategy=fallback_chain&limit=20" | jq
+
+# Who spent what: aggregate the filtered ring by any mix of model,
+# api_key_id, tenant, and user, all at once:
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=model,api_key_id,tenant,user" | jq
+
+# Raw export of the same filtered view (CSV or JSONL):
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/export?format=csv&tenant=acme" -o requests.csv
 ```
 
 **Hot reload after editing `sb.yml` out of band:**
