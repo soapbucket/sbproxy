@@ -32,9 +32,13 @@
 //! ## Verdict semantics (PR β)
 //!
 //! - [`PolicyDecision::Allow`]: forward the call to the upstream.
-//! - [`PolicyDecision::Deny`]: short-circuit with a JSON-RPC `-32603`
-//!   error response carrying the deny message; upstream is never
-//!   contacted.
+//! - [`PolicyDecision::Deny`]: short-circuit with a JSON-RPC `-32602`
+//!   (`INVALID_PARAMS`) error response carrying the deny message;
+//!   upstream is never contacted. WOR-2538: not `-32603`
+//!   (`INTERNAL_ERROR`) -- a policy hook refusing this call is a
+//!   deterministic decision about the request, not a server fault, and
+//!   the code matches `sbproxy-core::server::action_dispatch`'s
+//!   separate, config-declared RBAC deny path for the same reason.
 //! - [`PolicyDecision::AllowWithHeaders`]: treated as `Allow`; the
 //!   header list is dropped because JSON-RPC has no response-header
 //!   surface. PR γ adds the verdict combiner that will route this

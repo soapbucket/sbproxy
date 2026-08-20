@@ -12064,6 +12064,21 @@ mod mcp_catalog_snapshot_tests {
                 message.contains("RBAC"),
                 "expected an RBAC denial, got: {message}"
             );
+            // WOR-2538: pins the JSON-RPC error code for a `tools/call`
+            // RBAC denial as INVALID_PARAMS (-32602), not INTERNAL_ERROR
+            // (-32603) -- a caller refused by policy is a deterministic
+            // outcome for this request, not a server fault. Also guards
+            // against this path and `McpFederation::DeniedByPolicy`'s
+            // (a separate, code-registered policy-hook mechanism; see
+            // its doc comment in `sbproxy-extension`) drifting onto
+            // different codes for what a client sees as the same kind
+            // of `tools/call` refusal, which is exactly what happened
+            // before this fix.
+            assert_eq!(
+                call["error"]["code"],
+                sbproxy_extension::mcp::types::INVALID_PARAMS,
+                "RBAC-denied tools/call must answer INVALID_PARAMS, got: {call:?}"
+            );
 
             let event = poll_for_governance_event(&events_path, |event| {
                 event["data"]["gen_ai.tool.name"] == TOOL_NAME
