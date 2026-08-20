@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: per-request hard price ceiling.
+#
+# `max_price_per_request` is a routing guard, not a budget: before any
+# provider is selected, each routing candidate's estimated cost for the
+# request is checked against the ceiling, and candidates over it are
+# excluded. As shipped, the ceiling sits below what any configured
+# candidate can serve, so every chat request is refused with 402 and the
+# refusal lists each candidate's estimated cost. That is the fail-closed
+# contract: the gateway never silently routes to something more
+# expensive than the stated ceiling.
+#
+# Both providers declare the logical model `chat-default` and map it to
+# their own upstream model, so the refusal shows two candidates priced
+# through their own `model_map`.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#
+# Run:
+#   make run CONFIG=examples/price-ceiling/sb.yml
+#
+# Test (refused as-shipped):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "chat-default",
+#       "max_tokens": 1000,
+#       "messages": [{"role": "user", "content": "Draft a two-line status update."}]
+#     }'
+#
+# Expected behaviour:
+#   Every chat request answers 402 price_ceiling_exceeded naming the
+#   $0.0001 ceiling, with both candidates' estimated costs in
+#   error.excluded. Raise max_price_per_request to 0.001 and the same
+#   request routes to the cheap OpenAI candidate while the pricier
+#   Anthropic one stays excluded; at 0.05 both are eligible. The
+#   x-sbproxy-max-price request header can only tighten the configured
+#   ceiling, never raise it.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      # $0.0001 per request: below the cheapest estimate any candidate
+      # here can produce, so every request is refused rather than
+      # dispatched over the ceiling.
+      max_price_per_request: 0.0001
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models:
+            - chat-default
+          model_map:
+            chat-default: gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models:
+            - chat-default
+          model_map:
+            chat-default: claude-sonnet-4-5

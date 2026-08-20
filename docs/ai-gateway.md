@@ -1344,6 +1344,113 @@ budget:
 
 Window selection, the downgrade-target resolution order, and how a downgrade is tagged in the spend history are in [ai-predictive-budget.md](ai-predictive-budget.md).
 
+### Per-request price ceiling
+
+Budgets cap what a scope spends over a period. The price ceiling caps what a single request may cost before it dispatches: "never route this one call to anything over $0.05," where a budget can only say "stop me once I have spent too much this hour." The two are disjoint and compose: the ceiling gates each request against its own estimated cost and keeps no state, budgets accumulate real usage per scope and never look at an individual request's price. A request can pass a generous budget and still be refused by the ceiling, or clear the ceiling and be blocked by an exhausted budget.
+
+Set an origin-level ceiling in USD per request:
+
+```yaml
+action:
+  type: ai_proxy
+  max_price_per_request: 0.05
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+```
+
+The value must be positive. A ceiling of zero or below admits nothing, so the config is refused at load rather than booting an origin that answers 402 to everything.
+
+A caller can tighten it per request with the `x-sbproxy-max-price` header (USD). The header only ever lowers the effective ceiling; a request cannot raise a guard the operator set. A malformed or non-positive header value is refused with 400 rather than ignored, since a caller who asked for a bound and mistyped it must not dispatch unbounded.
+
+Before provider selection, the gateway estimates what each routing candidate would charge for this request and drops every candidate whose estimate exceeds the effective ceiling. The estimate reuses the exact price resolution that cost tracking bills with (`model_prices`, then the rate card, then the built-in catalog, then the pessimistic $5 / $5 fallback), so there is no second price table to drift: a model your cost reports price at $2.50 per million input tokens is gated at $2.50 per million input tokens. Each candidate is priced against the model it would actually dispatch, after its `model_map` rename. The token volumes are the same pre-dispatch prompt estimate budget accounting uses, plus the request's declared output cap (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`); a request that declares no output cap is assumed to produce 1,024 completion tokens, so an output-priced frontier model cannot slip under the ceiling on a short prompt alone. A model no price layer knows gets the same $5 / $5 fallback as billing, which usually excludes it under a tight ceiling: unpriced is treated as expensive, not free.
+
+```mermaid
+flowchart TD
+    A[Request reaches routing] --> B{"effective ceiling?\n(min of config and\nx-sbproxy-max-price)"}
+    B -->|none| G[Candidate set unchanged]
+    B -->|set| K["Candidate set:\nthe provider order, and a\ncascade's tier list when the\norigin cascades"]
+    K --> C["Estimate each candidate:\nprompt est x input rate +\noutput cap x output rate\n(same layers as cost tracking)"]
+    C --> D{estimate <= ceiling?}
+    D -->|yes| E[Candidate stays routable]
+    D -->|no| F["Candidate excluded\n(counted, resolved price kept)"]
+    E --> H{any candidate left?}
+    F --> H
+    H -->|yes| I[Strategy selects from the survivors]
+    H -->|no| J["402 price_ceiling_exceeded\nnames the ceiling, lists each\ncandidate's estimated cost"]
+```
+
+When every candidate is over the ceiling the request fails closed with 402. The gateway will not quietly route to something more expensive than the caller was willing to pay. The refusal names the ceiling and carries each excluded candidate's estimated cost and the price layer that produced it, so the caller sees what the request would have cost:
+
+```bash
+$ curl -s http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Host: ai.local' \
+    -H 'Content-Type: application/json' \
+    -H 'x-sbproxy-max-price: 0.001' \
+    -d '{
+      "model": "gpt-4o",
+      "max_tokens": 1000,
+      "messages": [{"role": "user", "content": "Draft the quarterly summary."}]
+    }' | jq .
+{
+  "error": {
+    "ceiling_usd": 0.001,
+    "excluded": [
+      {
+        "estimated_cost_usd": 0.01003,
+        "model": "gpt-4o",
+        "price_source": "catalog",
+        "provider": "openai"
+      }
+    ],
+    "message": "no eligible provider can serve this request under the price ceiling of $0.001 per request; each candidate's estimated cost is listed in error.excluded",
+    "request_id": "01a02141ab5673718591887fb0169d6b",
+    "type": "price_ceiling_exceeded"
+  }
+}
+```
+
+That $0.01003 is the whole estimate: a prompt the gateway sizes at 12 tokens, at `gpt-4o`'s $2.50 per million input tokens, plus the declared 1,000-token output cap at $10.00 per million. Raise the ceiling above it and the same request dispatches.
+
+With more than one candidate the ceiling usually narrows rather than refuses. Give the same origin a second provider that renames `gpt-4o` down to `gpt-4o-mini`:
+
+```yaml
+providers:
+  - name: openai
+    api_key: ${OPENAI_API_KEY}
+  - name: openai-mini
+    provider_type: openai
+    api_key: ${OPENAI_API_KEY}
+    model_map:
+      gpt-4o: gpt-4o-mini
+```
+
+At `x-sbproxy-max-price: 0.005` the frontier candidate is dropped and the mini candidate serves the request. Each drop is traced at debug on `ai.price_ceiling.exclude`:
+
+```
+DEBUG sbproxy_core::server::ai_dispatch: price ceiling excluded a routing candidate
+  event="ai.price_ceiling.exclude" provider=openai model=gpt-4o
+  estimated_cost_usd=0.01003 price_source=catalog ceiling_usd=0.005
+```
+
+Every request the ceiling ran on carries its verdict in the admin request record's policy decisions: `price_ceiling:allow` when every candidate fit, `price_ceiling:narrowed` when some were dropped, and `price_ceiling:deny` on a refusal, where the deny reason names the ceiling and the excluded candidates' prices. One verdict per request, so a row never carries two. Exclusions and refusals increment `sbproxy_ai_price_ceiling_total`, labeled `outcome="candidate_excluded"` per dropped candidate and `outcome="refused"` per fully excluded request, so a dashboard can tell "the ceiling is trimming the expensive tier" from "the ceiling is blocking all traffic."
+
+#### Confidence cascades and the ceiling
+
+A [confidence cascade](#cascade) does not route over the provider order. Each tier names its own provider and its own model, and the tier's model overrides the request's, so the tier list is a second candidate set. The ceiling filters it the same way, pricing each tier against the model that tier would dispatch after its provider's `model_map` rename. Tiers over the ceiling are skipped; a cascade with no tier left under the ceiling refuses with the same 402. Without that, an origin could set a ceiling, watch it narrow the provider order, and still be billed for tier one at the frontier model the tier names.
+
+A tier naming a provider that is not configured is left alone: it cannot dispatch either way, and the cascade's own skip-and-warn handling covers it.
+
+#### Limits worth knowing
+
+The gate covers the three token-priced chat surfaces: `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`. The last two arrive in their own wire formats, and the native inbound shim rewrites both into the canonical chat body before routing, so all three reach the ceiling as the same shape priced by the same per-million rates. An Anthropic-SDK client and an OpenAI-Responses-SDK client pointed at the same origin get the same guard the chat clients do.
+
+Everything else is priced on units this estimate does not model: per-image, per-second, per-character, and multipart surfaces, plus the control-plane endpoints. An origin-level ceiling does not reach them. A caller who sends `x-sbproxy-max-price` to one of those surfaces gets a 400 rather than an ungated dispatch, because a per-request demand the gateway cannot honor should be refused out loud.
+
+The estimate is a routing guard rather than a bill. Settlement still comes from the provider's reported usage, and a response that runs past its declared output cap settles at its real cost. A locally served model with no entry in `model_prices` or the rate card takes the $5 / $5 fallback like any other unpriced model, which a tight ceiling will exclude; price it explicitly if you want it eligible.
+
+The runnable [`examples/price-ceiling/`](../examples/price-ceiling/) config ships a ceiling set below every configured provider's price, proving the clean refusal.
+
 ### Model prices
 
 Cost tracking and cost-based routing need a per-model price. SBproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.

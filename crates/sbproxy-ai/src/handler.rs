@@ -217,6 +217,22 @@ pub struct AiHandlerConfig {
     /// runtime. `None` uses only `model_prices` + the built-in catalog.
     #[serde(default)]
     pub rate_card: Option<String>,
+    /// WOR-2559: origin-level hard price ceiling in USD per request (the
+    /// OpenRouter `provider.max_price` analog). Before provider
+    /// selection, each routing candidate on a token-priced chat surface
+    /// (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is
+    /// estimated through the same price resolution cost tracking bills with
+    /// (`model_prices`, rate card, built-in catalog, then the pessimistic
+    /// $5/$5 fallback); candidates whose estimate exceeds the ceiling are
+    /// excluded, and a fully excluded set refuses with 402 naming the
+    /// ceiling and each candidate's resolved price. On a `cascade`
+    /// origin the tier list is filtered the same way, priced on the model
+    /// each tier names, because the cascade routes over its tiers rather
+    /// than over the provider order. The `x-sbproxy-max-price` request
+    /// header can tighten this per request but never raise it. Must be
+    /// positive when set; `None` (the default) disables the gate.
+    #[serde(default)]
+    pub max_price_per_request: Option<f64>,
     /// WOR-1880: optional fair-share quota pool across providers.
     /// When set, each provider attempt reserves against the pool before
     /// dispatch; a deny advances to the next candidate when alternatives
@@ -1080,6 +1096,21 @@ impl AiHandlerConfig {
              the behavior you want."
         );
         let mut config: Self = serde_json::from_value(value)?;
+        // WOR-2559: a ceiling of zero or below cannot admit any request
+        // whose estimate is a real cost, so it would blackhole the origin
+        // at 402 for every chat request, which is what a typed `-0.05` or
+        // a stray `0` looks like. The header form already refuses a
+        // non-positive value; refusing here too means the operator learns
+        // at load rather than from a support ticket.
+        if let Some(ceiling) = config.max_price_per_request {
+            if !ceiling.is_finite() || ceiling <= 0.0 {
+                anyhow::bail!(
+                    "ai max_price_per_request must be a positive USD amount, got {ceiling}. \
+                     A ceiling at or below zero refuses every request, since no priced \
+                     candidate estimates below it. Remove the key to disable the ceiling."
+                );
+            }
+        }
         if let Some(rag) = config.rag.as_ref() {
             rag.validate()
                 .map_err(|error| anyhow::anyhow!("ai rag: {error}"))?;
@@ -2059,6 +2090,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2106,6 +2138,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2153,6 +2186,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2201,6 +2235,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2363,6 +2398,34 @@ mod tests {
             error.contains("reasoning budget must be greater than zero"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_a_price_ceiling_at_or_below_zero() {
+        // A ceiling of zero or below admits nothing, so it turns the
+        // origin into a 402 for every chat request. The header form
+        // already refuses a non-positive value; a typo in the config must
+        // not be the quieter of the two.
+        for bad in [0.0, -0.05] {
+            let json = serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "sk-test"}],
+                "max_price_per_request": bad,
+            });
+            let error = AiHandlerConfig::from_config(json)
+                .expect_err("a non-positive ceiling must refuse the config")
+                .to_string();
+            assert!(error.contains("max_price_per_request"), "{error}");
+        }
+    }
+
+    #[test]
+    fn from_config_accepts_a_positive_price_ceiling() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "max_price_per_request": 0.05,
+        }))
+        .expect("a positive ceiling is a valid config");
+        assert_eq!(config.max_price_per_request, Some(0.05));
     }
 
     #[test]

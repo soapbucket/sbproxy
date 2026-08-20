@@ -495,6 +495,41 @@ pub fn record_price_source(source: &str) {
     AI_PRICE_SOURCE.with_label_values(&[source]).inc();
 }
 
+/// Registered without `.unwrap()` (mirroring
+/// `MULTIPART_INSPECTION_SKIPPED`) because the production unwrap/expect
+/// ratchet in `scripts/check-unwrap-ratchet.sh` is at its baseline and
+/// a metric family is not worth a panic path.
+static AI_PRICE_CEILING: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_price_ceiling_total",
+            "Per-request price ceiling routing-guard outcomes (WOR-2559)"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Record a per-request price-ceiling outcome (WOR-2559). `outcome` is
+/// `candidate_excluded` (one routing candidate's estimate exceeded the
+/// ceiling and it was dropped from the eligible set) or `refused` (every
+/// candidate was over the ceiling, so the request failed closed with
+/// 402). A rising `candidate_excluded` rate with a flat `refused` rate
+/// means the ceiling is trimming the expensive tier; a rising `refused`
+/// rate means it is blocking traffic outright.
+///
+/// A request has two candidate sets the ceiling can filter, the provider
+/// order and a confidence cascade's tier list, and both count here. On a
+/// cascade origin one request can therefore report an exclusion from
+/// each, which is the honest reading: two separate routes were priced
+/// and both were over.
+pub fn record_price_ceiling(outcome: &str) {
+    let Some(counter) = &*AI_PRICE_CEILING else {
+        return;
+    };
+    counter.with_label_values(&[outcome]).inc();
+}
+
 // --- Shadow supervisor metrics ---
 
 static AI_SHADOW_INFLIGHT: LazyLock<Gauge> = LazyLock::new(|| {
