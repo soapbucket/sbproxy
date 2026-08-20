@@ -2038,6 +2038,47 @@ export interface RequestFilters {
   keyMode?: "none" | "minted" | "native";
 }
 
+// WOR-2575: routing decision ring entry (GET /api/routing-decisions).
+export interface RoutingDecisionCandidate {
+  provider: string;
+  model?: string;
+}
+
+export interface RoutingDecision {
+  timestamp?: string;
+  origin?: string;
+  request_id?: string;
+  tenant_id?: string;
+  strategy?: string;
+  requested_model?: string;
+  selected_provider?: string;
+  selected_model?: string;
+  reason?: string;
+  candidates?: RoutingDecisionCandidate[];
+  attempted?: string[];
+  attempts?: number;
+  failover_engaged?: boolean;
+  failover_from?: string;
+  failover_to?: string;
+  status?: number;
+  latency_ms?: number;
+  // Open, additive detail map. Later columns (typed fallback triggers,
+  // eligibility filters, price-ceiling exclusions, semantic-match
+  // scores) land as keys here, not as a schema change.
+  detail?: Record<string, unknown>;
+  [k: string]: unknown;
+}
+
+export interface RoutingDecisionFilters {
+  origin?: string;
+  strategy?: string;
+  provider?: string;
+  model?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
 export type AlertRuleState = "inactive" | "ok" | "firing";
 export type AlertDeliveryStatus = "untested" | "healthy" | "failing";
 export type AlertHistoryEvent = "fired" | "resolved" | "test";
@@ -2535,6 +2576,23 @@ function requestsPath(filters: RequestFilters = {}): string {
   return query ? `/api/requests?${query}` : "/api/requests";
 }
 
+// WOR-2575: routing-decisions ring query. Server-side filter params
+// mirror the admin API's RoutingDecisionFilter, snake_case on the wire.
+function routingDecisionsPath(filters: RoutingDecisionFilters = {}): string {
+  const params = new URLSearchParams();
+  if (filters.origin) params.set("origin", filters.origin);
+  if (filters.strategy) params.set("strategy", filters.strategy);
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.model) params.set("model", filters.model);
+  if (filters.since) params.set("since", filters.since);
+  if (filters.until) params.set("until", filters.until);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return query
+    ? `/api/routing-decisions?${query}`
+    : "/api/routing-decisions";
+}
+
 export const api = {
   // Auth (WOR-1758)
   session: () => getJson<SessionInfo>("/admin/session"),
@@ -2686,6 +2744,10 @@ export const api = {
   // WOR-1870: SSE live tail of the request ring. EventSource sends the
   // session cookie same-origin; the server enforces auth on connect.
   requestsStreamUrl: () => "/api/requests/stream",
+  // WOR-2575: recent routing decisions ("why was this request routed
+  // here"), newest first from the in-memory ring.
+  routingDecisions: (filters: RoutingDecisionFilters = {}) =>
+    getJson<RoutingDecision[]>(routingDecisionsPath(filters)),
 
   // WOR-2094: unified audit sample (security/key/config/admin/policy).
   auditEvents: (filters: AuditEventFilters = {}) => {

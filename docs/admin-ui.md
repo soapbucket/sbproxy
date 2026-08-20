@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -426,6 +426,72 @@ The observability surfaces compose into one attribution loop. Send
 Only properties listed in the origin's `properties.rollup_keys` become
 durable spend dimensions; every captured property stays filterable in Logs
 for the life of the ring. Redacted keys show as `[redacted]` everywhere.
+
+## Routing decisions (`/routing-decisions`)
+
+Per-request routing traces: which strategy or operator plan decided each
+request, the candidates it weighed, the winner, the reason, and the
+fallback chain it actually traversed. Neither Kong nor Cloudflare AI
+Gateway can answer "why this provider" per request; sbproxy already
+records the underlying decision data, and this page renders it.
+
+Where a row comes from, end to end:
+
+```mermaid
+flowchart TD
+    REQ["AI dispatch\n(handle_ai_proxy)"] --> PLANQ{"Operator routing\npolicy produced a plan?"}
+    PLANQ -->|"yes (CEL / Lua / JS / WASM / Rego)"| PLAN["Plan: ordered tiers + reason\n(strategy reported as\nai_routing_policy)"]
+    PLANQ -->|no| STRAT["Configured strategy orders\nthe eligible providers\n(round_robin, fallback_chain,\ncascade, lowest_latency, ...)"]
+    PLAN --> SNAP["Request context snapshot:\ncandidates, reason,\nattempted-provider trail,\nopen detail map"]
+    STRAT --> SNAP
+    SNAP --> DISPATCH["Provider dispatch\n(failover + cascade record\neach attempt as it happens)"]
+    DISPATCH --> LOG["End-of-request logging hook\nbuilds one decision record"]
+    LOG --> RING["In-memory ring\n(proxy.admin.max_log_entries,\ndrops oldest, clears on restart)"]
+    RING --> API["GET /api/routing-decisions\n(filters: origin, strategy,\nmodel, provider, since/until)"]
+    API --> VIEW["Routing decisions view\n(/routing-decisions)"]
+```
+
+- **Shows:** `GET /api/routing-decisions`: one row per routed request,
+  newest first, with strategy, winner (provider and model), the traversed
+  provider chain, the decision reason, status, and latency. Expanding a
+  row lists the candidates in the order the router weighed them with the
+  winner marked, the failover pair, tenant, request id, and every key of
+  the open `detail` map. A `substituted` badge marks rows where the served
+  model differs from the requested one.
+- **Filters:** origin, strategy, model (matches the requested or the
+  served side of a substitution), selected provider, and a rolling time
+  window, all applied server-side; deep links may pre-seed `origin`,
+  `strategy`, and `model` query parameters.
+- **Mutations:** none.
+- **Empty/error notes:** a config with no AI origin or load-balanced
+  upstream records no decisions, and the page says so rather than
+  erroring; plain proxied requests that never routed do not appear.
+- **Retention boundary:** the ring shares `proxy.admin.max_log_entries`
+  (default 1000) with the Logs ring and clears on restart. It is a
+  runtime sample for diagnosis, not durable routing history; ship the
+  decision audit records to your log pipeline for that.
+
+### Reading a failover trace
+
+A caller reports a slow, oddly-worded answer. Open Routing decisions and
+filter by the model they asked for:
+
+1. The row's chain reads `openai › anthropic` with a `substituted`
+   badge: the primary failed and the request was served by the second
+   tier under a different model.
+2. Expand the row. Candidates list the plan's order with `anthropic /
+   claude-sonnet-5` marked `selected`; the reason field carries the
+   operator plan's own words (or is empty for a built-in strategy,
+   which decides by its name's criterion); the failover pair and
+   attempt count quantify the detour.
+3. The request id links the decision to the same request's row in
+   [Logs](#logs-logs) and its access-log line, so cost, tokens, and
+   the response itself are one filter away.
+
+The four planned columns for this page (typed fallback triggers, data-
+posture eligibility results, price-ceiling exclusions, and semantic-match
+scores) will land as keys of the `detail` map and render in the expanded
+row without a redesign.
 
 ## Metrics (`/metrics`)
 

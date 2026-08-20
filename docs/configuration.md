@@ -476,7 +476,7 @@ HTTP/3 is not served by this build. The `http3` shape is retained for forward co
 | `port` | int | 9090 | Listen port |
 | `username` | string | "admin" | Top-level admin HTTP Basic username |
 | `password` | string | "changeme" | Top-level admin HTTP Basic password. The default is rejected when the surface is reachable off loopback (see below) |
-| `max_log_entries` | int | 1000 | Recent-request log buffer size |
+| `max_log_entries` | int | 1000 | Recent-request log buffer size; the routing-decisions ring shares this cap |
 | `rate_limit_per_minute` | int | 240 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
 | `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin. Must be an IP address literal; a value that does not parse is a validation error, not a silent fall back to loopback |
 | `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default (an empty list denies every non-loopback peer, it does not permit all) |
