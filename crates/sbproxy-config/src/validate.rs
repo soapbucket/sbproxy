@@ -168,6 +168,7 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "assertion",
     "response_assertion",
     "request_validator",
+    "body_threat_protection",
     "content_digest",
     "concurrent_limit",
     "concurrent_limiting",

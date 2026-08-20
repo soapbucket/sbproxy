@@ -8000,6 +8000,7 @@ dependencies = [
  "proptest",
  "prost 0.11.9",
  "pulldown-cmark",
+ "quick-xml",
  "rand 0.8.6",
  "redis",
  "regex",
