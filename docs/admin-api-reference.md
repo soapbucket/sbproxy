@@ -366,7 +366,7 @@ Mints a fresh secret, keeps the prior hash valid for `grace_secs`
 (both authenticate during the window), and returns:
 
 ```json
-{"token": "sk-key_9f2c...-<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
+{"token": "sbp_key_9f2c..._<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
 ```
 
 ### `GET /admin/keys/{id}/usage`

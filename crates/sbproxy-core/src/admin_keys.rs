@@ -1339,7 +1339,7 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
     if rec.status == RecordStatus::Revoked {
         return terminal_key(id, rec.policy_revision);
     }
-    let minted = plane.crypto().mint_secret();
+    let minted = plane.crypto().mint_secret(id);
     let now = Utc::now();
     // The current secret becomes the graced prior secret.
     rec.prev_secret_hash = Some(rec.secret_hash.clone());
@@ -1353,9 +1353,11 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
     invalidate(&plane, id);
     audit_mutation("rotate", "key", id);
 
-    let token = format!("sk-{}-{}", id, minted.secret);
     ok(json!({
-        "token": token,
+        // Same `sbp_<key_id>_<secret>` shape create_key returns, so a
+        // rotated token is self-identifying on the minted-key sweep just
+        // like a freshly created one.
+        "token": minted.token,
         "grace_expires_at": rec.prev_hash_expires_at,
         "key": KeyView::from(&rec),
     }))
@@ -2408,10 +2410,16 @@ mod tests {
         .unwrap();
         assert_eq!(resp.0, 200);
         let v = parse(&resp);
-        assert!(v["token"]
-            .as_str()
-            .unwrap()
-            .starts_with(&format!("sk-{key_id}-")));
+        let rotated_token = v["token"].as_str().unwrap().to_string();
+        // WOR-2537: a rotated token must come back in the same
+        // `sbp_<key_id>_<secret>` shape create_key uses, not the legacy
+        // `sk-` shape, so the minted-key sweep (which only recognizes the
+        // strict shape) can find it too.
+        assert!(rotated_token.starts_with(sbproxy_keystore::crypto::TOKEN_PREFIX));
+        assert_eq!(rotated_token.len(), sbproxy_keystore::crypto::TOKEN_LEN);
+        let (rotated_key_id, _) = sbproxy_keystore::crypto::parse_minted_token(&rotated_token)
+            .expect("a rotated token must round-trip through the strict parser");
+        assert_eq!(rotated_key_id, key_id);
         assert_eq!(v["key"]["rotation_pending"], true);
         assert_eq!(v["key"]["policy_revision"], 5);
         assert!(

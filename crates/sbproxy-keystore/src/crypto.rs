@@ -57,9 +57,15 @@ pub struct MintedKey {
 }
 
 /// A freshly minted secret for an existing key id (rotation): the one-time
-/// plaintext and the at-rest hash that replaces the record's current hash.
+/// plaintext token (in the same `sbp_<key_id>_<secret>` shape [`mint_key`]
+/// produces, not the legacy `sk-` shape), the plaintext secret half, and the
+/// at-rest hash that replaces the record's current hash.
 #[derive(Debug, Clone)]
 pub struct MintedSecret {
+    /// The full bearer token `sbp_<key_id>_<secret>`, built from the
+    /// existing key id and the freshly minted secret. Shown once, never
+    /// stored.
+    pub token: String,
     /// The new plaintext secret half of the token. Shown once, never stored.
     pub secret: String,
     /// `HMAC-SHA256(secret, pepper)`, hex-encoded. Persisted as the new hash.
@@ -72,12 +78,21 @@ pub fn mint_key(pepper: &[u8]) -> MintedKey {
     let key_id = random_hex(KEY_ID_BYTES);
     let secret = random_hex(SECRET_BYTES);
     let secret_hash = hash_secret(&secret, pepper);
-    let token = format!("{TOKEN_PREFIX}{key_id}_{secret}");
+    let token = format_token(&key_id, &secret);
     MintedKey {
         key_id,
         token,
         secret_hash,
     }
+}
+
+/// Format a token from its id and secret halves: `sbp_<key_id>_<secret>`.
+///
+/// The single place [`mint_key`] and [`KeyCrypto::mint_secret`] both build
+/// the minted shape, so a fresh key and a rotated key cannot drift onto two
+/// different token formats.
+fn format_token(key_id: &str, secret: &str) -> String {
+    format!("{TOKEN_PREFIX}{key_id}_{secret}")
 }
 
 /// Parse a bearer token of the form `sk-<key_id>-<secret>` into its public id
@@ -305,12 +320,16 @@ impl KeyCrypto {
         mint_key(&self.pepper)
     }
 
-    /// Mint a fresh secret + hash for an *existing* key id (rotation). The
-    /// caller forms the new token as `sk-<key_id>-<secret>`.
-    pub fn mint_secret(&self) -> MintedSecret {
+    /// Mint a fresh secret + hash for an *existing* key id (rotation),
+    /// returning the new plaintext token already formed in the same
+    /// `sbp_<key_id>_<secret>` shape the free-function `mint_key` produces.
+    /// `key_id` is the existing record's id; it is not itself minted here.
+    pub fn mint_secret(&self, key_id: &str) -> MintedSecret {
         let secret = random_hex(SECRET_BYTES);
         let secret_hash = hash_secret(&secret, &self.pepper);
+        let token = format_token(key_id, &secret);
         MintedSecret {
+            token,
             secret,
             secret_hash,
         }
@@ -461,6 +480,26 @@ mod tests {
         assert_eq!(secret.len(), 64);
         assert_eq!(minted.secret_hash, hash_secret(secret, b"pepper"));
         assert!(is_conforming_key_id(key_id));
+    }
+
+    #[test]
+    fn rotated_secret_mints_the_same_shape_token_as_a_fresh_key() {
+        // WOR-2537: rotate_key used to hand-build a legacy `sk-<id>-<secret>`
+        // token instead of reusing the `sbp_<id>_<secret>` shape mint_key
+        // produces. Pin the two callers of KeyCrypto to the same format so
+        // they cannot drift apart again.
+        let kc = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let created = kc.mint_key();
+        let rotated = kc.mint_secret(&created.key_id);
+
+        assert_eq!(rotated.token.len(), TOKEN_LEN);
+        assert!(rotated.token.starts_with(TOKEN_PREFIX));
+        let (key_id, secret) = parse_minted_token(&rotated.token)
+            .expect("a rotated token must round-trip through the strict parser");
+        assert_eq!(key_id, created.key_id, "rotation keeps the same key id");
+        assert_eq!(secret.len(), 64);
+        assert_eq!(rotated.secret_hash, hash_secret(secret, b"pepper"));
+        assert!(kc.verify_secret(secret, &rotated.secret_hash));
     }
 
     #[test]
