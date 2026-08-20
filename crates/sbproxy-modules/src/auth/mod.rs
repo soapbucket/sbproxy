@@ -17,6 +17,9 @@ pub mod dpop;
 pub mod dpop_outbound;
 /// WOR-2518: HMAC signed-request authentication (`hmac_auth`).
 pub mod hmac_auth;
+/// WOR-2520: JWE (RFC 7516) decryption for encrypted tokens presented
+/// to the `jwt` provider (decrypt-then-verify nested JWTs).
+mod jwe;
 pub mod jwks;
 /// WOR-2519: LDAP directory-bind authentication (`ldap_auth`).
 pub mod ldap;
@@ -38,6 +41,7 @@ pub use bot_auth_directory::{
 };
 pub use cap::{CapConfig, CapError, CapRateLimitInfo, CapTokenView, CapVerdict, CapVerifier};
 pub use hmac_auth::{HmacAuth, HmacVerdict};
+pub use jwe::JweConfig;
 pub use trust_tier::{compute_trust_tier, TrustSignals, TrustTier, NAMED_AGENT_SCORE_THRESHOLD};
 
 use base64::Engine;
@@ -730,6 +734,16 @@ pub struct JwtAuth {
     /// each binding is validated independently and both must pass.
     #[serde(default)]
     pub require_mtls_bound: bool,
+    /// WOR-2520: JWE decryption settings for encrypted tokens
+    /// (RFC 7516). When set, a five-segment JWE compact token is
+    /// decrypted with the configured private key and the recovered
+    /// payload is then verified as a nested JWS (RFC 7519 section
+    /// 5.2, decrypt-then-verify) with the same `secret` / `jwks_url`
+    /// machinery as a directly presented signed token. When absent
+    /// (the default), JWE tokens are refused, preserving the previous
+    /// behavior; JWS-only configurations need no changes.
+    #[serde(default)]
+    pub jwe: Option<JweConfig>,
 }
 
 impl JwtAuth {
@@ -880,6 +894,35 @@ impl JwtAuth {
         token: &str,
     ) -> Option<(String, serde_json::Value)> {
         use jsonwebtoken::{decode, DecodingKey, Validation};
+
+        // WOR-2520: a five-segment compact token is a JWE (RFC 7516);
+        // a JWS has three. Decrypt first, then verify the recovered
+        // payload as a nested JWS (RFC 7519 section 5.2) through the
+        // exact code below, so decryption never bypasses a signature
+        // check. Every refusal returns `None`, which the caller turns
+        // into the same challenge as a bad signature; the debug lines
+        // name only public header values, never the key or payload.
+        let decrypted;
+        let token = if jwe::is_compact_jwe(token) {
+            let Some(jwe_config) = &self.jwe else {
+                tracing::debug!(
+                    "JWE token presented but the jwt provider has no `jwe` decryption key; refusing"
+                );
+                return None;
+            };
+            match jwe::decrypt_compact(token, jwe_config) {
+                Ok(inner) => {
+                    decrypted = inner;
+                    decrypted.as_str()
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, "JWE decryption failed; refusing token");
+                    return None;
+                }
+            }
+        } else {
+            token
+        };
 
         let algorithms = self.allowed_algorithms();
         if algorithms.is_empty() {
@@ -1531,6 +1574,7 @@ mod tests {
             roles_claim: Vec::new(),
             require_dpop: false,
             require_mtls_bound: false,
+            jwe: None,
         });
         assert_eq!(auth.auth_type(), "jwt");
     }
@@ -1605,6 +1649,7 @@ mod tests {
             roles_claim: Vec::new(),
             require_dpop: false,
             require_mtls_bound: false,
+            jwe: None,
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Jwt"));
@@ -2171,6 +2216,131 @@ mod tests {
         let auth = jwt_auth(Some("k"));
         let headers = http::HeaderMap::new();
         assert!(!auth.check_request(&headers).await);
+    }
+
+    // --- JWE tests (WOR-2520) ---
+
+    /// Records the pre-WOR-2520 baseline the ticket asked to confirm
+    /// first: a well-formed JWE (five-segment compact token) presented
+    /// to a provider without a `jwe` block is refused through the same
+    /// deny path as a bad signature. Clean rejection, not silent
+    /// mishandling: `jsonwebtoken` cannot parse a five-segment token,
+    /// so validation returns `None` and the caller challenges. The
+    /// test stays green after the feature because a provider without
+    /// a decryption key still refuses every JWE.
+    #[tokio::test]
+    async fn jwe_token_refused_when_no_decryption_key_configured() {
+        let secret = "shared-secret-abc";
+        let auth = jwt_auth(Some(secret));
+        let inner = sign_jwt(
+            &serde_json::json!({"sub": "user1", "exp": future_epoch()}),
+            secret,
+        );
+        let (token, _pem) = jwe::test_support::mint_rsa_jwe(&inner, "RSA-OAEP");
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
+    }
+
+    /// WOR-2520 acceptance: a JWE-wrapped nested JWT authenticates end
+    /// to end once the provider carries a decryption key. The outer
+    /// RSA-OAEP + A256GCM envelope is decrypted, the inner HS256 JWS
+    /// is verified with the provider's existing machinery, and the
+    /// `sub` claim resolves from the nested payload.
+    #[tokio::test]
+    async fn jwe_wrapped_nested_jwt_authenticates() {
+        let secret = "shared-secret-abc";
+        let inner = sign_jwt(
+            &serde_json::json!({"sub": "enc-user", "exp": future_epoch()}),
+            secret,
+        );
+        let (token, pem) = jwe::test_support::mint_rsa_jwe(&inner, "RSA-OAEP");
+        let mut auth = jwt_auth(Some(secret));
+        auth.jwe = Some(JweConfig {
+            decryption_key: pem,
+        });
+        assert_eq!(
+            auth.check_request_with_subject(&jwt_headers(&token))
+                .await
+                .as_deref(),
+            Some("enc-user")
+        );
+    }
+
+    /// Same end-to-end path through ECDH-ES (direct P-256 agreement).
+    #[tokio::test]
+    async fn jwe_ecdh_es_wrapped_nested_jwt_authenticates() {
+        let secret = "shared-secret-abc";
+        let inner = sign_jwt(
+            &serde_json::json!({"sub": "ecdh-user", "exp": future_epoch()}),
+            secret,
+        );
+        let (token, pem) = jwe::test_support::mint_ecdh_es_jwe(&inner);
+        let mut auth = jwt_auth(Some(secret));
+        auth.jwe = Some(JweConfig {
+            decryption_key: pem,
+        });
+        assert_eq!(
+            auth.check_request_with_subject(&jwt_headers(&token))
+                .await
+                .as_deref(),
+            Some("ecdh-user")
+        );
+    }
+
+    /// Decryption is transport, not authentication: a JWE that
+    /// decrypts cleanly but wraps a JWS signed with the wrong secret
+    /// is refused by the nested signature check.
+    #[tokio::test]
+    async fn jwe_wrapping_a_badly_signed_jwt_is_refused() {
+        let inner = sign_jwt(
+            &serde_json::json!({"sub": "mallory", "exp": future_epoch()}),
+            "attacker-secret",
+        );
+        let (token, pem) = jwe::test_support::mint_rsa_jwe(&inner, "RSA-OAEP");
+        let mut auth = jwt_auth(Some("server-secret"));
+        auth.jwe = Some(JweConfig {
+            decryption_key: pem,
+        });
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
+    }
+
+    /// Garbage ciphertext under a valid header fails closed through
+    /// the public entry point, indistinguishable from any other bad
+    /// token (the caller sends the same challenge).
+    #[tokio::test]
+    async fn jwe_garbage_ciphertext_refused_at_check_request() {
+        let secret = "shared-secret-abc";
+        let inner = sign_jwt(
+            &serde_json::json!({"sub": "user1", "exp": future_epoch()}),
+            secret,
+        );
+        let (token, pem) = jwe::test_support::mint_rsa_jwe(&inner, "RSA-OAEP");
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let garbage = jwe::test_support::b64url_encode(&[0xA5; 48]);
+        parts[3] = &garbage;
+        let tampered = parts.join(".");
+        let mut auth = jwt_auth(Some(secret));
+        auth.jwe = Some(JweConfig {
+            decryption_key: pem,
+        });
+        assert!(!auth.check_request(&jwt_headers(&tampered)).await);
+    }
+
+    /// The `jwe` block deserializes from generic provider config, and
+    /// configs without it keep parsing exactly as before (no new
+    /// required fields).
+    #[test]
+    fn jwt_from_config_with_and_without_jwe_block() {
+        let with = serde_json::json!({
+            "type": "jwt",
+            "secret": "s",
+            "jwe": {"decryption_key": "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----"}
+        });
+        let auth = JwtAuth::from_config(with).unwrap();
+        assert!(auth.jwe.is_some());
+
+        let without = serde_json::json!({"type": "jwt", "secret": "s"});
+        let auth = JwtAuth::from_config(without).unwrap();
+        assert!(auth.jwe.is_none());
     }
 
     // --- constant_time_eq tests ---

@@ -353,6 +353,15 @@ argon2 = "0.5"
 
 # JWT verification (HS*, RS*, ES* etc.).
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+# JWE (RFC 7516) decryption in the jwt auth provider (WOR-2520):
+# RSA-OAEP / RSA-OAEP-256 key unwrap, ECDH-ES key agreement, and
+# A256GCM content decryption. Already in the dependency graph as
+# jsonwebtoken's crypto backend (same version, default features), so
+# depending on it directly adds no new crates to the lockfile. Chosen
+# over the josekit JOSE crate, which would bind a second full crypto
+# stack (OpenSSL) into a workspace that deliberately runs on
+# rustls/ring + aws-lc-rs.
+aws-lc-rs = "1"
 
 # JSON Schema validation.
 jsonschema = { version = "0.17", default-features = false }
