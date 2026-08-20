@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -345,7 +345,10 @@ tail and a runtime log-level control.
   renders roots, descendants, parents outside the ring, and ungrouped
   requests with per-session summaries. The Gateway column reads cache,
   retry, failover, load-balancer, and guardrail decisions as one causal
-  rail; expanding a row shows every bounded field.
+  rail; expanding a row shows every bounded field. For `admin`
+  operators, an expanded AI-dispatched row also offers "Replay in
+  playground", which re-runs the entry through the governed dispatch
+  path (see [Replay a logged request](#replay-a-logged-request)).
 - **Mutations:** none directly on request data; `GET`/`PUT /admin/log-level`
   reads and sets the live tracing filter (e.g.
   `debug` or `sbproxy_ai=debug`) without a restart.
@@ -606,6 +609,51 @@ with, and see the response, token usage, cost, and latency.
 - **Empty/error notes:** no AI origins configured is an empty state
   ("nothing to talk to yet"); an upstream failure surfaces the
   provider's error, not a generic one.
+
+### Replay a logged request
+
+An expanded row on the Logs page offers "Replay in playground" on any
+AI-dispatched entry (`admin` role only; the dispatch route refuses
+`read_only` operators). It opens this page with the entry's request id
+in the URL and pre-fills the form with what the request log actually
+retains:
+
+- **Always reconstructable:** the origin, the model, and the minted
+  virtual key the request ran as. These live on the ring entry itself,
+  so they survive even when no content was captured.
+- **The body, only when it was captured:** the prompt loads from the
+  redacted content sample retained when the AI origin sets
+  `capture_content: true` and the governed key's policy consents with
+  `allow_content_capture`. The page reads it through
+  `GET /api/requests/{request_id}/content`, the same audited admin
+  read behind the "View captured content" button on the Logs page, so
+  a replay surfaces nothing a normal log read would not. A captured
+  replay carries every captured message in order; the Prompt box edits
+  the last user message. Capture redacts before storage, so the replay
+  sends the redacted text, not the original bytes.
+- **Never reconstructable:** sampling parameters (temperature, token
+  limits) are not retained in the log, so the replay dispatches with
+  the playground's defaults. When no content sample exists (capture
+  not enabled, key consent absent, or the bounded sample store evicted
+  or restarted), the page states the gap and pre-fills only origin,
+  model, and key. It never fabricates a prompt.
+
+```mermaid
+flowchart LR
+    A[Logs: expanded AI request row] -->|Replay in playground| B[Playground, request id in the URL]
+    B --> C{"Content sample retained?\n(capture_content AND\nallow_content_capture)"}
+    C -->|yes, read is audited| D["Origin, model, key, and the\nredacted messages pre-fill"]
+    C -->|no| E["Origin, model, and key pre-fill;\nthe body gap is stated"]
+    D --> F["POST /admin/api/playground/dispatch"]
+    E --> F
+    F --> G["Governed pipeline: key policy, budgets,\nrouting, guardrails, like the original run"]
+```
+
+The dispatch is the governed one described above, pre-selected to the
+original request's virtual key when that key is still active. A
+replayed request is a new request: it runs the full policy chain
+again, spends real budget, and lands in the log under its own request
+id. The replay never touches the ungoverned `/chat` route.
 
 ## Cache (`/cache`)
 
