@@ -106,6 +106,30 @@ describe("KeysView policy editing contract", () => {
     expect(keysView).toContain("statusOf(k) !== 'revoked'");
   });
 
+  it("shows an active budget raise with its countdown and grantor", () => {
+    // WOR-2561: the server lists `budget_override` only while unexpired,
+    // so the badge, the expiry countdown, and the audit identity render
+    // straight from the key document.
+    expect(keysView).toContain("k.budget_override");
+    expect(keysView).toContain('label="raised"');
+    expect(keysView).toContain("overrideCountdown(k.budget_override.expires_at)");
+    expect(keysView).toContain("granted by {{ k.budget_override.granted_by }}");
+  });
+
+  it("grants and clears a temporary budget raise", () => {
+    expect(keysView).toContain("api.grantBudgetOverride");
+    expect(keysView).toContain("api.clearBudgetOverride");
+    expect(keysView).toContain("Raise budget");
+    expect(keysView).toContain("Clear raise");
+    expect(keysView).toContain("boostForm.ttl_minutes");
+    expect(keysView).toContain(
+      "Raise at least one axis: a token increase or a USD increase.",
+    );
+    // The grant form explains auto-expiry rather than implying a manual
+    // revert is needed.
+    expect(keysView).toContain("expires on its");
+  });
+
   it("loads governed usage for one selected key", () => {
     expect(keysView).toContain("api.keyUsage");
     expect(keysView).toContain("openUsage(k)");

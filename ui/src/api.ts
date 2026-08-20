@@ -568,6 +568,29 @@ export interface KeyPolicy {
   [k: string]: unknown;
 }
 
+/** A temporary, auto-expiring raise on top of a key's base budget
+ *  (WOR-2561). Present on the key document only while unexpired; the
+ *  server evaluates expiry lazily on read, so a listed override is an
+ *  active one. */
+export interface KeyBudgetOverride {
+  max_tokens_increase?: number | null;
+  max_cost_usd_increase?: number | null;
+  expires_at: string;
+  granted_by: string;
+  granted_at: string;
+  reason?: string | null;
+}
+
+/** Grant body for `POST /admin/keys/{id}/budget-override`. One of
+ *  `ttl_secs` or `expires_at` names the expiry. */
+export interface KeyBudgetOverrideGrant {
+  max_tokens_increase?: number;
+  max_cost_usd_increase?: number;
+  ttl_secs?: number;
+  expires_at?: string;
+  reason?: string;
+}
+
 export interface AdminKey {
   id?: string;
   key_id?: string;
@@ -602,6 +625,10 @@ export interface AdminKey {
   budget?: unknown;
   max_budget_tokens?: number;
   max_budget_usd?: number;
+  /** Active temporary raise on the base budget, when one is granted. */
+  budget_override?: KeyBudgetOverride | null;
+  /** The budget currently enforced: base plus any active override. */
+  effective_budget?: { max_tokens?: number | null; max_cost_usd?: number | null } | null;
   project?: string;
   user?: string;
   tenant_id?: string;
@@ -2648,6 +2675,24 @@ export const api = {
       "POST",
       `/admin/keys/${encodeURIComponent(id)}/${action}`,
     ),
+  // WOR-2561: temporary, auto-expiring budget overrides. The grant raises
+  // the key's effective budget until `expires_at`; the base budget resumes
+  // on its own after that, so clearing is only for ending a raise early.
+  grantBudgetOverride: async (id: string, grant: KeyBudgetOverrideGrant) => {
+    const document = await sendJson<{ key: AdminKey }>(
+      "POST",
+      `/admin/keys/${encodeURIComponent(id)}/budget-override`,
+      grant,
+    );
+    return document.key;
+  },
+  clearBudgetOverride: async (id: string) => {
+    const document = await sendJson<{ key: AdminKey }>(
+      "DELETE",
+      `/admin/keys/${encodeURIComponent(id)}/budget-override`,
+    );
+    return document.key;
+  },
   deleteKey: (id: string) =>
     sendJson<unknown>("DELETE", `/admin/keys/${encodeURIComponent(id)}`),
 

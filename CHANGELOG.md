@@ -12,6 +12,21 @@ the next version cut.
 
 ### Added
 
+- **Temporary, auto-expiring budget overrides on dynamic keys.** `POST
+  /admin/keys/{id}/budget-override` raises a governed key's effective
+  budget on top of its base caps (`max_tokens_increase`,
+  `max_cost_usd_increase`) until a `ttl_secs` or `expires_at` expiry,
+  after which the base caps resume with no operator action: expiry is
+  persisted on the key record and evaluated lazily at every budget
+  read, so it survives restarts and needs no sweeper. Read responses
+  and the console's Keys page show the base budget, the override with
+  its countdown and grantor, and the enforced `effective_budget`;
+  `DELETE` on the same path ends a raise early. Grant and expiry both
+  land in the `key_audit` trail (`budget_override_grant` naming the
+  operator, `budget_override_expire`). See the temp-override section
+  of [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/temp-budget-override/](examples/temp-budget-override/).
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,

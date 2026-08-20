@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -276,6 +276,8 @@ the policy model these records drive.
 | POST | `/admin/keys/{id}/block` | Mark blocked (reversible). |
 | POST | `/admin/keys/{id}/unblock` | Mark active. |
 | POST | `/admin/keys/{id}/rotate` | Mint a new secret with a grace-window dual-key transition. |
+| POST | `/admin/keys/{id}/budget-override` | Grant a temporary, auto-expiring raise on the key's base budget. |
+| DELETE | `/admin/keys/{id}/budget-override` | End an active raise early; the base budget resumes immediately. |
 | GET | `/admin/credentials` | List upstream credentials (no secrets). |
 | POST | `/admin/credentials` | Create a credential (`vault_ref` or `secret`, envelope-sealed at rest). |
 | GET | `/admin/credentials/{id}` | Fetch one credential. |
@@ -368,6 +370,23 @@ Mints a fresh secret, keeps the prior hash valid for `grace_secs`
 ```json
 {"token": "sbp_key_9f2c..._<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
 ```
+
+### `POST /admin/keys/{id}/budget-override`
+
+Body: `{"max_tokens_increase": <optional>, "max_cost_usd_increase":
+<optional>, "ttl_secs": <or expires_at>, "expires_at": <RFC 3339>,
+"reason": <optional>, "expected_revision": <optional>}`. At least one
+increase is required, each must be positive, and each must raise an axis
+the base budget actually caps; exactly one of `ttl_secs` or `expires_at`
+names the expiry, which must be in the future. The raise applies on top
+of the base budget until then, after which the base resumes with no
+further call. Regranting replaces the current raise. Read responses
+carry `budget` (the base), `budget_override` (increases, `expires_at`,
+`granted_by`, `granted_at`, `reason`), and `effective_budget` while a
+raise is live. `DELETE` on the same path ends the raise early and is
+`404` when none is active. Grant and expiry are both `key_audit`
+records (`budget_override_grant` with the acting operator,
+`budget_override_expire` when an admin read retires a lapsed grant).
 
 ### `GET /admin/keys/{id}/usage`
 
