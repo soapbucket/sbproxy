@@ -6,6 +6,25 @@ Every origin decides who may call it with an `authentication` block, a sibling o
 
 Two related things are deliberately absent from the tables below. mTLS client certificates are verified during the TLS handshake, before any auth provider runs, so they are configured on the listener rather than per origin; see [what rides alongside](#what-rides-alongside-authentication). And a `type:` value that names none of the twelve falls through to the auth plugin registry, so a linked plugin crate can add types such as `oauth_introspection` or `saml` without patching the proxy ([configuration.md](configuration.md#authentication)).
 
+The whole decision path, socket to policy chain. Stages the pipeline runs between these boxes (CORS preflight, bot and agent identity resolution, and the rest) are in [architecture.md](architecture.md#3-request-pipeline):
+
+```mermaid
+flowchart TD
+    REQ["Request arrives,\nhostname matched to an origin"] --> TLS{"Listener mTLS\nconfigured?"}
+    TLS -->|no| AB{"The origin's\nauthentication block"}
+    TLS -->|yes| MV["Client certificate verified\nin the TLS handshake"]
+    MV -->|"handshake fails"| DROP["Rejected before\nany provider runs"]
+    MV -->|verified| AB
+    AB -->|"single provider"| ONE["The one provider\naccepts or rejects"]
+    AB -->|"composition list"| SLOT["Try the next entry\nin declared order"]
+    SLOT -->|"rejects, entries remain"| SLOT
+    SLOT -->|accepts| WIN["The winner binds the principal:\nattribution, access log principal_kind,\ndecision records, the auth metric"]
+    SLOT -->|"rejects, list exhausted"| DENY["Denied at the proxy:\nthe first entry's status and message,\nall WWW-Authenticate challenges\nmerged on (RFC 7235)"]
+    ONE -->|accepts| WIN
+    ONE -->|rejects| DENY
+    WIN --> POL["Request policy chain\n(rate limits, WAF, object_authz, ...)"]
+```
+
 ## Which provider
 
 ### People at browsers and terminals
@@ -34,6 +53,22 @@ Two related things are deliberately absent from the tables below. mTLS client ce
 | Provider | What it proves | Reach for it when | Example |
 |---|---|---|---|
 | [`noop`](configuration.md#authentication) | Nothing. Every request passes. | You want the config to say out loud that an origin is deliberately unauthenticated. | One line of config; no example needed. |
+
+The same split, as a triage. The tables above carry the detail:
+
+```mermaid
+flowchart TD
+    Q{"Who calls this origin?"} -->|"people at browsers\nand terminals"| P{"Where does the\ncredential live?"}
+    Q -->|"services, agents,\nand crawlers"| M{"What can the\ncaller present?"}
+    Q -->|"no one is challenged,\non purpose"| NOOP["noop"]
+    P -->|"your IdP, as an\nSSO login"| OIDC["oidc"]
+    P -->|"an auth service\nyou already run"| FA["forward_auth"]
+    P -->|"a username and\npassword pair"| PW["basic_auth, or digest\nwhen a legacy system\ninsists on RFC 7616"]
+    M -->|"issuer-signed\ntokens"| JWT["jwt"]
+    M -->|"credentials in LDAP or\nActive Directory"| LDAP["ldap_auth"]
+    M -->|"a crawler signature\nor grant"| BOT["bot_auth, or cap for\npaid contracted traffic"]
+    M -->|"a static secret"| KEY["api_key or bearer;\nhmac_auth to keep it\noff the wire"]
+```
 
 ## Accepting more than one provider
 
@@ -75,6 +110,24 @@ origins:
 ```
 
 For a cutover to issuer-signed tokens instead, the second entry becomes a `jwt` block with your `jwks_url` and `issuer`; [configuration.md](configuration.md#accepting-more-than-one-provider) shows exactly that pairing. Either way, progress is measurable: the access log's `principal_kind` column names the provider that won each request, so you can watch legacy traffic drain and delete the old entry when it reaches zero.
+
+One round trip through that config, from a caller already moved to the new token:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as SBproxy
+    participant U as test.sbproxy.dev
+
+    C->>P: GET /get, Host: api.local<br/>Authorization: Bearer new-token-1
+    Note over P: authentication list: [api_key, bearer]
+    P->>P: api_key finds no X-Api-Key header,<br/>loses its slot
+    P->>P: bearer matches new-token-1 and wins
+    P->>U: Request forwarded,<br/>bearer principal bound
+    U-->>P: 200 OK
+    P-->>C: 200 OK
+    Note over P: Access log principal_kind names bearer,<br/>the winner, never the composite
+```
 
 ## What rides alongside authentication
 

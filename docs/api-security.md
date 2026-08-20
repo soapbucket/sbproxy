@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -151,6 +151,8 @@ the scheme that rejected it, and never with the credential.
 
 See [`examples/auth-jwt/`](../examples/auth-jwt/) for a complete working
 config.
+[authentication.md](authentication.md) is the chooser across all twelve
+providers, including how one origin accepts more than one.
 
 **Still yours.** Choosing an audience and issuer that actually narrow anything.
 A JWT validated against a wildcard audience is a validated JWT that proves
