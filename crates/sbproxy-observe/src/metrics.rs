@@ -2229,6 +2229,46 @@ pub fn record_http_framing_block(reason: &str, tenant: &str) {
         .inc();
 }
 
+/// Record one WebSocket upgrade refusal or tunnel teardown initiated
+/// by the gateway (WOR-2552).
+///
+/// `reason` is a closed three-value set: `message_too_large` (a frame
+/// scan crossed the `websocket` action's `max_message_size` cap),
+/// `subprotocol_violation` (the upstream's 101 selected a subprotocol
+/// outside the negotiated set, refused before the tunnel opened), and
+/// `upstream_error` (a post-upgrade failure tore the tunnel down:
+/// an upstream reset, timeout, or read error; WOR-2551's no-write
+/// teardown). `direction` is
+/// `client_to_upstream` or `upstream_to_client` for the size cap, and
+/// `none` for the two reasons that have no per-direction scan. Both
+/// are proxy-authored constants; `tenant` and `origin` are
+/// operator-scoped and pass through the cardinality limiter.
+///
+/// Registration failure yields no counter rather than a panic, the same
+/// shape [`record_policy_panic`] uses. This runs while a connection is
+/// already being torn down, and killing the process over a metric that
+/// would not register is a worse outcome than the missing series.
+pub fn record_websocket_teardown(reason: &str, direction: &str, tenant: &str, origin: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_websocket_teardowns_total",
+            "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin",
+            &["reason", "direction", "tenant", "origin"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let tenant_san = sanitize_label("tenant", tenant);
+        let origin_san = sanitize_label("origin", origin);
+        counter
+            .with_label_values(&[reason, direction, tenant_san.as_str(), origin_san.as_str()])
+            .inc();
+    }
+}
+
 /// Count a request that was rejected before origin resolution because
 /// no configured origin matched the inbound Host. `reason` is a closed
 /// string (`unknown_host`). These requests never reach the access log

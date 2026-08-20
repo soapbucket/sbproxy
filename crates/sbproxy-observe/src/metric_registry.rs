@@ -3590,6 +3590,17 @@ pub const METRICS: &[MetricCapability] = &[
         description: "WAF persistent (time-boxed) block actions, by lifecycle event and key kind.",
         dead_reason: None,
     },
+    MetricCapability {
+        name: "sbproxy_websocket_teardowns_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_websocket_teardown"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason", "direction", "tenant", "origin"],
+        description: "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin.",
+        dead_reason: None,
+    },
 ];
 
 /// Dashboards and alert rules that knowingly read a metric nothing writes.
@@ -3730,6 +3741,12 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_usage_bridge_enqueued_total",
     "sbproxy_usage_bridge_gap_total",
     "sbproxy_waf_persistent_blocks_total",
+    // WOR-2552. A websocket enforcement teardown is a security-policy
+    // outcome for one tenant's tunnel traffic, same reasoning as the
+    // WAF and egress counters beside it: merged across tenants it
+    // answers "some tunnel was torn down somewhere", which cannot tell
+    // an operator whose traffic is being refused.
+    "sbproxy_websocket_teardowns_total",
 ];
 
 /// Tenant-scoped families that are known to lack a tenant label today, and

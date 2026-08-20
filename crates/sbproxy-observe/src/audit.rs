@@ -1290,6 +1290,11 @@ mod tests {
             "waf",
             "prompt_injection",
             "credential_exposure",
+            // WOR-2552: the `websocket` action's two enforcement
+            // verdicts. Named here because this is the assertion that
+            // says which feed a SIEM rule finds them on.
+            "websocket_message_too_large",
+            "websocket_subprotocol_violation",
         ] {
             let entry = SecurityAuditEntry::policy_violation(
                 policy, "blocked", 403, None, None, None, None,

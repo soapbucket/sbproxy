@@ -345,3 +345,4 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_usage_bridge_enqueued_total` | Counter | `stable` | `beta` | `tenant_id`, `reporter`, `resource_type`, `result` | Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new. |
 | `sbproxy_usage_bridge_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Billable units that could not be queued for a usage reporter, by tenant and the posture in force. |
 | `sbproxy_waf_persistent_blocks_total` | Counter | `stable` | `beta` | `origin`, `tenant`, `event`, `key_kind` | WAF persistent (time-boxed) block actions, by lifecycle event and key kind. |
+| `sbproxy_websocket_teardowns_total` | Counter | `stable` | `beta` | `reason`, `direction`, `tenant`, `origin` | WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. |
