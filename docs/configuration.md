@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2326,6 +2326,16 @@ How the list behaves:
 - A provider that fails, whatever the reason, loses only its own slot. The next provider still runs, and a request no provider accepts is rejected.
 - A one-entry list is refused at config load; write a single provider as a plain mapping.
 - Three types are refused inside a list. `noop` would admit every request and make the other entries decorative. `forward_auth` runs as a separate subrequest and only works as an origin's sole provider. `oidc` needs the login-callback endpoint that only a sole `oidc` block wires up.
+
+The list, as a loop:
+
+```mermaid
+flowchart TD
+    R["Request reaches the origin's\nauthentication list"] --> T["Try the next entry\nin declared order"]
+    T -->|"rejects, entries remain"| T
+    T -->|accepts| W["First success wins: that entry binds\nattribution, audit events, decision\nrecords, and the auth metric"]
+    T -->|"rejects, list exhausted"| D["Denied: the first entry's status and message,\nall WWW-Authenticate challenges\nmerged on (RFC 7235)"]
+```
 
 See [examples/auth-composition/](../examples/auth-composition/) for a runnable two-provider config.
 
