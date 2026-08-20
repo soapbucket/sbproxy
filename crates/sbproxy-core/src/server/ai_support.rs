@@ -4602,6 +4602,62 @@ mod budget_window_tests {
         );
     }
 
+    /// Read the current `sbproxy_ai_budget_utilization_ratio` value for
+    /// one scope label off the process-global default registry, where
+    /// `sbproxy-ai`'s register macro puts it. `NAN` when the series does
+    /// not exist yet, which fails every assertion below by construction.
+    fn budget_utilization_gauge_value(scope: &str) -> f64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_ai_budget_utilization_ratio" {
+                continue;
+            }
+            for metric in &family.metric {
+                let matches = metric
+                    .label
+                    .iter()
+                    .any(|l| l.name() == "scope" && l.value() == scope);
+                if !matches {
+                    continue;
+                }
+                if let Some(gauge) = metric.gauge.as_ref() {
+                    return gauge.value();
+                }
+            }
+        }
+        f64::NAN
+    }
+
+    /// WOR-2560: consuming budget moves the utilization gauge, through
+    /// the same `record_usage` + `refresh_budget_utilization` pair the
+    /// billing path drives. This is the scrape an operator's headroom
+    /// alert reads (`1 - sbproxy_ai_budget_utilization_ratio`), so the
+    /// value has to track the tracker debit for debit, not just exist.
+    /// Isolation note: the gauge's `scope` label is class-wide and
+    /// process-global; nextest runs each test in its own process, which
+    /// is what makes the exact-value assertions safe.
+    #[test]
+    fn consuming_budget_moves_the_utilization_gauge() {
+        let key = format!("wor2560:{}:gauge-moves", std::process::id());
+        let cfg = api_key_token_cap(1_000);
+        let keys = vec![(0usize, key.clone())];
+
+        BUDGET_TRACKER.record_usage(&key, 250, 0.0);
+        refresh_budget_utilization(&cfg, &keys);
+        let quarter = budget_utilization_gauge_value("api_key");
+        assert!(
+            (quarter - 0.25).abs() < 1e-9,
+            "250 of 1000 tokens consumed must read 0.25, got {quarter}"
+        );
+
+        BUDGET_TRACKER.record_usage(&key, 250, 0.0);
+        refresh_budget_utilization(&cfg, &keys);
+        let half = budget_utilization_gauge_value("api_key");
+        assert!(
+            (half - 0.5).abs() < 1e-9,
+            "a further debit must move the gauge to 0.5, got {half}"
+        );
+    }
+
     // --- WOR-2213: the routing feedback sees the real status ---
 
     use super::record_routing_feedback;
