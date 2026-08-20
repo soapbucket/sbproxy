@@ -27,14 +27,14 @@ function pinnedOf(p: PromptEntry): string {
 // ---- add version ----
 const showAdd = ref(false);
 const addTarget = ref<PromptEntry | null>(null);
-const addForm = reactive({ version: "", content: "" });
+const addForm = reactive({ version: "", template: "" });
 const addBusy = ref(false);
 const addError = ref<ApiError | null>(null);
 
 function openAdd(p: PromptEntry) {
   addTarget.value = p;
   addForm.version = "";
-  addForm.content = "";
+  addForm.template = "";
   addError.value = null;
   showAdd.value = true;
 }
@@ -44,9 +44,10 @@ async function submitAdd() {
   addBusy.value = true;
   addError.value = null;
   try {
-    const body: Record<string, unknown> = {};
-    if (addForm.version) body.version = addForm.version;
-    if (addForm.content) body.content = addForm.content;
+    // Both fields are required by the endpoint (serde rejects a missing
+    // one with an opaque 400), so the submit button stays disabled until
+    // both are non-empty and the body always carries both.
+    const body = { version: addForm.version, template: addForm.template };
     await api.addPromptVersion(
       String(addTarget.value.host ?? ""),
       String(addTarget.value.name ?? ""),
@@ -154,11 +155,15 @@ async function submitPin() {
     </div>
     <div class="sb-field">
       <label class="sb-label">Prompt content</label>
-      <textarea class="sb-textarea" v-model="addForm.content" placeholder="Prompt text or template"></textarea>
+      <textarea class="sb-textarea" v-model="addForm.template" placeholder="Prompt text or template"></textarea>
     </div>
     <template #footer>
       <button class="sb-btn" @click="showAdd = false">Cancel</button>
-      <button class="sb-btn sb-btn--primary" :disabled="addBusy" @click="submitAdd">
+      <button
+        class="sb-btn sb-btn--primary"
+        :disabled="addBusy || !addForm.version || !addForm.template"
+        @click="submitAdd"
+      >
         {{ addBusy ? "Adding..." : "Add version" }}
       </button>
     </template>
