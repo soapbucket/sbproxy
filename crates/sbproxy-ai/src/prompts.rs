@@ -57,6 +57,15 @@ pub struct PromptVersion {
     /// The minijinja template source.
     pub template: String,
     /// Static variables exposed to the template under `variables.*`.
+    ///
+    /// These are operator-declared defaults, not operator-only values.
+    /// A `/v1/responses` caller sending
+    /// `"prompt": {"id": ..., "variables": {...}}` overwrites any of
+    /// them by name, so a constraint that must hold whatever the
+    /// caller sends belongs in the template text rather than here. The
+    /// `"name@version"` string form cannot supply variables at all, so
+    /// the same stored version has two trust models depending on which
+    /// surface reached it.
     #[serde(default)]
     pub variables: serde_json::Map<String, serde_json::Value>,
 }
@@ -105,7 +114,7 @@ impl std::fmt::Display for PromptError {
             PromptError::NoVersion(n) => {
                 write!(f, "prompt '{}' has no resolvable version", scrub(n))
             }
-            PromptError::Render(e) => write!(f, "prompt render failed: {e}"),
+            PromptError::Render(e) => write!(f, "prompt render failed: {}", scrub_detail(e)),
         }
     }
 }
@@ -120,6 +129,32 @@ impl std::fmt::Display for PromptError {
 /// becomes `unknown`, capped at 64 characters.
 fn scrub(fragment: &str) -> String {
     crate::format::sanitize_type_label(fragment)
+}
+
+/// Cap on a rendered `scrub_detail` message.
+const RENDER_DETAIL_CAP: usize = 200;
+
+/// Scrub a free-text detail (a template render error) for the same
+/// warn line, without flattening it into an identifier.
+///
+/// [`scrub`] is for fragments that are identifier-shaped to begin with
+/// (a prompt id, a version label). A minijinja render error is a
+/// sentence, and it can echo the caller's own `variables.*` values
+/// back into it, so it needs the newline-forging class closed without
+/// turning every space into an underscore: every ASCII control
+/// character becomes a space and the result is capped
+/// (WOR-2514 review, the one `Display` arm the first scrub sweep
+/// missed).
+fn scrub_detail(detail: &str) -> String {
+    let mut out: String = detail
+        .chars()
+        .take(RENDER_DETAIL_CAP)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if detail.chars().count() > RENDER_DETAIL_CAP {
+        out.push_str("...");
+    }
+    out
 }
 
 impl std::error::Error for PromptError {}
@@ -153,6 +188,16 @@ impl PromptStore {
     /// version label. `caller_variables` joins the resolved version's
     /// static `variables` in the template's `variables.*` scope; a
     /// caller-supplied value shadows a same-named static one.
+    ///
+    /// That shadowing is a trust boundary, not a convenience. The
+    /// `"name@version"` string path calls this with an empty
+    /// `caller_variables` map, so a version's static `variables` are
+    /// operator-only there; on `/v1/responses` the caller can overwrite
+    /// any of them by name. An operator who needs a value the caller
+    /// cannot rewrite should inline it in the template rather than
+    /// declare it under `variables:`. There is no per-version lock
+    /// today (WOR-2514 review), and `docs/ai-gateway.md` says the same
+    /// where the operator writes `variables:`.
     fn render_named(
         &self,
         name: &str,
@@ -997,6 +1042,75 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(r.version, "2");
+    }
+
+    #[test]
+    fn a_render_refusal_carries_the_caller_value_into_the_message() {
+        // Why the arm below matters: the Render detail is a minijinja
+        // message, and minijinja quotes what it was handed. On this
+        // path what it was handed is a caller-supplied `variables.*`
+        // value, so the refusal body and the warn `ai_dispatch` emits
+        // both carry client bytes.
+        let mut s = store();
+        s.templates.insert(
+            "echoing".to_string(),
+            NamedPrompt {
+                default_version: None,
+                versions: HashMap::from([(
+                    "1".to_string(),
+                    PromptVersion {
+                        template: "{% include variables.city %}".to_string(),
+                        variables: serde_json::Map::new(),
+                    },
+                )]),
+            },
+        );
+        let err = resolve_prompt_object(
+            &pobj(serde_json::json!({
+                "id": "echoing",
+                "variables": {"city": "caller-controlled-fragment"}
+            })),
+            "host-a.example.com",
+            &RuntimePromptOverlay::default(),
+            Some(&s),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        let PromptObjectRefusal::Render(m) = err else {
+            panic!("expected Render, got {err:?}");
+        };
+        assert!(m.contains("caller-controlled-fragment"), "{m:?}");
+    }
+
+    #[test]
+    fn render_refusals_are_scrubbed_too() {
+        // Red-first (WOR-2514 review): every Display arm but Render
+        // called a scrub, so Render was the one path that could carry
+        // a raw control character into a plain-text warn line. Whether
+        // today's minijinja happens to escape one is not the property
+        // worth depending on; the arm is.
+        let rendered =
+            PromptError::Render("boom\nFAKE 2026-08-20 ERROR forged line".to_string()).to_string();
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "a forged log record: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("boom FAKE"),
+            "scrubbed, not omitted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_long_render_detail_is_capped() {
+        let detail = "x".repeat(5_000);
+        let rendered = PromptError::Render(detail).to_string();
+        assert!(
+            rendered.len() < 300,
+            "unbounded render detail: {}",
+            rendered.len()
+        );
+        assert!(rendered.ends_with("..."), "{rendered}");
     }
 
     #[test]

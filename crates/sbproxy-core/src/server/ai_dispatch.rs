@@ -4470,6 +4470,14 @@ pub(super) async fn handle_ai_proxy(
             body_bytes.as_ref(),
         );
 
+    // The inbound translate seams warn with the origin and tenant that
+    // produced a drop, so an alert on
+    // `sbproxy_ai_translation_dropped_total` has somewhere to go next
+    // without capturing request bodies in production. An empty tenant
+    // id means the deployment is single-tenant; send `None` rather than
+    // an empty field.
+    let translation_tenant = Some(ctx.tenant_id.as_str()).filter(|t| !t.is_empty());
+
     // --- Native-format inbound shim ---
     //
     // Anthropic Messages and OpenAI Responses arrive on their own
@@ -4486,6 +4494,8 @@ pub(super) async fn handle_ai_proxy(
         sbproxy_ai::handler::AiSurface::Messages => {
             match sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
                 body_bytes.as_ref(),
+                hostname,
+                translation_tenant,
             ) {
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("anthropic".into());
@@ -4567,6 +4577,8 @@ pub(super) async fn handle_ai_proxy(
             }
             match sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
                 inbound_bytes.as_ref(),
+                hostname,
+                translation_tenant,
             ) {
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("responses".into());
@@ -13620,12 +13632,23 @@ fn bridge_responses_prompt_object(
                 use sbproxy_ai::prompts::PromptObjectRefusal;
                 let (status, message) = match refusal {
                     PromptObjectRefusal::NotFound(m) => {
-                        // WOR-2514 review: naming which half of the
-                        // reference missed (prompt vs version) was an
-                        // existence oracle for stored prompt names. The
-                        // caller gets one generic body; the precise,
-                        // already-scrubbed reason stays server-side at
-                        // debug level.
+                        // One generic body for both halves of the
+                        // reference: naming whether the prompt or the
+                        // version missed told a caller which stored
+                        // names exist while probing versions, and the
+                        // precise, already-scrubbed reason is just as
+                        // useful server-side at debug level.
+                        //
+                        // What this does NOT do is hide prompt
+                        // existence. A stored name still answers 200
+                        // and an absent one still answers 404, and a
+                        // template with a strict-undefined
+                        // `variables.*` hole answers 400 rather than
+                        // 404 when the name resolves. Prompt names are
+                        // not secrets here; treating them as such
+                        // would need a uniform status across resolve
+                        // and render, which would also hide real
+                        // client errors (WOR-2514 review).
                         tracing::debug!(
                             reason = %m,
                             "AI proxy: Responses prompt reference not found"
@@ -13696,6 +13719,8 @@ mod responses_prompt_bridge_tests {
 
         let chat = sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
             &serde_json::to_vec(&body).unwrap(),
+            "ai.test",
+            None,
         )
         .expect("translates clean");
         let chat: serde_json::Value = serde_json::from_slice(&chat).unwrap();
@@ -13814,6 +13839,8 @@ mod responses_prompt_bridge_tests {
 
         let chat = sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
             &serde_json::to_vec(&body).unwrap(),
+            "ai.test",
+            None,
         )
         .expect("translates clean");
         let chat: serde_json::Value = serde_json::from_slice(&chat).unwrap();
@@ -16666,11 +16693,15 @@ origins:
             serde_json::to_vec(&request_with_document("different native document")).unwrap();
         assert_eq!(
             sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
-                &first_request
+                &first_request,
+                "ai.test",
+                None,
             )
             .unwrap(),
             sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
-                &conflicting_request
+                &conflicting_request,
+                "ai.test",
+                None,
             )
             .unwrap(),
             "the regression requires fields omitted by canonical translation"

@@ -28,7 +28,12 @@ use serde_json::{json, Map, Value};
 ///   * Sampling knobs (`temperature`, `top_p`, `top_k`, `max_tokens`,
 ///     `stop`) move under `generationConfig`.
 ///   * `tools: [{type:"function", function:{name, parameters,
-///     description}}]` becomes `tools: [{functionDeclarations: [...]}]`.
+///     description}}]` becomes `tools: [{functionDeclarations: [...]}]`,
+///     and `tool_choice` becomes
+///     `toolConfig.functionCallingConfig.mode` (`AUTO` / `ANY` /
+///     `NONE`, with `allowedFunctionNames` for a forced tool).
+///     Gemini's parser is strict, so a leftover top-level
+///     `tool_choice` is a 400 `Unknown name "tool_choice"`.
 ///   * `tool_calls` on assistant messages become content parts with
 ///     `functionCall`. `role: "tool"` messages become user-role
 ///     `functionResponse` parts.
@@ -149,7 +154,20 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
         }
     }
 
-    // 4. Drop OpenAI-only knobs Gemini rejects.
+    // 4. Tool choice moves under toolConfig. Gemini's request parser
+    //    rejects any unknown top-level name outright, so the canonical
+    //    `tool_choice` has to be consumed here whether or not it maps
+    //    onto a functionCallingConfig mode.
+    if let Some(choice) = obj.remove("tool_choice") {
+        if let Some(config) = gemini_function_calling_config(&choice) {
+            obj.insert(
+                "toolConfig".to_string(),
+                json!({"functionCallingConfig": config}),
+            );
+        }
+    }
+
+    // 5. Drop OpenAI-only knobs Gemini rejects.
     for k in [
         "logit_bias",
         "n",
@@ -163,7 +181,7 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
         obj.remove(k);
     }
 
-    // 5. Path rewrite. Translator only supports chat completions today.
+    // 6. Path rewrite. Translator only supports chat completions today.
     let new_path = if path.ends_with("/chat/completions") && !model.is_empty() {
         format!("/v1beta/models/{}:generateContent", model)
     } else {
@@ -171,6 +189,39 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
     };
 
     (Value::Object(obj), new_path)
+}
+
+/// Map an OpenAI-shaped `tool_choice` onto Gemini's
+/// `functionCallingConfig`. `None` means the field carries nothing
+/// Gemini can act on and is simply consumed, which is what `auto`
+/// asks for anyway. A forced tool becomes `ANY` narrowed by
+/// `allowedFunctionNames`, the only way Gemini expresses "call this
+/// one".
+fn gemini_function_calling_config(choice: &Value) -> Option<Value> {
+    if let Some(s) = choice.as_str() {
+        return match s {
+            "none" => Some(json!({"mode": "NONE"})),
+            "required" => Some(json!({"mode": "ANY"})),
+            "auto" => Some(json!({"mode": "AUTO"})),
+            _ => None,
+        };
+    }
+    let obj = choice.as_object()?;
+    match obj.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(json!({"mode": "AUTO"})),
+        Some("any") => Some(json!({"mode": "ANY"})),
+        Some("none") => Some(json!({"mode": "NONE"})),
+        Some("tool") => obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({"mode": "ANY", "allowedFunctionNames": [name]})),
+        Some("function") => obj
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .map(|name| json!({"mode": "ANY", "allowedFunctionNames": [name]})),
+        _ => None,
+    }
 }
 
 /// Convert an OpenAI chat-completions message into a Gemini content

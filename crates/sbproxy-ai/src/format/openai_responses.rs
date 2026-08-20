@@ -32,6 +32,20 @@
 //!     400 because it asks the provider to dial an MCP server the
 //!     gateway never sees (WOR-2513 ruling).
 //!
+//!   * `tool_choice` is honored, in the OpenAI string spellings and in
+//!     both the Responses-native flat forced-tool shape and the
+//!     Chat-style nested one.
+//!
+//! Everything else this parser reads past records a `LossinessNote`:
+//! every top-level key outside `RESPONSES_REPRESENTED_TOP_LEVEL_KEYS`
+//! (`text` structured output, `reasoning`, `truncation`, `metadata`,
+//! `include`, and whatever OpenAI ships next), every input content
+//! part that maps onto no hub variant, and every non-object entry in a
+//! message list. The translate seam counts each class on
+//! `sbproxy_ai_translation_dropped_total` and emits one bounded warn
+//! per request (WOR-2554 review; this surface has the live translate
+//! seam and was the one the first sweep skipped).
+//!
 //! Outbound shape is the Responses response object: `output` array of
 //! typed items wrapping the assistant message; `usage.input_tokens`
 //! and `usage.output_tokens`. Streaming is implemented:
@@ -41,8 +55,8 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    BridgeContext, ChatError, ChatFormat, ContentPart, ContentPartDelta, FinishReason, HubChunk,
-    HubMessage, HubRequest, HubResponse, HubToolDefinition, Role,
+    json_type_name, note_drop, BridgeContext, ChatError, ChatFormat, ContentPart, ContentPartDelta,
+    FinishReason, HubChunk, HubMessage, HubRequest, HubResponse, HubToolDefinition, Role,
 };
 
 const INBOUND_PATHS: &[&str] = &["/v1/responses"];
@@ -191,18 +205,26 @@ impl ChatFormat for OpenAiResponsesFormat {
                         .any(|o| o.contains_key("role"));
                     if is_message_list {
                         for item in arr {
-                            if let Some(o) = item.as_object() {
-                                hub.messages.push(parse_responses_message(o)?);
+                            match item.as_object() {
+                                Some(o) => {
+                                    let message = parse_responses_message(o, &mut hub.lossiness)?;
+                                    hub.messages.push(message);
+                                }
+                                None => note_drop(
+                                    &mut hub.lossiness,
+                                    "responses.input",
+                                    "responses.input".into(),
+                                    format!(
+                                        "non-object input entry of JSON type '{}' dropped",
+                                        json_type_name(item)
+                                    ),
+                                ),
                             }
                         }
                     } else {
                         let mut content = Vec::new();
                         for part in arr {
-                            if let Some(p) = part.as_object() {
-                                if let Some(cp) = parse_responses_content_part(p) {
-                                    content.push(cp);
-                                }
-                            }
+                            push_responses_content_part(part, &mut content, &mut hub.lossiness);
                         }
                         hub.messages.push(HubMessage {
                             role: Role::User,
@@ -212,7 +234,17 @@ impl ChatFormat for OpenAiResponsesFormat {
                         });
                     }
                 }
-                _ => {}
+                Value::Null => {}
+                other => note_drop(
+                    &mut hub.lossiness,
+                    "responses.input",
+                    "responses.input".into(),
+                    format!(
+                        "input value of JSON type '{}' dropped: expected a string, \
+                         an array of content parts, or an array of message objects",
+                        json_type_name(other)
+                    ),
+                ),
             }
         }
 
@@ -262,15 +294,193 @@ impl ChatFormat for OpenAiResponsesFormat {
                     // WOR-2512: every unsupported tool block leaves a
                     // trace naming what was dropped.
                     let label = super::sanitize_type_label(ty);
-                    hub.lossiness.push(super::LossinessNote {
-                        field: format!("responses.tools.{label}"),
-                        metric_label: "responses.tools".into(),
-                        direction: super::LossinessDirection::Unsupported,
-                        note: format!(
+                    note_drop(
+                        &mut hub.lossiness,
+                        "responses.tools",
+                        format!("responses.tools.{label}"),
+                        format!(
                             "unsupported Responses tool type '{label}' dropped: \
                              only function tools are forwarded upstream"
                         ),
-                    });
+                    );
+                }
+            }
+        }
+
+        // Tool choice: the Responses spelling is the OpenAI one
+        // (`"none"` / `"auto"` / `"required"`) plus a forced tool in
+        // either the Responses-native flat shape
+        // (`{"type": "function", "name": ...}`) or the Chat-style
+        // nested one. All four have canonical representations, so they
+        // are honored rather than dropped: the same forced-tool bug
+        // WOR-2535 fixed on `/v1/messages` shipped here too, and the
+        // hub already carries `HubToolChoice` (WOR-2554 review).
+        match obj.get("tool_choice") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) => match s.as_str() {
+                "auto" => hub.tool_choice = super::HubToolChoice::Auto,
+                "none" => hub.tool_choice = super::HubToolChoice::None,
+                "required" => hub.tool_choice = super::HubToolChoice::Any,
+                other => {
+                    let label = super::sanitize_type_label(other);
+                    note_drop(
+                        &mut hub.lossiness,
+                        "responses.tool_choice",
+                        "responses.tool_choice".into(),
+                        format!(
+                            "tool_choice '{label}' dropped: it has no canonical \
+                             representation, so the model chooses tools as if \
+                             tool_choice were 'auto'"
+                        ),
+                    );
+                }
+            },
+            Some(Value::Object(tc)) => {
+                let name = tc
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| tc.get("function").and_then(|f| f.get("name"))?.as_str());
+                match (tc.get("type").and_then(Value::as_str), name) {
+                    (Some("function"), Some(name)) => {
+                        hub.tool_choice = super::HubToolChoice::Required(name.to_string());
+                    }
+                    (ty, _) => {
+                        let label = super::sanitize_type_label(ty.unwrap_or(""));
+                        note_drop(
+                            &mut hub.lossiness,
+                            "responses.tool_choice",
+                            "responses.tool_choice".into(),
+                            format!(
+                                "tool_choice of type '{label}' dropped: it has no \
+                                 canonical representation, so the model chooses \
+                                 tools as if tool_choice were 'auto'"
+                            ),
+                        );
+                    }
+                }
+            }
+            Some(other) => note_drop(
+                &mut hub.lossiness,
+                "responses.tool_choice",
+                "responses.tool_choice".into(),
+                format!(
+                    "tool_choice value of JSON type '{}' dropped: expected a \
+                     string or an object; the model chooses tools as if \
+                     tool_choice were 'auto'",
+                    json_type_name(other)
+                ),
+            ),
+        }
+
+        // Every top-level key outside the represented set is a control
+        // the canonical chat request cannot carry. The
+        // behavior-visible ones get a note naming what changes;
+        // everything else, today's unknowns and tomorrow's new
+        // Responses fields alike, gets the generic treatment under a
+        // sanitized key, so this detector is as wide as the parser
+        // above (WOR-2554 review: `text.format` structured output,
+        // `reasoning`, `truncation`, `metadata`, and the rest used to
+        // fall off the end of this function with no note, no counter,
+        // and no warn).
+        for (key, value) in obj {
+            if value.is_null() || RESPONSES_REPRESENTED_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            match key.as_str() {
+                "text" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.text",
+                    "responses.text".into(),
+                    "text dropped: the response-format request it carries is not \
+                     forwarded, so a json_schema client receives free-form prose \
+                     instead of the shape it asked for"
+                        .into(),
+                ),
+                "reasoning" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.reasoning",
+                    "responses.reasoning".into(),
+                    "reasoning configuration dropped: the provider serves the \
+                     request at its default reasoning effort and returns no \
+                     reasoning summary"
+                        .into(),
+                ),
+                "parallel_tool_calls" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.parallel_tool_calls",
+                    "responses.parallel_tool_calls".into(),
+                    "parallel_tool_calls dropped: the provider may still emit \
+                     parallel tool calls"
+                        .into(),
+                ),
+                "truncation" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.truncation",
+                    "responses.truncation".into(),
+                    "truncation dropped: an over-length conversation is refused \
+                     by the provider rather than truncated"
+                        .into(),
+                ),
+                "metadata" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.metadata",
+                    "responses.metadata".into(),
+                    "metadata dropped: the canonical request does not carry it, \
+                     so the provider never sees the request metadata"
+                        .into(),
+                ),
+                "include" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.include",
+                    "responses.include".into(),
+                    "include dropped: the additional output the client asked to \
+                     be returned is not requested from the provider"
+                        .into(),
+                ),
+                "top_logprobs" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.top_logprobs",
+                    "responses.top_logprobs".into(),
+                    "top_logprobs dropped: the response arrives without the \
+                     token log probabilities the client asked for"
+                        .into(),
+                ),
+                "service_tier" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.service_tier",
+                    "responses.service_tier".into(),
+                    "service_tier dropped: the provider serves the request on \
+                     its default tier"
+                        .into(),
+                ),
+                "background" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.background",
+                    "responses.background".into(),
+                    "background dropped: the request runs inline, so there is no \
+                     background job to poll"
+                        .into(),
+                ),
+                "max_tool_calls" => note_drop(
+                    &mut hub.lossiness,
+                    "responses.max_tool_calls",
+                    "responses.max_tool_calls".into(),
+                    "max_tool_calls dropped: the provider is not capped and may \
+                     emit more tool calls than the client allowed"
+                        .into(),
+                ),
+                other => {
+                    let label = super::sanitize_type_label(other);
+                    note_drop(
+                        &mut hub.lossiness,
+                        "responses.request",
+                        format!("responses.{label}"),
+                        format!(
+                            "top-level field '{label}' dropped: it has no \
+                             representation in the canonical request the \
+                             gateway governs"
+                        ),
+                    );
                 }
             }
         }
@@ -298,6 +508,30 @@ impl ChatFormat for OpenAiResponsesFormat {
         Ok(hub_chunk_to_responses_sse(chunk))
     }
 }
+
+/// Top-level OpenAI Responses request keys the hub represents (parsed
+/// in `to_hub` above) or refuses outright with a 400. Everything else
+/// hits the catch-all note loop. Keep this list in lockstep with the
+/// parser: a key parsed but not listed would double-note, a key listed
+/// but not parsed would drop silently again (WOR-2554 review).
+const RESPONSES_REPRESENTED_TOP_LEVEL_KEYS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "stream",
+    // Refused above with a 400, which is louder than a note. Listing
+    // them keeps the loop from reporting a field on a request that
+    // never reaches it.
+    "previous_response_id",
+    "conversation",
+    "store",
+    "prompt",
+];
 
 /// Translate one hub chunk into a vector of OpenAI Responses SSE
 /// frames. The Responses streaming wire format uses typed
@@ -385,7 +619,14 @@ pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
     }
 }
 
-pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
+/// Parse one Responses message object into a `HubMessage`, recording a
+/// `LossinessNote` into `lossiness` for every content part or content
+/// value that yields no hub representation (WOR-2554 review; the
+/// Anthropic surface got this detector first, on `/v1/messages`).
+pub(crate) fn parse_responses_message(
+    obj: &Map<String, Value>,
+    lossiness: &mut Vec<super::LossinessNote>,
+) -> Result<HubMessage, ChatError> {
     // WOR-599: missing or unknown role is an error, not a silent default to
     // user. Shared helper lives in the format module.
     let role = super::parse_role(obj)?;
@@ -395,14 +636,20 @@ pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMes
             Value::String(s) => content.push(ContentPart::Text { text: s.clone() }),
             Value::Array(arr) => {
                 for part in arr {
-                    if let Some(p) = part.as_object() {
-                        if let Some(cp) = parse_responses_content_part(p) {
-                            content.push(cp);
-                        }
-                    }
+                    push_responses_content_part(part, &mut content, lossiness);
                 }
             }
-            _ => {}
+            Value::Null => {}
+            other => note_drop(
+                lossiness,
+                "responses.input.content",
+                "responses.input.content".into(),
+                format!(
+                    "message content of JSON type '{}' dropped: expected a \
+                     string or an array of content parts",
+                    json_type_name(other)
+                ),
+            ),
         }
     }
     Ok(HubMessage {
@@ -411,6 +658,47 @@ pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMes
         name: None,
         tool_call_id: None,
     })
+}
+
+/// Map one wire content part into `content`, recording a note when it
+/// yields nothing. An `input_text` whose `text` is a present empty
+/// string is represented-as-nothing rather than dropped, so an SDK
+/// that pads a turn with an empty part does not tick the drop counter.
+fn push_responses_content_part(
+    part: &Value,
+    content: &mut Vec<ContentPart>,
+    lossiness: &mut Vec<super::LossinessNote>,
+) {
+    let Some(p) = part.as_object() else {
+        note_drop(
+            lossiness,
+            "responses.input.content",
+            "responses.input.content".into(),
+            format!(
+                "non-object content entry of JSON type '{}' dropped",
+                json_type_name(part)
+            ),
+        );
+        return;
+    };
+    if let Some(cp) = parse_responses_content_part(p) {
+        content.push(cp);
+        return;
+    }
+    let ty = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if matches!(ty, "text" | "input_text") && p.get("text").and_then(Value::as_str) == Some("") {
+        return;
+    }
+    let label = super::sanitize_type_label(ty);
+    note_drop(
+        lossiness,
+        "responses.input.content",
+        format!("responses.input.content.{label}"),
+        format!(
+            "content part of type '{label}' dropped: it has no representation \
+             in the canonical request the gateway governs"
+        ),
+    );
 }
 
 fn parse_responses_content_part(p: &Map<String, Value>) -> Option<ContentPart> {
@@ -540,14 +828,23 @@ pub fn translate_openai_response_to_responses(body: &[u8]) -> Vec<u8> {
 /// Completions request body. The gateway already handles the OpenAI
 /// Chat shape end to end; converting on the way in lets the existing
 /// router, guardrails, and translator pipeline run unchanged.
-pub fn translate_responses_request_to_openai(body: &[u8]) -> Result<Vec<u8>, ChatError> {
+pub fn translate_responses_request_to_openai(
+    body: &[u8],
+    origin: &str,
+    tenant: Option<&str>,
+) -> Result<Vec<u8>, ChatError> {
     let (hub, _ctx) = OpenAiResponsesFormat.to_hub(body)?;
     // Nothing downstream reads `hub.lossiness` on this path, so this
-    // seam is what makes each drop observable: the per-note drop
-    // counter plus one aggregated, bounded warn for the request
-    // (WOR-2535 review; the per-note warn loop this replaces was a
+    // seam is what makes each drop observable: the folded drop counter
+    // plus one aggregated, bounded warn for the request (WOR-2535
+    // review; the per-note warn loop this replaces was a
     // client-reachable log flood, here exactly as on /v1/messages).
-    super::report_translation_lossiness("responses", &hub.lossiness);
+    super::report_translation_lossiness(
+        crate::handler::AiSurface::Responses.label(),
+        origin,
+        tenant,
+        &hub.lossiness,
+    );
     Ok(hub_request_to_openai_bytes(&hub))
 }
 
@@ -571,11 +868,12 @@ pub fn hub_request_to_openai_bytes(hub: &HubRequest) -> Vec<u8> {
         // Plain text turns serialise as a flat string; multimodal
         // turns serialise as an array of content parts. Tool calls on
         // assistant turns surface alongside the content as
-        // `tool_calls`.
+        // `tool_calls`. Tool results become their own `role: "tool"`
+        // messages, one per result.
         let mut text_only = String::new();
         let mut parts: Vec<Value> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
-        let mut tool_result_for: Option<(String, String)> = None;
+        let mut tool_results: Vec<(String, String)> = Vec::new();
         for part in &m.content {
             match part {
                 ContentPart::Text { text } => {
@@ -598,44 +896,61 @@ pub fn hub_request_to_openai_bytes(hub: &HubRequest) -> Vec<u8> {
                         }
                     }));
                 }
+                // One `Option` here kept only the LAST result and
+                // silently discarded every earlier one, so an
+                // Anthropic parallel-tool-use turn (two `tool_result`
+                // blocks in one user message, a shape the native
+                // bypass never accepts) reached the provider with half
+                // its results and looked like a model error
+                // (WOR-2554 review).
                 ContentPart::ToolResult {
                     tool_call_id,
                     content,
                     ..
-                } => {
-                    tool_result_for = Some((tool_call_id.clone(), content.clone()));
-                }
+                } => tool_results.push((tool_call_id.clone(), content.clone())),
             }
         }
-        let content_value =
-            if parts.len() == 1 && tool_calls.is_empty() && tool_result_for.is_none() {
-                Value::String(text_only)
-            } else if parts.is_empty() && (tool_result_for.is_some() || !tool_calls.is_empty()) {
-                // Pure tool-call or tool-result turn.
-                if let Some((_, body)) = &tool_result_for {
-                    Value::String(body.clone())
-                } else {
-                    Value::String(String::new())
-                }
-            } else if parts.is_empty() {
-                Value::String(String::new())
-            } else {
-                Value::Array(parts)
-            };
+        // The single-part flattening keys on the part KIND, not the
+        // count: `text_only` accumulates from text parts alone, so a
+        // turn whose only part is an image (a plain "describe this
+        // image" request, which `governable_content_block` never
+        // bypasses) used to flatten to `"content": ""` and the model
+        // answered about nothing (WOR-2554 review).
+        let content_value = if parts.len() == 1
+            && tool_calls.is_empty()
+            && tool_results.is_empty()
+            && matches!(m.content.first(), Some(ContentPart::Text { .. }))
+        {
+            Value::String(text_only)
+        } else if parts.is_empty() {
+            Value::String(String::new())
+        } else {
+            Value::Array(parts)
+        };
 
-        let mut obj = Map::new();
-        obj.insert("role".into(), Value::String(role.into()));
-        obj.insert("content".into(), content_value);
-        if !tool_calls.is_empty() {
-            obj.insert("tool_calls".into(), Value::Array(tool_calls));
+        // A turn carrying nothing but tool results has no message of
+        // its own; the `role: "tool"` messages below are the whole
+        // turn, which is the shape OpenAI Chat Completions wants.
+        let content_is_empty = matches!(&content_value, Value::String(s) if s.is_empty());
+        if !(content_is_empty && tool_calls.is_empty() && !tool_results.is_empty()) {
+            let mut obj = Map::new();
+            obj.insert("role".into(), Value::String(role.into()));
+            obj.insert("content".into(), content_value);
+            if !tool_calls.is_empty() {
+                obj.insert("tool_calls".into(), Value::Array(tool_calls));
+            }
+            if let Some(name) = &m.name {
+                obj.insert("name".into(), Value::String(name.clone()));
+            }
+            messages.push(Value::Object(obj));
         }
-        if let Some((id, _)) = &tool_result_for {
-            obj.insert("tool_call_id".into(), Value::String(id.clone()));
+        for (id, body) in tool_results {
+            let mut obj = Map::new();
+            obj.insert("role".into(), Value::String("tool".into()));
+            obj.insert("content".into(), Value::String(body));
+            obj.insert("tool_call_id".into(), Value::String(id));
+            messages.push(Value::Object(obj));
         }
-        if let Some(name) = &m.name {
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        messages.push(Value::Object(obj));
     }
 
     let mut out = Map::new();
@@ -1125,7 +1440,12 @@ mod tests {
             "input": "hi",
             "tools": [{"type": "mcp", "server_label": "x", "server_url": "https://mcp.example/sse"}]
         });
-        let err = translate_responses_request_to_openai(req.to_string().as_bytes()).unwrap_err();
+        let err = translate_responses_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.status(), 400);
         assert!(err.message().contains("mcp"), "{}", err.message());
     }
@@ -1137,7 +1457,12 @@ mod tests {
             "instructions": "you are helpful",
             "input": "what time is it"
         });
-        let bytes = translate_responses_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_responses_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["model"], "gpt-4o");
         let msgs = parsed["messages"].as_array().unwrap();
@@ -1304,5 +1629,271 @@ mod tests {
             .filter_map(|item| item["id"].as_str())
             .collect();
         assert_eq!(ids, vec!["call_1", "call_2"], "{parsed}");
+    }
+
+    // --- WOR-2554 review: the Responses sweep ---
+
+    fn notes_for(req: Value) -> Vec<super::super::LossinessNote> {
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        hub.lossiness
+    }
+
+    #[test]
+    fn structured_output_requests_record_a_lossiness_note() {
+        // Red-first: `text` was never read, `response_format` was never
+        // emitted, and no note was pushed, so a client asking for
+        // schema-constrained JSON got free-form prose with the counter
+        // flat and nothing in the log.
+        let notes = notes_for(json!({
+            "model": "gpt-4.1",
+            "input": "extract the fields",
+            "text": {"format": {"type": "json_schema", "name": "r", "schema": {}}}
+        }));
+        let note = notes
+            .iter()
+            .find(|n| n.metric_label == "responses.text")
+            .unwrap_or_else(|| panic!("expected a text note, got {notes:?}"));
+        assert!(note.note.contains("free-form prose"), "{}", note.note);
+    }
+
+    #[test]
+    fn unrepresented_responses_top_level_fields_record_lossiness_notes() {
+        for (key, value) in [
+            ("reasoning", json!({"effort": "high"})),
+            ("parallel_tool_calls", json!(false)),
+            ("truncation", json!("auto")),
+            ("metadata", json!({"k": "v"})),
+            ("include", json!(["reasoning.encrypted_content"])),
+            ("top_logprobs", json!(3)),
+            ("service_tier", json!("flex")),
+            ("background", json!(true)),
+            ("max_tool_calls", json!(2)),
+            ("some_field_openai_adds_next", json!(1)),
+        ] {
+            let mut req = json!({"model": "gpt-4.1", "input": "hi"});
+            req[key] = value.clone();
+            let notes = notes_for(req);
+            assert_eq!(notes.len(), 1, "{key}={value}: {notes:?}");
+            assert!(
+                notes[0].field.contains(key) || notes[0].field == "responses.request",
+                "{key}: {:?}",
+                notes[0]
+            );
+        }
+    }
+
+    #[test]
+    fn represented_and_null_responses_fields_note_nothing() {
+        let notes = notes_for(json!({
+            "model": "gpt-4.1",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "instructions": "be terse",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+            "stream": true,
+            "tools": [{"type": "function", "name": "f", "parameters": {}}],
+            "tool_choice": "required",
+            "store": false,
+            "metadata": null
+        }));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn responses_tool_choice_is_honored_through_to_the_canonical_body() {
+        // Red-first: the forced-tool bug WOR-2535 fixed on
+        // /v1/messages still shipped here, and the hub already carried
+        // HubToolChoice.
+        for (wire, expected) in [
+            (json!("required"), json!("required")),
+            (json!("none"), json!("none")),
+            (
+                json!({"type": "function", "name": "get_weather"}),
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+            ),
+        ] {
+            let req = json!({
+                "model": "gpt-4.1",
+                "input": "hi",
+                "tools": [{"type": "function", "name": "get_weather", "parameters": {}}],
+                "tool_choice": wire.clone(),
+            });
+            let bytes = translate_responses_request_to_openai(
+                req.to_string().as_bytes(),
+                "test.sbproxy.dev",
+                None,
+            )
+            .unwrap();
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["tool_choice"], expected, "sent {wire}");
+        }
+    }
+
+    #[test]
+    fn an_unmappable_responses_tool_choice_records_a_note() {
+        let notes = notes_for(json!({
+            "model": "gpt-4.1",
+            "input": "hi",
+            "tool_choice": {"type": "file_search"}
+        }));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].metric_label, "responses.tool_choice");
+    }
+
+    #[test]
+    fn unmapped_input_content_parts_record_lossiness_notes() {
+        // Red-first: `parse_responses_content_part` returned None and
+        // the caller dropped it with `if let Some(..)`, so input_file,
+        // refusal, and a non-string input_text vanished with no note.
+        for part in [
+            json!({"type": "input_file", "file_id": "file_1"}),
+            json!({"type": "refusal", "refusal": "no"}),
+            json!({"type": "input_text", "text": {"nested": true}}),
+        ] {
+            let notes = notes_for(json!({
+                "model": "gpt-4.1",
+                "input": [{"role": "user", "content": [part.clone()]}]
+            }));
+            assert_eq!(notes.len(), 1, "{part}: {notes:?}");
+            assert_eq!(notes[0].metric_label, "responses.input.content", "{part}");
+        }
+    }
+
+    #[test]
+    fn a_non_object_input_entry_records_a_lossiness_note() {
+        let notes = notes_for(json!({
+            "model": "gpt-4.1",
+            "input": [{"role": "user", "content": "hi"}, "stray"]
+        }));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].metric_label, "responses.input");
+    }
+
+    #[test]
+    fn an_empty_input_text_part_is_not_counted_as_a_drop() {
+        let notes = notes_for(json!({
+            "model": "gpt-4.1",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": ""},
+                {"type": "input_text", "text": "hi"}
+            ]}]
+        }));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    // --- WOR-2554 review: the canonical message emitter ---
+
+    #[test]
+    fn an_image_only_turn_reaches_the_upstream_as_a_content_array() {
+        // Red-first: `parts.len() == 1` flattened to `text_only`, which
+        // only text parts contribute to, so a "describe this image"
+        // turn arrived upstream as `"content": ""` and the model
+        // answered about nothing.
+        let hub = HubRequest {
+            model: "gpt-4o".into(),
+            messages: vec![HubMessage {
+                role: Role::User,
+                content: vec![ContentPart::Image {
+                    source: "data:image/png;base64,iVBORw0".into(),
+                    media_type: "image/png".into(),
+                }],
+                name: None,
+                tool_call_id: None,
+            }],
+            ..Default::default()
+        };
+        let parsed: Value = serde_json::from_slice(&hub_request_to_openai_bytes(&hub)).unwrap();
+        let content = &parsed["messages"][0]["content"];
+        assert!(content.is_array(), "the image must survive: {parsed}");
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0"
+        );
+    }
+
+    #[test]
+    fn a_text_only_turn_still_flattens_to_a_plain_string() {
+        let hub = HubRequest {
+            model: "gpt-4o".into(),
+            messages: vec![HubMessage {
+                role: Role::User,
+                content: vec![ContentPart::Text { text: "hi".into() }],
+                name: None,
+                tool_call_id: None,
+            }],
+            ..Default::default()
+        };
+        let parsed: Value = serde_json::from_slice(&hub_request_to_openai_bytes(&hub)).unwrap();
+        assert_eq!(parsed["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn every_tool_result_in_a_turn_reaches_the_canonical_body() {
+        // Red-first: `tool_result_for` was one Option assigned inside
+        // the loop, so an Anthropic parallel-tool-use turn (two
+        // tool_result blocks in one user message, a shape the native
+        // bypass never accepts) lost every result but the last and the
+        // failure looked like a model error.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_a", "content": "A"},
+                {"type": "tool_result", "tool_use_id": "toolu_b", "content": "B"}
+            ]}]
+        });
+        let bytes = super::super::anthropic_messages::translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let results: Vec<(&str, &str)> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| {
+                (
+                    m["tool_call_id"].as_str().unwrap_or(""),
+                    m["content"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("toolu_a", "A"), ("toolu_b", "B")],
+            "both results must survive: {parsed}"
+        );
+    }
+
+    #[test]
+    fn a_single_tool_result_turn_is_one_tool_message() {
+        let hub = HubRequest {
+            model: "gpt-4o".into(),
+            messages: vec![HubMessage {
+                role: Role::User,
+                content: vec![ContentPart::ToolResult {
+                    tool_call_id: "call_1".into(),
+                    content: "42".into(),
+                    is_error: false,
+                }],
+                name: None,
+                tool_call_id: None,
+            }],
+            ..Default::default()
+        };
+        let parsed: Value = serde_json::from_slice(&hub_request_to_openai_bytes(&hub)).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{parsed}");
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+        assert_eq!(messages[0]["content"], "42");
     }
 }

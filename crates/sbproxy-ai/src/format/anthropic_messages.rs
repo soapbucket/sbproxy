@@ -14,17 +14,28 @@
 //!     that maps onto no variant, an image whose source yields no
 //!     string included, is dropped with a `LossinessNote` naming its
 //!     sanitized type (WOR-2535, mirroring WOR-2512 on
-//!     `/v1/responses`).
+//!     `/v1/responses`). A block the parser KEEPS gets the same
+//!     treatment for every attribute it read past, `cache_control` and
+//!     `citations` included, so nothing about a block is silent
+//!     (WOR-2554 review).
 //!   * `stop_reason` strings (`end_turn`, `max_tokens`, `tool_use`,
 //!     `stop_sequence`) normalized to the hub `FinishReason`.
 //!
 //! `tool_choice` (auto, any, none, and forced-tool) and `top_k` are
-//! honored end to end: parsed here, re-emitted by
-//! `hub_request_to_openai_bytes`. Every top-level field outside the
-//! represented set (`metadata`, `thinking`, `service_tier`,
-//! `container`, and anything newer) records a `LossinessNote`; the
-//! translate seam ticks `sbproxy_ai_translation_dropped_total` per
-//! note and emits one bounded warn per request (WOR-2535 review).
+//! honored end to end. "End to end" means past the canonical body:
+//! this parser fills the hub, `hub_request_to_openai_bytes` emits the
+//! canonical spelling, and each provider translator in
+//! `crate::translators` rewrites it into that provider's shape, which
+//! is where the first pass stopped and shipped `"tool_choice":
+//! "required"` to an upstream that requires an object.
+//!
+//! Every top-level field outside the represented set (`metadata`,
+//! `thinking`, `service_tier`, `container`, and anything newer)
+//! records a `LossinessNote`, and so does a represented field whose
+//! typed read fails (`"max_tokens": 1024.0`, `"stream": "true"`); the
+//! translate seam ticks `sbproxy_ai_translation_dropped_total` once
+//! per class and emits one bounded warn per request naming the origin
+//! and tenant (WOR-2535 review, WOR-2554 review).
 //!
 //! Streaming for the Anthropic outbound emitter is implemented in
 //! `from_hub_stream`, which turns each hub chunk into the matching
@@ -34,8 +45,8 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    BridgeContext, ChatError, ChatFormat, ContentPart, ContentPartDelta, FinishReason, HubChunk,
-    HubMessage, HubRequest, HubResponse, HubToolDefinition, HubUsage, Role,
+    json_type_name, note_drop, BridgeContext, ChatError, ChatFormat, ContentPart, ContentPartDelta,
+    FinishReason, HubChunk, HubMessage, HubRequest, HubResponse, HubToolDefinition, HubUsage, Role,
 };
 
 const INBOUND_PATHS: &[&str] = &["/v1/messages"];
@@ -81,6 +92,45 @@ impl ChatFormat for AnthropicMessagesFormat {
             ..Default::default()
         };
         hub.lossiness = notes;
+
+        // `model` and `stream` read through `unwrap_or`, which hides a
+        // wrong-typed value behind a plausible default, and both names
+        // are in the represented list so the catch-all below skips
+        // them. Without these two arms `{"stream": "true"}` served one
+        // buffered JSON body to a client parsing SSE, silently
+        // (WOR-2554 review).
+        if obj
+            .get("model")
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            let found = json_type_name(&obj["model"]);
+            note_drop(
+                &mut hub.lossiness,
+                "anthropic.model",
+                "anthropic.model".into(),
+                format!(
+                    "model of JSON type '{found}' dropped: expected a string, so \
+                     the canonical request names no model and routing falls back \
+                     to the origin default"
+                ),
+            );
+        }
+        if obj
+            .get("stream")
+            .is_some_and(|v| !v.is_null() && !v.is_boolean())
+        {
+            let found = json_type_name(&obj["stream"]);
+            note_drop(
+                &mut hub.lossiness,
+                "anthropic.stream",
+                "anthropic.stream".into(),
+                format!(
+                    "stream of JSON type '{found}' dropped: expected a boolean, \
+                     so the request is served as one buffered body rather than \
+                     the SSE stream it asked for"
+                ),
+            );
+        }
 
         // Anthropic `system` is either a string or an array of typed
         // content blocks. Concatenate text blocks; every block that
@@ -201,6 +251,32 @@ impl ChatFormat for AnthropicMessagesFormat {
             Some(Value::Array(arr)) => {
                 for t in arr {
                     if let Some(tobj) = t.as_object() {
+                        // A client tool carries `input_schema`. A
+                        // server tool (`web_search_20250305`,
+                        // `code_execution_20250522`, ...) does not: it
+                        // asks Anthropic to run the tool itself, and
+                        // the canonical body has no way to say that.
+                        // Forwarding it as a function with an empty
+                        // description and a null schema was a mangle
+                        // rather than a drop, and the provider would
+                        // have asked the model to call a tool the
+                        // client cannot answer (WOR-2554 review).
+                        if !tobj.contains_key("input_schema") {
+                            let label = super::sanitize_type_label(
+                                tobj.get("type").and_then(Value::as_str).unwrap_or(""),
+                            );
+                            note_drop(
+                                &mut hub.lossiness,
+                                "anthropic.tools",
+                                format!("anthropic.tools.{label}"),
+                                format!(
+                                    "tool of type '{label}' dropped: it declares no \
+                                     input_schema, so it is a provider-run server \
+                                     tool the canonical request cannot express"
+                                ),
+                            );
+                            continue;
+                        }
                         hub.tools.push(HubToolDefinition {
                             name: tobj
                                 .get("name")
@@ -560,6 +636,13 @@ fn take_open_block_indexes(ctx: &mut BridgeContext) -> Vec<usize> {
 /// the catch-all note loop in `to_hub`. Keep this list in lockstep
 /// with the parser: a key parsed but not listed would double-note, a
 /// key listed but not parsed would drop silently again.
+///
+/// "Represented" is about the NAME, not the value. A key here whose
+/// value the parser cannot read still has to note the drop itself,
+/// because this list makes the catch-all skip it: that is why
+/// `clamped_u32`, `finite_f32`, and the `model` / `stream` arms in
+/// `to_hub` each push a note on a wrong-typed value rather than
+/// leaning on the loop below (WOR-2554 review).
 const REPRESENTED_TOP_LEVEL_KEYS: &[&str] = &[
     "model",
     "messages",
@@ -584,7 +667,27 @@ fn clamped_u32(
     metric_label: &'static str,
     notes: &mut Vec<super::LossinessNote>,
 ) -> Option<u32> {
-    let n = obj.get(field)?.as_u64()?;
+    let raw = obj.get(field)?;
+    if raw.is_null() {
+        return None;
+    }
+    // A wrong-typed value used to read as absent. `REPRESENTED_TOP_LEVEL_KEYS`
+    // is a name list, so the catch-all below skips the key and
+    // `"max_tokens": 1024.0` (a float, which `as_u64` refuses) vanished
+    // with no note, no counter, and no warn (WOR-2554 review).
+    let Some(n) = raw.as_u64() else {
+        note_drop(
+            notes,
+            metric_label,
+            format!("anthropic.{field}"),
+            format!(
+                "{field} of JSON type '{}' dropped: expected a non-negative \
+                 integer, so the canonical request carries no {field} at all",
+                json_type_name(raw)
+            ),
+        );
+        return None;
+    };
     match u32::try_from(n) {
         Ok(v) => Some(v),
         Err(_) => {
@@ -613,7 +716,25 @@ fn finite_f32(
     metric_label: &'static str,
     notes: &mut Vec<super::LossinessNote>,
 ) -> Option<f32> {
-    let f = obj.get(field)?.as_f64()?;
+    let raw = obj.get(field)?;
+    if raw.is_null() {
+        return None;
+    }
+    // Same silent-drop shape as `clamped_u32`: `"temperature": "0.7"`
+    // read as absent and the catch-all skipped the represented name.
+    let Some(f) = raw.as_f64() else {
+        note_drop(
+            notes,
+            metric_label,
+            format!("anthropic.{field}"),
+            format!(
+                "{field} of JSON type '{}' dropped: expected a number, so the \
+                 canonical request carries no {field} at all",
+                json_type_name(raw)
+            ),
+        );
+        return None;
+    };
     let narrowed = f as f32;
     if narrowed.is_finite() {
         Some(narrowed)
@@ -628,24 +749,6 @@ fn finite_f32(
     }
 }
 
-/// Push an `Unsupported` lossiness note for a dropped wire-level value.
-/// `metric_label` is the note's bounded class for the drop counter and
-/// is a compile-time string on purpose: `field` may end in a sanitized
-/// client-derived segment, `metric_label` never does.
-fn note_drop(
-    lossiness: &mut Vec<super::LossinessNote>,
-    metric_label: &'static str,
-    field: String,
-    note: String,
-) {
-    lossiness.push(super::LossinessNote {
-        field,
-        metric_label: metric_label.to_string(),
-        direction: super::LossinessDirection::Unsupported,
-        note,
-    });
-}
-
 /// Sanitized `type` label for a content block: the block's `type`
 /// string through [`super::sanitize_type_label`], or `"unknown"` when
 /// the entry is not an object or carries no string `type`.
@@ -653,16 +756,67 @@ fn block_type_label(block: &Value) -> String {
     super::sanitize_type_label(block.get("type").and_then(Value::as_str).unwrap_or(""))
 }
 
-/// Name a JSON value's type for a lossiness note about a field whose
-/// shape the translator cannot represent.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
+/// Note every attribute of a KEPT content block that the parser read
+/// past, plus every represented attribute whose typed read failed.
+///
+/// The "no part pushed" detector covers blocks the parser drops whole.
+/// This covers the other half of the same gap: a block that yields a
+/// hub part but carries `cache_control`, `citations`, a non-string
+/// `id`, and so on. `native_request_is_losslessly_governable` already
+/// documented this hole in its own doc comment, so the enforcer
+/// described a case the detector could not see (WOR-2554 review).
+fn note_block_attribute_drops(part: &Value, lossiness: &mut Vec<super::LossinessNote>) {
+    let Some(p) = part.as_object() else {
+        return;
+    };
+    let ty = block_type_label(part);
+    // Second slot: represented keys whose value the parser reads with
+    // `unwrap_or("")`, so a wrong type produces an empty field rather
+    // than a dropped block. Keys whose failure already routes to the
+    // no-part-pushed detector (`text`, `image.source`) are not listed.
+    let (represented, string_valued): (&[&str], &[&str]) = match ty.as_str() {
+        "text" => (&["type", "text"], &[]),
+        "tool_use" => (&["type", "id", "name", "input"], &["id", "name"]),
+        "tool_result" => (
+            &["type", "tool_use_id", "content", "is_error"],
+            &["tool_use_id"],
+        ),
+        "image" => (&["type", "source"], &[]),
+        _ => return,
+    };
+    for key in p.keys() {
+        if represented.contains(&key.as_str()) {
+            continue;
+        }
+        let label = super::sanitize_type_label(key);
+        note_drop(
+            lossiness,
+            "anthropic.messages.content",
+            format!("anthropic.messages.content.{ty}.{label}"),
+            format!(
+                "attribute '{label}' on a kept '{ty}' content block dropped: the \
+                 canonical request carries the block's content only, so the \
+                 provider never sees it"
+            ),
+        );
+    }
+    for field in string_valued {
+        let Some(value) = p.get(*field) else {
+            continue;
+        };
+        if value.is_null() || value.is_string() {
+            continue;
+        }
+        note_drop(
+            lossiness,
+            "anthropic.messages.content",
+            format!("anthropic.messages.content.{ty}.{field}"),
+            format!(
+                "'{field}' on a '{ty}' content block is JSON type '{}' rather \
+                 than a string, so the canonical block carries an empty value",
+                json_type_name(value)
+            ),
+        );
     }
 }
 
@@ -825,6 +979,13 @@ pub(crate) fn parse_anthropic_message(
                              governs"
                         ),
                     );
+                } else {
+                    // A block the parser KEEPS can still carry
+                    // attributes it read past. `cache_control` is the
+                    // expensive one: prompt caching never engages and
+                    // the customer pays full input price on every turn
+                    // of a long conversation (WOR-2554 review).
+                    note_block_attribute_drops(part, lossiness);
                 }
             }
         }
@@ -925,14 +1086,25 @@ fn hub_response_to_anthropic_value(resp: &HubResponse) -> Value {
 /// the OpenAI Chat shape end to end; converting on the way in lets
 /// the existing router, guardrails, and translator pipeline run
 /// unchanged.
-pub fn translate_anthropic_request_to_openai(body: &[u8]) -> Result<Vec<u8>, ChatError> {
+pub fn translate_anthropic_request_to_openai(
+    body: &[u8],
+    origin: &str,
+    tenant: Option<&str>,
+) -> Result<Vec<u8>, ChatError> {
     let (hub, _ctx) = AnthropicMessagesFormat.to_hub(body)?;
     // Nothing downstream reads `hub.lossiness` on this path, so this
-    // seam is what makes each drop observable: the per-note drop
-    // counter plus one aggregated, bounded warn for the request
-    // (WOR-2535; the review killed the per-note warn loop, which was
-    // a client-reachable log flood).
-    super::report_translation_lossiness("anthropic", &hub.lossiness);
+    // seam is what makes each drop observable: the folded drop counter
+    // plus one aggregated, bounded warn for the request (WOR-2535; the
+    // review killed the per-note warn loop, which was a
+    // client-reachable log flood). `origin` and `tenant` name the
+    // caller on the warn so an alert on the counter has somewhere to
+    // go next.
+    super::report_translation_lossiness(
+        crate::handler::AiSurface::Messages.label(),
+        origin,
+        tenant,
+        &hub.lossiness,
+    );
     Ok(super::openai_responses::hub_request_to_openai_bytes(&hub))
 }
 
@@ -940,10 +1112,12 @@ pub fn translate_anthropic_request_to_openai(body: &[u8]) -> Result<Vec<u8>, Cha
 /// provider behavior is represented in the canonical request inspected by
 /// gateway governance.
 ///
-/// The Anthropic parser drops unrepresentable content blocks with a
-/// `LossinessNote` and ignores unknown extension attributes on blocks it
-/// keeps. Native byte forwarding is safe only when this stricter check
-/// proves that no such field can skip the canonical policy path. This is
+/// The Anthropic parser notes what it cannot represent rather than
+/// representing it: an unmappable content block is dropped with a
+/// `LossinessNote`, and so is every extension attribute on a block it
+/// keeps. A note is a record, not a substitute for governance, so
+/// native byte forwarding is safe only when this stricter check proves
+/// no such field can skip the canonical policy path. This is
 /// deliberately conservative: new Anthropic fields remain on the translated
 /// path until their canonical representation is implemented here and in the
 /// hub bridge.
@@ -1936,7 +2110,12 @@ mod tests {
                 ]
             }]
         });
-        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["messages"][0]["role"], "system");
         assert_eq!(parsed["messages"][0]["content"], "be terse");
@@ -2034,7 +2213,12 @@ mod tests {
             "tools": [{"name": "lookup", "description": "d", "input_schema": {}}],
             "tool_choice": {"type": "tool", "name": "lookup"}
         });
-        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["tool_choice"]["type"], "function", "{parsed}");
         assert_eq!(
@@ -2059,7 +2243,12 @@ mod tests {
         let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
         assert_eq!(hub.tool_choice, super::super::HubToolChoice::Any);
         assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
-        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["tool_choice"], "required", "{parsed}");
     }
@@ -2071,7 +2260,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tool_choice": {"type": "none"}
         });
-        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["tool_choice"], "none", "{parsed}");
 
@@ -2083,7 +2277,12 @@ mod tests {
         });
         let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
         assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
-        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.get("tool_choice").is_none(), "{parsed}");
     }
@@ -2154,7 +2353,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "top_k": 40
         });
-        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let bytes = translate_anthropic_request_to_openai(
+            req.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["top_k"], 40, "{parsed}");
         let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
@@ -2401,14 +2605,15 @@ mod tests {
         let body = req.to_string();
 
         let before =
-            crate::ai_metrics::translation_dropped_value("anthropic", "anthropic.messages.content");
+            crate::ai_metrics::translation_dropped_value("messages", "anthropic.messages.content");
         let layer = WarnCount::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            translate_anthropic_request_to_openai(body.as_bytes()).unwrap();
+            translate_anthropic_request_to_openai(body.as_bytes(), "test.sbproxy.dev", None)
+                .unwrap();
         });
         let after =
-            crate::ai_metrics::translation_dropped_value("anthropic", "anthropic.messages.content");
+            crate::ai_metrics::translation_dropped_value("messages", "anthropic.messages.content");
 
         let warns = layer.fields.lock().unwrap();
         assert_eq!(
@@ -2418,6 +2623,181 @@ mod tests {
             warns.len()
         );
         assert!(warns[0].contains("dropped=10000"), "{}", warns[0]);
-        assert_eq!(after - before, 10_000, "every dropped block is counted");
+        // `>=`, not `==`: this is a process-global counter and
+        // `translate_seam_keeps_dropped_blocks_out_of_the_openai_body`
+        // writes the same series. Under nextest each test owns its
+        // process, but the documented `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1`
+        // path shares one, and a shared-global equality assertion is a
+        // flake waiting for that run (WOR-2554 review).
+        assert!(
+            after - before >= 10_000,
+            "every dropped block is counted: {before} -> {after}"
+        );
+        // One folded write per class, not one per note: the counter
+        // value is identical either way, which is exactly why the
+        // per-note loop could sit there costing 160,000 limiter round
+        // trips on one request without any test noticing.
+    }
+
+    // --- WOR-2554 review: wrong-typed represented scalars ---
+
+    #[test]
+    fn wrong_typed_represented_scalars_record_lossiness_notes() {
+        // Red-first: REPRESENTED_TOP_LEVEL_KEYS is a name list while
+        // the parsers key on name AND type, so a float `max_tokens` or
+        // a string `stream` read as absent and the catch-all skipped
+        // the name. Anthropic's required budget knob vanished with no
+        // note, no counter, and no warn.
+        for (key, value, metric_label) in [
+            ("max_tokens", json!(1024.0), "anthropic.max_tokens"),
+            ("top_k", json!("40"), "anthropic.top_k"),
+            ("temperature", json!("0.7"), "anthropic.temperature"),
+            ("top_p", json!(true), "anthropic.top_p"),
+            ("stream", json!("true"), "anthropic.stream"),
+            ("model", json!(123), "anthropic.model"),
+        ] {
+            let mut req = json!({
+                "model": "claude-3-5-sonnet",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            req[key] = value.clone();
+            let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+            let labels: Vec<&str> = hub
+                .lossiness
+                .iter()
+                .map(|n| n.metric_label.as_str())
+                .collect();
+            assert!(
+                labels.contains(&metric_label),
+                "{key}={value} must be noted, got {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_typed_stream_flag_does_not_silently_buffer() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "stream": "true",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(!hub.stream, "the value is still unreadable");
+        assert!(
+            hub.lossiness
+                .iter()
+                .any(|n| n.note.contains("SSE stream it asked for")),
+            "{:?}",
+            hub.lossiness
+        );
+    }
+
+    // --- WOR-2554 review: attributes on blocks the parser KEEPS ---
+
+    #[test]
+    fn cache_control_on_a_kept_text_block_records_a_lossiness_note() {
+        // Red-first: the "no part pushed" detector only fires when a
+        // block yields nothing. A text block with `cache_control`
+        // yields a part, so prompt caching never engaged and the
+        // customer paid full input price every turn, silently.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "long context", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.messages[0].content.len(), 1, "the text is still kept");
+        let note = hub
+            .lossiness
+            .iter()
+            .find(|n| n.field.ends_with("text.cache_control"))
+            .unwrap_or_else(|| panic!("expected a cache_control note, got {:?}", hub.lossiness));
+        assert_eq!(note.metric_label, "anthropic.messages.content");
+    }
+
+    #[test]
+    fn citations_on_a_kept_text_block_record_a_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "cited", "citations": [{"type": "char_location"}]}
+            ]}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(
+            hub.lossiness
+                .iter()
+                .any(|n| n.field.ends_with("text.citations")),
+            "{:?}",
+            hub.lossiness
+        );
+    }
+
+    #[test]
+    fn non_string_identifiers_on_kept_blocks_record_lossiness_notes() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": 7, "name": {"a": 1}, "input": {}}
+            ]}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        let fields: Vec<&str> = hub.lossiness.iter().map(|n| n.field.as_str()).collect();
+        assert!(
+            fields.contains(&"anthropic.messages.content.tool_use.id")
+                && fields.contains(&"anthropic.messages.content.tool_use.name"),
+            "{fields:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_block_notes_nothing() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": false}
+                ]}
+            ]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
+    }
+
+    #[test]
+    fn an_anthropic_server_tool_is_dropped_with_a_note_not_mangled() {
+        // Red-first: a server tool carries no `input_schema`, so it
+        // used to reach the provider as
+        // {"type":"function","function":{"name":"web_search","description":"","parameters":null}},
+        // a mangle rather than a drop, with no note.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+                {"name": "get_weather", "input_schema": {"type": "object"}}
+            ]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.tools.len(), 1, "only the client tool survives");
+        assert_eq!(hub.tools[0].name, "get_weather");
+        let note = hub
+            .lossiness
+            .iter()
+            .find(|n| n.field == "anthropic.tools.web_search_20250305")
+            .unwrap_or_else(|| panic!("expected a server-tool note, got {:?}", hub.lossiness));
+        assert_eq!(note.metric_label, "anthropic.tools");
     }
 }

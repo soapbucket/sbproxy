@@ -153,29 +153,19 @@ impl ChatFormat for OpenAiChatFormat {
             hub.extensions.insert("openai.response_format".into(), rf);
         }
 
-        // Every top-level key outside the represented set records a
-        // note (WOR-2554, the same treatment WOR-2535 gave
-        // /v1/messages): the live chat path byte-forwards the original
-        // body, but any consumer of THIS parse (a future chat
-        // translate seam included) would otherwise lose `seed`,
-        // `logit_bias`, penalties, and every field OpenAI adds next,
-        // with nothing recording the drop.
-        for (key, value) in obj {
-            if value.is_null() || CHAT_REPRESENTED_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-                continue;
-            }
-            let label = super::sanitize_type_label(key);
-            hub.lossiness.push(super::LossinessNote {
-                field: format!("openai.{label}"),
-                metric_label: "openai.request".to_string(),
-                direction: super::LossinessDirection::Unsupported,
-                note: format!(
-                    "top-level field '{label}' dropped: it has no \
-                     representation in the canonical request the gateway \
-                     governs"
-                ),
-            });
-        }
+        // No catch-all note loop here, deliberately. `/v1/chat/completions`
+        // is the canonical path: the gateway forwards the client's own
+        // bytes and never builds a body from this parse, so a note
+        // saying `seed` was dropped would be a claim about behavior
+        // that does not happen. The drops that DO happen on this
+        // surface belong to the outbound provider translators
+        // (`translators::anthropic` and friends remove `seed`,
+        // `logit_bias`, and the penalties before an Anthropic or
+        // Gemini upstream sees them) and are a different set from
+        // anything this function could compute, because it runs before
+        // the provider is chosen. A sweep for this surface is a sweep
+        // of those translators, and it lands when a chat translate
+        // seam exists to report it (WOR-2554 review).
 
         let ctx = BridgeContext {
             inbound_format: self.id().into(),
@@ -200,25 +190,6 @@ impl ChatFormat for OpenAiChatFormat {
         Ok(hub_chunk_to_openai_sse(chunk))
     }
 }
-
-/// Top-level OpenAI Chat Completions request keys the hub represents
-/// (parsed in `to_hub` above, `response_format` riding the extensions
-/// map). Everything else hits the catch-all note loop. Keep in
-/// lockstep with the parser (WOR-2554).
-const CHAT_REPRESENTED_TOP_LEVEL_KEYS: &[&str] = &[
-    "model",
-    "messages",
-    "tools",
-    "tool_choice",
-    "max_tokens",
-    "max_completion_tokens",
-    "temperature",
-    "top_p",
-    "top_k",
-    "stop",
-    "stream",
-    "response_format",
-];
 
 /// Parse one OpenAI message object into a `HubMessage`. Pulled out so
 /// both the live request path and the test fixtures can call it.
@@ -662,38 +633,24 @@ mod tests {
     }
 
     #[test]
-    fn unrepresented_top_level_fields_record_lossiness_notes() {
-        // Red-first (WOR-2554, same class as WOR-2535 on /v1/messages):
-        // fields the hub cannot carry vanished from to_hub with no note.
-        for key in ["seed", "logit_bias", "presence_penalty", "user", "n"] {
-            let mut req = json!({
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": "hi"}]
-            });
-            req[key] = json!(1);
-            let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
-            assert_eq!(hub.lossiness.len(), 1, "{key}: {:?}", hub.lossiness);
-            assert_eq!(hub.lossiness[0].field, format!("openai.{key}"));
-            assert_eq!(hub.lossiness[0].metric_label, "openai.request", "{key}");
-        }
-    }
-
-    #[test]
-    fn represented_and_null_top_level_fields_note_nothing() {
+    fn the_canonical_chat_parse_records_no_lossiness() {
+        // The counterpart of the removed catch-all loop. This surface
+        // forwards the client's own bytes, so a note here would claim
+        // a drop that does not happen; the assertion pins that.
         let req = json!({
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "top_k": 40,
-            "stop": ["x"],
-            "stream": true,
-            "tools": [],
-            "tool_choice": "auto",
-            "response_format": {"type": "json_object"},
-            "seed": null
+            "seed": 7,
+            "logit_bias": {"1": 2},
+            "presence_penalty": 0.5,
+            "user": "u-1",
+            "n": 2
         });
         let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
-        assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
+        assert!(
+            hub.lossiness.is_empty(),
+            "the canonical path forwards these fields verbatim: {:?}",
+            hub.lossiness
+        );
     }
 }
