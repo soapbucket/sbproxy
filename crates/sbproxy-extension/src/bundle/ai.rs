@@ -202,9 +202,10 @@ fn prepare_dynamic_hook(
                 "Proxy-Wasm supports only streamed AI extension events",
             ));
         }
-        // WOR-2482: a Rego bundle hook is `kind: policy` only (refused
-        // earlier at manifest validation), so this arm is a defensive
-        // backstop rather than a reachable path.
+        // WOR-2482: a Rego bundle hook is `kind: policy` or
+        // `kind: transform` only (anything else is refused earlier at
+        // manifest validation), so this arm is a defensive backstop
+        // rather than a reachable path.
         BundleRuntime::Rego => {
             return Err(BundleLoadError::new(
                 "ai",

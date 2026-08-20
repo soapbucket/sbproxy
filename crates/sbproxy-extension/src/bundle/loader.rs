@@ -51,8 +51,8 @@ impl WasmBundleLimits {
     }
 }
 
-/// Compile one `runtime: rego` policy hook's module, once, at candidate
-/// load time (WOR-2482).
+/// Compile one `runtime: rego` hook's module, once, at candidate
+/// load time (WOR-2482; transform hooks since WOR-2493 item 6).
 ///
 /// Mirrors `prepare_javascript_artifact`'s "preflight the exports now"
 /// posture and `WasmRuntime::from_bundle_bytes`'s "validate the module
@@ -61,7 +61,10 @@ impl WasmBundleLimits {
 /// here, rather than compiling clean and then denying every request
 /// once the hook is finally attached. Manifest validation already
 /// proved `entry` ends in `.rego` and every hook here is `kind:
-/// policy`, so the only new failure mode is the module's own content.
+/// policy` or `kind: transform`, so the only new failure mode is the
+/// module's own content. The default query follows the kind: a policy
+/// hook evaluates `data.sbproxy.allow`, a transform hook
+/// `data.sbproxy.transform`, and an explicit `query` overrides either.
 ///
 /// Unlike the JavaScript source and the WASM/Proxy-Wasm runtimes
 /// (compiled once per manifest, then shared by every hook), this
@@ -88,13 +91,17 @@ fn compile_rego_hook(
         )
     })?;
     let site = format!(
-        "extension bundle `{bundle_name}` policy `{}`",
+        "extension bundle `{bundle_name}` {} `{}`",
+        hook_kind_label(hook.kind),
         hook.type_name
     );
-    let query = hook
-        .query
-        .clone()
-        .unwrap_or_else(|| "data.sbproxy.allow".to_owned());
+    let query = hook.query.clone().unwrap_or_else(|| {
+        if hook.kind == BundleHookKind::Transform {
+            "data.sbproxy.transform".to_owned()
+        } else {
+            "data.sbproxy.allow".to_owned()
+        }
+    });
     CompiledRego::compile(site, module, query, budget_ms, None, false)
         .map_err(|error| BundleLoadError::new("rego", error.to_string()))
 }
