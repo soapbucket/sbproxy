@@ -10,7 +10,6 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
-<<<<<<< HEAD
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised
@@ -26,7 +25,7 @@ the next version cut.
   request and exit keep working: a child that dies after serving is
   respawned on the next call. See the stdio section of
   [docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md).
-=======
+
 ### Fixed
 
 - **The `websocket` action's `max_message_size` and `subprotocols` are
@@ -48,7 +47,6 @@ the next version cut.
   `502`. Routes with `request_modifiers` still validate at the
   post-modifier seam, since the modified request is the one the
   contract holds.
->>>>>>> origin/main
 
 ## [1.13.0] - 2026-08-18
 
