@@ -105,6 +105,8 @@ section.
 | `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1` | permit the serial `cargo test` fallback |
 | `SBPROXY_CHECK_PRIVATE_DOCS=1` | extra rustdoc pass over private items |
 | `SBPROXY_CHECK_CAPTURES=1` | replay every documented command and diff it against the block the doc shows |
+| `SBPROXY_CHECK_FUZZ=1` | run the cargo-fuzz harnesses now, ignoring the cadence |
+| `SBPROXY_CHECK_FUZZ=0` | do not run them, ignoring the cadence |
 
 Anything the runner could not run is reprinted as a `SKIPPED PHASES`
 block just before the final result, so "All checks passed" cannot hide a
@@ -129,6 +131,80 @@ on exit to prune `target/doc`, nextest output, incremental directories,
 and other high-churn artifacts while keeping dependency build outputs
 available for reuse. Set `SBPROXY_CLEAN_AFTER_BUILD=0` only when you
 are deliberately preserving every artifact for local debugging.
+
+### The fuzz harnesses run locally on a cadence, not in CI
+
+`fuzz/` is a standalone cargo-fuzz crate carrying ten targets: the Wave
+4 parsers, the stateful proxy driver, and the four scripting runtimes.
+It used to have a CI lane, `wave4-fuzz.yml`, whose job was gated on a
+`run-fuzz` pull request label that was never created in this
+repository. The pull request arm of that condition could not evaluate
+true, so the lane concluded `skipped` in a few seconds on every run it
+ever had, and a green pull request has never meant the fuzzers ran. The
+workflow is deleted rather than repaired, because a lane that reads as
+opt-in coverage in review and delivers none is worse than no lane.
+
+The harnesses run from `scripts/check.sh` on a clock instead. A stamp
+records the last clean pass; when it is older than seven days, or
+missing, the next gate run fuzzes every target `cargo fuzz list`
+reports, fifteen seconds each. That is about two and a half minutes of
+fuzzing plus a cargo build of the fuzz crate, once a week rather than
+on every run. Seven days because these targets cover parsers and script
+engines that change on the order of weeks, and because the repository
+already schedules its heavy sweeps weekly. `SBPROXY_CHECK_FUZZ=1`
+forces a run now, `SBPROXY_CHECK_FUZZ=0` turns the phase off, and unset
+honors the cadence.
+
+cargo-fuzz is nightly-only, and neither nightly nor cargo-fuzz comes
+with a plain `cargo`. Without them the phase prints the install
+commands and skips. It never fails the gate over a missing tool, and it
+never lets a skip read as a pass: once a run is due, the message
+repeats on every gate run until the toolchain is installed or the phase
+is explicitly turned off, because the stamp only advances on a clean
+pass. To make the phase live:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+Homebrew's rust and rustup both provide a `cargo`, so put rustup ahead
+of Homebrew on `PATH`, and keep `~/.cargo/bin` on it so `cargo-fuzz` is
+found.
+
+The stamp and the fuzz crate's target directory live under the user's
+XDG state and cache directories, not in the tree. The cadence is a
+property of the machine and the calendar rather than of a branch, and
+this checkout carries about thirty worktrees at a time: a per-worktree
+stamp would make every new branch directory look like a machine that
+had never fuzzed and pay a cold multi-gigabyte nightly build on its
+first gate. One shared directory instead, which neither `cargo clean`
+nor `cleanup-build-artifacts.sh` reclaims; `rm -rf` it when the disk
+matters. `scripts/lib/fuzz-cadence.sh` holds the rest of the knobs and
+the reasoning, and `scripts/tests/fuzz_cadence_test.sh` pins every
+branch of the decision.
+
+One warning before the first run. No target in `fuzz/` has been
+observed passing anywhere (WOR-2594). The old CI lane could not run on
+a pull request at all, and the only two manual dispatches it ever had,
+one on `main` and one on a branch, failed every target identically
+inside `cargo fuzz run`:
+
+```
+error: sanitizer is incompatible with statically linked libc,
+       disable it using `-C target-feature=-crt-static`
+error[E0463]: can't find crate for `std`
+```
+
+`main` fails that way with no local change involved, so this is
+pre-existing rot rather than anything the move to a local phase
+introduced, and whether it reproduces on macOS is unknown: nobody has
+had a nightly toolchain on a Mac to try. If the first local run dies on
+crt-static, that is the known state of the harnesses and not a break
+you caused. WOR-2594 owns the fix and asks for the failure to be
+reproduced before a remedy is picked, which is why the gate phase
+carries no speculative workaround.
 
 ## Faster inner-loop alternatives
 

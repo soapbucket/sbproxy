@@ -39,6 +39,17 @@ gap rather than a shortcut, and the run says so in `SKIPPED PHASES`. It
 is opt-in only because that union recompiles the graph instead of
 reusing the rest of the gate's artifacts.
 
+`SBPROXY_CHECK_FUZZ` steers the one phase that runs on a clock rather
+than on every gate. `check.sh` fuzzes every target in the standalone
+`fuzz/` crate when the machine's last clean pass is more than a week
+old, forced with `SBPROXY_CHECK_FUZZ=1` and turned off with
+`SBPROXY_CHECK_FUZZ=0`. Those targets do not run in CI, and the lane
+that used to claim to run them never did; see `scripts/lib/fuzz-cadence.sh`
+for the cadence, the paths, and the nightly prerequisites, and
+`scripts/tests/fuzz_cadence_test.sh` for the branch tests. A machine
+without nightly and cargo-fuzz gets the install commands and a skip,
+never a silent pass.
+
 It fails when the working tree is dirty at the end of the run, because
 the gate validates the working tree while `git push` ships HEAD. Set
 `SBPROXY_ALLOW_DIRTY_TREE=1` for a deliberate work-in-progress run.
