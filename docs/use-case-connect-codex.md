@@ -1,6 +1,6 @@
 # Connect Codex to a governed gateway
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Codex CLI's config format makes it easy to point at any OpenAI-compatible endpoint. That is also exactly what a generic multi-provider proxy needs: no per-key budgets, no attribution, no guardrails on the prompt, nothing recording what got spent. This page connects Codex to SBproxy instead, so the same base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -24,7 +24,7 @@ env_key = "SBPROXY_API_KEY"
 wire_api = "chat"
 ```
 
-`wire_api = "chat"` matters: SBproxy's `ai_proxy` action speaks the OpenAI chat-completions wire on `POST /v1/chat/completions`, the shape third-party gateways implement, not OpenAI's newer Responses API.
+`wire_api = "chat"` matters. SBproxy's `ai_proxy` action does serve `/v1/responses`, but only for stateless requests: Codex's Responses mode leans on OpenAI-side response storage (`previous_response_id`, `store`), which the gateway refuses with a 400 rather than silently running without the stored turns. The chat-completions wire on `POST /v1/chat/completions` resends the full conversation every turn, so it works end to end through the gateway.
 
 ## Wire format
 

@@ -1,6 +1,6 @@
 # Vercel AI SDK with SBproxy
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 An AI SDK application normally talks to providers directly: the provider package calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the AI SDK side the change is one provider instance with a `baseURL` and one MCP client pointed at the gateway.
 
@@ -29,7 +29,7 @@ console.log(text);
 
 Install the packages with `npm install ai @ai-sdk/openai-compatible`.
 
-`createOpenAI` from `@ai-sdk/openai` also works, with one trap: a bare `openai("gpt-4o-mini")` posts to `/v1/responses`, the OpenAI Responses API, which the gateway does not serve. If you prefer that package, build models with `openai.chat("gpt-4o-mini")`. `createOpenAICompatible` has no such split, which is why this page uses it.
+`createOpenAI` from `@ai-sdk/openai` also works, with one trap: a bare `openai("gpt-4o-mini")` posts to `/v1/responses`, the OpenAI Responses API. The gateway serves that path for stateless requests, streaming included, but refuses `previous_response_id`, `conversation`, and `store: true` with a 400 rather than silently dropping the state they reference, and it forwards only `function` tools (see the [Responses API boundaries](ai-gateway.md#responses-api-boundaries) in the AI gateway guide). If you prefer that package, build models with `openai.chat("gpt-4o-mini")`, which stays on `/v1/chat/completions` and hits none of those boundaries. `createOpenAICompatible` has no such split, which is why this page uses it.
 
 The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml` and start the gateway with `sbproxy sb.yml`:
 

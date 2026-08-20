@@ -138,6 +138,18 @@ if grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'; then
 fi
 printf 'no WOR-XXX placeholders under crates/\n'
 
+# A merge that commits its own conflict markers ships corrupted files;
+# one reached main's CHANGELOG on 2026-08-19 through a gate that never
+# looked. Scan every tracked text surface a merge can mangle. The
+# pattern is anchored and paired so scripts discussing markers (like
+# this one) do not self-trip.
+step "no committed merge-conflict markers"
+if git grep -nE '^(<{7} |={7}$|>{7} )' -- ':!*.lock' ':!docs/llms-full.txt'; then
+  printf '\ncommitted merge-conflict markers found; resolve the merge for real.\n' >&2
+  exit 1
+fi
+printf 'no conflict markers in tracked files\n'
+
 # CI: docs-ci.yml, "llms-full.txt is current if carried". A branch may
 # carry the corpus, and the rule is that it has to be what the generator
 # produces rather than a hand edit. Nothing rejects the file any more:
