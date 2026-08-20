@@ -1428,7 +1428,7 @@ proxy:
       backend: embedded
       path: /tmp/sbproxy-temp-budget-override.redb
     cache:
-      ttl_secs: 1
+      ttl_secs: 60
     crypto:
       pepper: env:SBPROXY_KEY_PEPPER
       master_key: env:SBPROXY_KEY_MASTER
