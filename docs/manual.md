@@ -192,7 +192,8 @@ sbproxy ai ledger <subcommand>
 sbproxy ai prompt optimize --prompt <path> --eval-set <path> --endpoint <url>
                         --task-model <model> --name <name> --prompt-version <v>
                         --output <path> [--metric exact-match|contains|json-exact]
-sbproxy audit verify <path> [--signing-seed-hex <hex>] [--format text|json]
+sbproxy audit verify <path> [--channel security|config|key|admin]
+                        [--signing-seed-hex <hex>] [--format text|json]
 sbproxy admin hash-password [--password <value> | --password-stdin]
 sbproxy doctor [<config>] [--format text|json] [--strict]
 sbproxy service install <catalog-id> [--name <alias>] [--variant <id>]
@@ -224,8 +225,8 @@ The full subcommand set, one line each:
 | `rego` | `rego test <path>` is the offline `opa test` analogue: runs one or more YAML fixture files against the Rego module(s) they name and prints a per-module line-coverage summary, without touching `sb.yml` or a running proxy. See [scripting.md §3a](scripting.md#3a-rego-policies). |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
-| `ai` | AI gateway tools: `ai ledger` verifies or reports on the usage ledger, `ai prompt optimize` compiles a shorter static system prompt against a customer-owned evaluation set. |
-| `audit` | Audit-trail tools: `audit verify` re-derives the tamper-evident security audit chain from genesis and reports the first record that does not check out. |
+| `ai` | AI gateway tools: `ai ledger` verifies the usage ledger's hash chain, aggregates the value ledger into a savings report, or reconciles usage against a provider export; `ai prompt optimize` compiles a shorter static system prompt against a customer-owned evaluation set. |
+| `audit` | Audit-trail tools: `audit verify` re-derives a tamper-evident audit chain from genesis and reports the first record that does not check out; `--channel` picks the trail (`security` by default, or `config`, `key`, `admin`). |
 | `admin` | Admin-account maintenance: `hash-password` prints the `password_hash` value for `proxy.admin.operators[].password_hash`. |
 | `doctor` | Diagnose what this binary can do on the current host. |
 | `service` | Install, remove, or check a per-user `launchd` agent (macOS only) that runs a certified catalog model in the background; reuses the same secure config generation as `run`. |
@@ -1019,16 +1020,23 @@ The result is a JSON artifact at `--output` recording the prompt-store
 ```bash
 sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl
 sbproxy audit verify /var/lib/sbproxy/audit-chain.jsonl --signing-seed-hex "$SIGNING_SEED_HEX"
+sbproxy audit verify /var/lib/sbproxy/config-audit.jsonl --channel config
 ```
 
-Re-derives the tamper-evident security audit chain written by
-`audit.sink: chain` (the file named by `audit.path`) from genesis and
-reports the first record that does not check out. Reads the file and
-nothing else: no config, no admin API, no running proxy, so an auditor
-with a copy of the chain and the public key can run this against a file
-the proxy that wrote it no longer has. Without `--signing-seed-hex` only
-the hash chain is checked; passing it also verifies every signature.
-Exits `0` when the trail verifies, `1` otherwise.
+Re-derives a tamper-evident audit chain from genesis and reports the
+first record that does not check out. `--channel` picks which chain the
+file at `<path>` is: `security` (the default, the trail
+`audit.sink: chain` writes to the file named by `audit.path`), `config`
+(the trail `audit.config_path` writes), `key` (`audit.key_path`), or
+`admin` (`audit.admin_path`). Each channel writes a different payload
+shape to its own file, so pass the channel that matches the file; see
+[audit-log.md](audit-log.md) for what each trail records. Reads the file
+and nothing else: no config, no admin API, no running proxy, so an
+auditor with a copy of the chain and the public key can run this against
+a file the proxy that wrote it no longer has. Without
+`--signing-seed-hex` only the hash chain is checked; passing it also
+verifies every signature. Exits `0` when the trail verifies, `1`
+otherwise.
 
 ### `completions` - shell tab-completion scripts
 

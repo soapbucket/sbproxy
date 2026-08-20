@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Plain redirects.
+#
+# The redirect action's simple form: one origin, one target URL, one
+# status code. Every request to the origin gets a Location header
+# pointing at `url:`, exactly as written. The request path is not
+# appended; for per-path mappings, see examples/bulk-redirects.
+#
+# Three origins, three common cases:
+#
+#   old.example.local     -> 301 to the new site's front door
+#   search.example.local  -> 301 that keeps the query string
+#   ingest.example.local  -> 308 so a POST stays a POST
+#
+# Run:
+#   make run CONFIG=examples/redirect-basic/sb.yml
+#
+# Test:
+#   curl -i -H 'Host: old.example.local' http://127.0.0.1:8080/anything
+#   # => HTTP/1.1 301 Moved Permanently
+#   #    location: https://www.example.com/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # The domain move. Everything lands on the new front door, whatever
+  # path the old link carried.
+  "old.example.local":
+    action:
+      type: redirect
+      url: https://www.example.com/
+      status: 301
+
+  # Same 301, but preserve_query carries `?q=...` over to the target,
+  # so saved searches keep working.
+  "search.example.local":
+    action:
+      type: redirect
+      url: https://find.example.com/search
+      status: 301
+      preserve_query: true
+
+  # A relocated write endpoint. 308 tells the client to repeat the
+  # request at the new URL with the same method and body; a 301 would
+  # let it downgrade the POST to a GET.
+  "ingest.example.local":
+    action:
+      type: redirect
+      url: https://api.example.com/v2/ingest
+      status: 308
