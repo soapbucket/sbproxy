@@ -13,13 +13,18 @@
 //!     state this gateway does not hold, and `store: true` asks it to
 //!     create such state. All three are refused with a 400 rather than
 //!     silently served without the state they name (WOR-2511 ruling;
-//!     a real conversation store is WOR-2514's evaluation). `store:
-//!     false` is honored as-is: the stateless translation persists
-//!     nothing, which is exactly what it asks for.
-//!   * `prompt` references a server-side prompt template the gateway
-//!     does not resolve yet; it is dropped with a `LossinessNote`
-//!     because a bridge onto the gateway prompt store is planned
-//!     (WOR-2514) rather than ruled out.
+//!     WOR-2514's evaluation kept conversations refused until the
+//!     WOR-2511 stateful join exists). `store: false` is honored
+//!     as-is: the stateless translation persists nothing, which is
+//!     exactly what it asks for.
+//!   * An object-valued `prompt` is a stored-prompt reference the
+//!     gateway serves from its own prompt store (WOR-2514): the
+//!     dispatcher resolves it BEFORE this translation, rendering the
+//!     template into `instructions` and stripping the field. An
+//!     object that reaches this translator unresolved is therefore
+//!     refused with a 400 rather than dropped. A string-valued
+//!     `prompt` is not the object form; it keeps the pre-bridge
+//!     note-and-drop.
 //!   * `tools`: `function` tools are forwarded, in both the
 //!     Responses-native flat shape and the Chat-style nested shape.
 //!     Any other tool block records a `LossinessNote` naming the
@@ -127,19 +132,37 @@ impl ChatFormat for OpenAiResponsesFormat {
             }
         }
 
-        // A prompt template reference is dropped with a note rather than
-        // refused: bridging it onto the gateway prompt store is planned
-        // (WOR-2514), and the request still carries its own input.
-        if obj.get("prompt").is_some_and(|v| !v.is_null()) {
-            hub.lossiness.push(super::LossinessNote {
-                field: "responses.prompt".into(),
-                metric_label: "responses.prompt".into(),
-                direction: super::LossinessDirection::Unsupported,
-                note: "prompt template reference dropped: the gateway does \
-                       not resolve server-side prompt objects, so the request \
-                       runs without the referenced template"
-                    .into(),
-            });
+        // WOR-2514: an object-valued `prompt` is a stored-prompt
+        // reference the dispatcher resolves against the gateway prompt
+        // store before translation (rendered into `instructions`, field
+        // stripped, unknown references 404ed there). One that reaches
+        // this translator was never resolved, so the request would run
+        // without the template it names; refuse rather than drop. A
+        // string (or other non-object) `prompt` is not the bridge's
+        // object form and keeps the pre-bridge note-and-drop behavior
+        // (counted at the translate seam per WOR-2535).
+        match obj.get("prompt") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(_)) => {
+                return Err(ChatError::bad_request(
+                    "prompt object was not resolved against the gateway \
+                     prompt store: this request path does not bridge \
+                     stored-prompt references, so the request would run \
+                     without the referenced template; inline the prompt \
+                     text in 'input' or 'instructions' instead",
+                ));
+            }
+            Some(_) => {
+                hub.lossiness.push(super::LossinessNote {
+                    field: "responses.prompt".into(),
+                    metric_label: "responses.prompt".into(),
+                    direction: super::LossinessDirection::Unsupported,
+                    note: "prompt template reference dropped: the gateway does \
+                           not resolve server-side prompt objects, so the request \
+                           runs without the referenced template"
+                        .into(),
+                });
+            }
         }
 
         // `instructions` is the Responses-flavored system prompt.
@@ -806,14 +829,32 @@ mod tests {
     }
 
     #[test]
-    fn prompt_template_records_lossiness_note() {
-        // A prompt object references a server-side template this gateway
-        // does not resolve yet; the drop is noted, not refused, because a
-        // bridge onto the gateway prompt store is planned.
+    fn unresolved_prompt_object_is_refused_with_400() {
+        // WOR-2514: an object-valued `prompt` is a stored-prompt
+        // reference the gateway resolves against its own prompt store
+        // BEFORE translation (rendered into `instructions`, field
+        // stripped). One that reaches the translator was never
+        // resolved, and dropping it would run the request without the
+        // template it names. Refuse instead.
         let req = json!({
             "model": "gpt-4o",
             "input": "hi",
             "prompt": {"id": "pmpt_1", "version": "2", "variables": {"city": "SF"}}
+        });
+        let err = fmt().to_hub(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.message().contains("prompt"), "{}", err.message());
+    }
+
+    #[test]
+    fn string_prompt_keeps_the_lossiness_note() {
+        // A string `prompt` is not the Responses object form the
+        // WOR-2514 bridge serves; it keeps the pre-bridge
+        // note-and-drop behavior unchanged.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "prompt": "greeting@2"
         });
         let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
         assert_eq!(hub.lossiness.len(), 1);

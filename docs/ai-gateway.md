@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1769,7 +1769,7 @@ What the gateway does not do is hold server-side response state, and it refuses 
 - `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
 - An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
 - Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, and logged with a warning naming the dropped type.
-- A `prompt` template reference is dropped and logged the same way; the gateway does not resolve server-side prompt objects, so the request runs on its `input` alone.
+- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message (the precise miss is logged server-side at debug level, so callers cannot probe which prompt names exist), a malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is not the object form; it is dropped and logged with a warning, unchanged. See "Stored prompts and offline optimization" below.
 
 The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
 
@@ -1992,6 +1992,31 @@ the gateway-only `prompt` field, and records the resolved name and version in
 run metadata. Runtime versions are added, replaced, and pinned through the
 authenticated Admin API. Use a new version label when you need immutable
 history.
+
+On `/v1/responses` the same store serves the OpenAI Responses `prompt`
+object. `id` maps onto the stored prompt name, `version` onto a stored
+version label, and omitting `version` resolves the pinned default:
+
+```json
+{
+  "model": "gpt-4.1",
+  "input": "Where should I eat tonight?",
+  "prompt": {"id": "concierge", "version": "2", "variables": {"city": "Berlin"}}
+}
+```
+
+Variables must be strings. They fill the template's `variables.*` scope and
+shadow a same-named static variable on the stored version. SBproxy renders
+the version, prepends the text to `instructions`, removes the `prompt`
+field, and records the resolved name and version in run metadata, all before
+the request is translated for the upstream. Resolution is gateway-side, so
+one stored prompt serves every configured provider, which a dashboard-hosted
+template cannot. An `id` or `version` the store does not hold is a 404
+carrying one generic unknown-reference message; whether the prompt or the
+version missed is logged server-side at debug level only, so a caller
+cannot enumerate stored prompt names. A malformed prompt object (a
+non-string `id`, an unknown key, a typed content-part variable) is a 400. The string form above
+is unchanged.
 
 `sbproxy ai prompt optimize` compiles a shorter static system prompt offline.
 It never changes live route state. The command first scores the source prompt,

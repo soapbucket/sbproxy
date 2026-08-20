@@ -4,7 +4,10 @@
 //! one or more numbered versions; a request references one by
 //! `"name@version"` (or bare `"name"` for the pinned default version) and
 //! the gateway renders it server-side with the request variables before
-//! the messages reach the provider.
+//! the messages reach the provider. The OpenAI Responses `prompt` object
+//! (`{"id", "version", "variables"}`) resolves against the same store:
+//! `id` maps directly onto a stored prompt name and `version` onto a
+//! stored version label (WOR-2514, [`resolve_prompt_object`]).
 //!
 //! Templates are [minijinja] and may reference two scopes: `request.*`
 //! (request-derived fields the dispatcher supplies) and `variables.*`
@@ -90,14 +93,33 @@ pub enum PromptError {
 impl std::fmt::Display for PromptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PromptError::UnknownPrompt(n) => write!(f, "unknown prompt '{n}'"),
+            PromptError::UnknownPrompt(n) => write!(f, "unknown prompt '{}'", scrub(n)),
             PromptError::UnknownVersion { name, version } => {
-                write!(f, "unknown version '{version}' for prompt '{name}'")
+                write!(
+                    f,
+                    "unknown version '{}' for prompt '{}'",
+                    scrub(version),
+                    scrub(name)
+                )
             }
-            PromptError::NoVersion(n) => write!(f, "prompt '{n}' has no resolvable version"),
+            PromptError::NoVersion(n) => {
+                write!(f, "prompt '{}' has no resolvable version", scrub(n))
+            }
             PromptError::Render(e) => write!(f, "prompt render failed: {e}"),
         }
     }
+}
+
+/// Scrub a caller-controlled fragment (a prompt id, a version label,
+/// an object key) before it is interpolated into a refusal or log
+/// message. `prompt.id` is validated only as a non-empty string, and
+/// these messages reach warn/debug log lines: an embedded newline is a
+/// forged log record on a plain-text subscriber (WOR-2514 review).
+/// Delegates to the WOR-2535 scrub the translator seams use:
+/// anything outside `[A-Za-z0-9_.-]` becomes `_`, the empty string
+/// becomes `unknown`, capped at 64 characters.
+fn scrub(fragment: &str) -> String {
+    crate::format::sanitize_type_label(fragment)
 }
 
 impl std::error::Error for PromptError {}
@@ -113,17 +135,38 @@ impl PromptStore {
         request_ctx: &serde_json::Value,
     ) -> Result<RenderedPrompt, PromptError> {
         let (name, requested_version) = match reference.split_once('@') {
-            Some((n, v)) => (n.trim(), Some(v.trim().to_string())),
+            Some((n, v)) => (n.trim(), Some(v.trim())),
             None => (reference.trim(), None),
         };
+        self.render_named(
+            name,
+            requested_version,
+            request_ctx,
+            &serde_json::Map::new(),
+        )
+    }
 
+    /// Resolve and render an already-split name + optional version (the
+    /// WOR-2514 Responses `prompt` object carries them as separate keys,
+    /// so there is no `"name@version"` string to parse). A `None` version
+    /// resolves the pinned default, falling back to the highest numeric
+    /// version label. `caller_variables` joins the resolved version's
+    /// static `variables` in the template's `variables.*` scope; a
+    /// caller-supplied value shadows a same-named static one.
+    fn render_named(
+        &self,
+        name: &str,
+        requested_version: Option<&str>,
+        request_ctx: &serde_json::Value,
+        caller_variables: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<RenderedPrompt, PromptError> {
         let prompt = self
             .templates
             .get(name)
             .ok_or_else(|| PromptError::UnknownPrompt(name.to_string()))?;
 
         let version = match requested_version {
-            Some(v) => v,
+            Some(v) => v.to_string(),
             None => prompt
                 .default_version
                 .clone()
@@ -148,9 +191,13 @@ impl PromptStore {
                 .map_err(|e| PromptError::Render(e.to_string()))?;
         }
 
+        let mut variables = pv.variables.clone();
+        for (k, v) in caller_variables {
+            variables.insert(k.clone(), v.clone());
+        }
         let ctx = serde_json::json!({
             "request": request_ctx,
-            "variables": serde_json::Value::Object(pv.variables.clone()),
+            "variables": serde_json::Value::Object(variables),
         });
 
         let text = env
@@ -222,6 +269,159 @@ impl RuntimePromptOverlay {
         }
         Some(store.render(reference, request_ctx))
     }
+
+    /// [`Self::resolve`] for an already-split name + optional version
+    /// with caller-supplied variables (the WOR-2514 prompt-object
+    /// path). Same overlay semantics: `None` when the overlay holds
+    /// nothing for this hostname + prompt name, so the caller falls
+    /// through to the config-declared store.
+    fn resolve_named(
+        &self,
+        host: &str,
+        name: &str,
+        version: Option<&str>,
+        request_ctx: &serde_json::Value,
+        caller_variables: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Result<RenderedPrompt, PromptError>> {
+        let store = self.by_host.get(host)?;
+        if !store.templates.contains_key(name) {
+            return None;
+        }
+        Some(store.render_named(name, version, request_ctx, caller_variables))
+    }
+}
+
+// --- WOR-2514: the Responses `prompt` object ---
+//
+// OpenAI's Responses API references a stored prompt template as
+// `"prompt": {"id": ..., "version": ..., "variables": {...}}`. The
+// gateway serves that object from THIS store: `id` maps directly onto
+// a stored prompt name, `version` onto a stored version label (absent
+// means the pinned default), and the caller's string variables fill
+// the template's `variables.*` scope over the version's static
+// values. Resolution happens in the dispatcher before the Responses
+// body is translated to the canonical chat shape, so the rendered
+// template reaches any configured provider, and an unresolved
+// reference fails closed there rather than falling through to the
+// raw input.
+
+/// A validated Responses `prompt` object: `{"id", "version", "variables"}`.
+struct PromptObjectRef {
+    /// The stored prompt name (`id` on the wire).
+    name: String,
+    /// The stored version label; `None` resolves the pinned default.
+    version: Option<String>,
+    /// Caller-supplied string variables.
+    variables: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Why the WOR-2514 prompt-object bridge refused a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptObjectRefusal {
+    /// The prompt object itself is malformed: non-string `id`, unknown
+    /// keys, non-string variable values, and so on (refuse 400).
+    Malformed(String),
+    /// The reference names a prompt or version the store does not
+    /// hold (refuse 404; the message names the reference).
+    NotFound(String),
+    /// The template failed to render, e.g. a strict-undefined
+    /// variable miss (refuse 400).
+    Render(String),
+}
+
+/// Parse and validate the wire shape of a Responses `prompt` object,
+/// returning a client-facing message on refusal. Strict on purpose:
+/// an unknown key, a non-string id or version, or a typed
+/// content-part variable would otherwise change meaning silently. A
+/// JSON `null` version or variables is an SDK serializing an unset
+/// optional, not a value; both read as absent.
+fn parse_prompt_object(
+    prompt: &serde_json::Map<String, serde_json::Value>,
+) -> Result<PromptObjectRef, String> {
+    if let Some(key) = prompt
+        .keys()
+        .find(|k| !matches!(k.as_str(), "id" | "version" | "variables"))
+    {
+        return Err(format!(
+            "unknown key '{}' in prompt object; expected id, version, variables",
+            scrub(key)
+        ));
+    }
+    let name = match prompt.get("id") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(serde_json::Value::String(_)) => {
+            return Err("prompt.id must be a non-empty string".to_string());
+        }
+        Some(_) => return Err("prompt.id must be a string".to_string()),
+        None => return Err("prompt object is missing required key 'id'".to_string()),
+    };
+    let version = match prompt.get("version") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(serde_json::Value::String(_)) => {
+            return Err("prompt.version must be a non-empty string".to_string());
+        }
+        Some(_) => return Err("prompt.version must be a string".to_string()),
+    };
+    let variables = match prompt.get("variables") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(vars)) => {
+            if let Some((k, _)) = vars.iter().find(|(_, v)| !v.is_string()) {
+                return Err(format!(
+                    "prompt.variables['{}'] must be a string; typed content-part \
+                     variables (input_text, input_image, input_file) are not \
+                     supported",
+                    scrub(k)
+                ));
+            }
+            vars.clone()
+        }
+        Some(_) => {
+            return Err("prompt.variables must be an object of string values".to_string());
+        }
+    };
+    Ok(PromptObjectRef {
+        name,
+        version,
+        variables,
+    })
+}
+
+/// Resolve a Responses `prompt` object (WOR-2514): validate the wire
+/// shape, then render `id` as a stored prompt name through the
+/// runtime overlay first and the config-declared store second,
+/// exactly like the string `"name@version"` path. Fails closed: a
+/// reference neither layer holds is [`PromptObjectRefusal::NotFound`],
+/// never a silent fallthrough to the raw request.
+pub fn resolve_prompt_object(
+    prompt: &serde_json::Map<String, serde_json::Value>,
+    host: &str,
+    overlay: &RuntimePromptOverlay,
+    config_store: Option<&PromptStore>,
+    request_ctx: &serde_json::Value,
+) -> Result<RenderedPrompt, PromptObjectRefusal> {
+    let reference = parse_prompt_object(prompt).map_err(PromptObjectRefusal::Malformed)?;
+    let outcome = overlay
+        .resolve_named(
+            host,
+            &reference.name,
+            reference.version.as_deref(),
+            request_ctx,
+            &reference.variables,
+        )
+        .unwrap_or_else(|| match config_store {
+            Some(store) => store.render_named(
+                &reference.name,
+                reference.version.as_deref(),
+                request_ctx,
+                &reference.variables,
+            ),
+            None => Err(PromptError::UnknownPrompt(reference.name.clone())),
+        });
+    outcome.map_err(|e| match e {
+        PromptError::Render(_) => PromptObjectRefusal::Render(e.to_string()),
+        _ => PromptObjectRefusal::NotFound(e.to_string()),
+    })
 }
 
 /// Process-global runtime overlay. Reads load the current overlay
@@ -618,5 +818,227 @@ mod tests {
             .expect("render");
         assert_eq!(rendered.text, "v1");
         assert_eq!(rendered.version, "1");
+    }
+
+    // --- WOR-2514: the Responses `prompt` object ---
+
+    fn pobj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    fn resolve(prompt: serde_json::Value) -> Result<RenderedPrompt, PromptObjectRefusal> {
+        resolve_prompt_object(
+            &pobj(prompt),
+            "host-a.example.com",
+            &RuntimePromptOverlay::default(),
+            Some(&store()),
+            &req("Ada"),
+        )
+    }
+
+    #[test]
+    fn prompt_object_without_version_resolves_the_pinned_default() {
+        let r = resolve(serde_json::json!({"id": "greeting"})).unwrap();
+        assert_eq!(r.name, "greeting");
+        assert_eq!(r.version, "2");
+        assert_eq!(r.text, "Hello Ada. Be concise. Thanks!");
+    }
+
+    #[test]
+    fn prompt_object_version_pin_is_honored() {
+        let r = resolve(serde_json::json!({"id": "greeting", "version": "1"})).unwrap();
+        assert_eq!(r.version, "1");
+        assert_eq!(r.text, "Hello Ada.");
+    }
+
+    #[test]
+    fn prompt_object_caller_variables_shadow_static_ones() {
+        // Version 2's static `suffix` is "Thanks!"; the caller's value
+        // wins, exactly like a fill-in on the OpenAI object.
+        let r = resolve(serde_json::json!({
+            "id": "greeting",
+            "variables": {"suffix": "Cheers!"}
+        }))
+        .unwrap();
+        assert_eq!(r.text, "Hello Ada. Be concise. Cheers!");
+    }
+
+    #[test]
+    fn prompt_object_caller_variables_fill_strict_undefined_holes() {
+        let mut s = store();
+        s.templates.insert(
+            "city-line".to_string(),
+            NamedPrompt {
+                default_version: None,
+                versions: HashMap::from([(
+                    "1".to_string(),
+                    PromptVersion {
+                        template: "Best food in {{ variables.city }}.".to_string(),
+                        variables: serde_json::Map::new(),
+                    },
+                )]),
+            },
+        );
+        let r = resolve_prompt_object(
+            &pobj(serde_json::json!({"id": "city-line", "variables": {"city": "Berlin"}})),
+            "host-a.example.com",
+            &RuntimePromptOverlay::default(),
+            Some(&s),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(r.text, "Best food in Berlin.");
+
+        // And without the variable, strict-undefined rendering refuses.
+        let err = resolve_prompt_object(
+            &pobj(serde_json::json!({"id": "city-line"})),
+            "host-a.example.com",
+            &RuntimePromptOverlay::default(),
+            Some(&s),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromptObjectRefusal::Render(_)), "{err:?}");
+    }
+
+    #[test]
+    fn prompt_object_unknown_id_is_not_found_and_names_the_reference() {
+        let err = resolve(serde_json::json!({"id": "nope"})).unwrap_err();
+        match err {
+            PromptObjectRefusal::NotFound(m) => {
+                assert!(m.contains("unknown prompt 'nope'"), "{m}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_object_unknown_version_is_not_found_and_names_the_reference() {
+        let err = resolve(serde_json::json!({"id": "greeting", "version": "9"})).unwrap_err();
+        match err {
+            PromptObjectRefusal::NotFound(m) => {
+                assert!(
+                    m.contains("unknown version '9' for prompt 'greeting'"),
+                    "{m}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_object_with_no_store_configured_is_not_found() {
+        // Fail closed even on an origin with no prompt store at all;
+        // a reference must never fall through to the raw input.
+        let err = resolve_prompt_object(
+            &pobj(serde_json::json!({"id": "greeting"})),
+            "host-a.example.com",
+            &RuntimePromptOverlay::default(),
+            None,
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromptObjectRefusal::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn prompt_object_resolves_through_the_runtime_overlay_first() {
+        let overlay_store: PromptStore = serde_json::from_value(serde_json::json!({
+            "templates": {
+                "greeting": {
+                    "versions": {"1": {"template": "overlay wins"}}
+                }
+            }
+        }))
+        .unwrap();
+        let overlay = RuntimePromptOverlay {
+            by_host: HashMap::from([("host-a.example.com".to_string(), overlay_store)]),
+        };
+        let r = resolve_prompt_object(
+            &pobj(serde_json::json!({"id": "greeting"})),
+            "host-a.example.com",
+            &overlay,
+            Some(&store()),
+            &req("Ada"),
+        )
+        .unwrap();
+        assert_eq!(r.text, "overlay wins");
+    }
+
+    #[test]
+    fn malformed_prompt_objects_are_refused() {
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"id": 7}),
+            serde_json::json!({"id": null}),
+            serde_json::json!({"id": ""}),
+            serde_json::json!({"id": "greeting", "version": 2}),
+            serde_json::json!({"id": "greeting", "version": ""}),
+            serde_json::json!({"id": "greeting", "variables": "x"}),
+            serde_json::json!({"id": "greeting", "variables": {"v": 1}}),
+            serde_json::json!({"id": "greeting", "variables": {"v": {"type": "input_image"}}}),
+            serde_json::json!({"id": "greeting", "extra": true}),
+        ] {
+            let err = resolve(bad.clone()).unwrap_err();
+            assert!(
+                matches!(err, PromptObjectRefusal::Malformed(_)),
+                "{bad} should be malformed, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_object_null_version_and_variables_read_as_absent() {
+        // SDKs serialize unset optionals as JSON null.
+        let r = resolve(serde_json::json!({
+            "id": "greeting",
+            "version": null,
+            "variables": null
+        }))
+        .unwrap();
+        assert_eq!(r.version, "2");
+    }
+
+    #[test]
+    fn refusal_messages_scrub_caller_controlled_fragments() {
+        // WOR-2514 review Minor 1: prompt.id is validated only as a
+        // non-empty string, and the refusal message reaches a warn (and
+        // debug) log line. An embedded newline is a forged log record
+        // on a plain-text subscriber; every caller-controlled fragment
+        // goes through the sanitize_type_label idiom before it is
+        // interpolated.
+        let hostile = "nope\nFAKE 2026-08-20 ERROR forged line";
+        let err = resolve(serde_json::json!({"id": hostile})).unwrap_err();
+        let PromptObjectRefusal::NotFound(m) = err else {
+            panic!("expected NotFound, got {err:?}");
+        };
+        assert!(!m.chars().any(char::is_control), "{m:?}");
+        assert!(m.contains("nope_FAKE"), "scrubbed, not omitted: {m}");
+
+        let err = resolve(serde_json::json!({
+            "id": "greeting",
+            "version": "9\n2026 forged"
+        }))
+        .unwrap_err();
+        let PromptObjectRefusal::NotFound(m) = err else {
+            panic!("expected NotFound, got {err:?}");
+        };
+        assert!(!m.chars().any(char::is_control), "{m:?}");
+
+        let err = resolve(serde_json::json!({"id": "x", "bad\nkey": 1})).unwrap_err();
+        let PromptObjectRefusal::Malformed(m) = err else {
+            panic!("expected Malformed, got {err:?}");
+        };
+        assert!(!m.chars().any(char::is_control), "{m:?}");
+
+        let err = resolve(serde_json::json!({
+            "id": "x",
+            "variables": {"bad\nvar": 7}
+        }))
+        .unwrap_err();
+        let PromptObjectRefusal::Malformed(m) = err else {
+            panic!("expected Malformed, got {err:?}");
+        };
+        assert!(!m.chars().any(char::is_control), "{m:?}");
     }
 }
