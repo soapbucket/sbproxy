@@ -237,7 +237,7 @@ impl ChatFormat for OpenAiResponsesFormat {
                 } else {
                     // WOR-2512: every unsupported tool block leaves a
                     // trace naming what was dropped.
-                    let label = tool_type_label(ty);
+                    let label = super::sanitize_type_label(ty);
                     hub.lossiness.push(super::LossinessNote {
                         field: format!("responses.tools.{label}"),
                         direction: super::LossinessDirection::Unsupported,
@@ -358,26 +358,6 @@ pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
             vec![format!("event: response.completed\ndata: {body}\n\n")]
         }
     }
-}
-
-/// Sanitize a client-supplied tool `type` string for use in a
-/// `LossinessNote` field and the warn log: anything outside
-/// `[A-Za-z0-9_.-]` becomes `_`, the empty string becomes `unknown`,
-/// and the result is capped at 64 characters.
-fn tool_type_label(ty: &str) -> String {
-    if ty.is_empty() {
-        return "unknown".to_string();
-    }
-    ty.chars()
-        .take(64)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
@@ -919,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_type_label_is_sanitized_for_logs() {
+    fn unsupported_tool_type_label_is_sanitized_for_logs() {
         // The type string is client-controlled and lands in the note
         // field and the warn log; hostile characters must not pass
         // through verbatim.

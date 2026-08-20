@@ -6,11 +6,16 @@
 //! module owns:
 //!
 //!   * A top-level `system` field rather than interleaved `system`
-//!     turns. Maps to `HubRequest::system` directly.
+//!     turns. Maps to `HubRequest::system` directly. String and
+//!     text-block-array shapes are represented; every other system
+//!     value or block records a `LossinessNote` (WOR-2535).
 //!   * Typed content blocks (`text`, `tool_use`, `tool_result`,
-//!     `image`) that map onto the hub `ContentPart` variants.
+//!     `image`) that map onto the hub `ContentPart` variants. A block
+//!     that maps onto no variant is dropped with a `LossinessNote`
+//!     naming its sanitized type, and the translate seam warn-logs
+//!     every note (WOR-2535, mirroring WOR-2512 on `/v1/responses`).
 //!   * `stop_reason` strings (`end_turn`, `max_tokens`, `tool_use`,
-//!     `stop_sequence`) normalised to the hub `FinishReason`.
+//!     `stop_sequence`) normalized to the hub `FinishReason`.
 //!
 //! Streaming for the Anthropic outbound emitter is implemented in
 //! `from_hub_stream`, which turns each hub chunk into the matching
@@ -67,8 +72,10 @@ impl ChatFormat for AnthropicMessagesFormat {
         };
 
         // Anthropic `system` is either a string or an array of typed
-        // content blocks. Concatenate text blocks; ignore non-text
-        // blocks but flag them as lossiness so the operator can see it.
+        // content blocks. Concatenate text blocks; every block that
+        // carries no text records a `LossinessNote` naming its type,
+        // and an unrepresentable `system` value records one for the
+        // whole field, so the operator can see the drop (WOR-2535).
         if let Some(sys) = obj.get("system") {
             match sys {
                 Value::String(s) => hub.system = Some(s.clone()),
@@ -77,51 +84,141 @@ impl ChatFormat for AnthropicMessagesFormat {
                     for block in arr {
                         if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
                             chunks.push(t.to_string());
+                        } else {
+                            let label = block_type_label(block);
+                            note_drop(
+                                &mut hub.lossiness,
+                                format!("anthropic.system.{label}"),
+                                format!(
+                                    "system block of type '{label}' dropped: only \
+                                     text blocks flatten into the hub system prompt"
+                                ),
+                            );
                         }
                     }
                     if !chunks.is_empty() {
                         hub.system = Some(chunks.join("\n\n"));
                     }
                 }
-                _ => {}
+                // A JSON null is an SDK serializing an unset optional,
+                // not content; nothing is lost.
+                Value::Null => {}
+                other => note_drop(
+                    &mut hub.lossiness,
+                    "anthropic.system".into(),
+                    format!(
+                        "system value of JSON type '{}' dropped: expected a \
+                         string or an array of text blocks",
+                        json_type_name(other)
+                    ),
+                ),
             }
         }
 
-        if let Some(stops) = obj.get("stop_sequences").and_then(|v| v.as_array()) {
-            for s in stops {
-                if let Some(s) = s.as_str() {
-                    hub.stop.push(s.to_string());
+        match obj.get("stop_sequences") {
+            Some(Value::Array(stops)) => {
+                for s in stops {
+                    if let Some(s) = s.as_str() {
+                        hub.stop.push(s.to_string());
+                    } else {
+                        note_drop(
+                            &mut hub.lossiness,
+                            "anthropic.stop_sequences".into(),
+                            format!(
+                                "non-string stop_sequences entry of JSON type \
+                                 '{}' dropped",
+                                json_type_name(s)
+                            ),
+                        );
+                    }
                 }
             }
+            None | Some(Value::Null) => {}
+            Some(other) => note_drop(
+                &mut hub.lossiness,
+                "anthropic.stop_sequences".into(),
+                format!(
+                    "stop_sequences value of JSON type '{}' dropped: expected \
+                     an array of strings",
+                    json_type_name(other)
+                ),
+            ),
         }
 
-        if let Some(arr) = obj.get("messages").and_then(|v| v.as_array()) {
-            for m in arr {
-                if let Some(msg_obj) = m.as_object() {
-                    hub.messages.push(parse_anthropic_message(msg_obj)?);
+        match obj.get("messages") {
+            Some(Value::Array(arr)) => {
+                for m in arr {
+                    if let Some(msg_obj) = m.as_object() {
+                        let message = parse_anthropic_message(msg_obj, &mut hub.lossiness)?;
+                        hub.messages.push(message);
+                    } else {
+                        note_drop(
+                            &mut hub.lossiness,
+                            "anthropic.messages".into(),
+                            format!(
+                                "non-object messages entry of JSON type '{}' \
+                                 dropped",
+                                json_type_name(m)
+                            ),
+                        );
+                    }
                 }
             }
+            None | Some(Value::Null) => {}
+            Some(other) => note_drop(
+                &mut hub.lossiness,
+                "anthropic.messages".into(),
+                format!(
+                    "messages value of JSON type '{}' dropped: expected an \
+                     array of message objects",
+                    json_type_name(other)
+                ),
+            ),
         }
 
         // Tools: Anthropic ships `[{name, description, input_schema}]`.
-        if let Some(arr) = obj.get("tools").and_then(|v| v.as_array()) {
-            for t in arr {
-                if let Some(tobj) = t.as_object() {
-                    hub.tools.push(HubToolDefinition {
-                        name: tobj
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        description: tobj
-                            .get("description")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        parameters: tobj.get("input_schema").cloned().unwrap_or(Value::Null),
-                    });
+        // A non-object entry or a wrong-shape `tools` value carries
+        // definitions the hub cannot represent; each records a
+        // `LossinessNote` (WOR-2535).
+        match obj.get("tools") {
+            Some(Value::Array(arr)) => {
+                for t in arr {
+                    if let Some(tobj) = t.as_object() {
+                        hub.tools.push(HubToolDefinition {
+                            name: tobj
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            description: tobj
+                                .get("description")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            parameters: tobj.get("input_schema").cloned().unwrap_or(Value::Null),
+                        });
+                    } else {
+                        note_drop(
+                            &mut hub.lossiness,
+                            "anthropic.tools".into(),
+                            format!(
+                                "non-object tools entry of JSON type '{}' dropped",
+                                json_type_name(t)
+                            ),
+                        );
+                    }
                 }
             }
+            None | Some(Value::Null) => {}
+            Some(other) => note_drop(
+                &mut hub.lossiness,
+                "anthropic.tools".into(),
+                format!(
+                    "tools value of JSON type '{}' dropped: expected an array \
+                     of tool objects",
+                    json_type_name(other)
+                ),
+            ),
         }
 
         let ctx = BridgeContext {
@@ -307,7 +404,42 @@ fn take_open_block_indexes(ctx: &mut BridgeContext) -> Vec<usize> {
     }
 }
 
-pub(crate) fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
+/// Push an `Unsupported` lossiness note for a dropped wire-level value.
+fn note_drop(lossiness: &mut Vec<super::LossinessNote>, field: String, note: String) {
+    lossiness.push(super::LossinessNote {
+        field,
+        direction: super::LossinessDirection::Unsupported,
+        note,
+    });
+}
+
+/// Sanitized `type` label for a content block: the block's `type`
+/// string through [`super::sanitize_type_label`], or `"unknown"` when
+/// the entry is not an object or carries no string `type`.
+fn block_type_label(block: &Value) -> String {
+    super::sanitize_type_label(block.get("type").and_then(Value::as_str).unwrap_or(""))
+}
+
+/// Name a JSON value's type for a lossiness note about a field whose
+/// shape the translator cannot represent.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Parse one Anthropic message object into a `HubMessage`, recording a
+/// `LossinessNote` into `lossiness` for every content block or content
+/// value that yields no hub representation (WOR-2535).
+pub(crate) fn parse_anthropic_message(
+    obj: &Map<String, Value>,
+    lossiness: &mut Vec<super::LossinessNote>,
+) -> Result<HubMessage, ChatError> {
     // WOR-599: parse via the shared helper (missing or unknown role -> error,
     // never a silent default to user), then enforce that Anthropic message
     // turns carry only user or assistant roles (system is a top-level field,
@@ -326,6 +458,7 @@ pub(crate) fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMes
         }
         Some(Value::Array(arr)) => {
             for part in arr {
+                let parts_before = content.len();
                 if let Some(p) = part.as_object() {
                     let ty = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match ty {
@@ -350,19 +483,48 @@ pub(crate) fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMes
                             });
                         }
                         "tool_result" => {
-                            // Anthropic ships the result body either as
-                            // a string or as a nested array of text
-                            // blocks; flatten to a string.
+                            // Anthropic ships the result body as a
+                            // string or as a nested array of content
+                            // blocks; text blocks flatten into the hub
+                            // result string, and every other nested
+                            // block or body shape records a
+                            // `LossinessNote` (WOR-2535).
                             let body = match p.get("content") {
                                 Some(Value::String(s)) => s.clone(),
-                                Some(Value::Array(blocks)) => blocks
-                                    .iter()
-                                    .filter_map(|b| {
-                                        b.get("text").and_then(|t| t.as_str()).map(String::from)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(""),
-                                _ => String::new(),
+                                Some(Value::Array(blocks)) => {
+                                    let mut chunks: Vec<String> = Vec::new();
+                                    for b in blocks {
+                                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                            chunks.push(t.to_string());
+                                        } else {
+                                            let label = block_type_label(b);
+                                            note_drop(
+                                                lossiness,
+                                                format!("anthropic.messages.tool_result.{label}"),
+                                                format!(
+                                                    "tool_result content block of type \
+                                                     '{label}' dropped: only text blocks \
+                                                     flatten into the hub tool result"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    chunks.join("")
+                                }
+                                None | Some(Value::Null) => String::new(),
+                                Some(other) => {
+                                    note_drop(
+                                        lossiness,
+                                        "anthropic.messages.tool_result".into(),
+                                        format!(
+                                            "tool_result content of JSON type '{}' \
+                                             dropped: expected a string or an array \
+                                             of content blocks",
+                                            json_type_name(other)
+                                        ),
+                                    );
+                                    String::new()
+                                }
                             };
                             content.push(ContentPart::ToolResult {
                                 tool_call_id: p
@@ -401,9 +563,37 @@ pub(crate) fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMes
                         _ => {}
                     }
                 }
+                // WOR-2535: the drop detector sits on "no part pushed"
+                // rather than on a list of unknown types, so a
+                // malformed known-type block (a `text` block with no
+                // string `text`) and a non-object entry are caught by
+                // the same seam as an unknown block type.
+                if content.len() == parts_before {
+                    let label = block_type_label(part);
+                    note_drop(
+                        lossiness,
+                        format!("anthropic.messages.content.{label}"),
+                        format!(
+                            "content block of type '{label}' dropped: it has no \
+                             representation in the canonical request the gateway \
+                             governs"
+                        ),
+                    );
+                }
             }
         }
-        _ => {}
+        // Absent content is an empty turn and a JSON null is an SDK
+        // serializing an unset optional; neither loses content.
+        None | Some(Value::Null) => {}
+        Some(other) => note_drop(
+            lossiness,
+            "anthropic.messages.content".into(),
+            format!(
+                "message content of JSON type '{}' dropped: expected a string \
+                 or an array of content blocks",
+                json_type_name(other)
+            ),
+        ),
     }
 
     Ok(HubMessage {
@@ -434,9 +624,24 @@ fn hub_response_to_anthropic_value(resp: &HubResponse) -> Value {
             }
         }
     }
-    // Standalone tool_calls (separate from content) also surface as
-    // tool_use blocks in the Anthropic shape.
+    // Standalone tool_calls also surface as tool_use blocks in the
+    // Anthropic shape, but only the calls `content` does not already
+    // carry: the hub mirrors every model tool call into both `content`
+    // and `tool_calls` (see `HubResponse::tool_calls`), so emitting
+    // both pathways unconditionally duplicated every block (WOR-2535
+    // comment-drift sweep; the old comment promised "separate from
+    // content" while the code emitted all of them).
     for tc in &resp.tool_calls {
+        let mirrored_in_content = resp.content.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::ToolUse { id, name, input }
+                    if *id == tc.id && *name == tc.name && *input == tc.arguments
+            )
+        });
+        if mirrored_in_content {
+            continue;
+        }
         content_blocks.push(json!({
             "type": "tool_use",
             "id": tc.id,
@@ -475,6 +680,16 @@ fn hub_response_to_anthropic_value(resp: &HubResponse) -> Value {
 /// unchanged.
 pub fn translate_anthropic_request_to_openai(body: &[u8]) -> Result<Vec<u8>, ChatError> {
     let (hub, _ctx) = AnthropicMessagesFormat.to_hub(body)?;
+    // Nothing downstream reads `hub.lossiness` on this path, so the
+    // warn log is what makes each drop observable to an operator
+    // (WOR-2535, the same seam WOR-2512 added on /v1/responses).
+    for note in &hub.lossiness {
+        tracing::warn!(
+            field = %note.field,
+            note = %note.note,
+            "AI proxy: /v1/messages request field dropped in translation"
+        );
+    }
     Ok(super::openai_responses::hub_request_to_openai_bytes(&hub))
 }
 
@@ -482,8 +697,9 @@ pub fn translate_anthropic_request_to_openai(body: &[u8]) -> Result<Vec<u8>, Cha
 /// provider behavior is represented in the canonical request inspected by
 /// gateway governance.
 ///
-/// The Anthropic parser intentionally ignores unknown content blocks and
-/// extensions. Native byte forwarding is safe only when this stricter check
+/// The Anthropic parser drops unrepresentable content blocks with a
+/// `LossinessNote` and ignores unknown extension attributes on blocks it
+/// keeps. Native byte forwarding is safe only when this stricter check
 /// proves that no such field can skip the canonical policy path. This is
 /// deliberately conservative: new Anthropic fields remain on the translated
 /// path until their canonical representation is implemented here and in the
@@ -1195,5 +1411,371 @@ mod tests {
         assert_eq!(f2.len(), 1);
         assert!(f2[0].contains("input_json_delta"));
         assert!(f2[0].contains("partial_json"));
+    }
+
+    #[test]
+    fn system_non_text_block_records_lossiness_note() {
+        // WOR-2535: the parser claimed non-text system blocks were
+        // "flagged as lossiness" while pushing no note. Every dropped
+        // system block must leave a trace naming its type.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "system": [
+                {"type": "text", "text": "be terse"},
+                {"type": "server_instructions", "value": "governed"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.system.as_deref(), Some("be terse"));
+        assert_eq!(hub.lossiness.len(), 1);
+        let note = &hub.lossiness[0];
+        assert_eq!(note.field, "anthropic.system.server_instructions");
+        assert_eq!(
+            note.direction,
+            super::super::LossinessDirection::Unsupported
+        );
+        assert!(note.note.contains("server_instructions"), "{}", note.note);
+    }
+
+    #[test]
+    fn system_block_label_is_sanitized_for_logs() {
+        // The block type is client-controlled and lands in the note field
+        // and the warn log; hostile characters must not pass through.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "system": [{"type": "we ird\ntype!"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.system.we_ird_type_");
+    }
+
+    #[test]
+    fn system_unsupported_shape_records_lossiness_note() {
+        // A system value that is neither a string nor an array is content
+        // the client sent that the hub cannot carry; the drop is noted.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "system": 42,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.system, None);
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.system");
+        assert!(
+            hub.lossiness[0].note.contains("number"),
+            "{}",
+            hub.lossiness[0].note
+        );
+    }
+
+    #[test]
+    fn system_null_is_not_a_drop() {
+        // SDKs serialize unset optionals as null; nothing is lost.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "system": null,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.system, None);
+        assert!(hub.lossiness.is_empty());
+    }
+
+    #[test]
+    fn unknown_content_block_records_lossiness_note() {
+        // A `document` block has no hub representation and must be named
+        // rather than silently vanishing (WOR-2535, the same class
+        // WOR-2512 closed on the Responses tools loop).
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "supported"},
+                    {"type": "document", "source": {"type": "text", "data": "dropped"}}
+                ]
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.messages[0].content.len(), 1);
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(
+            hub.lossiness[0].field,
+            "anthropic.messages.content.document"
+        );
+    }
+
+    #[test]
+    fn text_block_without_text_records_lossiness_note() {
+        // The drop detector sits on "no hub part produced", not on a list
+        // of unknown types, so a malformed known-type block is caught by
+        // the same seam as an unknown type.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": 7}]
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.messages[0].content.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.messages.content.text");
+    }
+
+    #[test]
+    fn non_object_content_entry_records_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": ["rogue", {"type": "text", "text": "hi"}]
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.messages[0].content.len(), 1);
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.messages.content.unknown");
+    }
+
+    #[test]
+    fn unsupported_content_shape_records_lossiness_note() {
+        // Content that is neither a string nor an array drops the whole
+        // turn body; a null stays silent (an SDK's unset optional).
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": 42}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.messages[0].content.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.messages.content");
+
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": null}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.lossiness.is_empty());
+    }
+
+    #[test]
+    fn tool_result_non_text_block_records_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "ok"},
+                        {"type": "image", "source": {"media_type": "image/png", "data": "abc=="}}
+                    ]
+                }]
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        match &hub.messages[0].content[0] {
+            ContentPart::ToolResult { content, .. } => assert_eq!(content, "ok"),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(
+            hub.lossiness[0].field,
+            "anthropic.messages.tool_result.image"
+        );
+    }
+
+    #[test]
+    fn tool_result_unsupported_content_shape_records_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": {"nested": "object"}
+                }]
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        match &hub.messages[0].content[0] {
+            ContentPart::ToolResult { content, .. } => assert_eq!(content, ""),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.messages.tool_result");
+    }
+
+    #[test]
+    fn non_string_stop_sequence_records_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "stop_sequences": ["STOP", 42],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.stop, vec!["STOP".to_string()]);
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.stop_sequences");
+    }
+
+    #[test]
+    fn non_object_message_entry_records_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "hi"}, "rogue"]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.messages.len(), 1);
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.messages");
+    }
+
+    #[test]
+    fn non_object_tool_entry_records_lossiness_note() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "tools": [
+                {"name": "lookup", "description": "", "input_schema": {}},
+                42
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.tools.len(), 1);
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "anthropic.tools");
+    }
+
+    #[test]
+    fn wrong_shape_top_level_fields_record_lossiness_notes() {
+        // A messages/tools/stop_sequences value of the wrong JSON type
+        // silently dropped everything it carried; each records a note.
+        for (field, value) in [
+            ("messages", json!("hi")),
+            ("tools", json!({"name": "lookup"})),
+            ("stop_sequences", json!("STOP")),
+        ] {
+            let mut req = json!({
+                "model": "claude-3-5-sonnet",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            req[field] = value;
+            let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+            assert_eq!(hub.lossiness.len(), 1, "{field}");
+            assert_eq!(hub.lossiness[0].field, format!("anthropic.{field}"));
+        }
+    }
+
+    #[test]
+    fn translate_seam_keeps_dropped_blocks_out_of_the_openai_body() {
+        // The dispatch shim calls translate_anthropic_request_to_openai,
+        // which warn-logs each lossiness note (WOR-2535); the dropped
+        // blocks must not leak into the canonical OpenAI body either.
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "system": [
+                {"type": "text", "text": "be terse"},
+                {"type": "server_instructions", "value": "governed"}
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "supported"},
+                    {"type": "document", "source": {"type": "text", "data": "dropped"}}
+                ]
+            }]
+        });
+        let bytes = translate_anthropic_request_to_openai(req.to_string().as_bytes()).unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["messages"][0]["role"], "system");
+        assert_eq!(parsed["messages"][0]["content"], "be terse");
+        let body = String::from_utf8(bytes).unwrap();
+        assert!(!body.contains("document"), "{body}");
+    }
+
+    #[test]
+    fn openai_tool_call_response_emits_a_single_tool_use_block() {
+        // WOR-2535 drift sweep: the emit comment promised "standalone
+        // tool_calls (separate from content)" but the code emitted every
+        // hub-mirrored call twice: once from `content`, once from
+        // `tool_calls`.
+        let openai = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let body = translate_openai_response_to_anthropic(openai.to_string().as_bytes());
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let tool_use_blocks: Vec<&Value> = parsed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect();
+        assert_eq!(tool_use_blocks.len(), 1, "{parsed}");
+        assert_eq!(tool_use_blocks[0]["id"], "call_1");
+        assert_eq!(parsed["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn standalone_tool_calls_still_emit_blocks() {
+        // Deduplication must not eat a call that exists only on the
+        // standalone `tool_calls` pathway.
+        let resp = HubResponse {
+            id: "msg_01".into(),
+            model: "claude-3-5-sonnet".into(),
+            content: vec![ContentPart::ToolUse {
+                id: "toolu_1".into(),
+                name: "lookup".into(),
+                input: json!({"q": "a"}),
+            }],
+            tool_calls: vec![
+                super::super::HubToolCall {
+                    id: "toolu_1".into(),
+                    name: "lookup".into(),
+                    arguments: json!({"q": "a"}),
+                },
+                super::super::HubToolCall {
+                    id: "toolu_2".into(),
+                    name: "lookup".into(),
+                    arguments: json!({"q": "b"}),
+                },
+            ],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HubUsage::default(),
+            extensions: Default::default(),
+        };
+        let bytes = fmt().from_hub(&resp, &BridgeContext::default()).unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = out["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .filter_map(|b| b["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["toolu_1", "toolu_2"]);
     }
 }

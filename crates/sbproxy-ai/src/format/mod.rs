@@ -248,6 +248,26 @@ pub fn native_bypass_for(
     }
 }
 
+/// Sanitize a client-supplied `type` string for use in a
+/// `LossinessNote` field and the warn log at a translate seam:
+/// anything outside `[A-Za-z0-9_.-]` becomes `_`, the empty string
+/// becomes `unknown`, and the result is capped at 64 characters.
+pub(crate) fn sanitize_type_label(ty: &str) -> String {
+    if ty.is_empty() {
+        return "unknown".to_string();
+    }
+    ty.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// A bidirectional translator between a wire format and the hub.
 ///
 /// The trait is method-style and uses the names called out in the
@@ -537,7 +557,11 @@ mod parity_tests {
             expected
         );
         assert_eq!(
-            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            super::anthropic_messages::parse_anthropic_message(
+                &obj(input.clone()),
+                &mut Vec::new()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
@@ -560,7 +584,11 @@ mod parity_tests {
             expected
         );
         assert_eq!(
-            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            super::anthropic_messages::parse_anthropic_message(
+                &obj(input.clone()),
+                &mut Vec::new()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
@@ -582,10 +610,13 @@ mod parity_tests {
         })))
         .unwrap();
         // Anthropic: inline `tool_use` block, `input` already structured.
-        let anthropic = super::anthropic_messages::parse_anthropic_message(&obj(json!({
-            "role": "assistant",
-            "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
-        })))
+        let anthropic = super::anthropic_messages::parse_anthropic_message(
+            &obj(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
+            })),
+            &mut Vec::new(),
+        )
         .unwrap();
         let expected = HubMessage {
             role: Role::Assistant,
