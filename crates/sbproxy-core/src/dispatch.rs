@@ -202,6 +202,19 @@ async fn check_auth(
             );
             false
         }
+        Auth::Ldap(l) => {
+            // WOR-2519: the directory bind needs only the request
+            // headers, so it runs for real on the H3 path too. Every
+            // non-allowed outcome (missing credentials, refused bind,
+            // unreachable directory) maps to a denial here; the boolean
+            // return cannot carry the 503-vs-401 split the H1/H2 path
+            // reports, so H3 answers 401 for all of them, which still
+            // fails closed.
+            matches!(
+                l.authenticate(headers).await,
+                sbproxy_modules::auth::ldap::LdapBindOutcome::Allowed { .. }
+            )
+        }
         Auth::BotAuth(_) => {
             // Web Bot Auth verification needs the full request shape
             // (method, target-uri, headers) to reconstruct the

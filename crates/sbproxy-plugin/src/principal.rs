@@ -126,6 +126,10 @@ pub enum PrincipalSource {
     /// against a configured shared-secret key set; WOR-2518). At the
     /// end of the enum to keep serialized forms stable.
     Hmac,
+    /// WOR-2519: LDAP directory bind accepted the request's HTTP
+    /// Basic credentials. Added at the end of the enum per the
+    /// serialized-form stability note above.
+    Ldap,
 }
 
 impl PrincipalSource {
@@ -144,6 +148,7 @@ impl PrincipalSource {
             Self::ForwardAuth => "forward_auth",
             Self::Plugin => "plugin",
             Self::Hmac => "hmac_auth",
+            Self::Ldap => "ldap_auth",
         }
     }
 }

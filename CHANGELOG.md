@@ -10,8 +10,6 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
-<<<<<<< HEAD
-=======
 ### Added
 
 - **`hmac_auth`: signed-request authentication.** A new auth provider
@@ -28,8 +26,6 @@ the next version cut.
   section of [docs/configuration.md](docs/configuration.md) and
   [examples/auth-hmac/](examples/auth-hmac/).
 
-<<<<<<< HEAD
->>>>>>> feat/w2518-hmac
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised

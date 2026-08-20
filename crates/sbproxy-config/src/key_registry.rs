@@ -1248,6 +1248,8 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("auth", "forward_auth"),
     deferred("auth", "hmac_auth"),
     deferred("auth", "jwt"),
+    deferred("auth", "ldap"),
+    deferred("auth", "ldap_auth"),
     deferred("auth", "noop"),
     deferred("auth", "oidc"),
     deferred("auth", "web_bot_auth"),
