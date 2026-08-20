@@ -140,6 +140,8 @@ ulid.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 jsonwebtoken.workspace = true
+# JWE (RFC 7516) decryption for the jwt auth provider (WOR-2520).
+aws-lc-rs.workspace = true
 jsonschema.workspace = true
 dashmap.workspace = true
 rand.workspace = true

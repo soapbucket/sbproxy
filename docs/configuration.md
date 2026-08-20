@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2399,6 +2399,7 @@ origins:
 | `required_claims` | map | | Claims that must be present and equal to the configured value. |
 | `require_dpop` | bool | `false` | When `true`, the JWT MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token's `cnf.jkt` claim. Tokens without a `cnf.jkt` claim fail closed. |
 | `require_mtls_bound` | bool | `false` | When `true`, the JWT's `cnf.x5t#S256` claim MUST match the SHA-256 thumbprint of the inbound TLS client cert (RFC 8705 mutual-TLS-bound tokens). |
+| `jwe.decryption_key` | string | | PEM private key for decrypting JWE (RFC 7516) encrypted tokens before the usual signature checks. See "Encrypted tokens" below. |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
 
@@ -2433,6 +2434,43 @@ authentication:
 Both flags default to `false` so existing JWT configurations
 keep their unbound semantics. Turn them on per-route as the
 issuer starts minting `cnf.jkt` / `cnf.x5t#S256` tokens.
+
+#### Encrypted tokens (RFC 7516 JWE)
+
+Some identity providers encrypt their tokens instead of only
+signing them: a signed JWT nested inside a JWE envelope. Set
+`jwe.decryption_key` to the PEM private key registered with the
+issuer and the proxy decrypts the envelope first, then verifies
+the recovered JWT with the same `secret` / `jwks_url` settings
+as a plain signed token (decrypt-then-verify per RFC 7519). A
+provider without a `jwe` block refuses encrypted tokens, so
+existing JWS-only configurations are unaffected.
+
+```yaml
+authentication:
+  type: jwt
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  issuer: https://auth.example.com
+  audience: my-api
+  jwe:
+    decryption_key: ${JWT_JWE_PRIVATE_KEY}
+```
+
+Supported algorithms are the set enterprise issuers actually
+use for encrypted tokens: `RSA-OAEP` and `RSA-OAEP-256` key
+unwrap with an RSA private key, and `ECDH-ES` direct key
+agreement with a P-256 EC private key, all with `A256GCM`
+content encryption. Anything else, including the deprecated
+`RSA1_5`, is refused (debug-level logs name the offending
+algorithm).
+
+Failure handling is deliberately uniform: wrong key, garbage
+ciphertext, an unsupported algorithm, or a tampered tag all
+produce the same 401 challenge as a bad signature, so a probing
+client learns nothing from the response shape. The decryption
+key is never echoed in logs or error messages. Interpolate it
+from the environment or a secret backend (as above) rather than
+committing key material to the config file.
 
 ### digest
 
