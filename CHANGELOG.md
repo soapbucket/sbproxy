@@ -10,6 +10,22 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Added
+
+- **`hmac_auth`: signed-request authentication.** A new auth provider
+  for machine callers that prove possession of a shared secret by
+  signing each request (RFC 9421 HTTP Message Signatures,
+  `hmac-sha256`) instead of sending a static credential. Config is a
+  `keys` list of `key_id` + `secret` pairs (secrets resolve through
+  the secret resolver) with optional per-credential metadata, a
+  `required_components` list defaulting to `["@method",
+  "@target-uri"]`, and a `clock_skew_seconds` window (default 300)
+  enforced against the mandatory `created` parameter as the replay
+  defense. Failures answer `401` with a `WWW-Authenticate: Signature`
+  challenge that never carries key material. See the `hmac_auth`
+  section of [docs/configuration.md](docs/configuration.md) and
+  [examples/auth-hmac/](examples/auth-hmac/).
+
 <<<<<<< HEAD
 ### Changed, and worth checking before you upgrade
 

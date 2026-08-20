@@ -1246,6 +1246,7 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("auth", "digest"),
     deferred("auth", "forward"),
     deferred("auth", "forward_auth"),
+    deferred("auth", "hmac_auth"),
     deferred("auth", "jwt"),
     deferred("auth", "noop"),
     deferred("auth", "oidc"),

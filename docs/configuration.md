@@ -2259,7 +2259,7 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships ten built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships eleven built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
@@ -2491,6 +2491,43 @@ authentication:
 ```
 
 The algorithm is negotiated, not merely declared. The challenge carries `algorithm=`, and a response that names a different algorithm, or omits the parameter on a SHA-256 realm, is rejected. A client cannot talk a SHA-256 realm down to MD5 by dropping the parameter. Only `SHA-256` and `MD5` are implemented; the `-sess` variants and `SHA-512-256` are refused at config compile rather than silently downgraded.
+
+### hmac_auth
+
+Signed-request authentication for machine callers. The client holds a shared secret and signs each request with RFC 9421 HTTP Message Signatures (`hmac-sha256`), so no static credential crosses the wire and a captured request cannot be replayed against a different method, path, or time window. The right pick for webhook senders and machine-to-machine API clients that want per-request integrity without a bearer token.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: hmac_auth
+      clock_skew_seconds: 300
+      keys:
+        - key_id: svc-billing
+          secret: ${BILLING_HMAC_SECRET}
+          project: billing
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `hmac_auth`. |
+| `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
+| `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed elsewhere. |
+
+The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
+
+Clients send the standard RFC 9421 header pair. The signature base covers the declared components plus the `@signature-params` line, `created` is required, and `alg` must be `hmac-sha256` (the only symmetric algorithm in the RFC 9421 registry; HMAC-SHA1 does not exist here to be negotiated down to):
+
+```text
+Signature-Input: sig1=("@method" "@target-uri");created=1723800000;keyid="svc-billing";alg="hmac-sha256"
+Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
+```
+
+On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting. A signature that covers `content-digest` is checked against the request body available at the auth phase, which is empty, so body-covering signatures on body-bearing requests are refused rather than passed unverified; body-digest binding is a tracked follow-up. See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
 
 ### forward_auth
 

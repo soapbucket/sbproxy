@@ -15,6 +15,8 @@ pub mod cap;
 pub mod dpop;
 /// WOR-1071: RFC 9449 outbound DPoP proof minting (companion to `dpop`).
 pub mod dpop_outbound;
+/// WOR-2518: HMAC signed-request authentication (`hmac_auth`).
+pub mod hmac_auth;
 pub mod jwks;
 /// WOR-1072: RFC 8705 mTLS-bound access token validation.
 pub mod mtls_bound;
@@ -33,6 +35,7 @@ pub use bot_auth_directory::{
     MIN_DIRECTORY_TTL_SECS,
 };
 pub use cap::{CapConfig, CapError, CapRateLimitInfo, CapTokenView, CapVerdict, CapVerifier};
+pub use hmac_auth::{HmacAuth, HmacVerdict};
 pub use trust_tier::{compute_trust_tier, TrustSignals, TrustTier, NAMED_AGENT_SCORE_THRESHOLD};
 
 use base64::Engine;
@@ -157,6 +160,12 @@ pub enum Auth {
     /// cannot be replayed. See [`DigestAuth`] for the implementation
     /// details.
     Digest(DigestAuth),
+    /// HMAC signed-request authentication: RFC 9421 HTTP Message
+    /// Signatures with the `hmac-sha256` algorithm against a
+    /// configured `key_id` -> shared-secret set, with a mandatory
+    /// `created` timestamp window as the replay defense. See
+    /// [`HmacAuth`] (WOR-2518).
+    Hmac(HmacAuth),
     /// Forward auth to an external service.
     ForwardAuth(ForwardAuthProvider),
     /// Web Bot Auth: RFC 9421 message signature against an agent
@@ -189,6 +198,7 @@ impl Auth {
             Self::Bearer(_) => "bearer",
             Self::Jwt(_) => "jwt",
             Self::Digest(_) => "digest",
+            Self::Hmac(_) => "hmac_auth",
             Self::ForwardAuth(_) => "forward_auth",
             Self::BotAuth(_) => "bot_auth",
             Self::Cap(_) => "cap",
@@ -207,6 +217,7 @@ impl std::fmt::Debug for Auth {
             Self::Bearer(a) => f.debug_tuple("Bearer").field(a).finish(),
             Self::Jwt(a) => f.debug_tuple("Jwt").field(a).finish(),
             Self::Digest(a) => f.debug_tuple("Digest").field(a).finish(),
+            Self::Hmac(a) => f.debug_tuple("Hmac").field(a).finish(),
             Self::ForwardAuth(a) => f.debug_tuple("ForwardAuth").field(a).finish(),
             Self::BotAuth(a) => f.debug_tuple("BotAuth").field(a).finish(),
             Self::Cap(a) => f.debug_tuple("Cap").field(a).finish(),

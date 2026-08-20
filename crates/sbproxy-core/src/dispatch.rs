@@ -164,6 +164,30 @@ async fn check_auth(
             // hardcoded "GET" rejected every valid non-GET request.
             digest.check_request(headers, method.as_str())
         }
+        Auth::Hmac(h) => {
+            // RFC 9421 verification needs only method + uri + headers,
+            // all of which the H3 dispatch has, so it verifies for real
+            // here rather than failing closed like the providers that
+            // need wiring the H3 path lacks. The body is empty for the
+            // same reason as the H1/H2 path: a signature covering
+            // `content-digest` on a body-bearing request fails closed.
+            let builder = http::Request::builder()
+                .method(method.clone())
+                .uri(uri.clone());
+            match builder.body(bytes::Bytes::new()) {
+                Ok(mut req) => {
+                    *req.headers_mut() = headers.clone();
+                    match h.verify(&req) {
+                        sbproxy_modules::auth::HmacVerdict::Verified { .. } => true,
+                        verdict => {
+                            debug!(?verdict, "H3: hmac_auth verification failed");
+                            false
+                        }
+                    }
+                }
+                Err(_) => false,
+            }
+        }
         Auth::ForwardAuth(fa) => {
             // Forward auth requires an async subrequest. The H3 dispatch path is
             // synchronous at this point in the pipeline, so we cannot perform the

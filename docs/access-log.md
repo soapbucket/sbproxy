@@ -285,7 +285,7 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `session_id` | string? | Session identifier: caller-supplied, or auto-generated for anonymous traffic. |
 | `parent_session_id` | string? | Parent session identifier; never auto-generated. Absent when the request carried none. |
 | `tenant_id` | string | Tenant resolved from the matched origin's `tenant_id`. `__default__` for single-tenant deployments. Empty (and omitted) for log rows emitted before the request matched an origin, such as an early 404 on an unknown host. |
-| `principal_kind` | string? | Which kind of principal authenticated the request: `bearer`, `api_key`, `jwt`, `basic_auth`, `oidc`, `forward_auth`, `bot_auth`, `digest`, `cap`, `noop`, `virtual_key`, or `none`. `none` covers origins with no auth provider configured. |
+| `principal_kind` | string? | Which kind of principal authenticated the request: `bearer`, `api_key`, `jwt`, `basic_auth`, `oidc`, `forward_auth`, `bot_auth`, `digest`, `hmac_auth`, `cap`, `noop`, `virtual_key`, or `none`. `none` covers origins with no auth provider configured. |
 | `api_key_id` | string? | Stable identifier of the credential (virtual key) that authenticated the request, mirroring the `api_key_id` metric label. Never the raw secret. Absent for un-credentialed requests. |
 | `key_provider` | string? | Recognized native provider label when the request was governed by [native-key policy](key-management.md#attributing-native-provider-keys). Never contains credential material. |
 | `key_mode` | string? | Inbound credential mode: `none`, `minted`, or `native`. |
