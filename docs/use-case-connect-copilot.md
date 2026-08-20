@@ -1,6 +1,6 @@
 # Connect GitHub Copilot to a governed gateway
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 GitHub Copilot's bring-your-own-key (BYOK) support lets you register an OpenAI-compatible endpoint with an API key and use it in place of Copilot's own models. That is enough to reach a generic multi-provider proxy but buys nothing beyond it: no per-key budgets, no attribution, no guardrails on the prompt. This page registers SBproxy as that endpoint, so the same setup also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -89,7 +89,7 @@ Register the returned `token` as the BYOK provider's API key alongside the base 
 
 ## The payoff
 
-Every request Copilot sends through the BYOK provider is now attributed to the `copilot-vscode` key by name in the usage ledger (`sbproxy ai ledger verify` proves the file has not been edited after the fact), covered by whatever guardrails you attach to the origin, and stopped at `402` the moment the daily budget is spent. Add a `serve:` block naming a local model and give it the same alias as a hosted one, and the BYOK provider switches to your own GPU with no further client-side change: see [use-case-coding-assistant.md](use-case-coding-assistant.md) for that half. `serve:` is the compatibility form; [model-host.md](model-host.md) documents the canonical `proxy.model_host` form for new deployments.
+Every request Copilot sends through the BYOK provider is now attributed to the `copilot-vscode` key in the usage ledger (`sbproxy ai ledger verify` proves the file has not been edited after the fact), covered by whatever guardrails you attach to the origin, and stopped at `402` the moment the daily budget is spent. Add a `serve:` block naming a local model and give it the same alias as a hosted one, and the BYOK provider switches to your own GPU with no further client-side change: see [use-case-coding-assistant.md](use-case-coding-assistant.md) for that half. `serve:` is the compatibility form; [model-host.md](model-host.md) documents the canonical `proxy.model_host` form for new deployments.
 
 ## Next steps
 

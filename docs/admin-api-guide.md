@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -95,13 +95,20 @@ export SB_ADMIN_PASSWORD='replace-me'
 The admin server accepts two credential shapes on every protected
 route:
 
-1. **HTTP Basic**, using the top-level `username`/`password` or an
-   `operators[]` entry. This is the right shape for curl, CI, and
-   scripts. Send it on every request, no state to manage:
+1. **HTTP Basic**, using the top-level `username`/`password`. This is
+   the right shape for curl, CI, and scripts. Send it on every
+   request, no state to manage:
 
    ```bash
    curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/keys"
    ```
+
+   An `operators[]` entry's credentials are **not** accepted as Basic
+   auth on a protected route directly; only the top-level identity is.
+   An operator logs in through `POST /admin/login` (which does accept
+   a Basic header, or a JSON body, as the login credentials) and then
+   carries the resulting session cookie on every later request, the
+   same as a browser does. See the role example below.
 
 2. **A browser session**, for the UI (or any client that would rather
    not resend a password on every call). `POST /admin/login` verifies
@@ -165,7 +172,14 @@ each `operators[]` entry, has a role:
   before the mutation runs.
 
 ```bash
-curl -i -u "oncall:${ONCALL_PASSWORD}" -X POST "${SB_ADMIN_URL}/admin/reload"
+# oncall is a configured operator, so it authenticates through login,
+# not Basic auth on the route itself (see above).
+RESP="$(curl -fsS -c oncall-cookies.txt -X POST "${SB_ADMIN_URL}/admin/login" \
+  -u "oncall:${ONCALL_PASSWORD}")"
+CSRF="$(echo "$RESP" | jq -r .csrf_token)"
+
+curl -i -b oncall-cookies.txt -X POST "${SB_ADMIN_URL}/admin/reload" \
+  -H "X-CSRF-Token: ${CSRF}"
 # HTTP/1.1 403 Forbidden
 # {"error":"forbidden: read-only operator cannot perform this action"}
 ```
@@ -181,6 +195,31 @@ compression content inspection is `admin`-only *and* requires handler
 opt-in, and cluster enrollment authenticates a one-time token instead
 of an operator at all. Those are called out where they apply in
 [admin-api-reference.md](admin-api-reference.md).
+
+Put together, one request to a protected route walks through
+authentication, then CSRF (session callers only), then role, in that
+order:
+
+```mermaid
+flowchart TD
+    A["Request to a protected admin route"] --> B{"Credential presented"}
+    B -->|"Basic header"| C["Verify against the top-level\nusername/password only"]
+    B -->|"sb_admin_session cookie"| D["Look up the session"]
+    B -->|"neither"| E["401: missing/invalid credentials"]
+    C -->|"invalid"| E
+    D -->|"expired or unknown"| E
+    C -->|"valid"| F["AdminPrincipal: username + role"]
+    D -->|"valid"| F
+    F --> G{"Mutating request\n(POST/PUT/PATCH/DELETE)?"}
+    G -->|"no"| H["Handler runs"]
+    G -->|"yes, via session cookie"| I{"X-CSRF-Token matches\nthe session's token?"}
+    I -->|"no"| J["403: CSRF token missing or invalid"]
+    I -->|"yes"| K{"role == admin?"}
+    G -->|"yes, via Basic (CSRF-exempt)"| K
+    K -->|"read_only"| L["403: read-only operator\ncannot perform this action"]
+    K -->|"admin"| H
+    H --> M["sbproxy::admin::audit event,\nfor routes that mutate state"]
+```
 
 ## Error envelope
 
@@ -227,10 +266,11 @@ curl -fsS "${SB_ADMIN_URL}/health" | jq '{status,version,checks}'
 
 **Extension inventory for the running generation.** A `read_only` operator can
 call this route. It reports safe bundle and hook metadata, never entry bytes,
-source paths, attachment config, or secrets:
+source paths, attachment config, or secrets. Logged in as `oncall` (see the
+login example above for getting a cookie):
 
 ```bash
-curl -fsS -u "oncall:${ONCALL_PASSWORD}" \
+curl -fsS -b oncall-cookies.txt \
   "${SB_ADMIN_URL}/api/extensions" \
   | jq '{scope, summary, bundles, hooks, collisions}'
 ```

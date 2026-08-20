@@ -1,8 +1,8 @@
 # Connect Codex to a governed gateway
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
-Codex CLI's config format makes it easy to point at any OpenAI-compatible endpoint. That is also exactly what a generic multi-provider proxy needs: no per-key budgets, no attribution, no guardrails on the prompt, nothing recording what got spent. This page connects Codex to SBproxy instead, so the same base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
+Codex CLI's config format makes it easy to point at any OpenAI-compatible endpoint, which is enough to reach a generic multi-provider proxy but buys nothing beyond it: no per-key budgets, no attribution, no guardrails on the prompt. This page connects Codex to SBproxy instead, so the same base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
 ## What to set
 
@@ -24,7 +24,7 @@ env_key = "SBPROXY_API_KEY"
 wire_api = "chat"
 ```
 
-`wire_api = "chat"` matters: SBproxy's `ai_proxy` action speaks the OpenAI chat-completions wire on `POST /v1/chat/completions`, the shape third-party gateways implement, not OpenAI's newer Responses API.
+`wire_api = "chat"` matters. SBproxy's `ai_proxy` action does serve `/v1/responses`, but only for stateless requests: Codex's Responses mode leans on OpenAI-side response storage (`previous_response_id`, `store`), which the gateway refuses with a 400 rather than silently running without the stored turns. The chat-completions wire on `POST /v1/chat/completions` resends the full conversation every turn, so it works end to end through the gateway.
 
 ## Wire format
 
@@ -98,14 +98,14 @@ curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
 The response's `token` field is the plaintext credential, returned exactly once. Export it as the variable `config.toml` names in `env_key`:
 
 ```bash
-export SBPROXY_API_KEY=sk-...
+export SBPROXY_API_KEY=sbp_...
 ```
 
 Run `codex` as usual. Its requests now carry your SBproxy key, land on `gpt-4o-mini` through your own gateway, and get counted against the `codex-cli` key's daily budget.
 
 ## The payoff
 
-Every request Codex sends is now attributed to the `codex-cli` key by name in the usage ledger (`sbproxy ai ledger verify` proves the file has not been edited after the fact), covered by whatever guardrails you attach to the origin (PII redaction, prompt-injection classifiers, external moderation adapters), and stopped at `402` the moment the daily budget is spent rather than quietly running up a bill. Add a `serve:` block naming a local model and give it the same alias as a hosted one, and Codex switches to your own GPU with no client-side change at all: see [use-case-coding-assistant.md](use-case-coding-assistant.md) for that half.
+Every request Codex sends is now attributed to the `codex-cli` key in the usage ledger (`sbproxy ai ledger verify` proves the file has not been edited after the fact), covered by whatever guardrails you attach to the origin (PII redaction, prompt-injection classifiers, external moderation adapters), and stopped at `402` the moment the daily budget is spent rather than quietly running up a bill. Add a `serve:` block naming a local model and give it the same alias as a hosted one, and Codex switches to your own GPU with no further client-side change: see [use-case-coding-assistant.md](use-case-coding-assistant.md) for that half. `serve:` is the compatibility form; [model-host.md](model-host.md) documents the canonical `proxy.model_host` form for new deployments.
 
 ## Next steps
 

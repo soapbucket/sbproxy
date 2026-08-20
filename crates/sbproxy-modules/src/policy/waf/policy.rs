@@ -6,11 +6,11 @@
 //! policy without a restart.
 
 use regex::Regex;
-use sbproxy_config::types::FailureMode;
+use sbproxy_config::types::{EnforcementMode, FailureMode};
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::feed::{FeedRuleAction, WafFeedConfig, WafFeedSubscriber};
+use super::feed::{WafFeedConfig, WafFeedSubscriber};
 use super::persistent::{PersistentBlockConfig, PersistentBlockStore};
 
 /// Default paranoia level when none is configured. Mirrors the OWASP CRS
@@ -34,59 +34,84 @@ const MAX_PARANOIA: u8 = 4;
 /// paranoia=1 and therefore always run.
 ///
 /// Two independent axes decide what happens to a request, and they are
-/// worth keeping apart. [`Self::action_on_match`] and
-/// [`Self::test_mode`] answer "a rule fired, now what".
-/// [`Self::failure_posture()`] answers "a rule could not run, now
-/// what". A detector can reasonably be in log-only mode while it is
-/// being tuned and still need to refuse traffic it was unable to
+/// worth keeping apart. [`Self::enforcement()`] answers "a rule fired,
+/// now what". [`Self::failure_posture()`] answers "a rule could not
+/// run, now what". A detector can reasonably be in `observe` while it
+/// is being tuned and still need to refuse traffic it was unable to
 /// inspect.
 #[derive(Debug, Deserialize)]
 pub struct WafPolicy {
     /// OWASP Core Rule Set configuration.
     #[serde(default)]
     pub owasp_crs: Option<serde_json::Value>,
-    /// Action to take when a rule matches. The magic value `"log"`
-    /// means "record the match and let the request through"; anything
-    /// else (including the default) blocks.
+    /// Legacy enforcement knob: the magic value `"log"` means "record
+    /// the match and let the request through"; anything else (including
+    /// the default) blocks.
     ///
-    /// This is the *enforcement* axis: the WAF reached a verdict and
-    /// the verdict was "refuse". It is a different question from
-    /// [`Self::failure_posture()`], which covers the WAF being unable to
-    /// reach a verdict at all. See the note on [`Self::test_mode`] for
-    /// why this axis still has three spellings.
+    /// Superseded by [`Self::enforcement`], which spells the same
+    /// decision with the shared [`EnforcementMode`] vocabulary instead
+    /// of a magic string. This field still parses and is still honored
+    /// when `enforcement` is absent: `action_on_match: "log"` resolves
+    /// to `observe` in [`Self::enforcement()`]. Unlike `test_mode`, it
+    /// is only the *default* for rules that carry no `action` of their
+    /// own; a custom rule spelling `action: "block"` explicitly still
+    /// blocks. That asymmetry is pinned by test because shipped configs
+    /// rely on it.
+    ///
+    /// Read through [`Self::enforcement()`], never directly.
     #[serde(default)]
     pub action_on_match: Option<String>,
-    /// If true, log matches but do not block. Overrides
-    /// [`Self::action_on_match`] in the permissive direction.
+    /// Legacy enforcement knob: if true, log matches but do not block,
+    /// whatever the rule says.
     ///
-    /// # Three spellings of one idea
+    /// Superseded by [`Self::enforcement`]; `test_mode: true` is
+    /// `enforcement: observe` and the default `false` leaves the
+    /// decision to `action_on_match` and the per-rule actions. Still
+    /// parses and is still honored when `enforcement` is absent, so
+    /// existing configs are unaffected.
     ///
-    /// The enforcement axis is currently expressed three ways, and this
-    /// field is one of them:
-    ///
-    /// 1. `test_mode: true` - policy-wide, read at four sites inside
-    ///    [`Self::check_request`].
-    /// 2. `action_on_match: "log"` - policy-wide, a magic string.
-    /// 3. Per-rule [`FeedRuleAction::Log`] - carried on managed-bundle
-    ///    and feed rules.
-    ///
-    /// `sbproxy_config::types::EnforcementMode` exists to collapse all
-    /// three into one word. It is deliberately **not** wired here yet,
-    /// because a partial migration would add a fourth spelling rather
-    /// than remove two. Doing it properly means: replacing
-    /// `FeedRuleAction::Log` on the rule struct in
-    /// [`super::feed`] with the shared enum, so the per-rule and
-    /// policy-wide axes speak one vocabulary; giving the policy an
-    /// `enforcement: EnforcementMode` key that both legacy spellings
-    /// resolve into (`test_mode: true` or `action_on_match: "log"`
-    /// yields `Observe`); collapsing the four `self.test_mode` reads
-    /// into a single resolved value computed once at the top of
-    /// [`Self::check_request`]; and keeping the rule-level value as an
-    /// override of the policy-level one, which is the only ordering
-    /// that preserves today's behaviour. That work spans the feed
-    /// module and is tracked separately.
+    /// Read through [`Self::enforcement()`] (or the private
+    /// `observes_every_rule` helper for the policy-wide question),
+    /// never directly.
     #[serde(default)]
     pub test_mode: bool,
+    /// What the WAF does when a rule matches, in the shared
+    /// [`EnforcementMode`] vocabulary.
+    ///
+    /// This is the *did-decide* axis: the WAF reached a verdict and the
+    /// verdict was "refuse". It is a different question from
+    /// [`Self::failure_posture`], which covers the WAF being unable to
+    /// reach a verdict at all, and a policy legitimately holds both: in
+    /// `observe` while its rules are tuned, and still `closed` for
+    /// traffic it could not inspect.
+    ///
+    /// # Modes
+    ///
+    /// - `block` (the default posture): a matching rule refuses the
+    ///   request with 403. Rules that spell `action: "log"` (inline) or
+    ///   `action: log` (feed and managed-bundle) are rule-level
+    ///   overrides in the permissive direction and keep observing.
+    /// - `observe`: no rule blocks, including one that spells
+    ///   `action: "block"` explicitly. Every match is recorded with the
+    ///   same structured warn a blocking config would have produced.
+    ///   This is the rollout switch, and it is policy-wide on purpose:
+    ///   an operator turning a rule corpus loose on live traffic wants
+    ///   one key that guarantees nothing refuses.
+    ///
+    /// # Precedence
+    ///
+    /// The explicit key wins over both legacy spellings in both
+    /// directions. When it is absent, `test_mode: true` or
+    /// `action_on_match: "log"` resolve to `observe` and the default
+    /// resolves to `block`, so a config written before the key existed
+    /// keeps its exact behavior. The one behavioral nuance the legacy
+    /// pair carries (a rule-level explicit `"block"` escapes
+    /// `action_on_match: "log"` but not `test_mode: true`) is preserved
+    /// and pinned by test.
+    ///
+    /// Read through [`Self::enforcement()`], never directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement: Option<EnforcementMode>,
     /// Legacy failure knob: if true, allow requests through when the
     /// WAF cannot reach a verdict.
     ///
@@ -358,6 +383,49 @@ impl WafPolicy {
             .unwrap_or_else(|| FailureMode::from_fail_open(self.fail_open))
     }
 
+    /// Effective policy-wide enforcement mode.
+    ///
+    /// The explicit [`Self::enforcement`] key wins. When it is absent
+    /// the legacy spellings are converted, so a config written before
+    /// the key existed keeps its exact behavior: `test_mode: true` or
+    /// `action_on_match: "log"` is [`EnforcementMode::Observe`], and
+    /// the default is [`EnforcementMode::Block`].
+    ///
+    /// `Observe` here means "no rule without an override of its own
+    /// blocks". Whether an *explicitly* blocking rule also observes
+    /// depends on which spelling produced the mode; that policy-wide
+    /// question is answered by the private `observes_every_rule`
+    /// helper, and the difference is documented on
+    /// [`Self::enforcement`].
+    ///
+    /// This is the only supported read path. Do not branch on
+    /// `test_mode` or compare `action_on_match` against `"log"`
+    /// directly; the legacy conversions belong in one place.
+    pub fn enforcement(&self) -> EnforcementMode {
+        if let Some(explicit) = self.enforcement {
+            return explicit;
+        }
+        EnforcementMode::from_test_mode(
+            self.test_mode || self.action_on_match.as_deref() == Some("log"),
+        )
+    }
+
+    /// True when no rule blocks, whatever the rule itself says.
+    ///
+    /// The policy-wide observe switch: an explicit
+    /// `enforcement: observe`, or the legacy `test_mode: true` when the
+    /// key is absent. Deliberately *not* implied by
+    /// `action_on_match: "log"`, which has always been only the default
+    /// for rules carrying no action of their own; a rule spelling
+    /// `action: "block"` explicitly escapes it, and shipped configs
+    /// rely on that.
+    fn observes_every_rule(&self) -> bool {
+        match self.enforcement {
+            Some(mode) => !mode.blocks(),
+            None => self.test_mode,
+        }
+    }
+
     /// Check whether OWASP CRS is enabled.
     fn owasp_enabled(&self) -> bool {
         match &self.owasp_crs {
@@ -421,7 +489,14 @@ impl WafPolicy {
         headers: &http::HeaderMap,
         body: Option<&str>,
     ) -> WafResult {
-        let action = self.action_on_match.as_deref().unwrap_or("block");
+        // The did-decide axis, resolved once at the top. `default_mode`
+        // is what a rule with no action of its own does; `observe_all`
+        // is the policy-wide rollout switch that no rule escapes. The
+        // four legacy `self.test_mode` reads collapsed into these two
+        // values, and the rest of this function never consults the
+        // legacy spellings again.
+        let default_mode = self.enforcement();
+        let observe_all = self.observes_every_rule();
         let paranoia = self.effective_paranoia();
 
         // --- OWASP CRS built-in patterns ---
@@ -456,7 +531,9 @@ impl WafPolicy {
                         continue;
                     }
                     if rule.regex.is_match(target) {
-                        if action == "log" || self.test_mode {
+                        // Built-in patterns carry no per-rule action, so
+                        // the policy-level mode decides alone.
+                        if !default_mode.blocks() {
                             tracing::warn!(
                                 pattern = rule.name,
                                 paranoia = rule.paranoia,
@@ -505,8 +582,11 @@ impl WafPolicy {
                 if !matched {
                     continue;
                 }
-                let log_only =
-                    matches!(rule.action, FeedRuleAction::Log) || action == "log" || self.test_mode;
+                // A rule-level `log` observes even under a blocking
+                // policy mode; the wire enum cannot spell an explicit
+                // block distinctly from its default, so a blocking rule
+                // simply follows the policy-level mode.
+                let log_only = !rule.action.enforcement().blocks() || !default_mode.blocks();
                 if log_only {
                     tracing::warn!(
                         rule_id = rule.id.as_str(),
@@ -575,8 +655,9 @@ impl WafPolicy {
                 if !matched {
                     continue;
                 }
-                let log_only =
-                    matches!(rule.action, FeedRuleAction::Log) || action == "log" || self.test_mode;
+                // Same rule-level-permissive ordering as the managed
+                // bundle above.
+                let log_only = !rule.action.enforcement().blocks() || !default_mode.blocks();
                 if log_only {
                     tracing::warn!(
                         rule_id = rule.id.as_str(),
@@ -627,10 +708,6 @@ impl WafPolicy {
             match self.evaluate_custom_rule(rule_value, uri, headers, body) {
                 Ok(true) => {
                     // Rule matched.
-                    let rule_action = rule_value
-                        .get("action")
-                        .and_then(|a| a.as_str())
-                        .unwrap_or(action);
                     let message = rule_value
                         .get("message")
                         .and_then(|m| m.as_str())
@@ -640,7 +717,20 @@ impl WafPolicy {
                         .and_then(|id| id.as_str())
                         .unwrap_or("unknown");
 
-                    if rule_action == "log" || self.test_mode {
+                    // An explicit rule-level action overrides the
+                    // policy default in either direction; only the
+                    // policy-wide observe switch outranks it. This
+                    // ordering is pinned by test because shipped
+                    // configs rely on both halves: a rule's explicit
+                    // `"block"` escapes `action_on_match: "log"`, and
+                    // nothing escapes `test_mode: true` or
+                    // `enforcement: observe`.
+                    let rule_observes = observe_all
+                        || match rule_value.get("action").and_then(|a| a.as_str()) {
+                            Some(explicit) => explicit == "log",
+                            None => !default_mode.blocks(),
+                        };
+                    if rule_observes {
                         tracing::warn!(rule_id = rule_id, "WAF: custom rule matched (log mode)");
                     } else {
                         return WafResult::Blocked(format!("{} [rule {}]", message, rule_id));
@@ -1334,6 +1424,227 @@ mod tests {
             msg.contains("degraded"),
             "error must point at the posture that does work here: {msg}"
         );
+    }
+
+    // --- Enforcement mode (the did-decide axis) ---
+
+    /// `enforcement: observe` admits a request a built-in rule matched.
+    /// This is the one-key rollout switch the legacy `test_mode`
+    /// boolean spelled ad hoc.
+    #[test]
+    fn waf_enforcement_observe_admits_a_matching_builtin_rule() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "enabled": true },
+            "enforcement": "observe",
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        let result = policy.check_request("/api?q=union%20select%20*", &headers, None);
+        assert!(
+            matches!(result, WafResult::Clean),
+            "enforcement: observe must admit a matched request"
+        );
+    }
+
+    /// The explicit key wins over both legacy spellings, in both
+    /// directions. Asserting only the agreeing cases would not tell a
+    /// precedence bug apart from a working accessor.
+    #[test]
+    fn waf_enforcement_key_wins_over_legacy_spellings_in_both_directions() {
+        let headers = make_header_map(&[]);
+        let attack = "/api?q=union%20select%20*";
+
+        let block_over_test_mode = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "enabled": true },
+            "test_mode": true,
+            "enforcement": "block",
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                block_over_test_mode.check_request(attack, &headers, None),
+                WafResult::Blocked(_)
+            ),
+            "enforcement: block must win over test_mode: true"
+        );
+
+        let block_over_action = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "enabled": true },
+            "action_on_match": "log",
+            "enforcement": "block",
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                block_over_action.check_request(attack, &headers, None),
+                WafResult::Blocked(_)
+            ),
+            "enforcement: block must win over action_on_match: log"
+        );
+
+        let observe_over_defaults = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "enabled": true },
+            "action_on_match": "block",
+            "test_mode": false,
+            "enforcement": "observe",
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                observe_over_defaults.check_request(attack, &headers, None),
+                WafResult::Clean
+            ),
+            "enforcement: observe must win over the blocking legacy spellings"
+        );
+    }
+
+    /// Both legacy spellings resolve into the accessor, so a config
+    /// written before the key existed reads back in the shared
+    /// vocabulary without changing behavior.
+    #[test]
+    fn waf_legacy_spellings_resolve_into_the_enforcement_accessor() {
+        let default = WafPolicy::from_config(serde_json::json!({})).unwrap();
+        assert_eq!(default.enforcement(), EnforcementMode::Block);
+
+        let test_mode = WafPolicy::from_config(serde_json::json!({ "test_mode": true })).unwrap();
+        assert_eq!(test_mode.enforcement(), EnforcementMode::Observe);
+
+        let log_action =
+            WafPolicy::from_config(serde_json::json!({ "action_on_match": "log" })).unwrap();
+        assert_eq!(log_action.enforcement(), EnforcementMode::Observe);
+
+        let explicit = WafPolicy::from_config(serde_json::json!({
+            "test_mode": true,
+            "enforcement": "block",
+        }))
+        .unwrap();
+        assert_eq!(explicit.enforcement(), EnforcementMode::Block);
+    }
+
+    /// A per-rule `action: log` is a rule-level override in the
+    /// permissive direction and survives `enforcement: block`, exactly
+    /// as it survives the legacy blocking defaults today.
+    #[test]
+    fn waf_a_rule_level_log_still_observes_under_enforcement_block() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "enforcement": "block",
+            "custom_rules": [
+                {
+                    "id": "tuning",
+                    "operator": "contains",
+                    "pattern": "/forbidden",
+                    "action": "log",
+                    "message": "still tuning this one"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        assert!(
+            matches!(
+                policy.check_request("/forbidden/path", &headers, None),
+                WafResult::Clean
+            ),
+            "a rule-level log must not start blocking under enforcement: block"
+        );
+    }
+
+    /// `enforcement: observe` is policy-wide: a rule that spells
+    /// `action: block` explicitly still only logs, matching what
+    /// `test_mode: true` has always done to such a rule.
+    #[test]
+    fn waf_enforcement_observe_downgrades_an_explicit_block_rule() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "enforcement": "observe",
+            "custom_rules": [
+                {
+                    "id": "hard-block",
+                    "operator": "contains",
+                    "pattern": "/forbidden",
+                    "action": "block",
+                    "message": "would have blocked"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        assert!(
+            matches!(
+                policy.check_request("/forbidden/path", &headers, None),
+                WafResult::Clean
+            ),
+            "enforcement: observe is the rollout switch; no rule escapes it"
+        );
+    }
+
+    /// The key takes only the shared vocabulary. `log` is the legacy
+    /// per-rule spelling of `observe`, and accepting it here would give
+    /// the axis a fourth spelling; config compile refuses it instead.
+    #[test]
+    fn waf_enforcement_rejects_the_legacy_log_spelling() {
+        let err = WafPolicy::from_config(serde_json::json!({ "enforcement": "log" }))
+            .expect_err("`enforcement: log` must not compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("observe"),
+            "the error must name the accepted spellings: {msg}"
+        );
+    }
+
+    /// Legacy parity pin: `test_mode: true` observes everything,
+    /// including a rule that spells `action: block` explicitly. This is
+    /// today's behavior and the new key must not disturb it.
+    #[test]
+    fn waf_legacy_test_mode_still_observes_an_explicit_block_rule() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "test_mode": true,
+            "custom_rules": [
+                {
+                    "id": "hard-block",
+                    "operator": "contains",
+                    "pattern": "/forbidden",
+                    "action": "block",
+                    "message": "would have blocked"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        assert!(matches!(
+            policy.check_request("/forbidden/path", &headers, None),
+            WafResult::Clean
+        ));
+    }
+
+    /// Legacy parity pin: `action_on_match: log` is only the default
+    /// for rules that carry no action of their own; a rule-level
+    /// `action: block` still blocks. The asymmetry with `test_mode` is
+    /// today's behavior, and the migration must preserve it exactly.
+    #[test]
+    fn waf_legacy_action_on_match_log_does_not_override_an_explicit_block_rule() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "action_on_match": "log",
+            "custom_rules": [
+                {
+                    "id": "hard-block",
+                    "operator": "contains",
+                    "pattern": "/forbidden",
+                    "action": "block",
+                    "message": "explicit block wins over the log default"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        assert!(matches!(
+            policy.check_request("/forbidden/path", &headers, None),
+            WafResult::Blocked(_)
+        ));
     }
 
     /// A custom rule the engine cannot evaluate leaves the request

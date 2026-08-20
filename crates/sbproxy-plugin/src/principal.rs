@@ -122,6 +122,14 @@ pub enum PrincipalSource {
     ForwardAuth,
     /// Out-of-tree auth plugin registered via `AuthProvider`.
     Plugin,
+    /// HMAC signed-request authentication (RFC 9421 `hmac-sha256`
+    /// against a configured shared-secret key set; WOR-2518). At the
+    /// end of the enum to keep serialized forms stable.
+    Hmac,
+    /// WOR-2519: LDAP directory bind accepted the request's HTTP
+    /// Basic credentials. Added at the end of the enum per the
+    /// serialized-form stability note above.
+    Ldap,
 }
 
 impl PrincipalSource {
@@ -139,6 +147,8 @@ impl PrincipalSource {
             Self::Cap => "cap",
             Self::ForwardAuth => "forward_auth",
             Self::Plugin => "plugin",
+            Self::Hmac => "hmac_auth",
+            Self::Ldap => "ldap_auth",
         }
     }
 }
@@ -439,6 +449,7 @@ mod tests {
         assert_eq!(PrincipalSource::ApiKey.as_str(), "api_key");
         assert_eq!(PrincipalSource::VirtualKey.as_str(), "virtual_key");
         assert_eq!(PrincipalSource::Plugin.as_str(), "plugin");
+        assert_eq!(PrincipalSource::Hmac.as_str(), "hmac_auth");
     }
 
     /// The `anonymous` constructor short-circuits the `is_anonymous`

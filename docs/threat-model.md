@@ -1,6 +1,6 @@
 # SBproxy threat model
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 This is the threat-model companion to [`operator-runbook.md`](operator-runbook.md).
 It records the operator-facing assumptions that should be revisited at the end
@@ -23,6 +23,22 @@ of each implementation wave.
 - Proxy to observability sinks: redaction must happen before fan-out.
 - Proxy to external resolvers/providers: DNS, JWKS, ACME, AI providers, and
   webhook receivers may fail or return malformed data.
+
+```mermaid
+flowchart TD
+    Client[Client] -->|untrusted headers + bodies| Proxy[SBproxy]
+    Proxy -->|policy-filtered requests only| Origin[Upstream origin]
+    Proxy -->|admin auth + network placement| Admin["Admin API (/admin/*)"]
+    Proxy -->|redaction before fan-out| Obs["Observability sinks (logs, traces, metrics)"]
+    Proxy -->|egress authorizer, DNS-pinned, per-hop redirect re-auth| Ext["External resolvers/providers (DNS, JWKS, ACME, AI providers, webhooks)"]
+    Attacker["Caller with direct network access"] -.->|bypasses every control here entirely| Origin
+```
+
+The dotted edge is the boundary this model cannot close by configuration: a
+caller that reaches the origin, or an AI provider, without traversing the
+proxy is invisible to every control on this page. See "Egress bypass
+detection" in [Current Wave Notes](#current-wave-notes) below for what
+compensates.
 
 ## Current Wave Notes
 

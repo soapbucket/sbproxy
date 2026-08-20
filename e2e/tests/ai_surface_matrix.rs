@@ -36,6 +36,30 @@ origins:
     )
 }
 
+// Single-provider origin whose display name is decoupled from its
+// `provider_type` (WOR-2485: the capability matrix keys on the type, so
+// the name is a free-form operator label).
+fn config_for_typed(name: &str, provider_type: &str, host: &str, upstream_base: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "{host}":
+    action:
+      type: ai_proxy
+      providers:
+        - name: {name}
+          provider_type: {provider_type}
+          api_key: "stub-key"
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+      routing:
+        strategy: round_robin
+"#
+    )
+}
+
 // A translated-format provider must translate a supported surface to the
 // upstream's native endpoint, never forward the inbound path verbatim.
 // WOR-1127: the Gemini embeddings translator (WOR-824) now handles
@@ -215,6 +239,86 @@ fn openai_embeddings_is_forwarded_to_upstream() {
         captured[0].path, "/v1/embeddings",
         "OpenAI-format embeddings pass through unchanged"
     );
+}
+
+// WOR-2485: an operator's display name must not cost a provider entry
+// its surface set. A provider named `team-openai` with
+// `provider_type: openai` keeps the full OpenAI row, so a multipart
+// surface (audio transcription) dispatches to the upstream instead of
+// 501ing at the gateway. Before the fix the matrix keyed on the name,
+// classified `team-openai` as unknown, and returned
+// 501 "no configured AI provider supports this surface" here.
+#[test]
+fn renamed_openai_provider_serves_a_multipart_surface() {
+    let upstream = MockUpstream::start(json!({"text": "fixture transcript"})).expect("mock");
+    let harness = ProxyHarness::start_with_yaml(&config_for_typed(
+        "team-openai",
+        "openai",
+        "ai.localhost",
+        &upstream.base_url(),
+    ))
+    .expect("start proxy");
+
+    let boundary = "sbproxy-wor-2485";
+    let multipart = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.wav\"\r\nContent-Type: audio/wav\r\n\r\nfixture\r\n--{boundary}--\r\n"
+    );
+    let resp = harness
+        .post_bytes(
+            "/v1/audio/transcriptions",
+            "ai.localhost",
+            &format!("multipart/form-data; boundary={boundary}"),
+            multipart.into_bytes(),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(
+        resp.status, 200,
+        "a renamed openai-type provider must dispatch transcription, not 501; got {}",
+        resp.status
+    );
+    let captured = upstream.captured();
+    assert!(
+        !captured.is_empty(),
+        "the multipart transcription request must reach the upstream"
+    );
+    assert_eq!(
+        captured[0].path, "/v1/audio/transcriptions",
+        "OpenAI-format multipart passes through unchanged"
+    );
+}
+
+// WOR-2485 counterpart: the rename must not WIDEN either. A renamed
+// anthropic-type provider still 501s embeddings; the narrowing follows
+// the type, not the unknown-name default that happened to give the same
+// answer before the fix.
+#[test]
+fn renamed_anthropic_provider_still_501s_embeddings() {
+    let upstream = MockUpstream::start(json!({"unused": true})).expect("mock");
+    let harness = ProxyHarness::start_with_yaml(&config_for_typed(
+        "team-claude",
+        "anthropic",
+        "claude.localhost",
+        &upstream.base_url(),
+    ))
+    .expect("start proxy");
+
+    let resp = harness
+        .post_json(
+            "/v1/embeddings",
+            "claude.localhost",
+            &json!({"model": "claude", "input": "hi"}),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(
+        resp.status, 501,
+        "renamed anthropic-type embeddings must 501; got {}",
+        resp.status
+    );
+    assert!(upstream.captured().is_empty());
 }
 
 // WOR-752 Finding B: an unrecognized path against a translated-format

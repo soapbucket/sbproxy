@@ -1,11 +1,60 @@
 # OpenAPI Emission
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
 When you put SBproxy in front of an upstream service, the gateway already knows the routes, the auth schemes, the rate limits, and the response cache. OpenAPI emission turns that knowledge into a published OpenAPI 3.0 document that buyers can consume with standard tooling (Postman, Swagger UI, ReadMe.io, Stainless, SDK generators) without ever seeing your YAML config or talking to the upstream.
 
 The result: SBproxy is the single source of truth for what your API looks like, on the wire, right now.
+
+This page covers emission: turning your config into a published spec. The
+companion policy, [OpenAPI schema validation](openapi-validation.md),
+runs the other direction: it loads a spec (emitted from here, or written
+by hand) and rejects request bodies that do not conform to it. Emission
+publishes the contract; validation enforces it. Nothing wires the two
+together automatically today, an emitted document is not fed back into
+`openapi_validation` for you, so pairing them on one origin is a
+deliberate two-step config.
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    subgraph config["Compiled config (per reload)"]
+        H["hostname"]
+        FR["forward_rules[].rules[].path"]
+        AL["allowed_methods"]
+        PA["forward_rules[].parameters"]
+        AU["auth_config"]
+        RC["response_cache / error_pages"]
+        CO["cors"]
+    end
+
+    H --> B["sbproxy_openapi::build()"]
+    FR --> B
+    AL --> B
+    PA --> B
+    AU --> B
+    RC --> B
+    CO --> B
+
+    B --> SPEC["in-memory OpenAPI 3.0 Value"]
+    SPEC --> RJ["render_json()"]
+    SPEC --> RY["render_yaml()"]
+
+    RJ --> ADMIN["GET /api/openapi.json\n(admin, basic auth, all hosts,\ncached per config_revision)"]
+    RY --> ADMIN2["GET /api/openapi.yaml\n(admin, basic auth, all hosts,\ncached per config_revision)"]
+    RJ --> HOST["GET /.well-known/openapi.json\n(per-host, opt-in via\nexpose_openapi: true)"]
+    RY --> HOST2["GET /.well-known/openapi.yaml\n(per-host, opt-in via\nexpose_openapi: true)"]
+```
+
+`build()` walks the compiled snapshot fresh on every call; nothing about
+the mapping is cached. The admin endpoint caches the rendered bytes keyed
+by `config_revision`, so repeat admin requests between reloads cost one
+`Mutex` lock and a clone. The per-host endpoint rebuilds and re-renders
+on every request instead: cheap in practice (`build()` only walks the
+already-compiled config), but worth knowing if you are hammering
+`/.well-known/openapi.json` from a script.
 
 ## What gets emitted
 
@@ -45,9 +94,11 @@ Requires `proxy.admin.enabled: true`. The rendered document is cached per pipeli
 ```bash
 curl -s -H 'Host: api.localhost' \
   http://127.0.0.1:8080/.well-known/openapi.json
+curl -s -H 'Host: api.localhost' \
+  http://127.0.0.1:8080/.well-known/openapi.yaml
 ```
 
-Off by default. Set `expose_openapi: true` on the origin to publish. Useful for SDK generators, contract testing, and buyer-side discovery without coupling consumers to the admin API.
+Off by default. Set `expose_openapi: true` on the origin to publish. Useful for SDK generators, contract testing, and buyer-side discovery without coupling consumers to the admin API. Unlike the admin endpoint, this surface rebuilds and re-renders the document on every request; it is not cached by revision.
 
 ```yaml
 origins:
@@ -243,6 +294,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9090/api/openapi.json
 
 ## See also
 
+- [openapi-validation.md](openapi-validation.md) for the other half of the pair: loading a spec (this one, or a hand-written one) and rejecting requests that do not conform to it.
 - [configuration.md](configuration.md) for the `expose_openapi` and `forward_rules.parameters` field semantics.
 - [features.md](features.md) for the broader tour of gateway features.
 - [scripting.md](scripting.md) for the CEL, Lua, JavaScript, and WASM hook surfaces that can read captured `path_params`.

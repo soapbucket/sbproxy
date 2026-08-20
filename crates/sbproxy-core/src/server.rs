@@ -2489,6 +2489,21 @@ impl AuthTrustOutcome {
     fn is_suspicious(self) -> bool {
         matches!(self, Self::InvalidProof)
     }
+
+    /// Severity order for aggregating an OR composition's slots
+    /// (WOR-2517): an offered-and-rejected credential outranks a
+    /// backend failure, which outranks a neutral challenge, which
+    /// outranks nothing offered at all. `Allowed` never aggregates
+    /// because a success short-circuits the loop.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Allowed => 0,
+            Self::Missing => 1,
+            Self::Challenge => 2,
+            Self::BackendFailure => 3,
+            Self::InvalidProof => 4,
+        }
+    }
 }
 
 fn plugin_denial_trust_outcome(
@@ -2980,6 +2995,105 @@ async fn check_auth_with_tls_outcome(
                 )
             }
         }
+        Auth::Hmac(h) => {
+            use sbproxy_modules::auth::HmacVerdict;
+            // Synthesize the request shape the RFC 9421 verifier reads
+            // method / target-uri / headers from, mirroring bot_auth.
+            // The body is empty because auth runs before the body is
+            // buffered; the provider verifies with the safe-by-default
+            // form, so a signature covering `content-digest` on a
+            // body-bearing request fails closed rather than passing
+            // unverified (body-digest binding is the WOR-2518
+            // follow-up).
+            let target_uri = match query {
+                Some(q) if !q.is_empty() => format!("{}?{}", path, q),
+                _ => path.to_string(),
+            };
+            let builder = http::Request::builder().method(method);
+            let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
+                Ok(r) => r,
+                Err(_) => {
+                    return (
+                        AuthResult::Deny(500, "hmac_auth: bad request".to_string()),
+                        None,
+                        AuthTrustOutcome::BackendFailure,
+                    );
+                }
+            };
+            *req.headers_mut() = headers.clone();
+            // The challenge names the scheme and nothing else: no key
+            // id, no reason, and never any part of the credential.
+            let challenge_headers =
+                || vec![("WWW-Authenticate".to_string(), "Signature".to_string())];
+            match h.verify(&req) {
+                HmacVerdict::Verified { key_id } => {
+                    match h.principal_for(&key_id, tenant_id.clone()) {
+                        Some(principal) => {
+                            let sub = principal.sub.clone();
+                            (
+                                AuthResult::Allow {
+                                    sub: Some(sub),
+                                    source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                                },
+                                Some(principal),
+                                AuthTrustOutcome::Allowed,
+                            )
+                        }
+                        // Unreachable (a verified key_id is in the map),
+                        // but if the invariant ever breaks, fail closed.
+                        None => (
+                            AuthResult::DenyWithHeaders(
+                                401,
+                                "hmac_auth: verification failed".to_string(),
+                                challenge_headers(),
+                            ),
+                            None,
+                            AuthTrustOutcome::InvalidProof,
+                        ),
+                    }
+                }
+                HmacVerdict::Missing => (
+                    AuthResult::DenyWithHeaders(
+                        401,
+                        "hmac_auth: signature required".to_string(),
+                        challenge_headers(),
+                    ),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                HmacVerdict::UnknownKey { key_id } => {
+                    // The key id is an identifier the client itself
+                    // sent, safe to log; the client-facing message
+                    // stays generic so probes cannot enumerate the
+                    // configured key set.
+                    tracing::warn!(key_id = %key_id, "hmac_auth: unknown key id");
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "hmac_auth: verification failed".to_string(),
+                            challenge_headers(),
+                        ),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+                HmacVerdict::Failed { key_id, reason } => {
+                    // Log the failure, never the credential: `reason`
+                    // comes from the verifier's log-safe set and the
+                    // client sees only the generic message.
+                    tracing::warn!(key_id = %key_id, reason = %reason, "hmac_auth: verification failed");
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "hmac_auth: verification failed".to_string(),
+                            challenge_headers(),
+                        ),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+            }
+        }
         // ForwardAuth runs as a separate async subrequest in the
         // calling site; the result, including any trust headers
         // carrying the resolved user, lands on `ctx` after this
@@ -2991,6 +3105,50 @@ async fn check_auth_with_tls_outcome(
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
             AuthTrustOutcome::Allowed,
         ),
+        // WOR-2519: LDAP directory bind. Like forward_auth, this is an
+        // outbound dial on the inbound path, but the provider needs only
+        // the request headers, so it dispatches through this function
+        // like every non-forward-auth type. An unreachable directory
+        // fails closed with a 503 (mirroring forward_auth's
+        // "auth service unavailable") and stays trust-neutral: a backend
+        // failure is not evidence about the caller.
+        Auth::Ldap(a) => {
+            use sbproxy_modules::auth::ldap::LdapBindOutcome;
+            match a.authenticate(headers).await {
+                LdapBindOutcome::Allowed { username } => {
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: username.clone(),
+                        source: sbproxy_plugin::PrincipalSource::Ldap,
+                        virtual_key: None,
+                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: Some(username),
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                LdapBindOutcome::NoCredentials => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                LdapBindOutcome::InvalidCredentials => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    AuthTrustOutcome::InvalidProof,
+                ),
+                LdapBindOutcome::DirectoryUnavailable => (
+                    AuthResult::Deny(503, "auth directory unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+            }
+        }
         Auth::BotAuth(b) => {
             use sbproxy_modules::auth::BotAuthVerdict;
             // Synthesize a minimal http::Request the verifier can read
@@ -3226,6 +3384,24 @@ async fn check_auth_with_tls_outcome(
             };
             (result, principal, trust_outcome)
         }
+        Auth::AnyOf(providers) => {
+            // WOR-2517: OR composition. The winner's label is dropped
+            // here because this signature predates composition; the
+            // request phase calls `check_auth_decided` instead and
+            // keeps it for attribution.
+            let (result, principal, outcome, _provider) = check_any_of_auth(
+                providers,
+                headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                tls_cert_thumbprint,
+                resolved_agent_id,
+            )
+            .await;
+            (result, principal, outcome)
+        }
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
             // method / target-uri / headers from. We deliberately pass
@@ -3331,6 +3507,194 @@ async fn check_auth_with_tls_outcome(
             }
         }
     }
+}
+
+/// WOR-2517: the auth entry point the request phase calls. Same
+/// contract as [`check_auth_with_tls_outcome`] plus a fourth element:
+/// the auth type that decided the request. For a single provider that
+/// is its own type; for an [`Auth::AnyOf`] composition a success names
+/// the winning slot's provider (so audit and decision records
+/// attribute the request to the credential that actually
+/// authenticated it), and exhaustion names the composite `any_of`.
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_decided(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+    String,
+) {
+    match auth {
+        Auth::AnyOf(providers) => {
+            check_any_of_auth(
+                providers,
+                headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                tls_cert_thumbprint,
+                resolved_agent_id,
+            )
+            .await
+        }
+        single => {
+            let (result, principal, outcome) = check_auth_with_tls_outcome(
+                single,
+                headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                tls_cert_thumbprint,
+                resolved_agent_id,
+            )
+            .await;
+            (result, principal, outcome, single.auth_type().to_string())
+        }
+    }
+}
+
+/// WOR-2517: evaluate an [`Auth::AnyOf`] composition.
+///
+/// Providers run in declared order through the same
+/// [`check_auth_with_tls_outcome`] a scalar config uses, so each slot
+/// behaves exactly as it would standing alone. The first `Allow` (or
+/// CAP `RateLimited`, which is a recognized credential over its
+/// budget) wins: its result, principal, and trust outcome return
+/// unchanged, and no later provider runs. A slot that fails, however
+/// it fails, loses only its own slot; evaluation continues.
+///
+/// Exhaustion follows the rule the WOR-2517 ticket argued from RFC
+/// 7235: the first provider's status and message win (the first slot
+/// is the origin's primary scheme by declaration), and every slot's
+/// `WWW-Authenticate` challenge is merged onto the response in
+/// declared order so a client learns every scheme the origin accepts.
+/// The aggregate trust outcome is the most severe slot's, so one
+/// offered-and-rejected credential marks the request suspicious even
+/// when the other slots merely saw nothing.
+#[allow(clippy::too_many_arguments)]
+async fn check_any_of_auth(
+    providers: &[Auth],
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+    String,
+) {
+    // First provider's denial, kept whole: status, message, and its
+    // own headers (a digest challenge is folded into header form so it
+    // can merge with the other slots' challenges).
+    struct FirstDenial {
+        status: u16,
+        message: String,
+        headers: Vec<(String, String)>,
+    }
+    let mut first_denial: Option<FirstDenial> = None;
+    // Later slots' `WWW-Authenticate` values, in declared order.
+    let mut merged_challenges: Vec<(String, String)> = Vec::new();
+    let mut aggregate = AuthTrustOutcome::Missing;
+
+    for provider in providers {
+        // Boxed: async recursion (the composition evaluating its
+        // members through the same entry point) needs a pinned future.
+        let (result, principal, outcome) = Box::pin(check_auth_with_tls_outcome(
+            provider,
+            headers,
+            query,
+            method,
+            path,
+            tenant_id.clone(),
+            tls_cert_thumbprint,
+            resolved_agent_id,
+        ))
+        .await;
+
+        let denial_headers: Vec<(String, String)> = match &result {
+            // First success wins: bind the winning provider's
+            // principal and name it for attribution. RateLimited is a
+            // recognized credential (CAP over budget), so it decides
+            // the request the same way an Allow does.
+            AuthResult::Allow { .. } | AuthResult::RateLimited(_) => {
+                return (result, principal, outcome, provider.auth_type().to_string());
+            }
+            AuthResult::Deny(..) => Vec::new(),
+            AuthResult::DenyWithHeaders(_, _, headers) => headers.clone(),
+            AuthResult::DigestChallenge(challenge) => {
+                vec![("WWW-Authenticate".to_string(), challenge.clone())]
+            }
+        };
+
+        if outcome.severity() > aggregate.severity() {
+            aggregate = outcome;
+        }
+        if first_denial.is_none() {
+            let (status, message) = match &result {
+                AuthResult::Deny(status, message)
+                | AuthResult::DenyWithHeaders(status, message, _) => (*status, message.clone()),
+                AuthResult::DigestChallenge(_) => (401, "unauthorized".to_string()),
+                // Unreachable: Allow / RateLimited returned above.
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_) => {
+                    (401, "unauthorized".to_string())
+                }
+            };
+            first_denial = Some(FirstDenial {
+                status,
+                message,
+                headers: denial_headers,
+            });
+        } else {
+            merged_challenges.extend(
+                denial_headers
+                    .into_iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate")),
+            );
+        }
+    }
+
+    // Construction guarantees at least two providers, so the loop ran
+    // and `first_denial` is set; the fallback denial only guards a
+    // hypothetical empty composition, and it fails closed.
+    let FirstDenial {
+        status,
+        message,
+        headers: mut response_headers,
+    } = first_denial.unwrap_or_else(|| FirstDenial {
+        status: 401,
+        message: "unauthorized".to_string(),
+        headers: Vec::new(),
+    });
+    for (name, value) in merged_challenges {
+        let duplicate = response_headers
+            .iter()
+            .any(|(existing_name, existing_value)| {
+                existing_name.eq_ignore_ascii_case(&name) && existing_value == &value
+            });
+        if !duplicate {
+            response_headers.push((name, value));
+        }
+    }
+    let result = if response_headers.is_empty() {
+        AuthResult::Deny(status, message)
+    } else {
+        AuthResult::DenyWithHeaders(status, message, response_headers)
+    };
+    (result, None, aggregate, "any_of".to_string())
 }
 
 /// Lazily-initialized HTTP client for forward-auth subrequests. A
@@ -5168,6 +5532,277 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
         parts.push("Secure".to_string());
     }
     parts.join("; ")
+}
+
+// --- Response phases for locally generated responses (WOR-2496) ---
+
+/// Apply the origin's transform chain to a locally generated response
+/// body (a `static` or `mock` action's payload) and return the
+/// transformed bytes.
+///
+/// Mirrors the walk the static action has always run: each transform
+/// goes through `apply_transform_with_ctx` so the per-request ctx
+/// fields (content shape, markdown projection, canonical URL, CEL
+/// header mutations) behave exactly as they do for an upstream body,
+/// and a failing transform logs a warning and continues rather than
+/// failing the response (generated bodies are operator-authored, so
+/// the closed-transform posture the upstream body filter applies has
+/// nothing untrusted to fail closed against).
+fn apply_origin_transforms_to_generated_body(
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    ctx: &mut RequestContext,
+    body: Bytes,
+    content_type: &str,
+) -> Bytes {
+    let Some(idx) = origin_idx else {
+        return body;
+    };
+    if idx >= pipeline.transforms.len() || pipeline.transforms[idx].is_empty() {
+        return body;
+    }
+    let mut buf = bytes::BytesMut::from(&body[..]);
+    let ratio = resolved_token_bytes_ratio(Some(&pipeline.config.origins[idx]));
+    for compiled_transform in &pipeline.transforms[idx] {
+        let needs_synth_projection = matches!(
+            compiled_transform.transform,
+            sbproxy_modules::Transform::CitationBlock(_)
+                | sbproxy_modules::Transform::JsonEnvelope(_)
+        );
+        if needs_synth_projection {
+            synthesise_markdown_projection_if_missing(ctx, &buf, ratio);
+        }
+        if let Err(e) =
+            apply_transform_with_ctx(compiled_transform, &mut buf, Some(content_type), ctx)
+        {
+            warn!(
+                transform = compiled_transform.transform.transform_type(),
+                error = %e,
+                "generated-response transform failed, continuing"
+            );
+        }
+    }
+    buf.freeze()
+}
+
+/// Apply the response-phase policy surface to a locally generated
+/// response, right before it is written to the client.
+///
+/// `static`, `mock`, `echo`, `beacon`, and `redirect` actions answer
+/// during the request phase and never reach Pingora's `response_filter`
+/// / `response_body_filter`, so until WOR-2496 every response-phase
+/// policy silently no-opped for them: the config compiled, the policy
+/// chain logged `verdict=allow`, and the header or scan the operator
+/// asked for never happened. This helper runs the subset of the
+/// response phase that is meaningful for a generated response, in the
+/// same order the proxied path applies it:
+///
+/// 1. `security_headers` policy headers (plus `x-csp-nonce` when nonce
+///    mode is on)
+/// 2. `page_shield` CSP (its yield check reads the generated response's
+///    own CSP header, the analog of "the upstream already sent one")
+/// 3. plugin-policy response headers accumulated during the request
+///    phase (`AllowWithHeaders`, appended in chain order)
+/// 4. the CSRF cookie staged by the csrf enforcer
+/// 5. `assertion` policies (the body size is known exactly here, so it
+///    is passed instead of the proxied header-phase's `None`)
+/// 6. session cookie issuance from the origin's `session:` block
+/// 7. the `sri` scan over the final body (observation-only, `text/html`
+///    responses under an enforcing policy, identical logging and
+///    metrics to the proxied body filter)
+///
+/// Deliberately not applied here, because they need an upstream
+/// exchange to mean anything: on-status fallbacks, retries, meter and
+/// idempotency capture, compression negotiation, and gRPC re-framing.
+/// Response modifiers and transforms are applied by the action arms
+/// themselves before this runs.
+///
+/// One precedence note: on the proxied path, response modifiers run
+/// after policy headers and win same-key collisions; on a generated
+/// response the modifiers have already been folded into `header` by the
+/// action arm, so a policy-set header wins instead. Operators who need
+/// a specific value on a generated response set it on the action or
+/// the policy, not both.
+fn apply_generated_response_phases(
+    session: &Session,
+    ctx: &mut RequestContext,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    header: &mut ResponseHeader,
+    body: &[u8],
+) {
+    let Some(idx) = origin_idx else {
+        return;
+    };
+    let policies = pipeline.policies.get(idx);
+
+    // 1 + 2. security_headers and page_shield. The CSP-presence
+    // snapshot is taken before either policy writes, mirroring the
+    // proxied path where `upstream_has_csp` reads the raw upstream
+    // header map rather than the pending mutation set.
+    if let Some(policies) = policies {
+        let generated_has_csp = header
+            .headers
+            .contains_key(http::header::CONTENT_SECURITY_POLICY)
+            || header
+                .headers
+                .contains_key("content-security-policy-report-only");
+        for policy in policies {
+            if let Policy::SecHeaders(sec) = policy {
+                let path = session.req_header().uri.path();
+                let (headers, nonce) = sec.resolved_headers_for_request(path);
+                for (name, value) in headers {
+                    let _ = header.insert_header(name, &value);
+                }
+                if let Some(n) = nonce {
+                    let _ = header.insert_header("x-csp-nonce", &n);
+                }
+            }
+            if let Policy::PageShield(shield) = policy {
+                if !shield.yields_to_upstream(generated_has_csp) {
+                    let host = session
+                        .req_header()
+                        .headers
+                        .get("host")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let (name, value) = shield.header(host);
+                    let _ = header.insert_header(name, value);
+                }
+            }
+        }
+    }
+
+    // 3. Plugin-policy response headers, appended in chain order so
+    // multi-value contracts survive (same drain the proxied path runs).
+    for (key, value) in std::mem::take(&mut ctx.policy_response_headers) {
+        let _ = header.append_header(key, &value);
+    }
+
+    // 4. CSRF cookie staged by the csrf enforcer during the request
+    // phase.
+    if let Some(ref cookie) = ctx.csrf_cookie {
+        let _ = header.append_header("set-cookie", cookie);
+    }
+
+    // 5. Assertions: observational only, never block or modify. Unlike
+    // the proxied header phase, the full body is in hand, so its size
+    // is passed to the CEL context.
+    if let Some(policies) = policies {
+        if policies.iter().any(|p| matches!(p, Policy::Assertion(_))) {
+            let req = session.req_header();
+            let method = req.method.as_str();
+            let path = req.uri.path();
+            let query = req.uri.query();
+            let client_ip = ctx.client_ip.map(|ip| ip.to_string());
+            let resp_status = header.status.as_u16();
+            for policy in policies {
+                if let Policy::Assertion(a) = policy {
+                    let passed = a.evaluate_with_trust_tier(
+                        method,
+                        path,
+                        &req.headers,
+                        query,
+                        client_ip.as_deref(),
+                        &ctx.hostname,
+                        resp_status,
+                        &header.headers,
+                        Some(body.len()),
+                        Some(ctx.trust_tier.as_str()),
+                    );
+                    if passed {
+                        tracing::info!(
+                            target: "sbproxy::assertion",
+                            assertion = %a.name,
+                            status = resp_status,
+                            "assertion passed"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "sbproxy::assertion",
+                            assertion = %a.name,
+                            status = resp_status,
+                            expression = %a.expression,
+                            "assertion failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Session cookie: issue when the origin configures a `session:`
+    // block and the client did not already present the cookie.
+    {
+        let origin = &pipeline.config.origins[idx];
+        if let Some(ref session_cfg) = origin.session {
+            let cookie_name = session_cfg.cookie_name.as_deref().unwrap_or("sbproxy_sid");
+            let has_cookie = session
+                .req_header()
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(|cookies| {
+                    cookies.split(';').any(|c| {
+                        let c = c.trim();
+                        c.starts_with(cookie_name) && c[cookie_name.len()..].starts_with('=')
+                    })
+                })
+                .unwrap_or(false);
+            if !has_cookie {
+                let sid = uuid::Uuid::new_v4().to_string();
+                let cookie_val = build_session_cookie(session_cfg, &sid);
+                let _ = header.append_header("set-cookie", &cookie_val);
+            }
+        }
+    }
+
+    // 7. SRI scan over the final body. Same gate and semantics as the
+    // proxied body filter: only under an enforcing policy, only for
+    // text/html, observation-only (log + metric, no mutation).
+    if let Some(policies) = policies {
+        let ct = header
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let is_html = ct
+            .split(';')
+            .next()
+            .map(|t| t.trim().eq_ignore_ascii_case("text/html"))
+            .unwrap_or(false);
+        let any_sri_enforcing = policies
+            .iter()
+            .any(|p| matches!(p, Policy::Sri(s) if s.enforce));
+        if is_html && any_sri_enforcing {
+            for policy in policies {
+                if let Policy::Sri(s) = policy {
+                    match s.check_html_body(body, ct) {
+                        sbproxy_modules::SriCheckResult::Violations(v) => {
+                            for violation in &v {
+                                warn!(
+                                    hostname = %ctx.hostname,
+                                    tag = %violation.tag,
+                                    url = %violation.url,
+                                    reason = ?violation.reason,
+                                    "sri: subresource missing or weak integrity attribute"
+                                );
+                            }
+                            sbproxy_observe::metrics::record_policy(
+                                &ctx.hostname,
+                                "sri",
+                                "violation",
+                            );
+                        }
+                        sbproxy_modules::SriCheckResult::Clean => {
+                            sbproxy_observe::metrics::record_policy(&ctx.hostname, "sri", "clean");
+                        }
+                        sbproxy_modules::SriCheckResult::NotApplicable => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 // --- Callback firing ---

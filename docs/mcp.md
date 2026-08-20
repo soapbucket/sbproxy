@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -262,12 +262,14 @@ struct is `McpActionConfig` in
 
 ## Calling it
 
-Eight examples exercise different parts of this page. The one that matches the
+Nine examples exercise different parts of this page. The one that matches the
 config above, and the one used here, is
 [`examples/mcp-federation/`](../examples/mcp-federation/), because federation
 is what the `mcp` action is for and because it is self-contained: it ships its
 own upstream. For sessions, RBAC and quotas, progressive discovery, OAuth
-discovery, or tool versioning, use the example named for that feature.
+discovery, tool versioning, or the supervised `stdio` transport, use the
+example named for that feature
+([`examples/mcp-stdio/`](../examples/mcp-stdio/) for the last one).
 
 It runs as two processes. The first is a mock REST API that stands in for a
 real service; the second is the gateway that federates it:
@@ -544,6 +546,43 @@ Token validation itself stays in the generic auth layer; this block
 only drives discovery and the challenge. A request that already
 carries an `Authorization` header is never re-challenged. See
 [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery).
+
+## Discovery manifest
+
+Every origin whose action is the MCP gateway serves a discovery manifest at
+two paths, unconditionally and with no config of its own: `GET
+/.well-known/mcp-server` (the IETF `draft-serra-mcp-discovery-uri` path) and
+`GET /.well-known/mcp/server-card.json` (the Cloudflare Agent-Readiness
+alias). Both return the identical document, so an autonomous agent can learn
+the gateway's endpoint, protocol version, transport, and tool catalog without
+first opening a JSON-RPC session:
+
+```json
+{
+  "name": "my-mcp",
+  "version": "1.0.0",
+  "protocolVersion": "2025-06-18",
+  "transport": "streamable-http",
+  "endpoint": "https://mcp.example.com/",
+  "capabilities": { "tools": { "listChanged": false } },
+  "tools": [{ "name": "gh.search_repos", "description": "Search repositories by query." }],
+  "dnsDiscovery": {
+    "record": "_mcp.mcp.example.com",
+    "value": "v=mcp1; uri=https://mcp.example.com/.well-known/mcp-server"
+  }
+}
+```
+
+The `tools` list is the same per-caller view `tools/list` would return: the
+`tool_allowlist` guardrail and the calling principal's per-server RBAC policy
+both filter it, so the manifest never names a tool the gateway would refuse
+to call for that caller. `dnsDiscovery` is always present and is a
+recommendation, not a claim: SBproxy serves HTTP, not DNS, so it advertises
+the `_mcp.{domain}` TXT record an operator can publish in their own zone
+(`draft-morrison-mcp-dns-discovery` style) rather than publishing it itself.
+When the action declares `oauth:`, the manifest also carries an
+`authorization` pointer at the RFC 9728 protected-resource metadata URL, the
+same one the `401` challenge names.
 
 ## OpenAPI-backed servers
 
@@ -831,6 +870,35 @@ catalog is stored in an `ArcSwap` so refreshes do not block
 in-flight `tools/call` traffic. Source:
 `crates/sbproxy-extension/src/mcp/federation.rs:McpFederation`.
 
+Every entry contributes through the same interface regardless of what
+sits behind it: a real MCP server over `streamable_http`, `sse`, or a
+supervised `stdio` child; a REST API bridged from an OpenAPI spec; or
+tools declared entirely in config with no upstream at all
+(`type: local`, see [mcp-compose.md](mcp-compose.md)).
+
+```mermaid
+flowchart LR
+    subgraph Upstreams
+        A["mcp server\n(streamable_http / sse)"]
+        B["stdio server\n(supervised child process)"]
+        C["openapi server\n(REST + spec)"]
+        D["local server\n(static / http / steps, no dial)"]
+    end
+    A -->|tools/list| F[McpFederation catalog]
+    B -->|tools/list, over the pipe| F
+    C -->|derived from spec| F
+    D -->|declared in config| F
+    F -->|namespaced, refreshed on refresh_interval| G["tools/list response\n(RBAC-filtered per caller)"]
+    F -->|routed by owning server| H["tools/call dispatch\n(see mcp-gateway-guardrails.md gate order)"]
+```
+
+A refresh cycle probes each MCP upstream's `initialize` once and
+reuses that answer for the tool, resource, and prompt registries
+alike, and a failure on one upstream never blanks the others: the
+catalog degrades per server. `tools/call` and `resources/read` route
+by the namespaced name back to the one owning server, whichever kind
+it is.
+
 The resource and prompt registries are built by the same refresh pass
 and stored the same way. Each cycle probes every MCP upstream's
 `initialize` exactly once and reuses that one answer for every
@@ -958,6 +1026,15 @@ with `type: openapi` uses both: the gateway serves the derived tools
 and dispatches `tools/call` as REST against the origin (see the
 OpenAPI section above). Source:
 `crates/sbproxy-extension/src/mcp/openapi_convert.rs`.
+
+### `discovery`: the well-known manifest
+
+Builds the JSON document served at `/.well-known/mcp-server` and
+`/.well-known/mcp/server-card.json` (see [Discovery manifest](#discovery-manifest)
+above) and the recommended `_mcp.{domain}` DNS TXT record. No YAML knob of
+its own; it reads the same `server_info`, tool catalog, `tool_allowlist`,
+RBAC, and `oauth` config every other part of the action already declares.
+Source: `crates/sbproxy-extension/src/mcp/discovery.rs`.
 
 ### Prompt-linked audit
 

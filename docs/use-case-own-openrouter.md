@@ -1,6 +1,6 @@
 # API keys everywhere, accounting nowhere: stand up your own OpenRouter
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 ![Minting a virtual key, calling OpenAI and Anthropic through one governed endpoint, reading the spend ledger, and tripping a budget cap](assets/use-case-own-openrouter.gif)
 
@@ -36,7 +36,7 @@ The full install matrix, including checksums and air-gapped installs, is in the 
 
 The assembled file lives at [`examples/use-case-own-openrouter/sb.yml`](../examples/use-case-own-openrouter/sb.yml), with a docker-compose next to it. It reads in four parts.
 
-First, the two servers. Port 8080 is the data plane your teams call. The admin server on 9090 is the control plane where keys are minted; it is off by default and admits only loopback clients until you say otherwise. (The example file also sets `bind` and an `allow_ips` allowlist on the admin block so the docker-compose port mapping works, since Docker connections arrive from the bridge network rather than loopback. Running the binary directly, you can leave both out.)
+First, the two servers. Port 8080 is the data plane your teams call. The admin server on 9090 is the control plane where keys are minted; it is off by default and admits only loopback clients until you say otherwise. (The example file also sets `bind`, an `allow_ips` allowlist, and reads the admin password from `${SB_ADMIN_PASSWORD:-change-this-before-running}` rather than a literal value, because it binds wide for the docker-compose port mapping and a guessable password on a wide bind hands the whole admin API to anyone who can route to the port. Running the binary directly, admin stays on loopback by default, so this guide keeps a literal demo password below; still change it before anything real.)
 
 ```yaml
 proxy:
@@ -85,14 +85,14 @@ origins:
             - claude-haiku-4-5
 ```
 
-Fourth, governance: a budget and the ledger. The `api_key` scope gives every virtual key its own daily bucket, and `on_exceed: block` refuses the first request past the line with `402` before any provider is contacted. Ninety tokens is an absurd cap chosen so you can watch it trip in one sitting; a real deployment would set something like `max_cost_usd: 50` with `period: monthly`, or use `on_exceed: downgrade` to swap expensive models for cheap ones instead of refusing. Note that a request presenting no key skips a key-scoped limit, so add an auth gate in front when every caller must carry one. The ledger sink appends one entry per completed call, each hash-chained to the previous entry; add a `signing_seed_hex` and entries are Ed25519-signed too.
+Fourth, governance: a budget and the ledger. The `api_key` scope gives every virtual key its own daily bucket, and `on_exceed: block` refuses the first request past the line with `402` before any provider is contacted. Three hundred tokens is a small cap chosen so you can watch it trip in one sitting: the OpenAI call below spends about 64 tokens and the Anthropic call about 187, so two calls fit and a third does not; a real deployment would set something like `max_cost_usd: 50` with `period: monthly`, or use `on_exceed: downgrade` to swap expensive models for cheap ones instead of refusing. A request presenting no key is not exempt: it falls into a shared `__unattributed__` bucket that is still capped, so one unauthenticated caller cannot bypass the budget by omitting a key, though every caller without one shares that single bucket, which is a reason to add an auth gate in front when every caller must carry its own. The ledger sink appends one entry per completed call, each hash-chained to the previous entry; add a `signing_seed_hex` and entries are Ed25519-signed too.
 
 ```yaml
       budget:
         on_exceed: block
         limits:
           - scope: api_key
-            max_tokens: 90
+            max_tokens: 300
             period: daily
 
       usage_sinks:
@@ -117,12 +117,12 @@ $ curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
     -H 'Content-Type: application/json' \
     -d '{"name":"team-payments"}'
 {
-  "token": "sk-4fa2b91c-...",
-  "key": { "key_id": "4fa2b91c", "name": "team-payments", "status": "active", ... }
+  "token": "sbp_4fa2b91cd8e6a013_...",
+  "key": { "key_id": "4fa2b91cd8e6a013", "name": "team-payments", "status": "active", ... }
 }
 ```
 
-Hand that token to the payments team and mint another for the next team. A key is more than a credential: the record can carry `allowed_models`, `max_requests_per_minute`, tags for attribution, and a pinned `route_to_model`, all editable later with `PATCH /admin/keys/{id}` and all live on the next request. Revoking is one `POST /admin/keys/{id}/revoke`, and rotation keeps the old secret valid for a grace window while clients pick up the new one. The details are in [key-management.md](key-management.md).
+Hand that token to the payments team and mint another for the next team. A key is more than a credential: the record can carry `allowed_models`, `max_requests_per_minute` and `max_tokens_per_minute`, tags for attribution, and a pinned `route_to_model`, all editable later with `PATCH /admin/keys/{id}` and all live on the next request. Revoking is one `POST /admin/keys/{id}/revoke`, and rotation keeps the old secret valid for a grace window while clients pick up the new one. The details are in [key-management.md](key-management.md).
 
 If you would rather click than curl, builds that carry the embedded admin UI serve it at `http://127.0.0.1:9090/admin/ui`, driving these same endpoints from the browser (see [admin.md](admin.md) for how the UI is enabled and secured). The Keys page mints, edits, revokes, and rotates the same records:
 
@@ -131,7 +131,7 @@ If you would rather click than curl, builds that carry the embedded admin UI ser
 Now spend some of the budget. Save the token and send a normal OpenAI-shaped request through the gateway. The model field says `gpt-4o-mini`, so OpenAI serves it:
 
 ```console
-$ TOKEN=sk-4fa2b91c-...
+$ TOKEN=sbp_4fa2b91cd8e6a013_...
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' -H "Authorization: Bearer $TOKEN" \
     -H 'Content-Type: application/json' \
@@ -159,13 +159,13 @@ The admin UI covers this step too: the Playground page sends a test completion t
 
 ![The admin UI playground sending a test chat completion and showing the model's response](assets/admin-playground.png)
 
-Both calls are now in the ledger, attributed to the key by name:
+Both calls are now in the ledger, attributed to the key that spent them by its `key_id` (the stable public id from the mint response, not the `name` you gave it):
 
 ```console
 $ tail -n 2 /tmp/sbproxy-own-openrouter-ledger.jsonl \
     | jq -c '{provider: .event.provider, model: .event.model, tokens: .event.total_tokens, cost_usd: .event.cost_usd, key: .event.key_id}'
-{"provider":"openai","model":"gpt-4o-mini","tokens":64,"cost_usd":0.0000209,"key":"team-payments"}
-{"provider":"anthropic","model":"claude-haiku-4-5","tokens":187,"cost_usd":0.000819,"key":"team-payments"}
+{"provider":"openai","model":"gpt-4o-mini","tokens":64,"cost_usd":0.0000209,"key":"4fa2b91cd8e6a013"}
+{"provider":"anthropic","model":"claude-haiku-4-5","tokens":187,"cost_usd":0.000819,"key":"4fa2b91cd8e6a013"}
 ```
 
 Each entry's hash covers the entry before it, so the file is tamper-evident, and you can prove it:
@@ -177,7 +177,7 @@ ledger verify: OK (2 entries, chain only)
 
 Edit any `cost_usd` in the file and verification fails at that sequence number. [ai-usage-ledger.md](ai-usage-ledger.md) covers signing and the exactly-once replay behavior.
 
-Those two calls also spent more than 90 tokens, which is the point. The key's daily bucket is now over its cap, so the next request is refused before any provider sees it:
+Those two calls also spent most of that 300-token cap, which is the point. The key's daily bucket has too little left for a third call, so the next request is refused before any provider sees it:
 
 ```console
 $ curl -is http://127.0.0.1:8080/v1/chat/completions \
@@ -194,7 +194,7 @@ Every other key keeps working. Buckets are per key, so one team burning its budg
 ## You are done when
 
 - The same bearer token gets answers from both vendors through `http://127.0.0.1:8080/v1/chat/completions`, with `.model` reading `gpt-4o-mini` on one response and `claude-haiku-4-5` on the other.
-- `tail` on the ledger file shows one entry per call, with `provider` values `openai` and `anthropic` and both entries carrying `"key":"team-payments"`.
+- `tail` on the ledger file shows one entry per call, with `provider` values `openai` and `anthropic` and both entries carrying the same `key_id`.
 - `sbproxy ai ledger verify` prints `ledger verify: OK` and exits 0.
 - A further request with the spent key returns `HTTP/1.1 402 Payment Required` with `"type":"budget_exceeded"` and `"scope":"api_key"` in the body.
 

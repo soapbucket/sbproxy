@@ -1,5 +1,5 @@
 # A2A gateway
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces. See [`examples/a2a-protocol/`](../examples/a2a-protocol/) for a complete working config.
 
@@ -85,10 +85,46 @@ not A2A traffic": the content type, the MCP method, and above all your
 `route_glob` are still consulted. That ordering matters because the
 alternative is a bypass in one header.
 
+The two `v0` draft signals only classify the request; they do not parse
+it. Each draft's own body-carried chain state (`chain_depth`, `chain[]`,
+`callee` under the Anthropic `agents.invoke` envelope or its Google
+equivalent) is read by a parser gated behind its own Cargo feature
+(`a2a-anthropic` / `a2a-google`), and neither feature is on in the
+published binary or called from the request path even when compiled
+in. A `v0`-drafted request is still detected and still governed by the
+`a2a` policy, but its chain accounting comes only from the `X-A2A-*`
+headers or a signed `act` claim, the same as any other request; the
+draft's own body fields are never consulted. The ratified `A2A-Version:
+1.x` path has no such gap: its parser ships unconditionally (see
+`crates/sbproxy-modules/src/auth/a2a/v1.rs`).
+
 Because the first three signals are the caller's to send or withhold, a
 caller that wants to avoid the policy simply sends none of them. **Set
 `route_glob` on any route you actually intend to govern.** It is the
 only signal a caller cannot opt out of.
+
+```mermaid
+flowchart TD
+    A[Inbound request] --> B{Detected as A2A?\nA2A-Version / Content-Type /\nMCP-Method / route_glob}
+    B -->|no| C["failure_posture\n(open/closed/observe/degraded)"]
+    B -->|yes| D{Envelope source}
+    D -->|verified principal carries\nRFC 8693 act claim| E["allow:verified\nchain from the signed token"]
+    D -->|peer in proxy.trusted_proxies| F["allow:unverified\nchain from X-A2A-* headers"]
+    D -->|neither configured| G["empty envelope\ndepth 1, no chain, no caller id"]
+    E --> H["a2a policy: max_chain_depth,\ncycle_detection, callee_allowlist,\ncaller_denylist"]
+    F --> H
+    G --> H
+    H -->|pass| I[Forwarded to upstream agent]
+    H -->|depth exceeded| J[429]
+    H -->|cycle detected| K[409]
+    H -->|callee off-list or caller denied| L[403]
+```
+
+An envelope built from step G almost never trips the policy, since
+nothing in it can exceed a depth cap or collide in a cycle check: a
+route that only ever reaches `allow:unverified` or `skip:undetected`
+in its metrics is configured but not protecting anything, per
+[the section above](#where-the-envelope-comes-from-and-why-it-matters).
 
 ## Failure posture: what happens to a request that is not detected
 
@@ -321,7 +357,9 @@ The negotiator is case-insensitive on the MIME `type/subtype` head and strips `;
 
 ## See also
 
-- The A2A x402 payment bridge.
-- The agentgateway / Bifrost / SBproxy capability benchmark.
+- [`mcp-and-agents.md`](mcp-and-agents.md) - the hub page for MCP and
+  A2A agent traffic, and where this page fits next to the rest.
+- [`prompt-injection-v2.md`](prompt-injection-v2.md#the-agent-boundary) -
+  the classifier this page's message-content section configures.
 - `crates/sbproxy-modules/src/action/a2a.rs` - the proxy action itself.
 - `crates/sbproxy-modules/src/action/a2a_card.rs` - typed AgentCard + negotiator.

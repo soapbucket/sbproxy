@@ -1,6 +1,6 @@
 # Getting started: agent identity verification and discovery
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ## What you will build
 
@@ -104,6 +104,22 @@ Start the gateway:
 
 ```bash
 sbproxy serve -f sb.yml
+```
+
+Enforcement checks in this order: a missing signature is rejected before
+the directory is even consulted, an unrecognized `keyid` is rejected
+before the signature math runs, and only a request that clears both
+checks is forwarded.
+
+```mermaid
+flowchart TD
+    A[Request to blog.local] --> B{"Signature-Input header present?"}
+    B -->|no| R1["401: signature required"]
+    B -->|yes| C{"keyid in the agents directory?"}
+    C -->|no| R2["401: unknown keyid"]
+    C -->|yes| D{"Signature verifies against\nthe directory public key?"}
+    D -->|no| R3["401"]
+    D -->|yes| E["Forwarded to upstream: 200"]
 ```
 
 Enforcement: an unsigned request is rejected with `401`.

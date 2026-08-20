@@ -40,7 +40,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"In about 120 words, why give each team its own gateway key?"}]}' \
   | jq '{model, usage}'
 
-# Both calls are in the ledger, attributed to the key by name.
+# Both calls are in the ledger, attributed to the key's stable id.
 tail -n 2 /tmp/sbproxy-own-openrouter-ledger.jsonl \
   | jq -c '{provider: .event.provider, tokens: .event.total_tokens, cost_usd: .event.cost_usd, key: .event.key_id}'
 

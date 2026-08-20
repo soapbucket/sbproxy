@@ -1,6 +1,6 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 > **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
@@ -62,11 +62,11 @@ origins:
               - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
                 gguf_file: Qwen3-14B-Q4_K_M.gguf
                 name: claude-sonnet-4-5
-                extra_args: ["--jinja"]
+                engine: llama_cpp
                 keep_alive: 30m
 ```
 
-The `serve:` block is the whole trick. The model line names the weights explicitly: the Hugging Face repo, the quant, and the file. The gateway fetches them into its cache, spawns the engine as a supervised subprocess, and routes to it over loopback, which is why the provider carries no `base_url`. (A bare catalog id like `qwen3-14b` also resolves, with the fit planner choosing the quant for your card; the explicit form pins the exact weights file.) The `name:` field is the alias every plane sees. A request for `claude-sonnet-4-5` lands on the local Qwen, and since that is the model id Claude Code asks for by default, the client side shrinks to a base-URL change. `extra_args: ["--jinja"]` has llama-server apply the chat template embedded in the GGUF, and `keep_alive: 30m` unloads the engine after thirty idle minutes so the VRAM comes back.
+The `serve:` block is the whole trick. The model line names the weights explicitly: the Hugging Face repo, the quant, and the file. The gateway fetches them into its cache, spawns the engine as a supervised subprocess, and routes to it over loopback, which is why the provider carries no `base_url`. (A bare catalog id like `qwen3-14b` also resolves, with the fit planner choosing the quant for your card; the explicit form pins the exact weights file.) The `name:` field is the alias every plane sees. A request for `claude-sonnet-4-5` lands on the local Qwen, and since that is the model id Claude Code asks for by default, the client side shrinks to a base-URL change. `engine: llama_cpp` pins the engine explicitly: the stable llama.cpp argument allowlist does not include `--jinja`, so there is no way to force the Jinja template through this config, and llama-server already renders the GGUF's own embedded chat template by default. `keep_alive: 30m` unloads the engine after thirty idle minutes so the VRAM comes back.
 
 The origin key matters more than it looks. Hostname matching strips the port, so `"localhost"` matches a client whose base URL is `http://localhost:8080`. Running the gateway on a shared GPU box, key the origin with the hostname your clients will use instead.
 
@@ -159,7 +159,9 @@ Hi! Ready when you are.
 
 ## You are done when
 
-`curl -s http://localhost:8080/v1/messages` with the request above returns HTTP 200 in Anthropic shape with the served weights file in the `model` field, and `nvidia-smi` on the gateway host shows the engine process holding VRAM while it answers. On a box without a GPU you can only get partway: `sbproxy validate` passes and the gateway logs a startup warning naming the model and the missing prerequisite, which is the designed behavior, not a bug.
+- `curl -s http://localhost:8080/v1/messages` with the request above returns HTTP 200 in Anthropic shape, with the served weights file in the `model` field.
+- `nvidia-smi` on the gateway host shows the engine process holding VRAM while it answers.
+- On a box without a GPU, you can only get partway: `sbproxy validate` passes and the gateway logs a startup warning naming the model and the missing prerequisite. That is the designed behavior, not a bug.
 
 ## Next steps
 

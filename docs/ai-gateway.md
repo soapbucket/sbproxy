@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -242,7 +242,7 @@ routing:
 
 Lower tail latency at the cost of duplicate upstream calls ([config](../examples/ai-race-routing/)).
 
-Fans the request out to every eligible provider in parallel, returns the first 2xx, cancels the in-flight losers. Optimizes p99 latency at the cost of N times the API spend per request. Pair with `resilience` so persistently slow providers fall out of the eligible set.
+Fans the request out to every eligible provider in parallel, returns the first 2xx, cancels the in-flight losers. Optimizes p99 latency at the cost of N times the API spend per request. `resilience.outlier_detection` is meant to drop a persistently failing provider out of the race, but as of this pass it does not: see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#what-is-adaptive-and-what-fails-over) and [`examples/ai-race/README.md`](../examples/ai-race/README.md) for the gap and a live repro.
 
 ```yaml
 routing:
@@ -329,7 +329,7 @@ power-of-two candidate sampling are unchanged.
 
 ### cascade
 
-Tries a sequence of `(provider, model)` tiers from cheapest to most expensive. Each tier's response is graded against its `quality_threshold`; a response that is below threshold, empty, or refused retries on the next tier. `max_total_cost` (micro-USD) is an optional cumulative budget cap. Streaming requests dispatch only to the first tier.
+Tries a sequence of `(provider, model)` tiers from cheapest to most expensive. Each tier's response is graded against its `quality_threshold`; a response that is below threshold, empty, or refused retries on the next tier. `max_total_cost` (micro-USD) is an optional cumulative budget cap, and each tier can also carry its own `cost_cap` (micro-USD): a tier is skipped, not retried elsewhere, when dispatching it would push the cumulative cost past either cap. Streaming requests dispatch only to the first tier.
 
 ```yaml
 routing:
@@ -342,7 +342,10 @@ routing:
     - provider_id: openai
       model: gpt-4o
       quality_threshold: 0.85
+      cost_cap: 80000
 ```
+
+Grading looks for a top-level `confidence_score` JSON number (`[0.0, 1.0]`) in the tier's response. A score at or above `quality_threshold` accepts the response. When the field is absent, the response is treated as quality `1.0` and accepted outright: a tier only actually gets graded against `quality_threshold` when the provider (or a policy in front of it) returns a `confidence_score`, which plain OpenAI- and Anthropic-shaped completions do not. Without one, `cascade` still retries on a 5xx or an empty/refused response, but otherwise behaves like `fallback_chain` ordered cheapest-first, not like a quality-scored router.
 
 See [examples/ai-cascade-routing](../examples/ai-cascade-routing/sb.yml).
 
@@ -603,6 +606,8 @@ then rather than at the first request.
 ## Resilience
 
 Per-provider circuit breaker, outlier detection, and active health probes layered on top of the routing strategy. Each signal independently ejects a provider; when every provider is ejected, the router falls back to the unfiltered enabled list rather than refusing the request.
+
+`health_check` is unconditionally live: it runs its own background probe task regardless of routing strategy. `circuit_breaker` and `outlier_detection` are configured and enforced as a selection gate, but as of this pass the production dispatch path does not feed either one a live request outcome, on any routing strategy, so a provider that fails every request is not currently ejected by either signal. See [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#what-is-adaptive-and-what-fails-over) for the details and file citations.
 
 ```yaml
 resilience:
@@ -1298,7 +1303,7 @@ action:
 | `scope` | enum | required | One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`. |
 | `max_tokens` | u64 | unset | Total prompt + completion tokens allowed for the scope. |
 | `max_cost_usd` | f64 | unset | Total cost ceiling in USD across all requests in the scope. |
-| `period` | string | unset | One of `daily`, `weekly`, `monthly`, `total`. Window over which usage accumulates. |
+| `period` | string | unset | `daily`, `weekly`, `monthly`, `total`, `lifetime`, or a LiteLLM-style duration such as `30d` or `1h`. Window over which usage accumulates; an unrecognized value is not caught at config load and is silently treated as `total`. See [ai-predictive-budget.md](ai-predictive-budget.md) for the exact parsing rules. |
 | `downgrade_to` | string | unset | Model name routed to when this limit fires and `on_exceed` is `downgrade`. |
 
 ### Behavior notes
@@ -1311,7 +1316,7 @@ action:
   available.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
 - Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`) used by `BudgetLimit`.
-- An `agent`-scoped limit keys on the agent-to-agent caller identity, so per-agent spend is enforced rather than only reported. It names an agent only when the proxy verified that identity: asserted by a peer listed in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act` chain of a signed token. An unverified caller names itself, so honoring the name would let it spend to the cap and then rename itself for a fresh allowance, or burn through the budget of an agent whose name it borrowed. Unverified and unidentified spend therefore pools into one shared bucket that is still capped, which is the same `__unattributed__` fallback a request missing `x-user-id` gets. That fails closed: one noisy unverified caller can exhaust the shared bucket, and no unverified caller can reach a named agent's budget. Reporting keeps the finer grain, since the usage ledger records the claimed id and the trust flag either way. This is a different mechanism from the `agent_budget` policy, which rate-limits requests per fingerprinted agent class; this caps spend per asserted agent identity.
+- An `agent`-scoped limit keys on the agent-to-agent caller identity, so per-agent spend is enforced rather than only reported. It names an agent only when the proxy verified that identity: asserted by a peer listed in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act` chain of a signed token. An unverified caller names itself, so honoring the name would let it spend to the cap and then rename itself for a fresh allowance, or burn through the budget of an agent whose name it borrowed. Unverified and unidentified spend therefore pools into one shared bucket that is still capped, which is the same `__unattributed__` fallback a request missing `x-user-id` gets. That fails closed: one noisy unverified caller can exhaust the shared bucket, and no unverified caller can reach a named agent's budget. Reporting keeps the finer grain, since the usage ledger records the claimed id and the trust flag either way. This is a different mechanism from the [`agent_budget` policy](agent-budget.md), which rate-limits requests per fingerprinted agent class; this caps spend per asserted agent identity.
 - Realtime WebSocket requests run the same hard-limit preflight before the
   upgrade. `block` returns 402 without an upstream WebSocket handshake, `log`
   permits the upgrade, and `downgrade` replaces every inbound `model` query
@@ -1707,13 +1712,13 @@ Marking an alias `deprecated` keeps it serving while making its use visible. Eve
 
 Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
 
-Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface`. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
+Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface` and keys on the provider type: the entry's `provider_type`, falling back to `name` when no type is set. A custom-named entry such as `name: team-openai` with `provider_type: openai` therefore keeps the full OpenAI surface set; the display name never narrows or widens capability. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
 | `chat_completions` | POST | `/v1/chat/completions` | All |
 | `messages` | POST | `/v1/messages` | All |
-| `responses` | POST | `/v1/responses` | All |
+| `responses` | POST | `/v1/responses` | All, with stateless boundaries (see "Responses API boundaries" below) |
 | `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
 | `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
 | `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
@@ -1753,6 +1758,20 @@ An Anthropic client calling `/v1/messages` can bypass the internal format round 
 The bypass is deliberately narrow. Every request content and control field must have a lossless representation in the governed canonical tree. Unknown extensions and unsupported blocks such as `document` and `search_result` use the normal hub path, so the gateway never forwards content its policies could not inspect. The bypass is also disabled for streaming requests and whenever request processing changes content, including request PII redaction, prompt or tool injection, policy redaction, compression, and reasoning controls.
 
 A request with `stream: true` enters the SSE relay only when the upstream returns a successful `text/event-stream` response. Provider errors keep their original status, content type, and body. A successful buffered JSON response uses the normal provider translation and returns in the client's inbound shape. Both buffered paths have a bounded body read and can be replayed by idempotency.
+
+#### Responses API boundaries
+
+`/v1/responses` is served for every provider by translating the request into the canonical chat shape, so routing, guardrails, budgets, and cost tracking all apply. Translation covers `input` in all three wire shapes (string, content parts, message list), `instructions`, sampling controls, and `function` tools in both the Responses-native flat shape and the Chat-style nested shape. Replies come back as Responses objects, and streaming re-emits typed `response.*` SSE frames.
+
+What the gateway does not do is hold server-side response state, and it refuses rather than pretending:
+
+- `previous_response_id` and `conversation` are refused with a 400. Honoring either would return a response that silently lacks the prior turns it references. Resend the full conversation history in `input` instead.
+- `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
+- An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
+- Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, and logged with a warning naming the dropped type.
+- A `prompt` template reference is dropped and logged the same way; the gateway does not resolve server-side prompt objects, so the request runs on its `input` alone.
+
+The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
 
 ### Method coverage
 
@@ -2098,8 +2117,10 @@ on mismatch, independent of whatever the provider did with
 Assistants, threads, batches, image generation, audio, and fine-tuning remain
 live passthrough surfaces. `classify_surface(method, path)` in
 `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface`,
-and `provider_supports_surface(provider, surface)` in
-`crates/sbproxy-ai/src/api_routes.rs` answers whether that provider exposes it.
+and `provider_supports_surface(provider_type, surface)` in
+`crates/sbproxy-ai/src/api_routes.rs` answers whether that provider exposes it,
+keyed on the provider's effective type (`provider_type`, falling back to
+`name`), never on the display name alone.
 Those two are the whole path: a surface the classifier names is a surface the
 matrix answers for. The gateway forwards the request to an eligible provider;
 it does not emulate those provider APIs locally, and there are no per-surface
@@ -2450,7 +2471,7 @@ for chunk in stream:
 
 ## Realtime
 
-The AI gateway routes OpenAI Realtime API WebSocket sessions through the same dispatch path as the rest of the surface set. A client opens `GET /v1/realtime` with `Upgrade: websocket` against the proxy, the gateway runs its standard pre-upgrade gating, picks an enabled provider that supports Realtime (today: OpenAI), and lets Pingora forward bytes between the client and the provider after the `101 Switching Protocols` handshake.
+The AI gateway routes OpenAI Realtime API WebSocket sessions through the same dispatch path as the rest of the surface set. A client opens `GET /v1/realtime` with `Upgrade: websocket` against the proxy, the gateway runs its standard pre-upgrade gating, picks an enabled provider whose effective provider type supports Realtime (today: the `openai` type, whatever the entry is named), and lets Pingora forward bytes between the client and the provider after the `101 Switching Protocols` handshake.
 
 What runs before the upgrade:
 - Surface classification stamps `ai.surface = "realtime"` on the request span and the access log.

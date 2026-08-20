@@ -1,6 +1,6 @@
 # AI context compression
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 SBproxy can transform an AI chat request through an ordered, route-local
 compression pipeline before provider selection and dispatch. A route can keep
@@ -49,6 +49,23 @@ followed by `window_fit`. These can be separate named profiles on one route.
 | `compact_serialization` | None | Compact safe marked JSON and uniform scalar object rows | After selection |
 | `position_reorder` | None | Move highly ranked chunks toward block edges | Before the final bound |
 | `window_fit` | None | Apply the legacy newest-to-oldest message-selection heuristic within the known model window | Last |
+
+```mermaid
+flowchart LR
+    A[Request messages] --> B["Lever 1\n(e.g. rag_select)"]
+    B -->|"candidate strictly\nsmaller? commit"| C["Lever 2\n(e.g. query_select)"]
+    B -->|no savings, or\nskip/fail condition| C
+    C --> D["... remaining\nconfigured levers ..."]
+    D --> E["Lever N\n(e.g. window_fit)"]
+    E --> F[Final committed list]
+    F --> G[Provider routing + failover]
+```
+
+Every lever sees the list the previous one committed, whether or not that
+previous lever actually changed anything: a skip or failure just passes the
+input through unchanged. `position_reorder` is the one exception to "commit
+only on strict reduction" and may commit a same-size, differently ordered
+candidate.
 
 Canonical session summaries are never held only in worker memory. Local state
 survives a restart of the same process deployment through its redb file, but it

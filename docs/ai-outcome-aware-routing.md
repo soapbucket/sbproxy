@@ -1,5 +1,5 @@
 # Outcome-aware routing
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-19*
 
 The latency- and cost-aware routing strategies decide from live signals or
 static catalog price. None of them consume the *realized* outcome of a
@@ -90,3 +90,9 @@ same snapshot instead of building a second feedback pipeline.
 
 The runnable example is in
 [`examples/ai-outcome-aware-routing/`](../examples/ai-outcome-aware-routing/).
+
+## See also
+
+- [ai-gateway.md#routing-strategies](ai-gateway.md#routing-strategies) - the full menu `outcome_aware` is one entry in, including `cost_optimized`, `cascade`, and `race`.
+- [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - the circuit breaker and outlier detector that eject a provider on consecutive or sliding-window failures, a coarser-grained complement to this per-provider cost score.
+- [ai-lb-benchmark.md](ai-lb-benchmark.md) - latency-focused strategies (`peak_ewma`, `prefix_affinity`) benchmarked against a synthetic workload; `outcome_aware` is cost-focused and not in that comparison.

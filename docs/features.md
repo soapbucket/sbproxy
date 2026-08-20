@@ -1,5 +1,5 @@
 # SBproxy Features Hub
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
@@ -22,9 +22,9 @@ Traffic can be distributed across upstream targets using 8 algorithms (including
 * **Examples:** [Load Balancer](../examples/load-balancer/), [Active Health Checks](../examples/active-health-checks/), [Circuit Breaker](../examples/circuit-breaker/), [LB Deployment](../examples/load-balancer-deployment/)
 
 ### Authentication & Authorization
-Protect your endpoints with 10 built-in authentication types: API Keys, Basic Auth, Bearer tokens, JWT (with JWKS), Forward Auth, Digest, mTLS, Web Bot Auth, CAP, and OIDC. You can also enforce fine-grained access control.
+Protect your endpoints with 11 built-in authentication types: API Keys, Basic Auth, Bearer tokens, JWT (with JWKS), Forward Auth, LDAP directory bind, Digest, mTLS, Web Bot Auth, CAP, and OIDC. You can also enforce fine-grained access control.
 * **Docs:** [OIDC Auth](auth-oidc.md), [Object Authz](object-authz.md), [Key Management](key-management.md), [Web Bot Auth](web-bot-auth.md)
-* **Examples:** [Auth JWT](../examples/auth-jwt/), [Auth Forward](../examples/auth-forward/), [mTLS Client Auth](../examples/mtls-client-auth/), [API Key](../examples/auth-api-key/), [Basic Auth](../examples/auth-basic/), [Bearer Token](../examples/auth-bearer/), [Bearer DPoP](../examples/auth-bearer-dpop/), [CAP Auth](../examples/auth-cap/), [Inbound Keys](../examples/keys-inbound-headers/), [Sessions](../examples/sessions/)
+* **Examples:** [Auth JWT](../examples/auth-jwt/), [Auth Forward](../examples/auth-forward/), [Auth LDAP](../examples/auth-ldap/), [mTLS Client Auth](../examples/mtls-client-auth/), [API Key](../examples/auth-api-key/), [Basic Auth](../examples/auth-basic/), [Bearer Token](../examples/auth-bearer/), [Bearer DPoP](../examples/auth-bearer-dpop/), [CAP Auth](../examples/auth-cap/), [Inbound Keys](../examples/keys-inbound-headers/), [Sessions](../examples/sessions/)
 
 ### Security & Guardrails
 A built-in Web Application Firewall (WAF) screens requests before they hit your upstream. It ships a curated, CRS-derived baseline of 16 rules: 4 built-in patterns plus a 12-rule managed bundle with CRS-style IDs and paranoia levels. The rule set extends through a signed remote rule feed, verified with HMAC-SHA256, cached on disk, and rejected when older than a configured staleness bound, and repeat offenders can be blocked persistently through strike-based blocking. Both corpora are independent flags and neither implies the other: `owasp_crs.enabled: true` gives you the 4 built-in patterns, and `owasp_crs.managed_bundle: true` adds the 12-rule bundle. Operators who need full OWASP CRS coverage (anomaly scoring, transformation pipelines, body processors) should put ModSecurity, Coraza, or a CDN WAF in front and keep SBproxy's WAF as a baseline layer. [WAF options](waf-options.md) records why there is no SecLang engine in the dataplane, and gives the recipes for running one in front, publishing your own rules through the signed feed, and layering the policies already in the binary. SBproxy also mitigates DDoS attacks and HTTP request smuggling, and enforces token-bucket rate limiting.
@@ -158,7 +158,7 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 * **Scripting-driven:** `expression` (CEL), `rego`, `assertion`.
 * **Packs:** `owasp_api_top10` is not a twenty-eighth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
 
-Authentication is a separate axis, configured on an origin's `auth:` block rather than in `policies:`: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `oidc`, `bot_auth` (Web Bot Auth), and `cap`, plus mTLS client verification at the listener. The Authentication section above links the docs and examples.
+Authentication is a separate axis, configured on an origin's `auth:` block rather than in `policies:`: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `ldap_auth`, `oidc`, `bot_auth` (Web Bot Auth), and `cap`, plus mTLS client verification at the listener. The Authentication section above links the docs and examples.
 
 ## 8. Reference: where custom logic attaches
 

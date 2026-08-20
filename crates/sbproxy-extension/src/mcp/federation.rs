@@ -36,11 +36,53 @@ use sbproxy_security::egress::{
 ///
 /// Mirrors the shape the JSON-RPC dispatcher in `sbproxy-core::server`
 /// already understands: an `Allow` returns the upstream's result, a
-/// `Deny` returns a JSON-RPC error code (`-32603`) and a message, and
+/// `Deny` returns a JSON-RPC error code (`-32602`) and a message, and
 /// the caller is responsible for wrapping either into a
 /// [`JsonRpcResponse`]. Returning a dedicated outcome (rather than a
 /// flat `Result`) keeps the deny path observable without forcing every
 /// future hook addition to invent a fresh error string.
+///
+/// WOR-2538: this used to hardcode
+/// [`INTERNAL_ERROR`](super::types::INTERNAL_ERROR) (`-32603`), which
+/// disagreed with `sbproxy-core::server::action_dispatch`'s config-RBAC
+/// deny path (`-32602`, [`INVALID_PARAMS`](super::types::INVALID_PARAMS))
+/// for what reads, from a client's perspective, as the same kind of
+/// event: a `tools/call` refused because *this caller* is not allowed
+/// to make *this* call. `-32603` implies a server fault the client
+/// might usefully retry; a policy refusal is a deterministic decision
+/// about the request, not a malfunction, so `-32602` is the correct
+/// code here for the same reason `action_dispatch` already chose it.
+/// Both now build their error from the shared
+/// [`INVALID_PARAMS`](super::types::INVALID_PARAMS) constant rather
+/// than a literal, so they cannot silently drift apart again.
+///
+/// The two mechanisms stay structurally distinct even though they now
+/// agree on the code. `action_dispatch`'s RBAC deny is the built-in,
+/// config-declared `ToolAccessPolicy` (`rbac_policies` in config,
+/// WOR-1065/1066), checked before this module is ever reached.
+/// `DeniedByPolicy` here is produced by the pluggable, code-registered
+/// [`McpPolicyHook`] extension point (PR β), evaluated inside
+/// `call_tool_with_policy_cause_and_headers_from_held_tool` (private to
+/// this module) *after* that config RBAC gate has already passed. A hook can
+/// implement RBAC-like behavior, but the mechanism is deliberately
+/// generic -- it is just as usable for a budget check or a human
+/// approval gate -- so `DeniedByPolicy` is not itself an RBAC-specific
+/// type.
+///
+/// Caveat: today the only production caller reaching this module
+/// (`sbproxy-core::server::action_dispatch::handle_mcp_action`, via
+/// [`McpFederation::call_tool_with_upstream_headers_from_snapshot`])
+/// does not honor the "caller wraps it into a `JsonRpcResponse`"
+/// contract above. That wrapper collapses `DeniedByPolicy` into a
+/// generic `anyhow::Error` (see its doc comment), and
+/// `action_dispatch`'s catch-all `Err` arm for `tools/call` always
+/// answers with `INTERNAL_ERROR` regardless of cause. So a policy-hook
+/// deny still reaches the wire as `-32603` today, even after this fix;
+/// this enum's `code` is correct at the type level and is what a
+/// caller honoring the documented contract would send. Making the live
+/// gateway path actually honor it is a separate, larger change than
+/// reconciling this disagreement, and is tracked as a WOR-2538
+/// follow-up rather than folded into it.
 #[derive(Debug, Clone)]
 pub enum McpCallOutcome {
     /// Policy permitted the call; the upstream returned this result.
@@ -48,8 +90,10 @@ pub enum McpCallOutcome {
     /// Policy blocked the call. The caller emits a JSON-RPC error with
     /// the carried message; the upstream was never contacted.
     DeniedByPolicy {
-        /// JSON-RPC error code to surface. PR β always emits
-        /// [`INTERNAL_ERROR`](super::types::INTERNAL_ERROR) (`-32603`).
+        /// JSON-RPC error code to surface:
+        /// [`INVALID_PARAMS`](super::types::INVALID_PARAMS) (`-32602`),
+        /// same as `action_dispatch`'s RBAC deny path and for the same
+        /// reason (WOR-2538) -- see this enum's doc comment.
         code: i32,
         /// Human-readable deny reason returned in the JSON-RPC error
         /// message.
@@ -2801,8 +2845,14 @@ impl McpFederation {
                     reason = %message,
                     "MCP tool call denied by policy hook"
                 );
+                // WOR-2538: INVALID_PARAMS, not INTERNAL_ERROR -- a
+                // policy hook refusing this specific call is a
+                // deliberate decision about the request, not a server
+                // fault, and matches the code
+                // `action_dispatch`'s own (separate) RBAC deny path
+                // uses. See `McpCallOutcome`'s doc comment.
                 return Ok(McpCallOutcome::DeniedByPolicy {
-                    code: super::types::INTERNAL_ERROR,
+                    code: super::types::INVALID_PARAMS,
                     message,
                 });
             }
@@ -2822,8 +2872,11 @@ impl McpFederation {
                     reason = %reason,
                     "MCP tool call held by policy hook; PR β denies pending PendingConfirmStore"
                 );
+                // WOR-2538: same INVALID_PARAMS reasoning as the Deny
+                // arm above -- a held-for-confirmation call is denied
+                // for now, not internally broken.
                 return Ok(McpCallOutcome::DeniedByPolicy {
-                    code: super::types::INTERNAL_ERROR,
+                    code: super::types::INVALID_PARAMS,
                     message: format!("confirmation required: {}", reason),
                 });
             }
@@ -9361,7 +9414,13 @@ mod tests {
 
         match out {
             McpCallOutcome::DeniedByPolicy { code, message } => {
-                assert_eq!(code, super::super::types::INTERNAL_ERROR);
+                // WOR-2538: INVALID_PARAMS (-32602), not INTERNAL_ERROR
+                // (-32603) -- the same code
+                // `sbproxy-core::server::action_dispatch`'s config-RBAC
+                // deny path uses, and for the same reason: a policy
+                // refusal is a deterministic decision about this
+                // caller's request, not a server fault.
+                assert_eq!(code, super::super::types::INVALID_PARAMS);
                 assert!(
                     message.contains("policy hook denied"),
                     "deny reason must round-trip into the outcome, got {message}"
@@ -9453,7 +9512,9 @@ mod tests {
 
         match out {
             McpCallOutcome::DeniedByPolicy { code, message } => {
-                assert_eq!(code, super::super::types::INTERNAL_ERROR);
+                // WOR-2538: same INVALID_PARAMS reasoning as the Deny
+                // case above.
+                assert_eq!(code, super::super::types::INVALID_PARAMS);
                 assert!(
                     message.contains("approval required for prod write"),
                     "Confirm reason must round-trip into the deny message, got {message}"

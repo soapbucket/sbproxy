@@ -1,6 +1,6 @@
 # Replicated cluster state
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 The mesh's typed-state cache routes every key to a single owner and keeps
 everything in memory. That is fine for best-effort caching, but it cannot
@@ -68,6 +68,21 @@ intervals, `max_entries` at most 1048576, and `max_value_bytes` at most
 
 ## Placement and consistency
 
+```mermaid
+flowchart TD
+    KEY["Key hash"] --> RING["Walk the consistent-hash ring\nclockwise from the hash"]
+    RING --> PREF["Preference list:\nfirst factor distinct nodes"]
+    PREF --> WRITE["Write: build a versioned record,\nfan out to the whole preference list"]
+    WRITE --> ACKS{"Acknowledgments\nvs write_consistency"}
+    ACKS -->|"one: >=1 replica"| OK["Write succeeds"]
+    ACKS -->|"quorum: majority"| OK
+    ACKS -->|"all: every replica"| OK
+    ACKS -->|fewer than required| FAIL["Quorum failure returned\n(write may still be applied\non some replicas; retry is safe)"]
+    FAIL -.->|anti-entropy converges the rest| OK
+    PREF --> READ["Read: consult read_consistency\nreplicas, reconcile by logical version"]
+    READ --> REPAIR["Repair stale or missing\nreplicas in line before returning"]
+```
+
 Each key maps to a preference list: the first `factor` distinct nodes
 reached walking the consistent-hash ring clockwise from the key's hash.
 The first entry is the same node the single-owner cache would pick, so a
@@ -102,7 +117,12 @@ availability and tolerates stale reads.
 
 A node that the failure detector has isolated from the cluster fails
 its state operations fast instead of pretending a quorum is reachable.
-`one`-level operations still serve from the local shard.
+`one`-level operations still serve from the local shard. The
+`mesh_node_isolated{node_id}` gauge reads 1 while a node is in this
+quarantine state; [payment-clustering.md](payment-clustering.md) covers
+the split-brain detector's threshold and its known gap against the
+isolation observer in detail for the settlement use case, and the same
+mechanism gates state operations here.
 
 ## Durability and restart
 

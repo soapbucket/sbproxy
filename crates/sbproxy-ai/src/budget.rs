@@ -44,8 +44,12 @@ pub struct SoftLandingConfig {
     /// block (default `0.95`).
     #[serde(default = "default_downgrade_at")]
     pub downgrade_at: f64,
-    /// Model to downgrade to. When unset, the per-limit `downgrade_to` or
-    /// the cheapest model across the providers is used.
+    /// Fallback model to downgrade to. A per-limit `downgrade_to`
+    /// (WOR-2544) always takes precedence over this value when the
+    /// limit that tripped soft-landing sets one; this global value is
+    /// only used when that limit leaves `downgrade_to` unset, and the
+    /// cheapest model across the providers is used when neither is
+    /// set.
     #[serde(default)]
     pub downgrade_to: Option<String>,
 }

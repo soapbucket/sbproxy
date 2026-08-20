@@ -82,15 +82,36 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
 
         // Auth scheme for this origin (if any), keyed by scheme name we
         // synthesize from the origin id so distinct origins can declare
-        // distinct auth without collisions.
+        // distinct auth without collisions. A list-form block is an OR
+        // of providers, and OpenAPI's `security` array is natively an
+        // OR of requirement objects, so each entry becomes its own
+        // scheme and its own single-scheme requirement. The scalar form
+        // keeps its exact prior scheme name.
         let security_requirement = origin.auth_config.as_ref().and_then(|auth| {
-            let scheme_name = format!("{}_auth", origin.origin_id);
-            map_auth(auth, &scheme_name).map(|scheme| {
-                security_schemes.insert(scheme_name.clone(), scheme);
-                let mut req = Map::new();
-                req.insert(scheme_name, Value::Array(Vec::new()));
-                Value::Array(vec![Value::Object(req)])
-            })
+            let entries: Vec<&Value> = match auth.as_array() {
+                Some(list) => list.iter().collect(),
+                None => vec![auth],
+            };
+            let single = entries.len() == 1;
+            let mut requirements = Vec::new();
+            for (index, entry) in entries.into_iter().enumerate() {
+                let scheme_name = if single {
+                    format!("{}_auth", origin.origin_id)
+                } else {
+                    format!("{}_auth_{index}", origin.origin_id)
+                };
+                if let Some(scheme) = map_auth(entry, &scheme_name) {
+                    security_schemes.insert(scheme_name.clone(), scheme);
+                    let mut req = Map::new();
+                    req.insert(scheme_name, Value::Array(Vec::new()));
+                    requirements.push(Value::Object(req));
+                }
+            }
+            if requirements.is_empty() {
+                None
+            } else {
+                Some(Value::Array(requirements))
+            }
         });
 
         // Methods to emit per path. Empty allowlist = every standard verb.
@@ -621,6 +642,32 @@ mod tests {
         assert_eq!(
             scheme["description"],
             "Gateway auth type 'custom_plugin_auth' has no registered OpenAPI mapper; emitted as a generic API key scheme."
+        );
+    }
+
+    #[test]
+    fn build_emits_one_scheme_per_entry_for_an_auth_composition() {
+        // WOR-2517: a list-form `authentication:` block is an OR of
+        // providers, which OpenAPI expresses as multiple requirement
+        // objects in the `security` array. Each entry gets its own
+        // scheme keyed by slot index.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!([
+            {"type": "basic_auth"},
+            {"type": "oauth_client_creds", "token_url": "https://auth.example.com/token"},
+        ]));
+        let spec = build(&snap, None);
+        let schemes = spec["components"]["securitySchemes"]
+            .as_object()
+            .expect("securitySchemes object");
+        assert_eq!(schemes.len(), 2, "one scheme per composition entry");
+        let security = spec["paths"]["/users/{id}"]["get"]["security"]
+            .as_array()
+            .expect("security array");
+        assert_eq!(
+            security.len(),
+            2,
+            "two alternative requirements express the OR"
         );
     }
 

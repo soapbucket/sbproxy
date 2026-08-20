@@ -9,7 +9,7 @@ The config for the story doc
 provider with no `base_url` and a one-model `serve:` block.
 
 **This is a CPU/Apple Metal stand-in, not an NVIDIA L4 demo.** Apple
-Silicon Metal passed on 2026-07-11. The
+Silicon Metal passed certification on 2026-08-02. The
 config names llama.cpp and a GGUF file. This walkthrough tests its
 CPU/Metal engine path. On any host with `llama-server` on `PATH` (or fetchable), the
 gateway pulls the named Q4_K_M GGUF for `qwen3-14b` from Hugging Face,
@@ -83,7 +83,7 @@ says nothing about NVIDIA L4 readiness.
   build prerequisites can run this config through llama.cpp with GPU
   offload. The managed NVIDIA path through vLLM or SGLang is separate
   and not yet certified. See the
-  story doc's "NVIDIA L4 (planned)" section.
+  story doc's "NVIDIA L4" section.
 - If no engine is available at all, `validate` and `plan` still pass;
   only the completion and `pgrep` steps above are skipped, and
   `doctor` explains why.

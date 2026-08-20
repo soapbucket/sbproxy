@@ -1,6 +1,6 @@
 # Access log
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
 
@@ -285,23 +285,51 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `session_id` | string? | Session identifier: caller-supplied, or auto-generated for anonymous traffic. |
 | `parent_session_id` | string? | Parent session identifier; never auto-generated. Absent when the request carried none. |
 | `tenant_id` | string | Tenant resolved from the matched origin's `tenant_id`. `__default__` for single-tenant deployments. Empty (and omitted) for log rows emitted before the request matched an origin, such as an early 404 on an unknown host. |
-| `principal_kind` | string? | Which kind of principal authenticated the request: `bearer`, `api_key`, `jwt`, `basic_auth`, `oidc`, `forward_auth`, `bot_auth`, `digest`, `cap`, `noop`, `virtual_key`, or `none`. `none` covers origins with no auth provider configured. |
+| `principal_kind` | string? | Which kind of principal authenticated the request: `bearer`, `api_key`, `jwt`, `basic_auth`, `oidc`, `forward_auth`, `ldap_auth`, `bot_auth`, `digest`, `cap`, `noop`, `virtual_key`, or `none`. `none` covers origins with no auth provider configured. |
 | `api_key_id` | string? | Stable identifier of the credential (virtual key) that authenticated the request, mirroring the `api_key_id` metric label. Never the raw secret. Absent for un-credentialed requests. |
 | `key_provider` | string? | Recognized native provider label when the request was governed by [native-key policy](key-management.md#attributing-native-provider-keys). Never contains credential material. |
 | `key_mode` | string? | Inbound credential mode: `none`, `minted`, or `native`. |
 | `served_from_cache` | bool? | `true` when the response came from cache (hot or reserve) without contacting the upstream. |
 | `fallback_triggered` | bool? | `true` when the primary upstream failed and a `fallback_origin` served the response. |
 | `retry_count` | int? | Number of upstream retries attempted before the terminal outcome. `0` means the first attempt succeeded. |
+| `error_class` | string? | Compact failure label when the response was not a 2xx (`auth_denied`, `rate_limited`, `waf_blocked`, `upstream_5xx`, `upstream_timeout`, `validator_failed`, ...). Absent for successful requests; see [Calling it](#calling-it) above for a worked example. |
 
-A smaller set of additional fields cover agent detection (`agent_id`,
-`agent_class`, `agent_vendor`), AI cost and guardrails (`cost_usd_micros`,
-`guardrail_category`, `guardrail_action`), payment settlement and crawler
-pricing (`payment_rail`, `tier`, `price`, `currency`, `rail`, `txhash`), and
-A2A envelope linkage (`a2a_context_id`, `a2a_identity_verified`). Each is
-documented alongside the feature that produces it rather than repeated here;
-see [agent-budget.md](agent-budget.md), [payment-settlement.md](payment-settlement.md),
-[ai-crawl-control.md](ai-crawl-control.md), [guardrails.md](guardrails.md), and
-[a2a-gateway.md](a2a-gateway.md).
+A larger set of additional fields, one field or a handful per feature, are
+documented alongside the feature that produces them rather than repeated
+here in full:
+
+* Agent detection: `agent_id`, `agent_class`, `agent_vendor`. See
+  [agent-budget.md](agent-budget.md).
+* AI cost, surface, and guardrails: `cost_usd_micros`, `ai_surface`,
+  `guardrail_category`, `guardrail_action`. See [guardrails.md](guardrails.md).
+* Content shaping: `content_shape` (the pricing-pass shape), `shape` (the
+  shape the body transformer actually ran), `stripped_bytes` (boilerplate
+  transform). See [content-for-agents.md](content-for-agents.md).
+* Payment settlement and crawler pricing: `payment_rail`, `tier`, `price`,
+  `currency`, `rail`, `txhash`, `redeemed_token_id`,
+  `settlement_receipt_digest`. See [payment-settlement.md](payment-settlement.md)
+  and [ai-crawl-control.md](ai-crawl-control.md).
+* OLP and CAP tokens: `license_token_id`, `cap_token_id`. See
+  [cap.md](cap.md).
+* A2A envelope linkage: `a2a_context_id`, `a2a_identity_verified`. See
+  [a2a-gateway.md](a2a-gateway.md).
+* Stored prompts: `prompt_name`, `prompt_version`.
+* Per-credential attribution (the fields the unified `attribution` object
+  above superseded but still ships for existing consumers):
+  `project`, `user`, `team`, `tags`, `metadata`. See
+  [clickhouse-attribution.md](clickhouse-attribution.md).
+* Caller-supplied custom properties from `X-Sb-Property-*` headers:
+  `properties`. See [headers-reference.md](headers-reference.md).
+* Multi-tenant and routing detail: `workspace_id`, `auth_type`,
+  `forward_rule_idx`.
+* End-user identity: `user_id`, `user_id_source`.
+* Geo and classifier signal (optional policies): `request_geo`,
+  `classifier_prompt`, `classifier_intent`. See
+  [classifier-sidecar.md](classifier-sidecar.md).
+
+All of the above follow the same `skip_serializing_if` rule as the core
+table: absent from the line whenever the owning feature is off or did not
+fire for that request.
 
 Optional fields are omitted from the JSON object when their value is
 `None`.

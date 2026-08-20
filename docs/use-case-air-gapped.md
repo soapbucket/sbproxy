@@ -1,6 +1,6 @@
 # Air-gapped AI: weights, prompts, and verdicts that never leave your network
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-19*
 
 > **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
@@ -149,6 +149,23 @@ So, the accounting the auditor asked for. What leaves the box: nothing. One chan
 | Anything the table missed | The compose network is `internal: true`; a channel this accounting overlooked still has no route out. |
 
 A table in a doc is still just a promise, so the compose file in the example makes the posture physical: a Docker network with `internal: true` has no default gateway, no published ports, no route out. If someone later edits a cloud provider into this config, their requests fail with a connection error instead of quietly leaving.
+
+```mermaid
+flowchart TD
+    subgraph NET["Internal-only network (internal: true, no default gateway)"]
+        CLIENT["client container"] -->|"Host: ai.internal"| GW["sbproxy :8080"]
+        GW --> GR{"guardrails\ninjection + pii"}
+        GR -->|blocked| ERR["400 guardrail_violation\nrequest goes no further"]
+        GR -->|clean| SC{"semantic cache\nsource: sidecar"}
+        SC -->|miss| ENGINE["llama.cpp engine\n(loopback)"]
+        SC -.->|embed| SIDE["classifier-sidecar :9440\n(ONNX, loopback)"]
+        ENGINE --> W["file: weights\n(sha256-verified)"]
+    end
+    GW -.->|attempted egress| WALL(("kernel: no route out"))
+    WALL -.-> OUT["provider APIs, moderation APIs,\nACME/CA, telemetry exporters"]
+```
+
+Everything a request can reach lives inside the boundary. Everything the table above closes sits past a wall the kernel enforces.
 
 ## Run it
 

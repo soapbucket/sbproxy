@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-19*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -39,7 +39,7 @@ manifest naming exactly what it did for each.
 | API5 | Broken Function Level Authorization | `needs_operator_input`: shares API1's `object_authz` entry, blocking nothing until you add `function_rules` | [Object access that trusts the caller's ID](#object-access-that-trusts-the-callers-id) |
 | API6 | Unrestricted Access to Sensitive Business Flows | `not_covered`: compose `rate_limiting`, `object_authz`, and bot checks yourself | [Automated traffic you cannot distinguish](#automated-traffic-you-cannot-distinguish) |
 | API7 | Server Side Request Forgery | `enforced`, always, with nothing synthesized: the SSRF guard already runs on every outbound dial *sbproxy itself* makes - not the backend's own server-side URL fetching | [Requests the service makes on the caller's behalf](#requests-the-service-makes-on-the-callers-behalf) |
-| API8 | Security Misconfiguration | `enforced`: adds `security_headers` and `http_framing` on a `proxy`/`load_balancer`/etc. origin (`security_headers` needs a response-phase action; `static`/`mock`/etc. only get `http_framing`); layer `waf` yourself for broader coverage | [Browser-facing misconfiguration](#browser-facing-misconfiguration) |
+| API8 | Security Misconfiguration | `enforced`: adds `security_headers` and `http_framing` on proxied and generated-response origins alike (`static`/`mock`/`echo`/`beacon`/`redirect` included; `mcp`/`storage`/`ai_proxy`/plugin actions only get `http_framing`); layer `waf` yourself for broader coverage | [Browser-facing misconfiguration](#browser-facing-misconfiguration) |
 | API9 | Improper Inventory Management | `enforced`: sets `expose_openapi: true`, a disclosure decision worth reviewing first | [openapi-emission.md](openapi-emission.md) |
 | API10 | Unsafe Consumption of APIs | `not_covered`: no response-handling safety net for third-party API calls today | n/a |
 
@@ -133,7 +133,11 @@ which one to attach:
 
 `oidc` runs a full relying-party login with authorization code and PKCE and a
 sealed session cookie ([auth-oidc.md](auth-oidc.md)). `api_key` and
-`bearer_token` cover machine callers.
+`bearer_token` cover machine callers. For machine callers that should prove
+possession of their secret on every request instead of sending it, `hmac_auth`
+verifies an RFC 9421 HMAC signature over the method, path, and a mandatory
+timestamp, so a captured request replays nowhere else and expires inside a
+configured window ([configuration.md](configuration.md)).
 
 Two options on `jwt` are worth turning on if your issuer supports them.
 `require_dpop: true` demands an RFC 9449 proof whose `jkt` matches the token's
@@ -355,6 +359,13 @@ which is the difference between a crawler claiming to be someone and one proving
 it. Its directory and key settings are in [web-bot-auth.md](web-bot-auth.md).
 `pay_per_crawl` turns unwanted automation into a priced transaction rather than
 a block.
+
+A request can carry evidence from several of these sources at once (Web Bot
+Auth, CAP, named-agent rule packs, TLS fingerprint signals), and each answers
+its own narrow question. `request.trust_tier` collapses that fan-out into one
+conservative verdict (`suspicious`, `strong`, `named`, or `anonymous`) so a
+policy asks one question instead of replicating every verifier's logic. See
+[trust-tiers.md](trust-tiers.md).
 
 See [`examples/ip-filter/`](../examples/ip-filter/) for a complete working
 config of the `ip_filtering` policy above.

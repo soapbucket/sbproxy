@@ -79,11 +79,22 @@ impl OpenApiValidationPolicy {
     /// Accepts either:
     /// - `spec`: inline OpenAPI document as a JSON/YAML object
     /// - `spec_file`: path to an OpenAPI document on disk (JSON or YAML)
-    /// - `spec_url`: HTTPS URL fetched at startup (synchronous; fails
-    ///   the policy if unreachable)
+    ///
+    /// `deny_unknown_fields` below refuses any other key (a stale
+    /// `spec_url` included) at config-load time rather than silently
+    /// ignoring it; this policy does not fetch a spec over the
+    /// network.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
+            /// The dispatch key, captured so `deny_unknown_fields` does
+            /// not reject the `type: openapi_validation` every config
+            /// carries. A typo or stale key among the real fields
+            /// (`spec_url` included) is refused rather than silently
+            /// dropped, which is exactly how that gap stayed invisible.
+            #[serde(rename = "type")]
+            _policy_type: Option<String>,
             #[serde(default)]
             spec: Option<serde_json::Value>,
             #[serde(default)]
@@ -504,5 +515,51 @@ mod tests {
     fn missing_spec_and_file_fails() {
         let err = OpenApiValidationPolicy::from_config(serde_json::json!({})).unwrap_err();
         assert!(err.to_string().contains("requires"));
+    }
+
+    #[test]
+    fn from_config_tolerates_type_discriminator() {
+        // Real configs always carry `type: openapi_validation` in the
+        // same JSON object `compile_policy` hands to `from_config`
+        // (see `compile_origin_policy_chain` in sbproxy-core). The
+        // discriminator must not trip `deny_unknown_fields`.
+        let policy = OpenApiValidationPolicy::from_config(serde_json::json!({
+            "type": "openapi_validation",
+            "spec": small_spec(),
+        }))
+        .unwrap();
+        assert_eq!(policy.operation_count(), 1);
+    }
+
+    #[test]
+    fn from_config_spec_file_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spec.json");
+        std::fs::write(&path, small_spec().to_string()).unwrap();
+        let policy = OpenApiValidationPolicy::from_config(serde_json::json!({
+            "type": "openapi_validation",
+            "spec_file": path.to_str().unwrap(),
+        }))
+        .unwrap();
+        assert_eq!(policy.operation_count(), 1);
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_field() {
+        // WOR-2542: `spec_url` was documented in this module's doc
+        // comment but never implemented, so an operator who set it got
+        // silent no-op, not an error. `deny_unknown_fields` turns any
+        // stale or misspelled key (spec_url included) into a config-load
+        // failure instead.
+        let err = OpenApiValidationPolicy::from_config(serde_json::json!({
+            "type": "openapi_validation",
+            "spec": small_spec(),
+            "spec_url": "https://example.com/openapi.json",
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("spec_url"),
+            "expected the error to name the unknown field, got: {err}"
+        );
     }
 }

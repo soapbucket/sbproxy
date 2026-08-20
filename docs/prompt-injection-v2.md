@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![Two requests carrying injection-style instructions: one tagged, one blocked](assets/prompt-injection-v2.gif)
 
@@ -22,6 +22,15 @@ behavior as the default detector while exposing a richer interface:
 - Score in `[0.0, 1.0]` plus a label (`Clean`, `Suspicious`,
   `Injection`).
 - Three actions: `tag` (default), `block`, `log`.
+- An optional `enforcement` key in the shared vocabulary
+  (`block` / `observe`), overriding the block-versus-admit half of
+  `action` without touching its side-effect flavor. `enforcement:
+  observe` is the whole-policy rollout switch: a `block` action
+  downgrades to `log`, `tag` keeps tagging, and the agent-boundary
+  depth escalation observes too, which no combination of the other
+  keys can say in one place. `enforcement: block` flips the same
+  policy to enforcing. An explicit `a2a.root_action: log` survives
+  `enforcement: block`.
 - Pluggable detector slot. Configs reference detectors by name; the
   inventory registry rejects unknown names at compile time.
 
@@ -490,6 +499,24 @@ unscanned, because the policy reads only the URI and headers by default.
 
 Detection runs in two places and they do not behave the same way.
 
+```mermaid
+flowchart TD
+    A[Request arrives] --> B["request_filter: scan URI + non-auth headers"]
+    B -->|clean| C{enable_body_aware?}
+    B -->|hit, action tag| D[Stamp score/label headers]
+    D --> C
+    B -->|hit, action log| E[Structured warn, forward]
+    E --> C
+    B -->|hit, action block| F["403: block_body wrapped as {error: block_body}\nContent-Type fixed at application/json"]
+    C -->|false| G[Forward to upstream, body unscanned]
+    C -->|true| H["request_body_filter: scan buffered body"]
+    H -->|clean| G
+    H -->|hit, action block| I["403: block_body served verbatim\nContent-Type = block_content_type"]
+    H -->|hit, action log| E
+    H -->|hit, action tag, ai_proxy only| J[Stamp headers before provider dispatch]
+    J --> G
+```
+
 The request-filter scan reads the URI and the non-auth headers, before the
 upstream request is built. A hit there can stamp the score and label headers,
 so `action: tag` works.
@@ -504,10 +531,27 @@ compile_config refuses `action: tag` together with `enable_body_aware`.
 If a future path skipped the compiler, the body-phase arm logs an error
 rather than looking like `log`.
 
+The two `block` cells below also differ in what the caller receives, not
+just in when they fire. The body phase (and the `ai_proxy` and A2A dispatch
+paths, which are body-phase scans by construction) serve `block_body`
+verbatim as the response body with `block_content_type` as the
+`Content-Type`. The URI + header phase does not: a hit there returns a
+generic policy denial that the dispatcher renders through the same
+catch-all JSON path every other synchronous policy without a dedicated
+response branch uses. That path wraps `block_body`'s text inside a fixed
+`{"error": "<block_body>"}` envelope and always answers with
+`Content-Type: application/json`, regardless of `block_content_type`. An
+operator relying on `block_content_type` for a non-JSON body (or on
+`block_body` being returned as raw bytes rather than re-embedded as a JSON
+string) gets that behavior only when the hit is body-borne; a hit caught in
+the URI or a header, including the query-parameter and custom-header
+patterns in the next section, always comes back as the generic JSON
+envelope.
+
 | Action | URI + header phase | Body phase (`enable_body_aware: true`) |
 |--------|--------------------|----------------------------------------|
 | `tag` | Stamps the score and label headers on the upstream request | Refused at config compile on non-`ai_proxy` origins; unreachable arm logs an error |
-| `block` | Rejects with `403` before the upstream is contacted | Rejects with `403`; the buffered body never reaches the upstream |
+| `block` | Rejects with `403`; body is `{"error": "<block_body>"}`, `Content-Type` fixed at `application/json`, `block_content_type` ignored | Rejects with `403`; body is `block_body` verbatim, `Content-Type` is `block_content_type` |
 | `log` | Structured warn, request forwarded | Structured warn, request forwarded |
 
 The body scan buffers at most 8 MiB of request body. A body past that cap is

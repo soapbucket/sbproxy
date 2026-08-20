@@ -326,8 +326,8 @@ pub struct BridgeContext {
     /// re-touching the request.
     pub stream: bool,
     /// Wire-level facts the format wants to preserve across the round
-    /// trip. Each format namespaces its own keys (`"responses.previous_id"`,
-    /// `"anthropic.system_blocks"`).
+    /// trip. Each format namespaces its own keys (for example
+    /// `"anthropic.open_block_indexes"`).
     pub extras: BTreeMap<String, Value>,
 }
 

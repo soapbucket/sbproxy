@@ -1,6 +1,6 @@
 # External AI guardrails
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 External guardrails let an AI route ask a moderation or policy service before SBproxy sends a request upstream, after it receives a non-streaming response, or in logging-only mode. The adapter receives the selected model and the inspected phase. SBproxy records bounded labels for provider, phase, and outcome. It does not put prompt text, headers, or credentials into those labels.
 
@@ -136,3 +136,10 @@ Use the provider's own documentation for account setup and policy semantics: [La
 If the route fails to load, check the selected provider's required fields and make sure environment or secret references resolved before compile time. A private endpoint needs `allow_private_url: true`; setting it does not permit non-HTTP URLs. A 400 with `guardrail_violation` means the adapter returned a block result or an enforcing adapter failed under `failure_posture: closed`. For a temporary availability investigation, set `failure_posture: degraded` only after deciding that requests may pass without the external check; it admits like `open` while recording that the content was never scanned. Logs identify the guardrail name, provider, phase, latency, categories, and outcome without including inspected content or credential values.
 
 The checked schema is [ai-external-guardrail.schema.json](../schemas/ai-external-guardrail.schema.json). Regenerate it with `cargo run -p sbproxy-ai --bin generate-ai-external-guardrail-schema` when the Rust configuration type changes.
+
+## See also
+
+- [ai-gateway.md#guardrails](ai-gateway.md#guardrails) - the built-in `guardrails.input` / `guardrails.output` pipeline (PII, injection, jailbreak, toxicity, content safety, schema, and more) that this page's adapters sit alongside.
+- [ai-guardrail-mesh.md](ai-guardrail-mesh.md) - fusing multiple built-in security verdicts under a quorum instead of blocking on the first flag.
+- [prompt-injection-v2.md](prompt-injection-v2.md) - a standalone, swappable-detector prompt-injection policy usable on any origin, not only `ai_proxy`.
+- [security.md](security.md) - where this page fits in the wider security surface.

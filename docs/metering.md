@@ -1,6 +1,6 @@
 # Attested metering
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-19*
 
 ![A metered request cuts a signed receipt, the chain verifies, one tampered entry on disk breaks it, and the verifier names the broken sequence number](assets/metering-verify.gif)
 
@@ -269,6 +269,21 @@ head -1 /tmp/sbproxy-metering/receipts.ndjson | jq .
 ```
 
 The envelope is the chain link: `seq` is the entry's position, `prev_hash` is the previous entry's digest (all zeros for the first), `entry_hash` is the SHA-256 binding this entry to everything before it, and `signature` is the Ed25519 signature over that digest. The `event` inside is the receipt itself: the subject the units are charged to, the route, the outcome, the units with their provenance and raw evidence, the agreement they bill under, and `config_revision`, the content hash of the configuration that priced the call. That last field answers "you priced my call under a config I never agreed to".
+
+```mermaid
+flowchart TD
+    G["Genesis\nprev_hash = all zeros"] --> E0["Entry 0\nentry_hash = SHA-256(prev_hash, seq, ts, event)\nsignature = Ed25519(entry_hash)"]
+    E0 --> E1["Entry 1\nprev_hash = entry 0's entry_hash"]
+    E1 --> E2["Entry 2\nprev_hash = entry 1's entry_hash"]
+    E2 -.->|"edit one byte in entry 1"| TAMPER["entry 1's entry_hash no longer matches\nwhat entry 2's prev_hash recorded"]
+    TAMPER --> BROKEN["POST /api/meter/verify\nreports broken_seq at the first mismatch"]
+```
+
+One edited byte anywhere in the history breaks the link at that exact
+position, forward from the edit. Re-signing the tampered entry does not
+help: the signature has to verify against the operator's published key,
+which the attacker does not hold. See [The verify demo](#the-verify-demo)
+below for this exact scenario run end to end.
 
 ### The operator surface
 

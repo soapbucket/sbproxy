@@ -1,5 +1,5 @@
 # Cache Reserve
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
@@ -51,6 +51,23 @@ The pipeline ignores unknown backend types with a warning.
 The filter runs before any reserve I/O happens so a misconfigured admission window doesn't show up as a reserve write spike.
 
 ## Request flow
+
+```mermaid
+flowchart TD
+    REQ[Incoming request] --> HOT{Hot cache lookup}
+    HOT -->|hit| SERVE["Serve HIT,\nno reserve I/O"]
+    HOT -->|miss| RES{Reserve lookup}
+    RES -->|hit| PROMOTE["Serve HIT-RESERVE,\npromote entry into hot tier"]
+    RES -->|miss| ORIGIN[Fetch from origin]
+    ORIGIN --> CACHEABLE{Cacheable response?}
+    CACHEABLE -->|yes| WRITEHOT[Write into hot tier]
+    CACHEABLE -->|no| DONE[Return response]
+    WRITEHOT --> FILTER{"Admission filter:\nsample_rate, min_ttl,\nmax_size_bytes"}
+    FILTER -->|passes| WRITERESERVE[Mirror into reserve]
+    FILTER -->|skipped| DONE
+    WRITERESERVE --> DONE
+    EVICT["Hot-tier TTL expiry\n(outside any SWR window)"] -->|mirror before delete| WRITERESERVE
+```
 
 1. Hot cache lookup runs first.
 2. On a hot miss, the proxy consults the reserve. A reserve hit replays the body to the client with `x-sbproxy-cache: HIT-RESERVE` and promotes the entry back into the hot tier so subsequent reads stay hot.

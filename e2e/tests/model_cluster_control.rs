@@ -44,20 +44,34 @@ struct NodeSpec {
     keystore: PathBuf,
 }
 
-fn reserve_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve TCP port")
-        .local_addr()
-        .expect("reserved TCP address")
-        .port()
+/// A picked port whose socket stays bound until just before the node
+/// that will re-bind it is spawned. Dropping the reservation at the
+/// last moment shrinks the WOR-2295 window in which a concurrently
+/// starting process can be handed the same number while this test is
+/// still provisioning identities and validating configs.
+struct PortLease {
+    _tcp: Option<TcpListener>,
+    _udp: Option<UdpSocket>,
 }
 
-fn reserve_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .expect("reserve UDP port")
-        .local_addr()
-        .expect("reserved UDP address")
-        .port()
+fn reserve_tcp_port(leases: &mut Vec<PortLease>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+    let port = listener.local_addr().expect("reserved TCP address").port();
+    leases.push(PortLease {
+        _tcp: Some(listener),
+        _udp: None,
+    });
+    port
+}
+
+fn reserve_udp_port(leases: &mut Vec<PortLease>) -> u16 {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("reserve UDP port");
+    let port = socket.local_addr().expect("reserved UDP address").port();
+    leases.push(PortLease {
+        _tcp: None,
+        _udp: Some(socket),
+    });
+    port
 }
 
 fn provision_test_identities(nodes: &[NodeSpec]) -> Result<()> {
@@ -155,16 +169,18 @@ fn node_spec(
     node_id: &'static str,
     role: &'static str,
     zone: &'static str,
+    leases: &mut BTreeMap<&'static str, Vec<PortLease>>,
 ) -> NodeSpec {
     let identity = root.join(node_id);
     let state_dir = identity.join("state");
+    let node_leases = leases.entry(node_id).or_default();
     NodeSpec {
         node_id,
         role,
         zone,
-        gossip_port: reserve_udp_port(),
-        transport_port: reserve_tcp_port(),
-        admin_port: reserve_tcp_port(),
+        gossip_port: reserve_udp_port(node_leases),
+        transport_port: reserve_tcp_port(node_leases),
+        admin_port: reserve_tcp_port(node_leases),
         certificate: state_dir.join("node.pem"),
         private_key: state_dir.join("node-key.pem"),
         state_dir,
@@ -693,11 +709,36 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     let root = tempfile::tempdir().context("create cluster fixture")?;
     let catalog_path = write_model_fixture(root.path())?;
     let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
+    let mut node_leases: BTreeMap<&'static str, Vec<PortLease>> = BTreeMap::new();
     let nodes = vec![
-        node_spec(root.path(), "authority-a", "authority", "control"),
-        node_spec(root.path(), "gateway-a", "gateway", "edge"),
-        node_spec(root.path(), "worker-a", "worker", "zone-a"),
-        node_spec(root.path(), "worker-b", "worker", "zone-b"),
+        node_spec(
+            root.path(),
+            "authority-a",
+            "authority",
+            "control",
+            &mut node_leases,
+        ),
+        node_spec(
+            root.path(),
+            "gateway-a",
+            "gateway",
+            "edge",
+            &mut node_leases,
+        ),
+        node_spec(
+            root.path(),
+            "worker-a",
+            "worker",
+            "zone-a",
+            &mut node_leases,
+        ),
+        node_spec(
+            root.path(),
+            "worker-b",
+            "worker",
+            "zone-b",
+            &mut node_leases,
+        ),
     ];
     provision_test_identities(&nodes)?;
     let authority_gossip_port = nodes[0].gossip_port;
@@ -724,6 +765,10 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
 
     let mut processes = BTreeMap::new();
     for (node, config) in nodes.iter().zip(&configs) {
+        // Release this node's port reservations only now, so the
+        // WOR-2295 window is the spawn itself rather than the identity
+        // provisioning and config validation above.
+        drop(node_leases.remove(node.node_id));
         processes.insert(
             node.node_id,
             start_node(config).with_context(|| format!("start {}", node.node_id))?,
@@ -930,7 +975,11 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
 
     // Rejoin with a signed but unreachable gossip advertisement. Peers retain
     // the same enrolled identity yet must call out the partitioned node.
-    let bad_gossip_port = reserve_udp_port();
+    // The lease stays held on purpose: nothing may answer on this port,
+    // and keeping our own silent socket bound guarantees no concurrent
+    // test's process is handed the same number.
+    let mut bad_gossip_lease = Vec::new();
+    let bad_gossip_port = reserve_udp_port(&mut bad_gossip_lease);
     let partitioned_config = node_config(
         &nodes[failed_index],
         authority_gossip_port,

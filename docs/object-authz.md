@@ -1,5 +1,5 @@
 # object_authz policy
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The `object_authz` policy enforces object- and function-level authorization at the gateway, catching the two top OWASP API risks: BOLA (API1:2023, Broken Object Level Authorization) and BFLA (API5:2023, Broken Function Level Authorization). Alias: `bola`.
 
@@ -48,6 +48,32 @@ origins:
           window_secs: 60
           max_distinct: 100
 ```
+
+### Path template syntax
+
+`object_rules[].path` and `function_rules[].path` share one template
+syntax. A segment is one of three kinds: `{name}` captures that
+segment under `name` (an `owner_param` or `object_param` must name one
+of these), a bare `*` matches exactly one segment without capturing
+it, and a trailing `**` as the last segment matches the rest of the
+path regardless of length. `**` is only valid last; declaring it
+mid-path is a config-compile error. A template with no `**` requires
+an exact segment-count match, so `/tenants/{owner}/orders/{order_id}`
+never matches `/tenants/{owner}/orders/{order_id}/items/{item_id}`.
+
+```yaml
+object_rules:
+  - path: /tenants/{owner}/*/orders/{order_id}
+    owner_param: owner
+    object_param: order_id
+  - path: /tenants/{owner}/**
+    owner_param: owner
+```
+
+The first rule ignores whichever segment sits between the tenant and
+`orders` without capturing it; the second matches every path under a
+tenant, which is the shape for a catch-all ownership rule on an origin
+that otherwise has no per-object id to gate.
 
 ### Owner source
 

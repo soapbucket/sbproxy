@@ -1,11 +1,13 @@
 # agent_budget policy
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![70 rapid requests from a Cursor user agent: 200s until the per-agent budget trips and the rest return 429](assets/agent-budget.gif)
 
 The budget keys on the resolved agent_id, not the client IP ([config](../examples/agent-budget/)).
 
 The `agent_budget` policy is a semantic rate-limit primitive keyed on the resolved `agent_id`. Standard per-IP / per-user / per-key limits assume humans pause between requests; agents driven by an LLM loop fire at network speed and trip those buckets immediately. Datadog reports roughly a third of LLM-span errors in production are rate-limit denials for exactly that reason.
+
+This is a rate cap, not a cost cap: it tracks requests and tokens per minute/hour against one agent's identity, not dollars against a workspace. For a dollar-denominated spend cap with graceful degradation, see [ai-predictive-budget.md](ai-predictive-budget.md).
 
 One bucket per named agent collapses "every request from the Cursor instance" or "every request from the same OpenAI Assistant" into a single budget that an operator can actually size. The `agent_id` comes from the agent-class resolver (`sbproxy-agent-detect` / `sbproxy-classifiers`); when no `agent_id` resolved, the policy applies the `on_anonymous` rule.
 
@@ -219,4 +221,5 @@ A standard rate-limit policy keyed on IP or API key cannot distinguish "Cursor m
 * [features.md](./features.md) - tour with policy examples.
 * [examples/agent-budget/](../examples/agent-budget/) - runnable per-agent rate-limit fixture.
 * [ai-gateway.md](./ai-gateway.md) - the AI surfaces the budget protects.
+* [ai-predictive-budget.md](./ai-predictive-budget.md) - the dollar-denominated cost cap this rate cap complements.
 * [configuration.md](./configuration.md) - the full schema.

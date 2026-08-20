@@ -1180,6 +1180,165 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
         );
 }
 
+// --- hmac_auth dispatch tests (WOR-2518) ---
+//
+// These pin the `Auth::Hmac(_)` arm of `check_auth`: the seam between
+// the provider's verdict and the AuthResult / principal / challenge
+// the request phase acts on.
+
+fn build_hmac_auth_provider(key_id: &str, secret_hex: &str) -> sbproxy_modules::Auth {
+    let provider = sbproxy_modules::auth::HmacAuth::from_config(serde_json::json!({
+        "keys": [
+            {"key_id": key_id, "secret": secret_hex, "project": "billing"}
+        ]
+    }))
+    .expect("hmac provider builds");
+    sbproxy_modules::Auth::Hmac(provider)
+}
+
+/// Sign `GET <target_uri>` with a fresh `created` timestamp (the
+/// provider enforces a staleness window, so the fixed epoch the
+/// bot_auth helper uses would be refused here).
+fn hmac_sign_for_path(secret_hex: &str, key_id: &str, target_uri: &str) -> (String, String) {
+    use base64::Engine;
+    use hmac::{KeyInit, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = hmac::Hmac<Sha256>;
+
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let raw_input = format!(
+        "sig1=(\"@method\" \"@target-uri\");created={created};keyid=\"{key_id}\";alg=\"hmac-sha256\""
+    );
+    let entry = sbproxy_middleware::signatures::parse_signature_input(&raw_input)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+    let req_for_signing = http::Request::builder()
+        .method("GET")
+        .uri(target_uri)
+        .body(bytes::Bytes::new())
+        .unwrap();
+    let base =
+        sbproxy_middleware::signatures::build_signature_base(&req_for_signing, &entry).unwrap();
+    let key_bytes = hex::decode(secret_hex).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&key_bytes).unwrap();
+    mac.update(base.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig);
+    (raw_input, format!("sig1=:{}:", sig_b64))
+}
+
+#[tokio::test]
+async fn hmac_auth_accepts_valid_signature_and_binds_attribution() {
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let (sig_input, sig_value) = hmac_sign_for_path(secret_hex, key_id, "/api/invoices");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+
+    let (result, principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/invoices",
+        test_tenant(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, AuthResult::Allow { sub: Some(ref sub), .. } if sub == key_id),
+        "expected Allow bound to the key id; got {}",
+        auth_result_label(&result)
+    );
+    let principal = principal.expect("hmac allow returns principal");
+    assert_eq!(principal.sub, key_id);
+    assert_eq!(principal.source, sbproxy_plugin::PrincipalSource::Hmac);
+    assert_eq!(principal.attrs.project.as_deref(), Some("billing"));
+    assert_eq!(principal.attrs.key_id.as_deref(), Some(key_id));
+}
+
+#[tokio::test]
+async fn hmac_auth_rejects_signature_bound_to_different_path() {
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let (sig_input, sig_value) = hmac_sign_for_path(secret_hex, key_id, "/api/invoices");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+
+    let (result, principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/admin",
+        test_tenant(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, AuthResult::DenyWithHeaders(401, _, _)),
+        "a signature bound to another path must be refused; got {}",
+        auth_result_label(&result)
+    );
+    assert!(principal.is_none());
+}
+
+#[tokio::test]
+async fn hmac_auth_missing_signature_gets_challenge_without_credential_material() {
+    let auth = build_hmac_auth_provider("svc-billing", "00112233445566778899aabbccddeeff");
+    let headers = http::HeaderMap::new();
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    match result {
+        AuthResult::DenyWithHeaders(401, ref msg, ref extra) => {
+            assert_eq!(msg, "hmac_auth: signature required");
+            assert_eq!(
+                extra,
+                &vec![("WWW-Authenticate".to_string(), "Signature".to_string())],
+                "the challenge names the scheme and carries no key material"
+            );
+        }
+        other => panic!(
+            "expected DenyWithHeaders challenge, got {}",
+            auth_result_label(&other)
+        ),
+    }
+    assert!(principal.is_none());
+}
+
+#[tokio::test]
+async fn hmac_auth_unknown_key_id_is_refused_generically() {
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let auth = build_hmac_auth_provider("svc-billing", secret_hex);
+    // Signed correctly, but under a key id the provider does not know.
+    let (sig_input, sig_value) = hmac_sign_for_path(secret_hex, "svc-unknown", "/");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::DenyWithHeaders(401, ref msg, _) if msg == "hmac_auth: verification failed"),
+        "unknown key ids get the generic refusal; got {}",
+        auth_result_label(&result)
+    );
+    assert!(principal.is_none());
+}
+
 // --- Auth plugin dispatch tests ---
 //
 // These guard the OSS gap fixed in this commit: the
@@ -1377,6 +1536,252 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
             auth_result_label(&other)
         ),
     }
+}
+
+// --- WOR-2517: auth composition (OR semantics) ---
+//
+// A list-form `authentication:` compiles to `Auth::AnyOf`. Providers
+// run in declared order; the first success wins and binds its own
+// principal. Exhaustion returns the first provider's denial with every
+// provider's `WWW-Authenticate` challenge merged onto it (RFC 7235
+// permits multiple challenges on one response).
+
+/// Two-provider composition used by the tests below: an API key and a
+/// bearer token, the credential-migration shape the feature exists for.
+fn composed_api_key_or_bearer() -> sbproxy_modules::Auth {
+    sbproxy_modules::compile::compile_auth(&serde_json::json!([
+        {"type": "api_key", "api_keys": ["composed-key"], "header_name": "X-Api-Key"},
+        {"type": "bearer", "tokens": ["composed-token"]},
+    ]))
+    .expect("two-provider auth list must compile")
+}
+
+#[tokio::test]
+async fn any_of_accepts_first_provider_credential() {
+    let auth = composed_api_key_or_bearer();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-api-key", "composed-key".parse().unwrap());
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::Allow { .. }),
+        "the first provider's credential must be accepted; got {}",
+        auth_result_label(&result)
+    );
+    assert!(
+        principal.is_some(),
+        "the winning provider must bind its principal"
+    );
+}
+
+#[tokio::test]
+async fn any_of_accepts_second_provider_credential() {
+    let auth = composed_api_key_or_bearer();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("authorization", "Bearer composed-token".parse().unwrap());
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::Allow { .. }),
+        "the second provider's credential must be accepted; got {}",
+        auth_result_label(&result)
+    );
+    assert!(
+        principal.is_some(),
+        "the winning provider must bind its principal"
+    );
+}
+
+#[tokio::test]
+async fn any_of_all_fail_returns_first_denial_with_merged_challenges() {
+    // api_key denies with a bare 401; digest contributes a
+    // `WWW-Authenticate: Digest ...` challenge. Exhaustion keeps the
+    // first provider's status and message and carries the challenge.
+    let auth = sbproxy_modules::compile::compile_auth(&serde_json::json!([
+        {"type": "api_key", "api_keys": ["composed-key"], "header_name": "X-Api-Key"},
+        {"type": "digest", "realm": "Restricted", "users": [{"username": "u", "password": "p"}]},
+    ]))
+    .expect("api_key + digest list must compile");
+    let headers = http::HeaderMap::new();
+
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(principal.is_none(), "exhaustion must bind no principal");
+    match result {
+        AuthResult::DenyWithHeaders(status, msg, hdrs) => {
+            assert_eq!(status, 401, "first provider's status must win");
+            assert_eq!(msg, "unauthorized", "first provider's message must win");
+            let challenges: Vec<&str> = hdrs
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(
+                challenges.len(),
+                1,
+                "exactly the digest challenge must be merged; got {challenges:?}"
+            );
+            assert!(
+                challenges[0].starts_with("Digest "),
+                "digest's challenge must survive the merge; got {:?}",
+                challenges[0]
+            );
+        }
+        other => panic!(
+            "expected DenyWithHeaders on exhaustion; got {}",
+            auth_result_label(&other)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn any_of_merges_challenges_in_declared_order_and_keeps_first_status() {
+    // Plugin stubs give exact control over both denials: the first
+    // provider's 401 + Bearer challenge must win the status line, and
+    // the second provider's License challenge must be appended after it.
+    let first = StubAuthProvider {
+        type_name: "stub-bearer-guard",
+        decision: AuthDecision::DenyWithHeaders {
+            status: 401,
+            message: "missing token".to_string(),
+            headers: vec![(
+                "WWW-Authenticate".to_string(),
+                "Bearer realm=\"api\"".to_string(),
+            )],
+            kind: AuthDenialKind::Challenge,
+        },
+        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let second = StubAuthProvider {
+        type_name: "stub-license-guard",
+        decision: AuthDecision::DenyWithHeaders {
+            status: 403,
+            message: "license required".to_string(),
+            headers: vec![("WWW-Authenticate".to_string(), "License".to_string())],
+            kind: AuthDenialKind::Challenge,
+        },
+        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let auth = sbproxy_modules::Auth::AnyOf(vec![
+        sbproxy_modules::Auth::Plugin(Box::new(first)),
+        sbproxy_modules::Auth::Plugin(Box::new(second)),
+    ]);
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    match result {
+        AuthResult::DenyWithHeaders(status, msg, hdrs) => {
+            assert_eq!(status, 401, "first provider's status must win");
+            assert_eq!(msg, "missing token");
+            let challenges: Vec<&str> = hdrs
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(
+                challenges,
+                vec!["Bearer realm=\"api\"", "License"],
+                "challenges must merge in declared order"
+            );
+        }
+        other => panic!(
+            "expected DenyWithHeaders on exhaustion; got {}",
+            auth_result_label(&other)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn any_of_offered_invalid_credential_is_suspicious() {
+    // A wrong bearer token offered to slot 2 is an invalid proof even
+    // though slot 1 saw no credential at all: the aggregate trust
+    // outcome takes the most suspicious slot.
+    let auth = composed_api_key_or_bearer();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("authorization", "Bearer not-the-token".parse().unwrap());
+
+    let (_result, _principal, outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+    assert!(
+        matches!(outcome, AuthTrustOutcome::InvalidProof),
+        "an offered-and-rejected credential in any slot must aggregate to InvalidProof"
+    );
+}
+
+#[tokio::test]
+async fn any_of_attribution_names_the_winner() {
+    // The decision record and audit event must name the provider that
+    // authenticated the request, not the composite. A bearer credential
+    // against [api_key, bearer] decides as "bearer".
+    let auth = composed_api_key_or_bearer();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("authorization", "Bearer composed-token".parse().unwrap());
+
+    let (result, principal, _outcome, decided) =
+        super::check_auth_decided(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+    assert!(matches!(result, AuthResult::Allow { .. }));
+    assert_eq!(decided, "bearer", "attribution must name the winning slot");
+    let principal = principal.expect("the winner must bind a principal");
+    assert!(
+        matches!(principal.source, sbproxy_plugin::PrincipalSource::Bearer),
+        "the bound principal must come from the winning provider; got {:?}",
+        principal.source
+    );
+}
+
+#[tokio::test]
+async fn any_of_exhaustion_attribution_names_the_composite() {
+    let auth = composed_api_key_or_bearer();
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, _outcome, decided) =
+        super::check_auth_decided(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+    assert!(
+        !matches!(result, AuthResult::Allow { .. }),
+        "no credential must not authenticate"
+    );
+    assert_eq!(
+        decided, "any_of",
+        "exhaustion belongs to no single provider, so the composite is named"
+    );
+}
+
+#[tokio::test]
+async fn scalar_auth_decided_label_matches_its_type() {
+    // The decided-aware entry point must not change single-provider
+    // attribution: a scalar api_key decides as "api_key".
+    let auth = sbproxy_modules::compile::compile_auth(&serde_json::json!({
+        "type": "api_key", "api_keys": ["solo-key"], "header_name": "X-Api-Key"
+    }))
+    .expect("scalar api_key must compile");
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-api-key", "solo-key".parse().unwrap());
+
+    let (result, _principal, _outcome, decided) =
+        super::check_auth_decided(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+    assert!(matches!(result, AuthResult::Allow { .. }));
+    assert_eq!(decided, "api_key");
+}
+
+#[tokio::test]
+async fn any_of_no_credential_at_all_is_missing_not_suspicious() {
+    let auth = composed_api_key_or_bearer();
+    let headers = http::HeaderMap::new();
+
+    let (_result, _principal, outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+    assert!(
+        matches!(outcome, AuthTrustOutcome::Missing),
+        "no credential offered anywhere must stay a neutral Missing"
+    );
 }
 
 #[tokio::test]
@@ -5486,4 +5891,65 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
             "`{name}` is accepted at decode but did not change the key, so it partitions nothing"
         );
     }
+}
+
+// --- WOR-2519: ldap_auth dispatch mapping ---
+
+/// An unreachable directory maps to Deny(503), never an allow: the
+/// auth boundary fails closed on backend failure. The port comes from
+/// a listener that is bound and immediately dropped so nothing
+/// answers.
+#[tokio::test]
+async fn ldap_auth_unreachable_directory_denies_with_503() {
+    let port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let auth = Auth::Ldap(
+        sbproxy_modules::auth::ldap::LdapAuthProvider::from_config(serde_json::json!({
+            "type": "ldap_auth",
+            "url": format!("ldap://127.0.0.1:{port}"),
+            "base_dn": "ou=users,dc=example,dc=org",
+            "allow_insecure": true,
+            "timeout_secs": 2,
+        }))
+        .unwrap(),
+    );
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        // base64("alice:s3cret")
+        "Basic YWxpY2U6czNjcmV0".parse().unwrap(),
+    );
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::Deny(503, _)),
+        "directory unreachable must refuse with 503, got {result:?}"
+    );
+    assert!(principal.is_none());
+}
+
+/// Missing credentials deny with 401 without dialing the directory:
+/// the URL here points at a dropped listener, so any dial would have
+/// burned the 2s timeout and a failed connect, and the outcome would
+/// still have to be a refusal.
+#[tokio::test]
+async fn ldap_auth_missing_credentials_denies_with_401() {
+    let auth = Auth::Ldap(
+        sbproxy_modules::auth::ldap::LdapAuthProvider::from_config(serde_json::json!({
+            "type": "ldap_auth",
+            "url": "ldaps://directory.example.org:636",
+            "base_dn": "ou=users,dc=example,dc=org",
+        }))
+        .unwrap(),
+    );
+    let headers = http::HeaderMap::new();
+    let (result, principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(
+        matches!(result, AuthResult::Deny(401, _)),
+        "missing credentials must refuse with 401, got {result:?}"
+    );
+    assert!(principal.is_none());
 }

@@ -78,10 +78,14 @@ because the cardinality cost is high.
 
 The OSS structured-log sink is "stdout, JSON, one event per line".
 Production deployments pair that with whatever log shipper they
-already run (Fluent Bit, Vector, OTel Collector). Durable, indexed
-audit storage (Postgres, S3, hash-chained verification, the
-verifier CLI) ships with the commercial distribution; the OSS
-sink is the breadcrumb path your shipper picks up.
+already run (Fluent Bit, Vector, OTel Collector). SBproxy also ships
+its own durable, tamper-evident chain (hash-chained, Ed25519-signed,
+verified offline with `sbproxy audit verify`) across four opt-in
+channels, security, config, key, and admin-action audit; see
+[`docs/audit-log.md`](../../docs/audit-log.md) for the full design.
+The stdout sink documented on this page is the lighter-weight
+breadcrumb path your log shipper picks up; the two are independent
+and can run together.
 
 ## Mutating verbs to try
 

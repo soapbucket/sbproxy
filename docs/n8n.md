@@ -1,6 +1,6 @@
 # n8n with SBproxy
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-08-19*
 
 n8n workflows normally talk to model providers directly: you paste an OpenAI key into a credential and every AI Agent run calls `api.openai.com`. Point that credential at an SBproxy you run instead, and every workflow run crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. n8n is configured through its UI rather than code, so this page walks through the fields to fill in and the exact values to type, on both sides of the wire.
 
@@ -18,6 +18,7 @@ origins:
   "127.0.0.1":
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}
@@ -41,7 +42,7 @@ origins:
 
 Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs on another machine, key the origin with the hostname n8n will dial. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; never put a raw provider key in the file.
 
-Be precise about what the virtual key does. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `n8n` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. n8n never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: anyone who can reach the listener and guess a key could present it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+Be precise about what the virtual key does. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `n8n` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. n8n never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. `action.require_governed_key: true` is what makes any of this enforced rather than declarative: config compile now refuses an origin that declares `credentials:` without it, and with it set, a request presenting an unknown key or no key gets a 401 before any upstream call. The virtual key is still a static bearer secret with no rate limiting on guessing it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
 
 ### Verify the gateway side
 
@@ -104,9 +105,41 @@ origins:
 
 Bare hostnames under `federated_servers` are normalized to `https://<host>/mcp`; use a full URL for any other path. Tool names stay bare in the federated catalog by default; each upstream's `prefix` steps in only to disambiguate a clash, when two upstreams advertise the same tool name. An origin key carries one action, so to run chat completions and MCP behind the same gateway process, give each its own origin keyed by hostname.
 
+Both `federated_servers` entries above are placeholders. `orders.internal` and `weather.internal` do not resolve, so booting that config as written gives you an empty `tools/list`: the gateway degrades per server, dropping an unreachable upstream with a log line instead of failing the whole catalog. Substitute your own tool servers, or run the federation example below against an upstream that answers.
+
+### Run the MCP half without writing a tool server
+
+[`examples/mcp-federation/`](../examples/mcp-federation/) is the runnable version of this shape, and it ships its own upstream so nothing external has to resolve. Its `gh` entry is a `type: openapi` federated server: the gateway derives an MCP tool from an inline OpenAPI spec and dispatches the call as an ordinary REST request, so there is no MCP server code anywhere in the example. Its `db` entry is left unresolvable on purpose, so you can watch the per-server degradation described above happen right next to an upstream that works. It runs as two processes, the mock REST API and the gateway that federates it:
+
+```bash
+sbproxy serve -f examples/mcp-federation/upstream.yml &
+sbproxy serve -f examples/mcp-federation/sb.yml
+```
+
+The example's origin is keyed by hostname (`mcp.example.com`), so every request needs a matching `Host` header. List the real federated catalog:
+
+```console
+$ curl -s -X POST http://127.0.0.1:8080/ \
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2025-06-18' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | jq -r '.result.tools[].name'
+gh.search_repos
+```
+
+One tool, not two: the `db` upstream never answered. Calling the tool that did register dispatches a real HTTP request to the mock upstream and returns its response as MCP tool-result content:
+
+```
+[{"full_name":"soapbucket/sbproxy","name":"sbproxy","stars":4200},{"full_name":"soapbucket/docs","name":"docs","stars":12}]
+```
+
+To point n8n's MCP Client Tool node at this stack instead of your own servers, set its endpoint to `http://127.0.0.1:8080/` with a `Host: mcp.example.com` header (the node's Options let you add one) and look for `gh.search_repos` in Tools to Include.
+
 ### Verify the gateway side
 
-n8n's MCP client opens the session with `initialize`, then fetches the catalog with `tools/list`. Send both by hand first:
+Once you substitute real MCP servers for the `orders.internal` / `weather.internal` placeholders above, confirm the wiring the same way n8n's MCP client will: it opens the session with `initialize`, then fetches the catalog with `tools/list`. Send both by hand first:
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080/ \
@@ -134,7 +167,7 @@ n8n ships an MCP Client Tool node for AI Agent workflows (since n8n 1.88; use a 
 2. In the node's endpoint URL field, enter `http://127.0.0.1:8080/`. In current builds this field sits at the top of the node parameters next to the transport selector and is labeled Endpoint; older builds label it SSE Endpoint.
 3. Set the transport selector (labeled Server Transport) to HTTP Streamable.
 4. Leave Authentication set to None for the config above. The node also offers bearer and header credentials for when you put authentication in front of the origin.
-5. Leave Tools to Include on All. The agent now sees `get_order_status` and `get_weather` and calls them through the gateway, subject to whatever `tool_allowlist` guardrails, RBAC, and per-server timeouts the origin defines.
+5. Leave Tools to Include on All. The agent now sees `get_order_status` and `get_weather` (or `gh.search_repos` if you pointed the node at the `examples/mcp-federation` stack above) and calls them through the gateway, subject to whatever `tool_allowlist` guardrails, RBAC, and per-server timeouts the origin defines.
 
 The connection also works in the other direction: n8n's MCP Server Trigger node exposes the workflows you wire to it as an MCP server (the node's Path field and its production URL give you the endpoint), and you can federate that into the gateway as one more entry so every MCP client behind the gateway gets n8n's workflows as tools, with the `n8n` prefix stepping in if a workflow's tool name clashes with another upstream's:
 

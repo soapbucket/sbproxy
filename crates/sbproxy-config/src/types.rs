@@ -7587,6 +7587,12 @@ pub struct RawOriginConfig {
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
     /// Authentication block (also accepted under YAML alias `auth`).
+    /// Either a single provider mapping (`type: api_key`, ...) or a
+    /// list of two or more provider mappings tried in declared order
+    /// with OR semantics: the first provider that accepts the request
+    /// wins, and a request every provider rejects gets the first
+    /// provider's denial with every provider's challenge merged onto
+    /// it.
     #[serde(default, alias = "auth")]
     pub authentication: Option<serde_json::Value>,
     /// Policy entries (rate limit, WAF, IP filter, etc.) evaluated in order.

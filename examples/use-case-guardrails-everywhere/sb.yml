@@ -75,7 +75,7 @@ origins:
 
         # To have the gateway run the weights itself instead of
         # proxying to an engine you manage, swap the ollama entry for
-        # a serve: block once model-host GPU certification lands.
+        # a serve: block now that model-host GPU certification has landed.
         # docs/model-host.md carries the phased status; the config
         # below parses today but only starts an engine on a GPU host.
         #

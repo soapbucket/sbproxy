@@ -330,10 +330,24 @@ run_batch "read-only source and doc scans" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
   batch_secret_resolver_drift "secret-resolver drift (no new ad-hoc secret parsers)" \
-  batch_doc_drift "doc drift"
+  batch_doc_drift "doc drift" \
+  batch_conflict_markers "no committed merge-conflict markers"
 
 # Serial: regen-llms-full.sh --check rebuilds the corpus into a temp
 # file when the branch carries it, and this phase can record a skip.
+# A merge that commits its own conflict markers ships corrupted files;
+# one reached main's CHANGELOG on 2026-08-19 through a gate that never
+# looked. Scan every tracked text surface a merge can mangle. The
+# pattern is anchored and paired so scripts discussing markers (like
+# this one) do not self-trip. Read-only git grep, so it batches.
+batch_conflict_markers() {
+  if git grep -nE '^(<{7} |={7}$|>{7} )' -- ':!*.lock' ':!docs/llms-full.txt'; then
+    printf '\ncommitted merge-conflict markers found; resolve the merge for real.\n' >&2
+    return 1
+  fi
+  printf 'no conflict markers in tracked files\n'
+}
+
 # CI: docs-ci.yml, "llms-full.txt is current if carried". A branch may
 # carry the corpus, and the rule is that it has to be what the generator
 # produces rather than a hand edit. Nothing rejects the file any more:

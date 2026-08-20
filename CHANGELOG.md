@@ -10,7 +10,22 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
-<<<<<<< HEAD
+### Added
+
+- **`hmac_auth`: signed-request authentication.** A new auth provider
+  for machine callers that prove possession of a shared secret by
+  signing each request (RFC 9421 HTTP Message Signatures,
+  `hmac-sha256`) instead of sending a static credential. Config is a
+  `keys` list of `key_id` + `secret` pairs (secrets resolve through
+  the secret resolver) with optional per-credential metadata, a
+  `required_components` list defaulting to `["@method",
+  "@target-uri"]`, and a `clock_skew_seconds` window (default 300)
+  enforced against the mandatory `created` parameter as the replay
+  defense. Failures answer `401` with a `WWW-Authenticate: Signature`
+  challenge that never carries key material. See the `hmac_auth`
+  section of [docs/configuration.md](docs/configuration.md) and
+  [examples/auth-hmac/](examples/auth-hmac/).
+
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised
@@ -26,7 +41,7 @@ the next version cut.
   request and exit keep working: a child that dies after serving is
   respawned on the next call. See the stdio section of
   [docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md).
-=======
+
 ### Fixed
 
 - **The `websocket` action's `max_message_size` and `subprotocols` are
@@ -48,7 +63,6 @@ the next version cut.
   `502`. Routes with `request_modifiers` still validate at the
   post-modifier seam, since the modified request is the one the
   contract holds.
->>>>>>> origin/main
 
 ## [1.13.0] - 2026-08-18
 

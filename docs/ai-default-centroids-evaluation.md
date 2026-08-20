@@ -1,6 +1,13 @@
 # Default safety centroid evaluation
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-08-19*
+
+The `toxicity`, `jailbreak`, and `content_safety` guardrails ship a versioned,
+precomputed centroid per class so `mode: classifier` works without an
+operator supplying training examples. See
+[Safety guardrail modes](ai-gateway.md#safety-guardrail-modes) for how to
+configure those three guardrails; this page is the evaluation report for the
+shipped centroid artifact, not a configuration guide on its own.
 
 This report is generated from repo-authored, held-out fixtures. The training and evaluation prompts are disjoint. No external attack corpus is vendored or redistributed.
 
@@ -44,3 +51,9 @@ Safe-prompt false positives: 0/10. Abstentions: 7/20.
 |---|---:|---:|---:|
 | `safe` | 10 | 1.000 | 0.300 |
 | `toxic` | 10 | 1.000 | 1.000 |
+
+## See also
+
+- [ai-gateway.md#safety-guardrail-modes](ai-gateway.md#safety-guardrail-modes) - configuring `toxicity`, `jailbreak`, and `content_safety` in `keyword` or `classifier` mode.
+- [local-inference.md](local-inference.md#download-the-models) - downloading the pinned `all-MiniLM-L6-v2` model and tokenizer.
+- `scripts/regenerate-default-safety-centroids.sh` - regenerates the centroid artifact and this report; `--check` verifies freshness without writing.

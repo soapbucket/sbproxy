@@ -2278,17 +2278,25 @@ impl CompiledPipeline {
             // Compile auth (optional per origin). Route through the
             // registry-aware compile only when the `type:` names a loaded
             // bundle auth hook, so built-ins and linked plugins keep their
-            // exact existing path (WOR-2426).
+            // exact existing path (WOR-2426). A list-form block (WOR-2517)
+            // takes the registry-aware path when any entry names a bundle
+            // hook, for the same reason a scalar one does.
             let auth = match &origin.auth_config {
-                Some(cfg) => Some(
-                    if configured_type(cfg)
-                        .is_some_and(|name| extension_registry.auth(name).is_some())
-                    {
+                Some(cfg) => {
+                    let names_bundle_hook = |value: &serde_json::Value| {
+                        configured_type(value)
+                            .is_some_and(|name| extension_registry.auth(name).is_some())
+                    };
+                    let uses_bundle_hook = match cfg.as_array() {
+                        Some(entries) => entries.iter().any(names_bundle_hook),
+                        None => names_bundle_hook(cfg),
+                    };
+                    Some(if uses_bundle_hook {
                         compile_auth_with_registry(cfg, extension_registry.as_ref())?
                     } else {
                         compile_auth(cfg)?
-                    },
-                ),
+                    })
+                }
                 None => None,
             };
             auths.push(auth);
@@ -3168,6 +3176,40 @@ fn compile_origin_policy_chain(
                         sbproxy_modules::policy::WafPolicy::from_config(serde_json::json!({}))?,
                     );
                     *waf = taken.with_block_store(l2_store.clone(), origin_id);
+                }
+                Policy::AgentBudget(ab) => {
+                    // WOR-2540: same shared L2 store as RateLimit's tier
+                    // above, so `requests_per_minute` is decided by one
+                    // fixed-window counter per agent instead of once per
+                    // replica. `with_store`/`with_async_store` take the
+                    // same store types RateLimit's setters do and consume
+                    // an owned `AgentBudgetPolicy` by value, but WOR-506
+                    // wraps the compiled policy in `Arc` so the
+                    // request-path enforcer wrapper can share bucket
+                    // state without cloning the LRU caches, so the Arc
+                    // has to be unwrapped rather than the policy taken
+                    // directly.
+                    let taken = std::mem::replace(
+                        ab,
+                        Arc::new(sbproxy_modules::AgentBudgetPolicy::from_config(
+                            serde_json::json!({}),
+                        )?),
+                    );
+                    *ab = match Arc::try_unwrap(taken) {
+                        Ok(policy) => Arc::new(
+                            policy
+                                .with_store(l2_store.clone(), origin_id)
+                                .with_async_store(l2_async_store.clone(), origin_id),
+                        ),
+                        // The chain was just compiled by this function, so
+                        // nothing else can hold a second strong reference
+                        // to a policy still in it. Fall back to the
+                        // pre-attachment Arc rather than assuming that
+                        // invariant holds, so a violation degrades to
+                        // per-replica enforcement instead of losing the
+                        // compiled policy state.
+                        Err(shared) => shared,
+                    };
                 }
                 _ => {}
             }
@@ -5155,6 +5197,151 @@ origins:
             vec![serde_json::json!({"type": "nonexistent_policy"})],
         );
         assert!(CompiledPipeline::from_config(config).is_err());
+    }
+
+    // --- WOR-2540: agent_budget adopts the same L2 store `compile_origin_policy_chain` already attaches to RateLimit and Waf ---
+
+    fn compiled_agent_budget(chain: &[Policy]) -> &sbproxy_modules::AgentBudgetPolicy {
+        match chain.first() {
+            Some(Policy::AgentBudget(ab)) => ab.as_ref(),
+            other => panic!("expected a compiled AgentBudget policy, got {other:?}"),
+        }
+    }
+
+    /// Minimal `AsyncKVStore` fake, enough to prove attachment without a
+    /// real backend: every increment reports `1`, always inside any
+    /// configured cap.
+    struct AlwaysAdmitAsyncStore;
+
+    #[async_trait::async_trait]
+    impl sbproxy_platform::storage::AsyncKVStore for AlwaysAdmitAsyncStore {
+        async fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn put_with_ttl(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl_secs: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn incr_with_ttl(&self, _key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            Ok(1)
+        }
+        async fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn compile_origin_policy_chain_attaches_the_sync_store_to_agent_budget() {
+        // Before WOR-2540, `compile_origin_policy_chain` attached the
+        // shared L2 store to `Policy::RateLimit` and `Policy::Waf` but fell
+        // through the `_ => {}` catch-all for `Policy::AgentBudget`, even
+        // though `AgentBudgetPolicy::with_store`/`with_async_store` exist,
+        // are tested, and are documented as the cluster-shared path. This
+        // is the compile-time half of that seam: proves the store the
+        // pipeline holds actually reaches the policy. The enforcer-side
+        // half (a store on the policy produces a `shared_admission`
+        // handle) is already pinned by
+        // `agent_budget_with_a_store_produces_a_shared_admission_handle`
+        // in `builtin_enforcers::registry`.
+        let store: Arc<dyn sbproxy_platform::storage::KVStore> =
+            Arc::new(sbproxy_platform::storage::MemoryKVStore::new(0));
+        let registry = empty_extension_registry();
+        let chain = compile_origin_policy_chain(
+            &[serde_json::json!({
+                "type": "agent_budget",
+                "requests_per_minute": 2.0
+            })],
+            Some(store),
+            None,
+            "wor-2540-origin",
+            registry.as_ref(),
+        )
+        .expect("agent_budget policy compiles");
+
+        let ab = compiled_agent_budget(&chain);
+        assert!(
+            ab.has_shared_tier(),
+            "an agent_budget policy compiled with an L2 store configured must \
+             report a shared tier, the same way RateLimit's store attachment \
+             makes `converges_on_mesh`-style state observable"
+        );
+        let debug = format!("{ab:?}");
+        assert!(
+            debug.contains("store_attached: true"),
+            "sync store must be attached: {debug}"
+        );
+    }
+
+    #[test]
+    fn compile_origin_policy_chain_attaches_the_async_store_to_agent_budget() {
+        // `with_async_store` is a separate setter from `with_store`, and
+        // the pipeline attaches both together (mirroring the WOR-2084
+        // comment on the RateLimit arm above): the async handle is only
+        // ever derived from a configured sync `l2_store`, so both are
+        // `Some` here, the only combination `compile_pipeline` actually
+        // produces (see the `l2_async_store` derivation a few hundred
+        // lines up, which maps `config.l2_store` through
+        // `validated_redis_connection`).
+        let store: Arc<dyn sbproxy_platform::storage::KVStore> =
+            Arc::new(sbproxy_platform::storage::MemoryKVStore::new(0));
+        let async_store: Arc<dyn sbproxy_platform::storage::AsyncKVStore> =
+            Arc::new(AlwaysAdmitAsyncStore);
+        let registry = empty_extension_registry();
+        let chain = compile_origin_policy_chain(
+            &[serde_json::json!({
+                "type": "agent_budget",
+                "requests_per_minute": 2.0
+            })],
+            Some(store),
+            Some(async_store),
+            "wor-2540-origin",
+            registry.as_ref(),
+        )
+        .expect("agent_budget policy compiles");
+
+        let ab = compiled_agent_budget(&chain);
+        assert!(
+            ab.has_shared_tier(),
+            "an agent_budget policy compiled with an async L2 store configured \
+             must report a shared tier"
+        );
+        let debug = format!("{ab:?}");
+        assert!(
+            debug.contains("store_attached: true") && debug.contains("async_store_attached: true"),
+            "both the sync and async handles must be attached: {debug}"
+        );
+    }
+
+    #[test]
+    fn compile_origin_policy_chain_leaves_agent_budget_local_without_a_store() {
+        // The other half of the contract already pinned for RateLimit at
+        // the enforcer layer: an origin with no L2 store configured must
+        // not pay for the seam, and must keep the policy's local-only view.
+        let registry = empty_extension_registry();
+        let chain = compile_origin_policy_chain(
+            &[serde_json::json!({
+                "type": "agent_budget",
+                "requests_per_minute": 2.0
+            })],
+            None,
+            None,
+            "wor-2540-origin",
+            registry.as_ref(),
+        )
+        .expect("agent_budget policy compiles");
+
+        let ab = compiled_agent_budget(&chain);
+        assert!(
+            !ab.has_shared_tier(),
+            "no L2 store configured must leave agent_budget on its local bucket"
+        );
     }
 
     fn make_config_with_transforms(

@@ -67,7 +67,7 @@ origins:
       # Two vendors behind one origin. The requested model narrows the
       # provider set before any routing strategy runs, so the request's
       # `model` field picks the vendor and clients only ever see one URL.
-      # Any of the 66 providers slots in the same way.
+      # Any of the 72 providers slots in the same way.
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}

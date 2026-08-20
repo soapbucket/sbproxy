@@ -1,6 +1,6 @@
 # Kubernetes operator quickstart
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
@@ -19,7 +19,7 @@ Before you begin, make sure you have:
   cluster-scoped `sbproxies.sbproxy.dev` and `sbproxyconfigs.sbproxy.dev`
   CRDs.
 - Registry access from each node to pull
-  `ghcr.io/soapbucket/sbproxy:1.11.0`.
+  `ghcr.io/soapbucket/sbproxy:1.13.0`.
 - An operator image you have built and pushed yourself. There is not a
   published one; see "Build the operator image first" below.
 
@@ -41,7 +41,7 @@ That is the one piece of this quickstart you have to supply. Build the image fro
 ```bash
 # A registry your cluster nodes can pull from.
 export OPERATOR_REPO=registry.example.com/soapbucket/sbproxy-k8s-operator
-export OPERATOR_TAG=1.11.0
+export OPERATOR_TAG=1.13.0
 
 docker build -t "$OPERATOR_REPO:$OPERATOR_TAG" \
   -f crates/sbproxy-k8s-operator/Dockerfile.ci .
@@ -91,7 +91,7 @@ metadata:
   name: demo
   namespace: sbproxy-system
 spec:
-  image: ghcr.io/soapbucket/sbproxy:1.11.0
+  image: ghcr.io/soapbucket/sbproxy:1.13.0
   configRef: demo-config
   replicas: 1
   port: 8080

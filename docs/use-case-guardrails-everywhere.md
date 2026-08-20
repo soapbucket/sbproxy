@@ -1,6 +1,6 @@
 # Guardrails on every prompt, local or hosted
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![One guardrail mesh blocking an injection aimed at a local model and redacting PII bound for a hosted one](assets/use-case-guardrails-everywhere.gif)
 
@@ -83,7 +83,7 @@ Two lanes, one origin. Before any routing strategy runs, the proxy narrows the c
         redact_response: false
 ```
 
-This is the redactor the mesh borrows for redact-and-continue. `redact_request: false` matters here. Set it true and every request gets masked unconditionally, which is a fine policy but a different one. Left false, masking only happens when a guardrail flags the prompt first, so clean prompts pass through byte-identical.
+This is the redactor the mesh borrows for redact-and-continue. `redact_request: false` matters here. Set it true and every request gets masked unconditionally, which is a fine policy but a different one. Left false, masking only happens when a guardrail flags the prompt first, so clean prompts pass through byte-identical. `redact_response` has to stay `false`: no code path scrubs model output today, and the gateway refuses to boot with `redact_response: true` rather than let you believe replies are being redacted when they are not.
 
 ```yaml
       guardrails:
@@ -105,6 +105,24 @@ This is the redactor the mesh borrows for redact-and-continue. `redact_request: 
 Without the `mesh` block these three detectors would run serially and block on the first flag. The mesh runs all of them, counts the flags, and fuses: at `block_threshold: 2` a prompt is rejected only when two detectors agree, so one noisy pattern cannot hard-block traffic on its own. Below the quorum, `redact_on_flag` masks the prompt with the `pii` redactor above and forwards it. `cache: true` means a repeated prompt reuses its verdict, and the latency budget stops the cascade from launching expensive detectors once 50 ms are spent. The label set also feeds the `ai.guardrails.*` namespace of the [CEL policy plane](ai-policy-cel.md) if you want to route or audit on `flagged_count` instead of blocking.
 
 One caveat to carry: `detect_common` gives you the built-in substring pattern sets, which catch the OWASP LLM Top 10 2026 (LLM01) vocabulary but miss obfuscation, translation, and novel phrasings. This config uses them anyway because they boot with no model download. When you outgrow them, set the safety guardrail to explicit `mode: classifier`; [ai-safety-classifiers](../examples/ai-safety-classifiers/) shows the local enforcing configuration. [local-inference.md](local-inference.md) covers the shared ONNX embedding runtime, while [prompt-injection-v2.md](prompt-injection-v2.md) documents the separate scored prompt-injection detector interface.
+
+Here is the same logic as a flow. The cascade always runs cheapest-first (`pii`, then `injection` and `jailbreak`), so the quorum count is final before either lane is picked:
+
+```mermaid
+flowchart TD
+    REQ["Request arrives\nmodel: llama3.1 or gpt-4o-mini"] --> CASCADE["Guardrail cascade, cheap-first:\npii, then injection, jailbreak"]
+    CASCADE --> COUNT{"Security flags >= block_threshold (2)?"}
+    COUNT -->|yes| BLOCK["400 guardrail_violation\nrequest dies at the edge, no provider contacted"]
+    COUNT -->|"no, but flagged > 0"| REDACT["redact_on_flag:\nmask via the pii redactor,\nforward the masked body"]
+    COUNT -->|no flags| PASS["Forward unchanged"]
+    REDACT --> LANE{"model field"}
+    PASS --> LANE
+    LANE -->|llama3.1| LOCAL["Ollama, 127.0.0.1:11434\n(allow_private_base_url)"]
+    LANE -->|gpt-4o-mini| HOSTED["OpenAI"]
+    LOCAL --> LOG["access_log: one JSON line\n{status, provider, model}"]
+    HOSTED --> LOG
+    BLOCK --> LOG
+```
 
 ## Run it
 

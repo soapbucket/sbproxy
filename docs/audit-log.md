@@ -1,5 +1,5 @@
 # Audit log
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` / `sbproxy::admin::audit` tracing channels, the tamper-evident chains each of those four can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
 
@@ -208,6 +208,37 @@ actions. Losing the process loses the ring; it does not lose the
 chain.
 
 ### What the chain proves
+
+```mermaid
+flowchart TD
+    subgraph channels["Four independently opt-in channels"]
+        SEC["security_audit\n(audit.sink: chain + audit.path)"]
+        CFG["config_audit\n(audit.config_path)"]
+        KEY["key_audit\n(audit.key_path,\nfingerprinted before/after fields)"]
+        ADM["admin-console actions\n(audit.admin_path)"]
+    end
+
+    SEC --> F1["security-audit.jsonl"]
+    CFG --> F2["config-audit.jsonl"]
+    KEY --> F3["key-audit.jsonl"]
+    ADM --> F4["admin-audit.jsonl"]
+
+    subgraph record["Each record in any of the four files"]
+        direction LR
+        PREV["prev_hash"] --> DIGEST["digest =\nSHA-256(prev_hash || seq ||\nrecorded_at || event)"]
+        SEQ["seq (contiguous from 0)"] --> DIGEST
+        RA["recorded_at"] --> DIGEST
+        EV["event\n(channel-specific payload)"] --> DIGEST
+        DIGEST --> SIG["Ed25519 signature over the digest\n(signed by sign_with: proxy.web_bot_auth)"]
+    end
+
+    F1 -.-> record
+    F2 -.-> record
+    F3 -.-> record
+    F4 -.-> record
+
+    record -.->|"sbproxy audit verify <path>\n--channel {security,config,key,admin}"| VERIFY["re-derived from genesis,\nfirst broken record reported"]
+```
 
 Each record is `SHA-256(prev_hash || seq || recorded_at || event)` and
 carries an Ed25519 signature over that raw digest. Three consequences an

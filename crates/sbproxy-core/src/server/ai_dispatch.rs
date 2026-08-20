@@ -1235,9 +1235,7 @@ pub(super) async fn realtime_budget_gate(
         .flatten();
     let provider = config.providers.iter().find(|provider| {
         provider.enabled
-            && sbproxy_ai::api_routes::provider_supports_realtime(
-                provider.effective_provider_type(),
-            )
+            && sbproxy_ai::api_routes::provider_supports_realtime(provider)
             && sbproxy_ai::routing::provider_allowed_by_policy(
                 provider.name.as_str(),
                 allowed_providers,
@@ -2580,10 +2578,14 @@ fn any_allowed_provider_supports_surface(
     allowed: &[String],
     blocked: &[String],
 ) -> bool {
+    // WOR-2485: eligibility (allow/block policy) keys on the config
+    // entry NAME; capability keys on the effective provider TYPE. The
+    // matrix helper takes the whole config entry so the type keying
+    // holds by construction.
     providers.iter().any(|provider| {
         provider_allowed_for_request(provider, allowed, blocked)
             && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
-                &provider.name,
+                provider,
                 surface,
                 served_provider_modality(provider, surface),
             )
@@ -8877,6 +8879,43 @@ pub(super) async fn handle_ai_proxy(
                     )
                     .await;
                 }
+                // WOR-2541: `ai.failure` fired only behind the
+                // content-policy-fallback branch above, so an origin with
+                // that flag off got zero AI-failure observability from
+                // bundles, and a 5xx (including a timeout that surfaces as
+                // 504) could never reach the hook at all: the branch above
+                // only ever looks at `400..500`. Every status that reaches
+                // this point is the one the client is about to receive (the
+                // branch above always `continue`s or `return`s, so control
+                // only falls through here for a status it did not already
+                // handle), which is exactly the "terminal, about to be
+                // returned" moment the hook is meant to observe.
+                //
+                // Classification here is status-only (an empty body), not
+                // the body-refined classification the branch above uses:
+                // this path forwards the response byte-exact below (a
+                // streaming reqwest::Response is not read into memory), and
+                // reading the body just to classify it would force
+                // buffering a response that today is never buffered. A 5xx
+                // classifies exactly from status alone (`ServerError`, or
+                // `Timeout` for 504); a 4xx without a body degrades to the
+                // coarser `BadRequest` rather than a body-refined
+                // `ContentPolicy` / `ContextWindowExceeded`, which is the
+                // same coarsening `content_policy_fallback` already accepts
+                // when it is off.
+                if (400..600).contains(&status) {
+                    if let Some(extensions) = ai_extensions.as_mut() {
+                        let cause = sbproxy_ai::failure_cause::FailureCause::classify(status, "");
+                        extensions
+                            .failure(
+                                ai_failure_cause(cause),
+                                Some(status),
+                                Some(provider.name.as_str()),
+                                cause.as_str(),
+                            )
+                            .await;
+                    }
+                }
                 // WOR-1103: this provider's response is the one we keep.
                 // HTTP error statuses still count as provider-attempt
                 // errors even when they are not retried, so metrics agree
@@ -13817,7 +13856,8 @@ mod external_guardrail_context_tests {
         }
     }
 
-    async fn handle_with_captured_warnings(
+    async fn handle_with_captured_logs_at(
+        level: tracing::Level,
         session: &mut Session,
         config: &sbproxy_ai::AiHandlerConfig,
         pipeline: &crate::pipeline::CompiledPipeline,
@@ -13828,7 +13868,7 @@ mod external_guardrail_context_tests {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .without_time()
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(level)
             .with_writer(WarningCapture(Arc::clone(&captured)))
             .finish();
         {
@@ -13839,6 +13879,49 @@ mod external_guardrail_context_tests {
         }
         let bytes = captured.lock().expect("warning capture").clone();
         String::from_utf8(bytes).expect("UTF-8 warnings")
+    }
+
+    async fn handle_with_captured_warnings(
+        session: &mut Session,
+        config: &sbproxy_ai::AiHandlerConfig,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        context: &mut crate::context::RequestContext,
+        origin_idx: Option<usize>,
+    ) -> String {
+        handle_with_captured_logs_at(
+            tracing::Level::WARN,
+            session,
+            config,
+            pipeline,
+            context,
+            origin_idx,
+        )
+        .await
+    }
+
+    /// Same as [`handle_with_captured_warnings`] but captures at `INFO`.
+    ///
+    /// `ai_extensions.rs`'s dispatch loop logs a hook's `flag` verdict
+    /// with `tracing::info!("AI extension hook flagged an event")`; a
+    /// `WARN`-filtered subscriber never sees it, so a test that wants to
+    /// observe an `ai_failure` hook actually firing (WOR-2541) needs the
+    /// lower bar.
+    async fn handle_with_captured_info(
+        session: &mut Session,
+        config: &sbproxy_ai::AiHandlerConfig,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        context: &mut crate::context::RequestContext,
+        origin_idx: Option<usize>,
+    ) -> String {
+        handle_with_captured_logs_at(
+            tracing::Level::INFO,
+            session,
+            config,
+            pipeline,
+            context,
+            origin_idx,
+        )
+        .await
     }
 
     fn assert_single_body_aware_provider_diagnostic(output: &str, provider: &str, status: u16) {
@@ -15375,6 +15458,97 @@ origins:
         assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
         assert_eq!(response_json(&response), upstream_error);
         assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn ai_failure_observer_bundle() -> (&'static str, &'static str) {
+        (
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: failure-observer\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_failure\n    type: observe_failure\n    export: inspect\n",
+            r#"export function inspect(input) { const e = input.event; return {version:"sbproxy-envelope/v1",decision:"flag",code:"observed_failure",message:"cause=" + e.cause + " status=" + (e.status === undefined ? "none" : e.status) + " provider=" + (e.provider === undefined ? "none" : e.provider)}; }"#,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_failure_hook_fires_for_server_error_status_previously_excluded_by_the_gate() {
+        // WOR-2541: the `ai.failure` hook's gate was `content_policy_fallback
+        // && (400..500).contains(&status)`, so a 5xx could never reach it no
+        // matter how it was configured. `content_policy_fallback` is left at
+        // its default (off, `openai_proxy_config` sets no `resilience`
+        // block) to prove the hook no longer depends on it for this case.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&serde_json::json!({"error": {"message": "upstream overloaded"}}))
+                .expect("upstream JSON"),
+            Some("application/json"),
+            503,
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (manifest, javascript) = ai_failure_observer_bundle();
+        let (_directory, pipeline) = pipeline_with_ai_javascript(manifest, javascript);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let logs =
+            handle_with_captured_info(&mut session, &config, &pipeline, &mut context, None).await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+        assert!(
+            logs.contains("AI extension hook flagged an event")
+                && logs.contains("observed_failure"),
+            "ai_failure hook must fire for a 5xx even with content_policy_fallback off: {logs}"
+        );
+        assert!(
+            logs.contains("cause=server_error status=503 provider=openai"),
+            "hook must see the classified cause, status, and provider: {logs}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_failure_hook_fires_for_4xx_status_with_content_policy_fallback_off() {
+        // WOR-2541: before this fix, a 4xx only ever reached `ai.failure`
+        // when `resilience.content_policy_fallback` was on. This config has
+        // no `resilience` block at all (matching `content_policy_fallback`'s
+        // documented default), which previously meant zero AI-failure
+        // observability for this origin.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&serde_json::json!({"error": {"message": "bad request fixture"}}))
+                .expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (manifest, javascript) = ai_failure_observer_bundle();
+        let (_directory, pipeline) = pipeline_with_ai_javascript(manifest, javascript);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let logs =
+            handle_with_captured_info(&mut session, &config, &pipeline, &mut context, None).await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert!(
+            logs.contains("AI extension hook flagged an event")
+                && logs.contains("observed_failure"),
+            "ai_failure hook must fire for a 4xx even though content_policy_fallback is off: {logs}"
+        );
+        assert!(
+            logs.contains("cause=bad_request status=400 provider=openai"),
+            "hook must see the classified cause, status, and provider: {logs}"
+        );
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
@@ -17741,6 +17915,84 @@ mod request_policy_tests {
             &sbproxy_ai::handler::AiSurface::ImageGeneration,
             &allowed,
             &blocked,
+        ));
+    }
+
+    fn renamed_providers() -> Vec<sbproxy_ai::ProviderConfig> {
+        serde_json::from_value(serde_json::json!([
+            {"name": "team-openai", "provider_type": "openai", "api_key": "test"}
+        ]))
+        .expect("renamed provider fixture")
+    }
+
+    // WOR-2485: the surface matrix keys on the provider TYPE
+    // (`effective_provider_type`), so an operator's display name must
+    // not cost the entry its surface set. Keying on the name demoted
+    // `name: team-openai, provider_type: openai` to the
+    // unknown-provider default and 501'd every non-universal surface.
+    #[test]
+    fn renamed_provider_keeps_its_surface_support() {
+        assert!(any_allowed_provider_supports_surface(
+            &renamed_providers(),
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &[],
+            &[],
+        ));
+    }
+
+    // WOR-2485: a provider NAMED like a narrowed catalog entry but
+    // TYPED as openai follows its type. The wire shape actually spoken
+    // is the type's, so the name's narrowing arm must not fire.
+    #[test]
+    fn provider_type_wins_a_name_collision_in_the_surface_gate() {
+        let providers: Vec<sbproxy_ai::ProviderConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "bedrock", "provider_type": "openai", "api_key": "test"}
+            ]))
+            .expect("collision fixture");
+        assert!(any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &[],
+            &[],
+        ));
+    }
+
+    // WOR-2485: the per-provider narrowing arms key on the type too. A
+    // renamed bedrock entry stays narrowed; the rename neither drops it
+    // to the unknown default nor widens it past its upstream.
+    #[test]
+    fn renamed_provider_inherits_its_types_narrowing() {
+        let providers: Vec<sbproxy_ai::ProviderConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "prod-bedrock", "provider_type": "bedrock", "api_key": "test"}
+            ]))
+            .expect("narrowed fixture");
+        assert!(!any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::Embeddings,
+            &[],
+            &[],
+        ));
+    }
+
+    // WOR-2485: capability keys on the type; the allow/block policy
+    // lists keep keying on the config entry NAME that credentials
+    // reference. Both axes must hold at once.
+    #[test]
+    fn surface_gate_policy_lists_stay_keyed_on_the_config_name() {
+        let providers = renamed_providers();
+        assert!(any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &["team-openai".to_string()],
+            &[],
+        ));
+        assert!(!any_allowed_provider_supports_surface(
+            &providers,
+            &sbproxy_ai::handler::AiSurface::AudioTranscription,
+            &[],
+            &["team-openai".to_string()],
         ));
     }
 

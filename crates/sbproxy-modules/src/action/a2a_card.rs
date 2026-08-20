@@ -21,14 +21,18 @@
 //!   discovery paths (`/.well-known/agent-card.json` per ratified
 //!   A2A 1.0, plus the pre-1.0 aliases) with the stored card, its
 //!   routed URLs swapped to the proxy host.
-//! * **Modality negotiation**. Before forwarding the request the
-//!   gateway runs [`AgentCard::negotiate_input`] over the caller's
-//!   `Content-Type` and [`AgentCard::negotiate_output`] over the
-//!   caller's `Accept`. A mismatch returns 406 with a typed error so
-//!   the caller knows which dimension failed.
-//! * **Capability gating**. CEL policies can branch on
-//!   `card.supports_streaming` / `card.supports_push_notifications`
-//!   once the negotiation result is on the request context.
+//! * **Modality negotiation (not yet wired, WOR-2543)**.
+//!   [`AgentCard::negotiate_input`] and [`AgentCard::negotiate_output`]
+//!   compare a caller's `Content-Type` / `Accept` against the card's
+//!   advertised modes and are covered by this module's unit tests, but
+//!   nothing on the request path calls them today: forwarding a
+//!   request does not check modality compatibility before proxying to
+//!   the agent.
+//! * **Capability gating (not yet wired)**. There is no CEL binding
+//!   for `card.supports_streaming` / `card.supports_push_notifications`
+//!   anywhere in this workspace today. Wiring modality negotiation and
+//!   capability flags into the request path and CEL context is a
+//!   larger decision left open by WOR-2543.
 //!
 //! The card model is intentionally permissive on the deserialisation
 //! side: unknown fields are preserved on `AgentCard::extensions` so

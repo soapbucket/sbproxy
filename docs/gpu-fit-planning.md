@@ -1,6 +1,6 @@
 # GPU fit planning
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 When you name a model, the fit planner decides which quantization to
 run on the GPU you have, and it refuses a configuration the card cannot
@@ -26,6 +26,22 @@ It walks the model's quant list in preference order and returns the
 first quant that both runs and fits. If none run, the error says so and
 names the capability gap. If they run but none fit, the error says that
 instead, with the smallest estimate it found.
+
+```mermaid
+flowchart TD
+    START["Model's quant list,\nin preference order"] --> NEXT{Next candidate quant}
+    NEXT --> CAP{"Capability gate:\ndoes the card's compute\ncapability have the kernel?"}
+    CAP -->|no| SKIPCAP["Skip: capability refusal\n(names the missing kernel)"]
+    SKIPCAP --> NEXT
+    CAP -->|yes| SIZE["Estimate VRAM:\nweight bytes + KV cache\nat planned seq_len,\ntimes headroom factor"]
+    SIZE --> FIT{Fits free VRAM?}
+    FIT -->|no| SKIPFIT["Skip: track as smallest\nestimate seen so far"]
+    SKIPFIT --> NEXT
+    FIT -->|yes| THROUGHPUT["Estimate decode throughput\nfrom memory bandwidth"]
+    THROUGHPUT --> PICK["Pick this quant:\nreport quant + estimated VRAM"]
+    NEXT -->|list exhausted, none passed capability| FAILCAP["Refuse: capability refusal,\nnames the kernel gap"]
+    NEXT -->|list exhausted, some ran but none fit| FAILSIZE["Refuse: size refusal,\nreports free VRAM and\nsmallest estimate found"]
+```
 
 ## The VRAM math
 

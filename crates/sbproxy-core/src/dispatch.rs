@@ -164,6 +164,30 @@ async fn check_auth(
             // hardcoded "GET" rejected every valid non-GET request.
             digest.check_request(headers, method.as_str())
         }
+        Auth::Hmac(h) => {
+            // RFC 9421 verification needs only method + uri + headers,
+            // all of which the H3 dispatch has, so it verifies for real
+            // here rather than failing closed like the providers that
+            // need wiring the H3 path lacks. The body is empty for the
+            // same reason as the H1/H2 path: a signature covering
+            // `content-digest` on a body-bearing request fails closed.
+            let builder = http::Request::builder()
+                .method(method.clone())
+                .uri(uri.clone());
+            match builder.body(bytes::Bytes::new()) {
+                Ok(mut req) => {
+                    *req.headers_mut() = headers.clone();
+                    match h.verify(&req) {
+                        sbproxy_modules::auth::HmacVerdict::Verified { .. } => true,
+                        verdict => {
+                            debug!(?verdict, "H3: hmac_auth verification failed");
+                            false
+                        }
+                    }
+                }
+                Err(_) => false,
+            }
+        }
         Auth::ForwardAuth(fa) => {
             // Forward auth requires an async subrequest. The H3 dispatch path is
             // synchronous at this point in the pipeline, so we cannot perform the
@@ -177,6 +201,19 @@ async fn check_auth(
                  Configure an HTTP/1.1 or HTTP/2 listener for origins that depend on forward_auth."
             );
             false
+        }
+        Auth::Ldap(l) => {
+            // WOR-2519: the directory bind needs only the request
+            // headers, so it runs for real on the H3 path too. Every
+            // non-allowed outcome (missing credentials, refused bind,
+            // unreachable directory) maps to a denial here; the boolean
+            // return cannot carry the 503-vs-401 split the H1/H2 path
+            // reports, so H3 answers 401 for all of them, which still
+            // fails closed.
+            matches!(
+                l.authenticate(headers).await,
+                sbproxy_modules::auth::ldap::LdapBindOutcome::Allowed { .. }
+            )
         }
         Auth::BotAuth(_) => {
             // Web Bot Auth verification needs the full request shape
@@ -205,6 +242,20 @@ async fn check_auth(
         Auth::Plugin(_) => {
             // Plugin auth not supported in H3 dispatch; fail closed for safety.
             warn!("H3: plugin auth not supported in H3 dispatch; denying request");
+            false
+        }
+        Auth::AnyOf(providers) => {
+            // WOR-2517: OR composition. First success wins; a slot the
+            // H3 path cannot evaluate (forward_auth is refused at
+            // compile, bot_auth / cap / oidc / plugin fail closed
+            // above) simply loses its slot and the next provider gets
+            // its turn. Boxed because async recursion needs a pinned
+            // future.
+            for provider in providers {
+                if Box::pin(check_auth(provider, headers, uri, method)).await {
+                    return true;
+                }
+            }
             false
         }
     }
@@ -1154,6 +1205,38 @@ mod tests {
         assert!(
             !authorized,
             "forward_auth over H3 must fail closed (return false), not bypass auth"
+        );
+    }
+
+    // --- WOR-2517: auth composition over H3 ---
+
+    #[tokio::test]
+    async fn check_auth_any_of_accepts_either_credential_over_h3() {
+        let auth = sbproxy_modules::compile::compile_auth(&serde_json::json!([
+            {"type": "api_key", "api_keys": ["h3-key"], "header_name": "X-Api-Key"},
+            {"type": "bearer", "tokens": ["h3-token"]},
+        ]))
+        .expect("two-provider auth list must compile");
+        let uri: http::Uri = "/protected".parse().unwrap();
+
+        let mut with_key = http::HeaderMap::new();
+        with_key.insert("x-api-key", "h3-key".parse().unwrap());
+        assert!(
+            check_auth(&auth, &with_key, &uri, &http::Method::GET).await,
+            "the first provider's credential must be accepted"
+        );
+
+        let mut with_token = http::HeaderMap::new();
+        with_token.insert("authorization", "Bearer h3-token".parse().unwrap());
+        assert!(
+            check_auth(&auth, &with_token, &uri, &http::Method::GET).await,
+            "the second provider's credential must be accepted"
+        );
+
+        let empty = http::HeaderMap::new();
+        assert!(
+            !check_auth(&auth, &empty, &uri, &http::Method::GET).await,
+            "a request neither provider accepts must be denied"
         );
     }
 }

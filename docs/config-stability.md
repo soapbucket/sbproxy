@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -214,12 +214,20 @@ see that case, because the key is read.
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
 | `origins.*.credentials[].attrs.budget.reset` | Credential lowering copies `max_tokens` and `max_cost_usd` and nothing else, so the cap is cumulative and never resets. For a resetting cap today, use the AI action's `budget.limits[]`, which does take a `period`. The same leaf is config-only at proxy and tenant credential scopes. |
 | `proxy.observability.log.sampling.info`, `.debug`, `.trace` | The process logger has no sampling call site, so no rate is applied at any level and every line is emitted. Throttle request logs with `access_log.sample_rate` instead. The sibling `log.level` and `log.format` are live; see [observability.md](observability.md) for where they sit against the CLI flags and `RUST_LOG`. |
-| `proxy.secrets.rotation.grace_period_secs`, `.re_resolve_interval_secs` | The rotation runtime exists and implements exactly this grace window and interval, but nothing constructs it from this block and nothing drives the interval. Secrets are resolved once at boot and never again, so neither deadline is ever reached. Wiring it is tracked as future work. |
 
 `origins.*.action.resilience.circuit_breaker` and
 `.outlier_detection` used to be listed here and are not config-only any
 more. The AI router installs both when the config asks for them, so they
 are live and are pinned `stable` in the key registry.
+
+`proxy.secrets.rotation.grace_period_secs` and `.re_resolve_interval_secs`
+used to be listed here too. WOR-2327 wired both into
+`KeyPlane::resolve_credential_secret`, which now reads them for real: the
+interval gates how long a resolved credential is cached before the backend
+is consulted again, and the grace period covers a re-resolution failure
+with the last-known-good value. Both are `stable` in the key registry; see
+[configuration.md](configuration.md#secret-rotation) for the current
+behavior.
 
 ---
 

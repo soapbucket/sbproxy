@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use sbproxy_config::extract_type;
 use sbproxy_extension::bundle::{
     build_javascript_action, build_javascript_auth, build_javascript_policy,
-    build_javascript_transform, build_rego_policy, build_wasm_action, build_wasm_policy,
-    build_wasm_transform, BundleRegistry, LoadedBundleHook,
+    build_javascript_transform, build_rego_policy, build_rego_transform, build_wasm_action,
+    build_wasm_policy, build_wasm_transform, BundleRegistry, LoadedBundleHook,
 };
 
 use crate::action::{
@@ -19,7 +19,7 @@ use crate::action::{
 };
 use crate::auth::{
     ApiKeyAuth, Auth, BasicAuthProvider, BearerAuth, BotAuthProvider, DigestAuth,
-    ForwardAuthProvider, JwtAuth,
+    ForwardAuthProvider, HmacAuth, JwtAuth,
 };
 use crate::policy::{
     AssertionPolicy, CsrfPolicy, DdosPolicy, ExpressionPolicy, IpFilterPolicy, Policy,
@@ -163,6 +163,12 @@ pub fn compile_auth_with_registry(
     config: &serde_json::Value,
     registry: &dyn BundleRegistry,
 ) -> Result<Auth> {
+    // A list form has no top-level `type:`; hand it straight to the
+    // registry-aware path so an entry naming a bundle auth hook still
+    // resolves (WOR-2517).
+    if config.is_array() {
+        return compile_auth_with_optional_registry(config, Some(registry));
+    }
     let type_name = extract_type(config)?;
     if registry.auth(&type_name).is_none() {
         return compile_auth(config);
@@ -170,10 +176,83 @@ pub fn compile_auth_with_registry(
     compile_auth_with_optional_registry(config, Some(registry))
 }
 
+/// Compile a list-form `authentication:` block into [`Auth::AnyOf`]
+/// (WOR-2517).
+///
+/// Every entry routes through the same single-provider construction
+/// the scalar form uses, so a provider behaves identically whether it
+/// stands alone or sits in a composition. The refusals are the
+/// fail-closed edge of the feature:
+///
+/// * fewer than two entries: the scalar form already expresses one
+///   provider, and a one-entry list invites drift between two
+///   spellings of the same config;
+/// * `noop`: a slot that admits every request makes the other slots
+///   decorative;
+/// * `forward_auth`: evaluated as an out-of-band HTTP subrequest at
+///   its own call site, which the composition path cannot run, so
+///   admitting it here would silently fail open;
+/// * `oidc`: its login flow needs the origin-level callback wiring
+///   that only exists for a scalar `oidc` block;
+/// * a nested list: OR of OR is the same OR, flatten it by hand.
+fn compile_auth_list(
+    entries: &[serde_json::Value],
+    registry: Option<&dyn BundleRegistry>,
+) -> Result<Auth> {
+    if entries.len() < 2 {
+        anyhow::bail!(
+            "an `authentication:` list needs at least two providers; \
+             write a single provider as a plain mapping instead"
+        );
+    }
+    let mut providers = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_array() {
+            anyhow::bail!(
+                "authentication[{index}]: lists cannot nest; \
+                 declare every provider at the top level of one list"
+            );
+        }
+        let type_name = extract_type(entry)
+            .with_context(|| format!("authentication[{index}] in a composition list"))?;
+        if type_name == "noop" {
+            anyhow::bail!(
+                "authentication[{index}]: `noop` cannot join a composition; \
+                 a provider that admits every request would make the other \
+                 entries decorative. Drop the auth block to disable auth"
+            );
+        }
+        if type_name == "forward_auth" || type_name == "forward" {
+            anyhow::bail!(
+                "authentication[{index}]: `forward_auth` cannot join a composition; \
+                 it runs as a separate subrequest and only works as the origin's \
+                 sole provider"
+            );
+        }
+        if type_name == "oidc" {
+            anyhow::bail!(
+                "authentication[{index}]: `oidc` cannot join a composition; \
+                 its login flow needs the origin-level callback endpoint that \
+                 only a sole `oidc` provider wires up"
+            );
+        }
+        let provider = compile_auth_with_optional_registry(entry, registry)
+            .with_context(|| format!("authentication[{index}] ({type_name})"))?;
+        providers.push(provider);
+    }
+    Ok(Auth::AnyOf(providers))
+}
+
 fn compile_auth_with_optional_registry(
     config: &serde_json::Value,
     registry: Option<&dyn BundleRegistry>,
 ) -> Result<Auth> {
+    // WOR-2517: a list of provider configs compiles to the OR
+    // composition. Entries reuse this same function, so each one takes
+    // exactly the path its scalar form would.
+    if let Some(entries) = config.as_array() {
+        return compile_auth_list(entries, registry);
+    }
     let type_name = extract_type(config)?;
     match type_name.as_str() {
         "api_key" => Ok(Auth::ApiKey(ApiKeyAuth::from_config(config.clone())?)),
@@ -183,9 +262,13 @@ fn compile_auth_with_optional_registry(
         "bearer" | "bearer_token" => Ok(Auth::Bearer(BearerAuth::from_config(config.clone())?)),
         "jwt" => Ok(Auth::Jwt(JwtAuth::from_config(config.clone())?)),
         "digest" => Ok(Auth::Digest(DigestAuth::from_config(config.clone())?)),
+        "hmac_auth" => Ok(Auth::Hmac(HmacAuth::from_config(config.clone())?)),
         "forward_auth" | "forward" => Ok(Auth::ForwardAuth(ForwardAuthProvider::from_config(
             config.clone(),
         )?)),
+        "ldap_auth" | "ldap" => Ok(Auth::Ldap(
+            crate::auth::ldap::LdapAuthProvider::from_config(config.clone())?,
+        )),
         "bot_auth" | "web_bot_auth" => {
             Ok(Auth::BotAuth(BotAuthProvider::from_config(config.clone())?))
         }
@@ -241,8 +324,9 @@ fn compile_bundle_auth(hook: &LoadedBundleHook, config: serde_json::Value) -> Re
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide auth hooks")
         }
-        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
-        // at manifest validation; this arm is the defensive backstop.
+        // Rego bundle hooks are `kind: policy` and `kind: transform` only
+        // (WOR-2482, WOR-2493 item 6); other kinds are refused at manifest
+        // validation, so this arm is the defensive backstop.
         sbproxy_config::BundleRuntime::Rego => {
             anyhow::bail!("rego bundles cannot provide auth hooks")
         }
@@ -553,11 +637,11 @@ fn compile_bundle_transform(
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide transform hooks")
         }
-        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
-        // at manifest validation; this arm is the defensive backstop.
-        sbproxy_config::BundleRuntime::Rego => {
-            anyhow::bail!("rego bundles cannot provide transform hooks")
-        }
+        // WOR-2493 item 6: a signed extension bundle's Rego module can
+        // provide transform hooks through the same verify-then-activate
+        // flow its policy hooks ride (WOR-2482); see
+        // `sbproxy_extension::bundle::rego`.
+        sbproxy_config::BundleRuntime::Rego => Box::new(build_rego_transform(hook, config)?),
     };
     Ok(Transform::Plugin(crate::PluginTransform::dynamic(
         handler,
@@ -574,8 +658,9 @@ fn compile_bundle_action(hook: &LoadedBundleHook, config: serde_json::Value) -> 
         sbproxy_config::BundleRuntime::ProxyWasm => {
             anyhow::bail!("Proxy-Wasm bundles cannot provide action hooks")
         }
-        // Rego bundle hooks are `kind: policy` only (WOR-2482), refused
-        // at manifest validation; this arm is the defensive backstop.
+        // Rego bundle hooks are `kind: policy` and `kind: transform` only
+        // (WOR-2482, WOR-2493 item 6); other kinds are refused at manifest
+        // validation, so this arm is the defensive backstop.
         sbproxy_config::BundleRuntime::Rego => {
             anyhow::bail!("rego bundles cannot provide action hooks")
         }
@@ -867,6 +952,83 @@ hooks:
                 body: Bytes::from_static(b"dynamic action"),
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extension_registry_compiles_a_rego_bundle_transform() {
+        // WOR-2493 item 6: before this landed, the Rego arm of
+        // `compile_bundle_transform` was an unconditional
+        // "rego bundles cannot provide transform hooks" bail, and the
+        // manifest itself was refused at candidate load.
+        let directory = TempDir::new().expect("temporary bundle directory");
+        let bundle = directory.path().join("rego-transform-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(
+            bundle.join("transform.rego"),
+            r#"
+package sbproxy
+
+transform := base64.encode("rewritten") if {
+    input.body.content_type == "text/plain"
+}
+"#,
+        )
+        .expect("write rego module");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: rego-transform-fixture
+version: 1.0.0
+runtime: rego
+entry: transform.rego
+hooks:
+  - kind: transform
+    type: rego_compile_transform
+    execution:
+      body_mode: buffered
+"#,
+        )
+        .expect("write bundle manifest");
+        let config = ExtensionBundlesConfig {
+            bundles_dir: Some(directory.path().display().to_string()),
+            sources: Vec::new(),
+            grants: Default::default(),
+        };
+        let registry = DynamicBundleRegistry::load(&config, directory.path(), &BTreeSet::new())
+            .expect("load rego transform fixture");
+
+        let transform = compile_transform_with_registry(
+            &serde_json::json!({"type": "rego_compile_transform"}),
+            registry.as_ref(),
+        )
+        .expect("rego bundle transform should compile");
+        // Cacheability: a bundle transform is arbitrary out-of-tree
+        // logic, so it is conservatively request-dependent like every
+        // other `Transform::Plugin`, and the cached-origin refusal in
+        // `sbproxy-core`'s pipeline compiler applies to it the same way
+        // it does to the JS and Lua transform surfaces.
+        assert!(transform.request_dependent());
+        let Transform::Plugin(transform) = transform else {
+            panic!("rego bundle transform should use plugin dispatch");
+        };
+        let metadata = transform
+            .dynamic_hook()
+            .expect("rego bundle transform should retain bundle execution metadata");
+        assert_eq!(metadata.bundle_id(), "rego-transform-fixture");
+        assert_eq!(metadata.hook_type(), "rego_compile_transform");
+        assert_eq!(metadata.body_mode(), BundleBodyMode::Buffered);
+        let mut body = BytesMut::from(&b"original"[..]);
+        transform
+            .handler()
+            .apply(
+                &mut body,
+                Some("text/plain"),
+                &TransformContext::new("fixture.example"),
+            )
+            .await
+            .expect("rego bundle transform should run");
+        assert_eq!(&body[..], b"rewritten");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1319,6 +1481,16 @@ hooks:
     }
 
     #[test]
+    fn compile_auth_hmac() {
+        let json = serde_json::json!({
+            "type": "hmac_auth",
+            "keys": [{"key_id": "svc-a", "secret": "0011223344556677"}]
+        });
+        let auth = compile_auth(&json).unwrap();
+        assert_eq!(auth.auth_type(), "hmac_auth");
+    }
+
+    #[test]
     fn compile_auth_forward_auth() {
         let json = serde_json::json!({
             "type": "forward_auth",
@@ -1328,10 +1500,107 @@ hooks:
         assert_eq!(auth.auth_type(), "forward_auth");
     }
 
+    /// WOR-2519: `ldap_auth` compiles through the built-in arm (with
+    /// `ldap` accepted as an alias) instead of falling through to the
+    /// plugin registry.
+    #[test]
+    fn compile_auth_ldap() {
+        for type_name in ["ldap_auth", "ldap"] {
+            let json = serde_json::json!({
+                "type": type_name,
+                "url": "ldaps://directory.example.org:636",
+                "base_dn": "ou=users,dc=example,dc=org",
+            });
+            let auth = compile_auth(&json).unwrap();
+            assert_eq!(auth.auth_type(), "ldap_auth");
+        }
+    }
+
+    /// WOR-2519: the provider's config-load refusals surface through
+    /// `compile_auth`, so an insecure directory URL stops the whole
+    /// config from compiling rather than failing at request time.
+    #[test]
+    fn compile_auth_ldap_insecure_url_refused() {
+        let json = serde_json::json!({
+            "type": "ldap_auth",
+            "url": "ldap://directory.example.org:389",
+            "base_dn": "ou=users,dc=example,dc=org",
+        });
+        let err = compile_auth(&json).unwrap_err();
+        assert!(err.to_string().contains("allow_insecure"), "{err}");
+    }
+
     #[test]
     fn compile_auth_unknown_type() {
         let json = serde_json::json!({"type": "oauth2"});
         assert!(compile_auth(&json).is_err());
+    }
+
+    // --- compile_auth composition (WOR-2517) ---
+
+    #[test]
+    fn compile_auth_list_builds_any_of_in_declared_order() {
+        let json = serde_json::json!([
+            {"type": "api_key", "api_keys": ["key1"]},
+            {"type": "bearer", "tokens": ["tok-1"]},
+        ]);
+        let auth = compile_auth(&json).unwrap();
+        assert_eq!(auth.auth_type(), "any_of");
+        let Auth::AnyOf(providers) = auth else {
+            panic!("a two-entry auth list must compile to Auth::AnyOf");
+        };
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].auth_type(), "api_key");
+        assert_eq!(providers[1].auth_type(), "bearer");
+    }
+
+    #[test]
+    fn compile_auth_list_single_entry_refused() {
+        let json = serde_json::json!([
+            {"type": "api_key", "api_keys": ["key1"]},
+        ]);
+        let err = compile_auth(&json).expect_err("single-entry list must not compile");
+        assert!(err.to_string().contains("at least two"), "{err:#}");
+    }
+
+    #[test]
+    fn compile_auth_list_refuses_noop() {
+        let json = serde_json::json!([
+            {"type": "api_key", "api_keys": ["key1"]},
+            {"type": "noop"},
+        ]);
+        let err = compile_auth(&json).expect_err("noop in a list must not compile");
+        assert!(err.to_string().contains("noop"), "{err:#}");
+    }
+
+    #[test]
+    fn compile_auth_list_refuses_forward_auth() {
+        let json = serde_json::json!([
+            {"type": "forward_auth", "url": "http://auth-svc/check"},
+            {"type": "api_key", "api_keys": ["key1"]},
+        ]);
+        let err = compile_auth(&json).expect_err("forward_auth in a list must not compile");
+        assert!(err.to_string().contains("forward_auth"), "{err:#}");
+    }
+
+    #[test]
+    fn compile_auth_list_refuses_oidc() {
+        let json = serde_json::json!([
+            {"type": "api_key", "api_keys": ["key1"]},
+            {"type": "oidc"},
+        ]);
+        let err = compile_auth(&json).expect_err("oidc in a list must not compile");
+        assert!(err.to_string().contains("oidc"), "{err:#}");
+    }
+
+    #[test]
+    fn compile_auth_list_refuses_nested_list() {
+        let json = serde_json::json!([
+            {"type": "api_key", "api_keys": ["key1"]},
+            [{"type": "bearer", "tokens": ["tok-1"]}],
+        ]);
+        let err = compile_auth(&json).expect_err("nested list must not compile");
+        assert!(err.to_string().contains("nest"), "{err:#}");
     }
 
     // --- compile_policy tests ---

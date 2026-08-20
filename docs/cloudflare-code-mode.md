@@ -1,5 +1,5 @@
 # Cloudflare Code Mode
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-19*
 
 SBproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code
@@ -97,7 +97,8 @@ a streaming tool, so a module with none stays as small as before.
 
 The proxy serves the module itself: `GET
 /.well-known/mcp/codemode.ts` on an MCP gateway origin returns the
-emitted TypeScript with `content-type: text/typescript`. The response
+emitted TypeScript with `content-type: text/typescript; charset=utf-8`.
+The response
 carries a strong `ETag` (the SHA-256 of the emitted bytes) and
 `Cache-Control: max-age=60, must-revalidate`; a request whose
 `If-None-Match` matches gets a `304 Not Modified` with no body.
@@ -108,7 +109,7 @@ A `draft` federated server's tools are excluded from the emitted
 module, the same treatment `tools/list` gives them (see
 [mcp-security-coverage.md](mcp-security-coverage.md)'s MCP09 row).
 This endpoint runs ahead of per-caller authentication and its module
-is cached per catalogue, not per principal, so `rbac_policies`
+is cached per catalog, not per principal, so `rbac_policies`
 scoping is not applied here: every caller receives the same module,
 listing every non-`draft` tool regardless of which tools an RBAC rule
 would let that caller actually call.

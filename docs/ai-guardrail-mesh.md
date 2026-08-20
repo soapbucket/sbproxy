@@ -1,5 +1,5 @@
 # Guardrail mesh
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 The serial guardrail chain blocks on the first security detector that flags.
 The guardrail mesh instead runs the input detectors as a cascade, collects
@@ -11,6 +11,24 @@ cache.
 
 Default off: with no `mesh` block under `guardrails`, the pipeline keeps
 the serial block-on-any behavior.
+
+```mermaid
+flowchart TD
+    A[Prompt arrives] --> B{"cache: true and\nverdict cached?"}
+    B -->|hit| H
+    B -->|miss| C["Cascade: cheap detectors first\n(regex, PII, schema, then classifiers)"]
+    C --> D{latency_budget_ms spent?}
+    D -->|yes| E[Skip remaining optional detectors]
+    D -->|no, more detectors queued| C
+    D -->|no more detectors| E
+    E --> G["Fuse: count flagged security detectors\n(routing labels do not count)"]
+    G -->|cache: true| S[(Store verdict in cache)]
+    G --> H{"flagged_count >= block_threshold?"}
+    H -->|yes| I["400 guardrail_violation\n(provider never called)"]
+    H -->|no, flagged and redact_on_flag| J[Redact via PII redactor, forward]
+    H -->|no flags, or redact_on_flag: false| L[Forward unchanged]
+    G -.->|"ai.guardrails.* labels"| M[AI policy plane / CEL]
+```
 
 ## Configuration
 

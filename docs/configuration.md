@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -9,48 +9,56 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 ## Table of contents
 
 1. [Overview](#overview)
-2. [Top-level structure](#top-level-structure)
-3. [Proxy settings](#proxy-settings)
-4. [Origins](#origins)
-5. [Actions](#actions)
-6. [Authentication](#authentication)
-7. [Policies](#policies)
-8. [Transforms](#transforms)
-9. [Request modifiers](#request-modifiers)
-10. [Response modifiers](#response-modifiers)
-11. [Response cache](#response-cache)
-12. [Forward rules](#forward-rules)
-13. [Fallback origin](#fallback-origin)
-14. [Variables, vaults, and secrets](#variables-vaults-and-secrets)
-15. [Session config](#session-config)
-16. [Compression](#compression)
-17. [HSTS](#hsts)
-18. [Connection pool](#connection-pool)
-19. [Upstream timeouts](#upstream-timeouts)
-20. [Bot detection](#bot-detection)
-21. [Threat protection](#threat-protection)
-22. [Error pages](#error-pages)
-23. [Rate limit headers](#rate-limit-headers)
-24. [Message signatures](#message-signatures)
-25. [Traffic capture](#traffic-capture)
-26. [Host header semantics](#host-header-semantics)
-27. [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers)
-28. [Request mirror](#request-mirror)
-29. [Upstream retries](#upstream-retries)
-30. [Active health checks](#active-health-checks)
-31. [Circuit breaker](#circuit-breaker)
-32. [Outlier detection](#outlier-detection)
-33. [Service discovery](#service-discovery)
-34. [Correlation ID](#correlation-id)
-35. [mTLS client authentication](#mtls-client-authentication)
-36. [Webhook envelope and signing](#webhook-envelope-and-signing)
-37. [Secrets](#secrets)
-38. [Environment variables](#environment-variables)
-39. [ACME / auto TLS](#acme--auto-tls)
-40. [Redis integration](#redis-integration)
-41. [Config source (GitOps)](#config-source-gitops)
-42. [Config authority](#config-authority-fleet-configuration-distribution)
-43. [Validation](#validation)
+2. [JSON Schema (editor autocomplete + validation)](#json-schema-editor-autocomplete--validation)
+3. [Top-level structure](#top-level-structure)
+4. [Proxy settings](#proxy-settings)
+5. [Tenants](#tenants)
+6. [Origins](#origins)
+7. [Actions](#actions)
+8. [Authentication](#authentication)
+9. [Policies](#policies)
+10. [Transforms](#transforms)
+11. [Request modifiers](#request-modifiers)
+12. [Response modifiers](#response-modifiers)
+13. [Response cache](#response-cache)
+14. [Forward rules](#forward-rules)
+15. [Fallback origin](#fallback-origin)
+16. [Variables, vaults, and secrets](#variables-vaults-and-secrets)
+17. [Session config](#session-config)
+18. [Compression](#compression)
+19. [HSTS](#hsts)
+20. [Connection pool](#connection-pool)
+21. [Upstream timeouts](#upstream-timeouts)
+22. [Bot detection](#bot-detection)
+23. [Threat protection](#threat-protection)
+24. [Error pages](#error-pages)
+25. [Problem details (RFC 9457)](#problem-details-rfc-9457)
+26. [Idempotency](#idempotency)
+27. [Rate limit headers](#rate-limit-headers)
+28. [Message signatures](#message-signatures)
+29. [Traffic capture](#traffic-capture)
+30. [Host header semantics](#host-header-semantics)
+31. [Origin overrides](#origin-overrides)
+32. [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers)
+33. [Request mirror](#request-mirror)
+34. [Upstream retries](#upstream-retries)
+35. [Active health checks](#active-health-checks)
+36. [Circuit breaker](#circuit-breaker)
+37. [Outlier detection](#outlier-detection)
+38. [Service discovery](#service-discovery)
+39. [Correlation ID](#correlation-id)
+40. [mTLS client authentication](#mtls-client-authentication)
+41. [Webhook envelope and signing](#webhook-envelope-and-signing)
+42. [Secrets](#secrets)
+43. [Environment variables](#environment-variables)
+44. [ACME / auto TLS](#acme--auto-tls)
+45. [Redis integration](#redis-integration)
+46. [Config source (GitOps)](#config-source-gitops)
+47. [Config authority](#config-authority-fleet-configuration-distribution)
+48. [Validation](#validation)
+49. [CORS](#cors)
+50. [Quick reference: config field locations](#quick-reference-config-field-locations)
+51. [Environment variable templating in header modifiers](#environment-variable-templating-in-header-modifiers)
 
 ---
 
@@ -245,13 +253,13 @@ origins:
 | `access_log` | object | unset | Structured JSON access-log configuration. |
 | `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
 | `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
-| `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; audit rows remain in memory and tracing. |
+| `audit` | object | unset | Admin-action and security/config/key audit trail. `sink: memory` (default) keeps rows in an in-memory ring and on the `tracing` targets; `sink: chain` additionally hash-chains and Ed25519-signs `security_audit` (plus `config_audit`/`key_audit`/admin-action rows when `config_path`/`key_path`/`admin_path` are set) to a durable file `sbproxy audit verify` can check. See [audit-log.md](audit-log.md). |
 | `egress` | object | unset | Per-purpose outbound allowlists (AI providers, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
 | `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
 | `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
-| `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy. |
+| `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy: `channel`, `auto` (background freshness check, reports only, never replaces an artifact), `check_interval_secs` (default 1 day). See [manual.md](manual.md#update---keep-the-binary-engines-and-models-current) for the full field reference and the `sbproxy update` CLI. |
 
 ### Agent classes
 
@@ -398,6 +406,8 @@ proxy:
 | `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
+| `payments` | object | unset | Durable settlement for paid requests: SQLite intent/attempt/proof/receipt store, challenge binding key, authorization timeout, and the infra-failure posture. Absent keeps every payment provider config-only. See [payments.md](payments.md#getting-paid-proxypayments). |
+| `attestation` | object | unset | Which half (or both) of receipt attestation this node performs, and its failure/enforcement posture; origins may narrow or widen `role`. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
 
 ### Choosing a bind address
 
@@ -891,6 +901,25 @@ proxy:
 | `keep` | int | `20` | Applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1. |
 | `keep_rejected` | int | `10` | Reserved for rejected-candidate retention. Accepted and stored for forward compatibility, but nothing writes to the ring's `rejected/` directory yet in this release, so this field has no observable effect today; a config that fails to apply is not recorded anywhere. Wiring the writer is a later change. |
 
+Every applied revision, whatever triggered it, lands in the ring the same
+way: hash the pre-resolution bytes, write the blob, append an entry, then
+persist the index (eviction, when `keep` is exceeded, always spares
+whichever entry the `lkg` pointer names). `mark_good` is the one thing
+that would move that pointer, and nothing in this release calls it:
+
+```mermaid
+flowchart TD
+    A["Config applies\n(boot, reload, or authority publish)"] --> B["SHA-256 the pre-resolution\ndocument bytes"]
+    B --> C["Write the blob\nblobs/&lt;digest&gt;.yaml.zst"]
+    C --> D["Append a RevisionEntry\nstate: applied, revision N,\nprovenance, blast_radius, actor"]
+    D --> E{"Ring holds more than\nkeep entries?"}
+    E -->|no| F["Persist index.json.bak,\nthen index.json"]
+    E -->|yes| G["Evict the oldest entries\n(never the one lkg names)"]
+    G --> F
+    F --> H["GET /admin/config/history\nGET /admin/config/history/{digest}"]
+    D -.->|"mark_good() exists but has\nno caller in this release"| I["state: good, lkg pointer moves\n(not wired yet)"]
+```
+
 Each entry stores the pre-resolution config bytes: exactly what was read off
 disk, git, or the config authority, before `${VAR}` and
 `vault://`/`secret://` references were resolved, compressed with zstd.
@@ -929,6 +958,9 @@ For what the ring records today, and what it deliberately does not do yet,
 see [operator-runbook.md](operator-runbook.md#config-history-ring). The
 admin routes that read it back are documented in
 [admin-api-reference.md](admin-api-reference.md#get-adminconfighistory).
+[`examples/config-history/`](../examples/config-history/) is a runnable
+walkthrough: boot, apply a change, read the ring back, and read one
+revision's stored document and diff.
 
 ### messenger_settings
 
@@ -974,7 +1006,7 @@ backend left for any driver name to select.
 
 ## Tenants
 
-SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream auth, policy, and vault resolution picks the tenant-scoped config block before falling back to proxy-level defaults.
+SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream credential resolution (and, through it, the credential a governed request authenticates against) and observability walk origin → tenant → proxy, picking the most specific scope that declares a match. Policy and secret-backend configuration are **not** tenant-scoped: there is no `tenants[].policies:` block (policies stay at origin and proxy-wide scope), and every tenant resolves `vault://`/`secret://` references against the same `proxy.secrets.backends:`. A tenant entry carries exactly three fields: `id`, `credentials`, and `observability`.
 
 For single-tenant deployments the synthetic `__default__` tenant is used implicitly; no operator action is required and existing configs see no behavior change.
 
@@ -1002,6 +1034,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `proxy.tenants[].id` | string | required | Stable identifier. Referenced from `origin.tenant_id` and stamped on every request the origin serves. Max 256 ASCII characters. The literal `__default__` is reserved and cannot be declared. |
+| `proxy.tenants[].credentials` | list | `[]` | Tenant-scoped credentials. See [Credentials at the tenant scope](#credentials-at-the-tenant-scope). |
+| `proxy.tenants[].observability` | object | | Tenant-scoped `log` (redaction, sinks, custom fields) and `cardinality` (per-tenant metric label budget). See [multi-tenant.md](multi-tenant.md#per-tenant-cardinality-budgets). |
 
 ### Resolution rules
 
@@ -2259,11 +2293,41 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships ten built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships twelve built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `ldap_auth`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
 Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
+
+### Accepting more than one provider
+
+`authentication` also takes a list of two or more provider blocks. Providers run in declared order and the first one that accepts the request wins. This is the shape of a credential migration (keep accepting legacy API keys while callers move to JWTs on the same origin) and of mixed-client origins (services present tokens, crawlers present signatures).
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      - type: api_key
+        api_keys:
+          - ${LEGACY_API_KEY}
+      - type: jwt
+        jwks_url: https://auth.example.com/.well-known/jwks.json
+        issuer: https://auth.example.com
+```
+
+How the list behaves:
+
+- Order matters. Put the provider most callers use first; every request walks the list from the top and stops at the first success.
+- The winner binds the request. Audit events, decision records, and the auth metric name the provider that authenticated the request, and principal attribution (project, user, team, `key_id`) comes from the winning entry's own config. Nothing is merged across providers.
+- When every provider rejects, the response carries the first provider's status and message, with each provider's `WWW-Authenticate` challenge merged onto it ([RFC 7235](https://www.rfc-editor.org/rfc/rfc7235) permits several challenges on one response). A client that failed both then sees every scheme the origin accepts.
+- A provider that fails, whatever the reason, loses only its own slot. The next provider still runs, and a request no provider accepts is rejected.
+- A one-entry list is refused at config load; write a single provider as a plain mapping.
+- Three types are refused inside a list. `noop` would admit every request and make the other entries decorative. `forward_auth` runs as a separate subrequest and only works as an origin's sole provider. `oidc` needs the login-callback endpoint that only a sole `oidc` block wires up.
+
+See [examples/auth-composition/](../examples/auth-composition/) for a runnable two-provider config.
 
 ### api_key
 
@@ -2399,6 +2463,7 @@ origins:
 | `required_claims` | map | | Claims that must be present and equal to the configured value. |
 | `require_dpop` | bool | `false` | When `true`, the JWT MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token's `cnf.jkt` claim. Tokens without a `cnf.jkt` claim fail closed. |
 | `require_mtls_bound` | bool | `false` | When `true`, the JWT's `cnf.x5t#S256` claim MUST match the SHA-256 thumbprint of the inbound TLS client cert (RFC 8705 mutual-TLS-bound tokens). |
+| `jwe.decryption_key` | string | | PEM private key for decrypting JWE (RFC 7516) encrypted tokens before the usual signature checks. See "Encrypted tokens" below. |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
 
@@ -2433,6 +2498,43 @@ authentication:
 Both flags default to `false` so existing JWT configurations
 keep their unbound semantics. Turn them on per-route as the
 issuer starts minting `cnf.jkt` / `cnf.x5t#S256` tokens.
+
+#### Encrypted tokens (RFC 7516 JWE)
+
+Some identity providers encrypt their tokens instead of only
+signing them: a signed JWT nested inside a JWE envelope. Set
+`jwe.decryption_key` to the PEM private key registered with the
+issuer and the proxy decrypts the envelope first, then verifies
+the recovered JWT with the same `secret` / `jwks_url` settings
+as a plain signed token (decrypt-then-verify per RFC 7519). A
+provider without a `jwe` block refuses encrypted tokens, so
+existing JWS-only configurations are unaffected.
+
+```yaml
+authentication:
+  type: jwt
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  issuer: https://auth.example.com
+  audience: my-api
+  jwe:
+    decryption_key: ${JWT_JWE_PRIVATE_KEY}
+```
+
+Supported algorithms are the set enterprise issuers actually
+use for encrypted tokens: `RSA-OAEP` and `RSA-OAEP-256` key
+unwrap with an RSA private key, and `ECDH-ES` direct key
+agreement with a P-256 EC private key, all with `A256GCM`
+content encryption. Anything else, including the deprecated
+`RSA1_5`, is refused (debug-level logs name the offending
+algorithm).
+
+Failure handling is deliberately uniform: wrong key, garbage
+ciphertext, an unsupported algorithm, or a tampered tag all
+produce the same 401 challenge as a bad signature, so a probing
+client learns nothing from the response shape. The decryption
+key is never echoed in logs or error messages. Interpolate it
+from the environment or a secret backend (as above) rather than
+committing key material to the config file.
 
 ### digest
 
@@ -2492,6 +2594,43 @@ authentication:
 
 The algorithm is negotiated, not merely declared. The challenge carries `algorithm=`, and a response that names a different algorithm, or omits the parameter on a SHA-256 realm, is rejected. A client cannot talk a SHA-256 realm down to MD5 by dropping the parameter. Only `SHA-256` and `MD5` are implemented; the `-sess` variants and `SHA-512-256` are refused at config compile rather than silently downgraded.
 
+### hmac_auth
+
+Signed-request authentication for machine callers. The client holds a shared secret and signs each request with RFC 9421 HTTP Message Signatures (`hmac-sha256`), so no static credential crosses the wire and a captured request cannot be replayed against a different method, path, or time window. The right pick for webhook senders and machine-to-machine API clients that want per-request integrity without a bearer token.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: hmac_auth
+      clock_skew_seconds: 300
+      keys:
+        - key_id: svc-billing
+          secret: ${BILLING_HMAC_SECRET}
+          project: billing
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `hmac_auth`. |
+| `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
+| `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed elsewhere. |
+
+The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
+
+Clients send the standard RFC 9421 header pair. The signature base covers the declared components plus the `@signature-params` line, `created` is required, and `alg` must be `hmac-sha256` (the only symmetric algorithm in the RFC 9421 registry; HMAC-SHA1 does not exist here to be negotiated down to):
+
+```text
+Signature-Input: sig1=("@method" "@target-uri");created=1723800000;keyid="svc-billing";alg="hmac-sha256"
+Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
+```
+
+On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting. A signature that covers `content-digest` is checked against the request body available at the auth phase, which is empty, so body-covering signatures on body-bearing requests are refused rather than passed unverified; body-digest binding is a tracked follow-up. See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
+
 ### forward_auth
 
 Delegate authentication to an external service. SBproxy sends a subrequest to the auth service and uses the response status to allow or deny the original request. The right choice when auth logic lives in its own service.
@@ -2521,6 +2660,44 @@ origins:
 | `headers_to_forward` | list | | Headers to copy from the original request. Alias: `forward_headers`. |
 | `trust_headers` | list | | Headers from the auth response to inject into the upstream request |
 | `success_status` | int \| list | 200 | Status code(s) that mean "authenticated". A list is accepted, but only the first element is used. |
+
+### ldap_auth
+
+Authenticate against an LDAP or Active Directory server with a directory bind. The client sends HTTP Basic credentials; the proxy composes a bind DN as `<uid_attribute>=<username>,<base_dn>` and attempts an LDAP simple bind with the supplied password. A successful bind authenticates the request and attributes it to the username. The password is used for the bind only: never stored, never forwarded upstream, never logged. `ldap` is accepted as an alias for the `type` value.
+
+```yaml
+origins:
+  "intranet.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: ldap_auth
+      url: ldaps://directory.internal:636
+      base_dn: ou=users,dc=example,dc=org
+      uid_attribute: uid
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `ldap_auth` (alias: `ldap`) |
+| `url` | string | required | Directory URL: `ldap://host[:port]` or `ldaps://host[:port]` |
+| `base_dn` | string | required | Base DN the user RDN is appended to, e.g. `ou=users,dc=example,dc=org` |
+| `uid_attribute` | string | `cn` | Attribute the username is bound under when composing the DN |
+| `use_tls` | bool | `false` | Upgrade an `ldap://` connection with StartTLS before the bind |
+| `tls_verify` | bool | `true` | Verify the directory's TLS certificate. When verifying, the `url` host must match the certificate's host. |
+| `allow_insecure` | bool | `false` | Accept a plaintext `ldap://` connection with no StartTLS |
+| `timeout_secs` | int | 5 | Deadline in seconds for the connect + bind exchange |
+
+Three behaviors are deliberate:
+
+- **Plaintext is refused at config load.** An `ldap://` URL with neither `use_tls: true` nor `allow_insecure: true` fails config validation, because a simple bind sends the password in the clear. TLS (both `ldaps://` and StartTLS) runs on the same rustls stack as the rest of the proxy.
+- **Directory unreachable fails closed.** A dial failure, TLS failure, or timeout refuses the request with a `503`; wrong credentials get a `401`. An LDAP outage therefore reads as an outage, and requests are never admitted unchecked.
+- **Empty passwords are refused locally.** RFC 4513 defines a name-plus-empty-password simple bind as an *unauthenticated* bind, which many directories answer with success; the proxy refuses it without consulting the directory.
+
+Like `forward_auth`, and unlike the static-credential providers, this adds one network round-trip to the directory per request. Bind results are not cached: a cached bind would keep accepting a password the directory has already revoked or rotated. Budget `timeout_secs` for the directory's real latency.
+
+See [examples/auth-ldap/](../examples/auth-ldap/) for a runnable setup, including a local OpenLDAP fixture.
 
 ### bot_auth
 
@@ -2700,7 +2877,7 @@ authentication:
     team: platform
 ```
 
-The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
+The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `ldap_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
 
 ---
 
@@ -2983,7 +3160,7 @@ policies:
 | `report_to_group` | string | unset | When set, the policy also emits `report-to <name>` for the modern Reporting API. |
 | `respect_upstream` | bool | `false` | When `true` and the upstream already emits a CSP header, the policy yields and does not write its own. |
 
-The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and returns `204 No Content`. The header is applied to proxied responses; static / redirect / mock actions short-circuit before the response-header phase and bypass injection.
+The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and returns `204 No Content`. The header is applied to proxied responses and to generated ones alike: `static`, `mock`, `echo`, `beacon`, and `redirect` actions carry it the same way a proxied origin does. Actions with their own protocol write paths (`mcp`, `storage`, `ai_proxy`, plugin actions) do not.
 
 ### dlp
 
@@ -3052,6 +3229,7 @@ policies:
 | `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
 | `threshold` | float | `0.5` | Score threshold in `[0.0, 1.0]`; the policy fires when `score >= threshold`. |
 | `action` | string | `tag` | `tag` stamps the score / label headers on the upstream. `block` returns `403` with `block_body`. `log` writes a structured warn under `sbproxy::prompt_injection_v2`. |
+| `enforcement` | string | none | Optional override for the did-decide axis, shared vocabulary. `block` forces a hit to refuse whatever observe flavor `action` names. `observe` admits every hit: `action: block` downgrades to `log`, `tag` keeps tagging, and the `a2a` depth escalation is downgraded too, so this one key is the whole-policy rollout switch. An explicit `a2a.root_action: log` survives `enforcement: block`. Absent leaves `action` in charge. |
 | `score_header` | string | `x-prompt-injection-score` | Header carrying the numeric score (formatted as `"%.3f"`) on `action: tag`. |
 | `label_header` | string | `x-prompt-injection-label` | Header carrying `clean` / `suspicious` / `injection` on `action: tag`. |
 | `block_body` | string | `prompt injection detected` | Response body returned on `action: block`. |
@@ -3074,8 +3252,7 @@ policies:
     owasp_crs:
       enabled: true
       managed_bundle: true
-    action_on_match: block
-    test_mode: false
+    enforcement: block
     failure_posture: closed
     custom_rules: []
 ```
@@ -3084,8 +3261,9 @@ policies:
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `waf` |
 | `owasp_crs` | object | | CRS-style rule configuration. `enabled: true` turns on the built-in patterns; `managed_bundle: true` additionally compiles the vendored 12-rule bundle (independent toggles, either runs without the other); `paranoia_level` sets rule strictness (1-4, default 1) when the top-level `paranoia` field is absent. |
-| `action_on_match` | string | "block" | Action when a rule matches: `block`, `log`. |
-| `test_mode` | bool | false | If true, log matches but do not block. |
+| `enforcement` | string | `block` | What happens when a rule matches: `block` refuses with 403; `observe` admits and records every match, the rollout switch that no rule escapes. A per-rule `action: log` (inline, feed, or bundle) is a permissive override and keeps observing under `block`. Wins over `test_mode` and `action_on_match` in both directions. The second axis, `failure_posture`, covers a rule that could not run at all. |
+| `action_on_match` | string | `block` | Legacy spelling of the enforcement axis: `block` or `log`. `log` resolves to `observe`, but only as the default for rules that carry no `action` of their own; a custom rule spelling `action: block` explicitly still blocks. Used only when `enforcement` is absent. |
+| `test_mode` | bool | false | Legacy spelling of the enforcement axis: `true` means `enforcement: observe` (no rule blocks). Used only when `enforcement` is absent. |
 | `failure_posture` | string | `closed` | What happens to a request the WAF could not fully evaluate: `closed` refuses with 403, `open` admits and claims nothing, `degraded` admits while recording that the WAF guarantee was not made. `observe` is rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
 | `fail_open` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: open`, `false` means `closed`. Still parses and is used only when `failure_posture` is absent. |
 | `paranoia` | int | 1 | Rule strictness, 1 to 4, gating the built-in patterns, the managed bundle, and any feed rules at once. Only rules whose own paranoia level is at or below this value are evaluated. Level 1 runs 8 of the 16 baseline rules, level 2 runs 15, levels 3 and 4 run all 16. Wins over `owasp_crs.paranoia_level` when both are present. |
@@ -4110,7 +4288,7 @@ What per-origin keys add on top is key separation. Under `inherit`, one leaked k
 - Purge is unaffected. It matches on the cache key and never opens a value, so `POST /admin/cache/purge` with a prefix still clears entries sealed under keys the admin path does not hold.
 - Entries written by a build that predates per-origin keys keep opening, and reseal with the origin bound the next time they are written. Downgrading to such a build evicts the newer entries as unreadable and refetches them, which costs a cache miss each and no correctness.
 
-The runnable version of all of this is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/).
+The runnable version of the store-wide setup (a file-backed cache, key resolved from a `file:` reference, entries sealed with AES-256-GCM) is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/). It is single-origin, so it does not exercise `per_origin_keys` or `previous_keys`; the config above is the reference for that shape.
 
 ### What is encrypted at rest, and what is not
 
@@ -4807,7 +4985,7 @@ Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
 
 ## Rate limit headers
 
-Rate-limit headers are configured on the rate-limiting policy's `headers` block. That is the only surface: the policy that counts the requests is the one that knows the limit, the remaining budget, and the reset time.
+Rate-limit headers are configured on the limiting policy's own `headers` block: the policy that counts the requests is the one that knows the limit, the remaining budget, and the reset time. Two policies emit them, in two different shapes, and neither reads the other's block.
 
 ```yaml
 origins:
@@ -4826,6 +5004,15 @@ origins:
 | `headers.include_retry_after` | bool | false | When true, emit `Retry-After` on 429 responses. |
 
 The origin-level `rate_limit_headers:` block has been removed. It parsed but was never consumed, so a config that still carries it fails config compile with a pointer at the policy-level block above. Delete the origin-level block and move the settings onto the policy.
+
+`rate_limit_budget`, the workspace-wide budget policy documented in
+[policy.md](policy.md), carries its own `headers` block instead of reading
+this one, and emits the newer `draft-ietf-httpapi-ratelimit-headers` /
+RFC 9239 shape on a 429: `RateLimit-Limit`, `RateLimit-Remaining`,
+`RateLimit-Reset`, and, when `headers.include_ratelimit_policy` is true
+(the default), `RateLimit-Policy`. See
+[headers-reference.md](headers-reference.md#response-headers-the-proxy-emits)
+for both header sets side by side.
 
 ---
 

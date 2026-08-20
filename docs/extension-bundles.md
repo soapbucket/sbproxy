@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, provider-neutral event hooks, and AI routing decisions without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -266,13 +266,17 @@ hooks:
     type: acme_authz
     execution:
       body_mode: none
+  - kind: transform
+    type: acme_rewrite
+    execution:
+      body_mode: buffered
 ```
 
-A `runtime: rego` bundle rides the same signing, digest verification, and candidate load-or-refuse flow as every other bundle asset; see [Candidate load and reload](#candidate-load-and-reload). What differs is evaluation: sbproxy compiles the `.rego` module once, at candidate load, on the same [Regorus](https://github.com/microsoft/regorus) interpreter `policy: rego` uses (see [scripting.md](scripting.md)), and proves the pinned query evaluable before the candidate can activate, the same load-time guarantee `entry.js`'s declared exports and `action.wasm`'s module contract already get. A `.rego` module performs no I/O during evaluation, so `runtime: rego` accepts only `kind: policy` hooks, must omit `abi` and `export`, and must declare `execution.body_mode: none`.
+A `runtime: rego` bundle rides the same signing, digest verification, and candidate load-or-refuse flow as every other bundle asset; see [Candidate load and reload](#candidate-load-and-reload). What differs is evaluation: sbproxy compiles the `.rego` module once per hook, at candidate load, on the same [Regorus](https://github.com/microsoft/regorus) interpreter `policy: rego` uses (see [scripting.md](scripting.md)), and proves each pinned query evaluable before the candidate can activate, the same load-time guarantee `entry.js`'s declared exports and `action.wasm`'s module contract already get. A `.rego` module performs no I/O during evaluation, so `runtime: rego` accepts only `kind: policy` and `kind: transform` hooks and must omit `abi` and `export`. A policy hook must declare `execution.body_mode: none`; a transform hook must declare `execution.body_mode: buffered`, because the buffered response body is exactly what it evaluates.
 
 Bundled Rego is v1 only: the manifest has no `rego_v0` flag, so a pre-OPA-1.0 module fails at candidate load with a parse error. This is narrower than the config-inline surfaces: `policy: rego` and the `rego_module`/`rego_module_path` modifier fields both accept `rego_v0: true` for a pasted-in legacy module.
 
-`type:` is the same `sb.yml` attachment name any other policy hook uses. The `query` field pins the rule reference evaluated per request (`data.<package>.<rule>`), defaulting to `data.sbproxy.allow` when omitted, matching `policy: rego`'s own default:
+`type:` is the same `sb.yml` attachment name any other policy or transform hook uses. The `query` field pins the rule reference evaluated per request (`data.<package>.<rule>`). When omitted it follows the hook kind: a policy hook defaults to `data.sbproxy.allow`, matching `policy: rego`'s own default, and a transform hook to `data.sbproxy.transform`:
 
 ```yaml
 hooks:
@@ -286,6 +290,22 @@ hooks:
 The rule reads the same JSON envelope a JavaScript or WASM policy hook reads: `input.request.method`, `input.request.uri`, `input.request.headers`, and `input.config` (the attachment's resolved `vars`, after `config_schema` defaults and `secret_vars` resolution). This is the wire-level request, not the internally resolved `CelContext` `policy: rego` reads from `sb.yml`; a bundle hook never sees trust tier or principal the way a built-in enforcer can. The query must evaluate to a Rego boolean: `true` allows and `false` denies, both with the fixed status and message `policy: rego` itself defaults to. A budget-exceeded, non-boolean-result, or other internal evaluation fault is not a decision, so it does not deny by itself: it reaches the same `failure_posture` handling every other bundle policy hook's fault reaches (`open` admits, `closed` refuses), rather than always denying the way `policy: rego`'s own unconditional fail-closed posture does.
 
 A denial is always a fixed `403` with body `forbidden by policy`. `policy: rego`'s `deny_status`/`deny_message` knobs do not apply inside a bundle.
+
+### Rego transform hooks
+
+A `kind: transform` hook attaches under `transforms[]` by its `type` name, the same way a JavaScript or WASM bundle transform does, and evaluates once per buffered response body. Its input is the transform shape of the same envelope: `input.body.body_base64` (the complete response body, base64), `input.body.content_type`, `input.body.origin`, and `input.config`. The queried rule must evaluate to a base64 string, which becomes the replacement body, bounded by the sandbox's `max_output_bytes`:
+
+```rego
+package sbproxy
+
+transform := base64.encode(upper(base64.decode(input.body.body_base64))) if {
+    input.body.content_type == "text/plain"
+}
+```
+
+A rule that is undefined for an input is the transform declining, and the body passes through unchanged; that is how a conditional rewrite skips the responses it does not care about. Anything else is a fault, not a rewrite: a non-string result, invalid base64, a replacement over `max_output_bytes`, a body over `max_buffer_bytes`, or a budget-exceeded evaluation each fail the transform without touching the body, and reach the same `failure_posture` handling every other bundle transform fault does.
+
+Like every scripted transform surface (`lua`, `lua_json`, `javascript`, `js_json`, and bundle transforms of any runtime), a Rego bundle transform counts as request-dependent for caching, so an origin combining it with `response_cache` is refused at config load; see [transforms.md](transforms.md).
 
 `sbproxy rego test` (see [scripting.md](scripting.md#3a-rego-policies)) is engine-agnostic: it evaluates a fixture's `input` document exactly as authored, so it works as an offline pre-flight for a `.rego` file destined for a bundle just as well as for `policy: rego`. Write the fixture's `input` in the bundle envelope shape above (`input.request.method`, `input.request.uri`, `input.config`), not the `CelContext` shape `policy: rego` fixtures use.
 
@@ -338,17 +358,31 @@ AI hooks receive a provider-neutral event with `schema_version: 1`, a monotonica
 | `ai_guardrail_output` | Canonical buffered assistant text |
 | `ai_stream_event` | Normalized message-start, text-delta, usage, or message-stop chunk |
 | `ai_close` | One terminal summary with finish reason, byte and delta counts, tool-call count, and token usage when known |
+| `ai_failure` | A classified `cause` (`timeout`, `rate_limit`, `context_window_exceeded`, `content_policy`, `auth`, `server_error`, `bad_request`, `unknown`), the upstream `status` when one was received, the `provider` dispatched to, and a bounded, client-safe `message` |
 | `ai_routing` | Not an event. The hook attaches by `type` from a routing policy and answers with a routing plan; see [Routing hooks](#routing-hooks) |
 
 JavaScript and envelope WASM event hooks return `release`, `flag`, `block`, or `mutate`. A `block` carries an HTTP status from 400 through 599 plus a bounded code and client-safe message. A `flag` carries the code and message but does not stop traffic. `enforcement_mode: observe` moves a hook onto a bounded observation lane; the default `block` mode waits for the decision before releasing the corresponding operation or bytes.
 
-A `mutate` rewrites the event's content in place and releases it. The decision carries a bounded `code` and a `body_base64` payload holding the replacement content: plain UTF-8 text for `ai_guardrail_output`, the JSON of the canonical message list for `ai_guardrail_input`, and the JSON of the complete call object for `ai_tool_call`. The host applies the rewrite before the next hook runs, so hooks compose: a redactor followed by a classifier classifies the redacted content. What ships is the rewritten content, spliced back into the provider-shaped body; a rewrite the body shape cannot faithfully carry (for example, one replacement text against a multi-choice completion) refuses the response rather than shipping the original.
+`ai_failure` is the one AI event kind whose verdict is never consulted: the call has already failed, and a hook that blocked here would only turn one error into a different one, so whatever the hook returns is recorded and discarded. `ai_close` and `ai_failure` are also the two payloads `execution.mutates: true` is refused on, since both carry facts about work already finished rather than content a hook could faithfully rewrite:
+
+```yaml
+hooks:
+  - kind: ai_failure
+    type: acme_failure_logger
+    export: onFailure
+```
+
+Today this fires from exactly one call site, gated on `routing.content_policy_fallback` being on for the origin: every `4xx` response from a provider is classified and reported there, on the way to deciding whether it is a content-policy refusal worth retrying against a more permissive provider. Within that gate, most of `AiFailureCause` is reachable in practice: a `408` classifies as `timeout`, a `429` as `rate_limit`, `401`/`403` as `auth`, and `400`/`422` as `context_window_exceeded`, `content_policy`, or `bad_request` depending on the body, with any other `4xx` falling to `unknown`. Only `server_error` (any `5xx`, including a `504` timeout) is structurally unreachable here, because the call site's own gate excludes every status at or above 500. A provider error on an origin that leaves `content_policy_fallback` unset or off never reaches this hook at all, regardless of status. Treat it as a content-policy-fallback-scoped signal, not general upstream-failure observability, until it is wired to more call sites.
+
+A `mutate` rewrites the event's content in place and releases it. The decision carries a bounded `code` and a `body_base64` payload holding the replacement content: plain UTF-8 text for `ai_guardrail_output`, the JSON of the canonical message list for `ai_guardrail_input`, the JSON of the complete call object for `ai_tool_call`, and the JSON of the one stream chunk for `ai_stream_event` (see below). The host applies the rewrite before the next hook runs, so hooks compose: a redactor followed by a classifier classifies the redacted content. What ships is the rewritten content, spliced back into the provider-shaped body; a rewrite the body shape cannot faithfully carry (for example, one replacement text against a multi-choice completion) refuses the response rather than shipping the original.
 
 A rewritten tool call replaces the held argument fragments with one canonical frame carrying the whole call. Three rewrites refuse as unrepresentable: a changed `index` (the call's identity is host-owned), `arguments_json` that does not parse as JSON (the frame carries it into a field clients parse), and any rewrite of a call whose assembled arguments were truncated at the stream buffer cap, because an edit of a prefix must not ship as if it were the whole value.
 
 The input splice is content-only. The canonical message list is a lossy view (it carries no tool calls, drops non-text content parts, and folds provider role spellings), so the host never rebuilds the body from it: the original request stays authoritative, and only the text of messages the rewrite actually changed lands back in its original slot. Tool calls, images, and role spellings on untouched messages survive byte for byte. A rewrite that adds, removes, reorders, or relabels messages, or changes a message whose content has more than one text part, refuses as unrepresentable.
 
-Mutation is declared, not inferred. A hook may return `mutate` only when its manifest entry sets `execution.mutates: true`, which is accepted on `ai_guardrail_input`, `ai_guardrail_output`, and `ai_tool_call` hooks; declaring it elsewhere, or combining it with `enforcement_mode: observe` (whose decisions are discarded), refuses at config load. An undeclared or oversized rewrite (the payload is capped by `sandbox.max_buffer_bytes`) is an engine fault handled under the bundle's failure posture: refused under `closed`, released unmodified under an admitting posture. Identity fields such as `sequence` and `request_id` are host-owned and cannot be rewritten.
+Mutation is declared, not inferred. A hook may return `mutate` only when its manifest entry sets `execution.mutates: true`, which is accepted on `ai_guardrail_input`, `ai_guardrail_output`, `ai_tool_call`, and `ai_stream_event` hooks; declaring it elsewhere, or combining it with `enforcement_mode: observe` (whose decisions are discarded), refuses at config load. An undeclared or oversized rewrite (the payload is capped by `sandbox.max_buffer_bytes`) is an engine fault handled under the bundle's failure posture: refused under `closed`, released unmodified under an admitting posture. Identity fields such as `sequence` and `request_id` are host-owned and cannot be rewritten.
+
+A mutating `ai_stream_event` hook may only rewrite a content-delta chunk's text, and only the exact index it was shown; the host tracks what each hook saw and diffs the returned text against it, so an echoing hook (`text` unchanged) costs nothing downstream. Rewriting a `message_start`, `usage`, `message_stop`, or tool-call chunk is refused rather than silently dropped, because those numbers feed cost tracking, the budget path, and the metering ledger, and a hook that could rewrite them could rewrite a bill through a surface that looks like content moderation. A stream rewrite reaches the client on both the translated and passthrough response lanes: it is spliced into the parsed chunk on the translate lane and substituted inside the raw upstream bytes on the passthrough lane, so a client sees the same rewritten text regardless of which wire format it asked for.
 
 ### Routing hooks
 
@@ -412,6 +446,24 @@ For a `started` outcome, a blocking hook returns `continue` or `reject` before t
 ## Candidate load and reload
 
 Startup, `sbproxy validate`, `sbproxy doctor <config>`, the file watcher, `SIGHUP`, and `POST /admin/reload` all build a candidate before publication. Candidate construction checks the source path, manifest, declared digest at its declared scope, hook collisions, config schemas, JavaScript or TypeScript exports, and WASM module contract. The running registry and pipeline generation swap together only after every required check succeeds.
+
+```mermaid
+flowchart TD
+    Trigger["Startup, sbproxy validate,\nsbproxy doctor, file watcher,\nSIGHUP, or POST /admin/reload"] --> Source
+    Source["Resolve the source:\nlocal bundles_dir or a\nverified Git checkout"] --> GitPin{"Git source: mutable\nrevision requested?"}
+    GitPin -->|yes, verify_signature off| Reject
+    GitPin -->|pinned SHA, or a\nverified tag/commit| Manifest
+    Manifest["Parse bundle.yaml:\nruntime, hooks, permissions"] --> Digest{"sha256 matches the\ndeclared digest_scope?"}
+    Digest -->|mismatch, or missing\non a Git source| Reject["Reject the candidate.\nPrevious generation\nkeeps serving."]
+    Digest -->|match| Grants{"Every declared\nnet:outbound destination\ngranted in extensions.grants?"}
+    Grants -->|declared without a\nmatching grant| Reject
+    Grants -->|ok| Preflight["Preflight the entry:\nJS/TS exports, WASM module\ncontract, or Rego query"]
+    Preflight -->|missing export, bad\nmodule, unsafe Rego| Reject
+    Preflight -->|ok| Collision{"Hook type collides with a\nbuilt-in, plugin, or\nanother bundle?"}
+    Collision -->|yes| Reject
+    Collision -->|no| Publish["Swap the registry and\npipeline generation atomically"]
+    Publish --> Running["GET /api/extensions reports\nthe new running generation"]
+```
 
 If a bundle edit has a bad digest, syntax error, missing export, unsupported import, invalid WASM module, or conflicting hook name, reload rejects that candidate and the prior generation keeps serving. No hook from a rejected candidate leaks into the running registry.
 

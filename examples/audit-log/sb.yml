@@ -21,7 +21,7 @@
 #
 # Then trigger a state-mutating admin call (the canonical audited
 # verb is `reload`):
-#   curl -s -X POST -u admin:demo http://127.0.0.1:9090/admin/reload
+#   curl -s -X POST -u admin:demo-change-me http://127.0.0.1:9090/admin/reload
 #
 # Watch stdout: one access-log line for the reload request itself,
 # plus one audit envelope (json, target_kind: admin) for the

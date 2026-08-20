@@ -1,5 +1,5 @@
 # Bulk redirects
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 ![/old/about answered with a 301 from a CSV row and a shop path answered 308 from an inline row](assets/bulk-redirects.gif)
 
@@ -17,7 +17,7 @@ hash hit on the redirect dispatch path.
 |------------------|---------------|
 | `inline` | YAML rows embedded directly in the config under `rows:`. |
 | `file` | A local file. CSV when the path ends in `.csv`, YAML otherwise. |
-| `url` | An HTTPS URL fetched once at startup. CSV/YAML by URL extension or explicit `format:`. The proxy refuses HTTP because list contents drive 30x responses. |
+| `url` | An HTTPS URL fetched once at startup. CSV/YAML by URL extension or explicit `format:`. A plain `http://` URL is refused because list contents drive 30x responses. |
 
 ```yaml
 origins:
@@ -149,11 +149,31 @@ Lists never cross origins. Two origins can declare lists with
 overlapping paths and no row leaks; each origin's compiled table is
 scoped to its hostname.
 
+## If the list fails to load
+
+A `file` source that cannot be read, a `url` source that cannot be
+fetched (including a plain `http://` URL, refused before the request
+is made), or a CSV/YAML body that fails to parse does not fail config
+load and does not stop the proxy from starting. The action logs a
+`WARN` naming the error and falls back to behaving like a plain
+single-target redirect: the compiled lookup table is empty, so every
+request falls straight through to the action's `url:` (or to `404`
+when `url:` is also unset). Nothing else on the origin is affected.
+
+That means a typo'd file path or an unreachable list URL is silent at
+the HTTP layer: the origin comes up healthy and answers every request
+with the fallback, not with an error. Watch the proxy's startup log
+for `bulk_list failed to load` rather than relying on the origin's
+own responses to catch it.
+
 ## Reload
 
 The list reloads on the next config swap. There is no per-row hot
 reload; redeploy the config to pick up new rows. URL-backed lists
-re-fetch on each config compile.
+re-fetch on each config compile, so the same silent-fallback behavior
+applies to a URL that goes unreachable between reloads: the prior
+in-memory table is not kept, and a subsequent reload has to reach the
+source again to get rows back.
 
 ## Performance
 

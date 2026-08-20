@@ -2,22 +2,36 @@
 //!
 //! The Responses API (`POST /v1/responses`) is OpenAI's stateful
 //! conversation surface. It overlaps heavily with Chat Completions but
-//! introduces three wrinkles the hub has to handle:
+//! introduces wrinkles the hub has to handle:
 //!
 //!   * `input` may be a plain string (single user turn), an array of
 //!     content parts (single user turn with multimodal content), or an
 //!     array of `{role, content}` items (a full conversation). All
 //!     three shapes flatten to a `HubRequest::messages` list.
-//!   * `instructions` is the Responses-flavoured `system` prompt.
-//!   * `previous_response_id` points at a prior conversation. The
-//!     stateful conversation handling is parked as an open question in
-//!     the ADR; for v1 we surface the id on the bridge context so any
-//!     stateful expansion can plug in later, but the hub itself remains
-//!     stateless.
+//!   * `instructions` is the Responses-flavored `system` prompt.
+//!   * `previous_response_id` and `conversation` reference server-side
+//!     state this gateway does not hold, and `store: true` asks it to
+//!     create such state. All three are refused with a 400 rather than
+//!     silently served without the state they name (WOR-2511 ruling;
+//!     a real conversation store is WOR-2514's evaluation). `store:
+//!     false` is honored as-is: the stateless translation persists
+//!     nothing, which is exactly what it asks for.
+//!   * `prompt` references a server-side prompt template the gateway
+//!     does not resolve yet; it is dropped with a `LossinessNote`
+//!     because a bridge onto the gateway prompt store is planned
+//!     (WOR-2514) rather than ruled out.
+//!   * `tools`: `function` tools are forwarded, in both the
+//!     Responses-native flat shape and the Chat-style nested shape.
+//!     Any other tool block records a `LossinessNote` naming the
+//!     dropped type (WOR-2512), except `mcp`, which is refused with a
+//!     400 because it asks the provider to dial an MCP server the
+//!     gateway never sees (WOR-2513 ruling).
 //!
 //! Outbound shape is the Responses response object: `output` array of
 //! typed items wrapping the assistant message; `usage.input_tokens`
-//! and `usage.output_tokens`. Streaming is deferred to WOR-226.
+//! and `usage.output_tokens`. Streaming is implemented:
+//! `from_hub_stream` re-emits hub chunks as typed `response.*` SSE
+//! frames via `hub_chunk_to_responses_sse`.
 
 use serde_json::{json, Map, Value};
 
@@ -67,7 +81,67 @@ impl ChatFormat for OpenAiResponsesFormat {
             ..Default::default()
         };
 
-        // `instructions` is the Responses-flavoured system prompt.
+        // WOR-2511 ruling: the gateway keeps no response state, so a
+        // stateful-join request would silently run without the turns it
+        // references. Refuse instead; silent context loss is the worse
+        // failure. A JSON null is an SDK serializing an unset optional,
+        // not a join request.
+        if obj
+            .get("previous_response_id")
+            .is_some_and(|v| !v.is_null())
+        {
+            return Err(ChatError::bad_request(
+                "previous_response_id is not supported: this gateway does not \
+                 store response state, so the turns it references would be \
+                 silently missing; resend the full conversation history in \
+                 'input' instead",
+            ));
+        }
+
+        // Same ruling for a conversation reference (string id or
+        // {"id": ...} object): it names upstream conversation state the
+        // translation to Chat Completions destroys.
+        if obj.get("conversation").is_some_and(|v| !v.is_null()) {
+            return Err(ChatError::bad_request(
+                "conversation is not supported: this gateway does not store \
+                 conversation state, so the conversation it references would \
+                 be silently missing; resend the full conversation history in \
+                 'input' instead",
+            ));
+        }
+
+        // store: true asks for a retrievable server-side response that
+        // will never exist once the request is translated; the returned
+        // id would be a dangling reference. store: false asks for
+        // nothing to be persisted, which the stateless translation
+        // delivers exactly, so it passes.
+        match obj.get("store") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+            Some(_) => {
+                return Err(ChatError::bad_request(
+                    "store is not supported: this gateway keeps no response \
+                     state, so a stored response could never be retrieved; \
+                     omit store or send store: false and keep conversation \
+                     history client-side",
+                ));
+            }
+        }
+
+        // A prompt template reference is dropped with a note rather than
+        // refused: bridging it onto the gateway prompt store is planned
+        // (WOR-2514), and the request still carries its own input.
+        if obj.get("prompt").is_some_and(|v| !v.is_null()) {
+            hub.lossiness.push(super::LossinessNote {
+                field: "responses.prompt".into(),
+                direction: super::LossinessDirection::Unsupported,
+                note: "prompt template reference dropped: the gateway does \
+                       not resolve server-side prompt objects, so the request \
+                       runs without the referenced template"
+                    .into(),
+            });
+        }
+
+        // `instructions` is the Responses-flavored system prompt.
         if let Some(instr) = obj.get("instructions").and_then(|v| v.as_str()) {
             hub.system = Some(instr.to_string());
         }
@@ -118,10 +192,20 @@ impl ChatFormat for OpenAiResponsesFormat {
             }
         }
 
-        // Tools share the OpenAI Chat shape.
+        // Tools: `function` tools are forwarded, whether they arrive in
+        // the Responses-native flat shape ({"type": "function", "name":
+        // ...}) or the Chat-style nested shape ({"function": {...}}).
+        // Everything else is unsupported: `mcp` is refused (WOR-2513),
+        // and every other type records a lossiness note naming what was
+        // dropped (WOR-2512). Nothing falls through silently.
         if let Some(arr) = obj.get("tools").and_then(|v| v.as_array()) {
             for t in arr {
-                if let Some(fobj) = t.get("function").and_then(|f| f.as_object()) {
+                let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(fobj) = t
+                    .get("function")
+                    .and_then(|f| f.as_object())
+                    .or_else(|| (ty == "function").then_some(t.as_object()).flatten())
+                {
                     hub.tools.push(HubToolDefinition {
                         name: fobj
                             .get("name")
@@ -135,28 +219,43 @@ impl ChatFormat for OpenAiResponsesFormat {
                             .to_string(),
                         parameters: fobj.get("parameters").cloned().unwrap_or(Value::Null),
                     });
+                } else if ty == "mcp" {
+                    // WOR-2513 ruling: an embedded mcp tool block asks
+                    // the model provider to contact an MCP server
+                    // directly, bypassing the gateway's governed MCP
+                    // surface (RBAC, sessions, audit, egress inventory).
+                    // Fail closed. The message deliberately does not
+                    // echo server_url or server_label: the URL can carry
+                    // credentials.
+                    return Err(ChatError::bad_request(
+                        "tools: type 'mcp' is not supported: it asks the model \
+                         provider to contact an MCP server directly, bypassing \
+                         this gateway's MCP governance; front the server with \
+                         an origin whose action is 'type: mcp' and point the \
+                         client at that origin instead",
+                    ));
+                } else {
+                    // WOR-2512: every unsupported tool block leaves a
+                    // trace naming what was dropped.
+                    let label = tool_type_label(ty);
+                    hub.lossiness.push(super::LossinessNote {
+                        field: format!("responses.tools.{label}"),
+                        direction: super::LossinessDirection::Unsupported,
+                        note: format!(
+                            "unsupported Responses tool type '{label}' dropped: \
+                             only function tools are forwarded upstream"
+                        ),
+                    });
                 }
             }
         }
 
-        let mut ctx = BridgeContext {
+        let ctx = BridgeContext {
             inbound_format: self.id().into(),
             inbound_path: "/v1/responses".into(),
             stream: hub.stream,
             ..Default::default()
         };
-        if let Some(prev) = obj.get("previous_response_id").and_then(|v| v.as_str()) {
-            ctx.extras.insert(
-                "responses.previous_response_id".into(),
-                Value::String(prev.to_string()),
-            );
-            hub.lossiness.push(super::LossinessNote {
-                field: "responses.previous_response_id".into(),
-                direction: super::LossinessDirection::Unsupported,
-                note: "stateful conversation join is not yet implemented (WOR-226 follow-up)"
-                    .into(),
-            });
-        }
         Ok((hub, ctx))
     }
 
@@ -259,6 +358,26 @@ pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
             vec![format!("event: response.completed\ndata: {body}\n\n")]
         }
     }
+}
+
+/// Sanitize a client-supplied tool `type` string for use in a
+/// `LossinessNote` field and the warn log: anything outside
+/// `[A-Za-z0-9_.-]` becomes `_`, the empty string becomes `unknown`,
+/// and the result is capped at 64 characters.
+fn tool_type_label(ty: &str) -> String {
+    if ty.is_empty() {
+        return "unknown".to_string();
+    }
+    ty.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
@@ -402,6 +521,15 @@ pub fn translate_openai_response_to_responses(body: &[u8]) -> Vec<u8> {
 /// router, guardrails, and translator pipeline run unchanged.
 pub fn translate_responses_request_to_openai(body: &[u8]) -> Result<Vec<u8>, ChatError> {
     let (hub, _ctx) = OpenAiResponsesFormat.to_hub(body)?;
+    // Nothing downstream reads `hub.lossiness` on this path, so the
+    // warn log is what makes each drop observable to an operator.
+    for note in &hub.lossiness {
+        tracing::warn!(
+            field = %note.field,
+            note = %note.note,
+            "AI proxy: /v1/responses request field dropped in translation"
+        );
+    }
     Ok(hub_request_to_openai_bytes(&hub))
 }
 
@@ -584,15 +712,317 @@ mod tests {
     }
 
     #[test]
-    fn previous_response_id_records_lossiness_note() {
+    fn previous_response_id_is_refused_with_400() {
+        // WOR-2511: the gateway holds no response state, so honoring the
+        // request would silently run without the turns it references.
+        // Refusal is the ruling; silent context loss is the worse failure.
         let req = json!({
             "model": "gpt-4o",
             "input": "hi",
             "previous_response_id": "resp_old"
         });
-        let (hub, ctx) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
-        assert!(ctx.extras.contains_key("responses.previous_response_id"));
-        assert!(!hub.lossiness.is_empty());
+        let err = fmt().to_hub(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(
+            err.message().contains("previous_response_id"),
+            "refusal must name the field: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("input"),
+            "refusal must point at the working alternative: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn previous_response_id_null_is_not_a_join_request() {
+        // SDKs that serialize unset optionals as null are not asking for
+        // a stateful join; only a real value is.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "previous_response_id": null
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.messages.len(), 1);
+        assert!(hub.lossiness.is_empty());
+    }
+
+    #[test]
+    fn conversation_reference_is_refused_with_400() {
+        // Same ruling as previous_response_id: the field references
+        // upstream-stored conversation state the gateway does not hold.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "conversation": "conv_123"
+        });
+        let err = fmt().to_hub(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(
+            err.message().contains("conversation"),
+            "refusal must name the field: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn conversation_object_reference_is_refused_with_400() {
+        // The field also arrives as {"id": ...}; both shapes are a join
+        // request.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "conversation": {"id": "conv_123"}
+        });
+        let err = fmt().to_hub(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.message().contains("conversation"), "{}", err.message());
+    }
+
+    #[test]
+    fn prompt_template_records_lossiness_note() {
+        // A prompt object references a server-side template this gateway
+        // does not resolve yet; the drop is noted, not refused, because a
+        // bridge onto the gateway prompt store is planned.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "prompt": {"id": "pmpt_1", "version": "2", "variables": {"city": "SF"}}
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "responses.prompt");
+        assert_eq!(
+            hub.lossiness[0].direction,
+            super::super::LossinessDirection::Unsupported
+        );
+    }
+
+    #[test]
+    fn store_true_is_refused_with_400() {
+        // store: true asks for a retrievable server-side response that
+        // will never exist once the request is translated to Chat
+        // Completions; the returned id would be a dangling reference.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "store": true
+        });
+        let err = fmt().to_hub(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.message().contains("store"), "{}", err.message());
+    }
+
+    #[test]
+    fn store_false_is_honored_without_note() {
+        // store: false asks for nothing to be persisted, which the
+        // stateless translation delivers exactly; no loss to report.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "store": false
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.lossiness.is_empty());
+        assert_eq!(hub.messages.len(), 1);
+    }
+
+    #[test]
+    fn file_search_tool_block_records_lossiness_note() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.tools.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        let note = &hub.lossiness[0];
+        assert_eq!(note.field, "responses.tools.file_search");
+        assert_eq!(
+            note.direction,
+            super::super::LossinessDirection::Unsupported
+        );
+        assert!(note.note.contains("file_search"), "{}", note.note);
+    }
+
+    #[test]
+    fn web_search_preview_tool_block_records_lossiness_note() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.tools.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "responses.tools.web_search_preview");
+    }
+
+    #[test]
+    fn code_interpreter_tool_block_records_lossiness_note() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.tools.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "responses.tools.code_interpreter");
+    }
+
+    #[test]
+    fn image_generation_tool_block_records_lossiness_note() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "image_generation"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.tools.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "responses.tools.image_generation");
+    }
+
+    #[test]
+    fn unknown_tool_block_records_lossiness_note() {
+        // The catchall: a type this parser has never heard of still gets
+        // named rather than silently vanishing.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "computer_use_preview", "display_width": 1024}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.tools.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(
+            hub.lossiness[0].field,
+            "responses.tools.computer_use_preview"
+        );
+    }
+
+    #[test]
+    fn typeless_tool_block_records_lossiness_note() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"vector_store_ids": ["vs_1"]}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.tools.is_empty());
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "responses.tools.unknown");
+    }
+
+    #[test]
+    fn tool_type_label_is_sanitized_for_logs() {
+        // The type string is client-controlled and lands in the note
+        // field and the warn log; hostile characters must not pass
+        // through verbatim.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "we ird\ntype!"}]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.lossiness.len(), 1);
+        assert_eq!(hub.lossiness[0].field, "responses.tools.we_ird_type_");
+    }
+
+    #[test]
+    fn mcp_tool_block_is_refused_with_400() {
+        // WOR-2513: an embedded mcp tool block asks the provider to dial
+        // an MCP server the gateway never sees. Fail closed and point at
+        // the governed mcp action instead.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{
+                "type": "mcp",
+                "server_label": "internal",
+                "server_url": "https://mcp.internal.example/sse?key=s3cret"
+            }]
+        });
+        let err = fmt().to_hub(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.message().contains("mcp"), "{}", err.message());
+        // The refusal must not echo the caller-supplied server URL: it
+        // can carry credentials in query parameters.
+        assert!(
+            !err.message().contains("mcp.internal.example"),
+            "refusal echoed the server URL: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn responses_native_flat_function_tool_parses() {
+        // The Responses wire shape carries function tools flat
+        // ({"type": "function", "name": ...}), not nested under a
+        // "function" key the way Chat Completions does.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Weather lookup.",
+                "parameters": {"type": "object"}
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.tools.len(), 1);
+        assert_eq!(hub.tools[0].name, "get_weather");
+        assert_eq!(hub.tools[0].description, "Weather lookup.");
+        assert!(hub.lossiness.is_empty());
+    }
+
+    #[test]
+    fn chat_style_nested_function_tool_parses_without_note() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Weather lookup.",
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.tools.len(), 1);
+        assert_eq!(hub.tools[0].name, "get_weather");
+        assert!(hub.lossiness.is_empty());
+    }
+
+    #[test]
+    fn mixed_tools_forward_functions_and_note_the_rest() {
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "function": {"name": "a", "description": "", "parameters": {}}},
+                {"type": "file_search"},
+                {"type": "web_search_preview"}
+            ]
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.tools.len(), 1);
+        assert_eq!(hub.tools[0].name, "a");
+        let fields: Vec<&str> = hub.lossiness.iter().map(|n| n.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec![
+                "responses.tools.file_search",
+                "responses.tools.web_search_preview"
+            ]
+        );
     }
 
     #[test]
@@ -619,6 +1049,20 @@ mod tests {
         assert_eq!(out["output"][0]["type"], "message");
         assert_eq!(out["output"][0]["content"][0]["text"], "hello");
         assert_eq!(out["usage"]["input_tokens"], 4);
+    }
+
+    #[test]
+    fn translate_seam_propagates_refusals() {
+        // The dispatch shim calls translate_responses_request_to_openai,
+        // not to_hub directly; the refusal has to survive that seam.
+        let req = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "mcp", "server_label": "x", "server_url": "https://mcp.example/sse"}]
+        });
+        let err = translate_responses_request_to_openai(req.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.message().contains("mcp"), "{}", err.message());
     }
 
     #[test]

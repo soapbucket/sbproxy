@@ -1,11 +1,25 @@
 # Routing Strategies
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-19*
 
 The `RoutingStrategy` trait is an extension point for custom upstream selection in a `load_balancer` action. It lives in `sbproxy-modules::action::routing`. The trait runs synchronously on the request hot path, receives already-projected request and target state, and returns the index of a chosen eligible target or `None` to use the configured `algorithm`.
 
 The built-in algorithms (`round_robin`, `weighted_random`, `least_connections`, `ip_hash`, `uri_hash`, `header_hash`, `cookie_hash`, and `ring_hash`) remain fallback selectors. When `strategy` names a registered strategy, the production action compiles it once and consults it before `algorithm` on every request. `lb_method: plugin` is an accepted compatibility marker and requires `strategy`; `strategy` is the field that selects and compiles the registered implementation.
 
 Before a strategy runs, the load balancer applies deployment-mode, backup, priority, active-health, circuit-breaker, and outlier-ejection filters. A strategy sees only that eligible slice. If every active target was filtered out, the load balancer uses its existing last-resort fallback rather than asking a strategy to bypass health filters.
+
+```mermaid
+flowchart TD
+    A[Request arrives at a load_balancer action] --> B["Filter targets: deployment mode, backup,\npriority, active health, circuit breaker,\noutlier ejection"]
+    B --> C{Any eligible target left?}
+    C -->|no| D["Last-resort fallback: bypass the filters"]
+    C -->|yes| E{"strategy configured?"}
+    E -->|no| F["Run algorithm directly\n(round_robin, least_connections, ring_hash, ...)"]
+    E -->|yes| G["RoutingStrategy::select(request, eligible targets)"]
+    G -->|Some index| H[Dispatch to that target]
+    G -->|None| F
+    F --> H
+    D --> H
+```
 
 ## Configuration
 
@@ -226,15 +240,9 @@ curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.
 
 `docker compose down -v` tears it down.
 
-## Examples in Practice
+## Examples in practice
 
-To see various routing strategies in action, consult these runnable examples:
-
-| Example | What it is | How to use it | Outcome |
-|---------|------------|---------------|---------|
-| [`load-balancer-deployment`](../examples/load-balancer-deployment/) | Advanced LB topologies. | Configure `upstream` blocks. | Sophisticated load balancing across clusters. |
-| [`error-pages`](../examples/error-pages/) | Custom error pages. | Set `error_pages` mapping in config. | Friendly, branded HTML responses on 503s or 404s. |
-| [`grpc-h2c`](../examples/grpc-h2c/) | gRPC over cleartext HTTP/2. | Set `protocol: h2c`. | Seamless gRPC proxying without TLS termination overhead. |
-| [`headers-and-cors`](../examples/headers-and-cors/) | Manage CORS and HTTP headers. | Use `cors:` and `headers:` blocks. | Secure, standard-compliant browser API access. |
-| [`request-limit`](../examples/request-limit/) | Concurrency limits. | Configure `concurrent_requests` cap. | Sheds load dynamically during traffic spikes to protect upstream servers. |
-| [`response-cache-per-origin-keys`](../examples/response-cache-per-origin-keys/) | Cache isolation by origin. | Add origin variables to your cache key. | Prevents cache poisoning across multitenant platforms. |
+| Example | Strategy | What it shows |
+|---|---|---|
+| [`examples/routing-strategies/`](../examples/routing-strategies/) | `gpu-aware`, `lora-aware` | Two upstreams that report their own name, so the picked target is visible; the "Watching a strategy choose" walkthrough above uses this fixture. |
+| [`examples/lora-aware-routing/`](../examples/lora-aware-routing/) | `lora-aware` | A three-target `sb.yml` with `metadata.loaded_adapters`, standalone from the docker-compose fixture. |

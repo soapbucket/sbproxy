@@ -1,15 +1,18 @@
 # Getting started
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-19*
 
 This walkthrough runs one local upstream through three gateway configurations. It needs SBproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
 
 On Windows, run the commands in Git Bash, or replace `curl` with `curl.exe` in PowerShell: the bare name is an alias for `Invoke-WebRequest` there and rejects flags like `-H`.
 
-SBproxy currently binds its data listener to all host interfaces. Run this
-walkthrough on a trusted development machine or behind a host firewall. The
-commands connect through `127.0.0.1`, and the cleanup section stops both
-listeners when you finish.
+SBproxy binds its data listener to all host interfaces (`0.0.0.0`) by
+default. Run this walkthrough on a trusted development machine or behind a
+host firewall. The commands connect through `127.0.0.1`, and the cleanup
+section stops both listeners when you finish. To bind to loopback only,
+set `proxy.bind_address: "127.0.0.1"` in the config; it applies to both
+`http_bind_port` and `https_bind_port` together, so one setting cannot
+leave HTTPS open while HTTP is closed.
 
 Install SBproxy first if `sbproxy --version` does not print a version:
 

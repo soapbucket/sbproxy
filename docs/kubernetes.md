@@ -1,12 +1,41 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-19*
 
 The Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
 If this is your first production bring-up, start with
 [`quickstart-operator.md`](quickstart-operator.md). This page is the longer
 reference for CRDs, hot reload, leader election, and local smoke testing.
+
+## The reconcile loop
+
+Every pass over one `SBProxy` follows the same shape, whether it was triggered by a watch event or the 300s belt-and-braces requeue. Only the leader replica runs it (see [Leader election](#leader-election)); the two checks that can stop a rollout before it touches a workload, `sbproxy validate` on the embedded `sb.yml` and the multi-replica ACME guard, both patch `status.lastError` and requeue rather than erroring the reconcile:
+
+```mermaid
+flowchart TD
+    Watch["Watch event or 300s requeue\n(leader replica only)"] --> Fetch["Fetch the referenced SBProxyConfig"]
+    Fetch --> Validate{"sbproxy validate the\nembedded sb.yml?"}
+    Validate -->|invalid| Status1["Patch status.lastError\nrequeue in 60s, no rollout"]
+    Validate -->|valid| AcmeCheck{"replicas > 1 and ACME on a\npod-local store (redb / sqlite /\nmemory / omitted)?"}
+    AcmeCheck -->|yes| Status1
+    AcmeCheck -->|no| Render["Render sb.yml: clustered adds\nproxy.cluster, non-clustered\nships it verbatim"]
+    Render --> Hash["Hash the rendered body,\nclear status.lastError"]
+    Hash --> Apply["Apply ConfigMap + Service\nunconditionally"]
+    Apply --> Shape{"spec.clustering.enabled?"}
+    Shape -->|no| GCSts["Delete any leftover StatefulSet\n+ headless Service"]
+    Shape -->|yes| GCDeploy["Delete any leftover Deployment"]
+    GCSts --> HotCheck{"adminAuthSecretRef set, a\nDeployment already exists, and\nonly the config changed?"}
+    HotCheck -->|yes| HotReload["POST /admin/reload\nto every pod IP"]
+    HotCheck -->|no| RolloutD["Patch Deployment: config-hash\nannotation triggers a rolling restart"]
+    HotReload -->|any pod fails| RolloutD
+    HotReload -->|all pods ok| Requeue["Requeue in 300s"]
+    RolloutD --> Requeue
+    GCDeploy --> StsApply["Apply shared-key Secret, headless\nService, StatefulSet (a cluster\ntopology change always rolls)"]
+    StsApply --> Requeue
+```
+
+Config-only changes prefer the hot-reload branch; a cluster-topology change (replica count, ports, flipping `clustering.enabled`) always takes the rollout path, because those are process-owned identity and never swap on a live reload. See [Hot-reload (recommended)](#hot-reload-recommended) and [Clustered proxies](#clustered-proxies) below for what each branch actually does to the pods.
 
 ## Install the chart
 

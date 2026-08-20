@@ -1,6 +1,6 @@
 # Agent Skills v0.2.0
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 SBproxy serves an Agent Skills v0.2.0 discovery manifest at
 `/.well-known/agent-skills/index.json`. Cooperative agents fetch the
@@ -147,14 +147,14 @@ manifest. The advertised URL is the absolute URL of the origin's
 
 ```json
 {
-  "protocol_version": "2025-06-18",
+  "protocolVersion": "2025-06-18",
   "capabilities": {
     "tools": {},
     "experimental": {
       "agentSkillsUrl": "https://api.example.com/.well-known/agent-skills/index.json"
     }
   },
-  "server_info": { "name": "sbproxy-mcp", "version": "1.0" }
+  "serverInfo": { "name": "sbproxy-mcp", "version": "1.0" }
 }
 ```
 

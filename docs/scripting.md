@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -59,7 +59,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `origins.<host>.response_cache.key_event`, field `source` | Lua or JavaScript | Returns `{vary, skip_lookup, reason}` before the cache lookup; adds dimensions to the cache key |
 | `origins.<host>.response_cache.admit_event`, field `source` | Lua or JavaScript | Returns `{store, ttl_secs, reason}` once the response body is complete; decides whether it is stored |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
-| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` only) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` hook reads `input.request.*` and `input.config` and returns a Rego boolean |
+| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, envelope WASM, or Rego (`policies[]` and `transforms[]`) | Uses a typed, versioned JSON envelope and the hook's `type` name; a `runtime: rego` policy hook reads `input.request.*` and `input.config` and returns a Rego boolean, and a `runtime: rego` transform hook reads `input.body.*` and `input.config` and returns a base64 string replacement body (or is undefined to decline) |
 | `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
 | `mcp` action `federated_servers[].argument_policies[]` / `result_policies[]` | CEL or Rego | Allow/deny over one tool call's `mcp.*` context, before dispatch (arguments) and after it (result); see the context note below the table |
 | `federated_servers[] type: local`, step `condition` | CEL | Boolean gate per DAG step, same `mcp.*` vocabulary as the argument policies; an expression that fails to evaluate fails the tool call closed ([mcp-compose.md](mcp-compose.md)) |
@@ -627,7 +627,7 @@ Reach for it to run a policy pasted from an older OPA install rather than rewrit
 
 ### `print()` capture
 
-A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior of Rego evaluation itself, not something each call site opts into, so it covers every surface that compiles a Rego module: `policy: rego`, `ai_routing_policy` `engine: rego`, a [request/response modifier's](#rego-modifiers) `rego_module`, and a signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook.
+A `print()` call inside a policy never reaches the process's stderr. It is gathered per evaluation and logged through `tracing` at INFO under the `rego_print` target, one event per call, carrying the policy's site, its query, and the tenant the evaluated request resolved to (empty when none). Nothing needs to be configured; this is the default behavior of Rego evaluation itself, not something each call site opts into, so it covers every surface that compiles a Rego module: `policy: rego`, `ai_routing_policy` `engine: rego`, a [request/response modifier's](#rego-modifiers) `rego_module`, and a signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy and transform hooks.
 
 ### Rego modifiers
 
@@ -1203,7 +1203,7 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **`admit_event` runs downstream of `cacheable_status`.** It only sees a response whose status already passed that gate, so it can decline a status the gate allows and cannot start caching one the gate excludes.
 
-**`admit_event` and `stale_while_revalidate` do not compose.** The revalidation refresh runs in the background with no request context, so it cannot evaluate the event and would write back with the static `ttl_secs`, reverting both the override and any refusal. Setting both on one origin fails config compile until the refresh can carry the event's context.
+**`admit_event` and `stale_while_revalidate` compose.** The revalidation refresh runs the event against the response it just fetched, from the same small request-side scope the initial request used, so an override or a refusal from `admit_event` still applies to what the background refresh writes back. The two were refused together before this evaluation path existed; that restriction is gone.
 
 Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation. Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose: `cache.admit` fails open, so it records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`, while `cache.key` fails closed on the cache and records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, with no fail-open counter. The field-level reference for the block is in [configuration.md](configuration.md#response-cache).
 
@@ -1413,7 +1413,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | `response_cache.key_event` | An `engine` of `cel` or `wasm`, any other unknown engine, or an empty `source` fails config compile; an engine fault or a document that cannot be decoded is logged and bypasses the cache for that request, with no read and no write |
-| `response_cache.admit_event` | The same config-compile checks, plus a refusal when the origin also sets `stale_while_revalidate`; an engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
+| `response_cache.admit_event` | The same config-compile checks; composes with `stale_while_revalidate` (the background refresh runs the event too). An engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
 | JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate. |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
 | Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |

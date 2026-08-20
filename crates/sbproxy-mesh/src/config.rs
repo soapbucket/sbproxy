@@ -96,6 +96,8 @@ pub struct MeshConfig {
     pub seed_peers: Vec<String>,
 
     /// Optional peer discovery backends (Kubernetes, DNS, cloud, Consul).
+    /// See [`DiscoveryConfig`] for the current reachability caveat
+    /// (WOR-2546).
     #[serde(default)]
     pub discovery: DiscoveryConfig,
 
@@ -318,9 +320,14 @@ impl Default for MeshFederationConfig {
 
 // --- DiscoveryConfig ---
 
-/// Union of all supported discovery backends. All fields are optional; any
-/// combination may be configured and will be tried in order by the bootstrap
-/// routine.
+/// Union of all supported discovery backends. All fields are optional and,
+/// if this struct were wired up, any combination could be configured and
+/// tried in order by the bootstrap routine. It is not wired up today
+/// (WOR-2546): `sbproxy-config`'s `ClusterConfig` has no `discovery` field
+/// reachable from `sb.yml`, and `SystemClusterBootstrap::bootstrap` in
+/// `sbproxy-core/src/cluster.rs` constructs only `SeedDiscovery`. These
+/// backend structs exist and deserialize correctly but nothing in this
+/// workspace's config path can currently reach them.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DiscoveryConfig {
     /// Kubernetes API-based peer discovery, when configured.

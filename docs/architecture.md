@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -735,7 +735,7 @@ LRU eviction policy are configured independently.
 
 Response cache keys are built as
 `workspace:hostname:method:path:canonical_query:vary_fp`, where `canonical_query` is the
-query string canonicalised under the origin's query mode and `vary_fp` is a fingerprint of
+query string canonicalized under the origin's query mode and `vary_fp` is a fingerprint of
 the configured `vary` header values. The leading workspace segment prevents cross-tenant
 collisions when multiple origins share a backend store.
 
@@ -923,8 +923,6 @@ config re-reads.
 
 The goal is near-zero heap allocations on the hot path for a proxy-type request:
 
-- Per-request state lives in a `bumpalo` arena that resets after the response is written.
-  Many small allocations become a single bump-pointer increment.
 - `bytes::Bytes` and `BytesMut` carry request and response bodies, avoiding copies as
   data moves through pipeline phases.
 - `compact_str::CompactString` keeps short strings (hostnames, IDs, header names) inline

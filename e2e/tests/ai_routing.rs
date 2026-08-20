@@ -109,12 +109,12 @@ origins:
 ///
 /// Two things about this fixture are load bearing.
 ///
-/// The providers are named `openai` and `groq` rather than
-/// `primary`/`secondary`. the surface-capability lookup keys the surface
-/// capability matrix on the provider *name*, not on `provider_type`, so a
-/// provider named `primary` is treated as an unknown provider and gets the
-/// most restrictive answer (chat, models, messages, responses). Audio
-/// transcription would then 501 before routing ever runs.
+/// Both providers carry `provider_type: openai`. The surface capability
+/// matrix keys on the effective provider type (`provider_type`, falling
+/// back to `name`; WOR-2485), and an entry that resolves to a non-catalog
+/// type gets the most restrictive answer (chat, models, messages,
+/// responses). Audio transcription would then 501 before routing ever
+/// runs.
 ///
 /// The path is `/v1/audio/transcriptions`, not `/v1/chat/completions`.
 /// Since WOR-2472 a multipart Content-Type on a classified JSON surface is

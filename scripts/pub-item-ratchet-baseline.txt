@@ -474,3 +474,15 @@
 # a real, allowed boot-only exporter leaves behind, without booting one:
 # that needs live network I/O and a tokio runtime neither test wants to
 # pay for. Same shape as `EventEgress::never_drained_for_test` above.
+
+# 2026-08-19 (WOR-2546): 298 -> 297. No pub item was wired to a new
+# caller or removed; the scanner's name-occurrence count moved because
+# `crates/sbproxy-mesh/src/config.rs`'s `DiscoveryConfig` doc comment
+# now spells out `SystemClusterBootstrap::bootstrap` by name (plain
+# text, not a real reference) to explain why the richer discovery
+# structs aren't reachable from config yet. That one textual mention,
+# in a file outside `sbproxy-core`, is enough for the grep-based
+# scanner to drop `sbproxy-core::cluster::SystemClusterBootstrap` out
+# of the test-only bucket, even though nothing about its actual
+# callers changed. Lowering to hold it rather than rephrasing the
+# comment to dodge the heuristic.

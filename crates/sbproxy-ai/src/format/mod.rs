@@ -18,11 +18,9 @@
 //! Anthropic Messages), and the inbound route wiring. The existing
 //! pairwise translators in `crates/sbproxy-ai/src/translators/` keep
 //! working unchanged; later work migrates them to use this trait. The
-//! `from_hub_stream` method is part of the trait surface today; only
-//! the OpenAI Chat branch returns frames end to end. The Anthropic and
-//! Responses branches return a `not implemented yet` error so a future
-//! caller wiring streaming gets a clear pointer rather than silent
-//! misbehaviour.
+//! `from_hub_stream` method is implemented for all three formats: the
+//! OpenAI Chat, Anthropic Messages, and OpenAI Responses branches each
+//! re-emit hub chunks as their native SSE frames.
 
 pub mod anthropic_messages;
 pub mod native_streams;

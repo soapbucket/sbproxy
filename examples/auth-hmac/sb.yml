@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# HMAC signed-request authentication (RFC 9421, hmac-sha256).
+#
+# One machine caller behind a signing key. The client never sends the
+# secret; it signs each request's method and path-and-query plus a
+# `created` timestamp, and the proxy recomputes the signature with the
+# same shared secret. A captured request cannot be replayed against a
+# different method or path, and it expires once `created` falls out of
+# the `clock_skew_seconds` window (default 300 seconds, the replay
+# defense).
+#
+# The secret resolves through the secret resolver (`env:`, `file:`,
+# `${VAR}`, or a vault backend URI), so it never has to live in this
+# file. The demo value used below:
+#
+#   export SBPROXY_HMAC_SECRET=worked-example-secret
+#
+# Run:
+#   make run CONFIG=examples/auth-hmac/sb.yml
+#
+# Test:
+#   # 401 + WWW-Authenticate: Signature - unsigned request
+#   curl -i -H 'Host: hmac.local' http://127.0.0.1:8080/
+#
+#   # 200 - sign "@method" + "@target-uri" + the signature params
+#   created=$(date +%s); base=$(printf '"@method": GET\n"@target-uri": /\n"@signature-params": ("@method" "@target-uri");created=%s;keyid="svc-billing";alg="hmac-sha256"' "$created"); sig=$(printf '%s' "$base" | openssl dgst -sha256 -hmac "$SBPROXY_HMAC_SECRET" -binary | base64); curl -i -H 'Host: hmac.local' -H "Signature-Input: sig1=(\"@method\" \"@target-uri\");created=$created;keyid=\"svc-billing\";alg=\"hmac-sha256\"" -H "Signature: sig1=:$sig:" http://127.0.0.1:8080/
+#
+#   # 401 - the same headers replayed after the 300s window are stale
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "hmac.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {"authenticated": true, "note": "served after a valid RFC 9421 hmac-sha256 signature"}
+
+    authentication:
+      type: hmac_auth
+      # Freshness window for the mandatory `created` parameter, in
+      # both directions. 300 is the default; spelled out here because
+      # it is the replay defense.
+      clock_skew_seconds: 300
+      keys:
+        # `key_id` is what the signer advertises as `keyid`; the
+        # secret stays in the environment. The metadata fields ride
+        # onto the matched principal for per-credential reporting.
+        - key_id: svc-billing
+          secret: env:SBPROXY_HMAC_SECRET
+          project: billing

@@ -1,5 +1,5 @@
 # Headers reference
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Every header SBproxy reads or stamps, with the config that triggers it.
 This is the single source of truth; `docs/manual.md` and the marketing
@@ -65,12 +65,15 @@ These fire only when the relevant config or request state applies.
 |---|---|---|
 | `X-Sb-Session-Id` | A session ID was captured | Echoed when the caller supplied a valid ULID, or when the proxy auto-generated one. Auto-generation follows `sessions.auto_generate`: the default `anonymous` mints an ID only for requests with no resolved user identity; `never` does what it says, and `always` has one exception: a request carrying an *invalid* session header is dropped from session tracking (and counted on the drop metric) rather than being assigned a fresh session, so a malformed ID cannot silently fork into a new identity. No session captured means no header. |
 | `x-sbproxy-cache` | `response_cache.enabled: true` on the origin | Values: `HIT`, `STALE`, `HIT-RESERVE`. There is no `MISS` value; a cache miss simply omits the header. |
+| `x-semcache` | `ai_proxy` action's `semantic_cache` block, on a hit | Always `HIT`; a miss omits the header the same way `x-sbproxy-cache` does. Distinct from `x-sbproxy-cache`, which is the plain response cache. `crates/sbproxy-core/src/server/ai_dispatch.rs` |
 | `x-sbproxy-debug-request-id` | Request carried `x-sb-flags: debug` | The request's correlation ID, stamped for quick copy-paste debugging. |
 | `x-sbproxy-debug-config-rev` | Request carried `x-sb-flags: debug` | The compiled-config revision that served the request. |
 | `X-Sb-Property-<key>` | `properties.echo: true` on the origin | Each captured `x-sb-property-*` request property echoed back. Off by default. |
 | `x-sbproxy-idempotency` | Idempotency middleware disengaged mid-request | Skip reason (oversize body, pool exhausted). Informational only. |
 | `x-sbproxy-retry-skip-reason` | Status-retry middleware skipped a retry | Skip reason for dashboards. |
 | `Retry-After` | 429 or a2a chain-depth denial | On rate-limit 429s this is opt-in via the policy's `headers.include_retry_after` (the built-in ddos and ai-crawl enforcers turn it on themselves). The a2a chain-depth-exceeded denial always sends `Retry-After: 0`, unconditionally. |
+| `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, `RateLimit-Policy` | `rate_limit_budget` policy's `headers.enabled: true`, on a 429 | The `draft-ietf-httpapi-ratelimit-headers` / RFC 9239 field set. `RateLimit-Policy` is additionally gated on `headers.include_ratelimit_policy` (default `true`) and reads `"<limit>;w=1"`. Distinct from `X-RateLimit-*` below: `rate_limit_budget` is the workspace-wide budget policy, `rate_limiting` is the legacy per-policy limiter, and each keeps its own header shape. `crates/sbproxy-core/src/server/request_phase.rs` |
+| `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` | `rate_limiting` policy's `headers.enabled: true` | The legacy shape. See [configuration.md](configuration.md#rate-limit-headers). |
 
 ## Headers on outbound requests the proxy makes
 

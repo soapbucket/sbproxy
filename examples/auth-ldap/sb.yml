@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# LDAP directory-bind authentication.
+#
+# The client sends HTTP Basic credentials. The proxy composes a bind DN
+# from `uid_attribute` and `base_dn` (here: uid=<username>,ou=users,
+# dc=example,dc=org) and attempts an LDAP simple bind against `url`
+# with the supplied password. A successful bind authenticates the
+# request; the username becomes the attributed subject. The password is
+# never stored, forwarded, or logged.
+#
+# This example needs a real directory listening at `url` to return
+# anything but 503; see the README for a one-command OpenLDAP fixture.
+# If the directory is unreachable the proxy fails closed and refuses
+# the request (503), it never falls open.
+#
+# Plaintext ldap:// URLs are refused at config load unless you
+# explicitly set `allow_insecure: true`. Use ldaps:// (shown here) or
+# `use_tls: true` (StartTLS upgrade on an ldap:// URL) in production.
+#
+# Run:
+#   make run CONFIG=examples/auth-ldap/sb.yml
+#
+# Test (with a directory running; see README):
+#   # 200 - the directory accepts the bind for uid=alice
+#   curl -i -u alice:s3cret -H 'Host: ldap.local' http://127.0.0.1:8080/get
+#
+#   # 401 - wrong password, the directory refuses the bind
+#   curl -i -u alice:wrong -H 'Host: ldap.local' http://127.0.0.1:8080/get
+#
+#   # 503 - stop the directory: the proxy refuses rather than failing open
+#   curl -i -u alice:s3cret -H 'Host: ldap.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ldap.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    authentication:
+      type: ldap_auth
+      url: ldaps://directory.internal:636
+      base_dn: ou=users,dc=example,dc=org
+      uid_attribute: uid
+      # tls_verify defaults to true; when verifying, the `url` host must
+      # match the directory certificate's host.
+      tls_verify: true
+      timeout_secs: 5

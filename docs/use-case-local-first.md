@@ -1,6 +1,6 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-19*
 
 > **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
@@ -21,7 +21,7 @@ An OpenAI-compatible endpoint backed by a single provider array. Provider zero i
 - An OpenAI API key (`OPENAI_API_KEY`) for the spill lane.
 - `curl` for sending requests, `jq` for reading responses and the ledger.
 
-One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Silicon Metal passed on 2026-07-11. NVIDIA vLLM, CUDA, and live GCP certification remain pending, with deterministic and local test evidence only. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
+One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Silicon Metal passed certification on 2026-08-02, and single-GPU NVIDIA CUDA (live vLLM container on an L4) passed on 2026-07-30. Multi-GPU and live multi-node GCP certification remain pending. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
 
 ## Install
 
@@ -72,11 +72,11 @@ Now the local lane:
               - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
                 gguf_file: Qwen3-14B-Q4_K_M.gguf
                 name: qwen3-14b
-                extra_args: ["--jinja"]
+                engine: llama_cpp
                 keep_alive: 30m
 ```
 
-The `serve:` block is the part that makes this box a provider. There is no `base_url`: the gateway spawns the engine and resolves its loopback port itself. The weights are named explicitly (repo, quant, file), llama-server serves them with the GGUF's embedded chat template (`--jinja`), and `name:` is the model id every plane sees. A bare catalog id works too, with the fit planner choosing a quant for your card (FP8 on an L4, an int4 GGUF on a T4); the explicit form pins the exact weights file. `keep_alive: 30m` unloads an idle engine to free VRAM.
+The `serve:` block is the part that makes this box a provider. There is no `base_url`: the gateway spawns the engine and resolves its loopback port itself. The weights are named explicitly (repo, quant, file), and `name:` is the model id every plane sees. `engine: llama_cpp` pins the engine explicitly: llama.cpp's stable argument allowlist has no `--jinja` flag, so the engine serves the GGUF's own embedded chat template by default rather than an operator-forced one. A bare catalog id works too, with the fit planner choosing a quant for your card (FP8 on an L4, an int4 GGUF on a T4); the explicit form pins the exact weights file. `keep_alive: 30m` unloads an idle engine to free VRAM.
 
 The `no_prompt_training: true` flag matters more than it looks. Tokens served here never leave the box, so the local lane is safe for prompts that opt out of training. The flag is also load-bearing: a request that opts out routes only to providers marked this way, so leaving it off would exclude the local lane from exactly the prompts it should keep.
 
@@ -95,6 +95,22 @@ Then the spill lane:
 ```
 
 Two things are deliberate here. The provider declares `qwen3-14b` in its `models` list so it stays eligible when the chain advances for that model, and `model_map` renames it to `gpt-4o-mini` on the way out, which is what the upstream actually serves. The response's `model` field therefore tells you which lane answered: `qwen3-14b` means your GPU, `gpt-4o-mini` means the spill. And this provider is not marked `no_prompt_training`, so a flagged prompt pins to the local lane and fails closed rather than spilling. If your cloud account has a written no-training or zero-data-retention agreement, mark it too and flagged prompts may spill.
+
+Put together, the two providers and the training flag make this decision on every request:
+
+```mermaid
+flowchart TD
+    REQ["POST /v1/chat/completions\nmodel: qwen3-14b"] --> FLAG{"x-sbproxy-disallow-\nprompt-training: true?"}
+    FLAG -->|no| ORDER["chain order:\nlocal (1), openai (2)"]
+    FLAG -->|yes| FILTERED["chain order, filtered to\nno_prompt_training only: local (1)"]
+    ORDER --> L1{"local engine ready?"}
+    FILTERED --> L1
+    L1 -->|yes| ALOCAL["200 model=qwen3-14b\nanswered on your GPU"]
+    L1 -->|no: down or 5xx| NEXT{"next eligible provider?"}
+    NEXT -->|flag not set: openai| L2["openai answers"]
+    NEXT -->|flag set: none left| FAIL["502\nfails closed, never spills"]
+    L2 --> ACLOUD["200 model=gpt-4o-mini\ncloud, via model_map"]
+```
 
 Last, the ledger:
 
@@ -166,7 +182,9 @@ $ jq -s '[ .[] | select(.event.provider=="local") | .event ]
 }
 ```
 
-The `0.15` and `0.60` are gpt-4o-mini's list prices per million prompt and completion tokens; swap in the price of whatever hosted model this GPU replaces for you. Two toy requests displace three thousandths of a cent, which is exactly right. Point the same query at a month of production ledger and the output is the number you put in the spreadsheet next to the card's cost, with the cloud lane's real spend sitting in the same file as `cost_usd` on the `openai` entries. The model host also carries this math built in (each local completion priced at the hosted equivalent); the report surface for it is part of the phased rollout, so today the ledger file is the source of truth and `jq` is the report.
+The `0.15` and `0.60` are gpt-4o-mini's list prices per million prompt and completion tokens; swap in the price of whatever hosted model this GPU replaces for you. Two toy requests displace three thousandths of a cent, which is exactly right. Point the same query at a month of production ledger and the output is the number you put in the spreadsheet next to the card's cost, with the cloud lane's real spend sitting in the same file as `cost_usd` on the `openai` entries.
+
+The model host also carries this math built in. Give the local model entry a `reference: gpt-4o-mini` (the hosted model it displaces), and the authenticated `GET /admin/model-host/value` endpoint reports the same split without a `jq` query: `local_completions` and `saved_micros` for calls your GPU answered, `cloud_completions` and `cloud_spent_micros` for the ones that spilled. See the Value delivered section of [model-host.md](model-host.md#value-delivered) for the exact response shape and how it prices context-compression savings alongside the lane split.
 
 ## You are done when
 

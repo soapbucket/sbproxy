@@ -1,8 +1,10 @@
 # OpenAPI schema validation
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 The `openapi_validation` policy loads an OpenAPI 3.0 document at startup and validates each incoming request body against the matching operation's `requestBody` schema. Requests whose path + method are not described in the spec, or whose `Content-Type` has no schema, are passed through untouched, with one exception: when the matched operation declares `requestBody.required: true`, a request whose `Content-Type` matches no schema is rejected rather than passed through.
+
+This is the enforcement half of the OpenAPI pair. [OpenAPI emission](openapi-emission.md) is the other half: it publishes a spec derived from your live config. The two are not wired together, an emitted document is not automatically fed back into this policy, so pointing `spec` or `spec_file` at a spec emission produced (or at one you maintain by hand) is a deliberate step.
 
 Use it to:
 
@@ -16,7 +18,7 @@ Use it to:
 |-------|---------|-------------|
 | `spec` | (required, or `spec_file`) | Inline OpenAPI 3.0 document as a YAML object. |
 | `spec_file` | (required, or `spec`) | Path to a JSON or YAML OpenAPI document. The file is read once at startup. |
-| `mode` | `enforce` | `enforce` rejects mismatched bodies; `log` writes a warning and forwards the request. |
+| `mode` | `enforce` | `enforce` rejects mismatched bodies; `log` (also accepted as `warn`) writes a warning and forwards the request. |
 | `status` | `400` | Status code returned in `enforce` mode when validation fails. |
 | `error_body` | (auto) | Optional fixed body for the rejection response. Defaults to a JSON object naming the failing JSON pointer. |
 | `error_content_type` | `application/json` | `Content-Type` for the rejection body. |
@@ -36,6 +38,23 @@ If any of these is missing, the policy treats the request as out of scope and fo
 JSON Schema validation runs through the `jsonschema` crate with remote `$ref` resolution disabled, so an attacker-controlled spec cannot become an SSRF primitive. Schemas are compiled once at config-load time, which keeps the per-request hot path cheap.
 
 The rejection body lists the failing JSON pointer (e.g. `/age`) but never echoes the offending value back to the caller, so a probing client cannot use error messages to confirm guesses.
+
+A body whose `Content-Type` matches a schema but does not parse as JSON at all fails with a distinct message (`invalid JSON in request body: ...`) rather than a JSON-pointer failure, since there is no instance to validate against the schema.
+
+```mermaid
+flowchart TD
+    R["Inbound request"] --> M1{"path matches a\ncompiled operation?"}
+    M1 -- no --> PASS["Out of scope: forward unvalidated"]
+    M1 -- yes --> M2{"method has an\noperation entry?"}
+    M2 -- no --> PASS
+    M2 -- yes --> M3{"Content-Type matches a\nrequestBody.content key?"}
+    M3 -- yes --> V["Validate body against\nthe compiled JSON Schema"]
+    M3 -- no --> REQ{"requestBody.required: true?"}
+    REQ -- no --> PASS
+    REQ -- yes --> FAIL["Reject: status"]
+    V -- conforms --> PASS2["Pass: forward to upstream"]
+    V -- fails --> FAIL
+```
 
 ## Example
 

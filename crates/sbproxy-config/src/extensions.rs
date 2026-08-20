@@ -247,8 +247,8 @@ pub enum BundleRuntime {
     ///
     /// No export, no ABI, no host call surface: a Rego module performs
     /// no I/O during evaluation, matching `policy: rego`'s own
-    /// constraint. Only `kind: policy` hooks are valid on this
-    /// runtime.
+    /// constraint. Only `kind: policy` and `kind: transform` hooks are
+    /// valid on this runtime (transforms since WOR-2493 item 6).
     Rego,
 }
 
@@ -967,24 +967,49 @@ impl BundleManifest {
                     return invalid("runtime rego entry must end in .rego");
                 }
                 for hook in &self.hooks {
-                    if hook.kind != BundleHookKind::Policy {
-                        return invalid(format!(
-                            "runtime rego may declare only policy hooks, got a {} hook",
-                            hook_kind_label(hook.kind)
-                        ));
+                    match hook.kind {
+                        // A policy hook evaluates the request line,
+                        // headers, and its own config, never a
+                        // buffered body.
+                        BundleHookKind::Policy => {
+                            if hook.execution.body_mode != BundleBodyMode::None {
+                                return invalid(format!(
+                                    "rego hook `{}` requires body_mode none; a bundled Rego \
+                                     policy evaluates the request line, headers, and its own \
+                                     config, never a buffered body",
+                                    hook.type_name
+                                ));
+                            }
+                        }
+                        // WOR-2493 item 6: a transform hook is the
+                        // opposite case. The whole point is the
+                        // buffered response body, so the declaration
+                        // must promise exactly that, the same
+                        // body-mode contract a JavaScript or WASM
+                        // transform hook carries implicitly via the
+                        // field default.
+                        BundleHookKind::Transform => {
+                            if hook.execution.body_mode != BundleBodyMode::Buffered {
+                                return invalid(format!(
+                                    "rego transform hook `{}` requires body_mode buffered; \
+                                     a bundled Rego transform evaluates the complete \
+                                     buffered response body",
+                                    hook.type_name
+                                ));
+                            }
+                        }
+                        other => {
+                            return invalid(format!(
+                                "runtime rego may declare only policy and transform hooks, \
+                                 got a {} hook",
+                                hook_kind_label(other)
+                            ));
+                        }
                     }
                     if hook.export.is_some() {
                         return invalid(format!(
                             "rego hook `{}` must omit export; a Rego module has no \
                              export, only the query it evaluates",
-                            hook.type_name
-                        ));
-                    }
-                    if hook.execution.body_mode != BundleBodyMode::None {
-                        return invalid(format!(
-                            "rego hook `{}` requires body_mode none; a bundled Rego \
-                             policy evaluates the request line, headers, and its own \
-                             config, never a buffered body",
                             hook.type_name
                         ));
                     }
@@ -1512,11 +1537,34 @@ permissions: []
     }
 
     #[test]
-    fn only_policy_hooks_are_valid_on_runtime_rego() {
+    fn a_rego_transform_hook_validates() {
+        // WOR-2493 item 6: `kind: transform` joined `kind: policy` as
+        // a valid hook kind on runtime rego. A transform hook receives
+        // the buffered response body, so its body_mode contract is
+        // `buffered`, the opposite of the policy hook's `none`.
+        let yaml = REGO_POLICY_MANIFEST
+            .replace("kind: policy", "kind: transform")
+            .replace("body_mode: none", "body_mode: buffered");
+        let manifest = parse_manifest(&yaml);
+        assert_eq!(manifest.hooks[0].kind, BundleHookKind::Transform);
+    }
+
+    #[test]
+    fn a_rego_transform_hook_requires_body_mode_buffered() {
         let yaml = REGO_POLICY_MANIFEST.replace("kind: policy", "kind: transform");
         let error = manifest_error(&yaml);
         assert!(
-            error.contains("runtime rego may declare only policy hooks"),
+            error.contains("rego transform hook `rego_authz` requires body_mode buffered"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_policy_and_transform_hooks_are_valid_on_runtime_rego() {
+        let yaml = REGO_POLICY_MANIFEST.replace("kind: policy", "kind: action");
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("runtime rego may declare only policy and transform hooks"),
             "{error}"
         );
     }

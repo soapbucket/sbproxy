@@ -1,10 +1,10 @@
 # Transforms
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 A transform edits a response body before it reaches the client. Reach for one when the shape an upstream returns is not the shape a caller needs: trimming fields from a JSON payload, converting HTML to Markdown for an LLM, capping a body size, or running a sandboxed script or WASM module over the bytes. Transforms never touch the request; for that, see the request modifier and forward-rule sections of [configuration.md](configuration.md).
 
-SBproxy ships 25 transform types plus `noop`. This page is the map: what a transform is, where it runs, the fields every transform shares, and a minimal working config for each kind. Full field references for the JSON/HTML/text transforms live inline below; the scripting, WASM, and agent-content transforms link out to their dedicated guides rather than duplicating them here.
+SBproxy ships 26 transform types plus `noop`. This page is the map: what a transform is, where it runs, the fields every transform shares, and a minimal working config for each kind. Full field references for the JSON/HTML/text transforms live inline below; the scripting, WASM, and agent-content transforms link out to their dedicated guides rather than duplicating them here.
 
 ## Where a transform runs
 
@@ -41,7 +41,7 @@ Transforms run in the order they're listed. Each one reads the buffer the previo
 
 Two things gate whether a transform runs at all on a given response, independent of its own fields: the `content_types` filter above, and `disabled: true`.
 
-**Response cache and request-dependent transforms.** An origin with `response_cache` enabled stores each cached entry's *transformed* body, not the raw upstream response, and a stale-while-revalidate refresh reruns the chain with no request in scope. That's only sound for a transform whose output is a pure function of the response body, its content type, and its own static config. A transform that reads request state (the scripted transforms `lua_json` / `javascript` / `js_json`, the content-negotiation family `html_to_markdown` / `citation_block` / `json_envelope`, `cel`, and `a2a_agent_card_rewrite`) is refused at config load when combined with `response_cache` on the same origin; the load error names the transform. Move it to an origin without `response_cache`, or drop it from the chain, to keep the pairing.
+**Response cache and request-dependent transforms.** An origin with `response_cache` enabled stores each cached entry's *transformed* body, not the raw upstream response, and a stale-while-revalidate refresh reruns the chain with no request in scope. That's only sound for a transform whose output is a pure function of the response body, its content type, and its own static config. A transform that reads request state (the scripted transforms `lua` / `lua_json` / `javascript` / `js_json`, the content-negotiation family `html_to_markdown` / `citation_block` / `json_envelope`, `cel`, `a2a_agent_card_rewrite`, and every linked-plugin transform) is refused at config load when combined with `response_cache` on the same origin; the load error names the transform. A `wasm` transform is the one type in this list that is not a constant: it only becomes request-dependent, and only then joins this refusal, when its own `request_context: true` is set (see [scripting.md §6.1](scripting.md#61-request_context-opting-a-module-into-ctx)); a `wasm` transform that leaves `request_context` unset stays cacheable. Move a refused transform to an origin without `response_cache`, or drop it from the chain, to keep the pairing.
 
 ## JSON shaping
 
@@ -247,7 +247,7 @@ No example directory ships this transform; the snippet is built directly from `S
 |-------|------|---------|-------------|
 | `remove_selectors` | list | `[]` | Tag names or `#id` selectors to strip. |
 | `inject` | list | `[]` | `{position, content}` entries. `position` is `head_end`, `body_start`, or `body_end`. |
-| `rewrite_attributes` | list | `[]` | `{selector, attribute, value}` entries; rewrites the first matching tag per selector. |
+| `rewrite_attributes` | list | `[]` | `{selector, attribute, value}` entries. When no matching tag already carries the attribute, only the *first* matching tag is stamped, not every one; see [the worked example's known-limitation note](../examples/transform-html/README.md#known-limitation-rewrite_attributes-only-touches-the-first-new-match) (WOR-2533). |
 | `format_options` | object | none | Optional post-manipulation HTML optimization (see `optimize_html` below for the sub-fields). |
 
 ```yaml
@@ -331,7 +331,22 @@ No example directory ships this transform standalone; the snippet is from [confi
 
 ## Scripting transforms
 
-Four transform types hand the body to a scripting or sandboxing engine instead of a fixed-shape config. Each is documented in depth in [scripting.md](scripting.md); this page only shows the minimal wiring.
+Six transform types hand the body to a scripting or sandboxing engine instead of a fixed-shape config. Each is documented in depth in [scripting.md](scripting.md); this page only shows the minimal wiring.
+
+### `lua`
+
+Runs a Lua `transform(body, ctx)` function over the raw body string; the return value (a non-string return is JSON-serialized) replaces it. Unlike `lua_json`, the body is never parsed as JSON, so this is the transform to reach for on plain text, XML, CSV, or a body that is only sometimes JSON. Optional `function_name` picks a different entrypoint. A script with no `transform` function falls back to the legacy format: top-level code with the raw body bound to a `body` global.
+
+```yaml
+transforms:
+  - type: lua
+    script: |
+      function transform(body, ctx)
+        return string.upper(body)
+      end
+```
+
+No example directory ships this transform standalone; the snippet is built directly from `LuaTransform`'s config struct in `crates/sbproxy-modules/src/transform/mod.rs`. `examples/transform-lua/sb.yml` demonstrates the JSON sibling, `lua_json`, below.
 
 ### `lua_json`
 

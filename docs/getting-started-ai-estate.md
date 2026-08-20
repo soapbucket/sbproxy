@@ -1,6 +1,6 @@
 # Getting started: AI estate (LLM gateway in front of model providers)
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-19*
 
 ## What you will build
 
@@ -75,6 +75,18 @@ origins:
 ```
 
 The `fallback_chain` strategy tries Anthropic first (`priority: 1`) and falls back to OpenRouter (`priority: 2`) when the attempt fails in a retriable way: a transport error or timeout, an upstream 500, 502, or 503, or a rate-limit refusal under a configured retry policy. An ordinary 4xx client error does not fail over; it comes back to the caller as-is. The two input guardrails run before any provider call. The workspace budget uses `on_exceed: log`, so the gauge moves but requests still flow.
+
+```mermaid
+flowchart TD
+    A["POST /v1/chat/completions"] --> B{"Input guardrails\ninjection + PII"}
+    B -->|blocked| R1["400: guardrail_violation"]
+    B -->|clean| C["Router: fallback_chain"]
+    C --> D["Try anthropic (priority 1)"]
+    D -->|success| F["200: OpenAI-shaped response"]
+    D -->|retriable failure| E["Try openrouter (priority 2)"]
+    E -->|success| F
+    E -->|failure, or ordinary 4xx from anthropic| R2["Error returned to caller"]
+```
 
 ## Run it and expected output
 
