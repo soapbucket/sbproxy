@@ -3878,7 +3878,7 @@ fn audit_admin_reload_rejection(prior_revision: &str, reason: &str) {
 }
 
 /// Clears the actor slot when the dispatch scope ends.
-struct AdminActorGuard;
+pub(crate) struct AdminActorGuard;
 
 impl Drop for AdminActorGuard {
     fn drop(&mut self) {
@@ -3888,7 +3888,11 @@ impl Drop for AdminActorGuard {
 
 /// Install `actor` as the dispatching operator for this thread and
 /// return a guard that clears it on scope exit.
-fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
+///
+/// `pub(crate)` so tests below the sync dispatcher (admin_keys' audit
+/// attribution tests) can install an operator through the same seam the
+/// production dispatcher uses, rather than through a test-only side door.
+pub(crate) fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
     CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = actor);
     AdminActorGuard
 }

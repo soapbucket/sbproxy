@@ -342,6 +342,52 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// WOR-2561: an override is durable state, and its expiry is a stored
+    /// instant read lazily, so a restart changes nothing. The reopened store
+    /// hands back the same record, and the record itself decides whether the
+    /// raise still applies: honored while unexpired, ignored once past.
+    #[tokio::test]
+    async fn a_persisted_budget_override_survives_reopen_and_expires_by_the_clock() {
+        use crate::record::{BudgetOverride, RecordBudget};
+
+        let path = temp_path();
+        let expires_at = now() + chrono::Duration::seconds(60);
+        {
+            let store = EmbeddedKeyStore::open(&path).unwrap();
+            let mut rec = KeyRecord::new("boosted", "h", now());
+            rec.budget = Some(RecordBudget {
+                max_tokens: Some(1_000),
+                max_cost_usd: None,
+            });
+            rec.budget_override = Some(BudgetOverride {
+                max_tokens_increase: Some(500),
+                max_cost_usd_increase: None,
+                expires_at,
+                granted_by: "casey".into(),
+                granted_at: now(),
+                reason: None,
+            });
+            store.put_key(rec).await.unwrap();
+        }
+
+        // "Restart": a fresh handle over the same file.
+        let store = EmbeddedKeyStore::open(&path).unwrap();
+        let got = store.get_key("boosted").await.unwrap().unwrap();
+        let grant = got.budget_override.as_ref().expect("override persisted");
+        assert_eq!(grant.granted_by, "casey");
+        assert_eq!(grant.expires_at, expires_at);
+
+        // Unexpired at read time: the raise is honored.
+        assert_eq!(got.effective_budget(now()).unwrap().max_tokens, Some(1_500));
+        // Past the stored expiry: the same persisted record yields the base
+        // cap, with no sweeper having touched the store.
+        assert_eq!(
+            got.effective_budget(expires_at).unwrap().max_tokens,
+            Some(1_000)
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     #[tokio::test]
     async fn key_policy_cas_is_transactional_and_monotonic() {
         let path = temp_path();

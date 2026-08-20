@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Temporary, auto-expiring budget overrides on the dynamic key store.
+#
+# A governed key carries a base budget. When a launch day or a load test
+# needs more headroom for an afternoon, you grant a temporary raise through
+# the admin API instead of editing the durable limit and remembering to put
+# it back: the raise applies on top of the base budget until its expiry,
+# then the base resumes on its own. Both the grant and the expiry land in
+# the key audit trail.
+#
+# The seeded key's base budget is a deliberately small 200 total tokens so
+# one request can hit the cap. The provider is a local OpenAI-shaped
+# fixture that bills exactly the token count named in the message body
+# (`spend=150`), so the walk below is reproducible without a provider
+# account.
+#
+# Setup:
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   python3 examples/temp-budget-override/fixture.py &
+#   make run CONFIG=examples/temp-budget-override/sb.yml
+#
+# Walk (see README.md for the full transcript):
+#   1. Spend most of the base budget, then watch the next request refuse.
+#   2. Grant a raise:  POST /admin/keys/seed0001/budget-override
+#      with {"max_tokens_increase": 100000, "ttl_secs": 60}
+#   3. The same request now passes; GET /admin/keys/seed0001 shows the
+#      base budget, the override, its expiry, and the effective budget.
+#   4. After the 60s TTL the raise is gone and the base cap refuses again,
+#      with no operator action.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-temp-budget-override.redb
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    failure_posture: closed
+    seed:
+      keys:
+        - key_id: seed0001
+          secret: demo-secret-please-rotate
+          name: launch-day-demo-key
+          # The base cap the override temporarily raises: 200 total
+          # tokens across the key's lifetime. Small on purpose, so one
+          # fixture request can exhaust it.
+          max_budget_tokens: 200
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; OpenAI-shaped provider
+          # config carries one. Against the real provider this would be
+          # ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+# sbproxy-docs:end
