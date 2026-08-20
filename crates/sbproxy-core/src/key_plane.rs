@@ -369,6 +369,15 @@ impl KeyPlane {
         // re-derived at each `return`. `cache_layer` reports which layer
         // answered: `hit` (fresh resolved-secret cache), `stale` (grace
         // window served the last known-good value), `miss` (full path).
+        //
+        // The wrapper deliberately publishes nothing. WOR-2571's typed
+        // `credential_resolved` events stay inside the inner function, at
+        // the two sites that actually read or serve material, because the
+        // two instrumentations have different widths on purpose: the
+        // histogram observes every call including the per-request cache
+        // hit, the typed feed carries only real reads and grace serves.
+        // Hoisting either one to the other's site is the merge defect to
+        // watch for; see the return-path table on the inner function.
         let started = std::time::Instant::now();
         let mut cache_layer: &'static str = "miss";
         let result = self
@@ -394,6 +403,25 @@ impl KeyPlane {
     /// [`Self::resolve_credential_secret`] minus the metrics wrapper.
     /// `cache_layer` starts at `miss` and is overwritten by the two
     /// early-return paths that did not run the full resolution.
+    ///
+    /// Every return path, with what each one reports (WOR-2572) and
+    /// publishes (WOR-2571). The two columns are not the same set, and
+    /// that is the contract:
+    ///
+    /// | return path | `cache` / `outcome` | typed event |
+    /// |---|---|---|
+    /// | fresh resolved-secret cache | `hit` / `ok` | none |
+    /// | grace window serves last known-good | `stale` / `ok` | `credential_resolved`, `outcome: stale_served` |
+    /// | record absent | `miss` / `refused` | none |
+    /// | record revoked or blocked | `miss` / `refused` | none |
+    /// | credential bound across tenants | `miss` / `refused` | none |
+    /// | store or vault down, no grace | `miss` / `error` | none |
+    /// | full resolution succeeds | `miss` / `ok` | `credential_resolved`, `outcome: resolved` |
+    ///
+    /// The histogram is observed once per call by the wrapper, on every
+    /// row. The typed feed carries only the two rows where material was
+    /// actually read or served, which is why ordinary per-request
+    /// traffic riding the cache publishes nothing at all.
     async fn resolve_credential_secret_inner(
         &self,
         id: &str,
@@ -435,6 +463,19 @@ impl KeyPlane {
                         "could not re-resolve a bound credential; serving the last known-good \
                          value for the remainder of proxy.secrets.rotation.grace_period_secs"
                     );
+                    // WOR-2571: a stale serve is still an actual use of
+                    // resolved material, and it is the one a SIEM most
+                    // wants to see, because it means the backend was down
+                    // and the credential kept working anyway. It sits
+                    // inside the grace arm, next to WOR-2572's
+                    // `cache_layer = "stale"`, so the two instrumentations
+                    // describe exactly the same set of serves: every
+                    // `cache=stale` observation has one `stale_served`
+                    // event and no other path publishes one.
+                    sbproxy_observe::publish_proxy_event(
+                        sbproxy_observe::EventType::CredentialResolved,
+                        || credential_resolved_event(id, tenant_id, "stale_served", None),
+                    );
                     Ok(value.clone())
                 }
                 _ => Err(err),
@@ -463,6 +504,14 @@ impl KeyPlane {
             return Err(CredentialResolveError::TenantMismatch);
         }
 
+        // WOR-2571: named before the material is opened so the typed
+        // event below can say where fresh material came from without
+        // holding anything secret.
+        let source = match &record.material {
+            CredentialMaterial::Plaintext { .. } => "plaintext",
+            CredentialMaterial::Envelope { .. } => "envelope",
+            CredentialMaterial::VaultRef { .. } => "vault_ref",
+        };
         let secret = match &record.material {
             CredentialMaterial::Plaintext { value } => value.clone(),
             CredentialMaterial::Envelope { envelope } => {
@@ -512,8 +561,62 @@ impl KeyPlane {
             id.to_string(),
             (std::time::Instant::now(), resolved.clone()),
         );
+        // WOR-2571: one typed event per actual resolution. The cached
+        // fast path above returns before this point, so a request that
+        // rode the cache publishes nothing; see
+        // [`credential_resolved_event`] for the cardinality ruling.
+        sbproxy_observe::publish_proxy_event(
+            sbproxy_observe::EventType::CredentialResolved,
+            || credential_resolved_event(id, tenant_id, "resolved", Some(source)),
+        );
         Ok(resolved)
     }
+}
+
+/// Build the `credential_resolved` typed event for one actual
+/// resolution of an upstream credential (WOR-2571).
+///
+/// Split from [`KeyPlane::resolve_credential_secret`] so the field set
+/// is testable without a running event egress, the same shape as
+/// `budget_exceeded_event` in `server::ai_support`. The payload mirrors
+/// the key-lifecycle mutation events (`op`, `resource`, `id`,
+/// `outcome`) so one SIEM rule vocabulary covers the whole family; it
+/// never carries the resolved secret, the header value, or a vault
+/// reference. `tenant_id` is the tenant scope the resolution was
+/// performed under: the tenant of the key that bound this credential,
+/// or empty for a shared credential resolved with no tenant scope.
+///
+/// `outcome` is `resolved` for a fresh resolution and `stale_served`
+/// when the backend failed and the last known-good value was served
+/// inside `proxy.secrets.rotation.grace_period_secs`. `source` names
+/// where fresh material came from (`plaintext`, `envelope`,
+/// `vault_ref`) and is absent on the stale path, where nothing was
+/// freshly read. The per-request cache hit publishes nothing: this
+/// event marks material actually being read, not every request that
+/// rode the cached value, the same cardinality ruling that keeps
+/// `cache_hit` unwired on the typed feed. Resolution refusals publish
+/// nothing here either; the refusal surface is WOR-2567's.
+fn credential_resolved_event(
+    id: &str,
+    tenant_id: Option<&str>,
+    outcome: &'static str,
+    source: Option<&'static str>,
+) -> sbproxy_observe::ProxyEvent {
+    let mut data = serde_json::json!({
+        "op": "resolve",
+        "resource": "credential",
+        "id": id,
+        "outcome": outcome,
+    });
+    if let Some(source) = source {
+        data["source"] = serde_json::json!(source);
+    }
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::CredentialResolved,
+        String::new(),
+        tenant_id.unwrap_or_default().to_string(),
+        data,
+    )
 }
 
 fn runtime_governance_consistency(
@@ -2708,6 +2811,294 @@ mod resolve_credential_secret_tests {
         assert!(
             resolution_count("miss", "error") > before_miss_error,
             "an unreachable backend is outcome=error, never refused"
+        );
+    }
+
+    // --- WOR-2571: the `credential_resolved` typed event ---
+
+    #[test]
+    fn credential_resolved_event_carries_the_allowlisted_fields() {
+        let event = super::credential_resolved_event(
+            "cred-shape",
+            Some("acme"),
+            "resolved",
+            Some("envelope"),
+        );
+        assert_eq!(
+            event.event_type,
+            sbproxy_observe::EventType::CredentialResolved
+        );
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.hostname, "");
+        assert_eq!(event.data["op"], "resolve");
+        assert_eq!(event.data["resource"], "credential");
+        assert_eq!(event.data["id"], "cred-shape");
+        assert_eq!(event.data["outcome"], "resolved");
+        assert_eq!(event.data["source"], "envelope");
+
+        let stale = super::credential_resolved_event("cred-shape", None, "stale_served", None);
+        assert_eq!(stale.tenant_id, "");
+        assert_eq!(stale.data["outcome"], "stale_served");
+        let object = stale.data.as_object().expect("payload is an object");
+        assert!(
+            !object.contains_key("source"),
+            "the stale path read nothing fresh, so it must not claim a source: {:?}",
+            stale.data
+        );
+    }
+
+    /// Poll `path` until `predicate` matches an NDJSON line or five
+    /// seconds pass. The file egress flushes per drained batch on its
+    /// own OS thread, so a plain read races the worker.
+    fn poll_events_file(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(line) = content.lines().find(|line| predicate(line)) {
+                    return Some(line.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// WOR-2571, the resolution seam, red-first: before the publish
+    /// call in [`KeyPlane::resolve_credential_secret`], this test timed
+    /// out polling for `credential_resolved` because a resolution left
+    /// no trace on the typed feed at all. One egress install per
+    /// process, which nextest's process-per-test model guarantees.
+    #[tokio::test]
+    async fn resolving_a_credential_publishes_one_credential_resolved_event() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("credential-resolved-events.ndjson");
+        let egress = sbproxy_observe::EventEgress::start(
+            sbproxy_observe::EventSinkTarget::File { path: path.clone() },
+            sbproxy_observe::EventTypeMask::from_types(&[
+                sbproxy_observe::EventType::CredentialResolved,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let p = plane();
+        let secret_material = "upstream-secret-material-that-must-not-cross";
+        let envelope = p
+            .crypto()
+            .seal("cred-siem", secret_material.as_bytes())
+            .unwrap();
+        let mut rec = credential("cred-siem", CredentialMaterial::Envelope { envelope });
+        rec.tenant_id = Some("acme".to_string());
+        put(&p, rec).await;
+        put(
+            &p,
+            credential(
+                "cred-marker",
+                CredentialMaterial::Plaintext {
+                    value: "marker-value".into(),
+                },
+            ),
+        )
+        .await;
+
+        p.resolve_credential_secret("cred-siem", Some("acme"))
+            .await
+            .expect("the envelope credential resolves");
+        // Ride the cache: this second call must not publish again.
+        p.resolve_credential_secret("cred-siem", Some("acme"))
+            .await
+            .expect("the cached credential resolves");
+        // The marker resolves after both, so once its event is on disk
+        // a second `cred-siem` event had every chance to arrive.
+        p.resolve_credential_secret("cred-marker", None)
+            .await
+            .expect("the marker credential resolves");
+
+        poll_events_file(&path, |line| line.contains("cred-marker"))
+            .expect("the marker resolution must reach the egress");
+
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+        let siem_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| line.contains("cred-siem"))
+            .collect();
+        assert_eq!(
+            siem_lines.len(),
+            1,
+            "one actual resolution, one event; the cache hit must not publish: {content}"
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(siem_lines[0]).expect("event line parses");
+        assert_eq!(event["event_type"], "credential_resolved");
+        assert_eq!(event["tenant_id"], "acme");
+        assert_eq!(event["data"]["op"], "resolve");
+        assert_eq!(event["data"]["resource"], "credential");
+        assert_eq!(event["data"]["id"], "cred-siem");
+        assert_eq!(event["data"]["outcome"], "resolved");
+        assert_eq!(event["data"]["source"], "envelope");
+        assert!(
+            !content.contains(secret_material),
+            "resolved material must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains("marker-value"),
+            "resolved material must never reach the typed feed: {content}"
+        );
+    }
+
+    // --- The seam WOR-2571 and WOR-2572 share ---
+
+    /// Neither ticket's own tests could reach this, because each was
+    /// written against a tree without the other. WOR-2572 wraps the
+    /// resolution in a metrics wrapper; WOR-2571 publishes typed events
+    /// from two sites inside it; the two are deliberately different
+    /// widths. One credential, one process, four claims:
+    ///
+    /// - a full resolution is `cache=miss outcome=ok` and publishes one
+    ///   `credential_resolved` with `outcome: resolved`;
+    /// - the per-request cached serve is `cache=hit outcome=ok` and
+    ///   publishes nothing, which is the property a publish hoisted into
+    ///   the wrapper would silently destroy, turning every request
+    ///   carrying a bound credential into a SIEM event;
+    /// - a grace-window serve is `cache=stale outcome=ok` and publishes
+    ///   one `credential_resolved` with `outcome: stale_served`, which is
+    ///   the property a wrapper that swallowed the closure's early return
+    ///   would silently destroy in the other direction;
+    /// - and no resolved material reaches the feed on any of them.
+    ///
+    /// One egress install per process, the same shape as the two tests
+    /// above, which nextest's process-per-test model guarantees.
+    #[tokio::test]
+    async fn the_metrics_wrapper_and_the_typed_feed_agree_on_every_resolution_path() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        // A real re-resolve interval, so the second call is a cache hit.
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(
+            300, 300,
+        )));
+        install_working_vault();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("resolution-seam-events.ndjson");
+        let egress = sbproxy_observe::EventEgress::start(
+            sbproxy_observe::EventSinkTarget::File { path: path.clone() },
+            sbproxy_observe::EventTypeMask::from_types(&[
+                sbproxy_observe::EventType::CredentialResolved,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let p = vault_backed_plane().await;
+        let before_miss_ok = resolution_count("miss", "ok");
+        let before_hit_ok = resolution_count("hit", "ok");
+        let before_stale_ok = resolution_count("stale", "ok");
+
+        // A full resolution: the vault is read, so both instruments fire.
+        p.resolve_credential_secret("rotating", None)
+            .await
+            .expect("the first resolution runs the full path");
+        assert_eq!(
+            resolution_count("miss", "ok"),
+            before_miss_ok + 1,
+            "the full path is one cache=miss outcome=ok observation"
+        );
+
+        // The cached serve: the metric fires, the feed must not.
+        p.resolve_credential_secret("rotating", None)
+            .await
+            .expect("the second resolution is served from the resolved cache");
+        assert_eq!(
+            resolution_count("hit", "ok"),
+            before_hit_ok + 1,
+            "a cached serve is still observed, at cache=hit"
+        );
+        assert_eq!(
+            resolution_count("miss", "ok"),
+            before_miss_ok + 1,
+            "a cached serve must not be counted as a fresh resolution"
+        );
+
+        // The grace window: the backend is gone, the last known-good
+        // value is served, and both instruments fire on their own labels.
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(
+            0, 300,
+        )));
+        break_the_vault();
+        p.resolve_credential_secret("rotating", None)
+            .await
+            .expect("grace serves the last known-good value");
+        assert_eq!(
+            resolution_count("stale", "ok"),
+            before_stale_ok + 1,
+            "a grace serve is cache=stale outcome=ok, never folded into hit"
+        );
+
+        // A plaintext marker resolves without the vault, so once its
+        // event is on disk every earlier publish had its chance to land.
+        put(
+            &p,
+            credential(
+                "seam-marker",
+                CredentialMaterial::Plaintext {
+                    value: "seam-marker-value".into(),
+                },
+            ),
+        )
+        .await;
+        p.resolve_credential_secret("seam-marker", None)
+            .await
+            .expect("the marker credential resolves");
+        poll_events_file(&path, |line| line.contains("seam-marker"))
+            .expect("the marker resolution must reach the egress");
+
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+        let rotating: Vec<&str> = content
+            .lines()
+            .filter(|line| line.contains("\"rotating\""))
+            .collect();
+        assert_eq!(
+            rotating.len(),
+            2,
+            "one fresh resolution and one grace serve, and nothing at all \
+             from the cached serve between them: {content}"
+        );
+
+        let fresh: serde_json::Value =
+            serde_json::from_str(rotating[0]).expect("the first event line parses");
+        assert_eq!(fresh["event_type"], "credential_resolved");
+        assert_eq!(fresh["data"]["outcome"], "resolved");
+        assert_eq!(fresh["data"]["source"], "vault_ref");
+
+        let stale: serde_json::Value =
+            serde_json::from_str(rotating[1]).expect("the second event line parses");
+        assert_eq!(stale["event_type"], "credential_resolved");
+        assert_eq!(stale["data"]["outcome"], "stale_served");
+        assert!(
+            stale["data"].get("source").is_none(),
+            "the grace serve read nothing fresh, so it must not claim a source: {stale}"
+        );
+
+        assert!(
+            !content.contains("live-secret"),
+            "resolved material must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains("seam-marker-value"),
+            "resolved material must never reach the typed feed: {content}"
         );
     }
 }

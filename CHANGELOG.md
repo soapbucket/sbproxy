@@ -26,6 +26,42 @@ the next version cut.
   section of [docs/configuration.md](docs/configuration.md) and
   [examples/auth-hmac/](examples/auth-hmac/).
 
+- **Key-lifecycle events reach the SIEM feed.** The `events:` type
+  list grows to eighteen declared types with five key-lifecycle kinds.
+  `key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` bridge
+  from the `key_audit` channel, so every admin mint, revoke, rotate,
+  or block of a key or upstream credential publishes one typed event
+  beside its audit-chain entry instead of a SIEM having to poll the
+  admin API. `credential_resolved` fires once per actual resolution of
+  an upstream credential's material (never per request), with
+  `outcome: stale_served` marking a value served through a secret
+  backend outage. Payloads are an explicit allowlist (`op`,
+  `resource`, the public id, actor, tenant, outcome, and closed
+  status labels), never the `key_audit` diff, a token, or a hash;
+  `events.types:` filters the new kinds like any other, and
+  `sbproxy_events_dropped_total` covers them. See
+  [docs/events.md](docs/events.md#key-lifecycle-events-the-dual-record).
+
+- **Key management gets its four operational metrics.**
+  `sbproxy_key_operations_total{operation, outcome}` counts every admin
+  key-lifecycle call at the dispatch seam, keeping `refused` (a 4xx the
+  caller can fix) apart from `error` (the store or governance backend
+  failed) so a busy console never reads as an outage.
+  `sbproxy_credential_resolution_duration_seconds{cache, outcome}`
+  times each bound-credential resolution and names the layer that
+  answered, with `stale` marking a grace-window serve rather than
+  folding it into `hit`. `sbproxy_key_lookup_cache_total{kind,
+  outcome}` reports the keystore TTL cache, including `negative_hit` as
+  its own value so a stampede of unknown keys stays visible. And
+  `sbproxy_key_audit_write_failures_total{channel}` counts audit
+  emissions that did not reach a sink they were promised, touching the
+  series at 0 on every emission so an `increase()` alert has a baseline
+  from the first scrape. Every label value is a compile-time constant,
+  so none passes through the cardinality limiter. The `sbproxy-security`
+  Grafana dashboard gains the matching panels. See the operational
+  metrics section of
+  [docs/key-management.md](docs/key-management.md#operational-metrics).
+
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised
