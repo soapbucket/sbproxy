@@ -108,7 +108,7 @@ Common pitfall: each origin has sibling fields, NOT fields nested inside `action
 
 Origin fields:
 - `action` what to do: proxy, ai_proxy, static, redirect, echo, mock, beacon, noop, load_balancer, websocket, grpc
-- `authentication` who can access: api_key, basic_auth, bearer, jwt, digest, forward_auth, ldap_auth, noop
+- `authentication` who can access: api_key, basic_auth, bearer, jwt, digest, hmac_auth, ldap_auth, forward_auth, noop
 - `policies` access rules: rate_limit, ip_filter, waf, ddos, csrf, security_headers, request_limit, sri, assertion, cel
 - `transforms` body transforms: json, json_projection, json_schema, html, markdown, css, template, encoding, lua, javascript, and 8 more
 - `request_modifiers` / `response_modifiers` rewrite headers, URL, or body inbound and outbound
