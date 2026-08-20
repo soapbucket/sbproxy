@@ -691,8 +691,15 @@ pub struct KeyAuditChainEntry {
 pub struct AdminActionAuditEntry {
     /// RFC 3339 timestamp.
     pub timestamp: String,
-    /// The admin action: `admin_action`, `login`, `login_failed`, or
-    /// `inspect_request_content`.
+    /// The admin action: `admin_action`, `login`, `login_failed`,
+    /// `inspect_request_content`, `read_audit_chain`, or
+    /// `read_audit_chain_denied`.
+    ///
+    /// The last two are reads rather than mutations, and they are here for
+    /// the reason Vault audits its own audit reads: "who looked at the
+    /// trail, and who was refused it" is a question an investigator asks
+    /// about the investigation itself, and it can only be answered if the
+    /// looking was recorded at the time.
     pub action: String,
     /// The operator username, when the request resolved one.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -3439,6 +3439,305 @@ fn request_export_response(
     (200, format.content_type(), body)
 }
 
+/// One channel's line in the `GET /api/audit/chain` response (WOR-2579).
+///
+/// All four channels appear on every response, including the ones this
+/// deployment never turned on and the ones this request did not walk, so
+/// the console renders "not configured" rather than nothing at all.
+///
+/// A channel that was not walked carries `enabled` and no verdict, and the
+/// absence of `ok` is load bearing: "this request proved nothing about
+/// this chain" and "this chain is broken" are different statements, and a
+/// status object that could only say one of them would let a filtered read
+/// render three chains as healthy on the strength of having ignored them.
+#[derive(Serialize)]
+struct AuditChainChannelStatus {
+    /// `security`, `config`, `key`, or `admin`.
+    channel: &'static str,
+    /// Whether this channel has a chain file configured.
+    enabled: bool,
+    /// The file the walk read. Absent unless this request walked it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// The `kid` the chain signs under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
+    /// Records committed to the chain when the read started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_entries: Option<u64>,
+    /// Records the walk verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_entries: Option<u64>,
+    /// Whether every link and signature held. Present only on a channel
+    /// this request actually walked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    /// First sequence that failed, when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broken_seq: Option<u64>,
+    /// Why it failed, when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// Records matching the filters across the verified prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_matched: Option<u64>,
+    /// Cursor for the next older page. Single-channel reads only: a
+    /// sequence number only means something inside one chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_before_seq: Option<u64>,
+    /// The file could not be read at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl AuditChainChannelStatus {
+    /// A channel this request did not walk: either it is off, or a
+    /// `channel=` filter pointed somewhere else.
+    fn not_walked(channel: &'static str, enabled: bool) -> Self {
+        Self {
+            channel,
+            enabled,
+            path: None,
+            key_id: None,
+            chain_entries: None,
+            verified_entries: None,
+            ok: None,
+            broken_seq: None,
+            reason: None,
+            total_matched: None,
+            next_before_seq: None,
+            error: None,
+        }
+    }
+
+    /// A channel this request walked, carrying the verdict the walk
+    /// reached. `paged` is false on a merged read, where a per-channel
+    /// cursor would be a number the caller cannot use.
+    fn walked(read: &sbproxy_observe::audit_chain::AuditChainRead, paged: bool) -> Self {
+        Self {
+            channel: read.channel,
+            enabled: true,
+            path: Some(read.path.clone()),
+            key_id: Some(read.key_id.clone()),
+            chain_entries: Some(read.chain_entries),
+            verified_entries: Some(read.verified_entries),
+            ok: Some(read.ok),
+            broken_seq: read.broken_seq,
+            reason: read.reason.clone(),
+            total_matched: Some(read.total_matched),
+            next_before_seq: paged.then_some(read.next_before_seq).flatten(),
+            error: read.error.clone(),
+        }
+    }
+}
+
+/// `GET /api/audit/chain`: browse the four tamper-evident audit chains,
+/// verified on the way (WOR-2579).
+///
+/// Read-only by construction. There is no arm here for any other method,
+/// which is what lets a `read_only` operator call it without a role check:
+/// the RBAC gate refuses state-changing routes, and this route cannot
+/// change state. Reading the trail is the job that role exists for.
+///
+/// A verification failure is served as a `200` carrying `ok: false`, never
+/// a `500`. The break is the finding, the records before it are still
+/// evidence, and a viewer that turned a broken chain into an error page
+/// would hide the one thing the chain exists to reveal.
+fn handle_audit_chain(method: &str, path: &str, state: &AdminState) -> (u16, &'static str, String) {
+    use sbproxy_observe::audit_chain::{
+        audit_chain_installed, parse_chain_timestamp, read_audit_chain, AuditChainQuery,
+        AUDIT_CHAIN_CHANNELS, DEFAULT_AUDIT_CHAIN_LIMIT, MAX_AUDIT_CHAIN_LIMIT,
+    };
+
+    if !method.eq_ignore_ascii_case("GET") {
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+
+    // A tenant-scoped operator is refused the whole surface rather than
+    // served a filtered slice of it, on the same argument the meter routes
+    // make for a cross-tenant read: a narrowed view of an audit trail
+    // reads as "nothing else happened", which is a worse answer than a
+    // refusal because somebody will believe it. Two facts make filtering
+    // worse here than there. Records with no tenant at all (a file-watcher
+    // reload, an operator login) belong to the deployment rather than to
+    // any tenant, and the chain's own sequence numbers and entry counts
+    // describe every tenant's activity whatever the payloads say.
+    //
+    // The scope is looked up in the live config by the dispatching
+    // operator's name, exactly as `resolve_principal` does, so revoking it
+    // is a config reload rather than a wait for a session to expire.
+    let operator = current_admin_actor();
+    if let Some(scope) = operator
+        .as_deref()
+        .and_then(|who| state.operator_tenant(who))
+    {
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "read_audit_chain_denied",
+            operator.clone(),
+            Some(scope.clone()),
+            None,
+            None,
+            Some("GET /api/audit/chain".to_string()),
+        )
+        .emit();
+        return (
+            403,
+            "application/json",
+            serde_json::json!({
+                "error": format!(
+                    "forbidden: the audit chain is deployment-wide and this operator is scoped \
+                     to tenant `{scope}`"
+                ),
+            })
+            .to_string(),
+        );
+    }
+
+    // --- Query ---
+    let channel = decoded_query_param(path, "channel");
+    if let Some(name) = channel.as_deref() {
+        if !AUDIT_CHAIN_CHANNELS.contains(&name) {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"channel must be one of {}"}}"#,
+                    AUDIT_CHAIN_CHANNELS.join(", ")
+                ),
+            );
+        }
+    }
+    let mut query = AuditChainQuery {
+        actor: decoded_query_param(path, "actor").filter(|value| !value.is_empty()),
+        limit: rl_query_param(path, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_AUDIT_CHAIN_LIMIT)
+            .clamp(1, MAX_AUDIT_CHAIN_LIMIT),
+        ..AuditChainQuery::default()
+    };
+    for (name, slot) in [
+        ("since", &mut query.since_ms),
+        ("until", &mut query.until_ms),
+    ] {
+        let Some(raw) = decoded_query_param(path, name).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        match parse_chain_timestamp(&raw) {
+            Some(at) => *slot = Some(at),
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    format!(r#"{{"error":"{name} must be an RFC 3339 timestamp"}}"#),
+                )
+            }
+        }
+    }
+    if let Some(raw) = rl_query_param(path, "before_seq") {
+        let Ok(seq) = raw.parse::<u64>() else {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"before_seq must be a non-negative integer"}"#.to_string(),
+            );
+        };
+        // Refused rather than ignored across a merged read. Sequence
+        // numbers restart at zero on every chain, so one cursor applied to
+        // four of them pages each to a different place and the merged
+        // window silently skips records the caller was never told about.
+        if channel.is_none() {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"before_seq requires channel: a sequence number only means something inside one chain"}"#
+                    .to_string(),
+            );
+        }
+        query.before_seq = Some(seq);
+    }
+
+    // --- Walk ---
+    let paged = channel.is_some();
+    let mut statuses: Vec<AuditChainChannelStatus> = Vec::with_capacity(AUDIT_CHAIN_CHANNELS.len());
+    let mut entries: Vec<sbproxy_observe::audit_chain::AuditChainRecord> = Vec::new();
+    for name in AUDIT_CHAIN_CHANNELS {
+        if channel.as_deref().is_some_and(|wanted| wanted != name) {
+            statuses.push(AuditChainChannelStatus::not_walked(
+                name,
+                audit_chain_installed(name),
+            ));
+            continue;
+        }
+        let Some(mut read) = read_audit_chain(name, &query) else {
+            statuses.push(AuditChainChannelStatus::not_walked(name, false));
+            continue;
+        };
+        sbproxy_observe::metrics::record_audit_chain_read(
+            read.channel,
+            match (read.error.is_some(), read.ok) {
+                (true, _) => "unreadable",
+                (false, true) => "verified",
+                (false, false) => "broken",
+            },
+        );
+        entries.append(&mut read.records);
+        statuses.push(AuditChainChannelStatus::walked(&read, paged));
+    }
+
+    // Newest first across the merged window, then cut to the page the
+    // caller asked for. Ties break on the sequence number so two records
+    // stamped in the same millisecond keep a stable order rather than
+    // shuffling between reads.
+    entries.sort_by(|left, right| {
+        let left_at = sbproxy_observe::audit_chain::parse_chain_timestamp(&left.recorded_at);
+        let right_at = sbproxy_observe::audit_chain::parse_chain_timestamp(&right.recorded_at);
+        right_at
+            .cmp(&left_at)
+            .then_with(|| right.seq.cmp(&left.seq))
+            .then_with(|| left.channel.cmp(right.channel))
+    });
+    entries.truncate(query.limit);
+    let served = entries.len();
+
+    let body = serde_json::json!({ "channels": statuses, "entries": entries });
+
+    // Reading the audit trail is itself an audited action, the same
+    // posture `/api/requests/{id}/content` takes: an investigator asking
+    // "who looked" must not have to take our word for it. Emitted after
+    // the page is built, so a reader never finds their own read inside the
+    // window they just asked for, and the next one does.
+    //
+    // The detail carries the channel (a closed vocabulary, validated
+    // above) and a count, never the caller's `actor=` or time filters: a
+    // caller-supplied string does not get to enter a file whose whole
+    // value is that nobody can quietly amend it.
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "read_audit_chain",
+        operator,
+        None,
+        None,
+        None,
+        Some(format!(
+            "GET /api/audit/chain channel={} entries={served}",
+            channel.as_deref().unwrap_or("all"),
+        )),
+    )
+    .emit();
+
+    match serde_json::to_string(&body) {
+        Ok(body) => (200, "application/json", body),
+        Err(e) => (
+            500,
+            "application/json",
+            format!(r#"{{"error":"serialization failed: {e}"}}"#),
+        ),
+    }
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -3846,6 +4145,12 @@ pub fn handle_admin_request(
                 format!(r#"{{"error":"serialization failed: {e}"}}"#),
             ),
         };
+    }
+    // WOR-2579: the durable, tamper-evident chains behind those samples,
+    // read with verification. Method-aware, so it takes the whole request
+    // line rather than just the path.
+    if path_only == "/api/audit/chain" {
+        return handle_audit_chain(method, path, state);
     }
     // WOR-2096: fetch one request's redacted content sample. Admin role
     // only, and every read is audited before the content is returned.
@@ -8244,6 +8549,359 @@ mod tests {
                 handle_admin_request(method, "/admin/config/effective", &state, Some(&auth), None);
             assert_eq!(status, 405, "{method} should not be accepted");
         }
+    }
+
+    // --- GET /api/audit/chain (WOR-2579) ---
+
+    /// The four-channel viewer route serves entries from every installed
+    /// chain, newest first, and reports the channels that are not
+    /// enabled as disabled rather than omitting them.
+    #[test]
+    fn audit_chain_route_serves_entries_across_channels() {
+        use sbproxy_observe::audit_chain::{
+            install_admin_audit_chain, install_security_audit_chain, AdminActionAuditChain,
+            SecurityAuditChain,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = "11".repeat(32);
+        let security =
+            SecurityAuditChain::open(&dir.path().join("security.jsonl"), &seed, "viewer-kid")
+                .expect("the security chain opens");
+        let admin =
+            AdminActionAuditChain::open(&dir.path().join("admin.jsonl"), &seed, "viewer-kid")
+                .expect("the admin chain opens");
+        if install_security_audit_chain(security).is_err()
+            || install_admin_audit_chain(admin).is_err()
+        {
+            // Another test in this process claimed a chain slot first
+            // (plain `cargo test` shares one process). The nextest run,
+            // where every test owns its process, covers this path.
+            return;
+        }
+        sbproxy_observe::SecurityAuditEntry::policy_violation(
+            "waf",
+            "chain-viewer-marker-deny",
+            403,
+            Some("api.example.com".to_string()),
+            None,
+            Some("req-viewer-1".to_string()),
+            Some("GET".to_string()),
+        )
+        .emit();
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "admin_action",
+            Some("root".to_string()),
+            None,
+            None,
+            None,
+            Some("POST /admin/reload".to_string()),
+        )
+        .emit();
+
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/audit/chain", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let channels = json["channels"].as_array().expect("a channels array");
+        assert_eq!(channels.len(), 4, "all four channels are reported: {body}");
+        let by_name = |name: &str| {
+            channels
+                .iter()
+                .find(|c| c["channel"] == name)
+                .unwrap_or_else(|| panic!("channel {name} is reported: {body}"))
+        };
+        assert_eq!(by_name("security")["enabled"], true, "{body}");
+        assert_eq!(by_name("security")["ok"], true, "{body}");
+        assert_eq!(by_name("security")["key_id"], "viewer-kid", "{body}");
+        assert_eq!(by_name("config")["enabled"], false, "{body}");
+        assert_eq!(by_name("key")["enabled"], false, "{body}");
+        let entries = json["entries"].as_array().expect("an entries array");
+        assert!(
+            entries.iter().any(|e| e["channel"] == "security"
+                && e["event"]["reason"] == "chain-viewer-marker-deny"),
+            "the security denial is browsable: {body}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["channel"] == "admin" && e["actor"] == "root"),
+            "the admin action is browsable with its actor: {body}"
+        );
+    }
+
+    /// Tampering with a chained entry on disk is surfaced in the
+    /// response rather than hidden: the walk stops at the break, names
+    /// the sequence, and serves only the records that verified. This is
+    /// the property that makes the viewer more than a log reader.
+    #[test]
+    fn audit_chain_route_surfaces_a_tampered_entry() {
+        use sbproxy_observe::audit_chain::{install_security_audit_chain, SecurityAuditChain};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("security.jsonl");
+        let seed = "22".repeat(32);
+        let chain = SecurityAuditChain::open(&path, &seed, "viewer-kid").expect("the chain opens");
+        if install_security_audit_chain(chain).is_err() {
+            return;
+        }
+        for marker in ["tamper-zero", "tamper-one", "tamper-two"] {
+            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                "waf", marker, 403, None, None, None, None,
+            )
+            .emit();
+        }
+        let content = std::fs::read_to_string(&path).expect("the chain file is readable");
+        let tampered = content.replace("tamper-one", "tamper-WAS-EDITED");
+        assert_ne!(content, tampered, "the marker was present to tamper with");
+        std::fs::write(&path, tampered).expect("the tampered file is writable");
+
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let broken_before = audit_chain_read_total("security", "broken");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?channel=security",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(
+            status, 200,
+            "a broken chain is a finding, not a 500: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let channels = json["channels"].as_array().expect("a channels array");
+        let security = channels
+            .iter()
+            .find(|c| c["channel"] == "security")
+            .expect("the security channel is reported");
+        assert_eq!(security["ok"], false, "{body}");
+        assert_eq!(security["broken_seq"], 1, "{body}");
+        assert!(
+            security["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tampered"),
+            "the reason names the tamper: {body}"
+        );
+        let entries = json["entries"].as_array().expect("an entries array");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the records before the break are served: {body}"
+        );
+        assert_eq!(entries[0]["seq"], 0, "{body}");
+        // And the verdict leaves the page. A broken chain only a person
+        // looking at the console can see is a finding nobody is on call
+        // for, so the alertable signal is asserted here by name rather
+        // than left to the renderer.
+        // Strictly greater rather than exactly one more: the counter is
+        // process-wide, and under a shared-process runner another test
+        // reading the same installed chain would move it too. What is
+        // being pinned is the mapping - a walk that failed counts as
+        // `broken` - and a mapping that reported anything else leaves
+        // this label where it was.
+        assert!(
+            audit_chain_read_total("security", "broken") > broken_before,
+            "sbproxy_audit_chain_read_total{{channel=\"security\",outcome=\"broken\"}} \
+             did not move"
+        );
+    }
+
+    /// The current `sbproxy_audit_chain_read_total` value for one label
+    /// pair, read back off the default registry. Zero when the family
+    /// has not registered yet, which is the same thing as never having
+    /// counted.
+    fn audit_chain_read_total(channel: &str, outcome: &str) -> u64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_audit_chain_read_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let has = |name: &str, want: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|pair| pair.name() == name && pair.value() == want)
+                };
+                if has("channel", channel) && has("outcome", outcome) {
+                    return metric.get_counter().value() as u64;
+                }
+            }
+        }
+        0
+    }
+
+    /// The viewer refuses what it cannot serve: an unknown channel, a
+    /// malformed timestamp, and a cursor without a channel are each a
+    /// 400, and the route is GET-only.
+    #[test]
+    fn audit_chain_route_validates_its_query() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?channel=nope",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?since=yesterday",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?before_seq=5",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "a cursor needs a channel to page: {body}");
+        let (status, _, body) =
+            handle_admin_request("POST", "/api/audit/chain", &state, Some(&auth), None);
+        assert_eq!(status, 405, "{body}");
+    }
+
+    /// The audit viewer is a read surface: a read-only operator gets the
+    /// same 200 an admin does (WOR-2579). The route is GET-only by
+    /// construction, so the mutating-action gate never applies to it.
+    #[tokio::test]
+    async fn a_read_only_operator_can_read_the_audit_chain() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/audit/chain HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    /// A login narrowed to one tenant is refused the whole chain
+    /// surface rather than served a filtered slice of it, and the
+    /// refusal is on the tenant axis rather than the role axis: this
+    /// operator holds the `admin` role and is still refused (WOR-2579).
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_the_audit_chain() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reseller".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reseller-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::Admin,
+                tenant: Some("acme".to_string()),
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reseller", AdminRole::Admin, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/audit/chain HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a deployment-wide trail must not be sliced per tenant: {response}"
+        );
+        assert!(
+            response.contains("acme"),
+            "the refusal names the scope that caused it: {response}"
+        );
+    }
+
+    /// Reading the trail is itself recorded on the admin chain, naming
+    /// the operator and what they asked for: an investigator asking
+    /// "who looked" must not have to take our word for it (WOR-2579).
+    #[tokio::test]
+    async fn reading_the_audit_chain_is_itself_recorded() {
+        use sbproxy_observe::audit_chain::{install_admin_audit_chain, AdminActionAuditChain};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("admin.jsonl");
+        let chain = AdminActionAuditChain::open(&path, &"44".repeat(32), "viewer-kid")
+            .expect("the admin chain opens");
+        if install_admin_audit_chain(chain).is_err() {
+            // Another test in this process claimed the slot first (plain
+            // `cargo test` shares one process); nextest covers this.
+            return;
+        }
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "auditor".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "auditor-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) =
+            state
+                .session_signer
+                .mint("auditor", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /api/audit/chain?channel=admin HTTP/1.1\r\n\
+                 Cookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        let recorded = std::fs::read_to_string(&path).expect("the admin chain is readable");
+        assert!(
+            recorded.contains(r#""action":"read_audit_chain""#),
+            "the read is on the chain under its own name: {recorded}"
+        );
+        assert!(
+            recorded.contains(r#""actor":"auditor""#),
+            "and it names who looked: {recorded}"
+        );
+        assert!(
+            recorded.contains("channel=admin"),
+            "and what they asked for: {recorded}"
+        );
+        assert!(
+            !recorded.contains("read_audit_chain_denied"),
+            "an allowed read is not a denial: {recorded}"
+        );
     }
 
     // --- /admin/config/history (WOR-2456/2457) ---

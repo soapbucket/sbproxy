@@ -2251,6 +2251,46 @@ export interface AuditEventFilters {
   keyId?: string;
 }
 
+// WOR-2579: the tamper-evident chain viewer (GET /api/audit/chain).
+// One status object per channel; only channels the request walked carry
+// verification fields, and a disabled channel carries just its name.
+export interface AuditChainChannel {
+  channel: "security" | "config" | "key" | "admin" | string;
+  enabled: boolean;
+  path?: string;
+  key_id?: string;
+  chain_entries?: number;
+  verified_entries?: number;
+  ok?: boolean;
+  broken_seq?: number | null;
+  reason?: string | null;
+  total_matched?: number;
+  next_before_seq?: number | null;
+  error?: string;
+}
+
+export interface AuditChainEntry {
+  channel: string;
+  seq: number;
+  recorded_at: string;
+  actor?: string | null;
+  event: Record<string, unknown>;
+}
+
+export interface AuditChainResponse {
+  channels: AuditChainChannel[];
+  entries: AuditChainEntry[];
+}
+
+export interface AuditChainFilters {
+  channel?: string;
+  actor?: string;
+  since?: string;
+  until?: string;
+  beforeSeq?: number;
+  limit?: number;
+}
+
 // WOR-2096: one redacted content sample for one request.
 export interface CapturedMessage {
   role: string;
@@ -2816,6 +2856,23 @@ export const api = {
     const query = params.toString();
     return getJson<AuditEvent[]>(
       query ? `/api/audit/events?${query}` : "/api/audit/events",
+    );
+  },
+  // WOR-2579: the durable, tamper-evident chains, read with verification.
+  // Without a channel the response merges the newest window across every
+  // enabled chain; `beforeSeq` pages one channel further back.
+  auditChain: (filters: AuditChainFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.channel) params.set("channel", filters.channel);
+    if (filters.actor) params.set("actor", filters.actor);
+    if (filters.since) params.set("since", filters.since);
+    if (filters.until) params.set("until", filters.until);
+    if (filters.beforeSeq !== undefined)
+      params.set("before_seq", String(filters.beforeSeq));
+    if (filters.limit) params.set("limit", String(filters.limit));
+    const query = params.toString();
+    return getJson<AuditChainResponse>(
+      query ? `/api/audit/chain?${query}` : "/api/audit/chain",
     );
   },
   // WOR-2096: one request's redacted content sample (admin role only;

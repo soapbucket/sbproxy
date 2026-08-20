@@ -482,3 +482,44 @@ describe("alert operations contracts", () => {
     );
   });
 });
+
+describe("api.auditChain (WOR-2579)", () => {
+  it("builds the snake_case chain query with the paging cursor", async () => {
+    const fetchMock = stubFetch('{"channels":[],"entries":[]}');
+
+    await api.auditChain({
+      channel: "security",
+      actor: "203.0.113.9",
+      since: "2026-08-20T10:30:00.000Z",
+      beforeSeq: 42,
+      limit: 50,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audit/chain?channel=security&actor=203.0.113.9&since=2026-08-20T10%3A30%3A00.000Z&before_seq=42&limit=50",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("keeps a zero cursor: seq 0 is a real position, not a missing one", async () => {
+    const fetchMock = stubFetch('{"channels":[],"entries":[]}');
+
+    await api.auditChain({ channel: "admin", beforeSeq: 0 });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audit/chain?channel=admin&before_seq=0",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("omits the query string entirely when nothing is filtered", async () => {
+    const fetchMock = stubFetch('{"channels":[],"entries":[]}');
+
+    await api.auditChain();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audit/chain",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});

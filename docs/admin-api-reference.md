@@ -1454,9 +1454,68 @@ Query parameters: `limit` (default 100, capped at 1000), `channel`,
 
 This is a bounded in-memory sample for runtime inspection: the ring
 holds the most recent 1,000 events and clears on restart. The durable
-audit trail is whatever your log pipeline or OTel collector ships the
-`security_audit`, `key_audit`, `config_audit`, and
+trail is the tamper-evident chain each channel can opt into, browsable
+at `GET /api/audit/chain` below, or whatever your log pipeline or OTel
+collector ships the `security_audit`, `key_audit`, `config_audit`, and
 `sbproxy::admin::audit` tracing targets to.
+
+### `GET /api/audit/chain`
+
+The tamper-evident chain viewer: reads the chained audit files
+(`audit.path`, `audit.config_path`, `audit.key_path`,
+`audit.admin_path`), re-verifying every hash link and Ed25519 signature
+as it reads. Unlike `/api/audit/events` this is not a sample; it is the
+durable record itself, and every page served has been proved unmodified
+since the proxy wrote it. See
+[audit-log.md](audit-log.md#browsing-it-from-the-console) for the walk's
+mechanics and a captured tamper example.
+
+Query parameters: `channel` (one of `security`, `config`, `key`,
+`admin`; without it the newest window across every enabled channel is
+merged), `actor` (exact match: the operator on the config, key, and
+admin channels, the client IP on the security channel), `since` /
+`until` (RFC 3339, inclusive, against each record's chained
+`recorded_at`), `before_seq` (page cursor, requires `channel`), and
+`limit` (default 100, capped at 500).
+
+The response carries one status object per channel, all four every
+time, plus the merged entry window:
+
+| Field | Type | Description |
+|---|---|---|
+| `channels[].channel` | string | `security`, `config`, `key`, or `admin`. |
+| `channels[].enabled` | bool | Whether this channel's chain file is configured. Disabled channels carry only these two fields. |
+| `channels[].path` | string | The chain file the walk read. |
+| `channels[].key_id` | string | The `kid` the chain signs under. |
+| `channels[].chain_entries` | number | Entries committed to the chain at the moment the read started. |
+| `channels[].verified_entries` | number | Entries the walk verified. Fewer than `chain_entries` means the file has lost records the proxy wrote, which is itself reported as `ok: false`; more means an entry was appended while the walk was running, which is not a failure. |
+| `channels[].ok` | bool | Whether every link and signature held. Only present on channels this request walked. |
+| `channels[].broken_seq` | number | First sequence that failed, when `ok` is false. |
+| `channels[].reason` | string | Why that sequence failed, when `ok` is false. |
+| `channels[].total_matched` | number | Entries matching the filters, the `before_seq` cursor included, across the verified prefix. |
+| `channels[].next_before_seq` | number | Cursor for the next older page, when one exists (single-channel reads only). |
+| `channels[].error` | string | The file could not be read at all. Present alongside `ok: false`, never instead of it: "we could not check" and "we checked and it held" must not render the same way. |
+| `entries[]` | array | The window, newest first: `channel`, `seq`, `recorded_at`, `actor`, and the full chained `event` payload. |
+
+A verification failure is a `200` with `ok: false`, never a `500`: the
+break is the finding, and the records before it are still served. Two
+things fail a walk: a record whose digest or signature no longer
+matches, and a file holding fewer records than the proxy wrote to it,
+which is what deleting or truncating a chain looks like from the inside.
+`400` names the offending parameter (unknown `channel`, malformed
+`since` or `until`, `before_seq` without a `channel`).
+
+GET-only, and read-only by construction, so both `admin` and `read_only`
+operators may call it. One operator may not: a login narrowed with
+`proxy.admin.operators[].tenant` gets a `403`, because the chains are
+deployment-wide and a per-tenant slice of an audit trail reads as
+"nothing else happened". Every call is itself recorded on the admin
+channel (`read_audit_chain`, or `read_audit_chain_denied` on the `403`)
+and counted on
+`sbproxy_audit_chain_read_total{channel, outcome}`, whose `outcome` is
+`verified`, `broken`, or `unreadable`. Alert on the last two: a broken
+chain that only a person looking at the console can see is a finding
+nobody is on call for.
 
 ### `GET /api/egress`
 

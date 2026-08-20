@@ -1459,6 +1459,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_audit_chain_read_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_audit_chain_read"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["channel", "outcome"],
+        description: "Audit-chain reads served by the console viewer, by verification outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_audit_emit_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_audit_emit_duration"),
