@@ -13,12 +13,54 @@
 //!   carries `Content-Security-Policy-Report-Only` and NOT
 //!   `Content-Security-Policy`.
 //!
-//! The headers are appended in `response_filter`, which only runs on
-//! the proxy flow (static actions short-circuit before that), so we
-//! pair every test with a `MockUpstream`.
+//! The headers are appended in `response_filter` on the proxy flow and
+//! by the generated-response application (WOR-2496) on `static` /
+//! `mock` / `echo` / `beacon` / `redirect` actions, so most tests here
+//! pair with a `MockUpstream` and one pins the static-origin path.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+
+#[test]
+fn security_headers_are_emitted_on_a_static_origin() {
+    // WOR-2496: response-phase policy headers apply to generated
+    // responses too; before the fix a static origin silently dropped
+    // every configured header.
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "sec.localhost":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: security_headers
+        headers:
+          - name: X-Frame-Options
+            value: DENY
+          - name: X-Content-Type-Options
+            value: nosniff
+"#;
+    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+
+    let resp = harness.get("/", "sec.localhost").expect("GET");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.headers.get("x-frame-options").map(String::as_str),
+        Some("DENY"),
+        "X-Frame-Options must appear on a static origin's response"
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-content-type-options")
+            .map(String::as_str),
+        Some("nosniff"),
+        "X-Content-Type-Options must appear on a static origin's response"
+    );
+}
 
 fn yaml_with_static_headers(upstream_base: &str) -> String {
     format!(

@@ -259,9 +259,8 @@ pub(super) async fn handle_action(
                 // 501 gate: at least one configured provider must support
                 // realtime. Identity-specific provider selection happens
                 // after credential policy is resolved below.
-                let any_realtime_provider = ai.config.providers.iter().any(|p| {
-                    p.enabled && sbproxy_ai::api_routes::provider_supports_realtime(&p.name)
-                });
+                let any_realtime_provider =
+                    any_enabled_provider_supports_realtime(&ai.config.providers);
                 if !any_realtime_provider {
                     warn!(
                         ai.surface = surface_label,
@@ -458,13 +457,26 @@ pub(super) async fn handle_action(
                 // No bulk match and no fallback url: surface a 404 so
                 // the caller sees an unconfigured route instead of an
                 // empty redirect.
-                let header = pingora_http::ResponseHeader::build(404, Some(0)).map_err(|e| {
-                    Error::because(
-                        ErrorType::InternalError,
-                        "failed to build redirect 404 header",
-                        e,
-                    )
-                })?;
+                ctx.response_status = Some(404);
+                let mut header =
+                    pingora_http::ResponseHeader::build(404, Some(0)).map_err(|e| {
+                        Error::because(
+                            ErrorType::InternalError,
+                            "failed to build redirect 404 header",
+                            e,
+                        )
+                    })?;
+                // WOR-2496: response-phase policies and cookies apply to
+                // the generated response exactly as they would to a
+                // proxied one.
+                apply_generated_response_phases(
+                    session,
+                    ctx,
+                    pipeline,
+                    origin_idx,
+                    &mut header,
+                    b"",
+                );
                 session
                     .write_response_header(Box::new(header), true)
                     .await?;
@@ -496,6 +508,12 @@ pub(super) async fn handle_action(
             header.insert_header("location", &location).map_err(|e| {
                 Error::because(ErrorType::InternalError, "failed to set location", e)
             })?;
+            // Stamp the status for the access log and metrics, mirroring
+            // the static and mock arms (WOR-1782).
+            ctx.response_status = Some(target_status);
+            // WOR-2496: response-phase policies and cookies apply to the
+            // generated response exactly as they would to a proxied one.
+            apply_generated_response_phases(session, ctx, pipeline, origin_idx, &mut header, b"");
             session
                 .write_response_header(Box::new(header), true)
                 .await?;
@@ -526,41 +544,15 @@ pub(super) async fn handle_action(
             // so the gated `html_to_markdown`, typed `citation_block`, and
             // typed `json_envelope` all run with the per-request ctx fields
             // (`content_shape_transform`, `markdown_projection`,
-            // `canonical_url`, `rsl_urn`, `citation_required`).
-            let mut body_bytes = if let Some(idx) = origin_idx {
-                if idx < pipeline.transforms.len() && !pipeline.transforms[idx].is_empty() {
-                    let mut buf = bytes::BytesMut::from(s.body.as_bytes());
-                    let content_type = Some(ct.as_str());
-                    let ratio = resolved_token_bytes_ratio(Some(&pipeline.config.origins[idx]));
-                    for compiled_transform in &pipeline.transforms[idx] {
-                        let needs_synth_projection = matches!(
-                            compiled_transform.transform,
-                            sbproxy_modules::Transform::CitationBlock(_)
-                                | sbproxy_modules::Transform::JsonEnvelope(_)
-                        );
-                        if needs_synth_projection {
-                            synthesise_markdown_projection_if_missing(ctx, &buf, ratio);
-                        }
-                        if let Err(e) = apply_transform_with_ctx(
-                            compiled_transform,
-                            &mut buf,
-                            content_type,
-                            ctx,
-                        ) {
-                            warn!(
-                                transform = compiled_transform.transform.transform_type(),
-                                error = %e,
-                                "static action transform failed, continuing"
-                            );
-                        }
-                    }
-                    buf.freeze()
-                } else {
-                    Bytes::copy_from_slice(s.body.as_bytes())
-                }
-            } else {
-                Bytes::copy_from_slice(s.body.as_bytes())
-            };
+            // `canonical_url`, `rsl_urn`, `citation_required`). The walk
+            // itself is shared with the mock arm (WOR-2496).
+            let mut body_bytes = apply_origin_transforms_to_generated_body(
+                pipeline,
+                origin_idx,
+                ctx,
+                Bytes::copy_from_slice(s.body.as_bytes()),
+                &ct,
+            );
 
             // Wave 4 day-5 Items 3 + 4: shape-driven body rewrite +
             // Content-Type override.
@@ -745,6 +737,11 @@ pub(super) async fn handle_action(
             }
 
             let effective_status = status_override.unwrap_or(s.status);
+            // Re-stamp with the post-override status so the access log
+            // and metrics record what actually went on the wire. The
+            // earlier stamp (pre-transforms) stays: the CEL header
+            // transform reads `response.status` during the body walk.
+            ctx.response_status = Some(effective_status);
             let num_headers = 2 + s.headers.len() + extra_headers.len();
             let mut header =
                 pingora_http::ResponseHeader::build(effective_status, Some(num_headers)).map_err(
@@ -853,6 +850,18 @@ pub(super) async fn handle_action(
                     let _ = header.insert_header("crawler-charged", charged);
                 }
             }
+            // WOR-2496: response-phase policies (security_headers,
+            // page_shield, sri, assertion), session cookies, the csrf
+            // cookie, and plugin-policy response headers apply to the
+            // generated response exactly as they would to a proxied one.
+            apply_generated_response_phases(
+                session,
+                ctx,
+                pipeline,
+                origin_idx,
+                &mut header,
+                &body_bytes,
+            );
             session
                 .write_response_header(Box::new(header), false)
                 .await?;
@@ -880,7 +889,37 @@ pub(super) async fn handle_action(
                 "headers": headers,
             });
             let body = serde_json::to_vec(&echo).unwrap_or_default();
-            send_response(session, 200, "application/json", &body).await?;
+            // Stamp the status for the access log and metrics, mirroring
+            // the static and mock arms (WOR-1782): an echo response never
+            // reaches Pingora's response_filter.
+            ctx.response_status = Some(200);
+            let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
+                Error::because(ErrorType::InternalError, "failed to build echo header", e)
+            })?;
+            header
+                .insert_header("content-type", "application/json")
+                .map_err(|e| {
+                    Error::because(ErrorType::InternalError, "failed to set content-type", e)
+                })?;
+            header
+                .insert_header("content-length", body.len().to_string())
+                .map_err(|e| {
+                    Error::because(ErrorType::InternalError, "failed to set content-length", e)
+                })?;
+            // Behavior-preserving: `send_response` (the previous writer
+            // for this arm) stamps the e2e harness token; keep doing so.
+            if let Some(token) = e2e_harness_token() {
+                let _ = header.insert_header("x-sbproxy-e2e-harness-token", token);
+            }
+            // WOR-2496: response-phase policies and cookies apply to the
+            // generated response exactly as they would to a proxied one.
+            apply_generated_response_phases(session, ctx, pipeline, origin_idx, &mut header, &body);
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
             Ok(true)
         }
 
@@ -891,6 +930,16 @@ pub(super) async fn handle_action(
             // log and sbproxy_requests_total record status="0" for a
             // request that got a 200 on the wire (WOR-1782).
             ctx.response_status = Some(m.status);
+            // WOR-2496: the origin's transform chain applies to the
+            // mock body the same way it does to a static body or an
+            // upstream response.
+            let body = apply_origin_transforms_to_generated_body(
+                pipeline,
+                origin_idx,
+                ctx,
+                Bytes::from(serde_json::to_vec(&m.body).unwrap_or_default()),
+                "application/json",
+            );
             let num_headers = 1 + m.headers.len();
             let mut header = pingora_http::ResponseHeader::build(m.status, Some(num_headers))
                 .map_err(|e| {
@@ -906,17 +955,42 @@ pub(super) async fn handle_action(
                     Error::because(ErrorType::InternalError, "failed to set header", e)
                 })?;
             }
-            let body = serde_json::to_vec(&m.body).unwrap_or_default();
+            // Drain CEL header mutations the transform walk accumulated,
+            // mirroring the static arm's drain of the same slot.
+            for mutation in std::mem::take(&mut ctx.cel_response_header_mutations) {
+                match mutation {
+                    sbproxy_modules::transform::CelHeaderMutation::Set(k, v) => {
+                        let _ = header.insert_header(k, &v);
+                    }
+                    sbproxy_modules::transform::CelHeaderMutation::Append(k, v) => {
+                        let _ = header.append_header(k, &v);
+                    }
+                    sbproxy_modules::transform::CelHeaderMutation::Remove(k) => {
+                        let _ = header.remove_header(&k);
+                    }
+                }
+            }
+            // WOR-2496: response-phase policies and cookies apply to the
+            // generated response exactly as they would to a proxied one.
+            apply_generated_response_phases(session, ctx, pipeline, origin_idx, &mut header, &body);
             session
                 .write_response_header(Box::new(header), false)
                 .await?;
-            session
-                .write_response_body(Some(bytes::Bytes::from(body)), true)
-                .await?;
+            session.write_response_body(Some(body), true).await?;
             Ok(true)
         }
 
         Action::Beacon(_) => {
+            // 1x1 transparent GIF
+            static GIF_1X1: &[u8] = &[
+                0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff,
+                0xff, 0xff, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+                0x3b,
+            ];
+            // Stamp the status for the access log and metrics, mirroring
+            // the static and mock arms (WOR-1782).
+            ctx.response_status = Some(200);
             let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
                 Error::because(ErrorType::InternalError, "failed to build beacon header", e)
             })?;
@@ -930,16 +1004,19 @@ pub(super) async fn handle_action(
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to set cache-control", e)
                 })?;
+            // WOR-2496: response-phase policies and cookies apply to the
+            // generated response exactly as they would to a proxied one.
+            apply_generated_response_phases(
+                session,
+                ctx,
+                pipeline,
+                origin_idx,
+                &mut header,
+                GIF_1X1,
+            );
             session
                 .write_response_header(Box::new(header), false)
                 .await?;
-            // 1x1 transparent GIF
-            static GIF_1X1: &[u8] = &[
-                0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff,
-                0xff, 0xff, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
-                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
-                0x3b,
-            ];
             session
                 .write_response_body(Some(bytes::Bytes::from_static(GIF_1X1)), true)
                 .await?;
@@ -1555,6 +1632,55 @@ fn split_plugin_action_response_headers(
     (content_type, extras)
 }
 
+/// The realtime pre-credential 501 gate: at least one enabled provider
+/// must support the Realtime surface before any credential resolution
+/// runs. Extracted as a free function so the gate's provider iteration
+/// is unit-testable (WOR-2485: the gate must key the capability lookup
+/// the same way the admission path in `ai_dispatch` does).
+fn any_enabled_provider_supports_realtime(providers: &[sbproxy_ai::ProviderConfig]) -> bool {
+    providers
+        .iter()
+        .any(|p| p.enabled && sbproxy_ai::api_routes::provider_supports_realtime(p))
+}
+
+#[cfg(test)]
+mod realtime_gate_tests {
+    use super::*;
+
+    fn providers(json: serde_json::Value) -> Vec<sbproxy_ai::ProviderConfig> {
+        serde_json::from_value(json).expect("provider fixture")
+    }
+
+    // WOR-2485: a renamed entry keeps its type's realtime support; the
+    // gate must key on the effective provider type, not the display
+    // name.
+    #[test]
+    fn renamed_openai_provider_passes_the_realtime_gate() {
+        assert!(any_enabled_provider_supports_realtime(&providers(
+            serde_json::json!([
+                {"name": "team-openai", "provider_type": "openai", "api_key": "k"}
+            ])
+        )));
+    }
+
+    #[test]
+    fn disabled_or_incapable_providers_do_not_satisfy_the_realtime_gate() {
+        // Disabled openai: capability without eligibility.
+        assert!(!any_enabled_provider_supports_realtime(&providers(
+            serde_json::json!([
+                {"name": "openai", "api_key": "k", "enabled": false}
+            ])
+        )));
+        // Enabled anthropic type: eligibility without capability, and
+        // the rename must not change that answer either.
+        assert!(!any_enabled_provider_supports_realtime(&providers(
+            serde_json::json!([
+                {"name": "team-claude", "provider_type": "anthropic", "api_key": "k"}
+            ])
+        )));
+    }
+}
+
 #[cfg(test)]
 mod plugin_action_tests {
     use std::future::Future;
@@ -1594,25 +1720,34 @@ mod plugin_action_tests {
         )))
     }
 
+    const DEFAULT_TEST_REQUEST: &[u8] =
+        b"POST /jobs HTTP/1.1\r\nHost: plugin.test\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
     async fn exchange(
         action: &Action,
         pipeline: &CompiledPipeline,
         origin_idx: Option<usize>,
     ) -> (pingora_error::Result<bool>, Vec<u8>) {
+        exchange_with(action, pipeline, origin_idx, DEFAULT_TEST_REQUEST, |_| {}).await
+    }
+
+    async fn exchange_with(
+        action: &Action,
+        pipeline: &CompiledPipeline,
+        origin_idx: Option<usize>,
+        raw_request: &[u8],
+        prepare_ctx: impl FnOnce(&mut RequestContext),
+    ) -> (pingora_error::Result<bool>, Vec<u8>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
         let address = listener.local_addr().expect("downstream address");
+        let request = raw_request.to_vec();
         let client = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect downstream fixture");
-            stream
-                .write_all(
-                    b"POST /jobs HTTP/1.1\r\nHost: plugin.test\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                )
-                .await
-                .expect("write request");
+            stream.write_all(&request).await.expect("write request");
             stream.shutdown().await.expect("half-close request");
             let mut response = Vec::new();
             stream
@@ -1629,6 +1764,7 @@ mod plugin_action_tests {
             .await
             .expect("parse downstream request");
         let mut ctx = RequestContext::new();
+        prepare_ctx(&mut ctx);
 
         let result = handle_action(action, &mut session, pipeline, origin_idx, &mut ctx).await;
         drop(session);
@@ -2152,6 +2288,578 @@ origins:
 
         assert!(result.is_err(), "invalid plugin response must fail");
         assert!(wire.is_empty(), "invalid response wrote bytes: {wire:?}");
+    }
+
+    // --- WOR-2496: response-phase policies on locally generated responses ---
+    //
+    // `static`, `mock`, `echo`, `beacon`, and `redirect` actions answer
+    // during the request phase and never reach Pingora's
+    // `response_filter`, so the response-phase surface (security_headers,
+    // page_shield, sri, assertion, session cookies, csrf cookies,
+    // plugin-policy response headers) used to silently no-op for them.
+    // These tests pin the generated-response path to the same behavior a
+    // proxied 200 gets.
+
+    fn pipeline_from_yaml(yaml: &str) -> CompiledPipeline {
+        let config = sbproxy_config::compile_config(yaml).expect("fixture config");
+        CompiledPipeline::from_config(config).expect("fixture pipeline")
+    }
+
+    #[tokio::test]
+    async fn static_action_applies_security_headers_policy() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: security_headers
+        headers:
+          - name: X-Frame-Options
+            value: DENY
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-frame-options: deny"),
+            "security_headers must apply to a static action's response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_action_issues_session_cookie() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    session:
+      cookie_name: sb_session
+      max_age: 3600
+      http_only: true
+      secure: false
+      same_site: Lax
+      allow_non_ssl: true
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: "{}"
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("set-cookie: sb_session="),
+            "a session block must issue its cookie on a static action: {response}"
+        );
+        assert!(
+            response.contains("Max-Age=3600"),
+            "cookie must carry the configured attributes: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_action_suppresses_session_cookie_when_request_carries_it() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    session:
+      cookie_name: sb_session
+      allow_non_ssl: true
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: "{}"
+"#,
+        );
+
+        // Positive control first: without the cookie the mechanism is
+        // live and issues one. Without this, the suppression assertion
+        // below would also pass in the broken pre-WOR-2496 state where
+        // no cookie was ever issued at all.
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("set-cookie: sb_session="),
+            "control: a cookie-less request must be issued the cookie: {response}"
+        );
+
+        let request = b"GET / HTTP/1.1\r\nHost: plugin.test\r\ncookie: sb_session=abc123\r\nconnection: close\r\n\r\n";
+        let (result, wire) =
+            exchange_with(&pipeline.actions[0], &pipeline, Some(0), request, |_| {}).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            !response.to_ascii_lowercase().contains("set-cookie:"),
+            "a request already carrying the session cookie must not get a fresh one: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_action_applies_page_shield_header() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: "<html></html>"
+    policies:
+      - type: page_shield
+        directives:
+          - "default-src 'self'"
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-security-policy-report-only:"),
+            "page_shield (report-only default) must stamp its CSP on a static action: {response}"
+        );
+        assert!(
+            lower.contains("report-uri /__sbproxy/csp-report"),
+            "the stamped CSP must point at the report intake: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_shield_yields_to_generated_csp_when_respect_upstream_is_set() {
+        // Positive control first: the same respect_upstream policy on
+        // an action WITHOUT its own CSP stamps the header, proving the
+        // mechanism is live. Without this, the yield assertion below
+        // would also pass in the broken pre-WOR-2496 state where
+        // page_shield never ran on static actions at all.
+        let control = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: "<html></html>"
+    policies:
+      - type: page_shield
+        respect_upstream: true
+        directives:
+          - "default-src 'self'"
+"#,
+        );
+        let (result, wire) = exchange(&control.actions[0], &control, Some(0)).await;
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("content-security-policy-report-only:"),
+            "control: page_shield must stamp when the action has no CSP of its own: {response}"
+        );
+
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: "<html></html>"
+      headers:
+        content-security-policy: "default-src 'none'"
+    policies:
+      - type: page_shield
+        respect_upstream: true
+        directives:
+          - "default-src 'self'"
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-security-policy: default-src 'none'"),
+            "the action's own CSP must survive: {response}"
+        );
+        assert!(
+            !lower.contains("content-security-policy-report-only:"),
+            "respect_upstream must yield to the generated response's own CSP: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_action_sri_scan_records_violation_metric() {
+        fn sri_violation_count() -> f64 {
+            sbproxy_observe::metrics::metrics()
+                .registry
+                .gather()
+                .iter()
+                .filter(|family| family.name() == "sbproxy_policy_triggers_total")
+                .flat_map(|family| family.get_metric())
+                .filter(|metric| {
+                    let labels = metric.get_label();
+                    labels
+                        .iter()
+                        .any(|l| l.name() == "policy_type" && l.value() == "sri")
+                        && labels
+                            .iter()
+                            .any(|l| l.name() == "action" && l.value() == "violation")
+                })
+                .map(|metric| metric.get_counter().value())
+                .sum()
+        }
+
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: '<html><head><script src="https://cdn.example.com/app.js"></script></head></html>'
+    policies:
+      - type: sri
+        enforce: true
+        algorithms: [sha256, sha384, sha512]
+"#,
+        );
+
+        let before = sri_violation_count();
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+        let after = sri_violation_count();
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.contains("cdn.example.com/app.js"),
+            "sri is observation-only; the body must pass through intact: {response}"
+        );
+        assert!(
+            after > before,
+            "an enforcing sri policy must scan a static HTML response \
+             (violation count before={before}, after={after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_action_applies_response_transforms() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: mock
+      status: 200
+      body:
+        endpoint: "https://internal.example.com/v1/charges"
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: "internal.example.com"
+            replace: "public.example.com"
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("mock action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.contains("public.example.com"),
+            "a configured transform must apply to a mock origin's body: {response}"
+        );
+        assert!(
+            !response.contains("internal.example.com"),
+            "the pre-transform body must not leak: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_action_applies_security_headers_policy() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: mock
+      status: 200
+      body:
+        ok: true
+    policies:
+      - type: security_headers
+        headers:
+          - name: X-Content-Type-Options
+            value: nosniff
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("mock action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-content-type-options: nosniff"),
+            "security_headers must apply to a mock action's response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn echo_action_applies_security_headers_policy() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: echo
+    policies:
+      - type: security_headers
+        headers:
+          - name: X-Frame-Options
+            value: SAMEORIGIN
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("echo action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-frame-options: sameorigin"),
+            "security_headers must apply to an echo action's response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn beacon_action_issues_session_cookie() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    session:
+      cookie_name: sb_beacon
+      allow_non_ssl: true
+    action:
+      type: beacon
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("beacon action must dispatch"));
+        // The GIF body is not UTF-8; inspect the headers lossily.
+        let response = String::from_utf8_lossy(&wire).to_string();
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("set-cookie: sb_beacon="),
+            "a session block must issue its cookie on a beacon action: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_action_issues_session_cookie() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    session:
+      cookie_name: sb_session
+      allow_non_ssl: true
+    action:
+      type: redirect
+      url: "https://example.com/next"
+      status: 302
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("redirect action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 302"), "response: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("set-cookie: sb_session="),
+            "a session block must issue its cookie on a redirect action: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_response_drains_policy_headers_and_csrf_cookie() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "ok"
+"#,
+        );
+
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| {
+                ctx.policy_response_headers
+                    .push(("X-Policy-Confirm".to_string(), "checked".to_string()));
+                ctx.csrf_cookie = Some("sb_csrf=tok; Path=/; SameSite=Lax".to_string());
+            },
+        )
+        .await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("x-policy-confirm: checked"),
+            "plugin-policy response headers must land on a generated response: {response}"
+        );
+        assert!(
+            lower.contains("set-cookie: sb_csrf=tok"),
+            "the csrf cookie must land on a generated response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_response_evaluates_assertion_policies() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+        struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedLogGuard {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log capture").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+            type Writer = SharedLogGuard;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                SharedLogGuard(Arc::clone(&self.0))
+            }
+        }
+
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: assertion
+        name: static-answers-200
+        expression: "response.status == 200"
+"#,
+        );
+
+        // Drive the sync helper directly under a capturing subscriber:
+        // assertions only log, so the captured event stream is the
+        // observable output.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(DEFAULT_TEST_REQUEST)
+                .await
+                .expect("write request");
+            stream.shutdown().await.expect("half-close request");
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response).await;
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        let mut ctx = RequestContext::new();
+        let mut header =
+            pingora_http::ResponseHeader::build(200, None).expect("build response header");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            apply_generated_response_phases(
+                &session,
+                &mut ctx,
+                &pipeline,
+                Some(0),
+                &mut header,
+                b"ok",
+            );
+        });
+        drop(session);
+        let _ = tokio::time::timeout(Duration::from_secs(2), client).await;
+
+        let bytes = captured.lock().expect("log capture").clone();
+        let logs = String::from_utf8(bytes).expect("log output is UTF-8");
+        assert!(
+            logs.contains("assertion passed") && logs.contains("static-answers-200"),
+            "an assertion policy must evaluate against a generated response: {logs}"
+        );
     }
 }
 

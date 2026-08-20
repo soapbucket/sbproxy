@@ -4064,15 +4064,17 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     //
     // Review round (WOR-2491, M1): read `config.action`'s own `type`
     // string here, before it moves into `action_config` below, so the
-    // expander can tell whether this origin's action reaches
-    // Pingora's response-phase filter at all. `api8`'s
-    // `security_headers` piece only takes effect there
-    // (`server/proxy_http.rs::response_filter`); an action handled
-    // entirely inside `request_filter` (`static`, `mock`, `echo`,
-    // `beacon`, `redirect`, `mcp`, `noop`, `ai_proxy`, `storage`, any
-    // plugin action - see `action_dispatch.rs::handle_action`'s own
-    // match) never reaches it, so synthesizing that piece there would
-    // claim coverage nothing enforces.
+    // expander can tell whether this origin's action applies
+    // response-phase policies. `api8`'s `security_headers` piece only
+    // takes effect where that surface runs: Pingora's response filter
+    // for proxied actions, and (WOR-2496) the generated-response
+    // application in `action_dispatch.rs::handle_action` for
+    // `static`/`mock`/`echo`/`beacon`/`redirect`. Actions with their
+    // own protocol write paths (`mcp`, `noop`, `ai_proxy`, `storage`,
+    // any plugin action) take neither, so synthesizing the piece
+    // there would claim coverage nothing enforces. The allowlist is
+    // `owasp_api_pack.rs::action_applies_response_phase_policies`,
+    // pinned by its own drift-tie test.
     let action_type = config
         .action
         .get("type")
@@ -11753,12 +11755,12 @@ origins:
     }
 
     #[test]
-    fn owasp_pack_api8_skips_security_headers_on_a_static_action() {
-        // WOR-2491 review round, M1: a `static` action never reaches
-        // Pingora's response-phase filter, so security_headers is not
-        // synthesized on the compiled origin even though the pack
-        // entry enables api8. http_framing (request-phase, action
-        // agnostic) still synthesizes.
+    fn owasp_pack_api8_synthesizes_security_headers_on_a_static_action() {
+        // WOR-2496: a static action's generated response runs the
+        // response-phase policy surface, so security_headers is
+        // synthesized on the compiled origin alongside http_framing
+        // (request-phase, action agnostic) when the pack entry
+        // enables api8.
         let yaml = r#"
 origins:
   api.example.com:
@@ -11780,8 +11782,8 @@ origins:
             .map(|p| p.get("type").and_then(|v| v.as_str()).unwrap_or(""))
             .collect();
         assert!(
-            !types.contains(&"security_headers"),
-            "security_headers must not be synthesized on a static action: {types:?}"
+            types.contains(&"security_headers"),
+            "security_headers must be synthesized on a static action: {types:?}"
         );
         assert!(types.contains(&"http_framing"), "{types:?}");
 
@@ -11790,7 +11792,10 @@ origins:
             .entry_for(crate::owasp_api_pack::PackItem::Api8)
             .expect("api8 entry");
         assert_eq!(entry.state, crate::owasp_api_pack::PackItemState::Enforced);
-        assert_eq!(entry.synthesized_types, vec!["http_framing"]);
+        assert_eq!(
+            entry.synthesized_types,
+            vec!["security_headers", "http_framing"]
+        );
     }
 
     // --- WOR-2491 task 3: api3, api9 wired at compile time ---

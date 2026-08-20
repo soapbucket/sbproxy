@@ -6,16 +6,18 @@
 //! missing an `integrity` attribute (or uses a disallowed algorithm).
 //! The response body and headers are not modified.
 //!
-//! The scan hooks into the upstream `response_filter`, which only runs
-//! for a genuinely proxied (`type: proxy`) origin. A `static` action
-//! writes its response during the request phase and never reaches that
-//! hook, so these tests proxy to a `MockUpstream` serving raw HTML,
-//! the same shape as `examples/sri/fixture.py`. With a `static` origin
-//! every passthrough assertion here stays green with the `sri` policy
-//! deleted, which is exactly the blind spot that shipped the original
-//! example bug - hence the metric assertions below.
+//! The scan runs in two places: the upstream `response_filter` /
+//! body-filter pair for proxied (`type: proxy`) origins, and the
+//! generated-response application (`apply_generated_response_phases`,
+//! WOR-2496) for `static` / `mock` origins, which used to be a blind
+//! spot: a `static` origin's passthrough assertions stayed green with
+//! the `sri` policy deleted because the scan never ran at all. The
+//! proxied tests here drive a `MockUpstream` serving raw HTML, the
+//! same shape as `examples/sri/fixture.py`; the static-origin test
+//! pins the generated-response scan. In both cases the metric is the
+//! proof the scan happened.
 //!
-//! These tests confirm three things end-to-end:
+//! These tests confirm four things end-to-end:
 //!
 //! 1. Missing integrity attributes: the response flows through intact
 //!    (no body mutation, no blocking) AND the scan really ran, proved
@@ -25,6 +27,8 @@
 //!    `action="clean"` sample, and no violation sample.
 //! 3. A non-HTML response is a no-op even when enforced: passthrough
 //!    and no sri-labeled series at all.
+//! 4. A `static` origin serving HTML with a missing integrity
+//!    attribute counts a violation too (WOR-2496).
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use std::time::{Duration, Instant};
@@ -145,6 +149,45 @@ fn html_with_valid_integrity_passes_through_and_counts_clean() {
     assert!(
         !metrics.lines().any(|line| is_sri_sample(line, "violation")),
         "a page with valid integrity attributes must not count a violation"
+    );
+}
+
+#[test]
+fn static_origin_html_with_missing_integrity_counts_a_violation() {
+    // WOR-2496: the old blind spot. A static action serving HTML with
+    // an uncovered external script used to skip the scan entirely; the
+    // violation sample is the proof it now runs.
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "sri.localhost":
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: '<html><body><script src="https://cdn.example.com/lib.js"></script></body></html>'
+    policies:
+      - type: sri
+        enforce: true
+        algorithms: [sha256, sha384, sha512]
+"#;
+    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+
+    let resp = harness.get("/", "sri.localhost").expect("send");
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.text()
+            .expect("decode body")
+            .contains("cdn.example.com/lib.js"),
+        "SRI is observation-only and must not mutate the generated body"
+    );
+
+    let line = wait_for_metric_line(&harness, |line| is_sri_sample(line, "violation"));
+    assert!(
+        line.is_some(),
+        "expected a sbproxy_policy_triggers_total sample with policy_type=\"sri\" \
+         action=\"violation\" for a static origin; the generated-response scan did not run"
     );
 }
 

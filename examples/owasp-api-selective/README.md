@@ -112,17 +112,15 @@ content-type: application/json
 {"error":"request entity too large"}
 ```
 
-**api8 enforces too, but only half of it actually runs on this
-`static` action.** `http_framing` runs at request phase, independent
-of action type, and synthesizes and enforces here exactly as it would
-on a `proxy` origin. `security_headers` does not: it only takes effect
-in Pingora's response-phase filter, and a `static` action answers
-entirely inside the request phase, never reaching that filter. The
-pack does not synthesize `security_headers` here at all, and the
-manifest's `synthesized` list for `api8` names only `http_framing` -
-see the compact pass below. If you need response headers on a
-`static`/`mock`/similar origin, configure them on the app itself, or
-move the route to a `proxy`/`load_balancer` action.
+**api8 enforces with both pieces, `static` action included.**
+`http_framing` runs at request phase, independent of action type.
+`security_headers` applies on the response: generated responses
+(`static`, `mock`, `echo`, `beacon`, `redirect`) carry response-phase
+policy headers the same way proxied ones do, so the pack synthesizes
+it here exactly as it would on a `proxy` origin and the headers appear
+on this example's responses. Only actions with their own protocol
+write paths (`mcp`, `storage`, `ai_proxy`, plugin actions) still skip
+the piece, and the manifest names that gap when it applies.
 
 ## Read the manifest back
 
@@ -142,7 +140,7 @@ $ curl -s -u admin:admin http://127.0.0.1:9090/admin/owasp-api-pack \
     {"item": "api1", "state": "needs_operator_input", "synthesized": ["object_authz"]},
     {"item": "api3", "state": "enforced", "synthesized": ["json_projection"]},
     {"item": "api4", "state": "enforced", "synthesized": ["request_limit", "concurrent_limit", "rate_limiting", "ddos_protection"]},
-    {"item": "api8", "state": "enforced", "synthesized": ["http_framing"]}
+    {"item": "api8", "state": "enforced", "synthesized": ["security_headers", "http_framing"]}
   ]
 }
 ```
@@ -152,8 +150,8 @@ is genuinely, unconditionally active once `response_exclude_fields`
 is set; its `reason` still names the request-side gap
 (`openapi_validation`/`request_validator`, neither configured here)
 so the label does not overstate what is actually covered. `api8`'s
-`synthesized` list naming only `http_framing`, not `security_headers`,
-is the phase gap above made visible in the JSON, not just in prose.
+`synthesized` list names both pieces: the static action carries the
+synthesized security headers on its generated responses.
 `posture` at the top is the pack-wide default (`report_only`); it
 applies to items whose synthesis has a posture-sensitive knob, which
 today is only `api1`/`api5`'s shared `object_authz` entry.
@@ -174,9 +172,9 @@ today is only `api1`/`api5`'s shared `object_authz` entry.
 - The honest gap between "the synthesized config changed" and "the
   live outcome changed": `api1`'s promotion is real and tested, and
   still does nothing until `object_rules` exists
-- `api8` reporting `enforced` while its `synthesized` list still names
-  only half its usual pieces, because this origin's `static` action
-  cannot run the other half
+- `api8` synthesizing both pieces on a `static` action: generated
+  responses carry response-phase policy headers the same way proxied
+  ones do
 
 ## See also
 
