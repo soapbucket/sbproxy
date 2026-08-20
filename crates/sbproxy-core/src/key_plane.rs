@@ -363,6 +363,43 @@ impl KeyPlane {
         id: &str,
         tenant_id: Option<&str>,
     ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
+        // WOR-2572: one wrapper, so every return path of the inner
+        // resolution lands on the histogram exactly once, with `outcome`
+        // read off the one `Result` every caller sees rather than
+        // re-derived at each `return`. `cache_layer` reports which layer
+        // answered: `hit` (fresh resolved-secret cache), `stale` (grace
+        // window served the last known-good value), `miss` (full path).
+        let started = std::time::Instant::now();
+        let mut cache_layer: &'static str = "miss";
+        let result = self
+            .resolve_credential_secret_inner(id, tenant_id, &mut cache_layer)
+            .await;
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(
+                CredentialResolveError::NotFound
+                | CredentialResolveError::NotUsable
+                | CredentialResolveError::TenantMismatch,
+            ) => "refused",
+            Err(CredentialResolveError::Unresolvable(_)) => "error",
+        };
+        sbproxy_observe::metrics::record_credential_resolution(
+            cache_layer,
+            outcome,
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+
+    /// [`Self::resolve_credential_secret`] minus the metrics wrapper.
+    /// `cache_layer` starts at `miss` and is overwritten by the two
+    /// early-return paths that did not run the full resolution.
+    async fn resolve_credential_secret_inner(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+        cache_layer: &mut &'static str,
+    ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
         let policy = rotation_policy();
         // One read of the cache, kept for both purposes: a fresh entry is
         // served immediately, and a stale one is held so the grace window
@@ -370,6 +407,7 @@ impl KeyPlane {
         let cached = self.resolved_credentials.lock().get(id).cloned();
         if let Some((at, value)) = &cached {
             if at.elapsed() < policy.re_resolve_interval() {
+                *cache_layer = "hit";
                 return Ok(value.clone());
             }
         }
@@ -385,20 +423,22 @@ impl KeyPlane {
         //
         // Grace defaults to zero, so this is opt-in and the closure is
         // never reached by a config that did not ask for it.
-        let serve_stale_on_failure = |err: CredentialResolveError| match &cached {
-            Some((at, value)) if at.elapsed() < policy.stale_serve_deadline() => {
-                tracing::warn!(
-                    credential_id = %id,
-                    error = %err,
-                    age_secs = at.elapsed().as_secs(),
-                    grace_secs = policy.grace_period().as_secs(),
-                    "could not re-resolve a bound credential; serving the last known-good \
-                     value for the remainder of proxy.secrets.rotation.grace_period_secs"
-                );
-                Ok(value.clone())
-            }
-            _ => Err(err),
-        };
+        let serve_stale_on_failure =
+            |cache_layer: &mut &'static str, err: CredentialResolveError| match &cached {
+                Some((at, value)) if at.elapsed() < policy.stale_serve_deadline() => {
+                    *cache_layer = "stale";
+                    tracing::warn!(
+                        credential_id = %id,
+                        error = %err,
+                        age_secs = at.elapsed().as_secs(),
+                        grace_secs = policy.grace_period().as_secs(),
+                        "could not re-resolve a bound credential; serving the last known-good \
+                         value for the remainder of proxy.secrets.rotation.grace_period_secs"
+                    );
+                    Ok(value.clone())
+                }
+                _ => Err(err),
+            };
 
         let record = match self.cache().resolve_credential(id).await {
             Ok(Some(record)) => record,
@@ -407,7 +447,10 @@ impl KeyPlane {
             // continuing to present it would be wrong.
             Ok(None) => return Err(CredentialResolveError::NotFound),
             Err(e) => {
-                return serve_stale_on_failure(CredentialResolveError::Unresolvable(e.to_string()))
+                return serve_stale_on_failure(
+                    cache_layer,
+                    CredentialResolveError::Unresolvable(e.to_string()),
+                )
             }
         };
 
@@ -452,9 +495,10 @@ impl KeyPlane {
                 match resolver.resolve_async(reference.clone()).await {
                     Ok(secret) => secret,
                     Err(e) => {
-                        return serve_stale_on_failure(CredentialResolveError::Unresolvable(
-                            e.to_string(),
-                        ))
+                        return serve_stale_on_failure(
+                            cache_layer,
+                            CredentialResolveError::Unresolvable(e.to_string()),
+                        )
                     }
                 }
             }
@@ -828,7 +872,15 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
         negative_ttl: std::time::Duration::from_secs(cfg.cache.negative_ttl_secs),
         max_entries: cfg.cache.max_entries,
     };
-    let mut cache = TtlCache::new(store, cache_cfg);
+    let mut cache = TtlCache::new(store, cache_cfg)
+        // WOR-2572: every TTL-cache lookup lands on
+        // `sbproxy_key_lookup_cache_total{kind, outcome}`. Installed here
+        // because this is the one production construction site, and the
+        // keystore crate deliberately depends on no metrics stack; the
+        // non-capturing closure coerces to the cache's plain `fn` hook.
+        .with_lookup_observer(|kind, outcome| {
+            sbproxy_observe::metrics::record_key_lookup_cache(kind, outcome)
+        });
     match cfg.cache.tier {
         KeyCacheTier::None => {}
         KeyCacheTier::Redis => {
@@ -1357,6 +1409,41 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// WOR-2572: `sbproxy_key_lookup_cache_total` is wired through
+    /// `build_cache`, not merely covered by keystore unit tests. A plane
+    /// built the way production builds one carries the lookup observer,
+    /// so a resolve through its cache moves the counter; without the
+    /// install in `build_cache` this test is red while every keystore
+    /// unit test stays green.
+    #[test]
+    fn the_key_lookup_cache_counter_is_wired_through_build_cache() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let plane = prepare_key_plane(Some(&base_cfg(&path)))
+            .expect("plane builds")
+            .expect("an enabled config yields a plane");
+
+        fn lookup_total() -> f64 {
+            gathered("sbproxy_key_lookup_cache_total")
+                .into_iter()
+                .filter(|(labels, _)| labels.contains("kind=key"))
+                .map(|(_, value)| value)
+                .sum()
+        }
+
+        let before = lookup_total();
+        let resolved = block_on_keystore(plane.cache().resolve_key("w2572-wired"))
+            .expect("embedded store answers");
+        assert!(resolved.is_none(), "the id was never minted");
+        assert!(
+            lookup_total() >= before + 1.0,
+            "a resolve through the production-built cache must move \
+             sbproxy_key_lookup_cache_total"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2497,6 +2584,130 @@ mod resolve_credential_secret_tests {
                 Err(CredentialResolveError::NotFound)
             ),
             "a revoked credential must not be served out of the grace window"
+        );
+    }
+
+    /// WOR-2572: observation count for one `{cache, outcome}` series of
+    /// the credential-resolution histogram. Other tests in this process
+    /// can also resolve credentials, so callers assert on deltas.
+    fn resolution_count(cache: &str, outcome: &str) -> u64 {
+        let want = [format!("cache={cache}"), format!("outcome={outcome}")];
+        let mut total = 0;
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_credential_resolution_duration_seconds" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                if want.iter().all(|label| labels.contains(label)) {
+                    total += metric.get_histogram().get_sample_count();
+                }
+            }
+        }
+        total
+    }
+
+    /// WOR-2572: every resolution lands on the histogram with the layer
+    /// that answered and the real outcome. `hit` and `miss` are what the
+    /// derivable cache-hit-ratio panel divides; `refused` is asserted as
+    /// its own value so an absent credential can never inflate `error`
+    /// (or disappear into `ok`).
+    #[tokio::test]
+    async fn resolution_latency_reports_cache_disposition_and_outcome() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        // A real re-resolve interval, so the second lookup is a fresh hit.
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(
+            300, 0,
+        )));
+
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "w2572-plain",
+                CredentialMaterial::Plaintext {
+                    value: "sk-w2572".to_string(),
+                },
+            ),
+        )
+        .await;
+
+        let before_miss_ok = resolution_count("miss", "ok");
+        let before_hit_ok = resolution_count("hit", "ok");
+        let before_miss_refused = resolution_count("miss", "refused");
+
+        p.resolve_credential_secret("w2572-plain", None)
+            .await
+            .expect("first resolution runs the full path");
+        assert!(
+            resolution_count("miss", "ok") > before_miss_ok,
+            "the first resolution is a miss with outcome=ok"
+        );
+
+        p.resolve_credential_secret("w2572-plain", None)
+            .await
+            .expect("second resolution is served from the resolved cache");
+        assert!(
+            resolution_count("hit", "ok") > before_hit_ok,
+            "a fresh resolved-cache serve must be labeled cache=hit"
+        );
+
+        assert!(matches!(
+            p.resolve_credential_secret("w2572-absent", None).await,
+            Err(CredentialResolveError::NotFound)
+        ));
+        assert!(
+            resolution_count("miss", "refused") > before_miss_refused,
+            "an absent credential is a refusal, its own outcome value"
+        );
+    }
+
+    /// WOR-2572: a grace-window serve is `stale`, deliberately not folded
+    /// into `hit`, and a backend that stays down past grace is `error`,
+    /// never `refused`. Both come from the one `Result` the wrapper sees.
+    #[tokio::test]
+    async fn stale_grace_serves_and_backend_failures_get_their_own_labels() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(
+            0, 300,
+        )));
+        install_working_vault();
+        let p = vault_backed_plane().await;
+
+        let before_stale_ok = resolution_count("stale", "ok");
+        let before_miss_error = resolution_count("miss", "error");
+
+        p.resolve_credential_secret("rotating", None)
+            .await
+            .expect("first resolution succeeds");
+
+        break_the_vault();
+        p.resolve_credential_secret("rotating", None)
+            .await
+            .expect("grace serves the last known-good value");
+        assert!(
+            resolution_count("stale", "ok") > before_stale_ok,
+            "a grace serve is cache=stale outcome=ok: a backend failure wearing a grace period"
+        );
+
+        // Same broken backend, no grace: the failure is an error.
+        sbproxy_vault::reset_process_rotation_for_test();
+        sbproxy_vault::install_process_rotation(Arc::new(sbproxy_vault::RotationPolicy::new(0, 0)));
+        assert!(matches!(
+            p.resolve_credential_secret("rotating", None).await,
+            Err(CredentialResolveError::Unresolvable(_))
+        ));
+        assert!(
+            resolution_count("miss", "error") > before_miss_error,
+            "an unreachable backend is outcome=error, never refused"
         );
     }
 }

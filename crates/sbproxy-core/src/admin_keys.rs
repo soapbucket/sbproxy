@@ -51,7 +51,7 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
         return Some(if method.eq_ignore_ascii_case("GET") {
             list_keys()
         } else if method.eq_ignore_ascii_case("POST") {
-            create_key(body)
+            count_key_operation("mint", create_key(body))
         } else {
             method_not_allowed()
         });
@@ -93,9 +93,9 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
             if method.eq_ignore_ascii_case("GET") {
                 get_key(id)
             } else if method.eq_ignore_ascii_case("PATCH") {
-                update_key(id, body)
+                count_key_operation("update", update_key(id, body))
             } else if method.eq_ignore_ascii_case("DELETE") {
-                delete_key(id)
+                count_key_operation("delete", delete_key(id))
             } else {
                 method_not_allowed()
             }
@@ -105,10 +105,16 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
             preview_effective_key_policy(id, body)
         }
         Some(action) if method.eq_ignore_ascii_case("POST") => match action {
-            "revoke" => set_key_status(id, RecordStatus::Revoked, body),
-            "block" => set_key_status(id, RecordStatus::Blocked, body),
-            "unblock" => set_key_status(id, RecordStatus::Active, body),
-            "rotate" => rotate_key(id, body),
+            "revoke" => {
+                count_key_operation("revoke", set_key_status(id, RecordStatus::Revoked, body))
+            }
+            "block" => {
+                count_key_operation("block", set_key_status(id, RecordStatus::Blocked, body))
+            }
+            "unblock" => {
+                count_key_operation("unblock", set_key_status(id, RecordStatus::Active, body))
+            }
+            "rotate" => count_key_operation("rotate", rotate_key(id, body)),
             _ => not_found("unknown key action"),
         },
         Some(_) => method_not_allowed(),
@@ -1830,6 +1836,31 @@ fn invalidate(plane: &KeyPlane, id: &str) {
     plane.invalidate_resolved_credential(id);
 }
 
+/// WOR-2572: map one admin key-operation response onto
+/// `sbproxy_key_operations_total{operation, outcome}` before returning
+/// it. Sits at the dispatch seam rather than inside each handler so a
+/// return path a handler grows later is already counted, and the
+/// outcome comes from the status class the handler actually returned:
+/// 2xx is `ok`, 5xx is `error` (the store or governance backend
+/// failed), everything else is `refused` (a 4xx the caller can fix).
+/// The three are never folded: a rate panel that cannot tell a busy
+/// console from an outage answers no operator question.
+///
+/// Scope is the key resource. `/admin/credentials` mutations are not
+/// counted here, because this family's `operation` label is the closed
+/// key-lifecycle set and its declared cardinality is that set times the
+/// three outcomes; a credential surface gets its own family rather than
+/// silently doubling this one's.
+fn count_key_operation(operation: &'static str, resp: Resp) -> Resp {
+    let outcome = match resp.0 {
+        200..=299 => "ok",
+        500..=599 => "error",
+        _ => "refused",
+    };
+    sbproxy_observe::metrics::record_key_operation(operation, outcome);
+    resp
+}
+
 fn status_verb(status: RecordStatus) -> &'static str {
     match status {
         RecordStatus::Active => "unblock",
@@ -3446,5 +3477,167 @@ mod tests {
         // either, so it must not read as pending.
         record.prev_hash_expires_at = None;
         assert!(!KeyView::from(&record).rotation_pending);
+    }
+
+    /// WOR-2572: every admin key-lifecycle route lands on
+    /// `sbproxy_key_operations_total` with an outcome derived from the
+    /// status class the handler actually returned. The three outcome
+    /// values are asserted separately on purpose: folding a refusal into
+    /// `ok` (or an outage into `refused`) is the labeling defect the
+    /// ticket exists to rule out.
+    #[test]
+    fn key_operations_move_at_the_admin_seam_with_separate_outcomes() {
+        let _g = crate::key_plane::test_plane_guard();
+
+        fn op_count(operation: &str, outcome: &str) -> f64 {
+            let want = [
+                format!("operation={operation}"),
+                format!("outcome={outcome}"),
+            ];
+            let mut total = 0.0;
+            for family in prometheus::gather() {
+                if family.name() != "sbproxy_key_operations_total" {
+                    continue;
+                }
+                for metric in family.get_metric() {
+                    let labels: Vec<String> = metric
+                        .get_label()
+                        .iter()
+                        .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                        .collect();
+                    if want.iter().all(|label| labels.contains(label)) {
+                        total += metric.get_counter().value();
+                    }
+                }
+            }
+            total
+        }
+
+        /// A store that is down for every operation, so a handler's 5xx
+        /// path is the real store-error path rather than a synthetic
+        /// status.
+        struct DownStore;
+        #[async_trait]
+        impl KeyStore for DownStore {
+            async fn get_key(&self, _: &str) -> anyhow::Result<Option<KeyRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn put_key(&self, _: KeyRecord) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn put_key_if_revision(
+                &self,
+                _: KeyRecord,
+                _: u64,
+            ) -> anyhow::Result<KeyPolicyCasResult> {
+                anyhow::bail!("store down")
+            }
+            async fn delete_key(&self, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn get_credential(&self, _: &str) -> anyhow::Result<Option<CredentialRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn put_credential(&self, _: CredentialRecord) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn delete_credential(&self, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn revision(&self) -> anyhow::Result<u64> {
+                anyhow::bail!("store down")
+            }
+        }
+
+        let before_mint_ok = op_count("mint", "ok");
+        let before_mint_error = op_count("mint", "error");
+        let before_rotate_ok = op_count("rotate", "ok");
+        let before_rotate_refused = op_count("rotate", "refused");
+        let before_block_ok = op_count("block", "ok");
+        let before_unblock_ok = op_count("unblock", "ok");
+        let before_update_ok = op_count("update", "ok");
+        let before_revoke_ok = op_count("revoke", "ok");
+        let before_delete_ok = op_count("delete", "ok");
+
+        // A dead store is an `error`: the operator asked for something
+        // legitimate and the infrastructure could not do it.
+        {
+            let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+            let store: Arc<dyn KeyStore> = Arc::new(DownStore);
+            let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+            let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
+                crypto, cache, false, false, None,
+            ));
+            crate::key_plane::install_key_plane_for_test(plane);
+        }
+        let resp = dispatch("POST", "/admin/keys", None).unwrap();
+        assert_eq!(resp.0, 500, "{}", resp.2);
+        assert_eq!(
+            op_count("mint", "error") - before_mint_error,
+            1.0,
+            "a store failure must land on outcome=error, not be folded into ok or refused"
+        );
+
+        // The healthy plane: one of each operation, all `ok`.
+        install_test_plane();
+        let resp = dispatch("POST", "/admin/keys", Some(r#"{"name":"m"}"#)).unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        let minted = parse(&resp);
+        let key_id = minted["key"]["key_id"]
+            .as_str()
+            .expect("minted key id")
+            .to_string();
+        // `update_key` requires an explicit `expected_revision`; the
+        // status and rotate routes default it to the record's current
+        // value, which is why only this call carries a body.
+        let revision = minted["key"]["policy_revision"]
+            .as_u64()
+            .expect("minted policy revision");
+        let resp = dispatch(
+            "PATCH",
+            &format!("/admin/keys/{key_id}"),
+            Some(&format!(r#"{{"expected_revision":{revision}}}"#)),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/rotate"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/block"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/unblock"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/revoke"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        // A rotate against a revoked (terminal) key is a refusal the
+        // operator can understand, not an error.
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/rotate"), None).unwrap();
+        assert!((400..500).contains(&resp.0), "{}", resp.2);
+        let resp = dispatch("DELETE", &format!("/admin/keys/{key_id}"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        assert_eq!(op_count("mint", "ok") - before_mint_ok, 1.0);
+        assert_eq!(op_count("update", "ok") - before_update_ok, 1.0);
+        assert_eq!(op_count("rotate", "ok") - before_rotate_ok, 1.0);
+        assert_eq!(op_count("block", "ok") - before_block_ok, 1.0);
+        assert_eq!(op_count("unblock", "ok") - before_unblock_ok, 1.0);
+        assert_eq!(op_count("revoke", "ok") - before_revoke_ok, 1.0);
+        assert_eq!(op_count("delete", "ok") - before_delete_ok, 1.0);
+        assert_eq!(
+            op_count("rotate", "refused") - before_rotate_refused,
+            1.0,
+            "a terminal-key rotate is a refusal, its own label value"
+        );
+        assert_eq!(
+            op_count("mint", "error") - before_mint_error,
+            1.0,
+            "the healthy-plane run must not have added error outcomes"
+        );
     }
 }

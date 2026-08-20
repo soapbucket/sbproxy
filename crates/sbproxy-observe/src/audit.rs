@@ -757,6 +757,11 @@ impl AdminActionAuditEntry {
         ));
         let chain_ok = crate::audit_chain::append_admin_audit(self);
         let outcome = if chain_ok { "ok" } else { "chain_error" };
+        // WOR-2572: the dedicated audit-write-failure counter, fed from
+        // the same real append result the histogram's outcome label
+        // folds in. Touches the series on success too, so a healthy
+        // channel exports an explicit 0.
+        crate::metrics::record_key_audit_write_outcome("admin_path", chain_ok);
         crate::metrics::record_audit_emit_duration(
             "admin",
             outcome,
@@ -874,6 +879,11 @@ impl KeyAuditEntry {
             true
         };
         let outcome = if !chain_ok { "chain_error" } else { outcome };
+        // WOR-2572: the dedicated audit-write-failure counter. `ok` here
+        // means every sink this emission was promised was reached: the
+        // tracing serialize succeeded AND a configured chain accepted
+        // the append. Sourced from those real results, never a default.
+        crate::metrics::record_key_audit_write_outcome("key_path", outcome == "ok");
         crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
     }
 }

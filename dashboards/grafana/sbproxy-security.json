@@ -408,6 +408,249 @@
         }
       ],
       "description": "Measures Bot Detections. Runbook: docs/operator-runbook.md#security-controls. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
+    },
+    {
+      "id": 6,
+      "title": "Key Operations",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation, outcome) (rate(sbproxy_key_operations_total[5m]))",
+          "legendFormat": "{{operation}} / {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Admin key-lifecycle operations (mint, update, delete, revoke, block, unblock, rotate) by real handler outcome. `refused` is a 4xx the operator can act on; `error` is the store or governance backend failing and belongs with the key-store outage panels. Runbook: docs/operator-runbook.md#security-controls."
+    },
+    {
+      "id": 7,
+      "title": "Credential Resolution Latency",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sbproxy_credential_resolution_duration_seconds_bucket{outcome=\"ok\"}[5m])))",
+          "legendFormat": "p95 (ok)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_credential_resolution_duration_seconds_count{cache=\"stale\"}[5m]))",
+          "legendFormat": "stale grace serves/sec",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(sbproxy_credential_resolution_duration_seconds_count{outcome=\"error\"}[5m]))",
+          "legendFormat": "errors/sec",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Bound-credential resolution p95 plus the two series that should read zero: stale grace serves (a backend failure wearing a grace period) and outright resolution errors. Runbook: docs/operator-runbook.md#security-controls."
+    },
+    {
+      "id": 8,
+      "title": "Key Lookup Cache Hit Ratio",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_key_lookup_cache_total{outcome=~\"hit|negative_hit|tier_hit\"}[5m])) / sum(rate(sbproxy_key_lookup_cache_total[5m]))",
+          "legendFormat": "hit ratio",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_credential_resolution_duration_seconds_count{cache=\"hit\",outcome=\"ok\"}[5m])) / sum(rate(sbproxy_credential_resolution_duration_seconds_count{outcome=\"ok\"}[5m]))",
+          "legendFormat": "resolved-secret hit ratio",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Two distinct caches, deliberately on one panel so they cannot be conflated: the keystore TTL cache in front of the store (key + credential record lookups) and the per-generation resolved-secret cache in front of the vault round-trip. A falling TTL-cache ratio hammers the store; a falling resolved-secret ratio hammers the secret backend. Runbook: docs/operator-runbook.md#security-controls."
+    },
+    {
+      "id": 9,
+      "title": "Key Audit Write Failures",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (channel) (increase(sbproxy_key_audit_write_failures_total[5m]))",
+          "legendFormat": "{{channel}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Key-management audit emissions that did not reach a sink they were promised, by channel (audit.key_path, audit.admin_path). Reads exactly zero in a healthy system; any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and SBPROXY-AUDIT-WRITE-FAILURE pages on the same condition across all audit channels. Runbook: docs/operator-runbook.md#rb-audit-write."
     }
   ],
   "templating": {

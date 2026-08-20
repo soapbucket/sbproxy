@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -194,6 +194,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_revision_info` | Gauge | `stable` | `beta` | `revision`, `digest`, `provenance` | Current entry in the config revision ring; always 1, the revision/digest/provenance are the labels. |
 | `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
+| `sbproxy_credential_resolution_duration_seconds` | Histogram | `stable` | `beta` | `cache`, `outcome` | Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
@@ -216,6 +217,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_judge_cost_usd` | Counter | `stable` | `beta` | `provider` | Judge backend cost per decision in USD. |
 | `sbproxy_judge_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `cached` | Judge backend round-trip latency. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | Counter | `stable` | `beta` | `result` | JWKS refreshes triggered by tokens whose kid was absent from the local cache. |
+| `sbproxy_key_audit_write_failures_total` | Counter | `stable` | `beta` | `channel` | Key-management audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0. |
+| `sbproxy_key_lookup_cache_total` | Counter | `stable` | `beta` | `kind`, `outcome` | Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error). |
+| `sbproxy_key_operations_total` | Counter | `stable` | `beta` | `operation`, `outcome` | Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error). |
 | `sbproxy_key_policy_stored_rejections_total` | Counter | `stable` | `alpha` | `reason` | Stored key records rejected while lowering to an effective policy, by reason. |
 | `sbproxy_key_store_outage_total` | Counter | `stable` | `beta` | `entrypoint`, `posture`, `outcome` | Inbound-key resolutions that could not reach the virtual key store, by entrypoint, configured failure posture, and what the posture decided. |
 | `sbproxy_key_store_unavailable` | Gauge | `stable` | `beta` | `posture` | 1 while the last inbound-key resolution could not reach the virtual key store; the posture label is what that costs. |

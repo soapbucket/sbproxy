@@ -8053,6 +8053,7 @@ dependencies = [
  "hmac",
  "http 1.4.0",
  "jsonschema 0.17.1",
+ "libc",
  "once_cell",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",

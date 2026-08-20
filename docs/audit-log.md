@@ -1,5 +1,5 @@
 # Audit log
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` / `sbproxy::admin::audit` tracing channels, the tamper-evident chains each of those four can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
 
@@ -501,6 +501,14 @@ sbproxy_audit_emit_duration_seconds{channel, outcome}
 ```
 
 `channel` is `config`, `security`, `key`, or `admin`. `outcome` is `ok`, `serialize_error`, or `chain_error`. `serialize_error` means the audit record failed to encode to JSON and was dropped from the tracing target it belongs to; the `admin` channel never reports it, because an `AdminActionAuditEntry` does not go through that JSON-encode-to-tracing step the other three channels' entries do, it goes straight to the ring and, when a chain is installed, to the chain. `chain_error` means a configured chain (`audit.path` on security, `audit.config_path` on config, `audit.key_path` on key, `audit.admin_path` on admin) rejected the append, so that record reached whatever read model the channel has, a tracing line, the ring, or both, but is not in the durable trail. Any non-`ok` outcome is worth alerting on: `outcome!="ok"` firing means either an audit record vanished or your tamper-evident trail has a gap. The histogram carries the active trace as an exemplar so a slow audit sink links back to the originating span.
+
+The two key-management channels carry a second, narrower signal:
+
+```
+sbproxy_key_audit_write_failures_total{channel}
+```
+
+It counts only the durability failures on those channels, which makes it the one an alert can baseline against: the series is touched at 0 on every emission, so `increase(...[5m]) > 0` is meaningful from the first scrape rather than from the first failure. Read the `channel` label carefully, because the two families deliberately do not share a vocabulary. The histogram's `channel` names the audit channel (`key`, `admin`); this counter's names the config key that turned the trail on (`key_path`, `admin_path`, with `key_access_path` reserved for the read-audit channel). The counter complements the histogram rather than replacing it: `sbproxy_audit_emit_duration_seconds{outcome!="ok"}` is still the workspace-wide signal across all four channels, and it is what `SBPROXY-AUDIT-WRITE-FAILURE` pages on.
 
 ## See also
 
