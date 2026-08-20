@@ -472,6 +472,8 @@ The schema deliberately omits the offending header value: including attacker-con
 
 One `KeyAuditEntry` per key or credential mutation (`create`, `update`, `delete`, `revoke`, `block`, `unblock`, `rotate`) on the `key_audit` target. The record carries the public record id, the acting principal when known, the tenant, and redacted before/after snapshots. It never carries a plaintext secret or hash.
 
+The four operations worth a real-time alert additionally bridge to typed proxy events on the `events:` egress: `create` publishes `key_minted`, `revoke` publishes `key_revoked`, `rotate` publishes `key_rotated`, and `block` publishes `key_blocked`, for keys and upstream credentials alike, so a SIEM subscribes to the feed instead of tailing this tracing target. The typed copy carries an allowlisted payload (never the before/after diff) and is lossy under load where this channel and its chain are not; [events.md](events.md#key-lifecycle-events-the-dual-record) documents the dual-record design.
+
 ### `sbproxy::admin::audit`: admin-console actions
 
 One `AdminActionAuditEntry` per authenticated admin-console action (`admin_action`, `login`, `login_failed`, `inspect_request_content`) on the `sbproxy::admin::audit` target. See [Admin-action audit rows](#admin-action-audit-rows) above for the ring this channel also feeds and the fields it carries, and [The admin chain](#the-admin-chain) for its durable form.

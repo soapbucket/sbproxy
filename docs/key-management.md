@@ -903,6 +903,42 @@ resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
 apply normal operational-log access controls. See [Audit log](audit-log.md).
 
+Mint, revoke, rotate, and block additionally publish typed events on the
+`events:` egress (`key_minted`, `key_revoked`, `key_rotated`, `key_blocked`),
+so a SIEM alerts on a lifecycle change in real time instead of polling the
+admin API, and `credential_resolved` joins them whenever an upstream
+credential's material is actually read. Subscribe with the `events:` block:
+
+```yaml
+events:
+  sink: webhook
+  url: https://siem.example.com/sbproxy
+  signing_secret: secret://local/siem-hmac
+  types:
+    - key_minted
+    - key_revoked
+    - key_rotated
+    - key_blocked
+    - credential_resolved
+```
+
+A mint, rotate, block, revoke sequence lands in the feed as four NDJSON
+lines (file-sink form shown, captured from a real run; timestamps and ids
+will differ):
+
+```json
+{"event_type":"key_minted","hostname":"","tenant_id":"acme","timestamp":1787251963170,"data":{"id":"a7237f88fdd6fb04","op":"create","outcome":"applied","resource":"key"}}
+{"event_type":"key_rotated","hostname":"","tenant_id":"acme","timestamp":1787251963173,"data":{"id":"a7237f88fdd6fb04","op":"rotate","outcome":"applied","resource":"key"}}
+{"event_type":"key_blocked","hostname":"","tenant_id":"acme","timestamp":1787251963173,"data":{"id":"a7237f88fdd6fb04","new_status":"blocked","op":"block","outcome":"applied","prior_status":"active","resource":"key"}}
+{"event_type":"key_revoked","hostname":"","tenant_id":"acme","timestamp":1787251963174,"data":{"id":"a7237f88fdd6fb04","new_status":"revoked","op":"revoke","outcome":"applied","prior_status":"blocked","resource":"key"}}
+```
+
+The payload never carries the plaintext token, a verifier hash, or the
+`key_audit` diff, and that is a property under test rather than a
+convention. [events.md](events.md#key-lifecycle-events-the-dual-record)
+has the full field posture and the dual-record design (chain for tamper
+evidence, typed event for real-time delivery).
+
 ## Live policy
 
 A key is not just an auth token; it carries its own policy. Everything below

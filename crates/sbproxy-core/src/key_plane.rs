@@ -395,6 +395,14 @@ impl KeyPlane {
                     "could not re-resolve a bound credential; serving the last known-good \
                      value for the remainder of proxy.secrets.rotation.grace_period_secs"
                 );
+                // WOR-2571: a stale serve is still an actual use of
+                // resolved material, and it is the one a SIEM most
+                // wants to see, because it means the backend was down
+                // and the credential kept working anyway.
+                sbproxy_observe::publish_proxy_event(
+                    sbproxy_observe::EventType::CredentialResolved,
+                    || credential_resolved_event(id, tenant_id, "stale_served", None),
+                );
                 Ok(value.clone())
             }
             _ => Err(err),
@@ -420,6 +428,14 @@ impl KeyPlane {
             return Err(CredentialResolveError::TenantMismatch);
         }
 
+        // WOR-2571: named before the material is opened so the typed
+        // event below can say where fresh material came from without
+        // holding anything secret.
+        let source = match &record.material {
+            CredentialMaterial::Plaintext { .. } => "plaintext",
+            CredentialMaterial::Envelope { .. } => "envelope",
+            CredentialMaterial::VaultRef { .. } => "vault_ref",
+        };
         let secret = match &record.material {
             CredentialMaterial::Plaintext { value } => value.clone(),
             CredentialMaterial::Envelope { envelope } => {
@@ -468,8 +484,62 @@ impl KeyPlane {
             id.to_string(),
             (std::time::Instant::now(), resolved.clone()),
         );
+        // WOR-2571: one typed event per actual resolution. The cached
+        // fast path above returns before this point, so a request that
+        // rode the cache publishes nothing; see
+        // [`credential_resolved_event`] for the cardinality ruling.
+        sbproxy_observe::publish_proxy_event(
+            sbproxy_observe::EventType::CredentialResolved,
+            || credential_resolved_event(id, tenant_id, "resolved", Some(source)),
+        );
         Ok(resolved)
     }
+}
+
+/// Build the `credential_resolved` typed event for one actual
+/// resolution of an upstream credential (WOR-2571).
+///
+/// Split from [`KeyPlane::resolve_credential_secret`] so the field set
+/// is testable without a running event egress, the same shape as
+/// `budget_exceeded_event` in `server::ai_support`. The payload mirrors
+/// the key-lifecycle mutation events (`op`, `resource`, `id`,
+/// `outcome`) so one SIEM rule vocabulary covers the whole family; it
+/// never carries the resolved secret, the header value, or a vault
+/// reference. `tenant_id` is the tenant scope the resolution was
+/// performed under: the tenant of the key that bound this credential,
+/// or empty for a shared credential resolved with no tenant scope.
+///
+/// `outcome` is `resolved` for a fresh resolution and `stale_served`
+/// when the backend failed and the last known-good value was served
+/// inside `proxy.secrets.rotation.grace_period_secs`. `source` names
+/// where fresh material came from (`plaintext`, `envelope`,
+/// `vault_ref`) and is absent on the stale path, where nothing was
+/// freshly read. The per-request cache hit publishes nothing: this
+/// event marks material actually being read, not every request that
+/// rode the cached value, the same cardinality ruling that keeps
+/// `cache_hit` unwired on the typed feed. Resolution refusals publish
+/// nothing here either; the refusal surface is WOR-2567's.
+fn credential_resolved_event(
+    id: &str,
+    tenant_id: Option<&str>,
+    outcome: &'static str,
+    source: Option<&'static str>,
+) -> sbproxy_observe::ProxyEvent {
+    let mut data = serde_json::json!({
+        "op": "resolve",
+        "resource": "credential",
+        "id": id,
+        "outcome": outcome,
+    });
+    if let Some(source) = source {
+        data["source"] = serde_json::json!(source);
+    }
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::CredentialResolved,
+        String::new(),
+        tenant_id.unwrap_or_default().to_string(),
+        data,
+    )
 }
 
 fn runtime_governance_consistency(
@@ -2497,6 +2567,147 @@ mod resolve_credential_secret_tests {
                 Err(CredentialResolveError::NotFound)
             ),
             "a revoked credential must not be served out of the grace window"
+        );
+    }
+
+    // --- WOR-2571: the `credential_resolved` typed event ---
+
+    #[test]
+    fn credential_resolved_event_carries_the_allowlisted_fields() {
+        let event = super::credential_resolved_event(
+            "cred-shape",
+            Some("acme"),
+            "resolved",
+            Some("envelope"),
+        );
+        assert_eq!(
+            event.event_type,
+            sbproxy_observe::EventType::CredentialResolved
+        );
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.hostname, "");
+        assert_eq!(event.data["op"], "resolve");
+        assert_eq!(event.data["resource"], "credential");
+        assert_eq!(event.data["id"], "cred-shape");
+        assert_eq!(event.data["outcome"], "resolved");
+        assert_eq!(event.data["source"], "envelope");
+
+        let stale = super::credential_resolved_event("cred-shape", None, "stale_served", None);
+        assert_eq!(stale.tenant_id, "");
+        assert_eq!(stale.data["outcome"], "stale_served");
+        let object = stale.data.as_object().expect("payload is an object");
+        assert!(
+            !object.contains_key("source"),
+            "the stale path read nothing fresh, so it must not claim a source: {:?}",
+            stale.data
+        );
+    }
+
+    /// Poll `path` until `predicate` matches an NDJSON line or five
+    /// seconds pass. The file egress flushes per drained batch on its
+    /// own OS thread, so a plain read races the worker.
+    fn poll_events_file(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(line) = content.lines().find(|line| predicate(line)) {
+                    return Some(line.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// WOR-2571, the resolution seam, red-first: before the publish
+    /// call in [`KeyPlane::resolve_credential_secret`], this test timed
+    /// out polling for `credential_resolved` because a resolution left
+    /// no trace on the typed feed at all. One egress install per
+    /// process, which nextest's process-per-test model guarantees.
+    #[tokio::test]
+    async fn resolving_a_credential_publishes_one_credential_resolved_event() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("credential-resolved-events.ndjson");
+        let egress = sbproxy_observe::EventEgress::start(
+            sbproxy_observe::EventSinkTarget::File { path: path.clone() },
+            sbproxy_observe::EventTypeMask::from_types(&[
+                sbproxy_observe::EventType::CredentialResolved,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let p = plane();
+        let secret_material = "upstream-secret-material-that-must-not-cross";
+        let envelope = p
+            .crypto()
+            .seal("cred-siem", secret_material.as_bytes())
+            .unwrap();
+        let mut rec = credential("cred-siem", CredentialMaterial::Envelope { envelope });
+        rec.tenant_id = Some("acme".to_string());
+        put(&p, rec).await;
+        put(
+            &p,
+            credential(
+                "cred-marker",
+                CredentialMaterial::Plaintext {
+                    value: "marker-value".into(),
+                },
+            ),
+        )
+        .await;
+
+        p.resolve_credential_secret("cred-siem", Some("acme"))
+            .await
+            .expect("the envelope credential resolves");
+        // Ride the cache: this second call must not publish again.
+        p.resolve_credential_secret("cred-siem", Some("acme"))
+            .await
+            .expect("the cached credential resolves");
+        // The marker resolves after both, so once its event is on disk
+        // a second `cred-siem` event had every chance to arrive.
+        p.resolve_credential_secret("cred-marker", None)
+            .await
+            .expect("the marker credential resolves");
+
+        poll_events_file(&path, |line| line.contains("cred-marker"))
+            .expect("the marker resolution must reach the egress");
+
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+        let siem_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| line.contains("cred-siem"))
+            .collect();
+        assert_eq!(
+            siem_lines.len(),
+            1,
+            "one actual resolution, one event; the cache hit must not publish: {content}"
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(siem_lines[0]).expect("event line parses");
+        assert_eq!(event["event_type"], "credential_resolved");
+        assert_eq!(event["tenant_id"], "acme");
+        assert_eq!(event["data"]["op"], "resolve");
+        assert_eq!(event["data"]["resource"], "credential");
+        assert_eq!(event["data"]["id"], "cred-siem");
+        assert_eq!(event["data"]["outcome"], "resolved");
+        assert_eq!(event["data"]["source"], "envelope");
+        assert!(
+            !content.contains(secret_material),
+            "resolved material must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains("marker-value"),
+            "resolved material must never reach the typed feed: {content}"
         );
     }
 }

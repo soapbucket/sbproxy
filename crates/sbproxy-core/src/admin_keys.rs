@@ -448,7 +448,15 @@ fn create_key(body: Option<&str>) -> Resp {
         return internal_error(&format!("store key: {e:#}"));
     }
     invalidate(&plane, &minted.key_id);
-    audit_mutation("create", "key", &minted.key_id);
+    // Tenant-scoped so the `key_minted` typed event (WOR-2571) and the
+    // chain entry both attribute the mint; the record is at hand here.
+    audit_mutation_scoped(
+        "create",
+        "key",
+        &minted.key_id,
+        rec.tenant_id.as_deref(),
+        None,
+    );
 
     created(json!({
         // The plaintext token is shown exactly once and never stored.
@@ -1351,7 +1359,8 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
         Err(response) => return response,
     };
     invalidate(&plane, id);
-    audit_mutation("rotate", "key", id);
+    // Tenant-scoped for the same reason as the mint above (WOR-2571).
+    audit_mutation_scoped("rotate", "key", id, rec.tenant_id.as_deref(), None);
 
     ok(json!({
         // Same `sbp_<key_id>_<secret>` shape create_key returns, so a
@@ -1446,7 +1455,8 @@ fn create_credential(body: Option<&str>) -> Resp {
         return internal_error(&e);
     }
     invalidate(&plane, &id);
-    audit_mutation("create", "credential", &id);
+    // Tenant-scoped for the same reason as the key mint (WOR-2571).
+    audit_mutation_scoped("create", "credential", &id, rec.tenant_id.as_deref(), None);
     created(json!({ "credential": CredentialView::from(&rec) }))
 }
 
@@ -3446,5 +3456,141 @@ mod tests {
         // either, so it must not read as pending.
         record.prev_hash_expires_at = None;
         assert!(!KeyView::from(&record).rotation_pending);
+    }
+
+    /// Poll `path` until `predicate` matches an NDJSON line or five
+    /// seconds pass. The file egress flushes per drained batch on its
+    /// own OS thread, so a plain read races the worker.
+    fn poll_events_file(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(line) = content.lines().find(|line| predicate(line)) {
+                    return Some(line.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// WOR-2571, the real call sites, red-first: before the bridge in
+    /// `KeyAuditEntry::emit`, this test timed out polling for
+    /// `key_revoked` because the admin mutations reached the `key_audit`
+    /// channel and nothing else. Drives the actual admin routes
+    /// (mint, rotate, block, revoke) against a test plane with a file
+    /// egress installed, then checks the NDJSON the SIEM would ingest:
+    /// all four events, attributed to the tenant, and neither minted
+    /// plaintext token's secret anywhere in the feed. One egress
+    /// install per process, which nextest's process-per-test model
+    /// guarantees.
+    #[test]
+    fn admin_key_lifecycle_operations_reach_the_siem_event_feed() {
+        use sbproxy_observe::EventType;
+
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("key-lifecycle.ndjson");
+        let egress = sbproxy_observe::EventEgress::start(
+            sbproxy_observe::EventSinkTarget::File { path: path.clone() },
+            sbproxy_observe::EventTypeMask::from_types(&[
+                EventType::KeyMinted,
+                EventType::KeyRotated,
+                EventType::KeyBlocked,
+                EventType::KeyRevoked,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let minted = parse(
+            &dispatch("POST", "/admin/keys", Some(r#"{"tenant":"acme"}"#))
+                .expect("keys route is owned"),
+        );
+        let key_id = minted["key"]["key_id"]
+            .as_str()
+            .expect("mint returns the key id")
+            .to_string();
+        let mint_secret = minted["token"]
+            .as_str()
+            .expect("mint returns the one-time token")
+            .rsplit('_')
+            .next()
+            .expect("token carries a secret segment")
+            .to_string();
+
+        let rotated = parse(
+            &dispatch("POST", &format!("/admin/keys/{key_id}/rotate"), None)
+                .expect("rotate route is owned"),
+        );
+        let rotate_secret = rotated["token"]
+            .as_str()
+            .expect("rotate returns the one-time token")
+            .rsplit('_')
+            .next()
+            .expect("token carries a secret segment")
+            .to_string();
+
+        let blocked = dispatch("POST", &format!("/admin/keys/{key_id}/block"), None)
+            .expect("block route is owned");
+        assert_eq!(blocked.0, 200, "{}", blocked.2);
+        let revoked = dispatch("POST", &format!("/admin/keys/{key_id}/revoke"), None)
+            .expect("revoke route is owned");
+        assert_eq!(revoked.0, 200, "{}", revoked.2);
+
+        // The revoke is the last mutation, so once it is on disk the
+        // other three had every chance to arrive.
+        poll_events_file(&path, |line| line.contains("key_revoked"))
+            .expect("the revoke must reach the egress");
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+
+        for (event_type, op) in [
+            ("key_minted", "create"),
+            ("key_rotated", "rotate"),
+            ("key_blocked", "block"),
+            ("key_revoked", "revoke"),
+        ] {
+            let line = content
+                .lines()
+                .find(|line| line.contains(event_type))
+                .unwrap_or_else(|| panic!("no {event_type} event in the feed: {content}"));
+            let event: serde_json::Value = serde_json::from_str(line).expect("event line parses");
+            assert_eq!(event["event_type"], event_type);
+            assert_eq!(event["tenant_id"], "acme", "{event}");
+            assert_eq!(event["data"]["op"], op);
+            assert_eq!(event["data"]["resource"], "key");
+            assert_eq!(event["data"]["id"], key_id.as_str());
+            assert_eq!(event["data"]["outcome"], "applied");
+        }
+
+        let blocked_event: serde_json::Value = serde_json::from_str(
+            content
+                .lines()
+                .find(|line| line.contains("key_blocked"))
+                .expect("checked above"),
+        )
+        .expect("event line parses");
+        assert_eq!(blocked_event["data"]["prior_status"], "active");
+        assert_eq!(blocked_event["data"]["new_status"], "blocked");
+
+        assert!(
+            !content.contains(&mint_secret),
+            "the minted token's secret segment must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains(&rotate_secret),
+            "the rotated token's secret segment must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains("secret_hash"),
+            "no verifier material may reach the typed feed: {content}"
+        );
     }
 }

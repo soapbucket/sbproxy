@@ -26,6 +26,22 @@ the next version cut.
   section of [docs/configuration.md](docs/configuration.md) and
   [examples/auth-hmac/](examples/auth-hmac/).
 
+- **Key-lifecycle events reach the SIEM feed.** The `events:` type
+  list grows to eighteen declared types with five key-lifecycle kinds.
+  `key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` bridge
+  from the `key_audit` channel, so every admin mint, revoke, rotate,
+  or block of a key or upstream credential publishes one typed event
+  beside its audit-chain entry instead of a SIEM having to poll the
+  admin API. `credential_resolved` fires once per actual resolution of
+  an upstream credential's material (never per request), with
+  `outcome: stale_served` marking a value served through a secret
+  backend outage. Payloads are an explicit allowlist (`op`,
+  `resource`, the public id, actor, tenant, outcome, and closed
+  status labels), never the `key_audit` diff, a token, or a hash;
+  `events.types:` filters the new kinds like any other, and
+  `sbproxy_events_dropped_total` covers them. See
+  [docs/events.md](docs/events.md#key-lifecycle-events-the-dual-record).
+
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised
