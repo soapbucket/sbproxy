@@ -1,5 +1,5 @@
 # Audit log
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` / `sbproxy::admin::audit` tracing channels, the tamper-evident chains each of those four can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
 
@@ -294,6 +294,492 @@ fixed and documented in the ledger module, so an auditor who would rather
 not run our binary at all can reproduce it from any SHA-256 and Ed25519
 implementation.
 
+### Browsing it from the console
+
+`sbproxy audit verify` is the auditor's tool: it runs anywhere, against
+a copy, with no proxy involved. Day to day, though, the person who wants
+to know what the chains hold is an operator with the admin console
+already open. `GET /api/audit/chain` serves that reader: it reads the
+chained files themselves, verifies every link on the way, and the
+console's Audit view renders the result with the verification status in
+the same place as the entries.
+
+```mermaid
+flowchart TD
+    F1["security-audit.jsonl\n(audit.path)"] --> WALK
+    F2["config-audit.jsonl\n(audit.config_path)"] --> WALK
+    F3["key-audit.jsonl\n(audit.key_path)"] --> WALK
+    F4["admin-audit.jsonl\n(audit.admin_path)"] --> WALK
+    WALK["Windowed read, per enabled channel:\nstream one record at a time,\nre-derive each digest and Ed25519 signature,\nkeep only the requested page in memory"]
+    WALK -->|"a link or signature fails"| BREAK["walk stops at the break:\nok: false, broken_seq, reason;\nrecords before the break still served"]
+    WALK -->|"a record is past the 1 MiB bound"| BREAK
+    WALK -->|"the file will not open"| GONE["ok: false, error;\nnothing was checked, so nothing is shown"]
+    WALK -->|every link holds| COUNT{"as many records as\nthis process wrote?"}
+    COUNT -->|fewer| CUT["records were deleted:\nok: false, broken_seq,\nreason names how many are missing"]
+    COUNT -->|"that many or more"| OK["ok: true\nentries for the requested window"]
+    OK --> API["GET /api/audit/chain\nchannel/actor/time filters, seq cursor"]
+    BREAK --> API
+    CUT --> API
+    GONE --> API
+    API --> VIEW["Admin console, Audit view:\nfour channel cards, entry table,\nverification-failure banner"]
+```
+
+The read is windowed, and the window is the memory bound. Chains are
+append-only files with no rotation, so a busy security chain can be
+large; the route never loads a whole file. Each request streams the file
+one record at a time, re-deriving every digest and checking every
+signature exactly as `sbproxy audit verify` does, and keeps only the
+page it was asked for: 100 records by default and 500 at most, per
+channel walked, so a merged read across all four holds at most four
+such pages before it cuts them down to one. Any single record past
+1 MiB stops the walk and is reported as a verification failure, since
+no writer of ours produces one; `sbproxy audit verify` stays the
+unbounded authority for a file in that state. Verification is
+not optional and not cached: it is the same walk that finds the entries,
+so a page of entries and a claim that the chain holds always describe
+the same read of the same bytes.
+
+A verification failure is served, never hidden. If a record fails the
+walk, the response still carries every record before the break, plus
+`ok: false`, the sequence number the walk stopped at, and the reason.
+The console shows the same thing as a banner over the table. This is
+the point of the feature: a viewer that quietly skipped a broken record
+would be a log reader, and the chain would be decoration.
+
+Two things fail a walk, and the second is the one a hash chain cannot
+catch by itself. A record that was *edited* breaks its own digest, and
+the walk stops there. A record that was *deleted*, or a file that was
+truncated or replaced wholesale, leaves nothing behind to disagree
+with: what is left links and signs perfectly. So the read compares the
+walk's count against the number of records this process wrote and
+flushed to that chain, and a file holding fewer than that is reported
+as a failure with the count of what is missing. Deleting the trail is
+the most obvious tamper there is, and it must not be the one that
+renders green.
+
+Query parameters, all optional:
+
+| Parameter | Meaning |
+|---|---|
+| `channel` | One of `security`, `config`, `key`, `admin`. Without it, the response merges the newest window across every enabled channel. |
+| `actor` | Exact match on the acting identity: the operator on the config, key, and admin channels; the client IP on the security channel, which has no operator. |
+| `since` / `until` | RFC 3339 bounds on each record's chained `recorded_at`, inclusive. |
+| `before_seq` | Cursor: only records with a lower sequence number, for paging back through one channel. Requires `channel`, because sequence numbers only mean something inside one chain. |
+| `limit` | Page size, default 100, capped at 500. |
+
+The response reports all four channels every time, the disabled ones
+included, so the console can show "not configured" rather than nothing.
+A channel the request did not walk carries no `ok` at all, which is a
+third answer next to true and false: this read proved nothing about that
+chain. A status object that could only say "fine" or "broken" would let a
+channel-filtered read render the other three as healthy on the strength
+of having ignored them.
+
+The route is GET-only and carries no state to mutate, so a `read_only`
+operator can use it exactly as an `admin` can; reading the trail is the
+job that role exists for. A login narrowed to one tenant with
+`proxy.admin.operators[].tenant` is refused instead, with a `403`. The
+chains are deployment-wide, and the narrowing does not fit them: records
+with no tenant at all (a file-watcher reload, an operator login) belong
+to the deployment rather than to anyone, and the sequence numbers and
+entry counts describe every tenant's activity whatever the payloads say.
+Serving a filtered slice would answer "was there anything else" with
+"no", which is worse than a refusal because somebody will believe it.
+
+Reading the trail is itself audited, because an auditor must be
+auditable: a served read records `read_audit_chain` on the admin channel
+and a refused one records `read_audit_chain_denied`, each naming the
+operator, the channel asked for, and how many records came back, and
+never the caller's own filter strings. The record lands after the page is
+built, so a reader never finds their own read inside the window they just
+asked for, and the next one does.
+
+Each channel walked also increments
+`sbproxy_audit_chain_read_total{channel, outcome}` with an `outcome` of
+`verified`, `broken`, or `unreadable`. That counter, not the console
+banner, is what pages somebody:
+`increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`
+fires whether or not anyone had the page open.
+
+Here is the whole surface against a demo stack. The config turns all
+four channels on under one signing identity, with the chain files
+somewhere a demo can reach:
+
+```yaml
+# /tmp/sbproxy-audit-demo/sb.yml
+proxy:
+  http_bind_port: 8080
+
+  web_bot_auth:
+    key_id: sbproxy-audit-2026
+    ed25519_seed_hex: ${SBPROXY_AUDIT_SEED}
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: secret
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-audit-demo/keystore.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+
+audit:
+  sink: chain
+  path: /tmp/sbproxy-audit-demo/security-audit.jsonl
+  sign_with: proxy.web_bot_auth
+  config_path: /tmp/sbproxy-audit-demo/config-audit.jsonl
+  key_path: /tmp/sbproxy-audit-demo/key-audit.jsonl
+  admin_path: /tmp/sbproxy-audit-demo/admin-audit.jsonl
+
+origins:
+  "waf.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: true
+          managed_bundle: true
+        action_on_match: block
+        test_mode: false
+        failure_posture: closed
+```
+
+Three calls put a record on each of the four chains. A refused request
+writes to the security chain; a reload writes to the config chain and
+to the admin chain; minting a key writes to the key chain and to the
+admin chain again.
+
+```bash
+curl -s -o /dev/null -H 'Host: waf.local' \
+  "http://127.0.0.1:8080/get?id=1%27%20OR%20%271%27=%271"
+curl -s -o /dev/null -X POST -u admin:secret \
+  http://127.0.0.1:9090/admin/reload
+curl -s -o /dev/null -X POST -u admin:secret \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"demo-agent-key"}' http://127.0.0.1:9090/admin/keys
+```
+
+#### One window across all four chains
+
+```bash
+curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?limit=5' | jq
+```
+
+```json
+{
+  "channels": [
+    {
+      "chain_entries": 1,
+      "channel": "security",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "ok": true,
+      "path": "/tmp/sbproxy-audit-demo/security-audit.jsonl",
+      "total_matched": 1,
+      "verified_entries": 1
+    },
+    {
+      "chain_entries": 1,
+      "channel": "config",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "ok": true,
+      "path": "/tmp/sbproxy-audit-demo/config-audit.jsonl",
+      "total_matched": 1,
+      "verified_entries": 1
+    },
+    {
+      "chain_entries": 1,
+      "channel": "key",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "ok": true,
+      "path": "/tmp/sbproxy-audit-demo/key-audit.jsonl",
+      "total_matched": 1,
+      "verified_entries": 1
+    },
+    {
+      "chain_entries": 2,
+      "channel": "admin",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "ok": true,
+      "path": "/tmp/sbproxy-audit-demo/admin-audit.jsonl",
+      "total_matched": 2,
+      "verified_entries": 2
+    }
+  ],
+  "entries": [
+    {
+      "actor": "admin",
+      "channel": "key",
+      "event": {
+        "actor": "admin",
+        "id": "fa00b38b17391238",
+        "key_epoch": "950c04d2",
+        "op": "create",
+        "resource": "key",
+        "timestamp": "2026-08-20T22:24:42.768924+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.769113+00:00",
+      "seq": 0
+    },
+    {
+      "actor": "admin",
+      "channel": "admin",
+      "event": {
+        "action": "admin_action",
+        "actor": "admin",
+        "detail": "POST /admin/keys",
+        "timestamp": "2026-08-20T22:24:42.719065+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.719075+00:00",
+      "seq": 1
+    },
+    {
+      "actor": "admin",
+      "channel": "config",
+      "event": {
+        "actor": "admin",
+        "next_revision": "0766cb44897f",
+        "origins_added": [],
+        "origins_modified": [],
+        "origins_removed": [],
+        "prior_revision": "0766cb44897f",
+        "source": "api",
+        "timestamp": "2026-08-20T22:24:42.707034+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.707096+00:00",
+      "seq": 0
+    },
+    {
+      "actor": "admin",
+      "channel": "admin",
+      "event": {
+        "action": "admin_action",
+        "actor": "admin",
+        "detail": "POST /admin/reload",
+        "timestamp": "2026-08-20T22:24:42.663840+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.663852+00:00",
+      "seq": 0
+    },
+    {
+      "actor": "127.0.0.1",
+      "channel": "security",
+      "event": {
+        "client_ip": "127.0.0.1",
+        "event_type": "waf",
+        "hostname": "waf.local",
+        "key_mode": "none",
+        "method": "GET",
+        "reason": "WAF: SQL injection detected",
+        "request_id": "01a02146ca987fc2a601fd57c467a69a",
+        "status_code": 403,
+        "tenant_id": "__default__",
+        "timestamp": "2026-08-20T22:24:42.651715+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.651892+00:00",
+      "seq": 0
+    }
+  ]
+}
+```
+
+Four verdicts and one merged window. The security denial names the
+client IP as its actor, because that channel has no operator; the other
+three name the console login that acted. Every channel reports its own
+`ok`, its own entry count, and the `kid` it signs under, so a reader can
+tell which chains this answer actually covers.
+
+#### One channel, paged
+
+```bash
+curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=admin&limit=2' | jq
+```
+
+```json
+{
+  "channels": [
+    {
+      "channel": "security",
+      "enabled": true
+    },
+    {
+      "channel": "config",
+      "enabled": true
+    },
+    {
+      "channel": "key",
+      "enabled": true
+    },
+    {
+      "chain_entries": 3,
+      "channel": "admin",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "next_before_seq": 1,
+      "ok": true,
+      "path": "/tmp/sbproxy-audit-demo/admin-audit.jsonl",
+      "total_matched": 3,
+      "verified_entries": 3
+    }
+  ],
+  "entries": [
+    {
+      "actor": "admin",
+      "channel": "admin",
+      "event": {
+        "action": "read_audit_chain",
+        "actor": "admin",
+        "detail": "GET /api/audit/chain channel=all entries=5",
+        "timestamp": "2026-08-20T22:24:52.880186+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:52.880195+00:00",
+      "seq": 2
+    },
+    {
+      "actor": "admin",
+      "channel": "admin",
+      "event": {
+        "action": "admin_action",
+        "actor": "admin",
+        "detail": "POST /admin/keys",
+        "timestamp": "2026-08-20T22:24:42.719065+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.719075+00:00",
+      "seq": 1
+    }
+  ]
+}
+```
+
+The three channels this request did not walk carry `enabled` and nothing
+else: no `ok`, because this read proved nothing about them.
+`next_before_seq` is the cursor for the next page back. And the newest
+record on the admin chain is the previous call to this route, which is
+the audit-of-the-audit doing its job.
+
+#### An edited record
+
+Edit a chained record on disk and ask again. The walk stops where the
+digest stops matching:
+
+```bash
+sed -i '' 's|POST /admin/keys|POST /admin/health|' \
+  /tmp/sbproxy-audit-demo/admin-audit.jsonl
+curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=admin' | jq
+```
+
+```json
+{
+  "channels": [
+    {
+      "channel": "security",
+      "enabled": true
+    },
+    {
+      "channel": "config",
+      "enabled": true
+    },
+    {
+      "channel": "key",
+      "enabled": true
+    },
+    {
+      "broken_seq": 1,
+      "chain_entries": 4,
+      "channel": "admin",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "ok": false,
+      "path": "/tmp/sbproxy-audit-demo/admin-audit.jsonl",
+      "reason": "entry_hash does not match recomputed digest (tampered event)",
+      "total_matched": 1,
+      "verified_entries": 1
+    }
+  ],
+  "entries": [
+    {
+      "actor": "admin",
+      "channel": "admin",
+      "event": {
+        "action": "admin_action",
+        "actor": "admin",
+        "detail": "POST /admin/reload",
+        "timestamp": "2026-08-20T22:24:42.663840+00:00"
+      },
+      "recorded_at": "2026-08-20T22:24:42.663852+00:00",
+      "seq": 0
+    }
+  ]
+}
+```
+
+The record before the edit still verifies and is still served. The
+edited record and everything after it are not, and the response says
+which sequence and why.
+
+#### A deleted trail
+
+The other tamper is deleting rather than editing, and a hash chain
+alone cannot see it: what is left of a truncated file links and signs
+perfectly, because there is nothing in the file to disagree with. The
+comparison the viewer adds is the count of records this process wrote.
+
+```bash
+: > /tmp/sbproxy-audit-demo/security-audit.jsonl
+curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=security' | jq
+```
+
+```json
+{
+  "channels": [
+    {
+      "broken_seq": 0,
+      "chain_entries": 3,
+      "channel": "security",
+      "enabled": true,
+      "key_id": "sbproxy-audit-2026",
+      "ok": false,
+      "path": "/tmp/sbproxy-audit-demo/security-audit.jsonl",
+      "reason": "this process wrote 3 records to this chain and the file holds 0: 3 are missing from it",
+      "total_matched": 0,
+      "verified_entries": 0
+    },
+    {
+      "channel": "config",
+      "enabled": true
+    },
+    {
+      "channel": "key",
+      "enabled": true
+    },
+    {
+      "channel": "admin",
+      "enabled": true
+    }
+  ],
+  "entries": []
+}
+```
+
+An empty file that reads as a clean chain is the failure this check
+exists for. The count only ever runs short in one direction: a record
+appended while the walk was running makes the walk's count larger, which
+is ordinary on a live chain and not reported. It also only covers what
+this process wrote, so records written before the last restart are
+covered by `sbproxy audit verify` against a copy and by the offsite copy
+you keep, not by this.
+
 ### What it does not cover yet
 
 All four channels are chainable now, but all four are opt-in, and none
@@ -502,9 +988,30 @@ sbproxy_audit_emit_duration_seconds{channel, outcome}
 
 `channel` is `config`, `security`, `key`, or `admin`. `outcome` is `ok`, `serialize_error`, or `chain_error`. `serialize_error` means the audit record failed to encode to JSON and was dropped from the tracing target it belongs to; the `admin` channel never reports it, because an `AdminActionAuditEntry` does not go through that JSON-encode-to-tracing step the other three channels' entries do, it goes straight to the ring and, when a chain is installed, to the chain. `chain_error` means a configured chain (`audit.path` on security, `audit.config_path` on config, `audit.key_path` on key, `audit.admin_path` on admin) rejected the append, so that record reached whatever read model the channel has, a tracing line, the ring, or both, but is not in the durable trail. Any non-`ok` outcome is worth alerting on: `outcome!="ok"` firing means either an audit record vanished or your tamper-evident trail has a gap. The histogram carries the active trace as an exemplar so a slow audit sink links back to the originating span.
 
+Reads of the chains have their own counter:
+
+```
+sbproxy_audit_chain_read_total{channel, outcome}
+```
+
+`channel` is the chain that was walked. `outcome` is `verified` when
+every link and signature held, `broken` when the walk stopped at a bad
+record, and `unreadable` when the file could not be walked at all. One
+increment per channel per call to
+[`GET /api/audit/chain`](admin-api-reference.md), so a console that is
+open and refreshing keeps re-asserting the answer rather than caching a
+stale one. The alert to write is
+`increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`.
+
+The two families answer different questions and both are needed. The
+emit histogram catches a record that never reached the trail; this
+counter catches a record that reached it and was changed afterwards.
+Neither sees the other's failure.
+
 ## See also
 
 - [ai-usage-ledger.md](ai-usage-ledger.md) and [metering.md](metering.md) - the other two chains built on the same primitive, for LLM spend and for metering receipts.
 - [observability.md](observability.md) - the logging pipeline the tracing targets flow through.
 - [access-log.md](access-log.md) - routine request records; reads are not audited, they are access-logged.
-- [admin-api-reference.md](admin-api-reference.md) - the admin surface that serves `/api/audit/recent`.
+- [admin-api-reference.md](admin-api-reference.md) - the admin surface that serves `/api/audit/recent` and the chain viewer at `/api/audit/chain`.
+- [admin-ui.md](admin-ui.md) - the console's Audit view, which renders the chain viewer.

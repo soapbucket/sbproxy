@@ -12,6 +12,38 @@ the next version cut.
 
 ### Added
 
+- **Audit chain viewer: `GET /api/audit/chain` and the console's
+  Audit view.** The four tamper-evident audit chains
+  (`audit.path`, `audit.config_path`, `audit.key_path`,
+  `audit.admin_path`) were CLI-only reads until now. The new route
+  reads the chained files themselves with channel, actor, and
+  time-range filters plus cursor paging, re-verifying every hash link
+  and Ed25519 signature as it reads; reads are windowed (streamed one
+  record at a time, never a whole-file load) and a verification
+  failure is served in the response with the first broken sequence
+  and reason, alongside the records that verified. A truncated or
+  deleted chain file is reported as a failure too: what is left of a
+  truncated file links and signs perfectly, so the read compares the
+  walk against the number of records the proxy wrote to that chain. The console's
+  Audit view renders the four channel cards, the merged entry table,
+  and a failure banner. GET-only, readable by the `read_only` role;
+  a login narrowed with `proxy.admin.operators[].tenant` is refused,
+  because the chains are deployment-wide and a per-tenant slice of an
+  audit trail reads as "nothing else happened". Every call is itself
+  recorded on the admin channel (`read_audit_chain`, or
+  `read_audit_chain_denied` on the refusal). See the audit-chain
+  sections of [docs/audit-log.md](docs/audit-log.md),
+  [docs/admin-api-reference.md](docs/admin-api-reference.md), and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **New metric `sbproxy_audit_chain_read_total{channel, outcome}`.**
+  One increment per chain walked per viewer read, with an `outcome`
+  of `verified`, `broken`, or `unreadable`. A broken chain that only
+  a person looking at the console can see is a finding nobody is on
+  call for, so the verdict leaves the page as well as rendering on
+  it: alert on
+  `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`.
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,

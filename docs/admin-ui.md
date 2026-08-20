@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -718,16 +718,41 @@ resident, and what can be reclaimed.
 
 ## Audit (`/audit`)
 
-Rate-limit budget actions (suspend, throttle, resume) with the reason
-each fired.
+Three records of what happened, ordered by how much they prove. At the
+top, the tamper-evident chain viewer: the durable, hash-chained,
+Ed25519-signed files themselves, re-verified on every page read. Below
+it, the bounded runtime samples: the unified security and change event
+ring, and the rate-limit budget actions (suspend, throttle, resume)
+with the reason each fired.
 
-- **Shows:** `GET /api/audit/recent?limit=100`, `GET /api/rate_limits/budget`
-  (per-workspace tier and cool-down state).
+The chain section shows one card per channel (`security`, `config`,
+`key`, `admin`), each labeled `verified`, `broken`, `unreadable`, or
+`off`, with the entry count and the signing key id. Entries from every
+enabled chain merge into one table, filterable by channel, actor, and
+time range, with Older/Newer paging inside a single channel. If any
+walked chain fails verification, a banner names the channel, the first
+broken sequence number, and the reason, and the table serves only the
+records that verified; see
+[audit-log.md](audit-log.md#browsing-it-from-the-console) for what the
+walk checks and why a break is served rather than hidden.
+
+- **Shows:** `GET /api/audit/chain` (the chained files, verified per
+  read), `GET /api/audit/events?limit=200` (the in-memory event
+  sample), `GET /api/audit/recent?limit=100`,
+  `GET /api/rate_limits/budget` (per-workspace tier and cool-down
+  state).
 - **Mutations:** `POST /api/rate_limits/resume` (manually clear a
   workspace's escalation back to `normal`).
-- **Empty/error notes:** no `rate_limits:` block configured returns an
-  empty audit list and a `404` on the budget snapshot; both render as
-  "not configured," not an error, since there is nothing to audit.
+- **Empty/error notes:** with no chain configured, all four cards read
+  "off" and the chain table explains which config keys turn each
+  channel on. No `rate_limits:` block configured returns an empty audit
+  list and a `404` on the budget snapshot; both render as "not
+  configured," not an error, since there is nothing to audit.
+- **Roles:** the whole page is readable by a `read_only` operator; the
+  chain route is GET-only. A login narrowed with
+  `proxy.admin.operators[].tenant` is refused the chain section with a
+  `403`, since the chains are deployment-wide; the rest of the page still
+  renders. Every chain read is itself recorded on the admin channel.
 
 ## Users (`/users`)
 

@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-20*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -901,7 +901,10 @@ or support bundles.
 Successful key mutations emit a structured `key_audit` event with the operation,
 resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
-apply normal operational-log access controls. See [Audit log](audit-log.md).
+apply normal operational-log access controls. With `audit.key_path` set, the
+same mutations also land on the tamper-evident key chain, browsable from the
+console's Audit view with per-read verification; see
+[Audit log](audit-log.md#browsing-it-from-the-console).
 
 ## Live policy
 

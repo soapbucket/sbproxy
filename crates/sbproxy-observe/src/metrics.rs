@@ -3768,6 +3768,46 @@ pub fn record_audit_emit_duration(channel: &str, outcome: &str, duration_secs: f
     );
 }
 
+/// Count one audit-chain read served by the console viewer on
+/// `sbproxy_audit_chain_read_total{channel, outcome}` (WOR-2579).
+///
+/// `channel` is one of `security`, `config`, `key`, `admin`. `outcome` is
+/// `verified` when every link and signature held, `broken` when the walk
+/// stopped at a bad record, and `unreadable` when the file could not be
+/// walked at all.
+///
+/// The reason this exists rather than leaving the verdict on the page: a
+/// broken chain that only a person looking at the console can see is a
+/// finding nobody is on call for. `broken` and `unreadable` are both
+/// alertable from the moment this ships, and `increase(...{outcome!=
+/// "verified"}[15m]) > 0` is the rule an operator wants. Both label
+/// values are closed vocabularies from this crate, never caller input, and
+/// both parameters are `&'static str` so that stays true by construction:
+/// a caller-supplied `String` cannot be passed here at all, which is what
+/// keeps this family off the cardinality limiter honestly rather than by
+/// assertion.
+pub fn record_audit_chain_read(channel: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    // `.ok()` rather than `.expect(...)`, the same shape
+    // [`record_key_store_outage`] uses: registration can only fail on a
+    // duplicate name, which the metric-registry guard catches at build
+    // time, and a counter is not worth ending the process over on a path
+    // whose whole job is to report on somebody else's failure.
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_audit_chain_read_total",
+            "Audit-chain reads served by the console viewer, by verification outcome",
+            &["channel", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[channel, outcome]).inc();
+    }
+}
+
 // --- script-engine metrics (CEL / Lua / JS / WASM) -----------------------
 //
 // Four counters / histograms cover the script-engine lifecycle so an
