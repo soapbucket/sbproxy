@@ -51,7 +51,7 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
         return Some(if method.eq_ignore_ascii_case("GET") {
             list_keys()
         } else if method.eq_ignore_ascii_case("POST") {
-            create_key(body)
+            count_key_operation("mint", create_key(body))
         } else {
             method_not_allowed()
         });
@@ -93,9 +93,9 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
             if method.eq_ignore_ascii_case("GET") {
                 get_key(id)
             } else if method.eq_ignore_ascii_case("PATCH") {
-                update_key(id, body)
+                count_key_operation("update", update_key(id, body))
             } else if method.eq_ignore_ascii_case("DELETE") {
-                delete_key(id)
+                count_key_operation("delete", delete_key(id))
             } else {
                 method_not_allowed()
             }
@@ -115,10 +115,16 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
             }
         }
         Some(action) if method.eq_ignore_ascii_case("POST") => match action {
-            "revoke" => set_key_status(id, RecordStatus::Revoked, body),
-            "block" => set_key_status(id, RecordStatus::Blocked, body),
-            "unblock" => set_key_status(id, RecordStatus::Active, body),
-            "rotate" => rotate_key(id, body),
+            "revoke" => {
+                count_key_operation("revoke", set_key_status(id, RecordStatus::Revoked, body))
+            }
+            "block" => {
+                count_key_operation("block", set_key_status(id, RecordStatus::Blocked, body))
+            }
+            "unblock" => {
+                count_key_operation("unblock", set_key_status(id, RecordStatus::Active, body))
+            }
+            "rotate" => count_key_operation("rotate", rotate_key(id, body)),
             _ => not_found("unknown key action"),
         },
         Some(_) => method_not_allowed(),
@@ -458,7 +464,15 @@ fn create_key(body: Option<&str>) -> Resp {
         return internal_error(&format!("store key: {e:#}"));
     }
     invalidate(&plane, &minted.key_id);
-    audit_mutation("create", "key", &minted.key_id);
+    // Tenant-scoped so the `key_minted` typed event (WOR-2571) and the
+    // chain entry both attribute the mint; the record is at hand here.
+    audit_mutation_scoped(
+        "create",
+        "key",
+        &minted.key_id,
+        rec.tenant_id.as_deref(),
+        None,
+    );
 
     created(json!({
         // The plaintext token is shown exactly once and never stored.
@@ -1390,7 +1404,8 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
         Err(response) => return response,
     };
     invalidate(&plane, id);
-    audit_mutation("rotate", "key", id);
+    // Tenant-scoped for the same reason as the mint above (WOR-2571).
+    audit_mutation_scoped("rotate", "key", id, rec.tenant_id.as_deref(), None);
 
     ok(json!({
         // Same `sbp_<key_id>_<secret>` shape create_key returns, so a
@@ -1767,7 +1782,8 @@ fn create_credential(body: Option<&str>) -> Resp {
         return internal_error(&e);
     }
     invalidate(&plane, &id);
-    audit_mutation("create", "credential", &id);
+    // Tenant-scoped for the same reason as the key mint (WOR-2571).
+    audit_mutation_scoped("create", "credential", &id, rec.tenant_id.as_deref(), None);
     created(json!({ "credential": CredentialView::from(&rec) }))
 }
 
@@ -2163,6 +2179,31 @@ fn invalidate(plane: &KeyPlane, id: &str) {
     // a rotation has to drop both on the same signal or the old secret keeps
     // going upstream until the TTL lapses.
     plane.invalidate_resolved_credential(id);
+}
+
+/// WOR-2572: map one admin key-operation response onto
+/// `sbproxy_key_operations_total{operation, outcome}` before returning
+/// it. Sits at the dispatch seam rather than inside each handler so a
+/// return path a handler grows later is already counted, and the
+/// outcome comes from the status class the handler actually returned:
+/// 2xx is `ok`, 5xx is `error` (the store or governance backend
+/// failed), everything else is `refused` (a 4xx the caller can fix).
+/// The three are never folded: a rate panel that cannot tell a busy
+/// console from an outage answers no operator question.
+///
+/// Scope is the key resource. `/admin/credentials` mutations are not
+/// counted here, because this family's `operation` label is the closed
+/// key-lifecycle set and its declared cardinality is that set times the
+/// three outcomes; a credential surface gets its own family rather than
+/// silently doubling this one's.
+fn count_key_operation(operation: &'static str, resp: Resp) -> Resp {
+    let outcome = match resp.0 {
+        200..=299 => "ok",
+        500..=599 => "error",
+        _ => "refused",
+    };
+    sbproxy_observe::metrics::record_key_operation(operation, outcome);
+    resp
 }
 
 fn status_verb(status: RecordStatus) -> &'static str {
@@ -4039,5 +4080,303 @@ mod tests {
         let decisions = &parse(&after)["decisions"];
         assert_eq!(decisions["budget"]["tokens"]["limit"], 1_000);
         assert_eq!(decisions["budget"]["allowed"], false);
+    }
+
+    /// WOR-2572: every admin key-lifecycle route lands on
+    /// `sbproxy_key_operations_total` with an outcome derived from the
+    /// status class the handler actually returned. The three outcome
+    /// values are asserted separately on purpose: folding a refusal into
+    /// `ok` (or an outage into `refused`) is the labeling defect the
+    /// ticket exists to rule out.
+    #[test]
+    fn key_operations_move_at_the_admin_seam_with_separate_outcomes() {
+        let _g = crate::key_plane::test_plane_guard();
+
+        fn op_count(operation: &str, outcome: &str) -> f64 {
+            let want = [
+                format!("operation={operation}"),
+                format!("outcome={outcome}"),
+            ];
+            let mut total = 0.0;
+            for family in prometheus::gather() {
+                if family.name() != "sbproxy_key_operations_total" {
+                    continue;
+                }
+                for metric in family.get_metric() {
+                    let labels: Vec<String> = metric
+                        .get_label()
+                        .iter()
+                        .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                        .collect();
+                    if want.iter().all(|label| labels.contains(label)) {
+                        total += metric.get_counter().value();
+                    }
+                }
+            }
+            total
+        }
+
+        /// A store that is down for every operation, so a handler's 5xx
+        /// path is the real store-error path rather than a synthetic
+        /// status.
+        struct DownStore;
+        #[async_trait]
+        impl KeyStore for DownStore {
+            async fn get_key(&self, _: &str) -> anyhow::Result<Option<KeyRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn put_key(&self, _: KeyRecord) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn put_key_if_revision(
+                &self,
+                _: KeyRecord,
+                _: u64,
+            ) -> anyhow::Result<KeyPolicyCasResult> {
+                anyhow::bail!("store down")
+            }
+            async fn delete_key(&self, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn get_credential(&self, _: &str) -> anyhow::Result<Option<CredentialRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
+                anyhow::bail!("store down")
+            }
+            async fn put_credential(&self, _: CredentialRecord) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn delete_credential(&self, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("store down")
+            }
+            async fn revision(&self) -> anyhow::Result<u64> {
+                anyhow::bail!("store down")
+            }
+        }
+
+        let before_mint_ok = op_count("mint", "ok");
+        let before_mint_error = op_count("mint", "error");
+        let before_rotate_ok = op_count("rotate", "ok");
+        let before_rotate_refused = op_count("rotate", "refused");
+        let before_block_ok = op_count("block", "ok");
+        let before_unblock_ok = op_count("unblock", "ok");
+        let before_update_ok = op_count("update", "ok");
+        let before_revoke_ok = op_count("revoke", "ok");
+        let before_delete_ok = op_count("delete", "ok");
+
+        // A dead store is an `error`: the operator asked for something
+        // legitimate and the infrastructure could not do it.
+        {
+            let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+            let store: Arc<dyn KeyStore> = Arc::new(DownStore);
+            let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+            let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
+                crypto, cache, false, false, None,
+            ));
+            crate::key_plane::install_key_plane_for_test(plane);
+        }
+        let resp = dispatch("POST", "/admin/keys", None).unwrap();
+        assert_eq!(resp.0, 500, "{}", resp.2);
+        assert_eq!(
+            op_count("mint", "error") - before_mint_error,
+            1.0,
+            "a store failure must land on outcome=error, not be folded into ok or refused"
+        );
+
+        // The healthy plane: one of each operation, all `ok`.
+        install_test_plane();
+        let resp = dispatch("POST", "/admin/keys", Some(r#"{"name":"m"}"#)).unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        let minted = parse(&resp);
+        let key_id = minted["key"]["key_id"]
+            .as_str()
+            .expect("minted key id")
+            .to_string();
+        // `update_key` requires an explicit `expected_revision`; the
+        // status and rotate routes default it to the record's current
+        // value, which is why only this call carries a body.
+        let revision = minted["key"]["policy_revision"]
+            .as_u64()
+            .expect("minted policy revision");
+        let resp = dispatch(
+            "PATCH",
+            &format!("/admin/keys/{key_id}"),
+            Some(&format!(r#"{{"expected_revision":{revision}}}"#)),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/rotate"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/block"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/unblock"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/revoke"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        // A rotate against a revoked (terminal) key is a refusal the
+        // operator can understand, not an error.
+        let resp = dispatch("POST", &format!("/admin/keys/{key_id}/rotate"), None).unwrap();
+        assert!((400..500).contains(&resp.0), "{}", resp.2);
+        let resp = dispatch("DELETE", &format!("/admin/keys/{key_id}"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        assert_eq!(op_count("mint", "ok") - before_mint_ok, 1.0);
+        assert_eq!(op_count("update", "ok") - before_update_ok, 1.0);
+        assert_eq!(op_count("rotate", "ok") - before_rotate_ok, 1.0);
+        assert_eq!(op_count("block", "ok") - before_block_ok, 1.0);
+        assert_eq!(op_count("unblock", "ok") - before_unblock_ok, 1.0);
+        assert_eq!(op_count("revoke", "ok") - before_revoke_ok, 1.0);
+        assert_eq!(op_count("delete", "ok") - before_delete_ok, 1.0);
+        assert_eq!(
+            op_count("rotate", "refused") - before_rotate_refused,
+            1.0,
+            "a terminal-key rotate is a refusal, its own label value"
+        );
+        assert_eq!(
+            op_count("mint", "error") - before_mint_error,
+            1.0,
+            "the healthy-plane run must not have added error outcomes"
+        );
+    }
+
+    /// Poll `path` until `predicate` matches an NDJSON line or five
+    /// seconds pass. The file egress flushes per drained batch on its
+    /// own OS thread, so a plain read races the worker.
+    fn poll_events_file(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(line) = content.lines().find(|line| predicate(line)) {
+                    return Some(line.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// WOR-2571, the real call sites, red-first: before the bridge in
+    /// `KeyAuditEntry::emit`, this test timed out polling for
+    /// `key_revoked` because the admin mutations reached the `key_audit`
+    /// channel and nothing else. Drives the actual admin routes
+    /// (mint, rotate, block, revoke) against a test plane with a file
+    /// egress installed, then checks the NDJSON the SIEM would ingest:
+    /// all four events, attributed to the tenant, and neither minted
+    /// plaintext token's secret anywhere in the feed. One egress
+    /// install per process, which nextest's process-per-test model
+    /// guarantees.
+    #[test]
+    fn admin_key_lifecycle_operations_reach_the_siem_event_feed() {
+        use sbproxy_observe::EventType;
+
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("key-lifecycle.ndjson");
+        let egress = sbproxy_observe::EventEgress::start(
+            sbproxy_observe::EventSinkTarget::File { path: path.clone() },
+            sbproxy_observe::EventTypeMask::from_types(&[
+                EventType::KeyMinted,
+                EventType::KeyRotated,
+                EventType::KeyBlocked,
+                EventType::KeyRevoked,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let minted = parse(
+            &dispatch("POST", "/admin/keys", Some(r#"{"tenant":"acme"}"#))
+                .expect("keys route is owned"),
+        );
+        let key_id = minted["key"]["key_id"]
+            .as_str()
+            .expect("mint returns the key id")
+            .to_string();
+        let mint_secret = minted["token"]
+            .as_str()
+            .expect("mint returns the one-time token")
+            .rsplit('_')
+            .next()
+            .expect("token carries a secret segment")
+            .to_string();
+
+        let rotated = parse(
+            &dispatch("POST", &format!("/admin/keys/{key_id}/rotate"), None)
+                .expect("rotate route is owned"),
+        );
+        let rotate_secret = rotated["token"]
+            .as_str()
+            .expect("rotate returns the one-time token")
+            .rsplit('_')
+            .next()
+            .expect("token carries a secret segment")
+            .to_string();
+
+        let blocked = dispatch("POST", &format!("/admin/keys/{key_id}/block"), None)
+            .expect("block route is owned");
+        assert_eq!(blocked.0, 200, "{}", blocked.2);
+        let revoked = dispatch("POST", &format!("/admin/keys/{key_id}/revoke"), None)
+            .expect("revoke route is owned");
+        assert_eq!(revoked.0, 200, "{}", revoked.2);
+
+        // The revoke is the last mutation, so once it is on disk the
+        // other three had every chance to arrive.
+        poll_events_file(&path, |line| line.contains("key_revoked"))
+            .expect("the revoke must reach the egress");
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+
+        for (event_type, op) in [
+            ("key_minted", "create"),
+            ("key_rotated", "rotate"),
+            ("key_blocked", "block"),
+            ("key_revoked", "revoke"),
+        ] {
+            let line = content
+                .lines()
+                .find(|line| line.contains(event_type))
+                .unwrap_or_else(|| panic!("no {event_type} event in the feed: {content}"));
+            let event: serde_json::Value = serde_json::from_str(line).expect("event line parses");
+            assert_eq!(event["event_type"], event_type);
+            assert_eq!(event["tenant_id"], "acme", "{event}");
+            assert_eq!(event["data"]["op"], op);
+            assert_eq!(event["data"]["resource"], "key");
+            assert_eq!(event["data"]["id"], key_id.as_str());
+            assert_eq!(event["data"]["outcome"], "applied");
+        }
+
+        let blocked_event: serde_json::Value = serde_json::from_str(
+            content
+                .lines()
+                .find(|line| line.contains("key_blocked"))
+                .expect("checked above"),
+        )
+        .expect("event line parses");
+        assert_eq!(blocked_event["data"]["prior_status"], "active");
+        assert_eq!(blocked_event["data"]["new_status"], "blocked");
+
+        assert!(
+            !content.contains(&mint_secret),
+            "the minted token's secret segment must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains(&rotate_secret),
+            "the rotated token's secret segment must never reach the typed feed: {content}"
+        );
+        assert!(
+            !content.contains("secret_hash"),
+            "no verifier material may reach the typed feed: {content}"
+        );
     }
 }

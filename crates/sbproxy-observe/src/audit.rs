@@ -757,6 +757,14 @@ impl AdminActionAuditEntry {
         ));
         let chain_ok = crate::audit_chain::append_admin_audit(self);
         let outcome = if chain_ok { "ok" } else { "chain_error" };
+        // WOR-2572: the dedicated audit-write-failure counter, fed from
+        // the same real append result the histogram's outcome label
+        // folds in. Touches the series on success too, so a healthy
+        // channel exports an explicit 0. `admin_path` is the console
+        // action trail, not a key-management channel, which is why the
+        // family is `sbproxy_audit_write_failures_total` rather than
+        // being named for the key plane.
+        crate::metrics::record_audit_write_outcome("admin_path", chain_ok);
         crate::metrics::record_audit_emit_duration(
             "admin",
             outcome,
@@ -874,8 +882,117 @@ impl KeyAuditEntry {
             true
         };
         let outcome = if !chain_ok { "chain_error" } else { outcome };
+        // WOR-2572: the dedicated audit-write-failure counter. `ok` here
+        // means every sink this emission was promised was reached: the
+        // tracing serialize succeeded AND a configured chain accepted
+        // the append. Sourced from those real results, never a default.
+        crate::metrics::record_audit_write_outcome("key_path", outcome == "ok");
+        // WOR-2571: the `events:` egress sees the four alertable
+        // lifecycle operations as typed events (`key_minted`,
+        // `key_revoked`, `key_rotated`, `key_blocked`), the same bridge
+        // shape `ConfigAuditEntry::emit` uses for `config_reloaded`.
+        // Bridging here rather than at each admin route makes the SIEM
+        // feed exactly as wide as the `key_audit` channel for the
+        // mapped operations: a mutation cannot reach the chain and
+        // miss the feed. The payload is the allowlist
+        // [`key_lifecycle_event`] builds, never this entry's raw
+        // before/after diff.
+        //
+        // The bridge is unconditional on the write outcome above, and
+        // deliberately so: a chain that rejected the append is exactly
+        // when the SIEM copy matters most. The counter reports the
+        // durability hole, the feed still carries the mutation.
+        if let Some(event_type) = key_lifecycle_event_type(&self.op) {
+            crate::event_sink::publish_proxy_event(event_type, || {
+                key_lifecycle_event(self, event_type)
+            });
+        }
         crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
     }
+}
+
+/// The typed [`crate::events::EventType`] a key/credential lifecycle
+/// operation bridges to on the `events:` egress, or `None` for an
+/// operation the SIEM feed does not carry (WOR-2571).
+///
+/// The mapping is by operation, not by resource: `revoke` on a key and
+/// `revoke` on an upstream credential both bridge to `key_revoked`,
+/// with the payload's `resource` field telling the two apart. That is
+/// deliberate, and it is what a SIEM rule shaped like "alert when a
+/// credential is revoked" needs; minting a second five-variant family
+/// for credentials would double the closed set to say the same four
+/// things.
+///
+/// `update`, `delete`, and `unblock` map to `None` on purpose. They
+/// stay on the `key_audit` channel (the tracing target, the admin ring,
+/// and the hash chain when `audit.key_path` is set), which records
+/// every mutation; the typed feed carries the four operations the
+/// WOR-2571 alerting surface names. `credential_resolved`, the fifth
+/// type, is not minted here at all: it is a read, not a mutation, and
+/// publishes from the resolution path in `sbproxy-core`.
+fn key_lifecycle_event_type(op: &str) -> Option<crate::events::EventType> {
+    match op {
+        "create" => Some(crate::events::EventType::KeyMinted),
+        "revoke" => Some(crate::events::EventType::KeyRevoked),
+        "rotate" => Some(crate::events::EventType::KeyRotated),
+        "block" => Some(crate::events::EventType::KeyBlocked),
+        _ => None,
+    }
+}
+
+/// Build the typed event for one key/credential lifecycle mutation
+/// (WOR-2571).
+///
+/// The payload is an explicit allowlist, not a serialization of the
+/// entry: `op`, `resource`, the public `id`, `outcome`, the acting
+/// principal when known, the owning tenant, and, when the mutation
+/// carried a status diff, the closed-vocabulary `prior_status` /
+/// `new_status` labels. Nothing else crosses. In particular the
+/// `before`/`after` snapshots do not pass through as values: the chain
+/// fingerprints them rather than carrying them (see
+/// [`KeyAuditChainEntry`]), and a webhook sink ships these bytes off
+/// the box, so the SIEM copy carries strictly less than the local
+/// record, never more. This is Vault's `audit_non_hmac_request_keys`
+/// posture read in reverse, and the qualifier matters: Vault HMACs
+/// everything and exempts a named list, while this carries a named
+/// list in the clear and withholds the rest. Same end state, opposite
+/// mechanism. Named non-secret fields cross by exception; everything
+/// unnamed is withheld rather than hashed.
+///
+/// `outcome` is always `applied` today because [`KeyAuditEntry::emit`]
+/// runs only after the store accepted the mutation; refusals are owned
+/// by the key-plane refusal surface (WOR-2567), not this event.
+fn key_lifecycle_event(
+    entry: &KeyAuditEntry,
+    event_type: crate::events::EventType,
+) -> crate::events::ProxyEvent {
+    let mut data = serde_json::json!({
+        "op": entry.op,
+        "resource": entry.resource,
+        "id": entry.id,
+        "outcome": "applied",
+    });
+    if let Some(actor) = &entry.actor {
+        data["actor"] = serde_json::json!(actor);
+    }
+    let status_of = |snapshot: Option<&serde_json::Value>| {
+        snapshot
+            .and_then(|snapshot| snapshot.get("status"))
+            .and_then(|status| status.as_str())
+            .map(str::to_owned)
+    };
+    if let Some(prior) = status_of(entry.before.as_ref()) {
+        data["prior_status"] = serde_json::json!(prior);
+    }
+    if let Some(new) = status_of(entry.after.as_ref()) {
+        data["new_status"] = serde_json::json!(new);
+    }
+    crate::events::ProxyEvent::new(
+        event_type,
+        String::new(),
+        entry.tenant_id.clone().unwrap_or_default(),
+        data,
+    )
 }
 
 #[cfg(test)]
@@ -1573,5 +1690,187 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- WOR-2571: key-lifecycle events on the `events:` egress ---
+
+    #[test]
+    fn key_lifecycle_ops_map_to_their_event_types_and_nothing_else_maps() {
+        use crate::events::EventType;
+        assert_eq!(
+            key_lifecycle_event_type("create"),
+            Some(EventType::KeyMinted)
+        );
+        assert_eq!(
+            key_lifecycle_event_type("revoke"),
+            Some(EventType::KeyRevoked)
+        );
+        assert_eq!(
+            key_lifecycle_event_type("rotate"),
+            Some(EventType::KeyRotated)
+        );
+        assert_eq!(
+            key_lifecycle_event_type("block"),
+            Some(EventType::KeyBlocked)
+        );
+        // The mutations the typed feed does not carry: they stay on the
+        // `key_audit` channel, which records every operation.
+        assert_eq!(key_lifecycle_event_type("update"), None);
+        assert_eq!(key_lifecycle_event_type("delete"), None);
+        assert_eq!(key_lifecycle_event_type("unblock"), None);
+        // The mapping is a closed match, not a prefix or substring test.
+        assert_eq!(key_lifecycle_event_type("created"), None);
+        assert_eq!(key_lifecycle_event_type(""), None);
+    }
+
+    #[test]
+    fn key_lifecycle_payload_carries_the_allowlisted_fields() {
+        let entry = KeyAuditEntry::new("block", "key", "sbp_payload_key")
+            .with_actor("ops@example.com")
+            .with_tenant_id("acme")
+            .with_diff(
+                Some(serde_json::json!({ "status": "active" })),
+                Some(serde_json::json!({ "status": "blocked" })),
+            );
+        let event = key_lifecycle_event(&entry, crate::events::EventType::KeyBlocked);
+
+        assert_eq!(event.event_type, crate::events::EventType::KeyBlocked);
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.hostname, "");
+        assert_eq!(event.data["op"], "block");
+        assert_eq!(event.data["resource"], "key");
+        assert_eq!(event.data["id"], "sbp_payload_key");
+        assert_eq!(event.data["actor"], "ops@example.com");
+        assert_eq!(event.data["outcome"], "applied");
+        assert_eq!(event.data["prior_status"], "active");
+        assert_eq!(event.data["new_status"], "blocked");
+    }
+
+    #[test]
+    fn key_lifecycle_payload_omits_what_it_does_not_know() {
+        let entry = KeyAuditEntry::new("create", "key", "sbp_sparse_key");
+        let event = key_lifecycle_event(&entry, crate::events::EventType::KeyMinted);
+
+        assert_eq!(event.tenant_id, "");
+        let object = event.data.as_object().expect("payload is an object");
+        assert!(!object.contains_key("actor"), "{:?}", event.data);
+        assert!(!object.contains_key("prior_status"), "{:?}", event.data);
+        assert!(!object.contains_key("new_status"), "{:?}", event.data);
+    }
+
+    /// The payload is an allowlist, not a pass-through: a diff value
+    /// beyond the closed `status` label never crosses, even when a
+    /// (hypothetical, adversarial) caller plants one. This is the SIEM
+    /// half of `key_chain_snapshot_values_are_fingerprinted_not_carried`
+    /// above: the chain fingerprints the diff, the typed event drops it.
+    #[test]
+    fn key_lifecycle_payload_never_carries_diff_values_beyond_status() {
+        let planted = "sk-plaintext-material-that-must-not-cross";
+        let entry = KeyAuditEntry::new("revoke", "credential", "cred-posture-test").with_diff(
+            Some(serde_json::json!({ "status": "active", "upstream_secret": planted })),
+            Some(serde_json::json!({ "status": "revoked", "upstream_secret": planted })),
+        );
+        let event = key_lifecycle_event(&entry, crate::events::EventType::KeyRevoked);
+
+        let line = serde_json::to_string(&event).expect("event serializes");
+        assert!(
+            !line.contains(planted),
+            "a diff value crossed onto the SIEM payload: {line}"
+        );
+        assert!(
+            !line.contains("upstream_secret"),
+            "a diff field name crossed onto the SIEM payload: {line}"
+        );
+        assert_eq!(event.data["prior_status"], "active");
+        assert_eq!(event.data["new_status"], "revoked");
+    }
+
+    /// Poll `path` until `predicate` matches a full NDJSON line or the
+    /// deadline passes. The file egress flushes per drained batch on its
+    /// own thread, so a plain read races the worker.
+    fn poll_events_file(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(line) = content.lines().find(|line| predicate(line)) {
+                    return Some(line.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// WOR-2571, the seam itself, red-first: before the bridge in
+    /// [`KeyAuditEntry::emit`], this test timed out polling for
+    /// `key_minted` because every lifecycle mutation stopped at the
+    /// tracing target, the ring, and the chain, and nothing reached the
+    /// `events:` egress. Installs this process's one egress (one test
+    /// per process under nextest, the same shape as the
+    /// `action_dispatch` governance-evidence tests) with a mask that
+    /// deliberately excludes `key_blocked`, so the same run also proves
+    /// the mask filters the new kinds: the blocked mutation lands
+    /// before the rotate, and its event must never appear even after
+    /// the rotate's has.
+    #[test]
+    fn key_audit_emit_reaches_the_event_egress_and_honors_the_mask() {
+        use crate::events::EventType;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("key-lifecycle-events.ndjson");
+        let egress = crate::event_sink::EventEgress::start(
+            crate::event_sink::EventSinkTarget::File { path: path.clone() },
+            crate::event_sink::EventTypeMask::from_types(&[
+                EventType::KeyMinted,
+                EventType::KeyRevoked,
+                EventType::KeyRotated,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        crate::event_sink::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        KeyAuditEntry::new("create", "key", "sbp_seam_key")
+            .with_actor("ops@example.com")
+            .with_tenant_id("acme")
+            .emit();
+        KeyAuditEntry::new("block", "key", "sbp_seam_key")
+            .with_tenant_id("acme")
+            .with_diff(
+                Some(serde_json::json!({ "status": "active" })),
+                Some(serde_json::json!({ "status": "blocked" })),
+            )
+            .emit();
+        KeyAuditEntry::new("rotate", "key", "sbp_seam_key")
+            .with_tenant_id("acme")
+            .emit();
+
+        // The rotate emitted after the block, so once it is on disk the
+        // masked-out block had every chance to arrive and did not.
+        let rotated = poll_events_file(&path, |line| line.contains("key_rotated"))
+            .expect("the rotate mutation must reach the egress");
+        assert!(rotated.contains("sbp_seam_key"), "{rotated}");
+
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+        let minted = content
+            .lines()
+            .find(|line| line.contains("key_minted"))
+            .expect("the create mutation must reach the egress");
+        let minted: serde_json::Value = serde_json::from_str(minted).expect("minted line parses");
+        assert_eq!(minted["event_type"], "key_minted");
+        assert_eq!(minted["tenant_id"], "acme");
+        assert_eq!(minted["data"]["op"], "create");
+        assert_eq!(minted["data"]["resource"], "key");
+        assert_eq!(minted["data"]["id"], "sbp_seam_key");
+        assert_eq!(minted["data"]["actor"], "ops@example.com");
+        assert_eq!(minted["data"]["outcome"], "applied");
+        assert!(
+            !content.contains("key_blocked"),
+            "a masked-out kind was delivered anyway: {content}"
+        );
     }
 }

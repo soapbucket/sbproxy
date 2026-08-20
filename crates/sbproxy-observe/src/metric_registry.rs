@@ -1434,6 +1434,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_audit_write_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_audit_write_outcome"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["channel"],
+        description: "Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_auth_results_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_auth"),
@@ -1797,6 +1808,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_credential_resolution_duration_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_credential_resolution"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["cache", "outcome"],
+        description: "Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_egress_refused_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_egress_refused"),
@@ -2051,6 +2073,28 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["result"],
         description: "JWKS refreshes triggered by tokens whose kid was absent from the local cache.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_key_lookup_cache_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_lookup_cache"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["kind", "outcome"],
+        description: "Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error).",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_key_operations_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_operation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["operation", "outcome"],
+        description: "Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error).",
         dead_reason: None,
     },
     MetricCapability {
@@ -4146,7 +4190,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-18*\n\n\
+         *Last modified: 2026-08-20*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

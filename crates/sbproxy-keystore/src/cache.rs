@@ -89,6 +89,20 @@ struct Entry<V> {
     stamp: u64,
 }
 
+/// Which layer answered one [`TtlCache`] lookup, reported to the
+/// [`LookupObserver`] with the record kind (`"key"` or `"credential"`)
+/// as the first argument (WOR-2572).
+///
+/// The outcome vocabulary, a closed set the observer can rely on:
+/// `"hit"` (fresh L1 record), `"negative_hit"` (fresh L1 known-absent),
+/// `"tier_hit"` (the L2 tier answered), `"miss"` (the store was
+/// consulted and answered, present or absent), `"error"` (the store was
+/// consulted and could not answer). A `negative_hit` is a hit in cache
+/// terms - it saved a store round trip - but it is not folded into
+/// `hit`, because "we know it is absent" and "we have it" are different
+/// answers and a stampede of unknown keys should be visible as itself.
+pub type LookupObserver = fn(kind: &'static str, outcome: &'static str);
+
 /// A TTL cache wrapping a [`KeyStore`] that never swallows a store error.
 pub struct TtlCache {
     store: Arc<dyn KeyStore>,
@@ -97,6 +111,12 @@ pub struct TtlCache {
     creds: Mutex<HashMap<String, Entry<CredentialRecord>>>,
     cfg: TtlCacheConfig,
     stamp: AtomicU64,
+    /// Per-instance lookup observer (WOR-2572). A plain `fn` pointer and
+    /// not a boxed closure, because the one production install site
+    /// (`key_plane::build_cache`) feeds a Prometheus counter and this
+    /// crate deliberately depends on no metrics stack; `None` (the
+    /// default) costs one branch per lookup and nothing else.
+    lookup_observer: Option<LookupObserver>,
 }
 
 impl TtlCache {
@@ -109,6 +129,7 @@ impl TtlCache {
             creds: Mutex::new(HashMap::new()),
             cfg,
             stamp: AtomicU64::new(0),
+            lookup_observer: None,
         }
     }
 
@@ -116,6 +137,21 @@ impl TtlCache {
     pub fn with_tier(mut self, tier: Arc<dyn CacheTier>) -> Self {
         self.tier = Some(tier);
         self
+    }
+
+    /// Attach a lookup observer, called once per [`Self::resolve_key`] /
+    /// [`Self::resolve_credential`] with the record kind and which layer
+    /// answered. See [`LookupObserver`] for the outcome vocabulary.
+    pub fn with_lookup_observer(mut self, observer: LookupObserver) -> Self {
+        self.lookup_observer = Some(observer);
+        self
+    }
+
+    /// Report one lookup outcome to the observer, if one is attached.
+    fn observe_lookup(&self, kind: &'static str, outcome: &'static str) {
+        if let Some(observer) = self.lookup_observer {
+            observer(kind, outcome);
+        }
     }
 
     /// The wrapped store. Admin mutations go through the store, then call
@@ -136,17 +172,28 @@ impl TtlCache {
         let now = Instant::now();
         // L1.
         if let Some(hit) = self.peek_key(key_id, now) {
+            self.observe_lookup("key", if hit.is_some() { "hit" } else { "negative_hit" });
             return Ok(hit);
         }
         // L2.
         if let Some(tier) = &self.tier {
             if let Some(rec) = tier.get_key(key_id).await {
+                self.observe_lookup("key", "tier_hit");
                 self.insert_key(key_id, Some(rec.clone()), now);
                 return Ok(Some(rec));
             }
         }
         // Store.
-        let loaded = self.store.get_key(key_id).await?;
+        let loaded = match self.store.get_key(key_id).await {
+            Ok(loaded) => {
+                self.observe_lookup("key", "miss");
+                loaded
+            }
+            Err(error) => {
+                self.observe_lookup("key", "error");
+                return Err(error);
+            }
+        };
         self.insert_key(key_id, loaded.clone(), now);
         if let (Some(tier), Some(rec)) = (&self.tier, loaded.as_ref()) {
             tier.put_key(rec, self.cfg.ttl).await;
@@ -158,15 +205,29 @@ impl TtlCache {
     pub async fn resolve_credential(&self, id: &str) -> Result<Option<CredentialRecord>> {
         let now = Instant::now();
         if let Some(hit) = self.peek_credential(id, now) {
+            self.observe_lookup(
+                "credential",
+                if hit.is_some() { "hit" } else { "negative_hit" },
+            );
             return Ok(hit);
         }
         if let Some(tier) = &self.tier {
             if let Some(rec) = tier.get_credential(id).await {
+                self.observe_lookup("credential", "tier_hit");
                 self.insert_credential(id, Some(rec.clone()), now);
                 return Ok(Some(rec));
             }
         }
-        let loaded = self.store.get_credential(id).await?;
+        let loaded = match self.store.get_credential(id).await {
+            Ok(loaded) => {
+                self.observe_lookup("credential", "miss");
+                loaded
+            }
+            Err(error) => {
+                self.observe_lookup("credential", "error");
+                return Err(error);
+            }
+        };
         self.insert_credential(id, loaded.clone(), now);
         if let (Some(tier), Some(rec)) = (&self.tier, loaded.as_ref()) {
             // Never publish a raw secret to the second tier. Every tier is a
@@ -587,5 +648,72 @@ mod tests {
             !encoded.contains("sk-super-secret"),
             "the raw secret must not appear anywhere in what reached the tier: {encoded}"
         );
+    }
+
+    /// WOR-2572: the lookup observer sees which layer answered, with the
+    /// full outcome vocabulary, in the order the lookups happened. The
+    /// observer is a per-instance `fn` pointer, so this test accumulates
+    /// into its own static and no other test's cache can write here.
+    #[tokio::test]
+    async fn lookups_report_hit_negative_tier_miss_and_error_to_the_observer() {
+        static EVENTS: Mutex<Vec<(&'static str, &'static str)>> = Mutex::new(Vec::new());
+        fn observe(kind: &'static str, outcome: &'static str) {
+            EVENTS.lock().push((kind, outcome));
+        }
+        fn drain() -> Vec<(&'static str, &'static str)> {
+            std::mem::take(&mut *EVENTS.lock())
+        }
+
+        let store = Arc::new(CountingStore::new());
+        store
+            .put_key(KeyRecord::new("k1", "h", ts()))
+            .await
+            .unwrap();
+        let cache =
+            TtlCache::new(store.clone(), TtlCacheConfig::default()).with_lookup_observer(observe);
+
+        // Store answers (present), then L1 answers.
+        cache.resolve_key("k1").await.unwrap();
+        cache.resolve_key("k1").await.unwrap();
+        assert_eq!(drain(), vec![("key", "miss"), ("key", "hit")]);
+
+        // Store answers (absent), then the negative cache answers. A
+        // negative hit is reported as itself, never folded into `hit`.
+        cache.resolve_key("missing").await.unwrap();
+        cache.resolve_key("missing").await.unwrap();
+        assert_eq!(drain(), vec![("key", "miss"), ("key", "negative_hit")]);
+
+        // The credential path reports under its own kind.
+        cache.resolve_credential("absent-cred").await.unwrap();
+        assert_eq!(drain(), vec![("credential", "miss")]);
+
+        // A tier answer is a tier_hit, not a miss: the store was never
+        // consulted.
+        struct AnsweringTier;
+        #[async_trait]
+        impl CacheTier for AnsweringTier {
+            async fn get_key(&self, key_id: &str) -> Option<KeyRecord> {
+                Some(KeyRecord::new(key_id, "h", ts()))
+            }
+            async fn put_key(&self, _: &KeyRecord, _: Duration) {}
+            async fn get_credential(&self, _: &str) -> Option<CredentialRecord> {
+                None
+            }
+            async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
+            async fn invalidate(&self, _: &str) {}
+            async fn invalidate_all(&self) {}
+        }
+        let tiered = TtlCache::new(store, TtlCacheConfig::default())
+            .with_tier(Arc::new(AnsweringTier))
+            .with_lookup_observer(observe);
+        tiered.resolve_key("k2").await.unwrap();
+        assert_eq!(drain(), vec![("key", "tier_hit")]);
+
+        // An unreachable store is an error, not a miss, on both paths.
+        let broken = TtlCache::new(Arc::new(BrokenStore), TtlCacheConfig::default())
+            .with_lookup_observer(observe);
+        broken.resolve_key("k3").await.unwrap_err();
+        broken.resolve_credential("c3").await.unwrap_err();
+        assert_eq!(drain(), vec![("key", "error"), ("credential", "error")]);
     }
 }

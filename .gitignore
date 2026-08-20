@@ -8,6 +8,13 @@ target/
 # is tracked; standalone helper crates lock their own deps locally).
 fuzz/Cargo.lock
 
+# Crash reproducers libfuzzer writes when a fuzz target finds one. They
+# are the useful output of a failed run and belong in a bug report, not
+# in git: check.sh's working-tree guard would otherwise fail every run
+# after the first crash until somebody deleted them by hand.
+# scripts/README.md covers running the harnesses.
+fuzz/artifacts/
+
 # Generated test material under examples/ (cert generation scripts emit
 # real keys into these dirs; we keep the scripts in git but never the
 # keys themselves).

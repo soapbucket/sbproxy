@@ -2095,6 +2095,148 @@ pub fn record_key_store_reachable(posture: &'static str) {
     set_key_store_unavailable(posture, 0);
 }
 
+/// Count one admin key-lifecycle operation on
+/// `sbproxy_key_operations_total{operation, outcome}` (WOR-2572).
+///
+/// `operation` is the closed admin-route set: `mint`, `update`, `delete`,
+/// `revoke`, `block`, `unblock`, `rotate`. `outcome` is `ok`, `refused`,
+/// or `error`, derived at the dispatch seam from the status class the
+/// handler actually returned (2xx, 4xx, 5xx), never from a default. The
+/// three values are deliberately separate: a revision conflict the
+/// operator can retry and a store that is down are different facts, and
+/// folding them into one value produces a rate panel that cannot tell an
+/// outage from a busy console.
+pub fn record_key_operation(operation: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_operations_total",
+            "Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error)",
+            &["operation", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[operation, outcome]).inc();
+    }
+}
+
+/// Observe one bound-credential resolution on
+/// `sbproxy_credential_resolution_duration_seconds{cache, outcome}`
+/// (WOR-2572).
+///
+/// `cache` says which layer answered: `hit` (the per-generation
+/// resolved-secret cache, fresh), `stale` (a known-good value served
+/// inside the `proxy.secrets.rotation` grace window after re-resolution
+/// failed), or `miss` (the full keystore/vault path ran). `outcome` is
+/// `ok`, `refused` (absent, revoked/blocked, or cross-tenant), or
+/// `error` (the secret backend could not answer), taken from the one
+/// `Result` every caller sees. The cache-hit ratio derives from the
+/// `_count` series; `stale` is deliberately not folded into `hit`
+/// because a stale serve is a backend failure wearing a grace period.
+pub fn record_credential_resolution(
+    cache: &'static str,
+    outcome: &'static str,
+    duration_secs: f64,
+) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<Option<HistogramVec>> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_credential_resolution_duration_seconds",
+            "Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome",
+            &["cache", "outcome"],
+            crate::exemplars::STANDARD_LATENCY_BUCKETS.to_vec(),
+        )
+        .ok()
+    });
+    if let Some(hist) = hist {
+        hist.with_label_values(&[cache, outcome])
+            .observe(duration_secs);
+    }
+}
+
+/// Count one keystore TTL-cache lookup on
+/// `sbproxy_key_lookup_cache_total{kind, outcome}` (WOR-2572).
+///
+/// Driven through the cache's lookup observer
+/// (`sbproxy_keystore::cache::TtlCache::with_lookup_observer`), installed
+/// where the production cache is built (`key_plane::build_cache`), because
+/// the keystore crate deliberately does not depend on this one. `kind` is
+/// `key` or `credential`; `outcome` is `hit` (fresh L1 record),
+/// `negative_hit` (fresh L1 known-absent), `tier_hit` (the L2 tier
+/// answered), `miss` (the store was consulted and answered), or `error`
+/// (the store was consulted and could not answer). Hit ratio:
+/// `(hit + negative_hit + tier_hit) / total`.
+pub fn record_key_lookup_cache(kind: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_lookup_cache_total",
+            "Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error)",
+            &["kind", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[kind, outcome]).inc();
+    }
+}
+
+/// Fold one audit emission's real write result into
+/// `sbproxy_audit_write_failures_total{channel}` (WOR-2572).
+///
+/// Modeled on Vault's audit-log failure counter, whose docs say a healthy
+/// system reads exactly zero, so the counter touches the channel's series
+/// on every emission (exporting an explicit 0 an `increase()` alert can
+/// baseline against) and increments only when `ok` is false. `ok` comes
+/// from the emit path's actual result - the chain append's returned
+/// `bool` or the serialize failure - never from a default, which is the
+/// difference between this counter and the `RB-AUDIT-WRITE-FAILURE`
+/// landmine WOR-2572 exists to avoid: an outcome label nothing can set to
+/// a failure value is an alert that structurally cannot fire. `channel`
+/// names the config key that turned the trail on: `key_path` (the key and
+/// credential mutation trail) or `admin_path` (the admin-console action
+/// trail) today, `key_access_path` reserved for the read-audit channel
+/// (WOR-2570). The family is named for the signal rather than for the key
+/// plane because `admin_path` is a console channel, not a key-management
+/// one.
+///
+/// Two things can set `ok` to false, and they have different
+/// reachability. A deployment with no chain configured cannot reach the
+/// chain half at all: [`crate::audit::KeyAuditEntry::emit`] substitutes `true`
+/// for the append result when no chain is installed. The serialize half
+/// is independent of that and does reach this call site on its own, so it
+/// is unreachable today only because every field of a `KeyAuditEntry` is
+/// a `String`, an `Option<String>`, or a `serde_json::Value`, none of
+/// which can fail to encode. A field with a hand-written `Serialize`
+/// would change that, which is why the reason is written down rather than
+/// left as "no chain, no failures".
+pub fn record_audit_write_outcome(channel: &'static str, ok: bool) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_audit_write_failures_total",
+            "Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0",
+            &["channel"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let series = counter.with_label_values(&[channel]);
+        if !ok {
+            series.inc();
+        }
+    }
+}
+
 /// Shared-budget reads/writes that could not reach the Redis/KV store and
 /// fell open to the per-instance tracker. Fired at the exact branch where
 /// the store error is still distinguishable from "no shared store
