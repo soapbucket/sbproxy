@@ -3263,7 +3263,14 @@ pub(super) async fn request_filter(
             // in a trace; a local HMAC check costs nothing and shows as
             // nothing.
             let auth_span = sbproxy_observe::telemetry::intake_authenticate_span(&auth_type);
-            let authenticated = check_auth_with_tls_outcome(
+            // WOR-2517: the decided-aware entry point. For a scalar
+            // provider `decided_auth_type == auth_type`; for an
+            // `any_of` composition it names the winning slot's
+            // provider on success (exhaustion keeps `any_of`), so the
+            // decision record, audit event, and per-provider follow-up
+            // checks below all bind to the provider that actually
+            // decided the request rather than to the composite label.
+            let authenticated = check_auth_decided(
                 auth,
                 req_headers,
                 query,
@@ -3274,7 +3281,8 @@ pub(super) async fn request_filter(
                 resolved_agent_id.as_deref(),
             )
             .instrument(auth_span);
-            let (auth_result, principal_opt, trust_outcome) = authenticated.await;
+            let (auth_result, principal_opt, trust_outcome, decided_auth_type) =
+                authenticated.await;
             #[cfg(feature = "agent-class")]
             let bot_auth_keyid = principal_opt
                 .as_ref()
@@ -3307,7 +3315,12 @@ pub(super) async fn request_filter(
                 auth_result,
                 AuthResult::Allow { .. } | AuthResult::RateLimited(_)
             );
-            if auth_succeeded && matches!(auth, Auth::BotAuth(_)) {
+            // WOR-2517: keyed on the deciding provider's type rather
+            // than the configured `Auth` variant so a `bot_auth` slot
+            // that wins inside an `any_of` composition still gets its
+            // deferred content-digest check. `matches!(auth,
+            // Auth::BotAuth(_))` would skip it there and fail open.
+            if auth_succeeded && decided_auth_type == "bot_auth" {
                 #[cfg(feature = "agent-class")]
                 if let Some(keyid) = bot_auth_keyid.as_deref() {
                     if let Some(resolver) = reload::agent_class_resolver() {
@@ -3342,7 +3355,7 @@ pub(super) async fn request_filter(
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
-                        &auth_type,
+                        &decided_auth_type,
                         true,
                         "credential accepted",
                     );
@@ -3352,7 +3365,7 @@ pub(super) async fn request_filter(
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
-                        &auth_type,
+                        &decided_auth_type,
                         true,
                         "admitted anonymously while the credential is rate limited",
                     );
@@ -3380,13 +3393,13 @@ pub(super) async fn request_filter(
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
-                        &auth_type,
+                        &decided_auth_type,
                         false,
                         "credential rejected",
                     );
                     emit_auth_audit(
                         "auth_denied",
-                        &auth_type,
+                        &decided_auth_type,
                         status,
                         &origin_label,
                         ctx,
@@ -3408,13 +3421,13 @@ pub(super) async fn request_filter(
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
-                        &auth_type,
+                        &decided_auth_type,
                         false,
                         "credential rejected; challenge headers returned",
                     );
                     emit_auth_audit(
                         "auth_denied_with_headers",
-                        &auth_type,
+                        &decided_auth_type,
                         status,
                         &origin_label,
                         ctx,
@@ -3446,13 +3459,13 @@ pub(super) async fn request_filter(
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
-                        &auth_type,
+                        &decided_auth_type,
                         false,
                         "digest challenge issued; no valid credential yet",
                     );
                     emit_auth_audit(
                         "auth_digest_challenge",
-                        &auth_type,
+                        &decided_auth_type,
                         401,
                         &origin_label,
                         ctx,

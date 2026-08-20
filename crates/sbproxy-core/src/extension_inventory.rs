@@ -386,11 +386,28 @@ fn active_extension_hooks(
                 );
             }
         }
-        // An origin has exactly one action and one auth provider, so
-        // both are position 0 by construction rather than by counting.
+        // An origin has exactly one action, so it is position 0 by
+        // construction. Auth is one provider at position 0 in the
+        // scalar form; a list-form composition (WOR-2517) records each
+        // entry at its declared slot.
         record_configured_action(&origin.action_config, registry, 0, &mut active);
         if let Some(auth) = &origin.auth_config {
-            record_configured_hook(auth, ExtensionHookKind::Auth, false, 0, &mut active);
+            match auth.as_array() {
+                Some(entries) => {
+                    for (position, entry) in entries.iter().enumerate() {
+                        record_configured_hook(
+                            entry,
+                            ExtensionHookKind::Auth,
+                            false,
+                            position as u32,
+                            &mut active,
+                        );
+                    }
+                }
+                None => {
+                    record_configured_hook(auth, ExtensionHookKind::Auth, false, 0, &mut active)
+                }
+            }
         }
         for (position, policy) in origin.policy_configs.iter().enumerate() {
             let dynamic =

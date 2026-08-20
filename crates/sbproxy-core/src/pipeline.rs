@@ -2278,17 +2278,25 @@ impl CompiledPipeline {
             // Compile auth (optional per origin). Route through the
             // registry-aware compile only when the `type:` names a loaded
             // bundle auth hook, so built-ins and linked plugins keep their
-            // exact existing path (WOR-2426).
+            // exact existing path (WOR-2426). A list-form block (WOR-2517)
+            // takes the registry-aware path when any entry names a bundle
+            // hook, for the same reason a scalar one does.
             let auth = match &origin.auth_config {
-                Some(cfg) => Some(
-                    if configured_type(cfg)
-                        .is_some_and(|name| extension_registry.auth(name).is_some())
-                    {
+                Some(cfg) => {
+                    let names_bundle_hook = |value: &serde_json::Value| {
+                        configured_type(value)
+                            .is_some_and(|name| extension_registry.auth(name).is_some())
+                    };
+                    let uses_bundle_hook = match cfg.as_array() {
+                        Some(entries) => entries.iter().any(names_bundle_hook),
+                        None => names_bundle_hook(cfg),
+                    };
+                    Some(if uses_bundle_hook {
                         compile_auth_with_registry(cfg, extension_registry.as_ref())?
                     } else {
                         compile_auth(cfg)?
-                    },
-                ),
+                    })
+                }
                 None => None,
             };
             auths.push(auth);

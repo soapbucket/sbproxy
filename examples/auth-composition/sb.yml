@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Auth composition: accept either of two credentials on one origin.
+#
+# The `authentication:` list tries providers in declared order. A request
+# that presents a valid API key or a valid bearer token is forwarded; a
+# request that satisfies neither is rejected with 401 before the upstream
+# is contacted.
+#
+# Run:
+#   make run CONFIG=examples/auth-composition/sb.yml
+#
+# Test:
+#   # 200 - the legacy API key still works
+#   curl -i -H 'Host: api.local' -H 'X-Api-Key: legacy-key-1' \
+#        http://127.0.0.1:8080/get
+#
+#   # 200 - the new bearer token works on the same origin
+#   curl -i -H 'Host: api.local' -H 'Authorization: Bearer new-token-1' \
+#        http://127.0.0.1:8080/get
+#
+#   # 401 - neither credential
+#   curl -i -H 'Host: api.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Providers run top to bottom; the first success wins and names
+    # itself in the audit and decision records. Put the provider most
+    # callers still use first.
+    authentication:
+      - type: api_key
+        header_name: X-Api-Key
+        api_keys:
+          - legacy-key-1
+      - type: bearer
+        tokens:
+          - new-token-1
