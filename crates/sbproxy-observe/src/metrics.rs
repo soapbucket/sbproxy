@@ -465,6 +465,12 @@ pub struct ProxyMetrics {
     /// by caller credential mode and its recognized provider.
     pub inbound_key_requests: IntCounterVec,
 
+    /// Counter `sbproxy_deprecated_requests_total` of requests that
+    /// resolved to a route carrying a `deprecation:` block or a
+    /// spec-deprecated OpenAPI operation, partitioned by origin, rule,
+    /// and whether the sunset instant had already passed (WOR-2565).
+    pub deprecated_requests_total: IntCounterVec,
+
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
     pub per_origin_requests_total: CounterVec,
@@ -755,6 +761,21 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // WOR-2565: deprecated-route usage. The whole point of
+        // announcing a deprecation is finding the remaining callers,
+        // so the counter carries which route is deprecated (`rule` is
+        // the forward rule's id or index, the OpenAPI path template
+        // for spec-driven matches, or empty for a whole-origin block)
+        // and whether the hit landed after the announced sunset.
+        let deprecated_requests_total = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_deprecated_requests_total",
+                "Requests that resolved to a deprecated route",
+            ),
+            &["origin", "rule", "past_sunset"],
+        )
+        .unwrap();
+
         // --- Per-origin metrics (Sprint 1A) ---
 
         let per_origin_requests_total = CounterVec::new(
@@ -1038,6 +1059,9 @@ impl ProxyMetrics {
             .register(Box::new(inbound_key_requests.clone()))
             .unwrap();
         registry
+            .register(Box::new(deprecated_requests_total.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -1106,6 +1130,7 @@ impl ProxyMetrics {
             agent_detect_inference_seconds,
             trust_tier_requests,
             inbound_key_requests,
+            deprecated_requests_total,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -1395,6 +1420,29 @@ pub fn record_request_with_labels(
             .with_label_values(&[origin_san.as_str(), "out"])
             .inc_by(bytes_out as f64);
     }
+}
+
+/// Record one request that resolved to a deprecated route (WOR-2565).
+///
+/// `rule` names which deprecation announcement matched: the forward
+/// rule's `origin.id` (or its index when no id is configured), the
+/// OpenAPI path template for a spec-driven match, or the empty-string
+/// sentinel for a whole-origin `deprecation:` block. `past_sunset`
+/// says whether the request landed after the announced sunset instant;
+/// it is always `false` when no sunset is configured. Both free-form
+/// labels run through [`sanitize_label_budget`], though in practice
+/// their cardinality is bounded by the authored config and spec.
+pub fn record_deprecated_request(origin: &str, rule: &str, past_sunset: bool) {
+    let origin_san = sanitize_label_budget("sbproxy_deprecated_requests_total", "origin", origin);
+    let rule_san = sanitize_label_budget("sbproxy_deprecated_requests_total", "rule", rule);
+    metrics()
+        .deprecated_requests_total
+        .with_label_values(&[
+            origin_san.as_str(),
+            rule_san.as_str(),
+            if past_sunset { "true" } else { "false" },
+        ])
+        .inc();
 }
 
 /// Record an auth check result for an origin.

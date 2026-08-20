@@ -108,6 +108,13 @@ pub struct CompiledOrigin {
     /// structured `Proxy-Status` header on every non-2xx response.
     /// See [`ProxyStatusConfig`].
     pub proxy_status: Option<ProxyStatusConfig>,
+    /// RFC 9745 / RFC 8594 deprecation announcement covering every
+    /// route this origin serves, compiled (instants parsed, header
+    /// values precomputed) at config load. A forward rule's own block
+    /// overrides this one for the requests it matches; the per-rule
+    /// compiled form lives on the runtime's compiled forward rules.
+    /// See [`crate::types::CompiledDeprecation`].
+    pub deprecation: Option<crate::types::CompiledDeprecation>,
     /// RFC 9421 HTTP Message Signatures verification. When `Some` with
     /// `verify = true`, the request filter enforces signature verification
     /// on every inbound request to this origin ahead of any downstream auth

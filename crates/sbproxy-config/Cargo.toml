@@ -58,6 +58,10 @@ zstd = "0.13"
 # workspace dependency (used for request-id generation elsewhere); this
 # just extends its use to this crate.
 uuid = { workspace = true }
+# WOR-2565: parse `deprecation:` block instants (RFC 3339 / YYYY-MM-DD)
+# and format the RFC 8594 `Sunset` HTTP-date at config compile. Already
+# a workspace dependency; dual MIT/Apache-2.0, so NOTICE is unaffected.
+chrono = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

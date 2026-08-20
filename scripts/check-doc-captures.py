@@ -107,6 +107,13 @@ MANIFEST: dict[str, dict] = {
         # re-ordered replay would find the raise already lapsed.
         "sections": [{"stack": "temp_budget_override", "fresh_each": False}],
     },
+    "examples/api-deprecation/README.md": {
+        # One walkthrough, one stack, no fixture: every origin in the
+        # config is a static action, so the proxy alone is the whole
+        # stack. Shared across the page because the metrics capture
+        # reads the counters the earlier per-route captures produced.
+        "sections": [{"stack": "api_deprecation", "fresh_each": False}],
+    },
     "docs/payment-settlement.md": {
         # This page is two halves with opposite needs, which is why
         # freshness is per section rather than per document.
@@ -442,10 +449,29 @@ def start_temp_budget_override_stack(binary: Path, logs: Path) -> Stack | None:
     return stack
 
 
+def start_api_deprecation_stack(binary: Path, logs: Path) -> Stack | None:
+    """Just the proxy: the example's origins are all static actions."""
+    stack = Stack()
+    proxy_log = (logs / "api-deprecation-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/api-deprecation/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+        stack.stop()
+        return None
+    return stack
+
+
 STACK_STARTERS = {
     "settlement": start_settlement_stack,
     "usage_bridge": start_usage_bridge_stack,
     "temp_budget_override": start_temp_budget_override_stack,
+    "api_deprecation": start_api_deprecation_stack,
 }
 
 

@@ -15,8 +15,10 @@
 //! attacker-controlled spec cannot become an SSRF primitive.
 
 use regex::Regex;
+use sbproxy_config::{compile_deprecation, CompiledDeprecation, DeprecationConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Action taken when a request fails validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,6 +49,10 @@ struct Operation {
     /// no schema matching its `Content-Type` is a failure, not an
     /// out-of-scope pass-through (WOR-1151).
     required_body: bool,
+    /// The spec's `deprecated: true` flag on this operation
+    /// (OpenAPI 3.1 Operation Object). Read only when the policy's
+    /// `deprecation_headers:` sub-block is configured (WOR-2565).
+    deprecated: bool,
 }
 
 /// Compiled OpenAPI validation policy.
@@ -61,6 +67,13 @@ pub struct OpenApiValidationPolicy {
     pub error_body: Option<String>,
     /// `Content-Type` for the rejection body.
     pub error_content_type: String,
+    /// WOR-2565: compiled `deprecation_headers:` sub-block. `None`
+    /// (the default) means spec-deprecated operations get no headers.
+    /// `Some` makes every operation the loaded spec marks
+    /// `deprecated: true` announce these values (RFC 9745
+    /// `Deprecation`, RFC 8594 `Sunset`, the Link relations); the
+    /// spec flag itself carries no date, so this block supplies them.
+    pub deprecation: Option<Arc<CompiledDeprecation>>,
 }
 
 impl std::fmt::Debug for OpenApiValidationPolicy {
@@ -107,6 +120,11 @@ impl OpenApiValidationPolicy {
             error_body: Option<String>,
             #[serde(default = "default_error_content_type")]
             error_content_type: String,
+            /// WOR-2565: opt-in header emission for operations the
+            /// loaded spec marks `deprecated: true`. Same shape as
+            /// the route-level `deprecation:` block; absent means off.
+            #[serde(default)]
+            deprecation_headers: Option<DeprecationConfig>,
         }
         fn default_status() -> u16 {
             400
@@ -138,6 +156,24 @@ impl OpenApiValidationPolicy {
             Some(other) => anyhow::bail!("unknown mode `{}`; want `enforce` or `log`", other),
         };
 
+        // WOR-2565: compile the deprecation defaults once so the
+        // per-request path clones an Arc instead of re-parsing dates.
+        // An unparseable date or a sunset before the deprecation
+        // instant refuses the config here, exactly like the
+        // route-level block.
+        let deprecation = raw
+            .deprecation_headers
+            .as_ref()
+            .map(|block| {
+                sbproxy_config::warn_dateless_deprecated(
+                    block,
+                    "openapi_validation deprecation_headers",
+                );
+                compile_deprecation(block, "openapi_validation deprecation_headers")
+            })
+            .transpose()?
+            .map(Arc::new);
+
         let operations = compile_operations(&spec_value)?;
         Ok(Self {
             operations,
@@ -145,7 +181,28 @@ impl OpenApiValidationPolicy {
             status: raw.status,
             error_body: raw.error_body,
             error_content_type: raw.error_content_type,
+            deprecation,
         })
+    }
+
+    /// WOR-2565: when the `deprecation_headers:` sub-block is
+    /// configured and the loaded spec marks the operation matching
+    /// `method` + `path` as `deprecated: true`, return the operation's
+    /// path template (the metric `rule` label) and the compiled header
+    /// set. `None` when the sub-block is absent (the default), when no
+    /// operation matches, or when the matching operation is not
+    /// deprecated.
+    pub fn spec_deprecation(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<(&str, Arc<CompiledDeprecation>)> {
+        let config = self.deprecation.as_ref()?;
+        let op = self.match_operation(method, path)?;
+        if !op.deprecated {
+            return None;
+        }
+        Some((op.template.as_str(), Arc::clone(config)))
     }
 
     /// Number of operations indexed from the spec. Useful for tests
@@ -293,6 +350,13 @@ fn compile_operations(spec: &serde_json::Value) -> anyhow::Result<Vec<Operation>
                 method: method.to_ascii_uppercase(),
                 schemas,
                 required_body,
+                // OpenAPI 3.1 Operation Object `deprecated` flag; the
+                // Path Item level has no such flag, so only the
+                // operation's own value counts.
+                deprecated: op
+                    .get("deprecated")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false),
             });
         }
     }
@@ -542,6 +606,77 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(policy.operation_count(), 1);
+    }
+
+    // --- WOR-2565: deprecation_headers sub-block ---
+
+    #[test]
+    fn deprecation_headers_absent_leaves_spec_deprecation_off() {
+        let spec = serde_json::json!({
+            "openapi": "3.0.3",
+            "info": {"title": "t", "version": "1"},
+            "paths": { "/v1/jobs": { "get": { "deprecated": true } } }
+        });
+        let policy =
+            OpenApiValidationPolicy::from_config(serde_json::json!({ "spec": spec })).unwrap();
+        assert!(
+            policy.spec_deprecation("GET", "/v1/jobs").is_none(),
+            "off by default: no sub-block, no headers"
+        );
+    }
+
+    #[test]
+    fn deprecation_headers_match_only_spec_deprecated_operations() {
+        let spec = serde_json::json!({
+            "openapi": "3.0.3",
+            "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/v1/jobs/{id}": { "get": { "deprecated": true } },
+                "/v2/jobs/{id}": { "get": {} }
+            }
+        });
+        let policy = OpenApiValidationPolicy::from_config(serde_json::json!({
+            "spec": spec,
+            "deprecation_headers": {
+                "deprecated": "2026-09-01",
+                "sunset": "2026-12-31T23:59:59Z"
+            }
+        }))
+        .unwrap();
+        let (template, config) = policy
+            .spec_deprecation("GET", "/v1/jobs/42")
+            .expect("deprecated operation matches");
+        assert_eq!(template, "/v1/jobs/{id}");
+        assert_eq!(config.deprecation_header.as_deref(), Some("@1788220800"));
+        assert!(
+            policy.spec_deprecation("GET", "/v2/jobs/42").is_none(),
+            "an operation the spec does not deprecate gets nothing"
+        );
+        assert!(
+            policy.spec_deprecation("GET", "/nowhere").is_none(),
+            "an unmatched path gets nothing"
+        );
+    }
+
+    #[test]
+    fn deprecation_headers_bad_dates_are_refused_at_config_load() {
+        let spec = serde_json::json!({
+            "openapi": "3.0.3",
+            "info": {"title": "t", "version": "1"},
+            "paths": { "/v1/jobs": { "get": { "deprecated": true } } }
+        });
+        let err = OpenApiValidationPolicy::from_config(serde_json::json!({
+            "spec": spec,
+            "deprecation_headers": {
+                "deprecated": "2026-09-01",
+                "sunset": "2020-01-01"
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RFC 9745"),
+            "the sub-block refuses the same combinations the route-level block does: {err:#}"
+        );
     }
 
     #[test]
