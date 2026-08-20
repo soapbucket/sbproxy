@@ -319,7 +319,10 @@ pub fn evaluate_body_with_audit(
             policy_version = %audit.policy_version.unwrap_or(""),
             detector = %policy.detector_name(),
             action = "bypass",
-            configured_action = policy.action().as_str(),
+            // The resolved action (`enforcement` applied over the
+            // configured one): what the scan would have done had the
+            // key not bypassed it.
+            effective_action = policy.action().as_str(),
             "body-aware prompt injection scan bypassed by virtual key policy"
         );
         record_metric(policy, "bypass", DetectionLabel::Clean);

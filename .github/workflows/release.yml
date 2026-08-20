@@ -292,15 +292,27 @@ jobs:
     # cannot prove a driver loads a model or returns tokens on real
     # hardware; certify-model-host-apple-silicon below covers that.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Was 45 with a warm cache. The rust-cache below is restore-only now,
+    # so a run after the old entry expires pays a full cold debug build of
+    # several unions; 60 gives that honest headroom.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Restore-only. This key held ~2.6 GB, the largest single line against
+      # the repo's 10 GB Actions cache budget, and the arithmetic in ci.yml's
+      # header keeps the per-PR keys (test, lint, e2e, payments, release)
+      # resident only because this line stopped being written. This lane runs
+      # on tags and dispatch, off every PR's critical path, so it pays its
+      # own rebuild: it restores while an old entry survives and runs cold
+      # once GitHub expires it. Do not flip this back to saving without
+      # redoing that budget.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: certify-model-host-deterministic
+          save-if: 'false'
 
       - name: install protoc and libclang
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang

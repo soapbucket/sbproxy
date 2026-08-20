@@ -3860,7 +3860,16 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
             continue;
         }
         let action_key = policy.get("action").and_then(|v| v.as_str());
-        if action_key.unwrap_or("tag") == "tag" && origin_action_type != "ai_proxy" {
+        // `enforcement: block` (WOR-2121) forces every hit to refuse,
+        // so the tag flavor never manifests and the combination is
+        // live: refusing it would make this compile-time detector
+        // narrower than the runtime it guards. `observe` keeps the tag
+        // flavor, so the dead combination stays dead there.
+        let enforcement_key = policy.get("enforcement").and_then(|v| v.as_str());
+        if action_key.unwrap_or("tag") == "tag"
+            && enforcement_key != Some("block")
+            && origin_action_type != "ai_proxy"
+        {
             let default_note = if action_key.is_none() {
                 " (the default)"
             } else {
@@ -4377,6 +4386,55 @@ origins:
         enable_body_aware: true
 "#;
         compile_config(yaml).expect("tag + body-aware is live on ai_proxy origins");
+    }
+
+    #[test]
+    fn compile_allows_tag_with_body_aware_when_enforcement_block_overrides_the_flavor() {
+        // `enforcement: block` forces every hit to refuse, so the tag
+        // flavor never manifests and the combination is not dead.
+        // Refusing it would be a compile-time detector narrower than
+        // the runtime it guards.
+        let yaml = r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        action: tag
+        enforcement: block
+        enable_body_aware: true
+"#;
+        compile_config(yaml)
+            .expect("enforcement: block makes the tag + body-aware combination live");
+    }
+
+    #[test]
+    fn compile_still_rejects_tag_with_body_aware_under_enforcement_observe() {
+        // Under `enforcement: observe` the tag flavor is exactly what a
+        // hit resolves to, so the dead combination is still dead.
+        let yaml = r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        action: tag
+        enforcement: observe
+        enable_body_aware: true
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("observe keeps the tag flavor, so this must not compile");
+        assert!(
+            format!("{error:#}").contains("enable_body_aware"),
+            "{error:#}"
+        );
     }
 
     #[test]

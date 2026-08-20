@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The gateway half of docs/n8n.md, runnable without a provider
+# account. Same origin, credential, and allow list as the doc; the one
+# difference is that the openai provider points at a local
+# OpenAI-shaped fixture (fixture.py) instead of api.openai.com, so the
+# wiring runs end to end with no real key.
+#
+# The n8n side is unchanged from the doc: create an OpenAI credential
+# with Base URL `http://127.0.0.1:8080/v1` and API key
+# `sk-your-virtual-key`, and every OpenAI Chat Model node built on it
+# crosses this gateway.
+#
+# Run:
+#   cd examples/n8n
+#   docker compose up -d --wait
+#
+# Test (the doc's curl check, the same wire bytes n8n's OpenAI Chat
+# Model node sends):
+#   curl -sS http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -H 'Authorization: Bearer sk-your-virtual-key' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi in one sentence."}]}'
+#
+# Test (a model outside the credential allow list is refused with 403):
+#   curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -H 'Authorization: Bearer sk-your-virtual-key' \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "127.0.0.1":
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; the field exists because
+          # OpenAI-shaped provider configuration carries one. The doc's
+          # version of this file uses ${OPENAI_API_KEY} here instead.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+    credentials:
+      - name: n8n
+        type: ai_provider
+        provider: openai
+        # Placeholder demo value so the doc's credential walkthrough
+        # works unchanged. Invent your own value in production and
+        # keep it identical in n8n's credential and here.
+        key: sk-your-virtual-key
+        attrs:
+          project: n8n
+          tags: [n8n]
+          budget:
+            max_tokens: 1000000
+            max_cost_usd: 25
+        models:
+          allow: [gpt-4o-mini]

@@ -48,6 +48,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      # For the cache-prune step at the end of the job; `gh cache delete`
+      # needs it. Job-level is the narrowest scope GitHub offers, and the
+      # prune step itself only runs on non-PR events.
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +77,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
+        id: msrv-cache
         with:
           shared-key: msrv
           save-if: ${{ github.event_name != 'pull_request' }}
@@ -88,3 +93,40 @@ jobs:
       # feature union is the one CI already resolves elsewhere.
       - name: check workspace on the declared MSRV
         run: cargo check --workspace --exclude sbproxy-e2e --locked --all-targets
+
+      # Keep exactly one msrv cache generation. rust-cache writes a new entry
+      # whenever the lockfile hash or the declared toolchain changes and never
+      # deletes the superseded one, so with this repo's Cargo.lock churn two
+      # ~0.8 GB msrv generations were live at once. The second one is pure
+      # eviction pressure against the 10 GB budget accounted for in ci.yml's
+      # header: a superseded generation is never restored again (prefix
+      # restore picks the newest), so keeping it buys nothing. On an exact
+      # cache hit the entry this run restored is the live generation: keep
+      # it, delete the rest. On a miss the post-job save is about to write
+      # the new live generation: delete everything already there. Runs only
+      # on non-PR events, the same condition under which this workflow may
+      # save, and only after a green check, so a failing run cannot delete
+      # the cache and then bank nothing.
+      - name: prune superseded msrv cache generations
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSRV_CACHE_HIT: ${{ steps.msrv-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          keep_id=""
+          if [ "${MSRV_CACHE_HIT}" = "true" ]; then
+            keep_id="$(gh cache list --key v0-rust-msrv --limit 100 \
+              --json id,lastAccessedAt \
+              --jq 'sort_by(.lastAccessedAt) | last | .id // empty')"
+          fi
+          gh cache list --key v0-rust-msrv --limit 100 --json id --jq '.[].id' \
+          | while read -r cache_id; do
+              [ -n "${cache_id}" ] || continue
+              if [ "${cache_id}" != "${keep_id}" ]; then
+                # Tolerate a concurrent delete; losing that race means the
+                # entry is already gone, which is the goal.
+                gh cache delete "${cache_id}" \
+                  || echo "cache ${cache_id} already deleted"
+              fi
+            done
