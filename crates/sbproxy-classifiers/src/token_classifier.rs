@@ -517,7 +517,15 @@ fn keep_probabilities_from_logits(
         ));
     }
     logits
-        .chunks_exact(2)
+        // `as_chunks::<2>()` rather than `chunks_exact(2)`: the chunk
+        // size is a constant, so the iterator yields `&[f32; 2]` and the
+        // two indexes below are checked by the type instead of at run
+        // time. The length check above rejects anything that is not
+        // exactly `sequence_len * 2` values, so the remainder half this
+        // discards is always empty.
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             if !pair[0].is_finite() || !pair[1].is_finite() {
                 return Err(anyhow!("token logits contain a non-finite value"));

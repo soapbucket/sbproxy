@@ -124,5 +124,11 @@ jobs:
         # Smoke pass only: -max_total_time bounds the libfuzzer
         # campaign so the lane stays predictable. Longer campaigns
         # belong in a nightly cron, not on every PR.
+        # fuzz/ sits under the repo root, so rustup would resolve
+        # rust-toolchain.toml here and hand cargo-fuzz the pinned stable.
+        # RUSTUP_TOOLCHAIN outranks that file and keeps the nightly this
+        # job installs.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.time }}
         working-directory: fuzz
