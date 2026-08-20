@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-19*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -12,13 +12,12 @@ request that would only fail again is sent to a fallback instead.
 This is an opt-in addition to the failover loop. Without a `retry_policy`
 the default status-code retry set is unchanged.
 
-One request can touch provider selection, failure classification, the
-circuit breaker, and a fallback all in the same attempt loop. The gate
-worth calling out: a class beyond the default retryable set only gets
-another attempt when `routing: fallback_chain` is set, or on a
-content-policy refusal with `content_policy_fallback: true`. Outside
-those two cases, every request is exactly one attempt, `retry_policy` or
-not.
+One request can touch provider selection, failure classification, and a
+fallback all in the same attempt loop. The gate worth calling out: a class
+beyond the default retryable set only gets another attempt when
+`routing: fallback_chain` is set, or on a content-policy refusal with
+`content_policy_fallback: true`. Outside those two cases, every request is
+exactly one attempt, `retry_policy` or not.
 
 ```mermaid
 flowchart TD
@@ -29,13 +28,19 @@ flowchart TD
     D --> E{Response}
     E -->|2xx| F[Return the response]
     E -->|failure| G[Classify the failure cause]
-    G --> H[Circuit breaker and outlier detector record the outcome]
+    G --> H["Attempt outcome recorded\n(metrics, failover counters)"]
     H --> I{"fallback_chain routing,\nor a content-policy refusal\nwith content_policy_fallback"}
     I -->|no| J["Return the error or refusal\n(one attempt only)"]
     I -->|yes| K{Cause retryable and attempts remain?}
     K -->|yes, next provider| A
     K -->|no| J
 ```
+
+The breaker and outlier boxes in step A are a real eligibility gate, not
+decoration: `Router::provider_eligible` checks both before a provider is
+offered to the strategy. What is missing today is the write side. See
+"What is adaptive, and what fails over" below for the gap between that gate
+and what actually feeds it.
 
 ## Failure classification
 
@@ -171,15 +176,29 @@ a 200 response is a valid completion and is not intercepted. Off by default.
 
 ## What is adaptive, and what fails over
 
-Adaptive cooldowns are already in effect when `circuit_breaker` or
-`outlier_detection` is configured: every upstream outcome feeds the
-per-provider breaker and the sliding-window outlier detector, and a
-provider that crosses its failure threshold is ejected from selection until
-it recovers. The PeakEWMA latency model is a separate, independently
-selected routing strategy (`routing: { strategy: peak_ewma }`); it does not
-run automatically alongside `circuit_breaker` or `outlier_detection`.
-Failover itself routes to a different provider, so a retry never re-runs a
-side-effecting request against the same upstream.
+`circuit_breaker` and `outlier_detection` configure a real eligibility
+gate: `Router::provider_eligible` checks a breaker's state and an
+outlier ejection before offering a provider to the routing strategy, and a
+provider failing either check is skipped until it recovers. That gate needs
+a live feed of request outcomes, and the production AI dispatch path
+(`crates/sbproxy-core/src/server/ai_dispatch.rs`) does not currently supply
+one: neither the sequential failover loop nor the `race` dispatch calls the
+router methods that update the breaker or the sliding-window detector
+(`record_provider_success` / `record_provider_failure`). Those two are
+wired end to end only on the admin playground's chat path
+(`crates/sbproxy-core/src/admin_playground.rs`), not on the
+`/v1/chat/completions` path real traffic takes. A configured
+`circuit_breaker` or `outlier_detection` block is accepted without error,
+but a provider failing every request is not ejected by either signal today
+(SUSPECTED PRODUCT BUG; ticketed for the `race` case as WOR-2532, see
+`examples/ai-race/README.md` for a live repro). `health_check` is
+unaffected: its active probes run on an independent background task and
+never depend on request-path recording. The PeakEWMA latency model is a
+separate, independently selected routing strategy
+(`routing: { strategy: peak_ewma }`); it does not run automatically
+alongside `circuit_breaker` or `outlier_detection` even once that gap
+closes. Failover itself routes to a different provider, so a retry never
+re-runs a side-effecting request against the same upstream.
 
 ## Calling it
 

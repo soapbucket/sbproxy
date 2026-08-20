@@ -1,6 +1,6 @@
 # Model host hardware certification
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 This page is the evidence ledger for the self-host matrix, and the procedure
 that reproduces it. Passing a simulated GPU test is never recorded as live
@@ -332,3 +332,15 @@ failure logs, and GCP teardown notes stay in the evidence directory as
 supporting material. Do not promote a capability from those alone.
 Promotion requires a `record.json` tied to the tested revision, and a
 deterministic regression test for any bug the hardware run found.
+
+## Related
+
+- [model-host.md](model-host.md) - the configuration surface this page
+  certifies: deployments, engines, cluster roles, and the admin API.
+- [model-host-capabilities.md](model-host-capabilities.md) - the
+  generated stable/preview matrix this evidence ledger feeds.
+- [gpu-fit-planning.md](gpu-fit-planning.md) - the T4/L4 capability
+  tiers and VRAM math the hardware lanes check against.
+- [serving-engine-benchmark.md](serving-engine-benchmark.md) - a real-L4
+  head-to-head between vLLM and SGLang, gathered the same afternoon as
+  this page's NVIDIA single-GPU evidence but kept separate from it.

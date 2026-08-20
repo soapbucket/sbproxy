@@ -1,9 +1,33 @@
 # Routing and traffic management
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
 ![The same hostname routed to different backends by request body content](assets/body-routing.gif)
+
+The sections below cover each stage in depth. The shape they compose into:
+
+```mermaid
+flowchart TD
+    A[Inbound request] --> B{Host header matches an origin?}
+    B -->|no match| Z["No origin: connection refused"]
+    B -->|yes| C{"forward_rules configured\n(first match wins)"}
+    C -->|rule matches| D[Route to the matched child origin]
+    C -->|no match, or none configured| E[Use the origin's own action]
+    D --> F
+    E --> F[["Origin action"]]
+    F -->|load_balancer| G["Health / circuit-breaker / outlier\nfilter, then RoutingStrategy or algorithm"]
+    F -->|ai_proxy| H["Model-based provider narrowing,\nthen an AI routing strategy"]
+    F -->|websocket, grpc, graphql| I[Protocol-specific handling]
+    F -->|proxy, static, redirect, ...| J[Direct dispatch]
+    G --> K{"Response matches fallback_origin's\non_error / on_status trigger?"}
+    H --> K
+    I --> K
+    J --> K
+    K -->|yes| L["Run fallback_origin's action only\n(auth/policies/transforms are skipped)"]
+    K -->|no| M[Return the response]
+    L --> M
+```
 
 ## How a request finds an origin
 

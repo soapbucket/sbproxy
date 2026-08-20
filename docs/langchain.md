@@ -1,6 +1,6 @@
 # LangChain with SBproxy
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 A LangChain application normally talks to providers directly: `langchain-openai` calls `api.openai.com`, and each tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the LangChain side the change is a base URL on the model and one server entry for tools.
 
@@ -33,6 +33,7 @@ origins:
   "127.0.0.1":
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}
@@ -61,7 +62,7 @@ Two different keys appear across the two files, and you fill in both yourself:
 - **The virtual key** (`sk-your-virtual-key`) is a value you invent. It must be identical in two places: `api_key` in `chat.py` and `key:` under `credentials:` in `sb.yml`. Replace the placeholder with your own value in both; [Generating secret values](secrets.md#generating-secret-values) shows how to generate a strong one.
 - **The provider key** (`${OPENAI_API_KEY}`) is the real key from your provider's console. It lives only in the environment variable; the gateway reads it through `${OPENAI_API_KEY}` interpolation at startup. Never put a raw provider key in either file.
 
-Be precise about what the virtual key is doing here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `langchain-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: a request presenting an unknown key, or no key at all, still passes through on the provider's configured key, so add an `authentication` block to the origin whenever the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+Be precise about what the virtual key is doing here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `langchain-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. `action.require_governed_key: true` is what makes any of this enforced rather than declarative: config compile now refuses an origin that declares `credentials:` without it, and with it set, a request presenting an unknown key or no key gets a 401 before any upstream call. The virtual key is still a static bearer secret with no rate limiting on guessing it, so add an `authentication` block to the origin whenever the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
 
 ## Run it
 
@@ -198,7 +199,7 @@ llm = ChatAnthropic(
 )
 ```
 
-Two caveats on the native path. Releases through v1.9.0 answered `/v1/messages` in the OpenAI response shape, which Anthropic clients cannot parse; use a newer release for this path, or stay on `ChatOpenAI`, which works on every version. And the Anthropic SDK presents its key in the `x-api-key` header, which the static `credentials:` block does not read (it reads `Authorization: Bearer`), so on this path the virtual key is ignored unless you enable [dynamic key management](key-management.md), whose default header sweep includes `x-api-key`.
+Two caveats on the native path. Releases through v1.9.0 answered `/v1/messages` in the OpenAI response shape, which Anthropic clients cannot parse; use a newer release for this path, or stay on `ChatOpenAI`, which works on every version. And the Anthropic SDK presents its key in the `x-api-key` header, which the static `credentials:` block does not read (it reads `Authorization: Bearer`), so on this path the virtual key is ignored; with `require_governed_key: true` set, that means the request gets a 401 instead of dispatching, unless you enable [dynamic key management](key-management.md), whose default header sweep includes `x-api-key`.
 
 ## MCP tools through the gateway
 

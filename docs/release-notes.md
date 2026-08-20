@@ -1,10 +1,10 @@
 # Release notes
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 A category view of recent SBproxy changes, for readers who want to know
 what changed in an area they care about rather than read a chronological
-diff. Covers versions 1.8.0 through 1.12.0.
+diff. Covers versions 1.8.0 through 1.13.0.
 
 [`CHANGELOG.md`](../CHANGELOG.md) stays the canonical, chronological,
 Keep-a-Changelog-style record with full detail and exact version
@@ -16,6 +16,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
+- **Displayed credential masking covers more key names.** (1.13.0) The pass that masks secrets in `GET /admin/config`, config-history views, and log output now also recognizes session tokens, signing and client secrets, and the product's own key-name families (`master_key`, `signing_key`, `virtual_key`, and relatives). Operators diffing displayed config against disk will see more `[REDACTED]` than 1.12 showed.
 - **A matched virtual key no longer erases the inbound principal's roles and claims.** (1.11.0) `roles` and `claims` now carry forward from the JWT principal instead of being wiped by a virtual-key match; role-scoped MCP ACL rules and claim-based CEL policies that silently stopped matching now match again.
 - **`require_mtls_bound: true` no longer rejects every request in production.** (1.11.0) The production auth path hardcoded a missing client-certificate thumbprint; any origin using `require_mtls_bound` was rejecting all of its traffic until this fix.
 - **`GET /admin/config` and `GET /admin/config/effective` no longer return inlined secrets in plaintext.** (1.11.0) Both now redact secrets like the log pipeline does; a config with an inlined secret can no longer round-trip through GET, edit, PUT (move the value to `env:` or a secrets backend).
@@ -31,6 +32,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
+- h2 updated to 0.4.16, closing an unbounded-queue RUSTSEC advisory (RUSTSEC-2026-0258, low severity) where a peer that never drained a stream could queue empty DATA frames without bound. (1.13.0)
 - A tamper-evident security audit trail behind `audit.sink: chain`: SHA-256 hash-chained, Ed25519-signed, independently verifiable with `sbproxy audit verify`. (1.11.0)
 - OCSP stapling now builds a real RFC 6960 request and validates the response; a staple no client could verify is no longer sent. (1.11.0)
 - Four fixes from a security inventory of the auth path: async JWKS refresh, constant-time comparators via `subtle`, malformed CIDR now fails config compile. (1.11.0)
@@ -49,6 +51,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
+- **The AI PII guardrail's knobs all do something, or refuse.** (1.13.0) `action: log` was a silent no-op; it now logs the detection (pattern type only, never the matched text) and allows the request. `action: mask` and `redact_response: true` cannot work under the current guardrail signature, so both are now refused at config load; a config carrying either stops loading on upgrade.
 - **`timeout_ms` on an AI provider is now enforced.** (1.12.0) The key previously validated and did nothing; a forgotten low value starts cutting requests off on upgrade.
 - **A broken `ai_policy.expression` now refuses the config instead of disabling itself.** (1.12.0) If your config stops loading on upgrade, the expression was never actually running.
 - **`model_aliases` now actually does something.** (1.11.0) The key previously parsed and was silently ignored; a second bug also closed credential model-gate bypass via alias.
@@ -81,11 +84,15 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
+- **The `dlp` policy now scans request bodies.** (1.13.0) It documented body scanning and only ever saw the URI and headers; the enforcer received the buffered body and never read it. It now scans request bodies by default, capped at 16 KiB. An origin carrying a `dlp` policy starts matching on body content the moment you upgrade.
+- **Enumeration detection fires without `object_rules`.** (1.13.0) `object_authz`'s `enumeration.enabled: true` never counted anything unless a declared ownership rule captured an object id. With no `object_rules` configured it now falls back to a path heuristic (an id-shaped trailing path segment counts as the object); hits are always detect-only. If you run `enumeration.enabled` with no rules, expect violation records on traffic that previously counted nothing.
 - **`agent_budget`'s `tokens_per_hour` limit is now actually enforced.** (1.11.0) The request-rate half worked; the token half never charged usage after a response completed until this fix.
 - **Every `config_only` key now has a real disposition.** (1.11.0) Most visibly, `cors.enable: false` was silently ignored and CORS stayed enabled; it's now refused at config compile with a message naming the fix.
 
 **Also shipped:**
 
+- `policies: [{type: owasp_api_top10}]` expands into the OWASP API Security Top 10 controls the proxy can honestly cover: a compile-time expander synthesizes concrete policy entries per item, safe by default (`report_only` unless `posture: enforce`), with a five-state coverage manifest at `GET /admin/owasp-api-pack`, `sbproxy plan`, and validation errors. (1.13.0)
+- PII and secret detections carry bounded position spans instead of a bare match/no-match, across the PII guardrail's decision-audit records, the `dlp` policy's deny reason, and MCP `content_filters` logging. (1.13.0)
 - `policy: rego` and the AI gateway's Rego engine can load a module from a file (`module_path`) and accept pre-OPA-1.0 syntax (`rego_v0: true`); request and response modifiers gained a Rego form, and signed extension bundles can ship a `.rego` policy module. (1.12.0)
 - `sbproxy rego test` runs Rego fixtures offline with per-module line coverage and a `--min-coverage` gate. (1.12.0)
 - Rate limits converge across a gossip mesh with no Redis required. (1.10.0)
@@ -132,6 +139,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
+- A `type: lua` transform gets the same raw string-in/string-out contract as the JavaScript raw transform, so a script can rewrite plain text, XML, CSV, or any non-JSON payload. A `type: wasm` transform can opt into `request_context: true` for the same principal/aipref/TLS-fingerprint `ctx` document Lua and JavaScript transforms get. (1.13.0)
 - The `a2a_agent_card_rewrite` transform now actually runs; a configured rewrite previously silently passed agent-card bodies through unchanged, leaking the real upstream URL. (1.11.0)
 - `proxy.scripting.javascript.sandbox` now tunes the live QuickJS engines used by response modifiers, `javascript`/`js_json` transforms, and WAF custom rules. (1.11.0)
 
@@ -155,6 +163,8 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
+- A `federated_servers[]` entry can be `type: local`: tools the gateway serves itself, declared entirely in config, as a fixed value, one HTTP call, or a dependency-ordered DAG of HTTP calls under `steps:`. Local tools publish into the same registry federation does, so RBAC, approval status, versioning, argument and result policies, content filters, and evidence records all apply with no new wiring. (1.13.0)
+- `codemode.ts` (`GET /.well-known/mcp/codemode.ts`) no longer advertises `draft` servers; it previously rendered the full federation catalog with no approval-status filtering, so a draft server's tool names and descriptions leaked even though `tools/list` and `tools/call` already hid and refused it. (1.13.0)
 - The full MCP surface is governed: `content_filters` runs the shared secret and PII detector catalog over tool-call arguments and results (`off | warn | redact | block` per category), sessions are tenant-bound with fail-closed caps, `result_policies[]` runs CEL/Rego over tool results, and `federated_servers[].status` stages a draft / approved / deprecated review lifecycle. (1.12.0)
 - Every dispatched MCP `tools/call` emits an `mcp_governance_decision` evidence event; `events.fail_closed` can refuse a call rather than serve it un-evidenced, and tool-definition changes and registry status transitions emit their own records. (1.12.0)
 - Federated MCP servers resist a silent protocol or auth downgrade: `federated_servers[].protocol` pins an era, and `downgrade: warn | block` acts on a peer answering weaker than it ever has. (1.12.0)
@@ -186,6 +196,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
+- **A config reload that would silently keep exporting to a newly-denied telemetry endpoint is now refused.** (1.13.0) The egress inventory's boot-time authorization never re-checked boot-built OTLP exporters after a hot reload; a denied telemetry endpoint also now reaches the `egress_refused` counter and event feed like every other purpose.
 - **The `outcome` label value `auth_denied` split in two.** (1.12.0) Dashboards keyed on `outcome="auth_denied"` need updating; usage rollups keep the legacy mapping.
 - **Single-tenant traffic now reports workspace `__default__`, not `default`.** (1.12.0) Dashboards or alerts matching `workspace="default"` need updating.
 - **The in-process burn-rate rule now reads the hour it is named for.** (1.11.0) A slow burn under 14.4x over the last hour no longer opens an in-process incident; alert labels changed from `scope`+`objectives` to `scope`+`objective`+`window`, which changes the PagerDuty dedup key.
@@ -226,6 +237,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Breaking / needs attention:**
 
+- **`$${...}` is now an escape everywhere the config's `${VAR}` environment interpolation runs.** (1.13.0) The pre-parse layer previously spliced the live environment value before honoring the escape, which could bake a secret into the compiled config. A config that relied on `$${VAR}` splicing a value reads differently after upgrading.
 - **Five config keys that parsed, warned, and governed nothing are now removed.** (1.11.0) `origins.*.connection_pool.max_connections`, `.max_lifetime_secs`, `origins.*.traffic_capture`, `origins.*.sessions.ttl_seconds`, `proxy.device_parser_file`; each now fails config compile naming a real replacement.
 - **`audit.sink: tracing` and the origin-level `rate_limit_headers:` block are removed.** (1.11.0) Both were accepted and did nothing.
 - **`proxy.messenger_settings` names the deleted bus defects and must be removed.** (1.12.0) Config distribution is `proxy.config_authority`, and cache invalidation is `POST /admin/cache/purge`.
@@ -235,6 +247,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 
 **Also shipped:**
 
+- `proxy.config_history` keeps a durable, content-addressed ring of every applied config, off by default; read it back with `GET /admin/config/history`, `sbproxy config history`, or the admin console's config panel. (1.13.0)
 - `localsecret://` replaces the overloaded `secret://` scheme name (old spelling still works, with a deprecation warning). (1.11.0)
 - `env:NAME` now resolves through the same secret resolver as every other secret-bearing field. (1.11.0)
 - Config compile now enforces GraphQL depth/introspection/syntax limits before upstream dispatch, keys concurrent-limit policies by client/API key/header/route, and refuses the reserved HTTP/3 listener at compile time instead of logging and continuing without QUIC. (1.8.0)

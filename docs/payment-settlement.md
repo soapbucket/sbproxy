@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -246,6 +246,31 @@ the seam between them:
   cost: crawler signatures, free paths, tiers, the price.
 - `proxy.payments` decides how a payment settles: rails, credentials,
   durable state, timeouts, and the failure posture.
+
+```mermaid
+flowchart TD
+    A["Route prices the request"] --> B["Requirement built from the price\nand proxy.payments, nothing else"]
+    B --> C["Pending intent committed to SQLite\nbefore the 402 leaves the proxy"]
+    C --> D["402 response:\nsigned challenge + quote token"]
+    D --> E["Client fulfills the challenge\npays, signs, or confirms"]
+    E --> F["Retry carries the rail credential\nin the configured header"]
+    F --> G["Local verification:\nbinding, expiry, digest"]
+    G --> H{"One bounded provider call:\nverify then settle"}
+    H -->|"provider proves funds moved"| I["Receipt committed,\nintent to Succeeded"]
+    H -->|"provider refuses"| J["Terminal,\n402 with problem document"]
+    H -->|"deadline elapsed, ambiguous"| K["NeedsReconciliation,\n503 Retry-After"]
+    K -->|"recovery worker resolves it"| I
+    K -->|"recovery worker resolves it"| J
+    I --> L["Origin called exactly once,\nnonce spent before the call"]
+```
+
+The receipt commit at `I` is the only edge into `L`. Every other outcome,
+including a provider that later comes back positive through `K`, still
+answers the request that triggered it with a refusal or a retry; a later
+`Succeeded` only unblocks the *next* request on that route. See
+[The state table](#the-state-table) for what governs each of these
+transitions and [Replay protection, and where it stops](#replay-protection-and-where-it-stops)
+for what "exactly once" at `L` actually guards against.
 
 The smallest pairing that settles is
 [`examples/settlement-gate-local/sb.yml`](../examples/settlement-gate-local/sb.yml),
@@ -522,11 +547,35 @@ because no local fixture can settle those rails.
 | Payment HTTP Authentication with `stripe` and `charge` | The payer speaks the IETF Payment scheme and you want the credential to arrive in a standard `Authorization` field with a body digest bound to it. |
 | Stripe PaymentIntents, advertised directly | You already have a Stripe account, the payer is a normal client, and you want challenge, client confirmation, and capture in three explicit steps. |
 | Core Lightning | You run CLN v26.06 or newer and want sub-cent amounts settled over your own node. |
-| LND | Same, on an LND node. CLN and LND are alternative backends for one advertised `lightning` rail, never both at once. |
+| LND | Not servable today. CLN and LND are alternative backends for one advertised `lightning` rail, never both at once, but only the CLN backend has a production transport. See "LND has no production transport yet" below before you configure it. |
 
 The proxy performs no currency conversion. Every rail one route advertises
 has to declare the same `quote_currency`, and config load rejects a mixed
 challenge by name.
+
+### LND has no production transport yet
+
+`LndSettler` and its contract tests are complete: the settlement logic, the
+deterministic preimage derivation, and the wire contract pinned to
+`v0.20.1-beta` all exist and are exercised against a recording service in
+`crates/sbproxy-billing/tests/lnd_contract.rs`. What is missing is the
+transport that would give it a real channel to a node. The generated gRPC
+client and the vendored upstream protobufs are a separate slice of work that
+has not landed, so `LndTransport` compiles as a trait with no implementor in
+this codebase.
+
+The consequence is a startup failure, not a silent gap. A build that
+compiles `payment-lightning-lnd` and a config that sets
+`proxy.payments.rails.lightning_lnd` registers no adapter, and startup fails
+naming the rail, the same path a rail whose feature is entirely missing
+already takes. There is no configuration under which the proxy advertises a
+Lightning challenge over LND that it has no way to settle.
+
+Until this lands, run Lightning over Core Lightning. The two backends stay
+documented side by side in the reference below and in
+[`examples/rail-lightning/`](../examples/rail-lightning/) because the
+config surface, and the migration path once LND ships, do not change; only
+the servability does.
 
 ## Build features
 
@@ -749,6 +798,11 @@ CLN and LND are alternative backends for one advertised `lightning` rail.
 Configure both only during a migration; set `rails.lightning_backend` to
 `cln` or `lnd` before any route advertises `lightning`, or the load fails
 as ambiguous. With exactly one configured, the backend is inferred.
+
+The fields below validate for both backends, but only CLN settles today.
+`lightning_lnd` is accepted at config load and rejected at startup, because
+no build registers an adapter for it yet; see "LND has no production
+transport yet" above.
 
 | Field | Default | What it does |
 |---|---|---|
@@ -1106,6 +1160,77 @@ proves nothing, commits nothing, and asks no provider anything. It
 releases a route gate and leaves the row on this queue, so every line
 above still applies to it afterwards.
 
+## The admin surface
+
+Two routes on the admin server, behind the same operator gate as the rest
+of the admin API (see [admin-api-guide.md](admin-api-guide.md) for that
+gate and the curl cookbook):
+
+| Route | Method | Does |
+|---|---|---|
+| `/admin/payments/status` | GET | Reports the schema version, the registered rails, and what the recovery worker has done since it started |
+| `/admin/payments/reconcile` | POST | Triggers the reconciliation read described above against up to `?limit=` outstanding attempts (default 32, capped at 100) |
+
+```bash
+curl -s -u admin:${SB_ADMIN_PASSWORD} http://127.0.0.1:9090/admin/payments/status | jq .
+```
+
+```json
+{
+  "configured": true,
+  "schema_version": 3,
+  "rails": ["x402", "lightning_cln"],
+  "worker": {
+    "ticks": 184203,
+    "challenges_expired": 12,
+    "leases_returned_to_retry_wait": 3,
+    "leases_moved_to_needs_reconciliation": 1,
+    "reconciliations_succeeded": 1,
+    "reconciliations_unresolved": 0,
+    "clean_shutdown": false
+  }
+}
+```
+
+```bash
+curl -s -u admin:${SB_ADMIN_PASSWORD} -X POST \
+  'http://127.0.0.1:9090/admin/payments/reconcile?limit=10' | jq .
+```
+
+```json
+{
+  "claimed": 1,
+  "results": [
+    {"rail": "lightning_cln", "operation": "query", "verdict": "needs_reconciliation"}
+  ]
+}
+```
+
+`verdict` is one of the same four values the reconciliation metric's
+`outcome` label uses: `succeeded`, `terminal`, `retry_wait`, or
+`needs_reconciliation`. `operation` is `query` for every row reconciliation
+produces, because a status check is the only operation this route ever
+performs.
+
+Both responses are counts, rail names, operations, and verdicts. Neither
+carries an intent id, a quote id, a tenant, a provider reference, a payer,
+or an amount, by construction of the type each is built from.
+
+There is deliberately no third route. Nothing under `/admin/payments/`
+settles, confirms, captures, retries, or marks an intent paid; the four
+paths a test in this crate asserts do not exist are `settle`, `succeed`,
+`force`, and `mark-paid`. An operator who believes a payment settled and
+whose provider disagrees has a dispute with that provider, not a control in
+this proxy. `reconcile` reaches exactly the same status query the recovery
+worker already runs; it does not add authority the worker lacks, it just
+lets an operator ask now instead of waiting for the next sweep.
+
+A binary built without the `payments` feature, and a node with `payments`
+compiled in but `proxy.payments` unconfigured, both answer 404 on either
+route, with a body naming which of the two is missing so the difference is
+never "the route does not exist" versus "settlement is not on here" left to
+guesswork.
+
 ## Metrics and logs
 
 Payment metrics carry four labels and no more: `rail`, `operation`,
@@ -1217,3 +1342,4 @@ The boundaries are as load-bearing as the features.
 - [l402.md](l402.md) - the separate L402 macaroon credential surface.
 - [secrets.md](secrets.md) - the backends behind `secret://`, `env:`, and `file:`.
 - [observability.md](observability.md) - where payment metrics land alongside everything else.
+- [admin-api-guide.md](admin-api-guide.md) - the operator gate `/admin/payments/*` sits behind, and the curl cookbook.

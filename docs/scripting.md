@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -1203,7 +1203,7 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **`admit_event` runs downstream of `cacheable_status`.** It only sees a response whose status already passed that gate, so it can decline a status the gate allows and cannot start caching one the gate excludes.
 
-**`admit_event` and `stale_while_revalidate` do not compose.** The revalidation refresh runs in the background with no request context, so it cannot evaluate the event and would write back with the static `ttl_secs`, reverting both the override and any refusal. Setting both on one origin fails config compile until the refresh can carry the event's context.
+**`admit_event` and `stale_while_revalidate` compose.** The revalidation refresh runs the event against the response it just fetched, from the same small request-side scope the initial request used, so an override or a refusal from `admit_event` still applies to what the background refresh writes back. The two were refused together before this evaluation path existed; that restriction is gone.
 
 Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation. Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose: `cache.admit` fails open, so it records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`, while `cache.key` fails closed on the cache and records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, with no fail-open counter. The field-level reference for the block is in [configuration.md](configuration.md#response-cache).
 
@@ -1413,7 +1413,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | `response_cache.key_event` | An `engine` of `cel` or `wasm`, any other unknown engine, or an empty `source` fails config compile; an engine fault or a document that cannot be decoded is logged and bypasses the cache for that request, with no read and no write |
-| `response_cache.admit_event` | The same config-compile checks, plus a refusal when the origin also sets `stale_while_revalidate`; an engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
+| `response_cache.admit_event` | The same config-compile checks; composes with `stale_while_revalidate` (the background refresh runs the event too). An engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |
 | JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate. |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
 | Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |

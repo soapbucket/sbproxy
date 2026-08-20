@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![an unsigned crawler request rejected with 401 and a signature-required challenge](assets/web-bot-auth.gif)
 
@@ -255,6 +255,7 @@ The deferred check fires only when `Signature-Input` actually covers `content-di
 
 ## See also
 
+- [headless-detection.md](headless-detection.md) - the heuristic complement: scoring how much an unsigned request's shape looks like automation, for agents that never present a Web Bot Auth signature.
 - [configuration.md](configuration.md#authentication) - schema reference (`bot_auth` provider).
 - [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html) - the underlying signature standard.
 - `crates/sbproxy-modules/src/auth/bot_auth.rs` - source.

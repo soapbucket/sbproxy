@@ -1,6 +1,6 @@
 # Connect Cursor to a governed gateway
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Cursor's "Override OpenAI Base URL" setting redirects its OpenAI-key traffic to any OpenAI-compatible endpoint, which is enough to reach a generic multi-provider proxy but buys nothing beyond it: no per-key budgets, no attribution, no guardrails on the prompt. This page points that same setting at SBproxy, so the base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -86,7 +86,7 @@ Paste the returned `token` into Cursor's "OpenAI API Key" field alongside the ba
 
 ## The payoff
 
-Every request Cursor sends is now attributed to the `cursor-editor` key by name in the usage ledger (`sbproxy ai ledger verify` proves the file has not been edited after the fact), covered by whatever guardrails you attach to the origin, and stopped at `402` the moment the daily budget is spent. Add a `serve:` block naming a local model and give it the same alias as a hosted one, and Cursor switches to your own GPU with no further client-side change: see [use-case-coding-assistant.md](use-case-coding-assistant.md) for that half.
+Every request Cursor sends is now attributed to the `cursor-editor` key in the usage ledger (`sbproxy ai ledger verify` proves the file has not been edited after the fact), covered by whatever guardrails you attach to the origin, and stopped at `402` the moment the daily budget is spent. Add a `serve:` block naming a local model and give it the same alias as a hosted one, and Cursor switches to your own GPU with no further client-side change: see [use-case-coding-assistant.md](use-case-coding-assistant.md) for that half. `serve:` is the compatibility form; [model-host.md](model-host.md) documents the canonical `proxy.model_host` form for new deployments.
 
 ## Next steps
 

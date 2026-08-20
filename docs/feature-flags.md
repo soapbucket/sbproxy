@@ -1,5 +1,5 @@
 # Edge feature flags
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 `sbproxy-extension` ships a small, sticky-bucketing feature-flag store and a `flag_enabled(name, key)` CEL helper. Flags are evaluated against a per-request bucketing key (user id, tenant id, JWT subject) so a request that lands inside a 25% rollout stays inside it across calls. The running proxy seeds the process-wide store from the top-level `flags:` block at boot and atomically replaces the complete set after each successful config reload.
 
@@ -43,7 +43,7 @@ The `flag_enabled(name, key)` CEL function reads the global store. The most comm
 flag_enabled("new-checkout", jwt.claims.sub)
 ```
 
-Use it anywhere the request-time CEL context is available: `expression` and `assertion` policies, CEL rate-limit keys, CEL access-log fields, and the AI selectors. A forward rule's `when:` is CEL but does not carry `features`, because routing runs before flags resolve, so naming `flag()` there is refused at config load. A flag that should route rather than gate belongs in a policy in front of the route or in a separate hostname. Unknown flags evaluate to `false`. Segment rules are not part of the YAML surface because this helper has no segment argument.
+Use it anywhere the request-time CEL context is available: `expression` and `assertion` policies, CEL rate-limit keys, CEL access-log fields, and the AI selectors. A forward rule's `when:` is CEL too, and it does carry the shared request bindings (`jwt.claims`, `request.headers`, `connection.remote_ip`, and the rest of the base request context), so `flag_enabled(name, key)` compiles and evaluates there the same as anywhere else. What it does not carry is anything a later pipeline pass stamps, such as `principal` or `request.trust_tier`, because forward rules match during routing, before authentication, identity enrichment, and classification run. A flag that should gate access rather than pick a route still belongs on a policy in front of the route: a forward rule's `when:` only decides which origin serves the request and cannot deny one on its own. Unknown flags evaluate to `false`. Segment rules are not part of the YAML surface because this helper has no segment argument.
 
 ## Run it
 
@@ -84,6 +84,22 @@ Date: Sun, 02 Aug 2026 05:08:17 GMT
 Connection: keep-alive
 
 {"error":"new-checkout is off for this bucketing key"}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
+
+`carol@acme.io` is on the block list too, and nowhere else. Bucket 17 is inside the 25% rollout, so this is the case that shows the block list overriding a rollout hit rather than an allow-list collision:
+
+```bash
+curl -i -H 'Host: flags.local' -H 'X-User: carol@acme.io' http://127.0.0.1:8080/checkout
+```
+
+```
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 54
+Date: Sun, 02 Aug 2026 05:08:17 GMT
+Connection: keep-alive
+
+{"error":"new-checkout is off for this bucketing key"}
 ```
 
 `ken@acme.io` is on no list. Bucket 22 is under the cutoff, and it is under the cutoff every time:
@@ -139,7 +155,7 @@ ivan@acme.io 28
 
 The proxy builds a fresh store from each compiled config and publishes it by replacing one process-wide `Arc`. A reader therefore observes either the complete previous flag set or the complete new set, never an incrementally updated mixture. A reload that fails validation or pipeline construction leaves the previous store installed.
 
-Direct embedders can still call `FlagStore::upsert(flag)` and `FlagStore::remove(name)`; those operations rewrite one store under an `RwLock`.
+The store also supports rewriting a single flag under an `RwLock` rather than replacing the whole set. The config-driven reload path above does not use this; it always swaps the complete store.
 
 ## Counters and observability
 

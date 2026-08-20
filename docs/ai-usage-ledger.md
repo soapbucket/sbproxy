@@ -1,5 +1,5 @@
 # Verifiable usage ledger
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 The usage ledger turns the stream of completed LLM calls into a
 tamper-evident, optionally signed record. Where a plain usage sink ships
@@ -206,3 +206,9 @@ The runnable example is in
 [`examples/ai-usage-ledger/`](../examples/ai-usage-ledger/). Drive a
 request through it, inspect the JSONL, then edit a `cost_usd` in the file
 and watch `verify` fail at the mutated sequence number.
+
+## See also
+
+- [ai-gateway.md#budgets](ai-gateway.md#budgets) - the `budget` block whose spend this ledger records.
+- [ai-predictive-budget.md](ai-predictive-budget.md) - soft-landing downgrades carry a `budget_soft_landing` tag that lands in this ledger's entries.
+- [agent-budget.md](agent-budget.md) - a separate, per-agent rate limit; it does not write to this ledger.

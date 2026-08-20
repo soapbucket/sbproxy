@@ -1,6 +1,6 @@
 # Payments and metering
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 If you want to charge for access to an API, an AI endpoint, or your
 content, this page is the map across three separate things SBproxy
@@ -24,6 +24,29 @@ Lightning or LND, alternative backends for one advertised rail, never
 both at once). If you only need the exact bytes on the wire, read
 [`402-challenge.md`](402-challenge.md) directly, it is the wire
 reference: every challenge, credential, and receipt shape.
+
+```mermaid
+flowchart TD
+    REQ["Request to a priced route"] --> NEG["Accept-Payment negotiation\nclient preference x proxy.payments.rails"]
+    NEG --> X402["x402 v2 exact\nfacilitator verify + settle"]
+    NEG --> PA["Payment HTTP Authentication\nstripe + charge"]
+    NEG --> STRIPE["Direct Stripe PaymentIntent\noperator opt-in only"]
+    NEG --> LN{"Lightning\none advertised rail, one backend"}
+    LN --> CLN["Core Lightning\nUnix socket, live"]
+    LN -.->|"configured, no adapter"| LND["LND\ngRPC transport not shipped yet"]
+    X402 --> STATE[("Durable intent\none SQLite file")]
+    PA --> STATE
+    STRIPE --> STATE
+    CLN --> STATE
+    LND -.-> FAIL["Refused at startup,\nnames the rail"]
+    STATE -->|"Succeeded, re-read at the decision boundary"| ORIGIN["Origin response"]
+```
+
+Every rail commits to the same durable intent store and the same one rule:
+nothing reaches `ORIGIN` except a re-read `Succeeded` row. Which box on the
+left you reach for is [payment-settlement.md](payment-settlement.md#which-rail-to-reach-for);
+LND is drawn dashed because it validates and fails at startup rather than
+serving a payment, see that page for the current state.
 
 **Before you configure this on a clustered deployment:** read
 [`payment-clustering.md`](payment-clustering.md) first. A node that

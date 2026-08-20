@@ -1,11 +1,17 @@
 # Predictive budgets with soft-landing
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 A fixed-window budget enforces a hard cliff: requests pass until the cap,
 then block at 100%. Soft-landing degrades gracefully as a scope approaches
 its limit, so spend tapers instead of stopping dead. It is an opt-in
-addition to the existing `budget` block; without it the hard-block behavior
-is unchanged.
+addition to the existing `budget` block (see [ai-gateway.md#budgets](ai-gateway.md#budgets)
+for the base `limits`, `on_exceed`, and `model_prices` fields this page
+builds on); without `soft_landing` the hard-block behavior is unchanged.
+
+This is a cost cap, not a request-rate cap: it tracks dollars and tokens
+against a window, not requests per second per caller. For a semantic
+rate limit keyed on the calling agent's identity instead, see
+[agent-budget.md](agent-budget.md).
 
 One thing this page's title oversells: nothing here forecasts spend. The
 mechanism is a ladder of fixed threshold fractions, `warn_at` and then
@@ -41,7 +47,7 @@ action:
 | `soft_landing` | absent | Opt-in. Without it the hard-block behavior above is unchanged. |
 | `soft_landing.warn_at` | `0.8` | Past this fraction, a request is allowed and a warning is logged. |
 | `soft_landing.downgrade_at` | `0.95` | Past this fraction, the request's model is rewritten before dispatch. Nothing validates that it is above `warn_at`. |
-| `soft_landing.downgrade_to` | optional | The rewrite target. Without it the per-limit `downgrade_to` applies, and without that the cheapest model across the configured providers. It has to be a model the providers serve, and a rewrite to the model already requested is a no-op with no log line and no tag. |
+| `soft_landing.downgrade_to` | optional | The fallback rewrite target. A per-limit `downgrade_to` on the limit that tripped always wins over this one when the limit sets it, not only when this field is absent; without either, the cheapest model across the configured providers is used. It has to be a model the providers serve, and a rewrite to the model already requested is a no-op with no log line and no tag. |
 
 Cost per call comes from the completed response's own `usage` object,
 priced by the built-in catalog. The `model_prices` block beside `budget:`
@@ -134,7 +140,11 @@ rewrote to:
 ```
 
 The tag lands on the usage record and nowhere else, so a sink is what makes
-the degradation queryable afterwards:
+the degradation queryable afterwards. A `ledger` sink (see
+[ai-usage-ledger.md](ai-usage-ledger.md)) carries the same tag in its
+hash-chained, optionally signed entry, so a downgrade shows up in the
+tamper-evident record too, not only in whatever plain sink you also
+configure:
 
 ```
 {"model": "gpt-4o-mini", "tag": "budget_soft_landing", "cost_usd": 0.06}
@@ -152,3 +162,9 @@ Connection: keep-alive
 
 {"error":{"message":"cost limit exceeded: $6000969.0600 >= $1000.0000","scope":"workspace","type":"budget_exceeded"}}
 ```
+
+## See also
+
+- [ai-gateway.md#budgets](ai-gateway.md#budgets) - the base `budget` block (`limits`, `on_exceed`, `model_prices`) this page adds `soft_landing` to.
+- [ai-usage-ledger.md](ai-usage-ledger.md) - the tamper-evident sink a `budget_soft_landing` tag lands in when configured.
+- [agent-budget.md](agent-budget.md) - a request-rate and token-rate cap keyed on the calling agent, independent of this cost-based budget.

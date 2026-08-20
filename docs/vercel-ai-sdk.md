@@ -1,6 +1,6 @@
 # Vercel AI SDK with SBproxy
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 An AI SDK application normally talks to providers directly: the provider package calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the AI SDK side the change is one provider instance with a `baseURL` and one MCP client pointed at the gateway.
 
@@ -29,7 +29,7 @@ console.log(text);
 
 Install the packages with `npm install ai @ai-sdk/openai-compatible`.
 
-`createOpenAI` from `@ai-sdk/openai` also works, with one trap: a bare `openai("gpt-4o-mini")` posts to `/v1/responses`, the OpenAI Responses API, which the gateway does not serve. If you prefer that package, build models with `openai.chat("gpt-4o-mini")`. `createOpenAICompatible` has no such split, which is why this page uses it.
+`createOpenAI` from `@ai-sdk/openai` also works, with one trap. A bare `openai("gpt-4o-mini")` builds a model for OpenAI's Responses API (`POST /v1/responses`), and the gateway does serve that path for a single turn: the request is parsed, routed, and answered in Responses shape like any other surface. What the gateway does not yet do is join the multi-turn state the Responses API is built around. The SDK's Responses model can carry a conversation forward with `previous_response_id`, and the gateway accepts that field without acting on it, so a second call built on an earlier response's id gets a fresh, contextless answer instead of one that remembers the first turn, with nothing in the response to say so. `openai.chat("gpt-4o-mini")` avoids the trap entirely: it speaks `/v1/chat/completions`, where every prior turn rides explicitly in the request body, so nothing depends on state the gateway doesn't hold. `createOpenAICompatible` has no Responses/Chat split to begin with, which is why this page uses it.
 
 The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml` and start the gateway with `sbproxy sb.yml`:
 
@@ -41,6 +41,7 @@ origins:
   "127.0.0.1":
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}
@@ -64,7 +65,7 @@ origins:
 
 Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs elsewhere, key the origin with the hostname your application uses. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; never put a raw provider key in the file.
 
-Be precise about what the virtual key does here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `ai-sdk-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: anyone who can reach the listener and guess a key could present it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+Be precise about what the virtual key does here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `ai-sdk-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. `action.require_governed_key: true` is what makes any of this enforced rather than declarative: config compile now refuses an origin that declares `credentials:` without it, and with it set, a request presenting an unknown key or no key gets a 401 before any upstream call. The virtual key is still a static bearer secret with no rate limiting on guessing it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
 
 ## Run it without a provider account
 

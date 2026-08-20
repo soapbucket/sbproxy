@@ -1,6 +1,6 @@
 # Security
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy sits between your clients and whatever they are calling, which makes it
 a good place to enforce things the service behind it might have forgotten. This
@@ -15,7 +15,13 @@ differently and the controls do not transfer.
 **Your API traffic.** Ordinary request and response governance: who is calling,
 what they may reach, how much of it, and what comes back. Most of this is
 familiar and most of it is solved by putting a policy in the path.
-[api-security.md](api-security.md).
+[api-security.md](api-security.md). The signature-matching layer of that,
+a curated baseline plus a signed rule feed rather than an embedded copy of
+the OWASP Core Rule Set, is [waf-options.md](waf-options.md); the
+one-config-entry shortcut that expands into the individually-documented API
+Top 10 policies is [owasp-api-top10.md](owasp-api-top10.md). A policy that
+already exists as Rego, rather than CEL, can run as-is:
+[opa-rego-policies.md](opa-rego-policies.md).
 
 **Your AI model traffic.** Prompts, completions, and the spend attached to
 them. The payload is conversation, the cost is metered per token, and the
@@ -31,7 +37,11 @@ something to act on, so integrity of the definition matters as much as
 authorization of the call. [mcp-security.md](mcp-security.md).
 
 **The proxy itself.** Its own attack surface, the assumptions it makes, and the
-trust boundaries it draws. [threat-model.md](threat-model.md).
+trust boundaries it draws. [threat-model.md](threat-model.md). Running a
+locally-hosted model widens that surface: the model host starts inference
+processes beside a gateway that may hold cloud provider credentials, and the
+process, artifact, and cluster-identity boundaries around that are
+[security-model-host.md](security-model-host.md).
 
 Separately from all four: reporting a vulnerability in SBproxy, verifying a
 release signature, and checking build provenance live in

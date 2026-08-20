@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -301,6 +301,47 @@ instance, still registers as movement and grades as at least a patch. The
 digest is the safety net, and a narrower digest than the contract the gateway
 enforces would make the net smaller than the thing it protects.
 
+## Checking a lockfile without a local config
+
+`sbproxy mcp lock` / `verify-lock` need a local `sb.yml` to compile and
+discover the live catalog through. A separate binary, `sbproxy-mcp-drift`,
+does the same lockfile write and check from a `tools/list` JSON document
+instead, so a CI job against a deployed gateway (no config checkout, just an
+HTTP endpoint) can pipe straight into it:
+
+```bash
+curl -s https://mcp.example.com/ -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | sbproxy-mcp-drift --check-tools - --lockfile tool-versions.lock.yaml
+```
+
+`--lock-tools <file|->` writes a lockfile from a `tools/list` dump the same
+way `sbproxy mcp lock` does; `--check-tools <file|->` diffs one against a
+committed lockfile the way `verify-lock` does. Both accept `-` to read
+stdin. Exit codes match the gate's severity model: `0` clean, `1`
+informational (tools added or removed under `--check-tools`), `2` breaking
+or an under-bumped version. `--format json` emits a structured report for
+downstream tooling instead of the text summary.
+
+Two further modes have no equivalent in `sbproxy mcp lock`/`verify-lock` at
+all, because they do not go through a gateway or an MCP catalog:
+
+- `--previous <file> --current <file>` diffs two raw OpenAPI documents
+  (JSON or YAML) directly, classifying the change as none, informational,
+  or breaking. Useful upstream of the MCP bridge entirely: catch a breaking
+  REST change before it ever reaches `type: openapi` conversion.
+- `--cassette <file> --current-tools <file>` diffs the tool and argument
+  shapes an mcptest-style cassette (or an NDJSON session-ledger recording)
+  actually relied on against a live `tools/list` snapshot, which is a
+  narrower, consumer-contract question than "did the declared schema move":
+  a cassette that never touched a changed field is unaffected by that
+  change.
+
+Source: `crates/sbproxy-extension/src/bin/sbproxy-mcp-drift.rs`, built on
+`crates/sbproxy-extension/src/mcp/schema_drift.rs` (OpenAPI diffing) and
+`crates/sbproxy-extension/src/mcp/cassette_drift.rs` (cassette diffing).
+`sbproxy-mcp-drift --help` prints the full flag reference.
+
 ## The description judge
 
 The description-semantics dimension asks a model whether the meaning moved. The
@@ -360,6 +401,15 @@ also removes the violating tool from `tools/list` and fails its `tools/call`
 with an error carrying the linter's detail. A changed tool with no entry in
 `declared_versions` is linted as "no bump declared" against its lockfile
 version.
+
+`block_unlocked: true` (default `false`, only consulted under `mode: block`)
+closes a narrower gap: a tool with no entry in the lockfile at all, not just
+a changed one. Digest correlation catches a tool that was renamed but is
+otherwise unchanged; a rename that also edits the contract matches no
+baseline by construction and is indistinguishable from a brand-new tool, so
+nothing stops it being served ungated unless unlocked tools are refused
+outright. In `mode: warn`, `block_unlocked` has no effect, since warn mode
+blocks nothing by definition.
 
 The lockfile is read at refresh time, never at config compile. An unreadable
 or invalid lockfile fails open: nothing is blocked, the gateway logs a loud

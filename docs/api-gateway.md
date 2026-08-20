@@ -1,6 +1,6 @@
 # API gateway guide
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 SBproxy is a reverse proxy first. Before it routes to an AI provider or federates an MCP server, it does the job Nginx, Envoy, or Kong do: match a hostname, authenticate the caller, apply rate limits and a WAF, load-balance across upstreams, and proxy the request. This guide is the entry point for that traditional pillar. If you are putting SBproxy in front of an existing HTTP API, or evaluating it as a replacement for a reverse proxy you already run, start here.
 
@@ -30,7 +30,21 @@ The `Host` header picks the origin; everything else in this guide (load balancin
 
 ## Routing and traffic shaping
 
-An origin matches an exact hostname or a dynamic forward rule, then dispatches to an action. Zero-downtime reload validates and compiles a candidate configuration, swaps it in atomically on success, and lets in-flight requests finish on the pipeline they started with; see [core-concepts.md](core-concepts.md#configuration-compilation-and-reload) for the contract. Blue-green and canary rollouts are configuration patterns layered on top of this.
+An origin matches an exact hostname or a dynamic forward rule, then dispatches to an action. An origin key can also be a wildcard, `"*.example.com"`, which matches any subdomain (`a.example.com`, `a.b.example.com`) but never the bare `example.com` itself; an exact origin always wins over a wildcard for the same request, and between two wildcards the longest matching suffix wins:
+
+```yaml
+origins:
+  "api.example.com":          # exact match wins when both could apply
+    action:
+      type: proxy
+      url: https://api-backend.internal
+  "*.example.com":            # catches every other subdomain
+    action:
+      type: proxy
+      url: https://catch-all-backend.internal
+```
+
+Zero-downtime reload validates and compiles a candidate configuration, swaps it in atomically on success, and lets in-flight requests finish on the pipeline they started with; see [core-concepts.md](core-concepts.md#configuration-compilation-and-reload) for the contract. Blue-green and canary rollouts are configuration patterns layered on top of this.
 
 Load distribution across upstreams supports 8 algorithms, including round-robin, least connections, and ketama-style consistent hashing (`ring_hash`), with active health checks, a circuit breaker, and outlier detection independently removing failing targets from the pool. Custom upstream-selection logic beyond the built-in algorithms is an extension point; see [routing-strategies.md](routing-strategies.md). [routing.md](routing.md) is the full reference for hostname matching, forward rules, load balancing, deployment patterns, and fallback origins; see [performance.md](performance.md) for tuning and [architecture.md](architecture.md#3-request-pipeline) for the pipeline internals.
 

@@ -1,12 +1,29 @@
 # Internal MCP servers multiplying without an owner: federate them behind one gateway
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-19*
 
 Every team that wires an agent up to a tool ends up standing up its own MCP server: one for the GitHub org, one for the internal database, one for the ticket tracker. Six months later there are a dozen of them, each with its own auth story, its own idea of who is allowed to call `delete_repo`, and no shared record of what any agent actually did. SBproxy's MCP gateway collapses that sprawl into one endpoint: it aggregates the tool catalogs of every upstream server behind a single virtual MCP server, gates every `tools/call` with default-deny RBAC keyed on the caller's identity, and can turn a REST API with no MCP support at all into governed tools with nothing but an OpenAPI spec. This guide builds that gateway end to end, with real curls against a real (if intentionally tiny) upstream.
 
 ## What you will build
 
 One MCP endpoint on port 8080 that speaks JSON-RPC 2.0 and aggregates two upstreams under namespace prefixes, `gh.*` and `db.*`, so an agent calling `gh.search_repos` never needs to know it isn't talking to GitHub directly. `gh` is backed by `type: openapi`: a tiny REST mock stands in for a real internal API, and the gateway derives its one tool from an inline OpenAPI spec with no server-side code. `db` is left pointed at an unreachable placeholder host, on purpose, so this walkthrough is honest about what a broken federated server looks like from the outside (quietly absent, not a crash) as well as what a working one looks like. Two RBAC policies gate `tools/call` per upstream by caller, and a `tool_allowlist` guardrail sits on top of both as a second, coarser check.
+
+A `tools/call` hits both gates before it hits a federated server, in this order:
+
+```mermaid
+flowchart TD
+    C["MCP client\ntools/call"] --> G["Virtual MCP endpoint\nmcp.example.com"]
+    G --> AL{"tool_allowlist guardrail\ntool on the allow list?"}
+    AL -->|no| E1["-32602 error\nblocked by tool_allowlist"]
+    AL -->|yes| RB{"Per-server RBAC policy\ncaller allowed for this tool?"}
+    RB -->|no| E2["-32602 error\ndenied by RBAC policy"]
+    RB -->|yes| FS{"Resolve federated server\nby namespace prefix"}
+    FS -->|"gh.* (type: openapi)"| OA["REST GET to origin\nhttp://127.0.0.1:8091"]
+    FS -->|"db.* (type: mcp, unreachable)"| UNK["Never registered:\n-32603 unknown tool"]
+    OA --> R["MCP tool-result content\nreturned to caller"]
+```
+
+The allowlist is a flat, single check independent of caller identity; RBAC is the one that reads `ctx.principal`. `db.query` clears both gates above but still fails, because `db`'s `tools/list` never succeeded against the unreachable placeholder, so the tool was never in the registry to dispatch.
 
 ## Prerequisites
 
@@ -28,7 +45,7 @@ The full install matrix is in the [manual](manual.md).
 
 ## Config
 
-The assembled files live in [`examples/mcp-federation/`](../examples/mcp-federation/): [`upstream.yml`](../examples/mcp-federation/upstream.yml) is the mock REST API, [`sb.yml`](../examples/mcp-federation/sb.yml) is the gateway. It reads in three parts.
+The assembled files live in [`examples/mcp-federation/`](../examples/mcp-federation/): [`upstream.yml`](../examples/mcp-federation/upstream.yml) is the mock REST API, [`sb.yml`](../examples/mcp-federation/sb.yml) is the gateway. It reads in four parts.
 
 First, the real federated server. `type: openapi` skips MCP entirely on the wire to the upstream: the gateway reads an inline spec, derives one tool per operation, and dispatches `tools/call` as a plain REST request. `namespace: always` guarantees the `gh.` prefix on every tool from this server regardless of name collisions, which is what makes `gh.search_repos` the name to rely on in RBAC policies and guardrails below.
 
@@ -90,6 +107,16 @@ guardrails:
       - db.query
 ```
 
+Fourth, the record the opening paragraph asked for. A top-level `session_ledger` block turns on the audit trail:
+
+```yaml
+session_ledger:
+  enabled: true
+  sink: logging
+```
+
+This is the "no shared record of what any agent actually did" gap, closed. Every `tools/call` appends one record naming the tool, the resolved server, the caller, and the round-trip duration; `sink: logging` writes each record as a structured `session_ledger` line on the gateway's own log stream, so nothing extra needs to run to see it in this walkthrough. Switch to `sink: file` to get the same records as a standalone NDJSON artifact. [mcp.md](mcp.md#session-ledger) has the full record shape.
+
 ## Run it
 
 Start the mock upstream, then the gateway that federates it:
@@ -149,6 +176,8 @@ $ curl -s -X POST http://127.0.0.1:8080 \
   | jq -r '.result.content[0].text'
 [{"full_name":"soapbucket/sbproxy","name":"sbproxy","stars":4200},{"full_name":"soapbucket/docs","name":"docs","stars":12}]
 ```
+
+Check the gateway's own terminal. That call also appended an info-level `session_ledger` line naming `gh.search_repos`, the caller, and how long the round trip took, this walkthrough's audit trail made concrete.
 
 Call a tool that is not on the allowlist. The `tool_allowlist` guardrail refuses it before the gateway even checks whether the tool exists, let alone contacts an upstream:
 

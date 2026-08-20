@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -355,6 +355,13 @@ which is the difference between a crawler claiming to be someone and one proving
 it. Its directory and key settings are in [web-bot-auth.md](web-bot-auth.md).
 `pay_per_crawl` turns unwanted automation into a priced transaction rather than
 a block.
+
+A request can carry evidence from several of these sources at once (Web Bot
+Auth, CAP, named-agent rule packs, TLS fingerprint signals), and each answers
+its own narrow question. `request.trust_tier` collapses that fan-out into one
+conservative verdict (`suspicious`, `strong`, `named`, or `anonymous`) so a
+policy asks one question instead of replicating every verifier's logic. See
+[trust-tiers.md](trust-tiers.md).
 
 See [`examples/ip-filter/`](../examples/ip-filter/) for a complete working
 config of the `ip_filtering` policy above.

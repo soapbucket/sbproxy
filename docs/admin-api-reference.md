@@ -1,11 +1,11 @@
 # Admin API reference
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
 lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
-operations, per-target health, spend and audit, config read/write and hot reload/drift, the local config-revision
+operations, per-target health, spend and audit, attested-metering summary/receipts/verify, config read/write and hot reload/drift, the local config-revision
 history ring, model-host catalog and deployment lifecycle, the
 response/semantic/key-policy caches, cluster status and the replicated-state
 substrate, prompts, the chat playground, and the emitted OpenAPI document.
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -821,6 +821,31 @@ the origin's bounded `properties.rollup_keys` list.
 
 An invalid `window` value is `400`; a valid windowed request when no
 rollup store is configured is `503` naming the config knob.
+
+### `GET /api/meter/summary`, `GET /api/meter/receipts`, `POST /api/meter/verify`
+
+The attested-metering operator surface (WOR-2131): units by tenant against
+the hash-chained receipt ledger `proxy.attestation` writes, a cursor-paged
+read of the chain itself, and a chain-integrity check. All three sit behind
+the same operator gate as the rest of this page and are read-only except
+`verify`, which reads the chain and never writes to it.
+
+`summary` and `receipts` always answer with a `state` of `off` (no
+`proxy.attestation`, or `role: off`), `idle` (configured, chain empty), or
+`reporting`, so an empty deployment and a stalled meter never look like the
+same zero. `summary`'s totals carry a `coverage` block naming which cluster
+nodes the figure includes, `null` when no mesh is configured. `verify`
+returns an `outcome` of `ok` or `broken`, and on `broken` the sequence
+number and reason the chain first fails to verify at.
+
+An operator scoped to a `tenant` under `admin.operators[]` is narrowed to
+that tenant on all three routes: an absent `tenant=` resolves to their own,
+and one naming another tenant is `403` rather than an empty result. Chain
+identity, coverage, and the verify verdict carry no tenant and are visible
+to every operator regardless of scope.
+
+Full field reference, the buyer-side verification recipe, and the
+tamper-response walkthrough live in [metering.md](metering.md#the-operator-surface).
 
 ### `GET /api/alerts`
 

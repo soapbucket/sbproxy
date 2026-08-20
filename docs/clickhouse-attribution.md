@@ -1,6 +1,6 @@
 # ClickHouse attribution
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 A canonical ClickHouse schema for the SBproxy access log, plus sample queries for the three reports an operator most often wants: monthly project cost, top users by token spend, and tag-level burndown against a budget. The schema mirrors the JSON shape emitted by the structured logger (`sbproxy-observe::access_log::AccessLogEntry`), so a Vector / Fluent Bit pipeline can ingest the proxy's stdout into ClickHouse without an intermediate transform.
 
@@ -52,6 +52,13 @@ CREATE TABLE access_log
 
     -- Attribution
     workspace_id              LowCardinality(String),
+    -- `tenant_id` (WOR-1053) is resolved from `origin.tenant_id` and reads
+    -- `__default__` in a single-tenant deployment. It is a different axis
+    -- from `workspace_id`: `workspace_id` is the SaaS-level owner and stays
+    -- empty in the OSS default, while `tenant_id` partitions traffic within
+    -- one workspace by the origin it hit. Group on whichever one matches
+    -- how your deployment actually separates customers.
+    tenant_id                 LowCardinality(String),
     auth_type                 LowCardinality(Nullable(String)),
     principal_kind            LowCardinality(Nullable(String)),
     project                   LowCardinality(Nullable(String)),
@@ -74,14 +81,20 @@ CREATE TABLE access_log
     cache_result              LowCardinality(Nullable(String)),
     tier                      LowCardinality(Nullable(String)),
     shape                     LowCardinality(Nullable(String)),
+    -- `price` / `currency` / `rail` are settlement fields: the quoted price
+    -- and the rail that settled it, present only when the request hit a
+    -- `proxy.payments` or `ai_crawl_control` price quote. `cost_usd_micros`
+    -- is a separate, independently populated field (WOR-1874): the derived
+    -- AI request cost in micro-USD from token usage and the pricing
+    -- catalog, present on ordinary AI-gateway traffic whether or not a
+    -- payment rail was ever involved. Ingest it directly rather than
+    -- deriving it from `price`; the two numbers answer different
+    -- questions and conflating them undercounts AI spend on any traffic
+    -- that never quoted a price.
     price                     Nullable(UInt64),
     currency                  LowCardinality(Nullable(String)),
     rail                      LowCardinality(Nullable(String)),
-    cost_usd_micros           Nullable(UInt64) MATERIALIZED if(
-        price IS NOT NULL AND currency = 'USD',
-        price,
-        toNullable(0)
-    ),
+    cost_usd_micros           Nullable(UInt64),
 
     -- Trace correlation
     trace_id                  Nullable(String),
@@ -162,7 +175,7 @@ GROUP BY project, month
 ORDER BY month DESC, usd_spend DESC;
 ```
 
-The query partitions by month and project. `cost_usd_micros` is the materialized column from the schema; rows without a settled price contribute zero. Pass the operator's workspace_id as a parameter so a SaaS deployment can serve the report to multiple tenants from one table without a per-tenant view.
+The query partitions by month and project. `cost_usd_micros` is `NULL` on non-AI traffic, so `sum()` ignores those rows rather than treating them as zero-cost. Pass the operator's workspace_id as a parameter so a SaaS deployment can serve the report to multiple tenants from one table without a per-tenant view.
 
 ## Sample query 2: top-10 users by token spend in the last 24h
 

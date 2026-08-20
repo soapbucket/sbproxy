@@ -1,5 +1,5 @@
 # Headless detection
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer.
 
@@ -17,7 +17,7 @@ The deterministic indicators below score these requests without running a model,
 | `claims_chrome_without_client_hints` | UA carries the Chrome vendor token but no `Sec-Ch-Ua` / `Sec-Ch-Ua-Mobile` / `Sec-Ch-Ua-Platform` header is present | 25 |
 | `claims_chrome_without_sec_fetch` | UA carries the Chrome vendor token but no `Sec-Fetch-*` fetch-metadata header is present | 25 |
 | `accept_language_missing` | the request omits `Accept-Language` entirely | 15 |
-| `accept_encoding_anomalous` | the `Accept-Encoding` value does not match a canonical browser order (`gzip, deflate, br` or `gzip, deflate, br, zstd`) | 10 |
+| `accept_encoding_anomalous` | the `Accept-Encoding` value does not match a canonical browser order (`gzip, deflate, br`, `gzip, deflate, br, zstd`, or `gzip, deflate`) | 10 |
 
 Weights add up; the score saturates at 100. Score bands:
 
@@ -64,6 +64,49 @@ Pair with `request.agent.score` and the JA4 verdict for a layered defense: a ben
 `onnx_model_path` loads an in-process CatBoost ONNX scorer at startup.
 When both `rule_pack_path` and `onnx_model_path` are set, exact
 rule-pack identity matches win and the ONNX scorer runs on rule misses.
+
+## Calling it
+
+The runnable configuration is
+[`examples/headless-detection/`](../examples/headless-detection/): the
+block above with a relative `rule_pack_path` and no ONNX scorer, in front
+of a static `200` response. Start it from that directory so the rule-pack
+path resolves:
+
+```bash
+cd examples/headless-detection
+sbproxy serve -f sb.yml
+```
+
+A vanilla headless client announces itself in the `User-Agent`, which alone
+saturates well past the 50 threshold:
+
+```bash
+curl -i -H 'Host: secure.local' \
+  -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/126.0.0.0 Safari/537.36' \
+  http://127.0.0.1:8080/
+# 403 automation suspected
+```
+
+A stealth wrapper that claims Chrome but sends neither `Sec-Ch-Ua` nor any
+`Sec-Fetch-*` header trips the same threshold on the two 25-point
+client-hint and fetch-metadata indicators alone:
+
+```bash
+curl -i -H 'Host: secure.local' \
+  -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+  http://127.0.0.1:8080/
+# 403 automation suspected
+```
+
+A client that does not claim to be Chrome trips none of the Chrome-gated
+indicators and passes:
+
+```bash
+curl -i -H 'Host: secure.local' -H 'Accept-Language: en-US' \
+  http://127.0.0.1:8080/
+# 200 {"page": "protected", "note": "you look like a real browser or an honest client"}
+```
 
 ## The fingerprint catalog ships empty
 
@@ -134,6 +177,8 @@ The proprietary ML score that Akamai Content Protector pairs with these heuristi
 
 ## See also
 
+- [web-bot-auth.md](web-bot-auth.md) - the cryptographic complement: verifying a signed agent's identity outright, instead of scoring how much an unsigned request's shape looks like automation.
 - [scripting.md](scripting.md) - the full CEL / Lua / JavaScript / WASM expression surface.
 - `crates/sbproxy-agent-detect/src/headless_indicators.rs` - source.
-- The JA4 CatBoost scorer that this pairs with.
+- `crates/sbproxy-agent-detect/src/onnx.rs` - the JA4 CatBoost scorer this pairs with (source); loaded via `onnx_model_path` above.
+- `examples/headless-detection/` - runnable example.

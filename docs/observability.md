@@ -1,7 +1,9 @@
 # Observability
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
+
+This is the umbrella page: the cross-cutting mechanics (sinks, redaction, sampling, correlation ids, spans, dashboards, alerts) live here, and three companion pages own the record shapes and compatibility promises this page only points at. [access-log.md](access-log.md) is the per-request access-log schema (opt-in, one JSON line per completed request). [audit-log.md](audit-log.md) is the admin-action and tamper-evident audit trail (four independently opt-in chained channels). [metrics-stability.md](metrics-stability.md) is the generated catalog of every metric SBproxy emits and what is promised about its name. Start here for how the pillars fit together; go to those three for the field-by-field reference.
 
 ## Three pillars
 
@@ -168,6 +170,29 @@ proxy:
 ```
 
 A record emitted with `tenant_id = Some("acme")` reaches only `acme-loki`; a record with `tenant_id = Some("beta")` reaches only `beta-stdout`; a record without a tenant id reaches neither tenant sink but still reaches any proxy-scope sinks.
+
+```mermaid
+flowchart LR
+    R["One emitted record\n(access_log / error_log /\naudit_log / trace_exporter /\nexternal_log)"] --> T{"target matches\na declared sink?"}
+    T -->|no sink subscribes| DROP["Not delivered to that sink\n(legacy single subscriber\nstill drives stdout when\nno sinks are declared at all)"]
+    T -->|yes| SCOPE{"Sink scope filter"}
+    SCOPE -->|proxy scope| PALL["Every record"]
+    SCOPE -->|tenant scope| PTEN["Only tenant_id == this tenant's id"]
+    SCOPE -->|origin scope| PORI["Only route == this origin's hostname"]
+    PALL --> PROFILE{"profile: internal or external"}
+    PTEN --> PROFILE
+    PORI --> PROFILE
+    PROFILE -->|internal| REDI["Keep JA3/JA4, raw query strings"]
+    PROFILE -->|external| REDE["Strip JA3/JA4, raw query strings"]
+    REDI --> OUT{"output.type"}
+    REDE --> OUT
+    OUT -->|stdout| STDOUT["Process stdout"]
+    OUT -->|stderr| STDERR["Process stderr"]
+    OUT -->|file| FILE["Rotating file\n(gzip on rollover)"]
+    OUT -->|otlp| OTLP["OTel BatchLogProcessor\n-> collector"]
+```
+
+A given record can reach several sinks at once: every proxy-scope sink that subscribes to its `target`, plus every tenant-scope and origin-scope sink whose filter matches. Each sink picks its own `profile` and `output`, so the same record can leave the process once redacted for an external Loki and once unredacted for an internal file, from one emission.
 
 ### OTLP-logs exporter
 
@@ -1452,7 +1477,9 @@ Prometheus-side alerting is independent of these channels: `dashboards/prometheu
 
 ## See also
 
-- [audit-log.md](audit-log.md) - admin-action audit envelope.
+- [access-log.md](access-log.md) - the per-request access-log record shape, filters, sampling, and header capture.
+- [audit-log.md](audit-log.md) - admin-action audit envelope and the four tamper-evident, hash-chained audit trails.
+- [metrics-stability.md](metrics-stability.md) - every metric SBproxy emits, its support tier, and its compatibility promise.
 - [ai-crawl-control.md](ai-crawl-control.md) - per-agent observability for the Pay Per Crawl policy.
 - `deploy/dashboards/` - Grafana JSON for the Wave 1 panels.
 - `deploy/alerts/` - PromQL recording and alerting rules.

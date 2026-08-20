@@ -1,5 +1,5 @@
 # MCP gateway guardrails
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 SBproxy's MCP gateway carries a small set of guardrail mechanisms for
 tool traffic: egress control, session risk accumulation, output
@@ -185,7 +185,7 @@ the honest limits of a deterministic approximation.
 
 ### Content filters
 
-`content_filters` runs the same secret- and PII-shape detector catalogue
+`content_filters` runs the same secret- and PII-shape detector catalog
 `pii:`/`dlp:` use elsewhere against tool-call arguments (outbound) and
 tool-call results, `resources/read`, and `prompts/get` responses
 (inbound), a seam the generic HTTP `response_filter` phase never reaches
@@ -202,7 +202,7 @@ action:
 ```
 
 See [mcp-security.md](mcp-security.md#credentials-reaching-a-tool-that-should-not-see-them)
-for the detector shapes and what a fixed catalogue does not catch.
+for the detector shapes and what a fixed catalog does not catch.
 
 A `warn`, `redact`, or `block` hit carries bounded detection spans on
 the underlying `McpContentFilterHit` / `McpContentFilterVerdict::Denied`
@@ -312,20 +312,36 @@ rather than once per exchange.
 The supervisor's contract:
 
 - The child is spawned on first use and health-checked with an MCP
-  `ping` while idle. A child that stops answering the probe is killed
-  and replaced on the next call.
-- A crashed child is restarted under a bounded exponential backoff.
-  Calls that arrive while the child is down fail closed with a typed
-  error instead of hanging; nothing queues behind a dead process.
+  `ping` every 30 seconds of idleness (not at launch, so a legacy
+  one-shot server that answers once and exits is never consumed by a
+  probe it did not expect). A child that stops answering the probe is
+  killed and replaced on the next call.
+- A crashed child is restarted under a bounded exponential backoff:
+  1 second before the first retry, doubling on each further failure,
+  capped at 60 seconds, with no jitter. The gateway never permanently
+  gives up on a configured server; it rate-bounds the restart instead
+  of gating it closed forever, since only a config edit or reload
+  removes a server. Calls that arrive while the child is inside that
+  backoff window fail closed with a typed error instead of hanging;
+  nothing queues behind a dead process. A child that dies *after*
+  serving at least one call successfully is exempt from backoff and
+  respawns immediately on the next call, which is what keeps a
+  legacy one-shot command working; a child that dies before ever
+  answering a real call is what arms the backoff.
 - A crash loses the child's in-memory state. The gateway replays the
   MCP `initialize` handshake on the replacement child, so protocol
   state is restored, but tool-side state is not.
 - A call that exceeds its deadline is treated as a hung child: the
   call fails closed, the child is killed, and the next call respawns
   it. An oversized or malformed response line closes the session the
-  same way, since line framing cannot be trusted past it.
+  same way, since line framing cannot be trusted past it, and the
+  response byte cap is enforced while the line is read rather than
+  after the whole line is buffered.
 - Removing the server from configuration, or any config reload, kills
   the child.
+
+The idle probe interval and the backoff's base/cap are fixed values,
+not YAML fields; there is no per-server knob for either today.
 
 ```yaml
 action:
@@ -347,6 +363,47 @@ guardrails as every other server's tools. What the gateway cannot see
 is the child's own behavior on the machine: it is a local process,
 outside egress control, and the gateway does not attest the binary it
 launched.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoChild
+    NoChild --> Spawning: first tools/call for this server
+    Spawning --> Handshaking: process started
+    Spawning --> Backoff: spawn failed, never proven
+    Handshaking --> Idle: initialize + notifications/initialized cached
+    Idle --> Idle: ping probe ok (every 30s idle)
+    Idle --> Dispatching: tools/call
+    Dispatching --> Idle: response correlated by wire id
+    Idle --> Dead: ping probe fails
+    Dispatching --> Dead: crash, timeout, oversized/malformed line
+    Dead --> Spawning: child had served at least one call (respawn now)
+    Dead --> Backoff: child never proved itself
+    Backoff --> Backoff: call arrives inside the window (fails closed)
+    Backoff --> Spawning: backoff elapsed (1s, doubling, capped at 60s)
+    NoChild --> [*]: config removal or reload
+    Idle --> [*]: config removal or reload
+    Backoff --> [*]: config removal or reload
+```
+
+Calls in flight when a child dies are failed closed individually
+(`StdioSessionError`), not queued for the replacement; a caller sees the
+error and, on its own retry, either finds an already-respawned child
+(post-success dead child) or a fresh `stdio_backoff` refusal (unproven
+dead child). See [`examples/mcp-stdio/`](../examples/mcp-stdio/) for a
+runnable server that makes the persistent-child behavior visible: the
+same PID and an incrementing per-call counter across two `tools/call`
+requests.
+
+Every failure above (`Backoff`, `Dead`, an oversized or non-JSON line, and
+a probe that times out on an idle child) is counted on
+`sbproxy_mcp_upstream_io_failures_total{kind}`, the same counter the
+`streamable_http` and `sse` transports record their own IO failures on.
+`kind` is `stdio_spawn`, `stdio_backoff`, or `stdio_session_closed` for a
+stdio-specific failure, or the shared `timeout` label when the failure is
+a deadline (stdio or HTTP alike); the HTTP transports additionally use
+`connect` and `response_cap`. Watching this metric surfaces a crash-looping
+or probe-deaf local server the same way it surfaces a hung upstream on the
+other two transports.
 
 ### Run-as-user MCP auth
 

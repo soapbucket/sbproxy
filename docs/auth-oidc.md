@@ -1,6 +1,6 @@
 # OIDC Relying-Party login
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 The `oidc` auth provider turns SBproxy into an OpenID Connect
 Relying Party. Unlike the `jwt` provider, which only validates a
@@ -63,6 +63,32 @@ the curl invocations to walk through.
    back to the originally-requested URL.
 5. Subsequent requests carry the session cookie; the proxy
    decrypts and the caller is treated as authenticated.
+
+```mermaid
+flowchart TD
+    A[Browser requests a protected origin] --> B{Session cookie present?}
+    B -->|yes| C[Decrypt session cookie]
+    C --> D[Request proceeds, caller authenticated]
+    B -->|no| E["Mint tx cookie: sealed PKCE verifier + state + nonce"]
+    E --> F["302 to authorization_endpoint"]
+    F --> G[IdP authenticates the user]
+    G --> H["302 back to /oidc/callback with code + state"]
+    H --> I{tx cookie present and state matches?}
+    I -->|no| J["400 invalid_request: restart the login"]
+    I -->|yes| K["POST code + code_verifier to token_endpoint"]
+    K --> L["Validate ID token: issuer + client_id aud + nonce"]
+    L --> M{userinfo_endpoint set?}
+    M -->|yes| N[Call userinfo, project trust headers]
+    M -->|no| O[No trust-header projection]
+    N --> P[Mint sealed session cookie]
+    O --> P
+    P --> Q[302 back to the originally-requested URL]
+    Q --> D
+```
+
+The `I` branch is the state-fixation guard from [Calling it](#calling-it)
+below: a `code` and `state` alone, with no matching tx cookie, never reach
+the token exchange.
 
 All cookies use the `__Host-` prefix per RFC 6265bis (forces
 `Secure` + `Path=/` + no `Domain`), so the cookie-tossing attack

@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -940,6 +940,23 @@ Every JSON command uses `schema_version: 1` and a stable command name such as
 include durable job IDs when a mutation occurred.
 
 ## Managed engines
+
+```mermaid
+flowchart TD
+    ENGINE{"engine: setting"} -->|"auto (default)"| AUTOFORMAT{Artifact format}
+    AUTOFORMAT -->|GGUF| LLAMACPP["llama.cpp"]
+    AUTOFORMAT -->|safetensors| VLLM["vLLM"]
+    ENGINE -->|"vllm (forced)"| VLLM
+    ENGINE -->|"llama_cpp (forced)"| LLAMACPP
+    ENGINE -->|"sglang (forced, opt-in only)"| SGLANG["SGLang"]
+    ENGINE -->|"mistralrs (forced, opt-in only)"| MISTRALRS["mistral.rs"]
+```
+
+`auto` never resolves to SGLang or mistral.rs; both are named explicitly
+per deployment or not used at all. Once an engine is selected, the fit
+planner in [gpu-fit-planning.md](gpu-fit-planning.md) walks that engine's
+compatible quant list to decide whether the chosen GPU can run and fit
+the model at the requested context.
 
 The runtime reports one of four availability states before provisioning:
 

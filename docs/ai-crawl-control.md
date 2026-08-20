@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 ![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
 
@@ -148,6 +148,10 @@ Content-Type: text/html; charset=utf-8
 link: </licenses.xml>; rel="license"
 Transfer-Encoding: chunked
 ```
+
+The `link` header and the chunked encoding are automatic on any origin that
+has this policy: see [rsl.md](rsl.md#automatic-license-discovery) for what
+else the proxy does to advertise the license document.
 
 Send that exact request a second time and it is refused, because the ledger is
 single-use and the token left the set when it was redeemed:

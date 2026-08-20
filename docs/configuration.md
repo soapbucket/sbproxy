@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -9,48 +9,56 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 ## Table of contents
 
 1. [Overview](#overview)
-2. [Top-level structure](#top-level-structure)
-3. [Proxy settings](#proxy-settings)
-4. [Origins](#origins)
-5. [Actions](#actions)
-6. [Authentication](#authentication)
-7. [Policies](#policies)
-8. [Transforms](#transforms)
-9. [Request modifiers](#request-modifiers)
-10. [Response modifiers](#response-modifiers)
-11. [Response cache](#response-cache)
-12. [Forward rules](#forward-rules)
-13. [Fallback origin](#fallback-origin)
-14. [Variables, vaults, and secrets](#variables-vaults-and-secrets)
-15. [Session config](#session-config)
-16. [Compression](#compression)
-17. [HSTS](#hsts)
-18. [Connection pool](#connection-pool)
-19. [Upstream timeouts](#upstream-timeouts)
-20. [Bot detection](#bot-detection)
-21. [Threat protection](#threat-protection)
-22. [Error pages](#error-pages)
-23. [Rate limit headers](#rate-limit-headers)
-24. [Message signatures](#message-signatures)
-25. [Traffic capture](#traffic-capture)
-26. [Host header semantics](#host-header-semantics)
-27. [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers)
-28. [Request mirror](#request-mirror)
-29. [Upstream retries](#upstream-retries)
-30. [Active health checks](#active-health-checks)
-31. [Circuit breaker](#circuit-breaker)
-32. [Outlier detection](#outlier-detection)
-33. [Service discovery](#service-discovery)
-34. [Correlation ID](#correlation-id)
-35. [mTLS client authentication](#mtls-client-authentication)
-36. [Webhook envelope and signing](#webhook-envelope-and-signing)
-37. [Secrets](#secrets)
-38. [Environment variables](#environment-variables)
-39. [ACME / auto TLS](#acme--auto-tls)
-40. [Redis integration](#redis-integration)
-41. [Config source (GitOps)](#config-source-gitops)
-42. [Config authority](#config-authority-fleet-configuration-distribution)
-43. [Validation](#validation)
+2. [JSON Schema (editor autocomplete + validation)](#json-schema-editor-autocomplete--validation)
+3. [Top-level structure](#top-level-structure)
+4. [Proxy settings](#proxy-settings)
+5. [Tenants](#tenants)
+6. [Origins](#origins)
+7. [Actions](#actions)
+8. [Authentication](#authentication)
+9. [Policies](#policies)
+10. [Transforms](#transforms)
+11. [Request modifiers](#request-modifiers)
+12. [Response modifiers](#response-modifiers)
+13. [Response cache](#response-cache)
+14. [Forward rules](#forward-rules)
+15. [Fallback origin](#fallback-origin)
+16. [Variables, vaults, and secrets](#variables-vaults-and-secrets)
+17. [Session config](#session-config)
+18. [Compression](#compression)
+19. [HSTS](#hsts)
+20. [Connection pool](#connection-pool)
+21. [Upstream timeouts](#upstream-timeouts)
+22. [Bot detection](#bot-detection)
+23. [Threat protection](#threat-protection)
+24. [Error pages](#error-pages)
+25. [Problem details (RFC 9457)](#problem-details-rfc-9457)
+26. [Idempotency](#idempotency)
+27. [Rate limit headers](#rate-limit-headers)
+28. [Message signatures](#message-signatures)
+29. [Traffic capture](#traffic-capture)
+30. [Host header semantics](#host-header-semantics)
+31. [Origin overrides](#origin-overrides)
+32. [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers)
+33. [Request mirror](#request-mirror)
+34. [Upstream retries](#upstream-retries)
+35. [Active health checks](#active-health-checks)
+36. [Circuit breaker](#circuit-breaker)
+37. [Outlier detection](#outlier-detection)
+38. [Service discovery](#service-discovery)
+39. [Correlation ID](#correlation-id)
+40. [mTLS client authentication](#mtls-client-authentication)
+41. [Webhook envelope and signing](#webhook-envelope-and-signing)
+42. [Secrets](#secrets)
+43. [Environment variables](#environment-variables)
+44. [ACME / auto TLS](#acme--auto-tls)
+45. [Redis integration](#redis-integration)
+46. [Config source (GitOps)](#config-source-gitops)
+47. [Config authority](#config-authority-fleet-configuration-distribution)
+48. [Validation](#validation)
+49. [CORS](#cors)
+50. [Quick reference: config field locations](#quick-reference-config-field-locations)
+51. [Environment variable templating in header modifiers](#environment-variable-templating-in-header-modifiers)
 
 ---
 
@@ -245,13 +253,13 @@ origins:
 | `access_log` | object | unset | Structured JSON access-log configuration. |
 | `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
 | `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
-| `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; audit rows remain in memory and tracing. |
+| `audit` | object | unset | Admin-action and security/config/key audit trail. `sink: memory` (default) keeps rows in an in-memory ring and on the `tracing` targets; `sink: chain` additionally hash-chains and Ed25519-signs `security_audit` (plus `config_audit`/`key_audit`/admin-action rows when `config_path`/`key_path`/`admin_path` are set) to a durable file `sbproxy audit verify` can check. See [audit-log.md](audit-log.md). |
 | `egress` | object | unset | Per-purpose outbound allowlists (AI providers, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
 | `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
 | `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
-| `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy. |
+| `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy: `channel`, `auto` (background freshness check, reports only, never replaces an artifact), `check_interval_secs` (default 1 day). See [manual.md](manual.md#update---keep-the-binary-engines-and-models-current) for the full field reference and the `sbproxy update` CLI. |
 
 ### Agent classes
 
@@ -398,6 +406,8 @@ proxy:
 | `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
+| `payments` | object | unset | Durable settlement for paid requests: SQLite intent/attempt/proof/receipt store, challenge binding key, authorization timeout, and the infra-failure posture. Absent keeps every payment provider config-only. See [payments.md](payments.md#getting-paid-proxypayments). |
+| `attestation` | object | unset | Which half (or both) of receipt attestation this node performs, and its failure/enforcement posture; origins may narrow or widen `role`. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
 
 ### Choosing a bind address
 
@@ -891,6 +901,25 @@ proxy:
 | `keep` | int | `20` | Applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1. |
 | `keep_rejected` | int | `10` | Reserved for rejected-candidate retention. Accepted and stored for forward compatibility, but nothing writes to the ring's `rejected/` directory yet in this release, so this field has no observable effect today; a config that fails to apply is not recorded anywhere. Wiring the writer is a later change. |
 
+Every applied revision, whatever triggered it, lands in the ring the same
+way: hash the pre-resolution bytes, write the blob, append an entry, then
+persist the index (eviction, when `keep` is exceeded, always spares
+whichever entry the `lkg` pointer names). `mark_good` is the one thing
+that would move that pointer, and nothing in this release calls it:
+
+```mermaid
+flowchart TD
+    A["Config applies\n(boot, reload, or authority publish)"] --> B["SHA-256 the pre-resolution\ndocument bytes"]
+    B --> C["Write the blob\nblobs/&lt;digest&gt;.yaml.zst"]
+    C --> D["Append a RevisionEntry\nstate: applied, revision N,\nprovenance, blast_radius, actor"]
+    D --> E{"Ring holds more than\nkeep entries?"}
+    E -->|no| F["Persist index.json.bak,\nthen index.json"]
+    E -->|yes| G["Evict the oldest entries\n(never the one lkg names)"]
+    G --> F
+    F --> H["GET /admin/config/history\nGET /admin/config/history/{digest}"]
+    D -.->|"mark_good() exists but has\nno caller in this release"| I["state: good, lkg pointer moves\n(not wired yet)"]
+```
+
 Each entry stores the pre-resolution config bytes: exactly what was read off
 disk, git, or the config authority, before `${VAR}` and
 `vault://`/`secret://` references were resolved, compressed with zstd.
@@ -929,6 +958,9 @@ For what the ring records today, and what it deliberately does not do yet,
 see [operator-runbook.md](operator-runbook.md#config-history-ring). The
 admin routes that read it back are documented in
 [admin-api-reference.md](admin-api-reference.md#get-adminconfighistory).
+[`examples/config-history/`](../examples/config-history/) is a runnable
+walkthrough: boot, apply a change, read the ring back, and read one
+revision's stored document and diff.
 
 ### messenger_settings
 
@@ -974,7 +1006,7 @@ backend left for any driver name to select.
 
 ## Tenants
 
-SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream auth, policy, and vault resolution picks the tenant-scoped config block before falling back to proxy-level defaults.
+SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream credential resolution (and, through it, the credential a governed request authenticates against) and observability walk origin → tenant → proxy, picking the most specific scope that declares a match. Policy and secret-backend configuration are **not** tenant-scoped: there is no `tenants[].policies:` block (policies stay at origin and proxy-wide scope), and every tenant resolves `vault://`/`secret://` references against the same `proxy.secrets.backends:`. A tenant entry carries exactly three fields: `id`, `credentials`, and `observability`.
 
 For single-tenant deployments the synthetic `__default__` tenant is used implicitly; no operator action is required and existing configs see no behavior change.
 
@@ -1002,6 +1034,8 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `proxy.tenants[].id` | string | required | Stable identifier. Referenced from `origin.tenant_id` and stamped on every request the origin serves. Max 256 ASCII characters. The literal `__default__` is reserved and cannot be declared. |
+| `proxy.tenants[].credentials` | list | `[]` | Tenant-scoped credentials. See [Credentials at the tenant scope](#credentials-at-the-tenant-scope). |
+| `proxy.tenants[].observability` | object | | Tenant-scoped `log` (redaction, sinks, custom fields) and `cardinality` (per-tenant metric label budget). See [multi-tenant.md](multi-tenant.md#per-tenant-cardinality-budgets). |
 
 ### Resolution rules
 
@@ -4111,7 +4145,7 @@ What per-origin keys add on top is key separation. Under `inherit`, one leaked k
 - Purge is unaffected. It matches on the cache key and never opens a value, so `POST /admin/cache/purge` with a prefix still clears entries sealed under keys the admin path does not hold.
 - Entries written by a build that predates per-origin keys keep opening, and reseal with the origin bound the next time they are written. Downgrading to such a build evicts the newer entries as unreadable and refetches them, which costs a cache miss each and no correctness.
 
-The runnable version of all of this is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/).
+The runnable version of the store-wide setup (a file-backed cache, key resolved from a `file:` reference, entries sealed with AES-256-GCM) is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/). It is single-origin, so it does not exercise `per_origin_keys` or `previous_keys`; the config above is the reference for that shape.
 
 ### What is encrypted at rest, and what is not
 
@@ -4808,7 +4842,7 @@ Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
 
 ## Rate limit headers
 
-Rate-limit headers are configured on the rate-limiting policy's `headers` block. That is the only surface: the policy that counts the requests is the one that knows the limit, the remaining budget, and the reset time.
+Rate-limit headers are configured on the limiting policy's own `headers` block: the policy that counts the requests is the one that knows the limit, the remaining budget, and the reset time. Two policies emit them, in two different shapes, and neither reads the other's block.
 
 ```yaml
 origins:
@@ -4827,6 +4861,15 @@ origins:
 | `headers.include_retry_after` | bool | false | When true, emit `Retry-After` on 429 responses. |
 
 The origin-level `rate_limit_headers:` block has been removed. It parsed but was never consumed, so a config that still carries it fails config compile with a pointer at the policy-level block above. Delete the origin-level block and move the settings onto the policy.
+
+`rate_limit_budget`, the workspace-wide budget policy documented in
+[policy.md](policy.md), carries its own `headers` block instead of reading
+this one, and emits the newer `draft-ietf-httpapi-ratelimit-headers` /
+RFC 9239 shape on a 429: `RateLimit-Limit`, `RateLimit-Remaining`,
+`RateLimit-Reset`, and, when `headers.include_ratelimit_policy` is true
+(the default), `RateLimit-Policy`. See
+[headers-reference.md](headers-reference.md#response-headers-the-proxy-emits)
+for both header sets side by side.
 
 ---
 

@@ -1,6 +1,6 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
@@ -11,6 +11,19 @@ GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling 
 One origin with two independent gates in front of it. The first gate is identity: the `bot_auth` provider verifies [RFC 9421 HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html) (the IETF Web Bot Auth pattern) against a directory of agent public keys, and returns `401` to anything unsigned or signed with a key it does not know. The second gate is metering: the `ai_crawl_control` policy returns `402 Payment Required` with a JSON challenge naming the price, and lets a request through when it carries a valid `crawler-payment` token. Each token redeems exactly once. A spoofed User-Agent gets past neither gate, because the User-Agent string is never what grants access; it only decides who gets charged.
 
 By the end you will have watched four requests on the wire: an unsigned crawler challenged with `401`, a signed crawler without payment challenged with `402`, the same crawler served with `200` after presenting a token, and the replayed token refused with a fresh `402`.
+
+```mermaid
+flowchart TD
+    REQ["Request arrives\nUser-Agent: GPTBot/1.0"] --> SIG{"bot_auth:\nSignature-Input verifies\nagainst a known key?"}
+    SIG -->|missing or unknown| D401["401 Unauthorized\nbot_auth: signature required"]
+    SIG -->|verified| TOK{"ai_crawl_control:\ncrawler-payment token\npresent and unspent?"}
+    TOK -->|missing| D402A["402 Payment Required\nchallenge body: price, target, header"]
+    TOK -->|present, already spent| D402B["402 Payment Required\nledger: token_already_spent"]
+    TOK -->|present, unspent| REDEEM["Ledger redeems the token\n(single use)"]
+    REDEEM --> D200["200 OK\nrequest forwarded to the origin"]
+```
+
+Identity first, metering second: a request that fails the signature check never reaches the ledger, and a request that passes it still pays per fetch unless a token redeems.
 
 This walkthrough uses the Apache-2.0 code in this repository. It covers 402 challenge bodies, multi-rail negotiation, quote-token JWS, and the two token ledgers: in-memory for one process and JSON over HTTPS for a fleet. Here, "paying" means redeeming a token seeded in the configuration. A production deployment issues tokens from its billing system through the HTTPS ledger client. Settlement adapters live in the same binary behind per-rail cargo features; see [payment-settlement.md](payment-settlement.md).
 
@@ -70,7 +83,7 @@ Nothing unusual so far: one hostname, one upstream. Point `url` at your real ori
             - "@authority"
 ```
 
-This is the identity gate. Crawlers that participate in Web Bot Auth sign every request with an Ed25519 key and advertise the key id in the `Signature-Input` header; the proxy verifies the signature against this directory and rejects everything else with `401`. The `required_components` list forces each accepted signature to cover the verb, the path, and the host, so a captured signature cannot be replayed against a different route or origin. Two caveats worth knowing. The `public_key` above is the published RFC 8032 test vector, chosen so this walkthrough can sign requests without generating keys; in production you paste the vendor's real published key. And `authentication` applies to the whole origin, so every client on `blog.local` must sign, browsers included. Run this shape on a hostname you dedicate to agent traffic. On a mixed human-and-bot site, drop the `authentication` block and let the paywall below do the work alone; it never charges browser User-Agents.
+This is the identity gate. Crawlers that participate in Web Bot Auth sign every request with an Ed25519 key and advertise the key id in the `Signature-Input` header; the proxy verifies the signature against this directory and rejects everything else with `401`. The `required_components` list forces each accepted signature to cover the verb, the path, and the host, so a captured signature cannot be replayed against a different route or origin. Two caveats worth knowing. The `public_key` above is the published RFC 8032 test vector, chosen so this walkthrough can sign requests without generating keys; in production you paste the vendor's real published key. And `authentication` applies to the whole origin, so every client on `blog.local` must sign, browsers included. Run this shape on a hostname you dedicate to agent traffic. On a mixed human-and-bot site, drop the `authentication` block and let the paywall below do the work alone; it never charges browser User-Agents. The example file also carries a second, placeholder `agents` entry for `anthropic-claudebot`: same shape, a filler key that will not verify anything until you paste in ClaudeBot's real published key. It is there to show the directory scaling to more than one crawler, not to work out of the box.
 
 ```yaml
     policies:
@@ -92,7 +105,7 @@ This is the identity gate. Crawlers that participate in Web Bot Auth sign every 
           - demo-tok-003
 ```
 
-This is the meter. A `GET` or `HEAD` from any User-Agent on the list, arriving without a redeemable token in the `crawler-payment` header, gets a `402` whose body names the price and the retry header. `valid_tokens` seeds the in-memory ledger: three tokens, each spendable once, per process. That is deliberate for a demo and wrong for a fleet; multiple replicas need the HTTPS ledger client from [ai-crawl-control.md](ai-crawl-control.md) so one token spends across all nodes. Because `bot_auth` runs first, the ledger only ever hears from crawlers whose identity already checked out.
+This is the meter. A `GET` or `HEAD` from any User-Agent on the list, arriving without a redeemable token in the `crawler-payment` header, gets a `402` whose body names the price and the retry header. `valid_tokens` seeds the in-memory ledger: three tokens, each spendable once, per process. That is deliberate for a demo and wrong for a fleet; multiple replicas need the HTTPS ledger client from [ai-crawl-control.md](ai-crawl-control.md) so one token spends across all nodes. Because `bot_auth` runs first, the ledger only ever hears from crawlers whose identity already checked out. A handful of paths are always free regardless of this policy: `robots.txt`, `sitemap.xml`, `security.txt`, and `crawlers.json` never get a 402, so a crawler can read your terms before deciding whether the rest of the site is worth paying for.
 
 ## Run it
 

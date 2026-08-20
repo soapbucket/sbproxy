@@ -1,6 +1,6 @@
 # MCP and agent traffic
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 ![Initialize an MCP session against the admin API and confirm the notification handshake](assets/admin-mcp.gif)
 
@@ -60,8 +60,17 @@ Four things sit on top of the wire protocol:
   are the mechanisms that enforce the policy `mcp-security.md`
   describes: deterministic egress allowlisting, the lethal-trifecta
   session guardrail (private-data tools + external-communication tools
-  in one session gets denied), dual-LLM output quarantine, stdio
-  supervision, and run-as-user auth.
+  in one session gets denied), dual-LLM output quarantine, supervised
+  `stdio` sessions (one persistent child per configured server, health
+  probed and restarted under bounded backoff rather than a fresh
+  process per call), and run-as-user auth.
+- **Tool composition** ([`mcp-compose.md`](mcp-compose.md)) is for a
+  tool that is only a call, or a short sequence of calls, with no
+  separate MCP server worth standing up: a `type: local` federated
+  server declares it entirely in config (a fixed value, one HTTP call,
+  or a dependency-ordered DAG), and it publishes into the same catalog
+  a real upstream would, so the same RBAC, versioning, and guardrails
+  apply.
 - **Tool lifecycle** ([`tool-versioning.md`](tool-versioning.md)) is
   what MCP has no native answer for: publishing several versions of one
   tool, resolving the right version per consumer, and a compatibility
@@ -141,10 +150,17 @@ individual tool-call JSON for a large catalog.
 - [`examples/mcp-tool-versioning/`](../examples/mcp-tool-versioning/) and
   [`examples/mcp-tool-rollout/`](../examples/mcp-tool-rollout/) - the
   rollout plane from `tool-versioning.md`.
+- [`examples/mcp-stdio/`](../examples/mcp-stdio/) - a federated server
+  reached over supervised `stdio` instead of HTTP.
+- [`examples/mcp-compose/`](../examples/mcp-compose/) and
+  [`examples/mcp-local-tools/`](../examples/mcp-local-tools/) - config-declared
+  tools from `mcp-compose.md`.
 - [`examples/mcp-code-mode/`](../examples/mcp-code-mode/) - the
   Cloudflare Code Mode emitter.
 - [`examples/admin-mcp/`](../examples/admin-mcp/) - the admin API
   exposed as governed MCP tools.
+- [`examples/agent-skills/`](../examples/agent-skills/) - the Agent
+  Skills manifest, visibility filter, and digest contract.
 - [`examples/a2a-protocol/`](../examples/a2a-protocol/) - the `a2a`
   action and policy.
 - [`examples/a2a-prompt-injection/`](../examples/a2a-prompt-injection/) -

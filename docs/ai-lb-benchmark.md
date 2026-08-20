@@ -1,5 +1,5 @@
 # AI router load-balancing benchmark
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-19*
 
 The AI router supports several load-balancing strategies (round-robin,
 peak-EWMA, least-connections, least-token-usage, prefix-affinity, and
@@ -143,3 +143,8 @@ the canonical reference for the flags and the model assumptions.
 - The `sbproxy_ai_lb_decisions_total{strategy, provider}` metric
   emitted by the router lets you reproduce the per-provider
   distribution table on a live deployment.
+- [ai-gateway.md#routing-strategies](ai-gateway.md#routing-strategies)
+  documents every strategy's config and semantics; this page only compares
+  the latency-sensitive subset under synthetic load.
+- [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md) covers
+  `outcome_aware`, the cost-per-success strategy this bench does not touch.

@@ -1,7 +1,7 @@
 # content_digest policy
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
-The `content_digest` policy verifies an inbound request body against the digest the client advertises in the `Content-Digest:` header (RFC 9530). On mismatch, malformed header, or unsupported algorithm, the proxy rejects the request before forwarding. The intended audience is integrity-critical inboxes: webhook receivers, agent endpoints, payment callbacks, audit-ingest paths.
+The `content_digest` policy verifies an inbound request body against the digest the client advertises in the `Content-Digest:` header (RFC 9530). On mismatch, malformed header, missing header, or unsupported algorithm, the proxy rejects the request with the configured status. The intended audience is integrity-critical inboxes: webhook receivers, agent endpoints, payment callbacks, audit-ingest paths.
 
 The policy honors `Content-Digest:` first and falls back to `Repr-Digest:` if `Content-Digest:` is absent. RFC 9530 §2 makes the two interchangeable for inbound traffic that does not decode `Content-Encoding`. SHA-256 and SHA-512 are supported; unknown algorithms fall through to the configured failure mode.
 
@@ -15,14 +15,31 @@ origins:
     upstream: https://api.internal
     policies:
       - type: content_digest
+        # Algorithms accepted in the header. Defaults to both active
+        # entries in the RFC 9530 IANA registry. Narrow to [sha-256]
+        # to refuse sha-512 for cost reasons.
+        algorithms: [sha-256, sha-512]
         # What to do when the client did not send any digest header.
         # `require` (default): reject. `skip`: pass through unverified
         # (useful when the origin mixes integrity-required and
         # integrity-optional traffic on the same hostname).
         on_missing: require
-        # HTTP status returned on every failure path (missing when
-        # required, mismatch, malformed, unsupported algorithm).
+        # HTTP status returned on mismatch, malformed header, or
+        # unsupported algorithm.
         status: 400
+        # HTTP status returned when the header is absent and
+        # on_missing: require. Defaults to `status` when unset, so a
+        # deployment can answer 400 on a mismatch and a different
+        # status (422, for instance) on a missing header.
+        missing_status: 400
+        # Response body on rejection. Omitted: the proxy sends the
+        # small JSON {error, detail} envelope shown below.
+        error_body: null
+        # Content-Type for the rejection body.
+        error_content_type: application/json
+        # Cap on body bytes buffered for verification; above this the
+        # body filter rejects with 413 instead of buffering unboundedly.
+        max_body_bytes: 10485760   # 10 MiB
 ```
 
 ## Failure modes
@@ -31,9 +48,9 @@ origins:
 |---|---|
 | Header present, digest matches | Pass; sets `ctx.content_digest_verified = true` |
 | Header present, digest mismatch | Reject with `status` |
-| Header present, algorithm not in {sha-256, sha-512} | Reject with `status` |
+| Header present, algorithm not in the configured `algorithms` set | Reject with `status` |
 | Header present, parse error | Reject with `status` |
-| Header absent, `on_missing: require` | Reject with `status` |
+| Header absent, `on_missing: require` | Reject with `missing_status` (defaults to `status`) |
 | Header absent, `on_missing: skip` | Pass through unverified |
 
 ## Calling it
@@ -108,9 +125,11 @@ is not a well-formed digest; it reports malformed rather than mismatch. If you
 are testing the mismatch path, use a real base64 digest of different content,
 as above, or you will be exercising the parser instead.
 
-All four responses carry `status`, so changing that one field moves
-every failure path together. There is no way to answer `400` on a mismatch and
-`422` on a missing header.
+Mismatch, malformed, and unsupported-algorithm all carry `status`, so
+changing that one field moves those three failure paths together. The
+missing-header path carries its own `missing_status`, which defaults to
+`status` but can be set separately, so a config can answer `400` on a
+mismatch and `422` on a missing header.
 
 ## Why the verified flag matters
 

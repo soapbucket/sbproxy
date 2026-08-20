@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
@@ -229,7 +229,7 @@ The repository ships three worked examples covering the common shapes:
 
 * `examples/multi-tenant-saas/`: the config above, runnable, with the three scopes asserted against a local fixture.
 * `examples/ai-virtual-keys/`: single-tenant credentials block with two team-scoped keys.
-* `examples/vault-reference/`: multi-tenant provider references across HashiCorp, AWS, GCP, Kubernetes, file, and static-map backends.
+* `examples/vault-reference/`: multi-tenant provider references across HashiCorp, AWS, GCP, Azure, Kubernetes, file, and static-map backends.
 
 ## Related reading
 

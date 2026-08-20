@@ -1,6 +1,6 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-19*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
@@ -74,7 +74,7 @@ sbproxy validate sb.yml
 | `litellm_params.weight` | `providers[].weight` |
 | `litellm_params.max_budget` (+ optional `budget_duration`) | action-level `budget.limits[]` with `max_cost_usd` and `period` when every model that sets a budget shares the same cap and window |
 | Two `model_list` entries sharing a `model_name` | a model group: two providers listing that model, load-balanced by the routing strategy |
-| `router_settings.routing_strategy` | `routing` (`simple-shuffle`->`round_robin`, `latency-based-routing`->`lowest_latency`, `usage-based-routing`->`least_token_usage`, `least-busy`->`least_connections`, `cost-based-routing`->`cost_optimized`). Unknown strategy names warn with the original value and fall back to `round_robin` |
+| `router_settings.routing_strategy` | `routing` (`simple-shuffle`->`round_robin`, `latency-based-routing`->`lowest_latency`, `usage-based-routing` or `usage-based-routing-v2`->`least_token_usage`, `least-busy`->`least_connections`, `cost-based-routing`->`cost_optimized`). Unknown strategy names warn with the original value and fall back to `round_robin` |
 | `litellm_settings.cache` | `semantic_cache.enabled` |
 | `callbacks` / `success_callback` / `failure_callback` of `langfuse`, `datadog`, `otel`, `s3`/`s3_v2`, `gcs_bucket` | `usage_sinks[]` entries (credentials via `${LANGFUSE_*}`, `${DD_API_KEY}`, `${AWS_S3_BUCKET_NAME}`, `${GCS_BUCKET_NAME}`) |
 | Other known sink names (`prometheus`, `helicone`, `langsmith`) | warned as unsupported; configure `usage_sinks` by hand |

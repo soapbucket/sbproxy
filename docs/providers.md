@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
@@ -124,6 +124,8 @@ origins:
             - claude-haiku-4-5
 ```
 
+`default_model` names the model shown in this provider's `/v1/models` listing and, for a locally served provider (a `serve:` block), the model a request routes to when it omits `model`. A hosted provider like the one above does not get this fallback: dispatch to a hosted provider still needs an explicit `model` from the caller. See [ai-gateway.md](ai-gateway.md#provider-setup) for the caveat in full.
+
 Useful per-provider knobs:
 
 ```yaml
@@ -132,7 +134,7 @@ providers:
     api_key: ${OPENAI_API_KEY}
     base_url: https://api.openai.com/v1     # Override default
     models: ["gpt-4o", "gpt-4o-mini"]       # Whitelist
-    default_model: gpt-4o-mini              # Used when client omits `model`
+    default_model: gpt-4o-mini              # Local-serving default and /v1/models metadata; not injected on hosted dispatch
     model_map:                              # Rename models on the way out
       fast: gpt-4o-mini
       smart: gpt-4o

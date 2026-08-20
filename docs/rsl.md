@@ -1,6 +1,6 @@
 # RSL 1.0 licensing cookbook
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-19*
 
 This is the cookbook for expressing a specific license stance via SBproxy YAML and seeing the result in the `/licenses.xml` document the proxy serves. The reader is a publisher author or counsel who wants the right RSL terms on the wire without writing XML by hand.
 
@@ -337,6 +337,177 @@ standard `Disallow` and `Crawl-delay` directives correctly.
 All three are `200` with distinct content types (`application/xml`,
 `application/json`, `text/plain; charset=utf-8`). Serving a `404` on any of
 them means the projection did not compile, not that the path is unrouted.
+
+## Automatic license discovery
+
+Once an origin has an `ai_crawl_control` policy (so `/licenses.xml` exists
+for it), the proxy advertises that document on every response from the same
+origin, not only on the priced routes. This is automatic; there is no
+config field that turns it on or off.
+
+Every response gets an RFC 8288 discovery header, appended after any
+`Link` headers the upstream already set:
+
+```
+link: </licenses.xml>; rel="license"
+```
+
+That is the header visible in the [ai-crawl-control.md](ai-crawl-control.md)
+walkthrough's paid response. When the response `Content-Type` is
+`text/html`, the proxy also buffers the body and inserts the same
+relationship as an inline tag immediately after the `<head>` open tag:
+
+```html
+<head><link rel="license" href="/licenses.xml">
+```
+
+RSS and Atom feeds (`Content-Type: application/rss+xml` or
+`application/atom+xml`, parameters ignored) get the self-closing XML form
+inserted immediately after the `<channel>` or `<feed>` open tag instead:
+
+```xml
+<channel><link rel="license" href="/licenses.xml"/>
+```
+
+Either injection is skipped, and the body passed through unchanged, when the
+body already contains a `rel="license"` link (case-insensitive) or when the
+expected container tag (`<head>`, `<channel>`, `<feed>`) is not found in the
+first 8 KiB, so a page that already declares its own license link is never
+double-tagged and a non-matching body is never rewritten. Because the
+injection can change the body length, the proxy drops any `Content-Length`
+on an HTML or feed response from a licensed origin and switches to
+`Transfer-Encoding: chunked`, which is why the example response in
+[ai-crawl-control.md](ai-crawl-control.md) shows chunked encoding rather
+than a length.
+
+## Richer license shapes
+
+The recipes above cover the common case: one signal, one price, one
+`<license>` per origin. Two further `ai_crawl_control` fields reach RSL
+elements the recipes above do not touch.
+
+### Payment types beyond crawl and free
+
+The `<payment type="...">` element in every example above was derived
+automatically from `price:` (`crawl` when positive, `free` when unset). An
+explicit `payment:` block on the policy overrides that derivation and
+reaches the rest of the RSL 1.0 payment-type enum: `purchase`,
+`subscription`, `training`, `use`, and `attribution`, alongside `crawl` and
+`free`. An unrecognized `type` value is ignored and the policy falls back
+to the automatic `price:`-derived terms.
+
+`attribution` additionally accepts a `standard:` URL naming the reuse
+framework the attribution requirement points to (a Creative Commons
+variant, typically):
+
+```yaml
+policies:
+  - type: ai_crawl_control
+    price: 0.001
+    currency: USD
+    payment:
+      type: attribution
+      standard: https://creativecommons.org/licenses/by/4.0/
+```
+
+```xml
+<payment type="attribution">
+  <standard>https://creativecommons.org/licenses/by/4.0/</standard>
+</payment>
+```
+
+Omitting `standard:` on an `attribution` payment keeps the self-closing
+form, `<payment type="attribution" />`.
+
+### Tier-1 vocabulary: audience and geography
+
+RSL 1.0 also defines an audience token set (`commercial`,
+`non-commercial`, `education`, `government`, `personal`, per RSL §3.4.1.2)
+and accepts ISO 3166-1 alpha-2 country codes as a geo tier. Declare either
+on the policy's `rsl_vocab:` block, each split into `permit` and
+`prohibit` lists the same way `content_signals:` splits usage tokens:
+
+```yaml
+policies:
+  - type: ai_crawl_control
+    price: 0.001
+    currency: USD
+    content_signals:
+      ai_train: true
+    rsl_vocab:
+      user:
+        permit: [non-commercial, education]
+        prohibit: [commercial]
+      geo:
+        permit: [US, CA]
+```
+
+```xml
+<permits type="usage">ai-train</permits>
+<permits type="user">non-commercial education</permits>
+<prohibits type="user">commercial</prohibits>
+<permits type="geo">US CA</permits>
+<content-signal>ai-train=yes</content-signal>
+```
+
+`rsl_vocab` only renders when the origin's usage signal comes from the
+plural `content_signals:` block or from `license_tiers:` (below). Pair it
+with the singular origin-level `content_signal:` field from the earlier
+recipes and it renders nothing extra: the license still renders, just
+without the `user` and `geo` elements, and nothing warns you. Use
+`content_signals:` on the policy, as in the example here, whenever
+`rsl_vocab` is in play.
+
+### Multiple license tiers on one origin
+
+A single origin can also offer more than one license, the way a TollBit
+marketplace prices a cheap summarization tier separately from an
+expensive full-display tier. Declare `license_tiers:` on the policy: each
+entry gets its own `<license>` element, all still wrapped in the origin's
+one `<content>` element, and its own URN fragment
+(`urn:rsl:1.0:<hostname>:<version>#<tier-name>`):
+
+```yaml
+policies:
+  - type: ai_crawl_control
+    price: 0.001
+    currency: USD
+    license_tiers:
+      - name: summarize
+        payment: { type: crawl, amount: 0.002, currency: USD }
+        signals: { search: true, ai_input: true }
+      - name: full-display
+        payment: { type: crawl, amount: 0.01, currency: USD }
+        signals: { search: true, ai_input: true, ai_train: false }
+```
+
+```xml
+<content url="https://blog.example.com/*">
+  <license urn="urn:rsl:1.0:blog.example.com:0#summarize">
+    <origin hostname="blog.example.com" />
+    <payment type="crawl" amount="0.002" currency="USD" />
+    <permits type="usage">search ai-input</permits>
+    <content-signal>search=yes, ai-input=yes</content-signal>
+  </license>
+  <license urn="urn:rsl:1.0:blog.example.com:0#full-display">
+    <origin hostname="blog.example.com" />
+    <payment type="crawl" amount="0.01" currency="USD" />
+    <permits type="usage">search ai-input</permits>
+    <prohibits type="usage">ai-train</prohibits>
+    <content-signal>search=yes, ai-input=yes, ai-train=no</content-signal>
+  </license>
+</content>
+```
+
+Each tier's `signals:` block takes the same `search` / `ai_input` /
+`ai_train` fields as the policy-level `content_signals:` block, scoped to
+that tier alone; a tier that omits `payment:` renders `type="free"`. A
+declared `rsl_vocab:` still applies origin-wide: both tiers repeat the
+same `user` and `geo` elements, since audience and geography are not
+priced per tier. `license_tiers:` takes priority over `content_signals:`
+and the singular `content_signal:` field when present; the `tdmrep.json`
+and `robots.txt` projections keep reading the policy-level signal, since
+per-tier rights are an RSL-only concept today.
 
 ## Validation
 

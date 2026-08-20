@@ -1,6 +1,6 @@
 # Config authority certification drills
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-08-19*
 
 Eight drills that run an authority and a subscriber as separate processes
 and check what happens when configuration is published, rotated,
@@ -23,6 +23,37 @@ Twice before in this project, a feature certified by unit tests alone
 turned out not to work when a real process tried it, and validation on
 real hardware found the bugs both times. Those two rounds cost a GPU
 instance and a day each. This one costs two processes on a laptop.
+
+## The transaction every drill is really testing
+
+A file-watch reload, a `SIGHUP`, `POST /admin/reload`, and an applied
+config-authority bundle all funnel into the same three-phase transaction.
+The order of the phases is the property, not an implementation detail: a
+config that compiles but cannot construct a pipeline used to leave a node
+running new sandbox limits, new redaction rules, and a new key plane
+against the *old* pipeline, while the error claimed nothing had changed.
+
+```mermaid
+flowchart TD
+    A["New config text\n(file watch, SIGHUP, admin reload, authority publish)"] --> B["Phase 1: Reject\ncompile the YAML, run every check that\ncan refuse the candidate outright"]
+    B -->|refused| Z1["Err returned.\nNothing observable has changed yet."]
+    B -->|compiles| C["Phase 2: Construct\ninstall the AI provider catalog, build the\npipeline, load listings, run the lifecycle\nhook, reconcile the model runtime"]
+    C -->|construction fails| D["Roll the provider catalog back"]
+    D --> Z2["Err returned.\nNode left exactly as it was."]
+    C -->|construction succeeds| E["Phase 3: Commit\ninstall the request-path and admin-path\nglobals, publish the pipeline"]
+    E --> F["ReloadOutcome returned.\nCannot fail; soft subsystem failures\nrecord themselves as degraded."]
+    F --> G["proxy.config_history ring:\na new entry is appended, if enabled"]
+```
+
+Each drill below exercises one seam in that transaction from outside the
+process: drill 1 proves phase 3 actually swaps the pipeline, drill 4
+proves phase 1 refuses a tampered payload before phase 2 ever runs, drill
+5 proves an authority outage never reaches phase 1 at all (the subscriber
+keeps serving what phase 3 already committed), and drill 6 proves the
+refusal in phase 1 holds at both the authority's publish gate and the
+subscriber's own apply gate. `reload_from_config_yaml` in
+`crates/sbproxy-core/src/server/lifecycle.rs` is the shared entry point;
+its doc comment is the source this diagram is drawn from.
 
 ## Running them
 

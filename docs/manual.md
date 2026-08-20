@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -160,6 +160,8 @@ sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
                         [--validate-only]
 sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
 sbproxy config {migrate|import-litellm|print}
+sbproxy config history [--admin-url <url>] [--format text|json]
+sbproxy config show <revision> [--admin-url <url>] [--format text|json]
 sbproxy config authority init --dir <path> [--key-id <id>] [--authority-id <id>]
                               [--force] [--format text|json]
 sbproxy config authority publish -f <payload.yml> [--mode overlay|replace]
@@ -214,11 +216,11 @@ The full subcommand set, one line each:
 | `validate` | Validate an `sb.yml` without starting the proxy. |
 | `plan` | Diff a proposed config against a baseline. |
 | `apply` | Validate and reload a config in place; the same primitive the SIGHUP handler and file watcher use. |
-| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked, `authority` operates a config authority (generate its key, publish, watch the rollout, roll back, manage subscriber credentials), `pull --dry-run` previews the bundle a subscriber would apply next. |
+| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked, `authority` operates a config authority (generate its key, publish, watch the rollout, roll back, manage subscriber credentials), `pull --dry-run` previews the bundle a subscriber would apply next, `history` lists the revisions recorded in a running proxy's `proxy.config_history` ring, `show <revision>` prints one of those revisions' stored document. |
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, drain and stop one, write or check a lockfile (`lock`, `verify-lock`), or reclaim unreferenced cache blobs (`prune`). |
-| `mcp` | Federated MCP tool-catalogue lockfile: `lock` discovers the configured servers and pins every advertised tool at its current contract digest; `verify-lock` re-discovers and diffs against the committed baseline without starting a listener, exiting 2 on drift, for CI. |
+| `mcp` | Federated MCP tool-catalog lockfile: `lock` discovers the configured servers and pins every advertised tool at its current contract digest; `verify-lock` re-discovers and diffs against the committed baseline without starting a listener, exiting 2 on drift, for CI. |
 | `rego` | `rego test <path>` is the offline `opa test` analogue: runs one or more YAML fixture files against the Rego module(s) they name and prints a per-module line-coverage summary, without touching `sb.yml` or a running proxy. See [scripting.md §3a](scripting.md#3a-rego-policies). |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
@@ -558,6 +560,32 @@ serving.
 | 3 | The bundle or the merged document was refused. The reason names which check fired. |
 | 7 | The authority could not be reached. Nothing was applied. |
 
+### `config history` / `config show` - inspect a running proxy's applied revisions
+
+Both talk to the admin API of an already-running proxy, the same way
+`apply` and `config authority status` do: `--admin-url` or `SB_ADMIN_URL`,
+credentials from `--username`/`--password` or
+`SB_ADMIN_USERNAME`/`SB_ADMIN_PASSWORD`. Neither reads a local YAML file.
+They require `proxy.config_history.enabled` on the node they talk to; a
+node with history disabled has nothing recorded to show.
+
+```bash
+sbproxy config history
+sbproxy config history --format json
+
+sbproxy config show 42
+sbproxy config show 42 --format json
+```
+
+`history` lists every revision recorded in `proxy.config_history`'s ring,
+newest first: revision number, state, blast radius, provenance, applied-at
+timestamp, actor, and digest. `show <revision>` prints one revision's
+stored document, selected from the same ring by the revision number
+`history` lists; a revision that has aged out under
+`proxy.config_history.keep` is no longer available. `--format json` on
+`show` prints the admin API's full detail envelope (`entry`, `document`,
+`plan_text`) rather than just the document.
+
 ### `projections render` - serve-time documents on demand
 
 Renders the per-origin projection document (robots.txt, llms.txt,
@@ -814,7 +842,7 @@ Six checks, each named so a script can grep for one:
 | `unpinned_weights` | a node holding the `worker` role serves an unpinned raw `hf:` or `file:` reference without `serve.allow_unpinned_refs` |
 
 Each check compares the config's own demands against the host, so a
-config that asks for nothing local is not penalised: a check that does
+config that asks for nothing local is not penalized: a check that does
 not apply reports `skip`, never a hollow `pass`. Both config forms are
 read, the inline provider-level `serve:` block and the canonical
 `proxy.model_host` block.
@@ -1869,7 +1897,7 @@ Status codes:
 | Code | Meaning |
 |------|---------|
 | 200 | Reload succeeded; the response body carries `config_revision` and `loaded_at`. |
-| 400 | YAML parse error. The response sanitises the file path so error envelopes never leak the absolute path on disk. |
+| 400 | YAML parse error. The response sanitizes the file path so error envelopes never leak the absolute path on disk. |
 | 401 | Missing or invalid basic auth. |
 | 405 | Wrong HTTP method (only `POST` is accepted). |
 | 409 | Another reload is already in flight. The proxy serializes the file watcher and the admin route on the same single-flight guard. |
@@ -2087,7 +2115,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: sbproxy
-          image: soapbucket/sbproxy:1.5.0
+          image: soapbucket/sbproxy:1.13.0
           args: ["serve", "-f", "/etc/sbproxy/sb.yaml"]
           env:
             - name: SB_LOG_LEVEL
