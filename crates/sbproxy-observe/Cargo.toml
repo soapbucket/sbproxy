@@ -108,6 +108,11 @@ tempfile = "3"
 # round-trips it. A substring assertion would not have caught the eaten
 # `:` that broke the YAML.
 serde_yaml.workspace = true
+# WOR-2572: the forced audit-write-failure test lowers RLIMIT_FSIZE and
+# ignores SIGXFSZ so a real chain append fails with EFBIG on the held
+# file descriptor; both knobs are libc-only and unix-only. Already in
+# the dependency graph transitively; this only makes it nameable.
+libc = "0.2"
 # WOR-1186: validate emitted session-ledger records against the
 # canonical schema (vendored copy under tests/).
 jsonschema.workspace = true

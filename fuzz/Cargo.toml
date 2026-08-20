@@ -12,8 +12,19 @@
 #     cargo +nightly fuzz run llms_txt_parser   -- -max_total_time=10
 #
 # The 10-second smoke pass is what landed in the commit message for
-# this change. CI runs longer; see `.github/workflows/wave4-fuzz.yml`
-# (B4.5 / B4.6 fan-out).
+# this change.
+#
+# Nothing runs these targets automatically. They had a CI lane,
+# `.github/workflows/wave4-fuzz.yml`, gated on a `run-fuzz` pull
+# request label that was never created in this repository, so the lane
+# skipped on every run it ever had. That file is deleted, and the local
+# gate does not run them either. Run them by hand; scripts/README.md
+# carries the prerequisites and the working-tree caveats.
+#
+# No target here has been observed passing anywhere. The only manual
+# dispatches of the old lane, one on `main` and one on a branch, failed
+# every target on "sanitizer is incompatible with statically linked
+# libc" and a missing `std` crate. WOR-2594 owns the fix.
 #
 # G4.6 (llms.txt projection, WOR-130) has landed; the
 # `llms_txt_parser` target drives the public

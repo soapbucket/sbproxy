@@ -194,7 +194,7 @@
       ]
     },
     "events": {
-      "description": "Where typed proxy events go. Absent, or present with the default `sink: none`, means the thirteen event types stay in-process and nothing leaves the proxy.",
+      "description": "Where typed proxy events go. Absent, or present with the default `sink: none`, means the eighteen event types stay in-process and nothing leaves the proxy.",
       "default": null,
       "anyOf": [
         {
@@ -11252,7 +11252,7 @@
           ]
         },
         "types": {
-          "description": "Which of the thirteen event types to deliver. Empty or absent means all of them.\n\nNames are the snake_case wire names (`policy_denied`, `auth_denied`, `config_reloaded`, ...). An unrecognized name is refused with the accepted list rather than skipped, so a typo cannot present as a sink that is working and quiet.",
+          "description": "Which of the eighteen event types to deliver. Empty or absent means all of them.\n\nNames are the snake_case wire names (`policy_denied`, `auth_denied`, `config_reloaded`, ...). An unrecognized name is refused with the accepted list rather than skipped, so a typo cannot present as a sink that is working and quiet.",
           "default": [],
           "type": "array",
           "items": {

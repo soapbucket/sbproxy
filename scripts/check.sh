@@ -89,8 +89,9 @@ print_skip_summary() {
   else
     printf '\033[1;33mSKIPPED PHASES (these did NOT run):\033[0m\n'
     printf '%s' "$SKIPPED"
-    printf '\033[1;33mCI runs every one of these. A skip here is a lane you\n'
-    printf 'have not actually checked on this machine.\033[0m\n'
+    printf '\033[1;33mA skip here is a lane you have not actually checked on\n'
+    printf 'this machine. Most of these have a CI lane behind them; do not\n'
+    printf 'assume all of them do.\033[0m\n'
   fi
   printf '\033[1;33m========================================================\033[0m\n'
 }

@@ -1,6 +1,6 @@
 # scripts/
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-20*
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
 the GitHub workflows invoke. Run from the repository root unless a
@@ -50,6 +50,80 @@ optional tools that land there. The full env-var list is in `CLAUDE.md`.
 `target/release` after local release-profile experiments. The default
 cleanup keeps release artifacts so deployment-oriented workflows do not
 pay an unexpected rebuild cost.
+
+## Fuzz harnesses
+
+`fuzz/` is a standalone cargo-fuzz crate whose targets cover the Wave 4
+parsers, the stateful proxy driver, and the scripting runtimes. Nothing
+runs them for you. They had a CI lane, `.github/workflows/wave4-fuzz.yml`,
+whose job was gated on a `run-fuzz` pull request label that was never
+created in this repository, so the lane concluded `skipped` on every run
+it ever had and a green pull request never meant the fuzzers ran. That
+file is deleted rather than repaired: a lane that reads as coverage in
+review and delivers none is worse than no lane. `check.sh` does not run
+them either, so they are a deliberate manual job.
+
+cargo-fuzz is nightly-only, and neither nightly nor cargo-fuzz ships with
+a plain `cargo`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+Homebrew's rust and rustup both provide a `cargo`, and only rustup's
+understands `+nightly`, so put rustup ahead of Homebrew on `PATH`, and
+keep `~/.cargo/bin` on it so `cargo-fuzz` is found. Then, from `fuzz/`:
+
+```bash
+cargo +nightly fuzz list
+cargo +nightly fuzz run <target> -- -max_total_time=15
+```
+
+`cargo +nightly fuzz list` is the only complete list of targets. The
+deleted CI matrix named nine by hand while `fuzz/Cargo.toml` declares
+ten, so `cel_script`, the one target with a committed seed corpus, was
+fuzzed nowhere.
+
+Two things to know before the first run.
+
+libfuzzer treats its first corpus argument as an output directory and
+grows it with every interesting input it finds, and cargo-fuzz defaults
+that argument to `fuzz/corpus/<target>/`. A default run therefore leaves
+either a new untracked directory or new files inside the tree, and
+`check.sh`'s working-tree guard fails on it afterwards. Point the
+writable corpus somewhere outside the repository and pass the committed
+seeds as a second, read-only argument:
+
+```bash
+mkdir -p ~/.cache/sbproxy/fuzz-corpus/<target>
+cargo +nightly fuzz run <target> \
+  ~/.cache/sbproxy/fuzz-corpus/<target> \
+  corpus/<target> \
+  -- -max_total_time=15
+```
+
+Crash reproducers land in `fuzz/artifacts/<target>/`, which is
+gitignored for the same reason.
+
+And expect a failure that is not yours. No target here has been observed
+passing anywhere. The only manual dispatches of the old CI lane, one on
+`main` and one on a branch, failed every target identically inside
+`cargo fuzz run`:
+
+```
+error: sanitizer is incompatible with statically linked libc,
+       disable it using `-C target-feature=-crt-static`
+error[E0463]: can't find crate for `std`
+```
+
+`main` fails that way with no local change involved, so this is
+pre-existing rot rather than anything a caller did. WOR-2594 owns the
+fix and wants the failure reproduced before a remedy is picked, which is
+why neither this document nor the crate carries a speculative
+`-C target-feature=-crt-static`. Whether the same break happens on macOS
+is not yet known: nobody has had a nightly toolchain on a Mac to try.
 
 ## Cross-cutting runners
 

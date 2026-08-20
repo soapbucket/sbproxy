@@ -10346,6 +10346,34 @@ origins:
         );
     }
 
+    /// WOR-2571: the five key-lifecycle kinds resolve through the same
+    /// `EventType::from_name` path as every other name, so this pins
+    /// the config boundary accepting them rather than trusting the
+    /// enum change alone. A regression here would refuse a correct
+    /// `events.types:` at compile time, which is the loudest possible
+    /// failure, but only if someone has a config that names them; this
+    /// test is that config.
+    #[test]
+    fn events_types_accept_the_key_lifecycle_kinds() {
+        let compiled = compile_config(&events_yaml(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  types:\n    \
+             - key_minted\n    - key_revoked\n    - key_rotated\n    - key_blocked\n    \
+             - credential_resolved",
+        ))
+        .expect("the key-lifecycle event names must be accepted");
+        let events = compiled.events.expect("events block survives compilation");
+        assert_eq!(
+            events.types,
+            vec![
+                "key_minted",
+                "key_revoked",
+                "key_rotated",
+                "key_blocked",
+                "credential_resolved"
+            ]
+        );
+    }
+
     #[test]
     fn an_unknown_events_key_is_refused() {
         // `deny_unknown_fields`, so a `batch_size:` or a `retries:` an

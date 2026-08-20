@@ -25,11 +25,16 @@
 # rustup honors this file for every cargo invocation inside the repo,
 # which outranks `rustup default`. Lanes that must run on a different
 # toolchain say so with RUSTUP_TOOLCHAIN, which outranks this file:
-# msrv.yml (the declared MSRV), wave4-fuzz.yml (nightly, for
-# cargo-fuzz), and release.yml's cross-target build (the toolchain the
-# release targets were installed into). Container builds pin through
-# their `FROM rust:<version>` tag, so this file is kept out of the
-# docker context in .dockerignore.
+# msrv.yml (the declared MSRV) and release.yml's cross-target build
+# (the toolchain the release targets were installed into). Container
+# builds pin through their `FROM rust:<version>` tag, so this file is
+# kept out of the docker context in .dockerignore.
+#
+# The fuzz harnesses need the nightly cargo-fuzz requires and had a
+# lane here too, until it turned out that lane had never run; it is
+# deleted. They are a manual, local job now, invoked as
+# `cargo +nightly`, which outranks this file the same way
+# RUSTUP_TOOLCHAIN does. See scripts/README.md.
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt", "clippy"]
