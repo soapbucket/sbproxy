@@ -133,6 +133,7 @@ impl ChatFormat for OpenAiResponsesFormat {
         if obj.get("prompt").is_some_and(|v| !v.is_null()) {
             hub.lossiness.push(super::LossinessNote {
                 field: "responses.prompt".into(),
+                metric_label: "responses.prompt".into(),
                 direction: super::LossinessDirection::Unsupported,
                 note: "prompt template reference dropped: the gateway does \
                        not resolve server-side prompt objects, so the request \
@@ -237,9 +238,10 @@ impl ChatFormat for OpenAiResponsesFormat {
                 } else {
                     // WOR-2512: every unsupported tool block leaves a
                     // trace naming what was dropped.
-                    let label = tool_type_label(ty);
+                    let label = super::sanitize_type_label(ty);
                     hub.lossiness.push(super::LossinessNote {
                         field: format!("responses.tools.{label}"),
+                        metric_label: "responses.tools".into(),
                         direction: super::LossinessDirection::Unsupported,
                         note: format!(
                             "unsupported Responses tool type '{label}' dropped: \
@@ -360,26 +362,6 @@ pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
     }
 }
 
-/// Sanitize a client-supplied tool `type` string for use in a
-/// `LossinessNote` field and the warn log: anything outside
-/// `[A-Za-z0-9_.-]` becomes `_`, the empty string becomes `unknown`,
-/// and the result is capped at 64 characters.
-fn tool_type_label(ty: &str) -> String {
-    if ty.is_empty() {
-        return "unknown".to_string();
-    }
-    ty.chars()
-        .take(64)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
     // WOR-599: missing or unknown role is an error, not a silent default to
     // user. Shared helper lives in the format module.
@@ -459,7 +441,23 @@ fn hub_response_to_responses_value(resp: &HubResponse) -> Value {
             ContentPart::ToolResult { .. } | ContentPart::Image { .. } => {}
         }
     }
+    // The hub mirrors every model tool call into both `content` and
+    // `tool_calls` (see `HubResponse::tool_calls`), so emitting both
+    // pathways unconditionally duplicated every function_call item
+    // (WOR-2553, the same double-emit WOR-2535 fixed on the Anthropic
+    // rewrap). Only calls `content` does not already carry get a
+    // standalone item.
     for tc in &resp.tool_calls {
+        let mirrored_in_content = resp.content.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::ToolUse { id, name, input }
+                    if *id == tc.id && *name == tc.name && *input == tc.arguments
+            )
+        });
+        if mirrored_in_content {
+            continue;
+        }
         function_call_items.push(json!({
             "type": "function_call",
             "id": tc.id,
@@ -521,15 +519,12 @@ pub fn translate_openai_response_to_responses(body: &[u8]) -> Vec<u8> {
 /// router, guardrails, and translator pipeline run unchanged.
 pub fn translate_responses_request_to_openai(body: &[u8]) -> Result<Vec<u8>, ChatError> {
     let (hub, _ctx) = OpenAiResponsesFormat.to_hub(body)?;
-    // Nothing downstream reads `hub.lossiness` on this path, so the
-    // warn log is what makes each drop observable to an operator.
-    for note in &hub.lossiness {
-        tracing::warn!(
-            field = %note.field,
-            note = %note.note,
-            "AI proxy: /v1/responses request field dropped in translation"
-        );
-    }
+    // Nothing downstream reads `hub.lossiness` on this path, so this
+    // seam is what makes each drop observable: the per-note drop
+    // counter plus one aggregated, bounded warn for the request
+    // (WOR-2535 review; the per-note warn loop this replaces was a
+    // client-reachable log flood, here exactly as on /v1/messages).
+    super::report_translation_lossiness("responses", &hub.lossiness);
     Ok(hub_request_to_openai_bytes(&hub))
 }
 
@@ -634,6 +629,35 @@ pub fn hub_request_to_openai_bytes(hub: &HubRequest) -> Vec<u8> {
     if let Some(t) = hub.top_p {
         if let Some(n) = serde_json::Number::from_f64(t as f64) {
             out.insert("top_p".into(), Value::Number(n));
+        }
+    }
+    // top_k is honored, not dropped (WOR-2535 review): OpenAI itself
+    // lacks the field, but this canonical body is what the provider
+    // translators read. Anthropic accepts `top_k` natively, Gemini
+    // re-homes it to `generationConfig.topK`, and much of the
+    // OpenAI-compatible fleet honors it; Bedrock's translator
+    // documents dropping it. A strict upstream that rejects the field
+    // turns the old silent sampling change into a visible 400, which
+    // is the failure direction this gateway prefers.
+    if let Some(k) = hub.top_k {
+        out.insert("top_k".into(), Value::Number(k.into()));
+    }
+    // Tool choice is honored, not dropped (WOR-2535 review: a
+    // forced-tool hint silently became auto). Auto is the OpenAI
+    // default, so it emits nothing.
+    match &hub.tool_choice {
+        super::HubToolChoice::Auto => {}
+        super::HubToolChoice::None => {
+            out.insert("tool_choice".into(), Value::String("none".into()));
+        }
+        super::HubToolChoice::Any => {
+            out.insert("tool_choice".into(), Value::String("required".into()));
+        }
+        super::HubToolChoice::Required(name) => {
+            out.insert(
+                "tool_choice".into(),
+                json!({"type": "function", "function": {"name": name}}),
+            );
         }
     }
     if hub.stream {
@@ -919,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_type_label_is_sanitized_for_logs() {
+    fn unsupported_tool_type_label_is_sanitized_for_logs() {
         // The type string is client-controlled and lands in the note
         // field and the warn log; hostile characters must not pass
         // through verbatim.
@@ -1161,5 +1185,83 @@ mod tests {
             .unwrap();
         assert_eq!(f2.len(), 1);
         assert!(f2[0].contains("response.function_call_arguments.delta"));
+    }
+
+    #[test]
+    fn responses_rewrap_emits_each_mirrored_tool_call_once() {
+        // Red-first (WOR-2553): openai_to_hub_response mirrors every
+        // model tool call into both `content` and `tool_calls`, and the
+        // Responses rewrap emitted both pathways, so every function_call
+        // item appeared twice. Same double-emit WOR-2535 fixed on the
+        // Anthropic rewrap.
+        let openai = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let body = translate_openai_response_to_responses(openai.to_string().as_bytes());
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let calls: Vec<&Value> = parsed["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 1, "{parsed}");
+        assert_eq!(calls[0]["id"], "call_1");
+    }
+
+    #[test]
+    fn responses_rewrap_keeps_standalone_tool_calls() {
+        // Deduplication must not eat a call that exists only on the
+        // standalone `tool_calls` pathway.
+        let resp = HubResponse {
+            id: "resp_01".into(),
+            model: "gpt-4o-mini".into(),
+            content: vec![ContentPart::ToolUse {
+                id: "call_1".into(),
+                name: "lookup".into(),
+                input: json!({"q": "a"}),
+            }],
+            tool_calls: vec![
+                super::super::HubToolCall {
+                    id: "call_1".into(),
+                    name: "lookup".into(),
+                    arguments: json!({"q": "a"}),
+                },
+                super::super::HubToolCall {
+                    id: "call_2".into(),
+                    name: "lookup".into(),
+                    arguments: json!({"q": "b"}),
+                },
+            ],
+            finish_reason: FinishReason::ToolCalls,
+            usage: super::super::HubUsage::default(),
+            extensions: Default::default(),
+        };
+        let bytes = fmt().from_hub(&resp, &BridgeContext::default()).unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = parsed["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["call_1", "call_2"], "{parsed}");
     }
 }

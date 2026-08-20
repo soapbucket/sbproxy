@@ -59,8 +59,12 @@ impl ChatFormat for OpenAiChatFormat {
                 .map(|f| f as f32),
             top_p: obj.get("top_p").and_then(|v| v.as_f64()).map(|f| f as f32),
             top_k: obj.get("top_k").and_then(|v| v.as_u64()).map(|n| n as u32),
+            // `max_completion_tokens` is OpenAI's current spelling of
+            // the budget knob (`max_tokens` is the legacy one); honor
+            // either, legacy first for stability (WOR-2554 sweep).
             max_tokens: obj
                 .get("max_tokens")
+                .or_else(|| obj.get("max_completion_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
             stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -149,6 +153,30 @@ impl ChatFormat for OpenAiChatFormat {
             hub.extensions.insert("openai.response_format".into(), rf);
         }
 
+        // Every top-level key outside the represented set records a
+        // note (WOR-2554, the same treatment WOR-2535 gave
+        // /v1/messages): the live chat path byte-forwards the original
+        // body, but any consumer of THIS parse (a future chat
+        // translate seam included) would otherwise lose `seed`,
+        // `logit_bias`, penalties, and every field OpenAI adds next,
+        // with nothing recording the drop.
+        for (key, value) in obj {
+            if value.is_null() || CHAT_REPRESENTED_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            let label = super::sanitize_type_label(key);
+            hub.lossiness.push(super::LossinessNote {
+                field: format!("openai.{label}"),
+                metric_label: "openai.request".to_string(),
+                direction: super::LossinessDirection::Unsupported,
+                note: format!(
+                    "top-level field '{label}' dropped: it has no \
+                     representation in the canonical request the gateway \
+                     governs"
+                ),
+            });
+        }
+
         let ctx = BridgeContext {
             inbound_format: self.id().into(),
             inbound_path: "/v1/chat/completions".into(),
@@ -172,6 +200,25 @@ impl ChatFormat for OpenAiChatFormat {
         Ok(hub_chunk_to_openai_sse(chunk))
     }
 }
+
+/// Top-level OpenAI Chat Completions request keys the hub represents
+/// (parsed in `to_hub` above, `response_format` riding the extensions
+/// map). Everything else hits the catch-all note loop. Keep in
+/// lockstep with the parser (WOR-2554).
+const CHAT_REPRESENTED_TOP_LEVEL_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop",
+    "stream",
+    "response_format",
+];
 
 /// Parse one OpenAI message object into a `HubMessage`. Pulled out so
 /// both the live request path and the test fixtures can call it.
@@ -584,5 +631,69 @@ mod tests {
                 .unwrap(),
         );
         assert!(frames.iter().any(|f| f.contains("[DONE]")));
+    }
+
+    // --- WOR-2554: the chat parser stops dropping silently too ---
+
+    #[test]
+    fn max_completion_tokens_is_honored_as_max_tokens() {
+        // Red-first: OpenAI's current spelling of the budget knob was
+        // never read, so a hub consumer saw no budget at all.
+        let req = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 128
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.max_tokens, Some(128));
+        assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
+    }
+
+    #[test]
+    fn legacy_max_tokens_wins_over_max_completion_tokens() {
+        let req = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "max_completion_tokens": 128
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert_eq!(hub.max_tokens, Some(64));
+    }
+
+    #[test]
+    fn unrepresented_top_level_fields_record_lossiness_notes() {
+        // Red-first (WOR-2554, same class as WOR-2535 on /v1/messages):
+        // fields the hub cannot carry vanished from to_hub with no note.
+        for key in ["seed", "logit_bias", "presence_penalty", "user", "n"] {
+            let mut req = json!({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            req[key] = json!(1);
+            let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+            assert_eq!(hub.lossiness.len(), 1, "{key}: {:?}", hub.lossiness);
+            assert_eq!(hub.lossiness[0].field, format!("openai.{key}"));
+            assert_eq!(hub.lossiness[0].metric_label, "openai.request", "{key}");
+        }
+    }
+
+    #[test]
+    fn represented_and_null_top_level_fields_note_nothing() {
+        let req = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
+            "stop": ["x"],
+            "stream": true,
+            "tools": [],
+            "tool_choice": "auto",
+            "response_format": {"type": "json_object"},
+            "seed": null
+        });
+        let (hub, _) = fmt().to_hub(req.to_string().as_bytes()).unwrap();
+        assert!(hub.lossiness.is_empty(), "{:?}", hub.lossiness);
     }
 }

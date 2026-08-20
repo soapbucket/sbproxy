@@ -248,6 +248,67 @@ pub fn native_bypass_for(
     }
 }
 
+/// Sanitize a client-supplied `type` string for use in a
+/// `LossinessNote` field and the warn log at a translate seam:
+/// anything outside `[A-Za-z0-9_.-]` becomes `_`, the empty string
+/// becomes `unknown`, and the result is capped at 64 characters.
+pub(crate) fn sanitize_type_label(ty: &str) -> String {
+    if ty.is_empty() {
+        return "unknown".to_string();
+    }
+    ty.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Cap on the distinct `field` labels one aggregated lossiness warn
+/// lists. Everything past the cap is still counted (`dropped` carries
+/// the full total and the counter every note), just not named.
+pub(crate) const LOSSINESS_WARN_FIELD_CAP: usize = 8;
+
+/// Report every lossiness note from one inbound translation: tick
+/// `sbproxy_ai_translation_dropped_total{surface, field}` once per
+/// note and emit ONE aggregated warn for the whole request.
+///
+/// One warn per request rather than per note, deliberately: the note
+/// count is bounded only by body size, so a per-note loop handed any
+/// client a log-flood primitive (a 1 MiB body of unknown blocks is
+/// tens of thousands of warn lines) while no counter moved. The
+/// counter is what dashboards alert on; the warn lists the first few
+/// distinct field labels plus the total so the log line stays
+/// grep-able without scaling with the body.
+pub(crate) fn report_translation_lossiness(surface: &'static str, notes: &[LossinessNote]) {
+    if notes.is_empty() {
+        return;
+    }
+    for note in notes {
+        crate::ai_metrics::record_translation_dropped(surface, &note.metric_label);
+    }
+    let mut listed: Vec<&str> = Vec::new();
+    for note in notes {
+        if !listed.contains(&note.field.as_str()) {
+            if listed.len() == LOSSINESS_WARN_FIELD_CAP {
+                break;
+            }
+            listed.push(note.field.as_str());
+        }
+    }
+    tracing::warn!(
+        surface,
+        dropped = notes.len(),
+        fields = %listed.join(", "),
+        first_note = %notes[0].note,
+        "AI proxy: request fields dropped in translation"
+    );
+}
+
 /// A bidirectional translator between a wire format and the hub.
 ///
 /// The trait is method-style and uses the names called out in the
@@ -537,7 +598,11 @@ mod parity_tests {
             expected
         );
         assert_eq!(
-            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            super::anthropic_messages::parse_anthropic_message(
+                &obj(input.clone()),
+                &mut Vec::new()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
@@ -560,7 +625,11 @@ mod parity_tests {
             expected
         );
         assert_eq!(
-            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            super::anthropic_messages::parse_anthropic_message(
+                &obj(input.clone()),
+                &mut Vec::new()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
@@ -582,10 +651,13 @@ mod parity_tests {
         })))
         .unwrap();
         // Anthropic: inline `tool_use` block, `input` already structured.
-        let anthropic = super::anthropic_messages::parse_anthropic_message(&obj(json!({
-            "role": "assistant",
-            "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
-        })))
+        let anthropic = super::anthropic_messages::parse_anthropic_message(
+            &obj(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
+            })),
+            &mut Vec::new(),
+        )
         .unwrap();
         let expected = HubMessage {
             role: Role::Assistant,
