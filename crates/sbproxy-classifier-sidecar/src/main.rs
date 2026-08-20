@@ -107,18 +107,44 @@ impl CompressionAdmission {
         }
     }
 
-    async fn acquire(&self) -> std::result::Result<CompressionPermits, Status> {
+    async fn acquire(&self) -> std::result::Result<CompressionPermits, AdmissionError> {
         let admitted = Arc::clone(&self.admitted)
             .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("token-compression queue is full"))?;
+            .map_err(|_| AdmissionError::QueueFull)?;
         let running = Arc::clone(&self.running)
             .acquire_owned()
             .await
-            .map_err(|_| Status::unavailable("token-compression admission is unavailable"))?;
+            .map_err(|_| AdmissionError::Unavailable)?;
         Ok(CompressionPermits {
             _admitted: admitted,
             _running: running,
         })
+    }
+}
+
+/// Why a token-compression request was not admitted.
+///
+/// `acquire` returns this rather than a `tonic::Status` so a 176-byte
+/// status is not carried through a helper's `Result`. The RPC method is
+/// the only place that owes tonic a status, and `?` makes the
+/// conversion there, so the wire behavior is unchanged.
+enum AdmissionError {
+    /// Admission queue was already full.
+    QueueFull,
+    /// The running semaphore was closed.
+    Unavailable,
+}
+
+impl From<AdmissionError> for Status {
+    fn from(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::QueueFull => {
+                Self::resource_exhausted("token-compression queue is full")
+            }
+            AdmissionError::Unavailable => {
+                Self::unavailable("token-compression admission is unavailable")
+            }
+        }
     }
 }
 

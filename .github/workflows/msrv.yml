@@ -91,7 +91,16 @@ jobs:
       # still compile on the old toolchain", and codegen adds minutes without
       # adding an answer. Package selection matches the test lane so the
       # feature union is the one CI already resolves elsewhere.
+      #
+      # RUSTUP_TOOLCHAIN outranks rust-toolchain.toml, which in turn
+      # outranks the `rustup default` the install step above sets. Without
+      # this the root pin would win and the lane would check the pinned
+      # stable while reporting that the MSRV still compiles, which is the
+      # exact "passes while testing the wrong toolchain" failure the step
+      # above exists to prevent.
       - name: check workspace on the declared MSRV
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: cargo check --workspace --exclude sbproxy-e2e --locked --all-targets
 
       # Keep exactly one msrv cache generation. rust-cache writes a new entry
