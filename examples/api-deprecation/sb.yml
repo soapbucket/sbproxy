@@ -1,0 +1,101 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# First-class API deprecation: RFC 9745 Deprecation + RFC 8594 Sunset.
+#
+# One origin, four versions of the same API, each at a different point
+# in its lifecycle:
+#
+#   /v2/    current: no deprecation block, clean responses
+#   /v1/    announced: deprecated with a far-future sunset; responses
+#           carry Deprecation, Sunset, and both Link relations
+#   /beta/  past sunset, default posture: still serves, headers show
+#           the elapsed dates, and the usage counter labels these hits
+#           past_sunset="true"
+#   /v0/    past sunset, after_sunset: gone: requests get 410 with a
+#           JSON body naming the successor, headers still attached
+#
+# The actions are static so the example runs with no upstreams; the
+# same blocks work unchanged on proxy actions.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Test:
+#   curl -is -H 'Host: api.local' http://127.0.0.1:8080/v1/users
+#   curl -is -H 'Host: api.local' http://127.0.0.1:8080/beta/users
+#   curl -is -H 'Host: api.local' http://127.0.0.1:8080/v0/users
+#   curl -is -H 'Host: api.local' http://127.0.0.1:8080/v2/users
+#   curl -s  http://127.0.0.1:8080/metrics | grep deprecated
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    # Publish the generated OpenAPI document so the deprecation marks
+    # are visible at /.well-known/openapi.json too.
+    expose_openapi: true
+    action:
+      type: static
+      status_code: 404
+      content_type: application/json
+      body: '{"error":"no such route"}'
+
+    forward_rules:
+      # Announced: deprecated now, retired at the start of 2030.
+      - rules:
+          - path: { prefix: /v1/ }
+        deprecation:
+          deprecated: 2026-09-01
+          sunset: 2030-01-01T00:00:00Z
+          successor: https://api.local/v2/
+          link: https://developer.example.com/deprecation/v1
+        origin:
+          id: v1
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            body: '{"version":"v1","user":"ada"}'
+
+      # Past its sunset, default posture: keeps serving, and every hit
+      # counts as a straggler (past_sunset="true" on the metric).
+      - rules:
+          - path: { prefix: /beta/ }
+        deprecation:
+          deprecated: 2020-01-01
+          sunset: 2020-06-01
+        origin:
+          id: beta
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            body: '{"version":"beta","user":"ada"}'
+
+      # Past its sunset with the strict posture: 410 Gone, body names
+      # the successor, headers still attached.
+      - rules:
+          - path: { prefix: /v0/ }
+        deprecation:
+          deprecated: 2020-01-01
+          sunset: 2020-06-01
+          after_sunset: gone
+          successor: https://api.local/v2/
+        origin:
+          id: v0
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            body: '{"version":"v0","user":"ada"}'
+
+      # The successor: no block, no headers.
+      - rules:
+          - path: { prefix: /v2/ }
+        origin:
+          id: v2
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            body: '{"version":"v2","user":"ada"}'

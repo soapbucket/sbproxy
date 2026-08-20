@@ -3372,6 +3372,38 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-2565: deprecation announcement headers ---
+        //
+        // When the settled route carries a `deprecation:` block (the
+        // matched forward rule's first, else the origin's) or the
+        // `openapi_validation` policy staged a spec-driven match,
+        // stamp RFC 9745 `Deprecation`, RFC 8594 `Sunset`, and the
+        // `successor-version` / `deprecation` Link relations. The
+        // gateway is the authority on this origin's lifecycle, so
+        // `Deprecation` and `Sunset` replace any upstream value of
+        // the same name; `Link` entries are appended so upstream
+        // `Link` headers survive. Generated responses get the same
+        // stamp in `apply_generated_response_phases`.
+        {
+            let pipeline = ctx.pipeline.clone();
+            if let Some(idx) = ctx.origin_idx {
+                if let Some(resolved) = super::deprecation::resolved_deprecation(
+                    &pipeline,
+                    idx,
+                    ctx.forward_rule_idx,
+                    ctx.openapi_deprecation.as_ref(),
+                ) {
+                    for (name, value) in super::deprecation::response_headers(resolved.config) {
+                        if name == "link" {
+                            let _ = upstream_response.append_header(name, &value);
+                        } else {
+                            let _ = upstream_response.insert_header(name, &value);
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Idempotency cache-miss response capture ---
         //
         // When `request_body_filter` recorded a cache miss on this
@@ -8341,6 +8373,8 @@ origins:
                 ),
                 request_modifiers: Vec::new(),
                 parameters: Vec::new(),
+                id: None,
+                deprecation: None,
             }]);
         std::sync::Arc::new(pipeline)
     }

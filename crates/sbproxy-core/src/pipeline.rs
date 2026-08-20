@@ -741,6 +741,14 @@ pub struct CompiledForwardRule {
     /// on emitted operations; available for future runtime validation
     /// of captured params.
     pub parameters: Vec<Parameter>,
+    /// Optional identifier from the rule's inline `origin.id`, used in
+    /// metrics and logs (the `rule` label on
+    /// `sbproxy_deprecated_requests_total` prefers it over the rule
+    /// index).
+    pub id: Option<String>,
+    /// WOR-2565: compiled deprecation announcement scoped to this
+    /// rule's matches. Overrides the origin-scope block when present.
+    pub deprecation: Option<sbproxy_config::CompiledDeprecation>,
 }
 
 /// A compiled fallback origin: triggers and the fallback action.
@@ -3416,11 +3424,32 @@ fn compile_single_forward_rule(
         None => Vec::new(),
     };
 
+    // WOR-2565: rule-scope deprecation announcement. `compile_config`
+    // already validated every block, so a failure here is a malformed
+    // hand-built rule JSON rather than an operator error; surface it
+    // the same way the other malformed-field arms do.
+    let deprecation = match non_null(val.get("deprecation")) {
+        Some(raw) => {
+            let parsed: sbproxy_config::DeprecationConfig = serde_json::from_value(raw.clone())
+                .map_err(|e| anyhow::anyhow!("invalid 'deprecation' in forward rule: {}", e))?;
+            Some(sbproxy_config::compile_deprecation(
+                &parsed,
+                &format!("forward rule `{rule_id}`"),
+            )?)
+        }
+        None => None,
+    };
+
     Ok(CompiledForwardRule {
         matchers,
         action,
         request_modifiers,
         parameters,
+        id: origin_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        deprecation,
     })
 }
 
@@ -4585,6 +4614,7 @@ mod tests {
                 error_pages: None,
                 problem_details: None,
                 proxy_status: None,
+                deprecation: None,
                 message_signatures: None,
                 olp: None,
                 web_bot_auth_publish: None,
@@ -5381,6 +5411,7 @@ origins:
                 error_pages: None,
                 problem_details: None,
                 proxy_status: None,
+                deprecation: None,
                 message_signatures: None,
                 olp: None,
                 web_bot_auth_publish: None,
@@ -6455,6 +6486,8 @@ mod body_matcher_tests {
             action: Action::Noop,
             request_modifiers: Vec::new(),
             parameters: Vec::new(),
+            id: None,
+            deprecation: None,
         }
     }
 

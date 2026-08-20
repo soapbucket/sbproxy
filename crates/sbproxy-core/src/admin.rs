@@ -8482,6 +8482,7 @@ origins:
                 error_pages: None,
                 problem_details: None,
                 proxy_status: None,
+                deprecation: None,
                 message_signatures: None,
                 olp: None,
                 web_bot_auth_publish: None,

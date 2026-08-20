@@ -40,7 +40,7 @@ manifest naming exactly what it did for each.
 | API6 | Unrestricted Access to Sensitive Business Flows | `not_covered`: compose `rate_limiting`, `object_authz`, and bot checks yourself | [Automated traffic you cannot distinguish](#automated-traffic-you-cannot-distinguish) |
 | API7 | Server Side Request Forgery | `enforced`, always, with nothing synthesized: the SSRF guard already runs on every outbound dial *sbproxy itself* makes - not the backend's own server-side URL fetching | [Requests the service makes on the caller's behalf](#requests-the-service-makes-on-the-callers-behalf) |
 | API8 | Security Misconfiguration | `enforced`: adds `security_headers` and `http_framing` on proxied and generated-response origins alike (`static`/`mock`/`echo`/`beacon`/`redirect` included; `mcp`/`storage`/`ai_proxy`/plugin actions only get `http_framing`); layer `waf` yourself for broader coverage | [Browser-facing misconfiguration](#browser-facing-misconfiguration) |
-| API9 | Improper Inventory Management | `enforced`: sets `expose_openapi: true`, a disclosure decision worth reviewing first | [openapi-emission.md](openapi-emission.md) |
+| API9 | Improper Inventory Management | `enforced`: sets `expose_openapi: true`, a disclosure decision worth reviewing first | [openapi-emission.md](openapi-emission.md); unretired old versions are the classic finding here, so announce and retire them with a [`deprecation:` block](api-gateway.md#deprecating-endpoints) |
 | API10 | Unsafe Consumption of APIs | `not_covered`: no response-handling safety net for third-party API calls today | n/a |
 
 `enable: all` defaults every item's posture to `report_only`. API7,

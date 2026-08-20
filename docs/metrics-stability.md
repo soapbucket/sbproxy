@@ -327,6 +327,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_decision_event_total` | Counter | `stable` | `alpha` | `event`, `engine`, `outcome`, `origin`, `tenant` | Decision events by pipeline point, engine, and outcome. |
 | `sbproxy_decision_event_duration_seconds` | Histogram | `stable` | `alpha` | `event`, `engine`, `origin` | Decision event evaluation latency. |
 | `sbproxy_decision_event_fail_open_total` | Counter | `stable` | `alpha` | `event`, `engine`, `origin`, `tenant` | Decision events that proceeded without the decision being made. |
+| `sbproxy_deprecated_requests_total` | Counter | `stable` | `beta` | `origin`, `rule`, `past_sunset` | Requests that resolved to a deprecated route. |
 | `sbproxy_semantic_cache_results_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `source`, `result` | Semantic-cache hit/miss/error counts. |
 | `sbproxy_serve_lane_admissions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `priority`, `decision` | Served-lane admission gate decisions by priority lane. |
 | `sbproxy_silent_degradations_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `op` | Best-effort operations that failed and were previously dropped silently, by op. |

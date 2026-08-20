@@ -1106,6 +1106,7 @@ origins:
 | `error_pages` | list | | Custom error pages matching one status code or an explicit list of status codes. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
 | `proxy_status` | object | | RFC 9209 `Proxy-Status` response-header configuration. |
+| `deprecation` | object | | RFC 9745 `Deprecation` + RFC 8594 `Sunset` announcement for every route this origin serves. Also accepted per forward rule, where it overrides this block. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 | `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
@@ -3063,6 +3064,7 @@ policies:
 | `status` | int | 400 | Status returned in `enforce` mode on validation failure. |
 | `error_body` | string | auto | Optional rejection body. Defaults to a JSON object naming the failing JSON pointer. |
 | `error_content_type` | string | `application/json` | `Content-Type` for the rejection body. |
+| `deprecation_headers` | object | off | Emit RFC 9745 / RFC 8594 deprecation headers on responses for operations the loaded spec marks `deprecated: true`. Same fields as the route-level block minus the spec flag: `deprecated`, `sunset`, `successor`, `link`, `after_sunset`. The spec flag carries no date, so this block supplies the values. A route-level `deprecation:` block wins over it. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 
 OpenAPI path templates compile to anchored regexes at startup; per-operation schemas compile once. The rejection body lists only the offending JSON pointer, not the value itself, to keep the surface area an attacker can probe small.
 
@@ -4504,6 +4506,7 @@ The forward rule itself wraps the matcher list and the inline child origin to di
 |-------|------|---------|-------------|
 | `rules` | list | `[]` | Matcher entries. The rule fires when any one matches. |
 | `origin` | object | required | Inline child origin. See below. |
+| `deprecation` | object | | RFC 9745 / RFC 8594 deprecation announcement for the requests this rule matches. Overrides the origin-level block for them. Same fields as [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 
 The `origin` object is a full child origin config plus identifying metadata:
 
@@ -4933,6 +4936,101 @@ The renderer covers both error sources:
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
   `http_request_error`) so downstream tooling can break down by
   failure mode without scraping the body.
+
+---
+
+## API deprecation (RFC 9745 + RFC 8594)
+
+The `deprecation` block announces that a route is going away, on the
+wire, where clients and SDKs can see it. Responses from a covered route
+carry the standard headers:
+
+- `Deprecation: @1788220800` (RFC 9745, an RFC 9651 structured-field
+  Date; past means "was deprecated", future means "will be")
+- `Sunset: Thu, 31 Dec 2026 23:59:59 GMT` (RFC 8594, when the resource
+  is expected to stop responding)
+- `Link: <url>; rel="successor-version"` (RFC 5829, where to migrate)
+- `Link: <url>; rel="deprecation"` (RFC 9745, human documentation)
+
+The block is accepted at two scopes. On the origin it covers every
+route the origin serves. On a forward rule it covers only requests
+that rule matches and overrides the origin block for them, which is
+how `/v1/*` gets deprecated while `/v2/*` on the same origin stays
+clean. The headers ride proxied and locally generated (`static`,
+`mock`, `redirect`) responses alike.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal
+    forward_rules:
+      - rules:
+          - path: { prefix: /v1/ }
+        deprecation:
+          deprecated: 2026-09-01
+          sunset: 2026-12-31T23:59:59Z
+          successor: https://api.example.com/v2/
+          link: https://developer.example.com/deprecation
+          after_sunset: serve        # or: gone
+        origin:
+          id: v1-legacy
+          action: { type: proxy, url: https://legacy.internal }
+      - rules:
+          - path: { prefix: /v2/ }
+        origin:
+          id: v2
+          action: { type: proxy, url: https://backend.internal }
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `deprecated` | date or bool | | When the route is (or will be) deprecated: `2026-09-01` or `2026-09-01T00:00:00Z`. Emits `Deprecation: @<unix>`. A bare `true` marks the route deprecated for OpenAPI emission and metrics but emits no header, because RFC 9745 requires a date value; config load warns and suggests one. `false` fails config load: remove the block instead. |
+| `sunset` | date | | When the route is expected to stop responding. Emits `Sunset: <HTTP-date>`. Must not be earlier than `deprecated`; config load refuses that per RFC 9745. |
+| `successor` | URL | | Where callers migrate to. Emits `Link: <url>; rel="successor-version"`. |
+| `link` | URL | | Human-readable deprecation documentation. Emits `Link: <url>; rel="deprecation"`. |
+| `after_sunset` | string | `serve` | Posture once `sunset` passes. `serve` keeps handling requests with the headers attached. `gone` refuses them with `410 Gone` and a JSON body naming `successor` and `link`, headers still attached. Requires `sunset`. |
+
+At least one of `deprecated` or `sunset` must be set. Dates are
+`YYYY-MM-DD` (midnight UTC) or RFC 3339 timestamps.
+
+Announcing is half the job; the other half is finding who has not
+migrated. Every request that resolves to a deprecated route increments
+
+```
+sbproxy_deprecated_requests_total{origin, rule, past_sunset}
+```
+
+where `rule` is the forward rule's `origin.id` (or its index), the
+OpenAPI path template for a spec-driven match, or empty for a
+whole-origin block, and `past_sunset` flips to `true` once the sunset
+instant passes. A dashboard on that counter is the migration tracker.
+
+Two boundary notes. Header stamping covers proxied responses and the
+locally generated response actions (`static`, `mock`, `echo`,
+`beacon`, `redirect`); `ai_proxy` and `mcp` responses follow the same
+posture those actions have for the rest of the response-phase surface
+and are not stamped, though the counter and the `gone` refusal still
+apply to them. And a response served from the response cache replays
+the headers it was stored with but does not increment the counter,
+because a cache hit answers before the route is resolved; on a cached
+route the counter undercounts by the hit rate.
+
+The announcement also reaches the emitted OpenAPI document: operations
+on a deprecated route are marked `deprecated: true` with
+`x-sbproxy-sunset` and `x-sbproxy-successor` extensions carrying the
+same values as the wire headers. See
+[openapi-emission.md](openapi-emission.md). For the reverse direction,
+emitting headers on operations an uploaded spec already marks
+deprecated, see the `deprecation_headers` sub-block on
+[openapi_validation](#openapi_validation).
+
+Specs: <https://www.rfc-editor.org/rfc/rfc9745.html>,
+<https://www.rfc-editor.org/rfc/rfc8594.html>,
+<https://www.rfc-editor.org/rfc/rfc5829.html>.
+
+See [`examples/api-deprecation/`](https://github.com/soapbucket/sbproxy/tree/main/examples/api-deprecation).
 
 ---
 

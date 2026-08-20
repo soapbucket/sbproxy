@@ -3354,6 +3354,24 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Decision events that proceeded without the decision being made.",
         dead_reason: None,
     },
+    // WOR-2565. Zalando rule 188: deprecated-API usage must be
+    // monitored, because the whole point of announcing a deprecation
+    // is enumerating the callers who have not migrated yet. `rule`
+    // names which announcement matched (forward-rule id or index,
+    // OpenAPI path template, or empty for a whole-origin block) and
+    // `past_sunset` separates stragglers still calling after the
+    // announced retirement instant.
+    MetricCapability {
+        name: "sbproxy_deprecated_requests_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_deprecated_request"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "rule", "past_sunset"],
+        description: "Requests that resolved to a deprecated route.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_semantic_cache_results_total",
         kind: MetricKind::Counter,
