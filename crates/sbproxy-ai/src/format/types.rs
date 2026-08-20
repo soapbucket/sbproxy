@@ -170,6 +170,10 @@ pub enum HubToolChoice {
     Auto,
     /// Disallow tool calls for this turn.
     None,
+    /// Require the model to call some offered tool, without naming
+    /// which. Anthropic spells this `{"type": "any"}`; OpenAI spells
+    /// it `"required"`.
+    Any,
     /// Require the model to call this specific tool.
     Required(String),
 }
@@ -337,8 +341,16 @@ pub struct BridgeContext {
 /// attribute and a counter.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LossinessNote {
-    /// Field that could not be preserved.
+    /// Field that could not be preserved. May end in a sanitized
+    /// client-derived segment (a block `type` label), so it is safe
+    /// for logs but not for metric labels.
     pub field: String,
+    /// Bounded class label for the drop counter
+    /// (`sbproxy_ai_translation_dropped_total{field}`). Every
+    /// constructor passes a compile-time string, never a
+    /// client-derived one, so client bytes cannot mint metric series.
+    #[serde(default)]
+    pub metric_label: String,
     /// Direction of the loss.
     pub direction: LossinessDirection,
     /// One-sentence explanation visible in logs and traces.

@@ -1368,6 +1368,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_translation_dropped_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_translation_dropped"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["surface", "field"],
+        description: "Request fields dropped while translating an inbound AI body (Anthropic Messages, OpenAI Responses) to the canonical chat shape, by inbound surface and dropped-field class.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_ttft_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_ttft"),
