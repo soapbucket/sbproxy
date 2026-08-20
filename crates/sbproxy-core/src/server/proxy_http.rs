@@ -5031,6 +5031,110 @@ impl ProxyHttp for SbProxy {
                                         break;
                                     }
                                 }
+                                Policy::BodyThreatProtection(btp) => {
+                                    // WOR-2563: structural JSON/XML body
+                                    // threat limits over the buffered
+                                    // body. The enforcer only asked for
+                                    // buffering when the content type
+                                    // resolved to a scanned family, but
+                                    // the buffer may exist because a
+                                    // neighboring policy wanted it, and
+                                    // a hot reload can change the policy
+                                    // between phases, so the family gate
+                                    // is re-derived here rather than
+                                    // trusted.
+                                    use sbproxy_modules::{body_threat_family, BodyThreatMode};
+                                    let Some(family) = body_threat_family(content_type.as_deref())
+                                    else {
+                                        continue;
+                                    };
+                                    if let Err(violation) = btp.check(family, &collected) {
+                                        match btp.mode {
+                                            BodyThreatMode::Block => {
+                                                tracing::warn!(
+                                                    target: "sbproxy::body_threat_protection",
+                                                    limit = violation.limit,
+                                                    observed = violation.observed,
+                                                    allowed = violation.allowed,
+                                                    "blocked: request body violates structural threat limit"
+                                                );
+                                                sbproxy_observe::metrics::record_policy(
+                                                    ctx.hostname.as_str(),
+                                                    "body_threat_protection",
+                                                    "deny",
+                                                );
+                                                ctx.record_policy_decision(
+                                                    "body_threat_protection",
+                                                    "deny",
+                                                );
+                                                sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                                    "body_threat_protection",
+                                                    violation.detail(),
+                                                    400,
+                                                    Some(ctx.hostname.to_string()),
+                                                    ctx.client_ip,
+                                                    Some(ctx.request_id.to_string()),
+                                                    Some(
+                                                        session
+                                                            .req_header()
+                                                            .method
+                                                            .as_str()
+                                                            .to_string(),
+                                                    ),
+                                                )
+                                                .with_tenant_id(ctx.tenant_id.to_string())
+                                                .emit();
+                                                ctx.deny_policy_type =
+                                                    Some("body_threat_protection");
+                                                // The limit name and the
+                                                // observed/allowed numbers
+                                                // only; body content is
+                                                // never echoed.
+                                                let body_str = serde_json::json!({
+                                                    "error": "request body violates structural threat limits",
+                                                    "limit": violation.limit,
+                                                    "detail": violation.detail(),
+                                                })
+                                                .to_string();
+                                                failed = Some((
+                                                    400,
+                                                    body_str,
+                                                    "application/json".to_string(),
+                                                ));
+                                                break;
+                                            }
+                                            BodyThreatMode::Tap => {
+                                                // Observe-only: log and
+                                                // count so the near-miss is
+                                                // visible on the policy
+                                                // counter and the admin
+                                                // ring, never block. Same
+                                                // reasoning as the
+                                                // object_authz detect-only
+                                                // precedent: shape limits
+                                                // can false-positive on
+                                                // legitimately deep
+                                                // payloads.
+                                                tracing::warn!(
+                                                    target: "sbproxy::body_threat_protection",
+                                                    limit = violation.limit,
+                                                    observed = violation.observed,
+                                                    allowed = violation.allowed,
+                                                    "tap mode: request body violates structural threat limit (not blocked)"
+                                                );
+                                                sbproxy_observe::metrics::record_policy(
+                                                    ctx.hostname.as_str(),
+                                                    "body_threat_protection",
+                                                    "tap",
+                                                );
+                                                ctx.record_policy_decision(
+                                                    "body_threat_protection",
+                                                    "tap",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 Policy::ContentDigest(cd) => {
                                     // RFC 9530 digests bind the inbound
                                     // representation. A validated GraphQL

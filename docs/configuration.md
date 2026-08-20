@@ -2895,7 +2895,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships twenty-seven policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
+SBproxy ships twenty-eight policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -3443,7 +3443,7 @@ policies:
 
 ### owasp_api_top10 (pack)
 
-Not one of the twenty-seven policy types above. `owasp_api_top10` is a
+Not one of the twenty-eight policy types above. `owasp_api_top10` is a
 pseudo-policy: the compiler reads it before any policy is compiled,
 expands it into the real synthesized policies and transforms named
 below, and removes this entry so it never reaches a policy module's own
@@ -4808,6 +4808,8 @@ origins:
 ## Threat protection
 
 Threat protection guards against pathological JSON request bodies. When the request `Content-Type` is `application/json`, the proxy parses the body and checks it against limits on nesting depth, key count, string length, array size, and total body size. A request that exceeds any limit is rejected before it reaches the upstream.
+
+The `body_threat_protection` *policy* ([api-security.md](api-security.md#structural-body-threat-limits)) is the successor surface for this job: it adds XML limits with a DTD refusal, returns a 400 naming the violated limit instead of a blanket 413, and has an observe-only `tap` mode. Prefer the policy for new configs; this origin-level block remains for existing ones.
 
 ```yaml
 origins:

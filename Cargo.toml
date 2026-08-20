@@ -205,6 +205,15 @@ tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 prometheus = "0.14"
 
+# WOR-2563: pull-mode XML structural scanner for the
+# `body_threat_protection` policy. Default features only (no serde);
+# events never expand entities, which is the property the
+# billion-laughs guard relies on. Already in the lockfile at this
+# version as a transitive dependency, so this adds an edge, not a
+# package. MIT licensed (no NOTICE stanza needed; that list is
+# Apache-2.0-only crates).
+quick-xml = "0.37"
+
 # WOR-1081: JSON Schema generation from the Rust config types.
 # `preserve_order` keeps the generated schema stable across runs
 # so the regenerator's CI gate diffs byte-for-byte (otherwise a

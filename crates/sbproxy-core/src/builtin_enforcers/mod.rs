@@ -24,6 +24,7 @@ pub mod agent_budget;
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
 pub mod ai_crawl;
+pub mod body_threat_protection;
 pub mod concurrent_limit;
 pub mod content_digest;
 pub mod csrf;
@@ -52,6 +53,7 @@ pub use agent_budget::AgentBudgetEnforcer;
 #[cfg(feature = "agent-class")]
 pub use agent_class::AgentClassEnforcer;
 pub use ai_crawl::AiCrawlEnforcer;
+pub use body_threat_protection::BodyThreatProtectionEnforcer;
 pub use concurrent_limit::ConcurrentLimitEnforcer;
 pub use content_digest::ContentDigestEnforcer;
 pub use csrf::CsrfEnforcer;
