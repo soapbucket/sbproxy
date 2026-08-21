@@ -1,6 +1,6 @@
 # Security
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy sits between your clients and whatever they are calling, which makes it
 a good place to enforce things the service behind it might have forgotten. This
@@ -130,6 +130,30 @@ Every outbound destination the gateway reaches, across every wired egress
 purpose and not just AI providers, is recorded with its authorization status,
 allowed, denied, or ungated, and is readable at `GET /api/egress`. Outbound
 dials pass a default-deny, DNS-pinned egress authorizer.
+
+Pinned means the connection goes to the addresses the authorization resolved,
+not to a second lookup the HTTP client runs on its own, so a DNS answer that
+changes between the check and the connect cannot move the dial.
+
+Two paths go further and do not follow redirects at all: the MCP run-as-user
+token exchange and the `events:` webhook sink, the two whose request body is
+itself the credential. On those, a `3xx` `Location` is put back through the
+same scheme, host, port, DNS, and private-address checks the original
+destination passed, dialed on that hop's own pinned addresses, and bounded at
+ten hops inside one timeout for the whole chain rather than one per hop. A
+hop that changes scheme, host, or port loses `Authorization`,
+`Proxy-Authorization`, `Cookie`, and any request signature before it is
+replayed, and a request carrying a body does not make that hop at all: an
+OAuth subject token in a form field or a signed event batch is the
+credential, so there is nothing to strip that leaves a request the next hop
+could serve. A refusal names one of a closed set of reasons on the log line,
+on `sbproxy_egress_refused_total`, in `GET /api/egress`, and on the typed
+`egress_refused` event.
+
+Three other outbound paths, AI provider dispatch, the usage-sink webhook, and
+model-artifact downloads, re-authorize each redirect hop against the same
+allowlist but still let their HTTP client resolve the host again at dial
+time. They get the allowlist and the hop bound; they do not yet get the pin.
 
 Serving-path request budgets key by tenant, and a panicking tenant policy now
 denies that one request instead of crashing the process. Neither changes the

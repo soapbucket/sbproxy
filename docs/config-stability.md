@@ -280,6 +280,67 @@ behavior.
 
 ---
 
+## Upgrade-affecting behavior changes
+
+A field whose meaning did not change can still change what your proxy does,
+when a code path that was supposed to read it starts reading it. Nothing here
+is a schema change: the same file compiles before and after. What changes is
+which traffic the value you already wrote now refuses.
+
+### `egress.usage_sinks` now gates the `events:` webhook sink
+
+**Who this reaches.** Any config that has both `egress.usage_sinks` set to
+`mode: deny_by_default` and an `events:` block with `sink: webhook`. A config
+with no `egress:` section, or one whose `usage_sinks` is absent or left at the
+default `allow_by_default`, is unaffected: that sink stays `ungated` and
+delivers exactly as before.
+
+**What changes.** `usage_sinks` has always compiled its allowlist under two
+purposes, `usage_sink` and `webhook`, and the events sink has always
+authorized under `webhook`. The `webhook` half was never installed into the
+process registry, so the events sink read an empty slot and dialed with no
+allowlist whatever the block said. It is installed now, so the block applies:
+your collector's host has to be on `egress.usage_sinks.hosts`, on a scheme and
+port that list permits (`ports` defaults to `[80, 443]`, so a collector on
+`:8088` needs an explicit `ports:`), and resolving onto a private address needs
+`allow_private: true`.
+
+**What an operator sees when it bites.** The SIEM feed stops and every surface
+says why: a `warn` on the `events` target carrying the closed reason
+(`unlisted_host`, `disallowed_port`, `private_address`, and the rest of
+[the egress vocabulary](admin-api-reference.md#get-apiegress)), one
+`sbproxy_events_dropped_total{sink="webhook",reason="egress_denied"}` per event
+in each dropped batch, one
+`sbproxy_egress_refused_total{purpose="webhook",reason=...}`, and a `denied`
+row for the collector in `GET /api/egress`. Nothing is dropped silently, and
+no surface carries the URL.
+
+**What to do before upgrading.** Read `GET /api/egress` on the running proxy,
+find the `webhook` row for your collector, and add that host (and its port, if
+it is not 80 or 443) to `egress.usage_sinks.hosts`.
+
+### `egress.token_exchange` now gates the MCP run-as-user token exchange
+
+**Who this reaches.** Any config with `egress.token_exchange` set to
+`mode: deny_by_default` and an MCP server whose `upstream_auth` uses the
+token-exchange mode with `run_as_user_auth`.
+
+**What changes.** That exchange passed no authorizer at all, so it ran ungated
+regardless of this sub-block. It now reads the same slot the non-MCP
+outbound-credential resolver does, and a per-server `egress:` block does not
+substitute for it: a per-server block gates that server's upstream connects and
+OpenAPI tool calls, never its token endpoint.
+
+**What an operator sees when it bites.** The tool call fails with
+`token exchange egress denied`, plus
+`sbproxy_egress_refused_total{purpose="token_exchange",reason=...}` and a
+`denied` row in `GET /api/egress` naming the token endpoint's host.
+
+**What to do before upgrading.** Add every MCP token endpoint host to
+`egress.token_exchange.hosts` alongside the non-MCP ones already there.
+
+---
+
 ## Selected field stability reference
 
 The tables below cover representative and high-impact leaves. They do not

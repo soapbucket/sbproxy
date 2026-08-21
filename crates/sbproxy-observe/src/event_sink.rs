@@ -37,7 +37,27 @@
 //! family under its own reason, so "the SIEM has no denials in it" always
 //! has an answer that is not "read the source". The closed set is
 //! `queue_full`, `worker_stopped`, `serialize_error`, `write_error`,
-//! `http_error`, `delivery_failed`, and `ssrf_rejected`.
+//! `http_error`, `delivery_failed`, `ssrf_rejected`, and
+//! `egress_denied`.
+//!
+//! # The collector is a governed destination
+//!
+//! The webhook sink does not dial for itself. It hands its POST to
+//! [`sbproxy_security::governed_egress`], the one bounded redirect loop
+//! every credential-carrying egress path in this workspace goes
+//! through, and so gets three things it did not have before (WOR-2612):
+//! the dial is pinned to the addresses the SSRF guard just resolved
+//! rather than to a second lookup, the destination is authorized
+//! against the `egress:` block's webhook allowlist when the operator
+//! has armed one, and a redirect is re-authorized rather than followed.
+//!
+//! That last one is why this matters at all. The batch carries an
+//! HMAC-SHA256 signature over its own body, in a header
+//! (`X-Sbproxy-Signature`) that no HTTP client's built-in credential
+//! stripping has ever heard of, and a 307 replays a body verbatim. A
+//! collector answering `Location: http://169.254.169.254/` used to
+//! receive the whole signed envelope. Now the hop is refused, counted
+//! under `egress_denied`, and visible in `GET /api/egress`.
 //!
 //! # Shutdown does not flush
 //!
@@ -97,6 +117,35 @@ const DRAIN_BATCH: usize = 256;
 
 /// Per-attempt HTTP timeout for the webhook sink.
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on the bytes read from a collector's reply.
+///
+/// Nothing here reads the reply body; only the status decides whether
+/// the batch landed. The cap exists because something has to: a
+/// collector that answers a 256-event POST with a gigabyte of prose
+/// would otherwise be an unbounded allocation on the delivery thread,
+/// and "we never look at it" is not a bound. 64 KiB is far more than
+/// any error payload a SIEM sends back and small enough that a wedged
+/// one cannot cost memory worth measuring.
+const WEBHOOK_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The attribution the webhook sink stamps on every egress refusal and
+/// inventory row. Configuration-scoped by construction: there is one
+/// `events:` block per process, so this is a constant rather than
+/// anything derived from the URL.
+const WEBHOOK_EGRESS_ORIGIN: &str = "events";
+
+/// Headers the governed loop must strip before any cross-origin replay,
+/// on top of the always-sensitive set it applies itself.
+///
+/// `X-Sbproxy-Signature` is the whole reason this list is not empty. It
+/// is an HMAC over `<timestamp>.<body>` keyed with `signing_secret`, and
+/// reqwest's built-in credential stripping knows about `Authorization`,
+/// `Cookie`, and `Proxy-Authorization` and nothing else, so a custom
+/// signature header rides a redirect untouched. The timestamp goes with
+/// it because the two are one construction: a receiver that has the
+/// pair has the whole signed statement.
+const WEBHOOK_SENSITIVE_HEADERS: [&str; 2] = ["x-sbproxy-signature", "x-sbproxy-timestamp"];
 
 /// Which [`EventType`]s an egress delivers.
 ///
@@ -554,13 +603,20 @@ fn start_webhook_worker(
     signing_secret: Option<String>,
     rx: Receiver<ProxyEvent>,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
-    if !allow_private_urls() {
-        if let Err(reason) = sbproxy_security::ssrf::validate_url(&url) {
+    if let Some(allowlist) = ssrf_allowlist() {
+        if let Err(reason) = sbproxy_security::ssrf::validate_url_with_allowlist(&url, &allowlist) {
             anyhow::bail!("events.url is refused by the SSRF guard: {reason}");
         }
     }
 
+    // No redirect policy of its own. Every hop this sink is willing to
+    // take is decided by `sbproxy_security::governed_egress`, which
+    // re-authorizes the destination and refuses to replay a signed body
+    // at a host the operator never named; a client that followed a 307
+    // on its own would hand the whole signed envelope over before that
+    // loop ever saw the `Location`.
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(WEBHOOK_TIMEOUT)
         .build()
         .map_err(|error| anyhow::anyhow!("events webhook client: {error}"))?;
@@ -571,19 +627,42 @@ fn start_webhook_worker(
 
     let handle = std::thread::Builder::new()
         .name("sbproxy-events-webhook".to_string())
-        .spawn(move || loop {
-            let batch = drain_batch(&rx);
-            if batch.is_empty() {
-                break;
+        .spawn(move || {
+            let mut collector: Option<PinnedCollector> = None;
+            loop {
+                let batch = drain_batch(&rx);
+                if batch.is_empty() {
+                    break;
+                }
+                runtime.block_on(deliver_batch(
+                    &mut collector,
+                    &client,
+                    &url,
+                    signing_secret.as_deref(),
+                    &batch,
+                ));
             }
-            runtime.block_on(deliver_batch(
-                &client,
-                &url,
-                signing_secret.as_deref(),
-                &batch,
-            ));
         })?;
     Ok(handle)
+}
+
+/// The collector's client, pinned to the addresses the SSRF guard most
+/// recently resolved for it.
+///
+/// The guard re-resolves the configured URL before every batch, and the
+/// dial has to use that exact answer: letting reqwest run its own
+/// lookup afterwards is what leaves the rebinding window open, because
+/// the address that passed the check and the address that gets
+/// connected to are then two different queries. Pinning closes it.
+///
+/// Cached across batches rather than rebuilt per batch, keyed on the
+/// address set itself, so a steady collector keeps one connection pool
+/// and its keep-alive instead of paying a fresh TCP and TLS handshake
+/// for every POST. A collector that genuinely moves gets a new client
+/// on the batch after the move.
+struct PinnedCollector {
+    addrs: Vec<std::net::SocketAddr>,
+    client: reqwest::Client,
 }
 
 /// POST one batch. One attempt, no retry; see the module docs.
@@ -592,7 +671,18 @@ fn start_webhook_worker(
 /// once per batch, so the metric answers "how many events did my SIEM
 /// not get" rather than "how many POSTs failed", which is the question
 /// an operator reconciling two systems is actually asking.
+///
+/// Delivery goes through [`sbproxy_security::governed_egress`] rather
+/// than a bare `send()`. Three properties come from that and none of
+/// them held before (WOR-2612): the dial is pinned to the addresses the
+/// SSRF guard just resolved, so the check and the connect cannot
+/// disagree; the destination is authorized against the
+/// [`sbproxy_security::egress::EgressPurpose::Webhook`] allowlist when
+/// the operator has armed one; and a redirect is re-authorized rather
+/// than followed, so a collector answering 307 with a `Location` on the
+/// link-local range does not receive the signed envelope.
 async fn deliver_batch(
+    collector: &mut Option<PinnedCollector>,
     client: &reqwest::Client,
     url: &str,
     signing_secret: Option<&str>,
@@ -600,13 +690,29 @@ async fn deliver_batch(
 ) {
     let count = batch.len() as u64;
 
-    if !allow_private_urls() {
+    if let Some(allowlist) = ssrf_allowlist() {
         let target = url.to_string();
-        let verdict =
-            tokio::task::spawn_blocking(move || sbproxy_security::ssrf::validate_url(&target))
-                .await;
+        let verdict = tokio::task::spawn_blocking(move || {
+            sbproxy_security::ssrf::validate_url_resolved(&target, &allowlist)
+        })
+        .await;
         match verdict {
-            Ok(Ok(())) => {}
+            Ok(Ok(resolved)) => {
+                if !pin_collector(collector, &resolved) {
+                    // No pinned client means no dial. Falling back to
+                    // the shared re-resolving client would give back
+                    // the pin defense silently, which is worse than
+                    // dropping a batch an operator can see on the
+                    // counter.
+                    tracing::error!(
+                        target: "events",
+                        reason = "client_build_failed",
+                        "events webhook has no pinned client for the collector; batch dropped"
+                    );
+                    count_batch_drop("webhook", "egress_denied", count);
+                    return;
+                }
+            }
             Ok(Err(reason)) => {
                 tracing::error!(
                     target: "events",
@@ -656,30 +762,134 @@ async fn deliver_batch(
         }
     }
 
-    match request.body(body).send().await {
-        Ok(response) if response.status().is_success() => {}
+    let request = match request.body(body).build() {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::error!(target: "events", error = %error, "events batch request would not build");
+            count_batch_drop("webhook", "delivery_failed", count);
+            return;
+        }
+    };
+
+    let gate = webhook_egress_gate();
+    let dial = collector.as_ref().map(|pinned| &pinned.client);
+    let governed = sbproxy_security::governed_egress::GovernedEgress {
+        purpose: sbproxy_security::egress::EgressPurpose::Webhook,
+        authorizer: gate.as_ref(),
+        resolver: &sbproxy_security::egress::CachedSystemResolver,
+        origin: WEBHOOK_EGRESS_ORIGIN,
+        // One `events:` block serves the whole process, so there is no
+        // per-tenant attribution to give a refusal here. `"unset"` is
+        // the documented way to say that rather than folding this
+        // sink's refusals into some tenant's series.
+        tenant: "unset",
+        sensitive_headers: &WEBHOOK_SENSITIVE_HEADERS,
+        max_response_bytes: WEBHOOK_MAX_RESPONSE_BYTES,
+        no_redirect_client: dial.unwrap_or(client),
+        timeout: WEBHOOK_TIMEOUT,
+    };
+
+    match governed.send(request).await {
+        Ok(response) if (200u16..300).contains(&response.status) => {}
         Ok(response) => {
             tracing::warn!(
                 target: "events",
-                status = %response.status(),
+                status = response.status,
                 count,
                 "events webhook returned non-success; batch dropped"
             );
             count_batch_drop("webhook", "http_error", count);
         }
-        Err(error) => {
-            // Not `error = %error`: a `reqwest::Error` Display ends with
-            // " for url ({url})", and the events webhook is the same
-            // shape of operator secret this file already refuses to log
-            // above (WOR-2629).
+        Err(sbproxy_security::governed_egress::GovernedEgressError::Denied(reason)) => {
+            // The closed reason is already on the warn line, the
+            // `sbproxy_egress_refused_total` counter, the `GET
+            // /api/egress` row, and the typed `egress_refused` event
+            // that `record_egress_refused` publishes. What is left to
+            // say here is what it cost this feed, which is the batch.
             tracing::warn!(
                 target: "events",
-                error = %sbproxy_httpkit::request_error_summary(&error),
+                reason = reason.as_label(),
+                count,
+                "events webhook destination refused by egress authorization; batch dropped"
+            );
+            count_batch_drop("webhook", "egress_denied", count);
+        }
+        Err(error) => {
+            // `reason`, a closed label off `GovernedEgressError`, rather
+            // than the error's own Display. The governed client returns a
+            // bounded enum that never holds a URL, so the webhook's path,
+            // which is the credential on Slack-shaped collectors, cannot
+            // reach this line by construction rather than by redaction
+            // (WOR-2612, WOR-2629).
+            tracing::warn!(
+                target: "events",
+                reason = error.as_label(),
                 count,
                 "events webhook delivery failed; batch dropped"
             );
             count_batch_drop("webhook", "delivery_failed", count);
         }
+    }
+}
+
+/// The `Webhook` slot of the process-wide configured-gate registry.
+///
+/// A named function with a literal purpose in it, rather than the read
+/// spelled inline, so the one thing this sink asks the registry for is
+/// greppable and testable by name. The registry is an exact-key map:
+/// this asks for `Webhook`, and `arm_egress_gates_from_config` in
+/// `sbproxy_core::server::lifecycle` is what has to write that key. It
+/// did not, for the whole life of the feature, and the answer here was
+/// `None` for every config anyone could write (WOR-2612).
+fn webhook_egress_gate() -> Option<sbproxy_security::egress::EgressAuthorizer> {
+    sbproxy_security::egress::configured_gate(sbproxy_security::egress::EgressPurpose::Webhook)
+}
+
+/// Point `collector` at `resolved`'s addresses, rebuilding its client
+/// only when the address set actually changed.
+///
+/// Returns false when the pinned client would not build, which the
+/// caller turns into a dropped batch. There is deliberately no
+/// unpinned fallback: see the call site.
+fn pin_collector(
+    collector: &mut Option<PinnedCollector>,
+    resolved: &sbproxy_security::ssrf::ResolvedUrl,
+) -> bool {
+    if resolved.addrs.is_empty() {
+        // `validate_url_resolved` returns an empty address set on one
+        // branch only: an allowlisted hostname it could not resolve
+        // (split-horizon DNS answering at dial time and not before).
+        // Production passes an empty allowlist, so that branch is
+        // unreachable from here, and the earlier version of this
+        // comment described a state the one caller cannot produce.
+        // Reaching it anyway means the guard changed shape, and the
+        // answer is the same one the rest of this path gives: a batch
+        // with nothing to pin to is dropped, not sent through a
+        // re-resolving client that would hand back the defense
+        // silently.
+        *collector = None;
+        return false;
+    }
+    if collector
+        .as_ref()
+        .is_some_and(|pinned| pinned.addrs == resolved.addrs)
+    {
+        return true;
+    }
+    let built = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(WEBHOOK_TIMEOUT)
+        .resolve_to_addrs(&resolved.host, &resolved.addrs)
+        .build();
+    match built {
+        Ok(client) => {
+            *collector = Some(PinnedCollector {
+                addrs: resolved.addrs.clone(),
+                client,
+            });
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -708,16 +918,30 @@ fn sign_batch(secret: &str, body: &[u8], timestamp: i64) -> Option<String> {
     Some(format!("v1={}", hex::encode(mac.finalize().into_bytes())))
 }
 
-/// Tests point the webhook sink at a loopback stub, which is exactly what
-/// the SSRF guard exists to refuse. Compiled out of the shipping binary.
-#[cfg(test)]
-fn allow_private_urls() -> bool {
-    true
+/// The allowlist the SSRF guard runs the collector URL against, or
+/// `None` to skip the guard entirely.
+///
+/// Production always answers with an empty allowlist: the guard runs,
+/// at boot and again before every batch, and no host is exempt from its
+/// private-address block.
+///
+/// Tests point the sink at a loopback stub, which is exactly what the
+/// guard exists to refuse, so the test build answers `None` by default.
+/// A default rather than a hard-coded skip, because skipping is what
+/// left the entire resolve-and-pin path unreachable from the suite:
+/// `validate_url_resolved`, `pin_collector`, the pinned dial, and the
+/// `client_build_failed` drop all sit inside the block this turns off,
+/// and deleting them would have kept every test green. The test
+/// module's `SsrfGuard` flips it back on with a host allowlisted, so at
+/// least one test drives the real path against a real stub.
+#[cfg(not(test))]
+fn ssrf_allowlist() -> Option<Vec<String>> {
+    Some(Vec::new())
 }
 
-#[cfg(not(test))]
-fn allow_private_urls() -> bool {
-    false
+#[cfg(test)]
+fn ssrf_allowlist() -> Option<Vec<String>> {
+    tests::ssrf_allowlist_override()
 }
 
 /// The process-wide egress, or nothing when `events:` is absent or set to
@@ -809,6 +1033,58 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
+
+    /// What [`super::ssrf_allowlist`] answers in the test build.
+    ///
+    /// `None`, the default, is the historical behavior: skip the guard
+    /// so a loopback stub URL is usable at all. [`SsrfGuard`] swaps in
+    /// `Some(allowlist)` for the length of one test so the real
+    /// resolve-and-pin path runs against that stub instead of being
+    /// jumped over.
+    static SSRF_ALLOWLIST: std::sync::RwLock<Option<Vec<String>>> = std::sync::RwLock::new(None);
+
+    /// Serializes the tests that flip [`SSRF_ALLOWLIST`]. nextest gives
+    /// every test its own process, but the `cargo test` fallback does
+    /// not, and a process-wide switch two threads share is exactly the
+    /// kind of state that makes a suite pass in one runner and not the
+    /// other.
+    static SSRF_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn ssrf_allowlist_override() -> Option<Vec<String>> {
+        match SSRF_ALLOWLIST.read() {
+            Ok(guard) => guard.as_ref().cloned(),
+            Err(poisoned) => poisoned.into_inner().as_ref().cloned(),
+        }
+    }
+
+    /// Turns the SSRF guard on, with `hosts` exempt from its
+    /// private-address block, until the returned value drops.
+    struct SsrfGuard {
+        _serialize: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SsrfGuard {
+        fn enforced_for(hosts: &[&str]) -> Self {
+            let serialize = match SSRF_GUARD_LOCK.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Ok(mut slot) = SSRF_ALLOWLIST.write() {
+                *slot = Some(hosts.iter().map(|host| (*host).to_string()).collect());
+            }
+            Self {
+                _serialize: serialize,
+            }
+        }
+    }
+
+    impl Drop for SsrfGuard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = SSRF_ALLOWLIST.write() {
+                *slot = None;
+            }
+        }
+    }
 
     fn event(event_type: EventType) -> ProxyEvent {
         ProxyEvent::new(
@@ -1101,6 +1377,348 @@ mod tests {
         assert!(
             !request.contains("shhh"),
             "the signing secret was transmitted rather than used as a key: {request}"
+        );
+    }
+
+    /// WOR-2612: a collector that answers 307 with a `Location` at
+    /// another origin must not get the signed envelope replayed at that
+    /// origin, and the batch must be counted as refused rather than
+    /// quietly delivered somewhere else.
+    ///
+    /// Before the governed loop this test was red twice over: the
+    /// webhook client carried reqwest's default `Policy::limited(10)`,
+    /// which follows the hop, and reqwest strips only `Authorization`,
+    /// `Cookie`, and `Proxy-Authorization` across it, so
+    /// `X-Sbproxy-Signature` and the whole event body arrived at the
+    /// second stub intact.
+    #[test]
+    fn a_redirected_batch_never_reaches_the_second_origin() {
+        let sink_listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        let sink_addr = sink_listener.local_addr().expect("redirect target addr");
+        let sink_saw = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink_side = sink_saw.clone();
+        let sink = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = sink_listener.accept() {
+                let request = read_request_and_ack(&mut socket);
+                if let Ok(mut slot) = sink_side.lock() {
+                    *slot = request;
+                }
+            }
+        });
+
+        let idp_listener = TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let idp_addr = idp_listener.local_addr().expect("collector addr");
+        let idp = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = idp_listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut scratch = [0u8; 16 * 1024];
+                let _ = socket.read(&mut scratch);
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{sink_addr}/steal\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes());
+                let _ = socket.flush();
+            }
+        });
+
+        let before = dropped("webhook", "egress_denied");
+        let egress = EventEgress::start(
+            EventSinkTarget::Webhook {
+                url: format!("http://{idp_addr}/ingest"),
+                signing_secret: Some("shhh".to_string()),
+            },
+            EventTypeMask::from_types(&[EventType::PolicyDenied]),
+            16,
+        )
+        .expect("webhook egress starts");
+        egress.publish(event(EventType::PolicyDenied));
+        drop(egress);
+        let _ = idp.join();
+
+        let stolen = sink_saw.lock().map(|slot| slot.clone()).unwrap_or_default();
+        assert!(
+            stolen.is_empty(),
+            "the redirect target received the batch: {stolen}"
+        );
+        assert_eq!(
+            dropped("webhook", "egress_denied") - before,
+            1,
+            "a refused hop must count one drop per event in the batch"
+        );
+
+        // Read the assertions off the mutex first, then unblock the
+        // redirect target's `accept` so its thread can exit. Joining it
+        // before this point would wait for a connection the whole test
+        // exists to prove never happens.
+        drop(TcpStream::connect(sink_addr));
+        let _ = sink.join();
+    }
+
+    /// The compiled shape of an armed `usage_sinks:` sub-block: one
+    /// allowlist filed under both purposes, the way
+    /// `sbproxy_config::compiler::compile_egress_gates` builds it.
+    fn usage_sinks_allowlist(host: &str) -> sbproxy_security::egress::EgressAuthorizer {
+        use sbproxy_security::egress::{
+            EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        let allowlist = PurposeAllowlist {
+            hosts: HashSet::from([host.to_string()]),
+            schemes: HashSet::from(["http".to_string(), "https".to_string()]),
+            ports: HashSet::from([80u16, 443u16]),
+            allow_private: false,
+        };
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::UsageSink, allowlist.clone());
+        purposes.insert(EgressPurpose::Webhook, allowlist);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    /// WOR-2612: an operator who arms `egress.usage_sinks` and points
+    /// `events.url` somewhere the allowlist does not name gets the batch
+    /// refused, not delivered.
+    ///
+    /// This is the reader half of the blocker. The registry is an
+    /// exact-key map: this sink asks it for `EgressPurpose::Webhook`,
+    /// nothing ever wrote that key, so `webhook_egress_gate()` answered
+    /// `None` for every config, `GovernedEgress::authorize_destination`
+    /// took its ungated branch, and the signed batch went to whatever
+    /// host `events.url` named without any allowlist, scheme, port, or
+    /// private-address rule being consulted. The writer half, that
+    /// `arm_egress_gates_from_config` files a compiled `usage_sinks:`
+    /// allowlist under `Webhook` as well as `UsageSink`, is pinned by
+    /// `every_purpose_the_compiled_egress_section_arms_is_reachable_in_the_registry`
+    /// in `sbproxy_core::server::lifecycle`.
+    #[test]
+    fn an_unlisted_collector_is_refused_and_the_batch_never_leaves() {
+        use sbproxy_security::egress::{
+            egress_inventory_snapshot, install_configured_gate, EgressPurpose,
+        };
+
+        install_configured_gate(
+            EgressPurpose::Webhook,
+            Some(usage_sinks_allowlist("collector.internal")),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let addr = listener.local_addr().expect("collector addr");
+        let reached = Arc::new(AtomicUsize::new(0));
+        let reached_side = Arc::clone(&reached);
+        let collector = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                reached_side.fetch_add(1, Ordering::SeqCst);
+                let _ = read_request_and_ack(&mut socket);
+            }
+        });
+
+        let before = dropped("webhook", "egress_denied");
+        let egress = EventEgress::start(
+            EventSinkTarget::Webhook {
+                url: format!("http://{addr}/ingest"),
+                signing_secret: Some("shhh".to_string()),
+            },
+            EventTypeMask::from_types(&[EventType::PolicyDenied]),
+            16,
+        )
+        .expect("webhook egress starts");
+        egress.publish(event(EventType::PolicyDenied));
+        // `Drop` closes the channel and joins the delivery thread, so
+        // every assertion below runs after the attempt finished.
+        drop(egress);
+
+        assert_eq!(
+            dropped("webhook", "egress_denied") - before,
+            1,
+            "a collector the allowlist does not name must count one drop per event"
+        );
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the unlisted collector accepted a connection, so the batch was sent anyway"
+        );
+
+        let row = egress_inventory_snapshot()
+            .into_iter()
+            .find(|row| {
+                row.purpose == "webhook" && row.host == "127.0.0.1" && row.port == addr.port()
+            })
+            .expect("the refused collector must appear in `GET /api/egress`");
+        assert_eq!(row.status, "denied", "{row:?}");
+        assert_eq!(row.last_reason, Some("unlisted_host"), "{row:?}");
+        assert_eq!(row.origin, "events", "{row:?}");
+
+        install_configured_gate(EgressPurpose::Webhook, None);
+        drop(TcpStream::connect(addr));
+        let _ = collector.join();
+    }
+
+    /// WOR-2612: the dial goes to the addresses the SSRF guard resolved,
+    /// not to a lookup the HTTP client runs for itself.
+    ///
+    /// The pin set names a loopback stub and the URL names a host in the
+    /// reserved `.invalid` domain, which no resolver answers for. The
+    /// only way this POST can arrive is through the address override
+    /// `pin_collector` installed, so the stub receiving it is the pin
+    /// doing its job. The `Host` header proves the other half: the
+    /// override changes where the connector dials and nothing else, so
+    /// TLS SNI and certificate verification still run against the name
+    /// the guard checked.
+    #[test]
+    fn the_dial_goes_to_the_pinned_address_and_not_a_fresh_lookup() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let addr = listener.local_addr().expect("collector addr");
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_side = Arc::clone(&seen);
+        let stub = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let request = read_request_and_ack(&mut socket);
+                if let Ok(mut slot) = seen_side.lock() {
+                    *slot = request;
+                }
+            }
+        });
+
+        let resolved = sbproxy_security::ssrf::ResolvedUrl {
+            host: "collector.invalid".to_string(),
+            port: addr.port(),
+            addrs: vec![addr],
+            allowlisted: true,
+        };
+        let mut collector: Option<PinnedCollector> = None;
+        assert!(
+            pin_collector(&mut collector, &resolved),
+            "a resolvable pin set must produce a client"
+        );
+        let pinned = collector
+            .as_ref()
+            .expect("a non-empty pin set installs a client");
+        assert_eq!(pinned.addrs, vec![addr]);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let sent = runtime.block_on(async {
+            pinned
+                .client
+                .post(format!("http://collector.invalid:{}/ingest", addr.port()))
+                .body("{}")
+                .send()
+                .await
+        });
+        assert!(
+            sent.is_ok(),
+            "the pinned client could not reach its pin set: {sent:?}"
+        );
+        // Join before reading: the stub stores the request it saw after
+        // it has already answered, so `send` returning is not proof the
+        // string has landed.
+        let _ = stub.join();
+        let request = seen.lock().map(|slot| slot.clone()).unwrap_or_default();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("host: collector.invalid"),
+            "the pin must move the dial and leave the Host name alone: {request}"
+        );
+
+        // An unchanged address set reuses the client rather than paying
+        // a fresh handshake; a set that moved replaces it.
+        assert!(pin_collector(&mut collector, &resolved));
+        assert_eq!(
+            collector.as_ref().map(|pinned| pinned.addrs.clone()),
+            Some(vec![addr])
+        );
+        let moved = sbproxy_security::ssrf::ResolvedUrl {
+            addrs: vec![std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                addr.port() ^ 1,
+            ))],
+            ..resolved
+        };
+        assert!(pin_collector(&mut collector, &moved));
+        assert_eq!(
+            collector.as_ref().map(|pinned| pinned.addrs.clone()),
+            Some(moved.addrs.clone()),
+            "a collector that moved must get a client pinned to where it moved to"
+        );
+    }
+
+    /// WOR-2612: the guard-and-pin block runs on the real delivery path,
+    /// not only in the unit test of its parts.
+    ///
+    /// Every other test in this file leaves the SSRF guard off, because
+    /// a loopback stub is exactly what it exists to refuse, and with it
+    /// off `deliver_batch` skips `validate_url_resolved`,
+    /// `pin_collector`, and the pinned dial entirely: the whole path
+    /// could be deleted and the suite would stay green.
+    /// [`SsrfGuard`] turns it on with loopback allowlisted, so this one
+    /// test drives it end to end and proves the batch went out through
+    /// the pinned client the guard's own answer built.
+    #[test]
+    fn the_real_guard_and_pin_path_delivers_through_the_pinned_client() {
+        let _guard = SsrfGuard::enforced_for(&["127.0.0.1"]);
+        // This one has to reach the stub, so make sure no sibling test
+        // in a shared `cargo test` process left a `Webhook` allowlist
+        // armed. nextest gives every test its own process and this is a
+        // no-op there.
+        sbproxy_security::egress::install_configured_gate(
+            sbproxy_security::egress::EgressPurpose::Webhook,
+            None,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let addr = listener.local_addr().expect("collector addr");
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_side = Arc::clone(&seen);
+        let stub = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let request = read_request_and_ack(&mut socket);
+                if let Ok(mut slot) = seen_side.lock() {
+                    *slot = request;
+                }
+            }
+        });
+
+        let shared = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(WEBHOOK_TIMEOUT)
+            .build()
+            .expect("shared client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut collector: Option<PinnedCollector> = None;
+        let before = dropped("webhook", "egress_denied") + dropped("webhook", "ssrf_rejected");
+        runtime.block_on(deliver_batch(
+            &mut collector,
+            &shared,
+            &format!("http://{addr}/ingest"),
+            Some("shhh"),
+            &[event(EventType::PolicyDenied)],
+        ));
+
+        assert_eq!(
+            dropped("webhook", "egress_denied") + dropped("webhook", "ssrf_rejected"),
+            before,
+            "the guard refused a batch it was supposed to pass"
+        );
+        assert_eq!(
+            collector.as_ref().map(|pinned| pinned.addrs.clone()),
+            Some(vec![addr]),
+            "the guard's own answer must be what the dial is pinned to"
+        );
+        // Join before reading: the stub stores what it saw only after
+        // it has answered, so `deliver_batch` returning is not proof
+        // the string has landed.
+        let _ = stub.join();
+        let request = seen.lock().map(|slot| slot.clone()).unwrap_or_default();
+        assert!(
+            request.contains("X-Sbproxy-Signature"),
+            "the signed batch never arrived: {request}"
         );
     }
 

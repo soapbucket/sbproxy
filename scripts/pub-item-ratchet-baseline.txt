@@ -510,3 +510,18 @@
 # caller and no reason to be askable again. Deleting the predicate is
 # the point rather than a side effect, which is why this lowers rather
 # than gaining a caller.
+
+# 2026-08-21 (WOR-2621): 297 -> 296, and not because anything was
+# narrowed or wired. `DistributedCache::sweep_expired` in
+# `crates/sbproxy-mesh/src/state/distributed_cache.rs` left the
+# test-only bucket without changing: WOR-2621's bounded run-as-user
+# token cache added a `TokenCache::sweep_expired` in
+# `crates/sbproxy-extension/src/mcp/auth.rs`, and a name occurrence in
+# another crate's production code is all the grep-based scanner needs
+# to decide the mesh item has a non-test consumer. Same class as the
+# `"fallback_trigger"` entry above, and answered the same way: the
+# extension method is not renamed to dodge the heuristic, because
+# `sweep_expired` is what it does and a cache's expiry sweep is a name
+# this workspace should be able to use twice. The count moves so the
+# ratchet keeps working; the mesh item is no more wired than it was
+# yesterday and is still worth a look.
