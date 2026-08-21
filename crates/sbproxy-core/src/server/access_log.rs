@@ -98,7 +98,7 @@ pub(super) fn agent_class_label(ctx: &RequestContext) -> &'static str {
 /// client IP with no PTR record yields a `DnsError` verdict, which the
 /// resolver chain treats as a miss and falls through to UA matching.
 ///
-/// Cache size honours `agent_classes.resolver.cache_size`; the default
+/// Cache size honors `agent_classes.resolver.cache_size`; the default
 /// (10 000 entries) matches the OSS recommendation in the resolver
 /// docs.
 #[cfg(feature = "agent-class")]
@@ -138,7 +138,7 @@ pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentC
                 other => {
                     tracing::warn!(
                         catalog = %other,
-                        "agent_classes.catalog '{}' is not recognised; falling back to \
+                        "agent_classes.catalog '{}' is not recognized; falling back to \
                          the built-in defaults",
                         other,
                     );
@@ -259,7 +259,7 @@ pub(super) fn redact_pii_other_fields(
             Some(r) => RedactorRef::Scoped(r),
             // No matching rule names: no-op so the caller falls back
             // to the cheap `redact_secrets` pass alone, matching the
-            // header-scope behaviour in `capture_headers_for_log`.
+            // header-scope behavior in `capture_headers_for_log`.
             None => return,
         }
     };

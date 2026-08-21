@@ -67,7 +67,7 @@ pub struct ResolveInputs<'a> {
     pub bot_auth_keyid: Option<&'a str>,
     /// Set to `true` when a Web Bot Auth signature was present and
     /// cryptographically valid but advertised a `keyid` that no
-    /// catalog entry recognises. Drives the `anonymous` verdict.
+    /// catalog entry recognizes. Drives the `anonymous` verdict.
     pub anonymous_bot_auth: bool,
     /// Client IP from the trusted-boundary peer. `None` skips rDNS.
     pub client_ip: Option<IpAddr>,
@@ -753,7 +753,7 @@ agent_classes:
     }
 
     #[test]
-    fn looks_like_generic_crawler_recognises_common_tokens() {
+    fn looks_like_generic_crawler_recognizes_common_tokens() {
         assert!(looks_like_generic_crawler("PalmCrawler/1.0"));
         assert!(looks_like_generic_crawler("ScrapeBot 0.9"));
         assert!(looks_like_generic_crawler("MySpider"));

@@ -34,7 +34,7 @@ use crate::context::RequestContext;
 ///
 /// `anonymous_bot_auth` should be `true` when a Web Bot Auth
 /// signature was present and structurally valid but advertised a
-/// `keyid` no catalog entry recognises.
+/// `keyid` no catalog entry recognizes.
 pub fn stamp_request_context(
     ctx: &mut RequestContext,
     resolver: &AgentClassResolver,
