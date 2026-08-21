@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -470,6 +470,127 @@ warm-up instead of waiting for a hard threshold. The scoring formula,
 confidence schedule, and feedback lifetime are in
 [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
+### semantic_route
+
+Routes on what the request means. Each deployment declares its specialty as
+exemplar prompts (or precomputed embedding centroids); the proxy embeds the
+request's final user message once, cosine-matches it against the exemplar
+vectors, and pins the best-scoring deployment when the score clears
+`min_similarity`. Distinct from `prefix_affinity`, which routes byte-stable
+prompt prefixes back to the worker holding their KV cache: prefix affinity
+optimizes cache reuse, semantic routing sends a newly worded request to the
+pool that specializes in its topic.
+
+```mermaid
+flowchart TD
+    A[Request arrives] --> B{Final user message present?}
+    B -->|no| F[Fallback deployment]
+    B -->|yes| C["Embed the message
+(exemplar vectors are cached from first use)"]
+    C -->|embedder unavailable| F
+    C -->|vector| D["Cosine-match against every
+declared exemplar vector"]
+    D --> E{"Best score >= min_similarity?"}
+    E -->|yes| G[Best-matching deployment]
+    E -->|no| F
+    F --> H[Dispatch]
+    G --> H
+```
+
+```yaml
+routing:
+  strategy: semantic_route
+  min_similarity: 0.75
+  fallback: chat-pool
+  routes:
+    - deployment: code-pool
+      exemplars:
+        - "Write a function that parses JSON and handles errors"
+        - "Review this pull request and point out bugs"
+    - deployment: chat-pool
+      exemplars:
+        - "Have a friendly conversation about everyday topics"
+  source: openai
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: text-embedding-3-small
+```
+
+`routes` declares up to 64 deployments with up to 64 exemplars each, and at
+most 256 exemplar texts across every route combined. The aggregate is a
+config-load refusal rather than a runtime truncation: the per-route cap on
+its own would admit 4,096 texts, and every one of them is a billed embedding
+call on whichever request happens to build the index. A config over it is
+named at load, with the count it declared (`semantic_route routes: must
+declare at most 256 exemplar texts across every route, and this config
+declares 300`), and the proxy does not start.
+
+A rule may carry a precomputed `centroid` vector instead of (or alongside)
+exemplar texts; centroids never trigger an embedding call and count against
+neither exemplar cap. A rule's score is the best cosine similarity over all
+of its vectors, and the best-scoring rule wins. Score ties keep the earliest
+declared exemplar, so decisions are deterministic.
+
+The embedding source reuses the semantic cache's source shapes: `provider`
+(an `embedding: {provider, model}` block naming one of the origin's
+providers), `sidecar` (the local classifier sidecar, no egress), or `openai`
+(a standalone OpenAI-compatible `/v1/embeddings` endpoint). An embedding
+source is required: a `semantic_route` block without one fails config
+compile with a named error, the same refusal posture `token_rate` gets. The
+cache's fourth shape, `source: inprocess`, is refused here: the in-process
+embedder is not reachable from the routing seam, and the error says so
+rather than degrading at runtime. Route deployments, the `fallback`, and
+`embedding.provider` must all name configured providers or the config is
+refused, the way cascade tiers are.
+
+Exemplar texts embed once per process on first use and the vectors are
+cached, so the steady-state cost is one embedding call per request, bounded
+by the embedding source's own timeout. The first-use build is single-flighted:
+one request holds the gate and embeds the whole index, and a request that
+arrives while that build is in flight takes the fallback rather than waiting
+on it, so a cold start under load pays for one build instead of one per
+request. A build that fails is negatively cached behind a retry floor that
+starts at 30s and doubles per consecutive failure up to a 300s ceiling;
+requests arriving inside that window also take the fallback, without touching
+the embedder at all. A permanently unbuildable index (a mistyped
+`embedding.model`, a centroid whose dimensions disagree with the embedder's
+real output) therefore costs one attempt per window rather than one per
+request.
+
+Every non-match is a fallback, never a failure: a below-floor score, a
+request with no user message, an unavailable embedder, a build already in
+flight, and a build inside its retry floor all route to the declared
+`fallback` deployment (or round-robin across the eligible set when none is
+declared). The request is never failed or hung on this strategy's account.
+The last three report the same `embed_error` outcome, so a burst of it in the
+first seconds after a deploy is the cold start rather than an embedder
+outage; a rate that persists is the outage.
+
+Each decision ticks
+`sbproxy_ai_semantic_route_decisions_total{outcome}` (`matched`,
+`below_floor`, `no_prompt`, `embed_error`, `target_ineligible`); the
+fallback outcomes also tick
+`sbproxy_ai_routing_fallbacks_total{strategy="semantic_route"}`, so an
+embedder outage is a visible fallback rate rather than silence.
+`sbproxy_ai_semantic_route_similarity{provider}` records the best cosine
+score of every scored request, matched and below-floor both, which is the
+histogram to consult when tuning the floor. The score is the observation,
+never a label.
+
+Per-request, the decision lands on the admin request log as
+`routing_detail` (the console renders it as **Routing detail** beside the
+strategy and the selected target), which is the durable record. Three log
+events carry the same decision: `ai.semantic_route.route` at `debug` for a
+match, with the deployment, the winning exemplar's ordinal, the score, and
+the floor; `ai.semantic_route.route_miss` at `warn` when the best-scoring
+deployment is not eligible for this request; and
+`ai.semantic_route.fallback` for the rest, at `debug` for a below-floor
+score or a promptless request and at `warn` for an unavailable embedder.
+
+See [examples/semantic-routing](../examples/semantic-routing/) for a
+runnable two-pool config with a below-floor fallback walkthrough.
+
 ## Routing policy
 
 The strategies above are a fixed menu. `ai_routing_policy` lets you write
@@ -740,7 +861,22 @@ resilience:
     content_policy: 0  # never retry a refusal in place
 ```
 
+A sibling `cooldown_policy` maps the same failure classes to provider cooldowns: a classified failure of a mapped class removes that provider from candidate rotation for the configured seconds (a `429` can park a provider for 30s; a dead credential can stop eating the first attempt on every request). Both policies default to current behavior when unset.
+
 The same block hosts the legacy `llm_aware.context_compress` shorthand, which maps to stateless `window_fit` when no explicit compression policy is present, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table and hedged-request behavior are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). Ordered summary, query selection, token pruning, retrieval shaping, and final fitting are documented in [AI context compression](ai-context-compression.md).
+
+### Typed fallback triggers
+
+The fallback chain is generic: any retryable failure advances to the next provider in priority order. Two failure classes deserve a different next hop, and each gets its own list as a sibling of `routing:` on the action:
+
+```yaml
+routing:
+  strategy: fallback_chain
+context_window_fallbacks: [big-window]   # prompt overflows the model's window
+content_policy_fallbacks: [permissive]   # provider refused on safety grounds
+```
+
+Each list names providers from the same action's `providers:` (a name matching nothing fails config load). An oversized prompt is caught by the pre-flight token estimate and rerouted to a larger-window provider before anything dispatches, so streaming requests participate too. The estimate runs on the three token-priced chat surfaces, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`, since the last two reach the trigger already normalized to the canonical chat body; on any other surface the pre-flight half stands down and only a provider that answers with a recognizable context-overflow body trips the trigger. A content-policy refusal reroutes to the aimed list instead of whatever the chain had queued next. A typed reroute is visible on `sbproxy_ai_failovers_total{reason="context_window"|"content_policy"}`. The generic availability hop is on the same counter under a different spelling: `reason="http_<status>"` for a status-code failover, `reason="transport"` for a connection failure, and `reason="managed_cold_fallback"` for a cold managed replica. `generic` is not a value of that label; it is the `failover_trigger` value on the admin console's request log, where the closed set is `context_window`, `content_policy`, and `generic`. Full decision-path diagram, scope notes, and the per-class retry and cooldown interplay are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#typed-fallback-triggers); the runnable, credential-free walkthrough is [examples/typed-fallbacks](../examples/typed-fallbacks/).
 
 ## Shadow eval
 
@@ -1565,6 +1701,119 @@ origins:
             - gpt-4o-mini
 ```
 
+### Per-request price ceiling
+
+Budgets cap what a scope spends over a period. The price ceiling caps what a single request may cost before it dispatches: "never route this one call to anything over $0.05," where a budget can only say "stop me once I have spent too much this hour." The two are disjoint and compose: the ceiling gates each request against its own estimated cost and keeps no state, budgets accumulate real usage per scope and never look at an individual request's price. A request can pass a generous budget and still be refused by the ceiling, or clear the ceiling and be blocked by an exhausted budget.
+
+Set an origin-level ceiling in USD per request:
+
+```yaml
+action:
+  type: ai_proxy
+  max_price_per_request: 0.05
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+```
+
+The value must be positive. A ceiling of zero or below admits nothing, so the config is refused at load rather than booting an origin that answers 402 to everything.
+
+A caller can tighten it per request with the `x-sbproxy-max-price` header (USD). The header only ever lowers the effective ceiling; a request cannot raise a guard the operator set. A malformed or non-positive header value is refused with 400 rather than ignored, since a caller who asked for a bound and mistyped it must not dispatch unbounded.
+
+Before provider selection, the gateway estimates what each routing candidate would charge for this request and drops every candidate whose estimate exceeds the effective ceiling. The estimate reuses the exact price resolution that cost tracking bills with (`model_prices`, then the rate card, then the built-in catalog, then the pessimistic $5 / $5 fallback), so there is no second price table to drift: a model your cost reports price at $2.50 per million input tokens is gated at $2.50 per million input tokens. Each candidate is priced against the model it would actually dispatch, after its `model_map` rename. The token volumes are the same pre-dispatch prompt estimate budget accounting uses, plus the request's declared output cap (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`); a request that declares no output cap is assumed to produce 1,024 completion tokens, so an output-priced frontier model cannot slip under the ceiling on a short prompt alone. On an origin with a [`reasoning:` budget](#reasoning-policy) the priced output volume also carries what that budget will add, because the gateway raises the cap itself after selection: the Anthropic-shaped transform rewrites `max_tokens` to `declared + budget` so the visible answer survives the thinking spend. The ceiling runs that same transform ahead of time and prices the cap it reads back, so a `{budget: 8192}` origin prices a request declaring 1,000 output tokens at 9,192 of them. Pricing the declared cap alone would clear a request the gateway then dispatches at several times the estimate it cleared on. A model no price layer knows gets the same $5 / $5 fallback as billing, which usually excludes it under a tight ceiling: unpriced is treated as expensive, not free.
+
+```mermaid
+flowchart TD
+    A[Request reaches routing] --> B{"effective ceiling?\n(min of config and\nx-sbproxy-max-price)"}
+    B -->|none| G[Candidate set unchanged]
+    B -->|set| K["Candidate set:\na cascade's tier list when the\ncascade will dispatch, else the\nprovider order (a streaming or\nmanaged-local cascade prices both)"]
+    K --> C["Estimate each candidate:\nprompt est x input rate +\noutput cap x output rate\n(same layers as cost tracking)"]
+    C --> D{estimate <= ceiling?}
+    D -->|yes| E[Candidate stays routable]
+    D -->|no| F["Candidate excluded\n(counted, resolved price kept)"]
+    E --> H{any candidate left?}
+    F --> H
+    H -->|yes| I[Strategy selects from the survivors]
+    H -->|no| J["402 price_ceiling_exceeded\nnames the ceiling, lists each\ncandidate's estimated cost"]
+```
+
+When every candidate is over the ceiling the request fails closed with 402. The gateway will not quietly route to something more expensive than the caller was willing to pay. The refusal names the ceiling and carries each excluded candidate's estimated cost and the price layer that produced it, so the caller sees what the request would have cost:
+
+```console
+$ curl -s http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Host: ai.local' \
+    -H 'Content-Type: application/json' \
+    -H 'x-sbproxy-max-price: 0.001' \
+    -d '{
+      "model": "gpt-4o",
+      "max_tokens": 1000,
+      "messages": [{"role": "user", "content": "Draft the quarterly summary."}]
+    }' | jq .
+{
+  "error": {
+    "ceiling_usd": 0.001,
+    "excluded": [
+      {
+        "estimated_cost_usd": 0.01003,
+        "model": "gpt-4o",
+        "price_source": "catalog",
+        "provider": "openai"
+      }
+    ],
+    "message": "no eligible provider can serve this request under the price ceiling of $0.001 per request; each candidate's estimated cost is listed in error.excluded",
+    "request_id": "01a02141ab5673718591887fb0169d6b",
+    "type": "price_ceiling_exceeded"
+  }
+}
+```
+
+That $0.01003 is the whole estimate: a prompt the gateway sizes at 12 tokens, at `gpt-4o`'s $2.50 per million input tokens, plus the declared 1,000-token output cap at $10.00 per million. Raise the ceiling above it and the same request dispatches.
+
+With more than one candidate the ceiling usually narrows rather than refuses. Give the same origin a second provider that renames `gpt-4o` down to `gpt-4o-mini`:
+
+```yaml
+providers:
+  - name: openai
+    api_key: ${OPENAI_API_KEY}
+  - name: openai-mini
+    provider_type: openai
+    api_key: ${OPENAI_API_KEY}
+    model_map:
+      gpt-4o: gpt-4o-mini
+```
+
+At `x-sbproxy-max-price: 0.005` the frontier candidate is dropped and the mini candidate serves the request. Each drop is traced at debug on `ai.price_ceiling.exclude`:
+
+```
+DEBUG sbproxy_core::server::ai_dispatch: price ceiling excluded a routing candidate
+  event="ai.price_ceiling.exclude" provider=openai model=gpt-4o
+  estimated_cost_usd=0.01003 price_source=catalog ceiling_usd=0.005
+```
+
+Every request the ceiling ran on carries its verdict in the admin request record's policy decisions: `price_ceiling:allow` when every candidate fit, `price_ceiling:narrowed` when some were dropped, and `price_ceiling:deny` on a refusal, where the deny reason names the ceiling and the excluded candidates' prices. One verdict per request, so a row never carries two.
+
+`sbproxy_ai_price_ceiling_total{outcome}` carries a closed set of four: `candidate_excluded` per dropped candidate, `refused` per fully excluded request, `invalid_header` when `x-sbproxy-max-price` was not a positive USD amount, and `unsupported_surface` when that header arrived on a surface the estimate cannot price. A rising `candidate_excluded` rate against a flat `refused` rate is the ceiling trimming the expensive tier; a rising `refused` rate is the ceiling blocking traffic outright. The two 400 outcomes are caller mistakes rather than gateway decisions, so alert on them separately or not at all: a client library that defaults the header onto `/v1/embeddings` shows up on `unsupported_surface` and nowhere else. [metrics-stability.md](metrics-stability.md) lists the same four.
+
+A 402 refusal is represented everywhere the gateway's other refusals are, not only in a log line. It writes a `security_audit` record (`event_type: price_ceiling`, carrying the hostname, request id, tenant, and resolved key id), which reaches a configured [`events:` sink](events.md) as a `policy_denied` event, appears in the admin audit feed, and lands on the tamper-evident chain when `audit.sink: chain` is on. The request carries the closed `price_ceiling_block` value on both the `outcome` label of `sbproxy_ai_requests_attributed_total` and the rejection `reason` of `sbproxy_ai_gateway_decisions_total`, rather than the `budget_exceeded` a bare 402 would otherwise read as, so a ceiling refusal stays separable from an exhausted tenant budget, and the durable spend rollups count it as blocked rather than errored.
+
+#### Confidence cascades and the ceiling
+
+A [confidence cascade](#cascade) does not route over the provider order. Each tier names its own provider and its own model, and the tier's model overrides the request's, so the tier list is a second candidate set. The ceiling filters it the same way, pricing each tier against the model that tier would dispatch after its provider's `model_map` rename. Tiers over the ceiling are skipped. It is also the only set priced when the cascade owns the whole of dispatch: the provider-order filter stands down there, because pricing the provider order against a model the request will never send would refuse a request every tier could have served under the ceiling. On that non-streaming path, a cascade with no tier left under the ceiling refuses with the same 402. Without that, an origin could set a ceiling and still be billed for tier one at the frontier model the tier names.
+
+A streaming request on that same cascade does not refuse from the tier list. Streaming pins tier one and hands the response to the relay unchanged, so an emptied tier list leaves nothing to pin and the request falls through to the provider order. That fall-through is still gated. The provider-order filter only stands down when the cascade is the thing that will dispatch, which on a streaming request it is not, so the provider order is priced and narrowed here exactly as it would be on an origin with no cascade at all, and it answers the same 402 when nothing survives. A cascade origin carrying a managed local model behaves the same way, because that origin also dispatches from the provider order rather than from the tiers. What the streaming request does not get is the cascade's tier models: it serves from the surviving provider order at the request's own model. One ordering detail matters if you are tuning this: on a streaming cascade the provider-order refusal runs before the tier pin, so a tier priced under the ceiling only keeps the request alive when that tier's provider also survived the provider-order filter at the request's own model. Set the ceiling low enough that the provider order empties and the streaming request refuses; leave one provider above water and it serves from the provider order at the request's model, whatever the tiers say.
+
+A tier naming a provider that is not configured is left alone: it cannot dispatch either way, and the cascade's own skip-and-warn handling covers it.
+
+#### Limits worth knowing
+
+The gate covers the three token-priced chat surfaces: `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`. The last two arrive in their own wire formats, and the native inbound shim rewrites both into the canonical chat body before routing, so all three reach the ceiling as the same shape priced by the same per-million rates. An Anthropic-SDK client and an OpenAI-Responses-SDK client pointed at the same origin get the same guard the chat clients do.
+
+Everything else is priced on units this estimate does not model: per-image, per-second, per-character, and multipart surfaces, plus the control-plane endpoints. An origin-level ceiling does not reach them. A caller who sends `x-sbproxy-max-price` to one of those surfaces gets a 400 rather than an ungated dispatch, because a per-request demand the gateway cannot honor should be refused out loud.
+
+The estimate is a routing guard rather than a bill. Settlement still comes from the provider's reported usage, and a response that runs past its declared output cap settles at its real cost. A locally served model with no entry in `model_prices` or the rate card takes the $5 / $5 fallback like any other unpriced model, which a tight ceiling will exclude; price it explicitly if you want it eligible.
+
+The runnable [`examples/price-ceiling/`](../examples/price-ceiling/) config ships a ceiling set below every configured provider's price, proving the clean refusal.
+
 ### Model prices
 
 Cost tracking and cost-based routing need a per-model price. SBproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.
@@ -2247,7 +2496,7 @@ in [AI context compression](ai-context-compression.md).
 
 There is no `context_overflow:` key. An earlier version of this page described one as parsed and ignored, which was an invitation to write it and wait for it to start working. A config that carries it now fails to compile, with an error naming what to use instead.
 
-Fitting an oversized prompt to the model's window is what the compression pipeline above does. Add a `window_fit` lever under `compression.levers`, or set `resilience.llm_aware.context_compress: true` for the one-lever shorthand. Nothing reroutes an oversized prompt to a model with a larger window on its own. If that is the behavior you want, order the larger model first in the provider list, or point a model alias at it.
+Fitting an oversized prompt to the model's window is what the compression pipeline above does. Add a `window_fit` lever under `compression.levers`, or set `resilience.llm_aware.context_compress: true` for the one-lever shorthand. To reroute an oversized prompt to a model with a larger window instead, name that provider in [`context_window_fallbacks:`](#typed-fallback-triggers); the two compose, with compression running first and the reroute firing only when the prompt still does not fit.
 
 ## Stored prompts and offline optimization
 
@@ -2617,7 +2866,7 @@ sum by (agent_id, model) (rate(sbproxy_ai_cost_dollars_attributed_total[5m])) * 
 #### The agent cannot name itself
 
 There is no `SB-Attr-Agent-Id` header. Sending one is a `400`, the same as any
-other unrecognised `SB-Attr-*` key. (`SB-Attr-Agent` is a different tag and still
+other unrecognized `SB-Attr-*` key. (`SB-Attr-Agent` is a different tag and still
 works: it carries `agent_type`, the `runtime` versus `development` bucket.)
 
 The reason is that a caller who can name its own agent can charge its spend to a
@@ -2737,7 +2986,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_tokens_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume; `sum by (agent_id)` for per-agent volume |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback, `sum by (agent_id)` for per-agent chargeback. `agent_id` is empty unless a verified agent identity resolved; see [Cost per agent](#cost-per-agent) |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | Model latency sliceable per tenant / credential / model. `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(..._bucket[5m])))` |
-| `sbproxy_ai_requests_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`, `data_posture_block`, `refusal`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
+| `sbproxy_ai_requests_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`, `data_posture_block`, `price_ceiling_block`, `refusal`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
 | `sbproxy_ai_gateway_decisions_total` | Counter | `decision`, `reason` | One terminal admission decision per AI request. `decision="rejected"` counts requests refused before provider dispatch, with the bounded outcome in `reason`; admitted requests use `reason="none"`. This is the numerator and denominator for gateway rejection-rate panels and alerts |
 | `sbproxy_ai_data_posture_filter_total` | Counter | `constraint`, `outcome`, `tenant` | Requests whose provider candidate set the data-posture constraint narrowed (`outcome="filtered"`) or refused outright (`outcome="refused"`). See [Provider data posture](#provider-data-posture) |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
@@ -2999,7 +3248,10 @@ To help you get started with the AI gateway, we provide several runnable example
 | [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Add a provider named `gemini` (or set `provider_type: gemini`) with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
 | [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | List multiple providers that declare the same model name in `models`; there is no separate `model_group` key. | The routing strategy load-balances requests for that model name across every declaring provider. |
 | [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
-| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
+| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate generic `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
+| [`typed-fallbacks`](../examples/typed-fallbacks/) | Typed fallback triggers. | Set `context_window_fallbacks:` and/or `content_policy_fallbacks:` as siblings of `routing:`, each naming providers. | An oversized prompt reroutes to a larger-window model before dispatch; a content-policy refusal reroutes to a more permissive provider; the admin request log names the trigger that fired. |
+| [`semantic-routing`](../examples/semantic-routing/) | Routing on what a request means. | Set `routing.strategy: semantic_route` with `routes:` (a deployment plus exemplar prompts each), a `min_similarity` floor, a `fallback`, and an embedding source. Runs keyless on loopback stand-ins. | A code-shaped request lands on the code pool and a chat-shaped one on the chat pool, both matched by embedding similarity rather than by wording; a below-floor score falls back and says so in `routing_detail`. |
+| [`price-ceiling`](../examples/price-ceiling/) | Per-request hard price ceiling. | Set `max_price_per_request` on the action, in USD. The shipped `0.0001` sits below every candidate. | Every chat request answers `402 price_ceiling_exceeded` listing each candidate's estimated cost. Raise it to `0.001` and the cheap candidate serves while the pricier one stays excluded. |
 | [`ai-cost-optimized`](../examples/ai-cost-optimized/) | Cost-optimized routing. | Set `routing.strategy: cost_optimized` and a per-provider `weight`. | Traffic is routed to the provider scoring lowest on `in_flight_requests * 1000 + weight`. |
 | [`ai-attribution-tags`](../examples/ai-attribution-tags/) | Request tagging for cost attribution. | Set `credentials[].attrs.tags` in config, or send `SB-Attr-*` headers (for example `SB-Attr-Project`) per request. | Emitted metrics and logs include the tags for fine-grained cost allocation. |
 

@@ -1,0 +1,100 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: semantic (embedding-similarity) routing.
+#
+# The `semantic_route` strategy routes on what a request means. Each
+# deployment declares its specialty as exemplar prompts; the proxy embeds
+# the request's final user message once, cosine-matches it against the
+# exemplar vectors, and pins the best-scoring deployment when the score
+# clears `min_similarity`. A below-floor score, a request with no user
+# message, and an unavailable embedder all route to the declared
+# `fallback` deployment instead of erroring.
+#
+# This differs from `prefix_affinity`, which routes repeated prompt
+# prefixes back to the worker that holds their KV cache. Prefix affinity
+# optimizes cache reuse on byte-identical openings; semantic routing
+# sends a request to the pool that specializes in its topic even when
+# the wording is new.
+#
+# Exemplar texts embed once per process on first use and the vectors are
+# cached, so the steady-state cost is one embedding call per request.
+#
+# Every upstream here is loopback so the example runs with no keys and no
+# network. Start the stand-ins first, then the proxy:
+#   python3 examples/semantic-routing/fixture.py
+#   make run CONFIG=examples/semantic-routing/sb.yml \
+#     LOG_LEVEL='info,sbproxy_core::server::ai_dispatch=debug'
+#
+# Routing decisions log at `debug` because they fire once per request;
+# the durable per-request record is `routing_detail` on the admin
+# request log, and the durable aggregate is
+# sbproxy_ai_semantic_route_decisions_total.
+#
+# For a real deployment, point `openai.base_url` at your embedding
+# provider (and drop `allow_private_base_url`), and point the two pools
+# at your own replicas. README.md shows the swap.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: semantic_route
+
+        # The best match must score at least this cosine similarity
+        # against one of a deployment's exemplar vectors, or the request
+        # routes to `fallback` instead. Raise it to make specialties
+        # stricter; watch sbproxy_ai_semantic_route_similarity to see
+        # where your real traffic scores.
+        min_similarity: 0.75
+
+        # Every non-match routes here: below-floor scores, requests with
+        # no user message, and embedder failures alike. Omit it and the
+        # eligible providers round-robin instead.
+        fallback: chat-pool
+
+        routes:
+          # A code-specialized pool. Exemplars are plain descriptions of
+          # the traffic this pool should win; three to five short ones
+          # beat one long one.
+          - deployment: code-pool
+            exemplars:
+              - "Write a function that parses JSON and handles errors"
+              - "Review this pull request and point out bugs"
+              - "Explain what this stack trace means and how to fix it"
+          # A general-conversation pool.
+          - deployment: chat-pool
+            exemplars:
+              - "Have a friendly conversation about everyday topics"
+              - "Help me draft a short, plain-language email"
+
+        # Where request and exemplar embeddings come from. `openai` is a
+        # standalone OpenAI-compatible /v1/embeddings endpoint, decoupled
+        # from the chat pools below (the same source shape the semantic
+        # cache uses). `provider` and `sidecar` work here too.
+        source: openai
+        openai:
+          base_url: http://127.0.0.1:18091/v1
+          model: bag-of-words
+          timeout_ms: 5000
+          # The stand-in embedder runs on loopback; a real embedding
+          # endpoint is public and does not need this.
+          allow_private_base_url: true
+
+      providers:
+        # Two self-hosted pools serving different models. Point the base
+        # URLs at your own replicas.
+        - name: code-pool
+          provider_type: vllm
+          base_url: http://127.0.0.1:18092/v1
+          # Loopback upstreams are refused by default (SSRF posture);
+          # a locally hosted engine opts in explicitly.
+          allow_private_base_url: true
+          default_model: qwen2.5-coder-32b
+        - name: chat-pool
+          provider_type: vllm
+          base_url: http://127.0.0.1:18093/v1
+          allow_private_base_url: true
+          default_model: llama-3.3-70b
