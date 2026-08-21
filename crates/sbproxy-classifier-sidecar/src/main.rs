@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -34,9 +36,9 @@ use sbproxy_classifier_proto::{
     ModelInfoRequest, ModelInfoResponse, VersionRequest, VersionResponse,
 };
 use sbproxy_classifiers::{
-    LoadOptions, OnnxClassifier, OnnxEmbedder, OnnxTokenClassifier, TokenCompressionLimitError,
-    TokenCompressionLimits, TokenCompressionOutput, TokenCompressionTarget,
-    MAX_MODEL_BYTES_DEFAULT,
+    ClassificationOutput, EmbeddingOutput, LoadOptions, OnnxClassifier, OnnxEmbedder,
+    OnnxTokenClassifier, TokenCompressionLimitError, TokenCompressionLimits,
+    TokenCompressionOutput, TokenCompressionTarget, MAX_MODEL_BYTES_DEFAULT,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Server;
@@ -55,8 +57,127 @@ const DEFAULT_TOKEN_MAX_CONCURRENT: usize = 2;
 const MAX_TOKEN_CONCURRENT: usize = 64;
 const DEFAULT_TOKEN_MAX_QUEUED: usize = 8;
 const MAX_TOKEN_QUEUED: usize = 1_024;
+const DEFAULT_INFERENCE_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_INFERENCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_INFERENCE_MAX_ITEMS: usize = 64;
+const MAX_INFERENCE_ITEMS: usize = 4_096;
+const MAX_INFERENCE_CONCURRENT: usize = 64;
+const MAX_INFERENCE_QUEUED: usize = 1_024;
+const MAX_INFERENCE_TIMEOUT_MS: u64 = 600_000;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const DEFAULT_GRPC_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Smallest running set the derived concurrency default will produce.
+///
+/// Also the value used when the host will not report its parallelism.
+const INFERENCE_CONCURRENT_FLOOR: usize = 4;
+
+/// Queue slots the derived queue default gives each running slot.
+const INFERENCE_QUEUE_DEPTH_PER_SLOT: usize = 8;
+
+/// Deadline for one `Classify`, `Embed`, or `Compress`, covering the wait
+/// for a running slot as well as the inference behind it.
+///
+/// This is not the caller's deadline and cannot usefully be. Callers set
+/// their own and theirs are far shorter: the `prompt_injection_v2` sidecar
+/// detector gives up after 250 ms, and `ClassifierClient` wraps every RPC
+/// in `tokio::time::timeout`, so a caller that gives up drops the stream
+/// and this handler's future is cancelled wherever it is parked. That, not
+/// this number, is what returns capacity in the normal case.
+///
+/// What is left for the sidecar to bound is the caller that sets no
+/// deadline of its own, and the request parked behind a model that has
+/// stopped returning. For that the value has to clear the slowest
+/// inference the sidecar will legitimately accept, which is a `Compress`
+/// over `--token-max-windows` windows: hundreds of forward passes, so
+/// seconds rather than milliseconds. 30 s clears that with room and is
+/// still a long way short of forever.
+///
+/// Cutting it to something in the detector's range would not make
+/// `Classify` answer sooner, because `Classify` is already bounded by the
+/// 250 ms the detector waits. It would only truncate `Compress`.
+const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 30_000;
+
+/// The `Classify` and `Embed` concurrency default, derived from the host.
+///
+/// A classification is CPU-bound: one forward pass occupies one thread
+/// until it returns. How many of them a host can genuinely run at once is
+/// its parallelism, so any fixed literal is wrong on every box except the
+/// one it was picked on.
+///
+/// Which direction it is wrong in decides whether it is a bug. Before this
+/// bound existed the only ceiling on `Classify` was the blocking pool and
+/// the core count, so a 16-core host answered roughly 16 classifications
+/// at a time. A literal default under that sheds load on upgrade at a rate
+/// the same hardware used to serve, and the caller does not experience the
+/// shed as a queued wait it can measure: the detector gives up at 250 ms
+/// and treats a refusal exactly like a sidecar that is down, so the shed
+/// becomes a `failure_posture` decision on live traffic. Tracking
+/// `available_parallelism` is what keeps the ceiling at what the machine
+/// can do instead of at what one machine could do once.
+///
+/// The clamps mark where tracking the host stops helping:
+///
+/// * `INFERENCE_CONCURRENT_FLOOR` keeps a one- or two-core host from
+///   serializing harder than a flat default would have, so deriving the
+///   value can only ever widen it.
+/// * `MAX_INFERENCE_CONCURRENT` is the same ceiling the flag validates
+///   against. Past it the running set has stopped being a bound, and on
+///   compute-bound work more runners buy queueing latency, not throughput.
+///
+/// `--inference-max-concurrent` replaces the whole calculation.
+fn derive_inference_max_concurrent(available_parallelism: Option<usize>) -> usize {
+    available_parallelism
+        .unwrap_or(INFERENCE_CONCURRENT_FLOOR)
+        .clamp(INFERENCE_CONCURRENT_FLOOR, MAX_INFERENCE_CONCURRENT)
+}
+
+/// `derive_inference_max_concurrent` against the running host.
+fn default_inference_max_concurrent() -> usize {
+    derive_inference_max_concurrent(std::thread::available_parallelism().ok().map(|n| n.get()))
+}
+
+/// The `Classify` and `Embed` queue-depth default, derived from the
+/// running set rather than fixed.
+///
+/// What decides whether a queue slot is worth having is how long the
+/// request in it waits, not how many requests are waiting: a request `n`
+/// deep behind a full running set starts after roughly `n / max_concurrent`
+/// service times. A flat count is therefore a different wait on every box,
+/// and it is the small box that draws the long one. Scaling depth with the
+/// running slots holds the wait at about
+/// `INFERENCE_QUEUE_DEPTH_PER_SLOT` service times on any host.
+///
+/// At floor concurrency this reproduces a 4-running, 32-queued pair, so no
+/// host ends up with a shallower queue than a flat default would have
+/// given it.
+///
+/// `--inference-max-queued` replaces it, and `0` disables waiting.
+fn derive_inference_max_queued(max_concurrent: usize) -> usize {
+    max_concurrent
+        .saturating_mul(INFERENCE_QUEUE_DEPTH_PER_SLOT)
+        .min(MAX_INFERENCE_QUEUED)
+}
+
+/// `derive_inference_max_queued` against the derived running set.
+fn default_inference_max_queued() -> usize {
+    derive_inference_max_queued(default_inference_max_concurrent())
+}
+
+// RPC names. Each is both the `rpc` log field and the subject of the
+// refusal messages that RPC returns.
+const RPC_CLASSIFY: &str = "classify";
+const RPC_EMBED: &str = "embed";
+const RPC_COMPRESS: &str = "compress";
+
+/// Emit one refusal warning per this many refusals of the same reason.
+///
+/// A refusal storm is the exact shape of the attack these bounds exist to
+/// stop, so a line per refusal would hand the caller a log amplifier. The
+/// first refusal of a reason speaks immediately, because an operator needs
+/// to see the onset, and every hundredth after that carries the running
+/// total. The count itself is exact either way.
+const REFUSAL_LOG_INTERVAL: u64 = 100;
 
 fn grpc_decoding_message_limit(max_request_bytes: usize) -> usize {
     DEFAULT_GRPC_DECODING_MESSAGE_BYTES.max(max_request_bytes)
@@ -94,12 +215,51 @@ impl Default for TokenCompressionRuntimeLimits {
     }
 }
 
-struct CompressionAdmission {
+/// Operator-configured bounds on `Classify` and `Embed` work.
+///
+/// `TokenCompressionRuntimeLimits` bounds the heavy `Compress` path. This is
+/// the same shape for the two fast-path RPCs, which had no bound of their
+/// own before: an unbounded `spawn_blocking` is a thread-pool exhaustion
+/// primitive, because the blocking pool has a fixed ceiling and every task
+/// queued past it stalls every other blocking caller in the process.
+///
+/// Every field has a finite default, and the two that decide how much of
+/// the machine the sidecar uses are derived from the machine rather than
+/// written down as literals. A bound an operator has to discover and
+/// configure is not a bound for the operator who never read the flag, and
+/// a bound picked on somebody else's hardware is not a bound that fits
+/// theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InferenceRuntimeLimits {
+    max_request_bytes: usize,
+    max_items: usize,
+    max_concurrent: usize,
+    max_queued: usize,
+    timeout: Duration,
+}
+
+impl Default for InferenceRuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: DEFAULT_INFERENCE_MAX_REQUEST_BYTES,
+            max_items: DEFAULT_INFERENCE_MAX_ITEMS,
+            max_concurrent: default_inference_max_concurrent(),
+            max_queued: default_inference_max_queued(),
+            timeout: Duration::from_millis(DEFAULT_INFERENCE_TIMEOUT_MS),
+        }
+    }
+}
+
+/// Running and queued capacity for one class of inference work.
+///
+/// Each RPC owns its own instance, so a burst of one cannot consume the
+/// slots another RPC needs.
+struct InferenceAdmission {
     running: Arc<Semaphore>,
     admitted: Arc<Semaphore>,
 }
 
-impl CompressionAdmission {
+impl InferenceAdmission {
     fn new(max_concurrent: usize, max_queued: usize) -> Self {
         Self {
             running: Arc::new(Semaphore::new(max_concurrent)),
@@ -107,7 +267,7 @@ impl CompressionAdmission {
         }
     }
 
-    async fn acquire(&self) -> std::result::Result<CompressionPermits, AdmissionError> {
+    async fn acquire(&self) -> std::result::Result<InferencePermits, AdmissionError> {
         let admitted = Arc::clone(&self.admitted)
             .try_acquire_owned()
             .map_err(|_| AdmissionError::QueueFull)?;
@@ -115,19 +275,20 @@ impl CompressionAdmission {
             .acquire_owned()
             .await
             .map_err(|_| AdmissionError::Unavailable)?;
-        Ok(CompressionPermits {
+        Ok(InferencePermits {
             _admitted: admitted,
             _running: running,
         })
     }
 }
 
-/// Why a token-compression request was not admitted.
+/// Why an inference request was not admitted.
 ///
-/// `acquire` returns this rather than a `tonic::Status` so a 176-byte
-/// status is not carried through a helper's `Result`. The RPC method is
-/// the only place that owes tonic a status, and `?` makes the
-/// conversion there, so the wire behavior is unchanged.
+/// `acquire` knows the two ways admission can fail and nothing about what
+/// the wire should say, so it hands back this instead of a `tonic::Status`.
+/// `SidecarService::admit` is the single place that turns one into a status,
+/// and it is also where the refusal is counted, so the message an operator
+/// reads and the number they alert on cannot drift apart.
 enum AdmissionError {
     /// Admission queue was already full.
     QueueFull,
@@ -135,31 +296,92 @@ enum AdmissionError {
     Unavailable,
 }
 
-impl From<AdmissionError> for Status {
-    fn from(error: AdmissionError) -> Self {
-        match error {
-            AdmissionError::QueueFull => {
-                Self::resource_exhausted("token-compression queue is full")
-            }
-            AdmissionError::Unavailable => {
-                Self::unavailable("token-compression admission is unavailable")
-            }
+struct InferencePermits {
+    _admitted: OwnedSemaphorePermit,
+    _running: OwnedSemaphorePermit,
+}
+
+/// Why the sidecar refused a request, as a dimension an operator alerts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalReason {
+    /// Encoded request exceeded the RPC's configured byte budget.
+    RequestBytes,
+    /// Batch carried more items than the configured budget.
+    BatchItems,
+    /// Running and queued capacity were both already full.
+    QueueFull,
+    /// Admission was closed, which happens on shutdown.
+    AdmissionUnavailable,
+    /// Inference did not finish inside the configured deadline.
+    DeadlineExceeded,
+    /// The blocking task ended without a result: a contained panic, or
+    /// cancellation while the runtime was shutting down.
+    TaskFailed,
+}
+
+impl RefusalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestBytes => "request_bytes",
+            Self::BatchItems => "batch_items",
+            Self::QueueFull => "queue_full",
+            Self::AdmissionUnavailable => "admission_unavailable",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::TaskFailed => "task_failed",
         }
     }
 }
 
-struct CompressionPermits {
-    _admitted: OwnedSemaphorePermit,
-    _running: OwnedSemaphorePermit,
+/// Exact per-reason refusal counts for the life of the process.
+///
+/// Counting is deliberately separate from logging. A refusal that exists
+/// only in a log line is lossy and rotates away, and under the load these
+/// bounds exist to shed the log is the first thing to become unreadable.
+/// The counter stays exact while `REFUSAL_LOG_INTERVAL` keeps the log
+/// quiet.
+///
+/// This process has no Prometheus exporter of its own yet, so these
+/// counters are the whole operator-facing signal today. The follow-up that
+/// gives the sidecar a scrape surface publishes them unchanged as
+/// `sbproxy_classifier_sidecar_refusals_total`, labeled by `rpc` and
+/// `reason`.
+#[derive(Default)]
+struct RefusalCounters {
+    request_bytes: AtomicU64,
+    batch_items: AtomicU64,
+    queue_full: AtomicU64,
+    admission_unavailable: AtomicU64,
+    deadline_exceeded: AtomicU64,
+    task_failed: AtomicU64,
+}
+
+impl RefusalCounters {
+    fn counter(&self, reason: RefusalReason) -> &AtomicU64 {
+        match reason {
+            RefusalReason::RequestBytes => &self.request_bytes,
+            RefusalReason::BatchItems => &self.batch_items,
+            RefusalReason::QueueFull => &self.queue_full,
+            RefusalReason::AdmissionUnavailable => &self.admission_unavailable,
+            RefusalReason::DeadlineExceeded => &self.deadline_exceeded,
+            RefusalReason::TaskFailed => &self.task_failed,
+        }
+    }
+
+    /// Count one refusal and return the running total for its reason.
+    fn record(&self, reason: RefusalReason) -> u64 {
+        self.counter(reason)
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
 }
 
 /// The `InferenceService` implementation, backed by a registry of loaded
 /// tract ONNX classifiers keyed by logical model id.
 struct SidecarService {
-    models: HashMap<String, Arc<OnnxClassifier>>,
+    models: HashMap<String, Arc<dyn TextClassifier>>,
     /// Embedding models keyed by logical id, paired with the embedding
     /// dimension learned at load time (for `ModelInfo`).
-    embedders: HashMap<String, (Arc<OnnxEmbedder>, u32)>,
+    embedders: HashMap<String, (Arc<dyn TextEmbedder>, u32)>,
     /// Token-classification models used by the `Compress` RPC.
     token_models: HashMap<String, Arc<dyn TokenCompressor>>,
     /// Classifier used when a `Classify` request leaves `model` empty.
@@ -170,10 +392,48 @@ struct SidecarService {
     default_token_model: Option<String>,
     /// Operator-configured bounds for token-compression artifacts and work.
     token_limits: TokenCompressionRuntimeLimits,
-    /// Bounds blocking inference work and the requests waiting behind it.
-    compression_admission: CompressionAdmission,
+    /// Operator-configured bounds for `Classify` and `Embed` work.
+    inference_limits: InferenceRuntimeLimits,
+    /// Bounds running `Classify` work and the requests waiting behind it.
+    classify_admission: InferenceAdmission,
+    /// The same bounds for `Embed`, on its own semaphores so a burst of one
+    /// fast-path RPC cannot starve the other.
+    embed_admission: InferenceAdmission,
+    /// Bounds running `Compress` work and the requests waiting behind it.
+    compression_admission: InferenceAdmission,
+    /// Per-reason refusal counts, the operator-facing signal for load
+    /// shedding.
+    refusals: RefusalCounters,
     /// Reported by the `Version` RPC.
     version: String,
+}
+
+/// The classification seam.
+///
+/// `OnnxClassifier` is the only production implementation. The trait exists
+/// so a test can hold inference open on a real request path without a real
+/// ONNX artifact, which is the only way to prove the admission bound is
+/// wired to the RPC rather than merely present.
+trait TextClassifier: Send + Sync {
+    fn classify(&self, text: &str) -> Result<ClassificationOutput>;
+}
+
+impl TextClassifier for OnnxClassifier {
+    fn classify(&self, text: &str) -> Result<ClassificationOutput> {
+        OnnxClassifier::classify(self, text)
+    }
+}
+
+/// The embedding seam, for the same reason. `OnnxEmbedder` is the only
+/// production implementation.
+trait TextEmbedder: Send + Sync {
+    fn embed(&self, text: &str) -> Result<EmbeddingOutput>;
+}
+
+impl TextEmbedder for OnnxEmbedder {
+    fn embed(&self, text: &str) -> Result<EmbeddingOutput> {
+        OnnxEmbedder::embed(self, text)
+    }
 }
 
 trait TokenCompressor: Send + Sync {
@@ -198,7 +458,7 @@ impl TokenCompressor for OnnxTokenClassifier {
 
 impl SidecarService {
     /// Resolve a request's `model` field (or the default) to a loaded model.
-    fn resolve(&self, model: &str) -> Option<(String, Arc<OnnxClassifier>)> {
+    fn resolve(&self, model: &str) -> Option<(String, Arc<dyn TextClassifier>)> {
         let id = if model.is_empty() {
             self.default_model.clone()?
         } else {
@@ -209,7 +469,7 @@ impl SidecarService {
 
     /// Resolve a request's `model` field (or the default) to a loaded
     /// embedder.
-    fn resolve_embedder(&self, model: &str) -> Option<(String, Arc<OnnxEmbedder>)> {
+    fn resolve_embedder(&self, model: &str) -> Option<(String, Arc<dyn TextEmbedder>)> {
         let id = if model.is_empty() {
             self.default_embed_model.clone()?
         } else {
@@ -228,6 +488,161 @@ impl SidecarService {
             .get(&id)
             .map(|token_model| (id, Arc::clone(token_model)))
     }
+
+    /// Count one refusal, speak about it on a sampled schedule, and hand
+    /// back the status the RPC returns.
+    ///
+    /// Every refusal path goes through here so that no bound can be added
+    /// later that sheds load without the operator being able to see it.
+    fn refuse(&self, rpc: &'static str, reason: RefusalReason, status: Status) -> Status {
+        let total = self.refusals.record(reason);
+        if total == 1 || total % REFUSAL_LOG_INTERVAL == 0 {
+            tracing::warn!(
+                rpc,
+                reason = reason.as_str(),
+                total,
+                "classifier sidecar refused a request"
+            );
+        }
+        status
+    }
+
+    /// Refuse an encoded request larger than the RPC's configured budget.
+    ///
+    /// This runs before the model is resolved and before any text is handed
+    /// to a tokenizer, so an oversized body never becomes a tensor.
+    /// `max_decoding_message_size` bounds what the transport will decode at
+    /// all; this is the per-RPC logical budget underneath it.
+    ///
+    /// `tonic::Status` is 176 bytes, over `result_large_err`'s threshold, and
+    /// this helper and the three below it all carry one. Returning a small
+    /// error instead would move the message and the refusal count back out to
+    /// every RPC that calls them, which is the duplication `refuse` exists to
+    /// prevent, and boxing a third-party type only to unbox it one frame up
+    /// buys nothing. Each takes the allow rather than the reshape.
+    #[allow(clippy::result_large_err)]
+    fn check_request_bytes(
+        &self,
+        rpc: &'static str,
+        encoded_len: usize,
+        limit: usize,
+    ) -> Result<(), Status> {
+        if encoded_len > limit {
+            return Err(self.refuse(
+                rpc,
+                RefusalReason::RequestBytes,
+                Status::resource_exhausted(format!(
+                    "{rpc} request exceeds its configured byte limit: {encoded_len} > {limit}"
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a batch carrying more items than the configured budget.
+    ///
+    /// The per-item loop inside the blocking closure is the unbounded work:
+    /// one admitted request with a million texts is a million inferences on
+    /// a single running slot.
+    #[allow(clippy::result_large_err)]
+    fn check_batch_items(&self, rpc: &'static str, items: usize) -> Result<(), Status> {
+        let limit = self.inference_limits.max_items;
+        if items > limit {
+            return Err(self.refuse(
+                rpc,
+                RefusalReason::BatchItems,
+                Status::resource_exhausted(format!(
+                    "{rpc} batch exceeds its configured item limit: {items} > {limit}"
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Take a running slot for `rpc` before `deadline`, or refuse.
+    ///
+    /// The wait for a slot is the part of the handling an overloaded
+    /// sidecar spends the most time in, so it runs under the same deadline
+    /// as the inference behind it. Bounding only the inference would leave
+    /// the queue wait unbounded, which is the half that actually grows,
+    /// and would make the deadline a bound on nothing the caller feels.
+    #[allow(clippy::result_large_err)]
+    async fn admit(
+        &self,
+        rpc: &'static str,
+        admission: &InferenceAdmission,
+        deadline: tokio::time::Instant,
+    ) -> Result<InferencePermits, Status> {
+        match tokio::time::timeout_at(deadline, admission.acquire()).await {
+            Ok(Ok(permits)) => Ok(permits),
+            Ok(Err(AdmissionError::QueueFull)) => Err(self.refuse(
+                rpc,
+                RefusalReason::QueueFull,
+                Status::resource_exhausted(format!("{rpc} queue is full")),
+            )),
+            Ok(Err(AdmissionError::Unavailable)) => Err(self.refuse(
+                rpc,
+                RefusalReason::AdmissionUnavailable,
+                Status::unavailable(format!("{rpc} admission is unavailable")),
+            )),
+            Err(_) => Err(self.refuse(
+                rpc,
+                RefusalReason::DeadlineExceeded,
+                Status::deadline_exceeded(format!(
+                    "{rpc} waited for a running slot past the configured deadline"
+                )),
+            )),
+        }
+    }
+
+    /// Await a blocking inference task under the configured deadline, and
+    /// keep the ways it can end without a result distinct from a model that
+    /// ran and failed.
+    ///
+    /// A panic inside `spawn_blocking` is contained by the runtime: it
+    /// arrives here as a `JoinError` instead of ending the process, and the
+    /// default panic hook has already written the payload and its location
+    /// to stderr for the operator. That payload is derived from
+    /// caller-supplied text, which is why this returns a fixed message
+    /// rather than formatting the `JoinError` onto the wire.
+    ///
+    /// The deadline frees the caller, not the thread. `spawn_blocking` work
+    /// cannot be cancelled, so the permit the closure owns stays held until
+    /// the inference really finishes: a wedged model keeps occupying one of
+    /// its RPC's running slots and the sidecar sheds load, rather than
+    /// handing out a slot whose thread is still busy.
+    ///
+    /// `deadline` is the same absolute instant `Self::admit` waited
+    /// against, not a fresh window, so the two halves of the handling share
+    /// one budget instead of each getting the whole of it.
+    #[allow(clippy::result_large_err)]
+    async fn join_bounded<T>(
+        &self,
+        rpc: &'static str,
+        task: tokio::task::JoinHandle<T>,
+        deadline: tokio::time::Instant,
+    ) -> Result<T, Status> {
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) if error.is_cancelled() => Err(self.refuse(
+                rpc,
+                RefusalReason::TaskFailed,
+                Status::unavailable(format!("{rpc} inference was cancelled")),
+            )),
+            Ok(Err(_)) => Err(self.refuse(
+                rpc,
+                RefusalReason::TaskFailed,
+                Status::internal(format!("{rpc} inference ended without a result")),
+            )),
+            Err(_) => Err(self.refuse(
+                rpc,
+                RefusalReason::DeadlineExceeded,
+                Status::deadline_exceeded(format!(
+                    "{rpc} inference exceeded the configured deadline"
+                )),
+            )),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -237,17 +652,35 @@ impl InferenceService for SidecarService {
         req: Request<ClassifyRequest>,
     ) -> Result<Response<ClassifyResponse>, Status> {
         let req = req.into_inner();
+        // One budget for the whole handling, fixed here rather than at each
+        // await, so queueing time and inference time cannot each spend it.
+        let deadline = tokio::time::Instant::now() + self.inference_limits.timeout;
         validate_model_id(&req.model).map_err(Status::invalid_argument)?;
+        self.check_request_bytes(
+            RPC_CLASSIFY,
+            req.encoded_len(),
+            self.inference_limits.max_request_bytes,
+        )?;
         let (_id, classifier) = self
             .resolve(&req.model)
             .ok_or_else(|| Status::not_found("unknown classifier model"))?;
         let text = req.text;
         let started = std::time::Instant::now();
         // tract inference is synchronous and CPU-bound: run it on the blocking
-        // pool so it never stalls a gRPC async worker.
-        let output = tokio::task::spawn_blocking(move || classifier.classify(&text))
-            .await
-            .map_err(|e| Status::internal(format!("classify task panicked: {e}")))?
+        // pool so it never stalls a gRPC async worker. The permit moves into
+        // the closure rather than staying with this future, so a cancelled or
+        // timed-out RPC never hands out a slot whose thread is still busy.
+        let permits = self
+            .admit(RPC_CLASSIFY, &self.classify_admission, deadline)
+            .await?;
+        let task = tokio::task::spawn_blocking(move || {
+            let output = classifier.classify(&text);
+            drop(permits);
+            output
+        });
+        let output = self
+            .join_bounded(RPC_CLASSIFY, task, deadline)
+            .await?
             .map_err(|e| Status::internal(format!("classify failed: {e}")))?;
         let latency_us = started.elapsed().as_micros() as u64;
         Ok(Response::new(ClassifyResponse {
@@ -261,7 +694,14 @@ impl InferenceService for SidecarService {
 
     async fn embed(&self, req: Request<EmbedRequest>) -> Result<Response<EmbedResponse>, Status> {
         let req = req.into_inner();
+        let deadline = tokio::time::Instant::now() + self.inference_limits.timeout;
         validate_model_id(&req.model).map_err(Status::invalid_argument)?;
+        self.check_request_bytes(
+            RPC_EMBED,
+            req.encoded_len(),
+            self.inference_limits.max_request_bytes,
+        )?;
+        self.check_batch_items(RPC_EMBED, req.texts.len())?;
         let (_id, embedder) = self.resolve_embedder(&req.model).ok_or_else(|| {
             Status::failed_precondition(
                 "no matching embedding model is loaded; start the sidecar with --embed-model",
@@ -269,17 +709,34 @@ impl InferenceService for SidecarService {
         })?;
         let texts = req.texts;
         let started = std::time::Instant::now();
+        // An empty batch has no work to admit. Answering it here stops a
+        // caller from spending a running slot and a blocking thread on
+        // nothing at all.
+        if texts.is_empty() {
+            return Ok(Response::new(EmbedResponse {
+                embeddings: Vec::new(),
+                latency_us: started.elapsed().as_micros() as u64,
+            }));
+        }
         // tract inference is synchronous and CPU-bound: run it on the blocking
-        // pool so it never stalls a gRPC async worker.
-        let vectors = tokio::task::spawn_blocking(move || {
-            texts
+        // pool so it never stalls a gRPC async worker. The permit moves into
+        // the closure rather than staying with this future, so a cancelled or
+        // timed-out RPC never hands out a slot whose thread is still busy.
+        let permits = self
+            .admit(RPC_EMBED, &self.embed_admission, deadline)
+            .await?;
+        let task = tokio::task::spawn_blocking(move || {
+            let vectors = texts
                 .iter()
                 .map(|t| embedder.embed(t))
-                .collect::<anyhow::Result<Vec<_>>>()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?
-        .map_err(|e| Status::internal(format!("embed failed: {e}")))?;
+                .collect::<anyhow::Result<Vec<_>>>();
+            drop(permits);
+            vectors
+        });
+        let vectors = self
+            .join_bounded(RPC_EMBED, task, deadline)
+            .await?
+            .map_err(|e| Status::internal(format!("embed failed: {e}")))?;
         Ok(Response::new(EmbedResponse {
             embeddings: vectors
                 .into_iter()
@@ -294,14 +751,13 @@ impl InferenceService for SidecarService {
         req: Request<CompressRequest>,
     ) -> Result<Response<CompressResponse>, Status> {
         let req = req.into_inner();
+        let deadline = tokio::time::Instant::now() + self.inference_limits.timeout;
         validate_model_id(&req.model).map_err(Status::invalid_argument)?;
-        let encoded_len = req.encoded_len();
-        if encoded_len > self.token_limits.max_request_bytes {
-            return Err(Status::resource_exhausted(format!(
-                "encoded compression request exceeds the configured byte limit: {encoded_len} > {}",
-                self.token_limits.max_request_bytes
-            )));
-        }
+        self.check_request_bytes(
+            RPC_COMPRESS,
+            req.encoded_len(),
+            self.token_limits.max_request_bytes,
+        )?;
         if req.text.is_empty() {
             return Err(Status::invalid_argument("compression text is empty"));
         }
@@ -335,14 +791,15 @@ impl InferenceService for SidecarService {
             max_windows: self.token_limits.max_windows,
         };
         let started = std::time::Instant::now();
-        let permits = self.compression_admission.acquire().await?;
-        let (source, output) = tokio::task::spawn_blocking(move || {
+        let permits = self
+            .admit(RPC_COMPRESS, &self.compression_admission, deadline)
+            .await?;
+        let task = tokio::task::spawn_blocking(move || {
             let output = token_model.compress(&source, target, work_limits);
             drop(permits);
             (source, output)
-        })
-        .await
-        .map_err(|error| Status::internal(format!("compress task panicked: {error}")))?;
+        });
+        let (source, output) = self.join_bounded(RPC_COMPRESS, task, deadline).await?;
         let output = output.map_err(|error| {
             if error.downcast_ref::<TokenCompressionLimitError>().is_some() {
                 Status::resource_exhausted(format!("compress failed: {error}"))
@@ -496,10 +953,35 @@ struct Cli {
     /// Maximum token-compression requests allowed to wait behind running work.
     #[arg(long, default_value_t = DEFAULT_TOKEN_MAX_QUEUED)]
     token_max_queued: usize,
+    /// Maximum encoded protobuf bytes accepted by one Classify or Embed
+    /// request.
+    #[arg(long, default_value_t = DEFAULT_INFERENCE_MAX_REQUEST_BYTES)]
+    inference_max_request_bytes: usize,
+    /// Maximum texts accepted in one Embed batch.
+    #[arg(long, default_value_t = DEFAULT_INFERENCE_MAX_ITEMS)]
+    inference_max_items: usize,
+    /// Maximum Classify inferences running simultaneously, and separately
+    /// the same ceiling for Embed. Defaults to this host's available
+    /// parallelism, clamped to between 4 and 64.
+    #[arg(long, default_value_t = default_inference_max_concurrent())]
+    inference_max_concurrent: usize,
+    /// Maximum Classify requests allowed to wait behind running work, and
+    /// separately the same ceiling for Embed. Defaults to eight per
+    /// running slot, so the wait stays comparable across host sizes.
+    #[arg(long, default_value_t = default_inference_max_queued())]
+    inference_max_queued: usize,
+    /// Deadline for one inference, in milliseconds, counted from the
+    /// moment the request arrives so it covers the wait for a running slot
+    /// as well. Applies to Classify, Embed, and Compress. A request past it
+    /// gets DEADLINE_EXCEEDED; a blocking thread cannot be cancelled, so an
+    /// inference that has already started keeps its running slot until the
+    /// model returns.
+    #[arg(long, default_value_t = DEFAULT_INFERENCE_TIMEOUT_MS)]
+    inference_timeout_ms: u64,
 }
 
 impl Cli {
-    fn validate_token_model_configuration(&self) -> Result<()> {
+    fn validate_runtime_configuration(&self) -> Result<()> {
         // Parse every specification before any artifact is opened so malformed
         // or oversized operator-controlled IDs fail at startup without doing
         // partial model loading first.
@@ -557,10 +1039,45 @@ impl Cli {
             max_queued: self.token_max_queued,
         })
     }
+
+    fn inference_limits(&self) -> Result<InferenceRuntimeLimits> {
+        if self.inference_max_request_bytes == 0
+            || self.inference_max_request_bytes > MAX_INFERENCE_REQUEST_BYTES
+        {
+            anyhow::bail!(
+                "--inference-max-request-bytes must be between 1 and {MAX_INFERENCE_REQUEST_BYTES}"
+            );
+        }
+        if self.inference_max_items == 0 || self.inference_max_items > MAX_INFERENCE_ITEMS {
+            anyhow::bail!("--inference-max-items must be between 1 and {MAX_INFERENCE_ITEMS}");
+        }
+        if self.inference_max_concurrent == 0
+            || self.inference_max_concurrent > MAX_INFERENCE_CONCURRENT
+        {
+            anyhow::bail!(
+                "--inference-max-concurrent must be between 1 and {MAX_INFERENCE_CONCURRENT}"
+            );
+        }
+        if self.inference_max_queued > MAX_INFERENCE_QUEUED {
+            anyhow::bail!("--inference-max-queued must not exceed {MAX_INFERENCE_QUEUED}");
+        }
+        if self.inference_timeout_ms == 0 || self.inference_timeout_ms > MAX_INFERENCE_TIMEOUT_MS {
+            anyhow::bail!(
+                "--inference-timeout-ms must be between 1 and {MAX_INFERENCE_TIMEOUT_MS}"
+            );
+        }
+        Ok(InferenceRuntimeLimits {
+            max_request_bytes: self.inference_max_request_bytes,
+            max_items: self.inference_max_items,
+            max_concurrent: self.inference_max_concurrent,
+            max_queued: self.inference_max_queued,
+            timeout: Duration::from_millis(self.inference_timeout_ms),
+        })
+    }
 }
 
 /// Parse one `id=<model>:<tokenizer>` spec and load the classifier.
-fn load_model_spec(spec: &str) -> Result<(String, Arc<OnnxClassifier>)> {
+fn load_model_spec(spec: &str) -> Result<(String, Arc<dyn TextClassifier>)> {
     let (id, paths) = spec
         .split_once('=')
         .with_context(|| format!("--model must be ID=MODEL:TOKENIZER, got {spec:?}"))?;
@@ -569,13 +1086,14 @@ fn load_model_spec(spec: &str) -> Result<(String, Arc<OnnxClassifier>)> {
         .with_context(|| format!("--model paths must be MODEL:TOKENIZER, got {paths:?}"))?;
     let classifier = OnnxClassifier::load(Path::new(model_path), Path::new(tokenizer_path))
         .with_context(|| format!("loading model {id:?}"))?;
-    Ok((id.to_string(), Arc::new(classifier)))
+    let classifier: Arc<dyn TextClassifier> = Arc::new(classifier);
+    Ok((id.to_string(), classifier))
 }
 
 /// Parse one `id=<model>:<tokenizer>` spec and load the embedder, learning
 /// its output dimension via a one-time warmup embed so `ModelInfo` can
 /// report it.
-fn load_embed_spec(spec: &str) -> Result<(String, Arc<OnnxEmbedder>, u32)> {
+fn load_embed_spec(spec: &str) -> Result<(String, Arc<dyn TextEmbedder>, u32)> {
     let (id, paths) = spec
         .split_once('=')
         .with_context(|| format!("--embed-model must be ID=MODEL:TOKENIZER, got {spec:?}"))?;
@@ -588,7 +1106,8 @@ fn load_embed_spec(spec: &str) -> Result<(String, Arc<OnnxEmbedder>, u32)> {
         .embed("dimension probe")
         .map(|o| o.values.len() as u32)
         .unwrap_or(0);
-    Ok((id.to_string(), Arc::new(embedder), dim))
+    let embedder: Arc<dyn TextEmbedder> = Arc::new(embedder);
+    Ok((id.to_string(), embedder, dim))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,15 +1200,19 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    cli.validate_token_model_configuration()?;
+    cli.validate_runtime_configuration()?;
     let token_compression_limits = cli.token_compression_limits()?;
+    let inference_limits = cli.inference_limits()?;
     // Tonic exposes one decoding cap for the entire service. Preserve its
-    // historical 4 MiB behavior for Classify/Embed at the default Compress
-    // budget; an explicit larger Compress budget raises (never lowers) that
-    // shared transport ceiling. Compress independently enforces its exact
+    // historical 4 MiB behavior at the default per-RPC budgets; an explicit
+    // larger budget on either side raises (never lowers) that shared
+    // transport ceiling. Each RPC independently enforces its own exact
     // encoded-message budget in the handler.
-    let max_decoding_message_size =
-        grpc_decoding_message_limit(token_compression_limits.max_request_bytes);
+    let max_decoding_message_size = grpc_decoding_message_limit(
+        token_compression_limits
+            .max_request_bytes
+            .max(inference_limits.max_request_bytes),
+    );
 
     let mut models = HashMap::new();
     for spec in &cli.models {
@@ -743,10 +1266,20 @@ async fn main() -> Result<()> {
         default_embed_model,
         default_token_model,
         token_limits: token_compression_limits,
-        compression_admission: CompressionAdmission::new(
+        inference_limits,
+        classify_admission: InferenceAdmission::new(
+            inference_limits.max_concurrent,
+            inference_limits.max_queued,
+        ),
+        embed_admission: InferenceAdmission::new(
+            inference_limits.max_concurrent,
+            inference_limits.max_queued,
+        ),
+        compression_admission: InferenceAdmission::new(
             token_compression_limits.max_concurrent,
             token_compression_limits.max_queued,
         ),
+        refusals: RefusalCounters::default(),
         models,
         embedders,
         token_models,
@@ -764,6 +1297,9 @@ async fn main() -> Result<()> {
             uds_path = %uds_path.display(),
             models = service.models.len(),
             token_models = service.token_models.len(),
+            inference_max_concurrent = inference_limits.max_concurrent,
+            inference_max_queued = inference_limits.max_queued,
+            inference_timeout = ?inference_limits.timeout,
             "classifier sidecar listening on Unix domain socket",
         );
         let stream = tokio_stream::wrappers::UnixListenerStream::new(listener);
@@ -787,6 +1323,9 @@ async fn main() -> Result<()> {
         %addr,
         models = service.models.len(),
         token_models = service.token_models.len(),
+        inference_max_concurrent = inference_limits.max_concurrent,
+        inference_max_queued = inference_limits.max_queued,
+        inference_timeout = ?inference_limits.timeout,
         "classifier sidecar listening on TCP",
     );
 
@@ -854,6 +1393,7 @@ mod tests {
     }
 
     fn empty_service() -> SidecarService {
+        let inference_limits = InferenceRuntimeLimits::default();
         SidecarService {
             models: HashMap::new(),
             embedders: HashMap::new(),
@@ -862,10 +1402,20 @@ mod tests {
             default_embed_model: None,
             default_token_model: None,
             token_limits: TokenCompressionRuntimeLimits::default(),
-            compression_admission: CompressionAdmission::new(
+            inference_limits,
+            classify_admission: InferenceAdmission::new(
+                inference_limits.max_concurrent,
+                inference_limits.max_queued,
+            ),
+            embed_admission: InferenceAdmission::new(
+                inference_limits.max_concurrent,
+                inference_limits.max_queued,
+            ),
+            compression_admission: InferenceAdmission::new(
                 DEFAULT_TOKEN_MAX_CONCURRENT,
                 DEFAULT_TOKEN_MAX_QUEUED,
             ),
+            refusals: RefusalCounters::default(),
             version: "sbproxy-classifier-sidecar test".to_string(),
         }
     }
@@ -1027,18 +1577,32 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
 
-    struct BlockingCompressionState {
+    struct BlockingInferenceState {
         entered: AtomicUsize,
         released: Mutex<bool>,
         released_changed: Condvar,
     }
 
-    impl BlockingCompressionState {
+    impl BlockingInferenceState {
         fn new() -> Self {
             Self {
                 entered: AtomicUsize::new(0),
                 released: Mutex::new(false),
                 released_changed: Condvar::new(),
+            }
+        }
+
+        /// Record entry into inference and block until the test releases it,
+        /// which is what holds a running slot open long enough to observe
+        /// the admission bound.
+        fn enter_and_wait(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut released = self.released.lock().expect("release lock poisoned");
+            while !*released {
+                released = self
+                    .released_changed
+                    .wait(released)
+                    .expect("release lock poisoned");
             }
         }
 
@@ -1049,7 +1613,7 @@ mod tests {
     }
 
     struct BlockingTokenCompressor {
-        state: Arc<BlockingCompressionState>,
+        state: Arc<BlockingInferenceState>,
     }
 
     impl TokenCompressor for BlockingTokenCompressor {
@@ -1059,15 +1623,7 @@ mod tests {
             _target: TokenCompressionTarget,
             _limits: TokenCompressionLimits,
         ) -> anyhow::Result<TokenCompressionOutput> {
-            self.state.entered.fetch_add(1, Ordering::SeqCst);
-            let mut released = self.state.released.lock().expect("release lock poisoned");
-            while !*released {
-                released = self
-                    .state
-                    .released_changed
-                    .wait(released)
-                    .expect("release lock poisoned");
-            }
+            self.state.enter_and_wait();
             Ok(TokenCompressionOutput {
                 text: text.to_string(),
                 original_tokens: 1,
@@ -1076,7 +1632,42 @@ mod tests {
         }
     }
 
-    struct ReleaseOnDrop(Arc<BlockingCompressionState>);
+    struct BlockingClassifier {
+        state: Arc<BlockingInferenceState>,
+    }
+
+    impl TextClassifier for BlockingClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<ClassificationOutput> {
+            self.state.enter_and_wait();
+            Ok(ClassificationOutput {
+                label: "clean".to_string(),
+                score: 0.25,
+            })
+        }
+    }
+
+    struct BlockingEmbedder {
+        state: Arc<BlockingInferenceState>,
+    }
+
+    impl TextEmbedder for BlockingEmbedder {
+        fn embed(&self, _text: &str) -> anyhow::Result<EmbeddingOutput> {
+            self.state.enter_and_wait();
+            Ok(EmbeddingOutput { values: vec![0.0] })
+        }
+    }
+
+    /// Panics with the caller's text in the payload, so a test can prove the
+    /// payload does not travel back to the caller.
+    struct PanickingClassifier;
+
+    impl TextClassifier for PanickingClassifier {
+        fn classify(&self, text: &str) -> anyhow::Result<ClassificationOutput> {
+            panic!("model exploded on {text}");
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<BlockingInferenceState>);
 
     impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
@@ -1094,12 +1685,12 @@ mod tests {
 
     #[tokio::test]
     async fn compress_bounds_running_and_queued_work() {
-        let state = Arc::new(BlockingCompressionState::new());
+        let state = Arc::new(BlockingInferenceState::new());
         let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
         let mut service = empty_service();
         service.token_limits.max_concurrent = 1;
         service.token_limits.max_queued = 1;
-        service.compression_admission = CompressionAdmission::new(1, 1);
+        service.compression_admission = InferenceAdmission::new(1, 1);
         service.token_models.insert(
             "blocking".to_string(),
             Arc::new(BlockingTokenCompressor {
@@ -1153,12 +1744,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_an_rpc_does_not_release_a_running_blocking_slot() {
-        let state = Arc::new(BlockingCompressionState::new());
+        let state = Arc::new(BlockingInferenceState::new());
         let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
         let mut service = empty_service();
         service.token_limits.max_concurrent = 1;
         service.token_limits.max_queued = 0;
-        service.compression_admission = CompressionAdmission::new(1, 0);
+        service.compression_admission = InferenceAdmission::new(1, 0);
         service.token_models.insert(
             "blocking".to_string(),
             Arc::new(BlockingTokenCompressor {
@@ -1197,6 +1788,460 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         assert_eq!(state.entered.load(Ordering::SeqCst), 1);
         state.release();
+    }
+
+    fn classify_request(text: &str) -> Request<ClassifyRequest> {
+        Request::new(ClassifyRequest {
+            model: String::new(),
+            text: text.to_string(),
+            top_k: 1,
+        })
+    }
+
+    fn blocking_classify_service(state: &Arc<BlockingInferenceState>) -> SidecarService {
+        let mut service = empty_service();
+        service.models.insert(
+            "blocking".to_string(),
+            Arc::new(BlockingClassifier {
+                state: Arc::clone(state),
+            }),
+        );
+        service.default_model = Some("blocking".to_string());
+        service
+    }
+
+    #[tokio::test]
+    async fn classify_bounds_running_and_queued_work() {
+        let state = Arc::new(BlockingInferenceState::new());
+        let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
+        let mut service = blocking_classify_service(&state);
+        service.inference_limits.max_concurrent = 1;
+        service.inference_limits.max_queued = 1;
+        service.classify_admission = InferenceAdmission::new(1, 1);
+        let service = Arc::new(service);
+
+        let first_service = Arc::clone(&service);
+        let first =
+            tokio::spawn(async move { first_service.classify(classify_request("first")).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.entered.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first request must enter inference");
+
+        let second_service = Arc::clone(&service);
+        let second =
+            tokio::spawn(async move { second_service.classify(classify_request("second")).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.classify_admission.admitted.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request must occupy the queue");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.classify(classify_request("third")),
+        )
+        .await
+        .expect("a request beyond capacity must be refused, not queued behind the others")
+        .expect_err("a request beyond running and queued capacity must fail");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(service.refusals.queue_full.load(Ordering::Relaxed), 1);
+
+        state.release();
+        first
+            .await
+            .expect("first task must join")
+            .expect("first request");
+        second
+            .await
+            .expect("second task must join")
+            .expect("second request");
+        assert_eq!(state.entered.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn embed_bounds_running_and_queued_work() {
+        let state = Arc::new(BlockingInferenceState::new());
+        let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
+        let mut service = empty_service();
+        service.embed_admission = InferenceAdmission::new(1, 0);
+        service.embedders.insert(
+            "blocking".to_string(),
+            (
+                Arc::new(BlockingEmbedder {
+                    state: Arc::clone(&state),
+                }),
+                1,
+            ),
+        );
+        service.default_embed_model = Some("blocking".to_string());
+        let service = Arc::new(service);
+
+        let first_service = Arc::clone(&service);
+        let first = tokio::spawn(async move {
+            first_service
+                .embed(Request::new(EmbedRequest {
+                    model: String::new(),
+                    texts: vec!["first".to_string()],
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.entered.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first request must enter inference");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.embed(Request::new(EmbedRequest {
+                model: String::new(),
+                texts: vec!["second".to_string()],
+            })),
+        )
+        .await
+        .expect("a request beyond capacity must be refused, not queued behind the first")
+        .expect_err("a request beyond running capacity must fail");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(service.refusals.queue_full.load(Ordering::Relaxed), 1);
+
+        state.release();
+        first
+            .await
+            .expect("first task must join")
+            .expect("first request");
+    }
+
+    #[tokio::test]
+    async fn classify_deadline_frees_the_caller_and_keeps_the_running_slot() {
+        let state = Arc::new(BlockingInferenceState::new());
+        let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
+        let mut service = blocking_classify_service(&state);
+        service.inference_limits.timeout = Duration::from_millis(50);
+        service.classify_admission = InferenceAdmission::new(1, 0);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.classify(classify_request("wedged")),
+        )
+        .await
+        .expect("a wedged model must not hold the caller open")
+        .expect_err("a wedged model must surface as an error");
+
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(
+            service.refusals.deadline_exceeded.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            service.classify_admission.running.available_permits(),
+            0,
+            "a thread that is still running must keep its slot after the deadline"
+        );
+        state.release();
+    }
+
+    #[tokio::test]
+    async fn classify_waiting_for_a_running_slot_is_bounded_by_the_deadline() {
+        let state = Arc::new(BlockingInferenceState::new());
+        let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
+        let mut service = blocking_classify_service(&state);
+        service.inference_limits.timeout = Duration::from_millis(100);
+        // One running slot and one queue slot behind it.
+        service.classify_admission = InferenceAdmission::new(1, 1);
+
+        // Hold the only running slot the way an inference in flight holds
+        // it, without running one: a real first request would race this
+        // test's own deadline, and what is under test is the wait, not the
+        // inference.
+        let held = Arc::clone(&service.classify_admission.running)
+            .acquire_owned()
+            .await
+            .expect("the running semaphore is open");
+        let queue_depth = service.classify_admission.admitted.available_permits();
+
+        let queued = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.classify(classify_request("queued")),
+        )
+        .await
+        .expect("a queued request must not wait for a running slot without a bound")
+        .expect_err("a queued request past the deadline must be refused");
+
+        // A deadline that wraps only the inference never fires here,
+        // because this request never reaches an inference to wrap.
+        assert_eq!(queued.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(
+            service.refusals.deadline_exceeded.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            state.entered.load(Ordering::SeqCst),
+            0,
+            "a request refused while queued must never reach the model"
+        );
+        assert_eq!(
+            service.classify_admission.admitted.available_permits(),
+            queue_depth,
+            "a request that gave up waiting must hand its queue slot back"
+        );
+
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn classify_panic_is_contained_and_never_echoed_to_the_caller() {
+        let mut service = empty_service();
+        service
+            .models
+            .insert("boom".to_string(), Arc::new(PanickingClassifier));
+        service.default_model = Some("boom".to_string());
+        service.classify_admission = InferenceAdmission::new(1, 0);
+
+        let error = service
+            .classify(classify_request("secret prompt text"))
+            .await
+            .expect_err("a panicking model must surface as an error");
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        // The panic payload carries the caller's text. It reaches the
+        // operator through the panic hook's stderr line and stops there.
+        assert_eq!(error.message(), "classify inference ended without a result");
+        assert_eq!(service.refusals.task_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            service.classify_admission.running.available_permits(),
+            1,
+            "a blocking task that unwinds must give its slot back"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_rejects_requests_above_the_default_byte_limit() {
+        let service = empty_service();
+
+        let error = service
+            .classify(classify_request(
+                &"x".repeat(DEFAULT_INFERENCE_MAX_REQUEST_BYTES + 1),
+            ))
+            .await
+            .expect_err("oversized request must fail before inference");
+
+        // An empty service answers NotFound once model lookup runs, so
+        // ResourceExhausted is proof the bound ran first, on the default
+        // configuration rather than an operator-supplied one.
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(service.refusals.request_bytes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_batches_above_the_default_item_limit() {
+        let service = empty_service();
+
+        let error = service
+            .embed(Request::new(EmbedRequest {
+                model: String::new(),
+                texts: vec!["hi".to_string(); DEFAULT_INFERENCE_MAX_ITEMS + 1],
+            }))
+            .await
+            .expect_err("oversized batch must fail before inference");
+
+        // An empty service answers FailedPrecondition once model lookup
+        // runs, so ResourceExhausted is proof the bound ran first.
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(service.refusals.batch_items.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn embed_with_no_texts_never_reaches_the_blocking_pool() {
+        let state = Arc::new(BlockingInferenceState::new());
+        let _release_on_drop = ReleaseOnDrop(Arc::clone(&state));
+        let mut service = empty_service();
+        // Admission that refuses every request. An empty batch answering OK
+        // is then proof the short-circuit ran: any path that reaches
+        // `admit` gets RESOURCE_EXHAUSTED here, and a blocking pool that is
+        // never entered cannot be distinguished from one entered zero times
+        // by counting entries alone.
+        service.embed_admission = InferenceAdmission::new(0, 0);
+        service.embedders.insert(
+            "blocking".to_string(),
+            (
+                Arc::new(BlockingEmbedder {
+                    state: Arc::clone(&state),
+                }),
+                1,
+            ),
+        );
+        service.default_embed_model = Some("blocking".to_string());
+
+        let response = service
+            .embed(Request::new(EmbedRequest {
+                model: String::new(),
+                texts: Vec::new(),
+            }))
+            .await
+            .expect("an empty batch is not an error")
+            .into_inner();
+
+        assert!(response.embeddings.is_empty());
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn every_refusal_is_counted_even_when_the_log_line_is_sampled() {
+        let mut service = empty_service();
+        service.inference_limits.max_request_bytes = 8;
+
+        for _ in 0..3 {
+            let error = service
+                .classify(classify_request("longer than eight bytes"))
+                .await
+                .expect_err("oversized request must fail");
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        }
+
+        assert_eq!(service.refusals.request_bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(service.refusals.queue_full.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn inference_limits_are_finite_without_any_configuration() {
+        let cli = Cli::try_parse_from(["sbproxy-classifier-sidecar"]).expect("CLI syntax");
+
+        let limits = cli.inference_limits().expect("default inference limits");
+
+        assert_eq!(limits, InferenceRuntimeLimits::default());
+        assert_eq!(
+            limits.max_request_bytes,
+            DEFAULT_INFERENCE_MAX_REQUEST_BYTES
+        );
+        assert_eq!(limits.max_items, DEFAULT_INFERENCE_MAX_ITEMS);
+        assert!(limits.max_concurrent >= INFERENCE_CONCURRENT_FLOOR);
+        assert!(limits.max_concurrent <= MAX_INFERENCE_CONCURRENT);
+        assert!(limits.max_queued <= MAX_INFERENCE_QUEUED);
+        assert_eq!(
+            limits.timeout,
+            Duration::from_millis(DEFAULT_INFERENCE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn inference_concurrency_default_tracks_the_host_between_its_clamps() {
+        // A one- or two-core host is held at the floor rather than
+        // serialized harder than a flat default would have serialized it.
+        assert_eq!(derive_inference_max_concurrent(Some(1)), 4);
+        assert_eq!(derive_inference_max_concurrent(Some(4)), 4);
+        // Between the clamps the default is the host, not a literal. This
+        // is the assertion a fixed `4` fails.
+        assert_eq!(derive_inference_max_concurrent(Some(8)), 8);
+        assert_eq!(derive_inference_max_concurrent(Some(16)), 16);
+        assert_eq!(
+            derive_inference_max_concurrent(Some(128)),
+            MAX_INFERENCE_CONCURRENT
+        );
+        // A host that will not report its parallelism falls back to the
+        // floor, never to something unbounded.
+        assert_eq!(
+            derive_inference_max_concurrent(None),
+            INFERENCE_CONCURRENT_FLOOR
+        );
+    }
+
+    #[test]
+    fn inference_queue_default_scales_with_the_running_slots() {
+        // Eight deep per running slot, so the wait a queued request faces
+        // stays comparable instead of the count staying comparable.
+        assert_eq!(derive_inference_max_queued(4), 32);
+        assert_eq!(derive_inference_max_queued(16), 128);
+        assert_eq!(derive_inference_max_queued(MAX_INFERENCE_CONCURRENT), 512);
+        assert_eq!(
+            derive_inference_max_queued(usize::MAX),
+            MAX_INFERENCE_QUEUED
+        );
+    }
+
+    #[test]
+    fn the_flag_defaults_are_the_derived_values_and_not_a_second_opinion() {
+        // Three declarations have to agree: the derivation, the struct's
+        // Default, and the clap default the operator sees in --help. A
+        // literal reintroduced in any one of them is the drift this pins.
+        // On a host at or below the floor the derivation and a literal 4
+        // coincide, which is what
+        // `inference_concurrency_default_tracks_the_host_between_its_clamps`
+        // covers instead.
+        let host = std::thread::available_parallelism().ok().map(|n| n.get());
+        let expected_concurrent = derive_inference_max_concurrent(host);
+        let expected_queued = derive_inference_max_queued(expected_concurrent);
+
+        let cli = Cli::try_parse_from(["sbproxy-classifier-sidecar"]).expect("CLI syntax");
+        let from_flags = cli.inference_limits().expect("default inference limits");
+
+        assert_eq!(from_flags.max_concurrent, expected_concurrent);
+        assert_eq!(from_flags.max_queued, expected_queued);
+        assert_eq!(
+            InferenceRuntimeLimits::default().max_concurrent,
+            expected_concurrent
+        );
+        assert_eq!(
+            InferenceRuntimeLimits::default().max_queued,
+            expected_queued
+        );
+    }
+
+    #[test]
+    fn inference_limit_cli_accepts_explicit_overrides() {
+        let cli = Cli::try_parse_from([
+            "sbproxy-classifier-sidecar",
+            "--inference-max-request-bytes",
+            "2097152",
+            "--inference-max-items",
+            "128",
+            "--inference-max-concurrent",
+            "8",
+            "--inference-max-queued",
+            "64",
+            "--inference-timeout-ms",
+            "1500",
+        ])
+        .expect("bounded inference override");
+
+        let limits = cli.inference_limits().expect("bounded inference limits");
+
+        assert_eq!(limits.max_request_bytes, 2_097_152);
+        assert_eq!(limits.max_items, 128);
+        assert_eq!(limits.max_concurrent, 8);
+        assert_eq!(limits.max_queued, 64);
+        assert_eq!(limits.timeout, Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn inference_limit_cli_rejects_zero_and_excessive_values() {
+        let cases = [
+            ("--inference-max-request-bytes", "0"),
+            ("--inference-max-request-bytes", "20000000"),
+            ("--inference-max-items", "0"),
+            ("--inference-max-items", "5000"),
+            ("--inference-max-concurrent", "0"),
+            ("--inference-max-concurrent", "65"),
+            ("--inference-max-queued", "1025"),
+            ("--inference-timeout-ms", "0"),
+            ("--inference-timeout-ms", "600001"),
+        ];
+
+        for (option, value) in cases {
+            let cli = Cli::try_parse_from(["sbproxy-classifier-sidecar", option, value])
+                .expect("CLI syntax");
+            assert!(
+                cli.inference_limits().is_err(),
+                "{option}={value} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1286,7 +2331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_decoder_keeps_existing_rpcs_at_the_four_mib_limit() {
+    async fn wire_decoder_admits_four_mib_and_the_handler_bounds_it() {
         let Some(mut client) = spawn_wire_service().await else {
             return;
         };
@@ -1299,7 +2344,15 @@ mod tests {
             .await
             .expect_err("request must reach the empty service");
 
-        assert_eq!(error.code(), tonic::Code::NotFound);
+        // The transport still decodes 2 MiB, so the request reaches the
+        // handler at all; the handler's own budget is what refuses it. A
+        // codec rejection could never produce this status.
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            error.message().contains("byte limit"),
+            "unexpected message: {}",
+            error.message()
+        );
     }
 
     #[tokio::test]
@@ -1406,7 +2459,7 @@ mod tests {
 
         assert_eq!(cli.token_models.len(), 2);
         assert_eq!(cli.default_token_model.as_deref(), Some("small"));
-        cli.validate_token_model_configuration()
+        cli.validate_runtime_configuration()
             .expect("valid token model IDs");
     }
 
@@ -1421,7 +2474,7 @@ mod tests {
         .expect("CLI syntax");
 
         let error = cli
-            .validate_token_model_configuration()
+            .validate_runtime_configuration()
             .expect_err("oversized default token model must fail");
 
         assert!(error.to_string().contains("256-byte"), "{error:#}");
