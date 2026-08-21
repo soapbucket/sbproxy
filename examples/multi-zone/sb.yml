@@ -1,0 +1,82 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Zone-aware target selection (locality routing).
+#
+# `proxy.zone` tells the proxy which zone it is in; each load balancer
+# target carries its own `zone` label. Selection prefers targets in the
+# proxy's zone and spills across zones only when no same-zone target is
+# healthy, so cross-zone traffic (and its latency and egress cost) is a
+# failover path rather than a steady state. When `proxy.zone` is unset,
+# the `SB_ZONE` environment variable fills in, which is the knob a
+# Kubernetes deployment populates from the node's
+# `topology.kubernetes.io/zone` label; config wins over the variable.
+#
+# Both targets point at test.sbproxy.dev, so which one answered is not
+# visible in the response body. The admin API is the witness instead:
+#   * GET /api/health/targets shows each target's zone, its health, and
+#     the proxy's own resolved zone.
+#   * GET /api/requests shows a `zone_locality` verdict per request:
+#     `local` while the proxy's zone is serving, `spilled` after the
+#     drill below takes the local zone down.
+#
+# The drill: the zone-a target's health probe below points at
+# /status/200, so it stays healthy and every request reports `local`.
+# Change that one path to /status/503 and the probe fails; after
+# `unhealthy_threshold` (2) consecutive failures, roughly 2 to 4
+# seconds, zone-a is ejected and every request spills to zone-b,
+# reported as `spilled`. Change it back and traffic snaps home. The
+# README walks the whole sequence with captured output.
+#
+# Run:
+#   export ADMIN_PASSWORD=change-me
+#   make run CONFIG=examples/multi-zone/sb.yml
+#
+# Test:
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#     -H 'Host: shop.local' http://127.0.0.1:8080/get
+#   curl -s -u admin:$ADMIN_PASSWORD \
+#     http://127.0.0.1:9090/api/requests | \
+#     jq -r '.[0] | [.path, .status, .zone_locality] | @tsv'
+
+proxy:
+  http_bind_port: 8080
+  # The zone this proxy considers itself in. Comment it out and start
+  # the process with SB_ZONE=zone-a to get the same behavior from the
+  # environment instead.
+  zone: zone-a
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    # No credential lives in this file; export ADMIN_PASSWORD before
+    # starting sbproxy.
+    password: ${ADMIN_PASSWORD}
+
+origins:
+  "shop.local":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        # The proxy's own zone. Healthy, so it takes every request.
+        # THE DRILL: change this target's health_check.path to
+        # /status/503 to force the local zone down and watch requests
+        # spill to zone-b.
+        - url: https://test.sbproxy.dev
+          zone: zone-a
+          health_check:
+            path: /status/200
+            interval_secs: 2
+            timeout_ms: 2000
+            unhealthy_threshold: 2
+            healthy_threshold: 2
+        # The other zone. Idle while zone-a is healthy; the failover
+        # path when it is not.
+        - url: https://test.sbproxy.dev
+          zone: zone-b
+          health_check:
+            path: /status/200
+            interval_secs: 2
+            timeout_ms: 2000
+            unhealthy_threshold: 2
+            healthy_threshold: 2

@@ -2017,6 +2017,60 @@ fn parse_outbound_credential_config(
     Ok(parsed)
 }
 
+/// Bind the proxy's zone identity to every compiled load balancer
+/// (WOR-2328).
+///
+/// The zone resolves once per pipeline compilation, `proxy.zone` first
+/// and the `SB_ZONE` environment variable as the fallback (config
+/// wins), and reaches every `load_balancer` action wherever one can be
+/// compiled: per-origin actions, forward-rule inline actions, and
+/// fallback actions. With no zone resolved the bind is skipped and
+/// selection behaves exactly as it did before zone-aware routing
+/// shipped; authored `targets[].zone` labels in that state steer
+/// nothing, so the mismatch is called out in one boot warning naming
+/// both knobs rather than left silent.
+fn bind_zone_identity(pipeline: &CompiledPipeline) {
+    use sbproxy_modules::Action;
+
+    let zone = pipeline.config.server.resolve_zone();
+    let load_balancers = pipeline
+        .actions
+        .iter()
+        .chain(
+            pipeline
+                .forward_rules
+                .iter()
+                .flatten()
+                .map(|rule| &rule.action),
+        )
+        .chain(
+            pipeline
+                .fallbacks
+                .iter()
+                .flatten()
+                .map(|fallback| &fallback.action),
+        )
+        .filter_map(|action| match action {
+            Action::LoadBalancer(lb) => Some(lb),
+            _ => None,
+        });
+
+    let mut zoned_but_unbound = false;
+    for lb in load_balancers {
+        match zone.as_deref() {
+            Some(zone) => lb.bind_local_zone(zone),
+            None => zoned_but_unbound |= lb.has_zoned_targets(),
+        }
+    }
+    if zoned_but_unbound {
+        tracing::warn!(
+            "load_balancer targets carry `zone` labels but the proxy has no zone identity; \
+             set `proxy.zone` (or the `SB_ZONE` environment variable) to activate same-zone \
+             preference, or remove the labels. Until then selection ignores them."
+        );
+    }
+}
+
 impl CompiledPipeline {
     /// Dynamic bundle registry pinned to this pipeline generation.
     #[allow(dead_code)]
@@ -2980,6 +3034,12 @@ impl CompiledPipeline {
             dns_resolver: Arc::new(sbproxy_platform::RefreshingResolver::new()),
             listings: sbproxy_config::ListingRegistry::default(),
         };
+        // Bind the proxy's zone identity to every compiled load
+        // balancer (WOR-2328) before any request can select through
+        // one. Both construction modes bind, so `sbproxy validate`
+        // and `doctor` see the same locality posture the runtime will.
+        bind_zone_identity(&pipeline);
+
         // Spawn active health-check probes for any load_balancer
         // target that has `health_check:` configured. Best-effort: if
         // we are not running inside a Tokio runtime (e.g. unit tests),
@@ -8947,5 +9007,69 @@ origins:
         assert_eq!(after.per_origin.len(), 2);
         assert!(after.per_origin.contains_key("a.example"));
         assert!(after.per_origin.contains_key("b.example"));
+    }
+
+    /// WOR-2328: the proxy's zone identity must reach every place a
+    /// load balancer can be compiled, not only per-origin actions. A
+    /// forward-rule inline LB or a fallback LB that missed the bind
+    /// would silently ignore `targets[].zone` on exactly the paths an
+    /// operator cannot watch, which is the inert-label failure this
+    /// feature exists to remove.
+    #[test]
+    fn zone_identity_binds_origin_forward_rule_and_fallback_load_balancers() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  zone: zone-a
+origins:
+  "lb.test":
+    action:
+      type: load_balancer
+      targets:
+        - { url: "http://a:8080", zone: zone-a }
+        - { url: "http://b:8080", zone: zone-b }
+    forward_rules:
+      - rules:
+          - path: { prefix: /shard/ }
+        origin:
+          id: shard
+          action:
+            type: load_balancer
+            targets:
+              - { url: "http://c:8080", zone: zone-a }
+              - { url: "http://d:8080", zone: zone-b }
+    fallback_origin:
+      on_error: true
+      origin:
+        action:
+          type: load_balancer
+          targets:
+            - { url: "http://e:8080", zone: zone-a }
+            - { url: "http://f:8080", zone: zone-b }
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("zone fixture compiles");
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("zone fixture builds a pipeline");
+
+        fn expect_bound(action: &sbproxy_modules::Action, surface: &str) {
+            match action {
+                sbproxy_modules::Action::LoadBalancer(lb) => assert_eq!(
+                    lb.local_zone(),
+                    Some("zone-a"),
+                    "{surface} load balancer missed the zone bind"
+                ),
+                _ => panic!("{surface} should compile a load balancer"),
+            }
+        }
+
+        expect_bound(&pipeline.actions[0], "per-origin");
+        expect_bound(&pipeline.forward_rules[0][0].action, "forward-rule inline");
+        expect_bound(
+            &pipeline.fallbacks[0]
+                .as_ref()
+                .expect("fallback compiled")
+                .action,
+            "fallback",
+        );
     }
 }

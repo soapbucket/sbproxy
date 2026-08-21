@@ -287,6 +287,45 @@ static AI_PREFIX_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Semantic-route selections by closed decision outcome (WOR-2564).
+/// `matched` pinned a deployment; every other outcome is a fallback
+/// disposition, mirrored on `sbproxy_ai_routing_fallbacks_total`.
+///
+/// Held as an `Option` rather than unwrapped like the older families
+/// above: a registration error is a duplicate name or a malformed label
+/// set, and losing one metric family is not worth ending the process a
+/// request is running through. The recorder below no-ops when the family
+/// is absent. The unwrap ratchet
+/// (`scripts/check-unwrap-ratchet.sh`) counts the older form; this is the
+/// shape new families take.
+static AI_SEMANTIC_ROUTE_DECISIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_semantic_route_decisions_total",
+            "Semantic-route selections by decision outcome"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Best exemplar cosine similarity per scored semantic-route request
+/// (WOR-2564). Recorded on matched and below-floor outcomes both, so an
+/// operator tuning `min_similarity` can see the near-miss distribution
+/// and not just the winners. Labeled by the best-scoring deployment; the
+/// score itself is the observation, never a label.
+static AI_SEMANTIC_ROUTE_SIMILARITY: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_semantic_route_similarity",
+            "Best exemplar cosine similarity of scored semantic-route requests"
+        )
+        .buckets(vec![0.3, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]),
+        &["provider"]
+    )
+    .ok()
+});
+
 /// Distributed quota-pool admissions allowed during backend unavailability.
 ///
 /// Pool names are operator-declared config values. Virtual-key identities are
@@ -543,6 +582,102 @@ pub(crate) fn translation_dropped_value(surface: &str, field: &str) -> u64 {
     AI_TRANSLATION_DROPPED
         .with_label_values(&[surface, field])
         .get() as u64
+}
+
+// --- Per-request price ceiling (WOR-2559) ---
+
+/// Registered without `.unwrap()` (mirroring
+/// `MULTIPART_INSPECTION_SKIPPED`) because the production unwrap/expect
+/// ratchet in `scripts/check-unwrap-ratchet.sh` is at its baseline and
+/// a metric family is not worth a panic path.
+static AI_PRICE_CEILING: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_price_ceiling_total",
+            "Per-request price ceiling routing-guard outcomes (WOR-2559)"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Record a per-request price-ceiling outcome (WOR-2559). `outcome` is a
+/// closed set of four:
+///
+/// - `candidate_excluded`: one routing candidate's estimate exceeded the
+///   ceiling and it was dropped from the eligible set.
+/// - `refused`: every candidate was over the ceiling, so the request
+///   failed closed with 402.
+/// - `invalid_header`: the caller's `x-sbproxy-max-price` was not a
+///   positive USD amount, answered 400.
+/// - `unsupported_surface`: the caller set that header on a surface the
+///   per-token estimate cannot price, answered 400.
+///
+/// A rising `candidate_excluded` rate with a flat `refused` rate means
+/// the ceiling is trimming the expensive tier; a rising `refused` rate
+/// means it is blocking traffic outright. The two 400 outcomes are
+/// caller mistakes rather than gateway decisions, so alert on them
+/// separately or not at all.
+///
+/// A request has two candidate sets the ceiling can filter, the provider
+/// order and a confidence cascade's tier list, and both count here. On a
+/// cascade origin one request can therefore report an exclusion from
+/// each, which is the honest reading: two separate routes were priced
+/// and both were over.
+pub fn record_price_ceiling(outcome: &str) {
+    let Some(counter) = &*AI_PRICE_CEILING else {
+        return;
+    };
+    counter.with_label_values(&[outcome]).inc();
+}
+
+// --- Per-error-class provider cooldowns (WOR-2556) ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` above: the production unwrap/expect ratchet is at
+/// its baseline and one metric family is not worth a panic path on a
+/// request the process is already serving.
+static AI_PROVIDER_COOLDOWNS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_provider_cooldowns_total",
+            "AI providers parked out of rotation by a classified-failure cooldown (WOR-2556)"
+        ),
+        &["provider", "cause"]
+    )
+    .ok()
+});
+
+/// Record one provider parked out of rotation by a
+/// `resilience.cooldown_policy` match (WOR-2556).
+///
+/// `cause` is the closed `FailureCause` label set and nothing else:
+/// `timeout`, `rate_limit`, `context_window_exceeded`, `content_policy`,
+/// `auth`, `server_error`, `bad_request`, `unknown`. `provider` is an
+/// operator-declared `providers[].name`, so it is bounded by the config
+/// rather than by traffic.
+///
+/// Both labels still pass the workspace cardinality limiter as a
+/// backstop, so a future call site that hands this an open value demotes
+/// to `__other__` instead of minting unbounded series, the same contract
+/// [`record_translation_dropped`] holds.
+///
+/// The counter exists because the cooldown axis is otherwise invisible:
+/// parking a provider is the moment traffic stops reaching it, and
+/// before this the only record was a rotating `warn!` line, which is
+/// neither alertable nor graphable. The comparable axis, the circuit
+/// breaker, has published `sbproxy_circuit_breaker_transitions_total`
+/// all along. `rate(sbproxy_ai_provider_cooldowns_total[5m]) > 0` is the
+/// expression an operator wants when a rotated credential parks the
+/// whole pool on `cause="auth"`.
+pub fn record_provider_cooldown(provider: &str, cause: &str) {
+    let Some(counter) = &*AI_PROVIDER_COOLDOWNS else {
+        return;
+    };
+    let metric = "sbproxy_ai_provider_cooldowns_total";
+    let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
+    let cause = sbproxy_observe::metrics::sanitize_label_budget(metric, "cause", cause);
+    counter.with_label_values(&[&provider, &cause]).inc();
 }
 
 // --- Shadow supervisor metrics ---
@@ -911,11 +1046,15 @@ pub fn record_lb_decision(strategy: &str, provider: &str) {
 
 /// Record an intentional routing fallback.
 ///
-/// Reasons are a closed vocabulary shared by the outcome-aware and
-/// prefix-affinity strategies.
+/// Reasons are a closed vocabulary shared by the outcome-aware,
+/// prefix-affinity, and semantic-route strategies. `below_floor`,
+/// `embed_error`, and `target_ineligible` are the semantic-route
+/// dispositions (WOR-2564); an unavailable embedder is deliberately a
+/// counted fallback here, never a failed request.
 pub fn record_routing_fallback(strategy: &str, reason: &str) {
     let reason = match reason {
-        "warmup" | "missing_signal" | "no_holder" | "no_feedback" => reason,
+        "warmup" | "missing_signal" | "no_holder" | "no_feedback" | "below_floor"
+        | "embed_error" | "target_ineligible" => reason,
         _ => "unknown",
     };
     AI_ROUTING_FALLBACKS
@@ -956,6 +1095,30 @@ pub fn record_prefix_affinity_eviction(reason: &str) {
     AI_PREFIX_AFFINITY_EVICTIONS
         .with_label_values(&[reason])
         .inc();
+}
+
+/// Record one semantic-route decision by closed outcome (WOR-2564):
+/// `matched`, `below_floor`, `no_prompt`, `embed_error`, or
+/// `target_ineligible`.
+pub fn record_semantic_route_decision(outcome: &str) {
+    let outcome = match outcome {
+        "matched" | "below_floor" | "no_prompt" | "embed_error" | "target_ineligible" => outcome,
+        _ => "unknown",
+    };
+    if let Some(decisions) = AI_SEMANTIC_ROUTE_DECISIONS.as_ref() {
+        decisions.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Record the best exemplar cosine similarity of one scored
+/// semantic-route request, labeled by the best-scoring deployment
+/// (WOR-2564).
+pub fn record_semantic_route_similarity(provider: &str, score: f32) {
+    if let Some(similarity) = AI_SEMANTIC_ROUTE_SIMILARITY.as_ref() {
+        similarity
+            .with_label_values(&[provider])
+            .observe(f64::from(score));
+    }
 }
 
 /// Record an admission that bypassed a failed shared quota backend.
@@ -1550,8 +1713,8 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// closed set (`ok`, `guardrail_block`, `content_filter`,
 /// `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`,
 /// `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`,
-/// `data_posture_block`, `refusal`, `client_error`, `other`) so
-/// cardinality stays bounded.
+/// `data_posture_block`, `price_ceiling_block`, `refusal`,
+/// `client_error`, `other`) so cardinality stays bounded.
 static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -2634,6 +2797,10 @@ mod tests {
         record_prefix_affinity_decision("operator-controlled");
         record_prefix_affinity_eviction("ttl");
         record_prefix_affinity_eviction("operator-controlled");
+        record_routing_fallback("semantic_route", "embed_error");
+        record_semantic_route_decision("matched");
+        record_semantic_route_decision("operator-controlled");
+        record_semantic_route_similarity("code-pool", 0.91);
         record_quota_pool_fail_open("shared-upstream");
         record_quota_pool_overshare("shared-upstream");
 
@@ -2650,6 +2817,14 @@ mod tests {
             (
                 "sbproxy_ai_prefix_affinity_evictions_total",
                 vec![("reason", "ttl")],
+            ),
+            (
+                "sbproxy_ai_routing_fallbacks_total",
+                vec![("strategy", "semantic_route"), ("reason", "embed_error")],
+            ),
+            (
+                "sbproxy_ai_semantic_route_decisions_total",
+                vec![("outcome", "matched")],
             ),
             (
                 "sbproxy_ai_quota_pool_fail_open_total",
@@ -2682,6 +2857,7 @@ mod tests {
             ("sbproxy_ai_routing_fallbacks_total", "reason"),
             ("sbproxy_ai_prefix_affinity_decisions_total", "outcome"),
             ("sbproxy_ai_prefix_affinity_evictions_total", "reason"),
+            ("sbproxy_ai_semantic_route_decisions_total", "outcome"),
         ] {
             let family = families
                 .iter()

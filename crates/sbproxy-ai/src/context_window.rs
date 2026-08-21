@@ -8,11 +8,13 @@
 //!
 //! WOR-2309: this file used to carry an overflow decision layer too, a
 //! `check_overflow` pair returning an `OverflowAction` of `Error`,
-//! `FallbackToLarger`, or `Truncate`. Nothing ever called it. Every
-//! action it could return is now either shipped elsewhere (`Truncate` is
-//! the `window_fit` lever) or would need a config surface that was never
-//! designed (`FallbackToLarger` names a model no key supplies), so it was
-//! deleted rather than left to look like a feature.
+//! `FallbackToLarger`, or `Truncate`. Nothing ever called it, so it was
+//! deleted rather than left to look like a feature. Both live actions
+//! now have a real caller and a config surface: `Truncate` is the
+//! `window_fit` compression lever, and `FallbackToLarger` is the
+//! `context_window_fallbacks:` reroute (WOR-2556), whose pre-flight half
+//! reads this table through
+//! `crate::typed_fallbacks::preflight_context_window_reroute`.
 
 /// Return the known maximum context window (in tokens) for a model.
 ///

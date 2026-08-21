@@ -498,13 +498,16 @@ fn validate_lsh(lsh: &SemanticLshConfig) -> Result<(), SemanticCacheConfigError>
     Ok(())
 }
 
-/// Validate the sidecar endpoint as a local-only transport.
+/// Validate the sidecar endpoint as a local-only transport. Shared with
+/// the `semantic_route` strategy's embedding-source validation (WOR-2564).
 ///
 /// Requires an absolute `http` or `https` URL with a literal IPv4 or IPv6
 /// loopback host, an explicit port, no userinfo, query, or fragment, and an
 /// empty or `/` path. `localhost`, public addresses, RFC1918 addresses,
 /// link-local addresses, and any other hostname are rejected.
-fn validate_sidecar(sidecar: &SidecarEmbeddingConfig) -> Result<(), SemanticCacheConfigError> {
+pub(crate) fn validate_sidecar(
+    sidecar: &SidecarEmbeddingConfig,
+) -> Result<(), SemanticCacheConfigError> {
     if !(1..=MAX_EMBEDDING_TIMEOUT_MS).contains(&sidecar.timeout_ms) {
         return Err(invalid(
             "sidecar.timeout_ms",
@@ -533,7 +536,8 @@ fn validate_sidecar(sidecar: &SidecarEmbeddingConfig) -> Result<(), SemanticCach
         .map_err(|_| invalid("sidecar.endpoint", "is not a usable gRPC endpoint"))
 }
 
-/// Validate the standalone OpenAI-compatible endpoint.
+/// Validate the standalone OpenAI-compatible endpoint. Shared with the
+/// `semantic_route` strategy's embedding-source validation (WOR-2564).
 ///
 /// Requires an absolute `http` or `https` base URL with a host, no userinfo,
 /// query, or fragment, and a bounded timeout. Public destinations are the
@@ -549,7 +553,9 @@ fn validate_sidecar(sidecar: &SidecarEmbeddingConfig) -> Result<(), SemanticCach
 /// and pins the destination on every call, which is both hermetic here and
 /// correct there. Same split as the RAG adapters: validation mode checks
 /// syntax and never dials.
-fn validate_openai(openai: &OpenAiEmbeddingConfig) -> Result<(), SemanticCacheConfigError> {
+pub(crate) fn validate_openai(
+    openai: &OpenAiEmbeddingConfig,
+) -> Result<(), SemanticCacheConfigError> {
     if !(1..=MAX_EMBEDDING_TIMEOUT_MS).contains(&openai.timeout_ms) {
         return Err(invalid(
             "openai.timeout_ms",

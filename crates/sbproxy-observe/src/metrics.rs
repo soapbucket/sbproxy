@@ -3499,6 +3499,50 @@ pub fn record_upstream_timeout_retry(origin: &str, phase: &str) {
         .inc();
 }
 
+/// Increment `sbproxy_lb_zone_locality_total{origin, verdict}`
+/// (WOR-2328).
+///
+/// Called once per load-balancer selection the zone-locality stage
+/// actually shaped. `verdict` is `local` (selection narrowed to the
+/// proxy's own zone) or `spilled` (no same-zone target was healthy, so
+/// selection widened across every eligible target). A selection the
+/// stage stood down on records nothing, so the two series together
+/// count exactly the selections locality decided.
+///
+/// The spill series is the one to alert on:
+/// `rate(sbproxy_lb_zone_locality_total{verdict="spilled"}[5m]) > 0`
+/// says traffic is crossing zones right now, paying the cross-AZ RTT
+/// and the egress bill. Before this counter that event reached only a
+/// `debug!` line, which `release_max_level_info` compiles out of a
+/// release build, and the in-memory admin request ring, which is off
+/// unless the admin server is enabled. On a release binary with admin
+/// off, a total local-zone outage was invisible until the invoice
+/// arrived.
+///
+/// The origin label is operator-supplied and passes through the
+/// cardinality limiter; `verdict` is a closed two-value set.
+pub fn record_zone_locality(origin: &str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    // Registered through `.ok()` rather than an expect, the same shape
+    // `record_policy_panic` uses: the unwrap/expect ratchet is at its
+    // baseline and one metric family does not justify a panic path on
+    // the serving side of a request already in flight.
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_lb_zone_locality_total",
+            "Load-balancer selections shaped by the zone-locality stage, by verdict (local: narrowed to the proxy's own zone; spilled: no same-zone target was healthy)",
+            &["origin", "verdict"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let origin = sanitize_label("origin", origin);
+        counter.with_label_values(&[origin.as_str(), verdict]).inc();
+    }
+}
+
 /// Increment the active (in-flight) connections gauge for an origin.
 pub fn inc_active(origin: &str) {
     let origin = sanitize_label("origin", origin);

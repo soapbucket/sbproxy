@@ -6,13 +6,13 @@
 # unimplemented-feature claims in user-facing docs. Code reality:
 #
 #   - crates/sbproxy-ai/data/ai_providers.yml has 72 entries.
-#   - crates/sbproxy-ai/src/routing.rs defines 18 routing strategies
+#   - crates/sbproxy-ai/src/routing.rs defines 19 routing strategies
 #     (RoundRobin, Weighted, FallbackChain, Random, LowestLatency,
 #     LeastConnections, CostOptimized, TokenRate, LeastTokenUsage,
 #     PrefixAffinity, Sticky, Race, PeakEwma, Cascade, CostQuality,
-#     OutcomeAware, Headroom, ResetAware). TokenRate is refused at
-#     config load (WOR-2233, superseded by LeastTokenUsage), so 17
-#     are actually selectable.
+#     OutcomeAware, Headroom, ResetAware, SemanticRoute). TokenRate is
+#     refused at config load (WOR-2233, superseded by LeastTokenUsage),
+#     so 18 are actually selectable.
 #   - crates/sbproxy-modules/src/action/routing/ ships two built-in
 #     RoutingStrategy implementations: first-healthy and lora-aware.
 #   - crates/sbproxy-observe/src/decision.rs defines 8 decision engines
@@ -69,6 +69,12 @@ STALE_STRINGS=(
   "10 routing strategies"
   "ten routing strategies"
   "Ten routing strategies"
+  # WOR-2564 added `semantic_route`, taking the selectable count from 17
+  # to 18. Root `llms.txt` was still claiming 15 at the time, three
+  # strategies behind, so both the count it carried and the one that was
+  # true before this change join the list.
+  "15 routing strategies"
+  "17 routing strategies"
   "43 native providers"
   "one trivial built-in strategy"
   "36 OpenAI-compatible"
