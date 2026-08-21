@@ -122,7 +122,12 @@ pub struct ProviderConfig {
     /// placeholder in the provider catalog's default endpoint. See
     /// `sbproxy_ai::aws_sigv4`.
     #[serde(default)]
-    pub aws_sigv4: Option<crate::aws_sigv4::AwsSigV4Config>,
+    /// Boxed deliberately. `AwsSigV4Config` is 256 bytes and almost
+    /// every entry leaves it unset, so inlining it grew every
+    /// `ProviderConfig` by 50% and, with it, every async state machine
+    /// that holds one across an await. That was enough to overflow the
+    /// Pingora proxy thread's stack on the AI request path.
+    pub aws_sigv4: Option<Box<crate::aws_sigv4::AwsSigV4Config>>,
 }
 
 fn default_weight() -> u32 {

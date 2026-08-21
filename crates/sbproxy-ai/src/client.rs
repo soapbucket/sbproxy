@@ -581,20 +581,33 @@ impl AiClient {
 
     /// Send one already-built provider request under the governed
     /// redirect contract (WOR-2165).
+    /// Boxed body. Every await on the AI request path is inlined into
+    /// one state machine on a Pingora worker thread, whose stack is the
+    /// std default of 2MB, and that machine was already within a few
+    /// hundred kilobytes of it. Adding the signer lookup and the signed
+    /// hop loop pushed it over, so an AI request aborted the worker
+    /// thread with a stack overflow before it reached a provider.
+    /// Boxing here puts this subtree on the heap and takes the frame
+    /// back under the limit. Unit tests never caught it because they
+    /// call this off a test runtime with a much larger stack; only the
+    /// e2e harness runs the real Pingora thread.
     async fn send_provider_request(
         &self,
         mut request: reqwest::Request,
         provider: &ProviderConfig,
     ) -> Result<reqwest::Response> {
-        apply_provider_timeout(&mut request, provider);
-        let signer = self.signers.signer_for(provider).await?;
-        send_governed(
-            &self.http,
-            self.egress.as_ref(),
-            &provider.name,
-            as_signer(&signer),
-            request,
-        )
+        Box::pin(async move {
+            apply_provider_timeout(&mut request, provider);
+            let signer = self.signers.signer_for(provider).await?;
+            send_governed(
+                &self.http,
+                self.egress.as_ref(),
+                &provider.name,
+                as_signer(&signer),
+                request,
+            )
+            .await
+        })
         .await
     }
 
