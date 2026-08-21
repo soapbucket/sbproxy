@@ -24,15 +24,37 @@ sbproxy disconnect          # put it back
 | Cline | its VS Code extension directory exists | Prints the four fields for the OpenAI Compatible provider |
 | GitHub Copilot | `copilot` on `PATH`, or its VS Code extension directory exists | Prints the BYOK fields and where the file behind them now lives |
 
-Three findings, not two. An agent that is not installed, an agent whose launcher is not on this shell's `PATH` but whose state directory is there, and an agent that is installed and has never been configured are three different situations, and the output says which one you are in:
+Three findings, not two. An agent that is not installed, an agent whose launcher is not on this shell's `PATH` but whose state directory is there, and an agent that is installed and has never been configured are three different situations, and the output says which one you are in.
 
-```console
+Here is a `--dry-run` sweep against a machine with Codex on `PATH`, Cursor installed but launched from the dock, and nothing else. The command that produced it builds that machine under a throwaway `HOME`, so `scripts/check-doc-captures.py` re-runs this block rather than trusting whoever pasted it:
+
+<!-- CAPTURE: rm -rf /tmp/sbproxy-connect-doc && mkdir -p /tmp/sbproxy-connect-doc/bin /tmp/sbproxy-connect-doc/.codex '/tmp/sbproxy-connect-doc/Library/Application Support/Cursor' && printf '#!/bin/sh\nexit 0\n' > /tmp/sbproxy-connect-doc/bin/codex && chmod +x /tmp/sbproxy-connect-doc/bin/codex && env -u CODEX_HOME HOME=/tmp/sbproxy-connect-doc PATH="$(dirname "$(command -v sbproxy)"):/tmp/sbproxy-connect-doc/bin" sbproxy connect --dry-run -->
+
+```text
 codex  Codex CLI
-    found: /opt/homebrew/bin/codex (on PATH)
+    found: ~/bin/codex (on PATH)
     would write: ~/.codex/sbproxy.config.toml
     backup: none, this file did not exist yet
+    +# Written by `sbproxy connect codex`.
+    +#
+    +# Codex layers this file over ~/.codex/config.toml when it runs as
+    +# `codex --profile sbproxy`. Your own config.toml is not touched.
+    +# Undo with `sbproxy disconnect codex`, or just delete this file.
+    +
+    +model_provider = "sbproxy"
+    +
+    +[model_providers.sbproxy]
+    +name = "SBproxy"
+    +base_url = "http://127.0.0.1:8080/v1"
+    +env_key = "SBPROXY_API_KEY"
+    +env_key_instructions = "Mint a gateway key with `curl -u admin:<password> -X POST <admin-url>/admin/keys`, then export it as SBPROXY_API_KEY."
+    +wire_api = "responses"
     run it as: codex --profile sbproxy
     credential: Codex reads $SBPROXY_API_KEY. This verb writes the variable's name, never its value.
+    note: Codex only accepts wire_api = "responses". The gateway serves stateless /v1/responses and refuses a request carrying previous_response_id, conversation, or store: true with a 400 naming the field.
+
+claude-code  Claude Code
+    found: not installed
 
 cursor  Cursor
     found: ~/Library/Application Support/Cursor (state directory; no launcher on PATH)
@@ -40,18 +62,28 @@ cursor  Cursor
     - Settings -> Models
     - Override OpenAI Base URL: http://127.0.0.1:8080/v1
     - OpenAI API Key: your sbproxy key
+    - chat and agent mode follow this; tab autocomplete stays on Cursor's own backend
 
 cline  Cline
     found: not installed
+
+copilot  GitHub Copilot
+    found: not installed
+
+nothing was written (--dry-run).
 ```
 
-`--format json` emits the same rows as one object, for a setup script that wants to branch on `status`.
+Every line under `codex` prefixed with `+` is the diff of the file that would be created. A rewrite of an existing profile shows the same diff with its unchanged lines as context, and a run that would change nothing says `unchanged` and prints no diff at all.
+
+`--format json` emits the same rows as one object, for a setup script that wants to branch on `status`. Its `backup` field names the copy the run wrote, so a `--dry-run` carries no `backup` at all.
 
 ## What it will not do
 
 It will not write your API key into another program's config file. Codex reads its key out of an environment variable named by `model_providers.<id>.env_key`, so the file this verb writes holds `env_key = "SBPROXY_API_KEY"` and the key itself stays in your environment. Claude Code reads `ANTHROPIC_AUTH_TOKEN` the same way. There is no `--key` flag, and that is a decision rather than an omission: with indirection available on both writable targets, a CLI that also accepted the secret would be offering a worse option for no reason.
 
 That is also why a shared machine needs no special handling here. Nothing written is worth reading. If the destination file is group- or world-readable, `connect` says so and leaves the mode alone, because the permissions on your own file are your call. A file that was 0600 comes back 0600; the replacement inherits the original's mode rather than this process's umask.
+
+It will not replace a symlink. If the file it would write is a link into a dotfiles repository, which is what `stow` and `chezmoi` leave behind, `connect` refuses and names the link and its target rather than renaming a regular file over the top of it. Point it at the real file or remove the link first.
 
 It will not touch `~/.codex/config.toml`. Codex layers `$CODEX_HOME/<name>.config.toml` over your base config when it runs as `codex --profile <name>`, so `connect` creates a file nothing else owns and `disconnect` deletes it. Your own config keeps its project trust decisions, its marketplace registrations, and its plugin state, because nothing goes near them.
 
@@ -73,7 +105,9 @@ flowchart TD
     I -- no --> K[back up once,<br/>temp file, fsync, rename,<br/>fsync the directory]
 ```
 
-The backup is written the first time a file changes and never again, so `~/.codex/sbproxy.config.toml.sbproxy.bak` always holds that file as it was before `connect` first touched it, no matter how many times you re-run. Before writing, `connect` re-reads the file and refuses if it changed since it built the diff, so the change you approved is the change that lands.
+The backup is written the first time a file changes and never again, so `~/.codex/sbproxy.config.toml.sbproxy.bak` always holds that file as it was before `connect` first touched it, no matter how many times you re-run. A removal keeps its own copy under a different name; see [Undo](#undo). Before writing, `connect` re-reads the file and refuses if it changed since it built the diff, so the change you approved is the change that lands.
+
+The write itself is a temp file, an fsync, a rename, and an fsync of the directory, in that order. If the last of those four fails, which is what an SMB- or FUSE-mounted home does on macOS, the run says the file was written and that the sync did not answer, rather than reporting a failure against a file that is already on disk.
 
 ## The gateway side
 
@@ -142,10 +176,11 @@ The response's `token` field is the plaintext credential, returned exactly once.
 
 ### Codex CLI
 
-`sbproxy connect codex` writes this, and prints the command that uses it:
+`sbproxy connect codex` writes `~/.codex/sbproxy.config.toml`, and prints the command that uses it. The whole file:
+
+<!-- CAPTURE: rm -rf /tmp/sbproxy-connect-doc-file && mkdir -p /tmp/sbproxy-connect-doc-file/.codex && env -u CODEX_HOME HOME=/tmp/sbproxy-connect-doc-file sbproxy connect codex > /dev/null && cat /tmp/sbproxy-connect-doc-file/.codex/sbproxy.config.toml -->
 
 ```toml
-# ~/.codex/sbproxy.config.toml
 # Written by `sbproxy connect codex`.
 #
 # Codex layers this file over ~/.codex/config.toml when it runs as
@@ -158,8 +193,11 @@ model_provider = "sbproxy"
 name = "SBproxy"
 base_url = "http://127.0.0.1:8080/v1"
 env_key = "SBPROXY_API_KEY"
+env_key_instructions = "Mint a gateway key with `curl -u admin:<password> -X POST <admin-url>/admin/keys`, then export it as SBPROXY_API_KEY."
 wire_api = "responses"
 ```
+
+`env_key_instructions` holds the recipe for minting a key and `env_key` holds the name of the variable to put it in. Neither holds the key, which is the whole reason there is no `--key` flag.
 
 ```bash
 export SBPROXY_API_KEY=sbp_...
@@ -215,7 +253,18 @@ The entry point moves between releases. On VS Code 1.109 and later the resulting
 sbproxy disconnect codex
 ```
 
-That removes `~/.codex/sbproxy.config.toml`. The `.sbproxy.bak` copy stays where it is, so if you had hand-edited the profile you can still get it back. Running `disconnect` twice is not an error; the second run reports the file is not there and writes nothing.
+That removes `~/.codex/sbproxy.config.toml`, after copying it to `~/.codex/sbproxy.config.toml.sbproxy.removed`. Two files, two different snapshots, and it is worth knowing which is which before you go looking for an edit:
+
+| File | What it holds |
+|---|---|
+| `sbproxy.config.toml.sbproxy.bak` | the profile as it was **before the first `connect`**, written once and never overwritten. On a machine where `connect` created the profile from nothing, there is no `.bak` at all. |
+| `sbproxy.config.toml.sbproxy.removed` | the profile as it was **at the moment `disconnect` took it away**, hand edits and all. Written by every removal. |
+
+So look in the `.removed` copy for a hand edit you made after connecting; the `.bak` was taken before that edit existed. Recover it with `mv ~/.codex/sbproxy.config.toml.sbproxy.removed ~/.codex/sbproxy.config.toml`.
+
+If a `.removed` copy from an earlier `disconnect` is already sitting there holding something else, the removal is refused rather than overwriting it, and the message names the file. Move it somewhere safe or delete it and re-run.
+
+Running `disconnect` twice is not an error; the second run reports the file is not there and writes nothing.
 
 For Claude Code, unset `ANTHROPIC_BASE_URL` and remove it from your shell profile. For the three editors, clear the base URL you typed into their settings.
 

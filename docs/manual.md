@@ -233,7 +233,7 @@ The full subcommand set, one line each:
 | `admin` | Admin-account maintenance: `hash-password` prints the `password_hash` value for `proxy.admin.operators[].password_hash`. |
 | `doctor` | Diagnose what this binary can do on the current host. |
 | `connect` | Point the coding agents installed on this machine at this gateway. Detects Codex, Claude Code, Cursor, Cline, and Copilot; writes `$CODEX_HOME/sbproxy.config.toml` (a Codex profile of its own, never your `config.toml`) through a temp file and a rename, taking a one-time `.sbproxy.bak` copy first; prints the exports or the settings-screen fields for the rest. `--dry-run` shows the unified diff and writes nothing. No credential is read or written: the config names the environment variable each client reads its key from. See [use-case-connect-coding-agents.md](use-case-connect-coding-agents.md). |
-| `disconnect` | Remove what `connect` wrote and name what to clear by hand. The `.sbproxy.bak` copy is left in place. |
+| `disconnect` | Remove what `connect` wrote and name what to clear by hand. The profile is copied to `<path>.sbproxy.removed` before it goes, so a hand edit made after connecting survives the removal; the one-time `.sbproxy.bak`, which holds the file as it was before the first `connect`, is left in place. |
 | `service` | Install, remove, or check a per-user `launchd` agent (macOS only) that runs a certified catalog model in the background; reuses the same secure config generation as `run`. |
 | `completions` | Print a shell-completion script for the requested shell. |
 | `version` | Print the version line. Synonym for `--version`. |

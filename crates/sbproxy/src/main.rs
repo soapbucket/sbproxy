@@ -226,7 +226,10 @@ enum Cmd {
     /// writes the variable's name.
     Connect(ConnectArgs),
     /// Undo `connect`: remove the profile it wrote and name what to clear by
-    /// hand. The one-time `.sbproxy.bak` copy is left in place.
+    /// hand. The profile's current contents are copied to
+    /// `<path>.sbproxy.removed` before it goes, so a hand edit survives the
+    /// removal; the one-time `.sbproxy.bak`, which holds the file as it was
+    /// before the first `connect`, is left exactly where it is.
     Disconnect(DisconnectArgs),
     /// Print a shell-completion script to stdout for the requested
     /// shell. Pipe into the shell's completion sink.

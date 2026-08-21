@@ -82,11 +82,36 @@
 //! over the destination, and fsyncs the directory. The destination is never
 //! opened for writing, so no reader ever sees a truncated config.
 //!
+//! The rename is the boundary between "nothing happened" and "it happened".
+//! A failure before it is a failure: the destination still holds every old
+//! byte and the run says so. A failure of the directory fsync *after* it is
+//! not, because the new bytes are already there;
+//! [`Durability::NotSynced`] carries that case so the run reports a write
+//! that landed and is not yet crash-proof rather than a write that did not
+//! happen. `sync_all` on macOS is `F_FULLFSYNC`, which answers ENOTSUP on an
+//! SMB- or FUSE-mounted home, so this is somebody's every run rather than a
+//! rare race, and telling them nothing was written when a file now exists is
+//! the one report that leaves them unable to undo it.
+//!
+//! # Nothing this verb takes away exists in only one place
+//!
 //! The first change to a file copies the original to `<path>.sbproxy.bak`, and
 //! that copy is never overwritten afterwards, so the pristine original stays
-//! recoverable no matter how many times `connect` runs. `--dry-run` prints the
-//! unified diff and touches nothing. Every run ends by printing the command
-//! that undoes it.
+//! recoverable no matter how many times `connect` runs.
+//!
+//! A removal needs its own copy, and for a while it did not have one. The
+//! `.bak` holds the file as it was before the *first* `connect`, so a
+//! `disconnect` that leaned on it deleted every hand edit made since. So
+//! [`Destination::Remove`] carries the path it stages the current bytes at,
+//! `<path>.sbproxy.removed`, and carries it unconditionally: a removal cannot
+//! be constructed without somewhere for its bytes to go, which is why a third
+//! direction added later cannot quietly reintroduce the hole. `apply` copies
+//! before it unlinks, and refuses up front when `<path>.sbproxy.removed`
+//! already holds something else, because overwriting the rescue copy is the
+//! same defect one level down.
+//!
+//! `--dry-run` prints the unified diff and touches nothing. Every run ends by
+//! printing the command that undoes it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -99,6 +124,13 @@ const PROVIDER_NAME: &str = "sbproxy";
 
 /// Suffix appended to a config path for the one-time pre-change backup.
 const BACKUP_SUFFIX: &str = ".sbproxy.bak";
+
+/// Suffix appended to a config path for the copy a removal stages before it
+/// unlinks. Distinct from [`BACKUP_SUFFIX`] on purpose: the `.bak` is the file
+/// as it was before the first `connect`, this is the file as it was at the
+/// moment `disconnect` took it away, and collapsing the two is what made a
+/// second `disconnect` lossy.
+const REMOVED_SUFFIX: &str = ".sbproxy.removed";
 
 /// Environment variable Codex is told to read the gateway key from.
 const CODEX_ENV_KEY: &str = "SBPROXY_API_KEY";
@@ -455,6 +487,41 @@ enum Change {
     Blocked(String),
 }
 
+/// Where a staged change leaves the destination, and where the bytes it takes
+/// away are kept.
+///
+/// The two arms are deliberately asymmetric, and the asymmetry is the whole
+/// safety property. A write can honestly have no copy to make: the one-time
+/// `.sbproxy.bak` is about the *pristine* original, so once one exists the
+/// answer is `None` and nothing is lost, because the bytes being replaced are
+/// still described by the diff the run prints and the file they came from is
+/// still recoverable. A removal can not: the bytes it unlinks exist nowhere
+/// else the moment it finishes. So `Remove` carries a staging path and
+/// `Option` does not appear in it. Sharing one nullable `backup` field across
+/// both directions is exactly the bug this shape removes; a direction added
+/// later has to pick an arm, and picking `Remove` means naming the path its
+/// bytes survive at.
+#[derive(Debug, Clone)]
+enum Destination {
+    /// Replace the file with these bytes, copying the current file to
+    /// `backup` first when this is the first change this verb has made to it.
+    /// `None` when there is nothing to copy (the file does not exist) or when
+    /// a backup from an earlier run is already there and must not be
+    /// overwritten.
+    Write {
+        /// The bytes to leave at the destination.
+        body: String,
+        /// Where the one-time pristine copy goes, when this run makes one.
+        backup: Option<PathBuf>,
+    },
+    /// Remove the file, after copying its current bytes to `staged`.
+    Remove {
+        /// Where the about-to-be-removed bytes are written first. Not
+        /// optional: see the type's own docs.
+        staged: PathBuf,
+    },
+}
+
 /// A staged change to one config file.
 #[derive(Debug, Clone)]
 struct FileEdit {
@@ -462,13 +529,8 @@ struct FileEdit {
     path: PathBuf,
     /// Its current bytes, or `None` when it does not exist.
     before: Option<String>,
-    /// What should be there afterwards. `None` means remove the file, which is
-    /// how `disconnect` reverses a profile this verb created.
-    after: Option<String>,
-    /// Where the first change copies `before`. `None` when there is nothing to
-    /// copy, or when a backup from an earlier run is already there and must
-    /// not be overwritten.
-    backup: Option<PathBuf>,
+    /// What happens to it, and where its current bytes are kept.
+    destination: Destination,
     /// The destination's current unix mode, carried onto the replacement.
     mode: Option<u32>,
     /// Whether the current mode lets group or other read the file. Reported,
@@ -477,11 +539,31 @@ struct FileEdit {
 }
 
 impl FileEdit {
+    /// The bytes this edit leaves at [`FileEdit::path`], or `None` when it
+    /// removes the file.
+    fn after(&self) -> Option<&str> {
+        match &self.destination {
+            Destination::Write { body, .. } => Some(body.as_str()),
+            Destination::Remove { .. } => None,
+        }
+    }
+
+    /// Where this run copies the current bytes before changing them, when it
+    /// copies them at all. The `.sbproxy.bak` for a first write, the
+    /// `.sbproxy.removed` for a removal.
+    fn preserved(&self) -> Option<&Path> {
+        match &self.destination {
+            Destination::Write { backup, .. } => backup.as_deref(),
+            Destination::Remove { staged } => Some(staged.as_path()),
+        }
+    }
+
     /// Whether applying this edit would change anything on disk. A second
     /// `connect` run with the same arguments lands here, which is what makes
-    /// the verb idempotent.
+    /// the verb idempotent, and so does a `disconnect` with no profile to
+    /// remove.
     fn is_noop(&self) -> bool {
-        self.before == self.after
+        self.before.as_deref() == self.after()
     }
 }
 
@@ -569,7 +651,7 @@ fn plan_codex(env: &Environment, settings: &Settings) -> anyhow::Result<FileEdit
         .ok_or_else(|| anyhow::anyhow!("no home directory: set HOME or CODEX_HOME"))?;
     let path = home.join(format!("{PROVIDER_NAME}.config.toml"));
     let before = read_config(&path)?;
-    let after = match settings.direction {
+    let destination = match settings.direction {
         Direction::Connect => {
             let body = render_codex_profile(before.as_deref().unwrap_or_default(), settings)?;
             // The header is prepended rather than parsed as the starting
@@ -579,29 +661,49 @@ fn plan_codex(env: &Environment, settings: &Settings) -> anyhow::Result<FileEdit
             // the comments are a real prefix on `model_provider` and the
             // structural edit preserves them, which is what keeps a second
             // run a byte-for-byte fixed point.
-            Some(if before.is_some() {
+            let body = if before.is_some() {
                 body
             } else {
                 format!("{CODEX_PROFILE_HEADER}\n{body}")
-            })
+            };
+            // The one-time copy of the pristine original, and only that: once
+            // one exists this is `None` and the file on disk keeps holding the
+            // state before the first `connect`.
+            let backup_path = backup_path_for(&path);
+            let backup = (before.is_some() && !backup_path.exists()).then_some(backup_path);
+            Destination::Write { body, backup }
         }
         // The file is this verb's own, named after it and carrying a header
         // that says so, so reversing means removing it rather than unpicking
-        // keys out of somebody else's document.
-        Direction::Disconnect => None,
+        // keys out of somebody else's document. What it may not do is take
+        // the bytes with it: the profile is editable by hand and the module
+        // docs promise those edits survive, so the removal stages the current
+        // file next to itself first.
+        Direction::Disconnect => {
+            let staged = staging_path_for(&path);
+            if let Some(body) = before.as_deref() {
+                // Refused at plan time rather than in `apply`, so `--dry-run`
+                // reports it too and nothing has been touched when it does.
+                // Byte-identical is not a conflict: rewriting the same
+                // content takes nothing away.
+                let kept = read_config(&staged).ok().flatten();
+                if staged.exists() && kept.as_deref() != Some(body) {
+                    anyhow::bail!(
+                        "'{}' already holds a different profile an earlier `disconnect` \
+                         rescued, and removing this one would overwrite it. Move it \
+                         somewhere safe or delete it, then re-run.",
+                        staged.display()
+                    );
+                }
+            }
+            Destination::Remove { staged }
+        }
     };
     let (mode, world_readable) = file_mode(&path);
-    let backup_path = backup_path_for(&path);
-    let backup = if before.is_some() && !backup_path.exists() {
-        Some(backup_path)
-    } else {
-        None
-    };
     Ok(FileEdit {
         path,
         before,
-        after,
-        backup,
+        destination,
         mode,
         world_readable,
     })
@@ -661,12 +763,32 @@ fn manual_steps(client: Client, settings: &Settings) -> Vec<String> {
 
 /// Read a client config, refusing anything implausibly large rather than
 /// holding it in memory and rewriting it.
+///
+/// The stat is `symlink_metadata`, not `metadata`, because the write half is
+/// a `rename(2)` onto this path and `rename` replaces the *link* rather than
+/// its target. A `stow` or `chezmoi` user whose profile is a link into their
+/// dotfiles would get the link silently swapped for a regular file, their
+/// dotfiles copy orphaned and stale, and no line of output saying so. The
+/// report cannot warn about it either: `run` applies before it describes, so
+/// a note would be a post-mortem. Refusing is the only answer that reaches
+/// the operator while the link still exists.
 fn read_config(path: &Path) -> anyhow::Result<Option<String>> {
-    let metadata = match std::fs::metadata(path) {
+    let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => anyhow::bail!("read '{}': {error}", path.display()),
     };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path)
+            .map(|target| target.display().to_string())
+            .unwrap_or_else(|_| "somewhere this process cannot read".to_string());
+        anyhow::bail!(
+            "'{}' is a symlink to '{target}'. This verb replaces the file at that path, \
+             which would break the link and leave the file it points at stale; run it \
+             against '{target}' instead, or remove the link first.",
+            path.display()
+        );
+    }
     if !metadata.is_file() {
         anyhow::bail!("'{}' is not a regular file", path.display());
     }
@@ -704,8 +826,19 @@ fn file_mode(path: &Path) -> (Option<u32>, bool) {
 
 /// Where the one-time backup for `path` lives.
 fn backup_path_for(path: &Path) -> PathBuf {
+    suffixed(path, BACKUP_SUFFIX)
+}
+
+/// Where a removal stages the bytes it is about to unlink.
+fn staging_path_for(path: &Path) -> PathBuf {
+    suffixed(path, REMOVED_SUFFIX)
+}
+
+/// `path` with `suffix` appended to its file name, so the copy lands beside
+/// the original rather than in a directory the operator did not name.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = path.file_name().unwrap_or_default().to_os_string();
-    name.push(BACKUP_SUFFIX);
+    name.push(suffix);
     path.with_file_name(name)
 }
 
@@ -767,6 +900,44 @@ fn render_codex_profile(existing: &str, settings: &Settings) -> anyhow::Result<S
 
 // --- Writing ----------------------------------------------------------
 
+/// Whether a change that landed is also guaranteed to survive a crash.
+///
+/// Two states rather than folding the second into an error, because they are
+/// opposite instructions to the operator. An error means the file is
+/// untouched and there is nothing to undo. `NotSynced` means the file is
+/// already replaced or already gone and only the *durability* of that is
+/// unproven, so the undo hint applies and the operator needs to know the path
+/// exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Durability {
+    /// The change is on disk and the directory holding it was synced.
+    Durable,
+    /// The rename or the unlink landed; the directory sync did not. Carries
+    /// the sentence to print, which names the file and the syscall's
+    /// complaint.
+    NotSynced(String),
+}
+
+impl Durability {
+    /// Fold two steps of one apply together. The first complaint wins: it is
+    /// the one nearest the cause, and one unsynced step makes the whole run
+    /// unsynced.
+    fn and(self, next: Durability) -> Durability {
+        match self {
+            Durability::Durable => next,
+            already => already,
+        }
+    }
+
+    /// The warning to print, when there is one.
+    fn warning(&self) -> Option<&str> {
+        match self {
+            Durability::Durable => None,
+            Durability::NotSynced(why) => Some(why.as_str()),
+        }
+    }
+}
+
 /// Replace `path` with `contents` without ever opening `path` for writing.
 ///
 /// Stage a sibling temp file, fsync it, rename it over the destination, then
@@ -778,7 +949,31 @@ fn render_codex_profile(existing: &str, settings: &Settings) -> anyhow::Result<S
 /// `mode` carries the destination's existing unix mode onto the replacement.
 /// Codex creates its config files at 0600, so a replacement left at this
 /// process's umask default would quietly widen a private file.
-fn replace_atomically(path: &Path, contents: &str, mode: Option<u32>) -> anyhow::Result<()> {
+///
+/// The result splits at the rename: `Err` means the destination still holds
+/// every old byte, `Ok(Durability::NotSynced)` means it holds the new ones and
+/// the directory fsync did not answer. See [`Durability`].
+fn replace_atomically(
+    path: &Path,
+    contents: &str,
+    mode: Option<u32>,
+) -> anyhow::Result<Durability> {
+    replace_atomically_with(path, contents, mode, sync_dir)
+}
+
+/// [`replace_atomically`] with the directory sync passed in.
+///
+/// The seam exists because the failure it guards is not producible in a temp
+/// directory: `sync_all` answers ENOTSUP on an SMB or FUSE mount and nothing
+/// else, so a test that wants the post-rename branch has to supply the
+/// refusal. Both production callers pass [`sync_dir`], so the path a test
+/// exercises is the path an operator runs.
+fn replace_atomically_with(
+    path: &Path,
+    contents: &str,
+    mode: Option<u32>,
+    sync: fn(&Path) -> std::io::Result<()>,
+) -> anyhow::Result<Durability> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -813,26 +1008,58 @@ fn replace_atomically(path: &Path, contents: &str, mode: Option<u32>) -> anyhow:
         }
         #[cfg(not(unix))]
         let _ = mode;
-        std::fs::rename(&temporary, path)?;
-        sync_dir(parent)
+        std::fs::rename(&temporary, path)
     })();
 
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
         return Err(anyhow::anyhow!("write '{}': {error}", path.display()));
     }
-    Ok(())
+    // Past the rename. The destination already holds `contents`, so whatever
+    // the directory sync answers, reporting this as a failed write would be
+    // false and would talk the operator out of the undo they now need.
+    Ok(match sync(parent) {
+        Ok(()) => Durability::Durable,
+        Err(error) => Durability::NotSynced(format!(
+            "'{}' was written, but syncing '{}' failed: {error}. The new bytes are in \
+             place; only their survival across a crash before the filesystem flushes is \
+             unproven.",
+            path.display(),
+            parent.display()
+        )),
+    })
 }
 
 /// Remove `path` and make the removal durable.
-fn remove_durably(path: &Path) -> anyhow::Result<()> {
+///
+/// Splits at the unlink for the same reason [`replace_atomically`] splits at
+/// the rename: once the file is gone, a directory sync that will not answer
+/// does not put it back.
+fn remove_durably(path: &Path) -> anyhow::Result<Durability> {
+    remove_durably_with(path, sync_dir)
+}
+
+/// [`remove_durably`] with the directory sync passed in. See
+/// [`replace_atomically_with`] for why the seam is here.
+fn remove_durably_with(
+    path: &Path,
+    sync: fn(&Path) -> std::io::Result<()>,
+) -> anyhow::Result<Durability> {
     std::fs::remove_file(path)
         .map_err(|error| anyhow::anyhow!("remove '{}': {error}", path.display()))?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        sync_dir(parent)
-            .map_err(|error| anyhow::anyhow!("sync '{}': {error}", parent.display()))?;
-    }
-    Ok(())
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(Durability::Durable);
+    };
+    Ok(match sync(parent) {
+        Ok(()) => Durability::Durable,
+        Err(error) => Durability::NotSynced(format!(
+            "'{}' was removed, but syncing '{}' failed: {error}. The file is gone; only \
+             the removal's survival across a crash before the filesystem flushes is \
+             unproven.",
+            path.display(),
+            parent.display()
+        )),
+    })
 }
 
 /// fsync a directory so a rename into it is durable. Directories are not
@@ -871,9 +1098,14 @@ fn nanos() -> u128 {
 /// The backup is written before the change and only when no backup from an
 /// earlier run exists, so the copy on disk is always the file as it was before
 /// this verb first touched it.
-fn apply(edit: &FileEdit) -> anyhow::Result<()> {
+///
+/// A removal copies first and unlinks second, in that order, so the bytes it
+/// takes away exist at a second path before they stop existing at the first.
+/// The order is not an optimization to revisit: reversed, a failed copy leaves
+/// nothing anywhere.
+fn apply(edit: &FileEdit) -> anyhow::Result<Durability> {
     if edit.is_noop() {
-        return Ok(());
+        return Ok(Durability::Durable);
     }
     if read_config(&edit.path)? != edit.before {
         anyhow::bail!(
@@ -881,12 +1113,24 @@ fn apply(edit: &FileEdit) -> anyhow::Result<()> {
             edit.path.display()
         );
     }
-    if let (Some(backup), Some(body)) = (edit.backup.as_deref(), edit.before.as_deref()) {
-        replace_atomically(backup, body, edit.mode)?;
-    }
-    match edit.after.as_deref() {
-        Some(body) => replace_atomically(&edit.path, body, edit.mode),
-        None => remove_durably(&edit.path),
+    match &edit.destination {
+        Destination::Write { body, backup } => {
+            let mut durability = Durability::Durable;
+            if let (Some(backup), Some(original)) = (backup.as_deref(), edit.before.as_deref()) {
+                durability = durability.and(replace_atomically(backup, original, edit.mode)?);
+            }
+            Ok(durability.and(replace_atomically(&edit.path, body, edit.mode)?))
+        }
+        Destination::Remove { staged } => {
+            // `before` is `Some` here: a removal with nothing to remove is a
+            // no-op and returned above. The `let ... else` is the compiler's
+            // proof of that rather than an `unwrap` asserting it.
+            let Some(original) = edit.before.as_deref() else {
+                return Ok(Durability::Durable);
+            };
+            let durability = replace_atomically(staged, original, edit.mode)?;
+            Ok(durability.and(remove_durably(&edit.path)?))
+        }
     }
 }
 
@@ -988,9 +1232,19 @@ struct ClientReport {
     /// The config file, when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// The one-time backup, when this run wrote one.
+    /// The copy of the previous contents this run wrote: the one-time
+    /// `.sbproxy.bak` on a first change, the `.sbproxy.removed` on a removal.
+    ///
+    /// Present only when the copy exists on disk. A `--dry-run` writes no
+    /// copy, so it reports none; the text output still names where the copy
+    /// would go, under a `would` verb that says it has not happened.
     #[serde(skip_serializing_if = "Option::is_none")]
     backup: Option<String>,
+    /// A change that landed with a caveat: the bytes are in place and the
+    /// directory sync that makes them crash-proof did not answer. Not a
+    /// failure, and not silence either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
     /// Environment variables the operator should export.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     env: BTreeMap<String, String>,
@@ -1020,9 +1274,11 @@ struct Report {
 enum Outcome {
     /// Nothing was written: either `--dry-run`, or there was nothing to write.
     Planned,
-    /// The file was replaced or removed.
-    Applied,
-    /// The write was attempted and refused. Carries why.
+    /// The file was replaced or removed. Carries whether the change is also
+    /// durable, which is a separate question from whether it happened.
+    Applied(Durability),
+    /// The write was attempted and refused. Carries why. Reaching this means
+    /// the destination is untouched.
     Failed(String),
 }
 
@@ -1100,14 +1356,18 @@ pub(crate) fn run(request: &Request) -> anyhow::Result<i32> {
     for entry in &plans {
         let outcome = match (&entry.change, request.dry_run) {
             (Change::File(edit), false) if !edit.is_noop() => match apply(edit) {
-                Ok(()) => {
+                Ok(durability) => {
                     wrote_anything = true;
-                    Outcome::Applied
+                    Outcome::Applied(durability)
                 }
                 Err(error) => Outcome::Failed(format!("{error:#}")),
             },
             _ => Outcome::Planned,
         };
+        // A write that landed without its directory sync is not degraded: the
+        // change the operator asked for is on disk and the report says so on
+        // its own line. Exiting 2 there would send a CI job looking for a
+        // failure that did not happen.
         degraded |=
             matches!(entry.change, Change::Blocked(_)) || matches!(outcome, Outcome::Failed(_));
         outcomes.push(outcome);
@@ -1151,6 +1411,7 @@ fn describe(env: &Environment, entry: &ClientPlan, outcome: &Outcome) -> (Client
         detected,
         path: None,
         backup: None,
+        warning: None,
         env: BTreeMap::new(),
         steps: Vec::new(),
         reason: None,
@@ -1184,21 +1445,36 @@ fn describe(env: &Environment, entry: &ClientPlan, outcome: &Outcome) -> (Client
                     env.display(&edit.path)
                 ));
             } else {
-                let applied = matches!(outcome, Outcome::Applied);
-                let (status, verb) = match (applied, edit.after.is_some()) {
+                let durability = match outcome {
+                    Outcome::Applied(durability) => Some(durability),
+                    _ => None,
+                };
+                let applied = durability.is_some();
+                let (status, verb) = match (applied, edit.after().is_some()) {
                     (true, true) => ("wrote", "wrote"),
                     (true, false) => ("wrote", "removed"),
                     (false, true) => ("would_write", "would write"),
                     (false, false) => ("would_write", "would remove"),
                 };
                 report.status = status;
-                report.backup = edit.backup.as_deref().map(|path| env.display(path));
+                // Only when the copy is on disk. A plan that names a path
+                // nothing wrote is a rollback point a setup script would
+                // believe in.
+                report.backup = if applied {
+                    edit.preserved().map(|path| env.display(path))
+                } else {
+                    None
+                };
                 block.push_str(&format!("    {verb}: {}\n", env.display(&edit.path)));
-                block.push_str(&backup_line(env, edit));
+                if let Some(why) = durability.and_then(Durability::warning) {
+                    report.warning = Some(why.to_string());
+                    block.push_str(&format!("    warning: {why}\n"));
+                }
+                block.push_str(&backup_line(env, edit, applied));
                 block.push_str(&mode_line(env, edit));
                 block.push_str(&unified_diff(
                     edit.before.as_deref().unwrap_or_default(),
-                    edit.after.as_deref().unwrap_or_default(),
+                    edit.after().unwrap_or_default(),
                 ));
             }
             block.push_str(&client_notes(entry.client));
@@ -1225,16 +1501,40 @@ fn describe(env: &Environment, entry: &ClientPlan, outcome: &Outcome) -> (Client
     (report, block)
 }
 
-/// The backup line, or the line that says an earlier one is being kept.
-fn backup_line(env: &Environment, edit: &FileEdit) -> String {
-    match (&edit.backup, edit.before.is_some()) {
-        (Some(path), _) => format!("    backup: {}\n", env.display(path)),
-        (None, true) => format!(
+/// Where the previous contents went, or are going.
+///
+/// The tense tracks `applied`, because this line is printed for a `--dry-run`
+/// too and a plan that says `backup: <path>` reads as a file that is already
+/// there. The removal line names a different file from the write line on
+/// purpose: `.sbproxy.bak` is the profile before the first `connect`,
+/// `.sbproxy.removed` is the profile `disconnect` just took away, and telling
+/// an operator to look in the first one for the second one is how a hand
+/// edit gets written off as unrecoverable.
+fn backup_line(env: &Environment, edit: &FileEdit, applied: bool) -> String {
+    match &edit.destination {
+        Destination::Remove { staged } if applied => format!(
+            "    saved: {}, which holds the profile this removed\n",
+            env.display(staged)
+        ),
+        Destination::Remove { staged } => format!(
+            "    would save: {}, a copy of the profile as it is now\n",
+            env.display(staged)
+        ),
+        Destination::Write {
+            backup: Some(path), ..
+        } => format!(
+            "    {}: {}\n",
+            if applied { "backup" } else { "would back up" },
+            env.display(path)
+        ),
+        Destination::Write { backup: None, .. } if edit.before.is_some() => format!(
             "    backup: {} already exists and holds this file as it was before the first \
              connect; it is not overwritten\n",
             env.display(&backup_path_for(&edit.path))
         ),
-        (None, false) => "    backup: none, this file did not exist yet\n".to_string(),
+        Destination::Write { backup: None, .. } => {
+            "    backup: none, this file did not exist yet\n".to_string()
+        }
     }
 }
 
@@ -1327,6 +1627,26 @@ mod tests {
             model: None,
             direction,
         }
+    }
+
+    /// The one-time `.sbproxy.bak` this edit would write, if any. Narrower
+    /// than [`FileEdit::preserved`] on purpose: a removal's staging copy is a
+    /// different promise and the tests that care say which one they mean.
+    fn one_time_backup(edit: &FileEdit) -> Option<&Path> {
+        match &edit.destination {
+            Destination::Write { backup, .. } => backup.as_deref(),
+            Destination::Remove { .. } => None,
+        }
+    }
+
+    /// A directory sync that refuses, standing in for `F_FULLFSYNC` on an SMB
+    /// or FUSE mount. `ENOTSUP` is what those answer; the kind is what the
+    /// message has to survive, not the exact string.
+    fn refusing_sync(_dir: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Operation not supported",
+        ))
     }
 
     /// A profile file an operator has already edited by hand: comments, a key
@@ -1508,10 +1828,8 @@ base_url = "https://example.invalid/v1"
         let env = Environment::fixture(&home);
 
         let first = plan_codex(&env, &settings(Direction::Connect)).expect("plan one");
-        assert_eq!(
-            first.backup,
-            Some(codex.join("sbproxy.config.toml.sbproxy.bak"))
-        );
+        let expected_backup = codex.join("sbproxy.config.toml.sbproxy.bak");
+        assert_eq!(one_time_backup(&first), Some(expected_backup.as_path()));
         apply(&first).expect("apply one");
 
         // A different base URL, so the second run genuinely rewrites the file.
@@ -1521,7 +1839,10 @@ base_url = "https://example.invalid/v1"
             direction: Direction::Connect,
         };
         let second = plan_codex(&env, &moved).expect("plan two");
-        assert!(second.backup.is_none(), "the backup must not be rewritten");
+        assert!(
+            one_time_backup(&second).is_none(),
+            "the backup must not be rewritten"
+        );
         apply(&second).expect("apply two");
 
         let backup = std::fs::read_to_string(codex.join("sbproxy.config.toml.sbproxy.bak"))
@@ -1582,6 +1903,217 @@ base_url = "https://example.invalid/v1"
             std::fs::read_to_string(&user_config).expect("read"),
             EDITED_PROFILE,
             "config.toml must never be touched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lifecycle the page describes, one step further than the two
+    /// removal tests above go: connect, hand-edit, disconnect.
+    ///
+    /// Both of those run on a fresh tree, so `.sbproxy.bak` never pre-exists
+    /// and the removal only ever sees the branch that had something to copy.
+    /// This one exercises the other branch, which is the one operators live
+    /// in: the `.bak` is taken by the first `connect` and holds the file as it
+    /// was *before* it, so a removal that leans on the `.bak` deletes every
+    /// edit made since. Every `disconnect` after the first used to.
+    #[test]
+    fn disconnect_keeps_an_edit_the_bak_was_never_going_to_hold() {
+        let dir = scratch("disconnect-handedit");
+        let home = dir.join("home");
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).expect("mkdir");
+        let profile = codex.join("sbproxy.config.toml");
+        std::fs::write(&profile, EDITED_PROFILE).expect("seed profile");
+        let env = Environment::fixture(&home);
+
+        // 1. connect. `.sbproxy.bak` takes the pristine original, once.
+        apply(&plan_codex(&env, &settings(Direction::Connect)).expect("plan")).expect("connect");
+        let backup = codex.join("sbproxy.config.toml.sbproxy.bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read the backup"),
+            EDITED_PROFILE
+        );
+
+        // 2. the operator edits the profile that connect just wrote. These
+        //    bytes are now in exactly one place on the machine.
+        let hand_edited = format!(
+            "# a note I added by hand\n{}",
+            std::fs::read_to_string(&profile).expect("read the profile")
+        );
+        std::fs::write(&profile, &hand_edited).expect("hand edit");
+
+        // 3. disconnect.
+        let removal = plan_codex(&env, &settings(Direction::Disconnect)).expect("plan removal");
+        apply(&removal).expect("disconnect");
+
+        assert!(!profile.exists(), "the profile should be gone");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read the backup"),
+            EDITED_PROFILE,
+            "the .bak still holds the pre-first-connect original and nothing else"
+        );
+        assert_eq!(
+            std::fs::read_to_string(codex.join("sbproxy.config.toml.sbproxy.removed"))
+                .expect("the removed profile has to still be somewhere"),
+            hand_edited,
+            "disconnect destroyed the only copy of the operator's edit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same invariant. The rescue copy is not a slot to
+    /// overwrite either: a second removal carrying different bytes is refused
+    /// at plan time, by name, with nothing unlinked. Identical bytes are not a
+    /// conflict, because rewriting the same content takes nothing away.
+    #[test]
+    fn a_removal_that_would_clobber_an_earlier_rescue_copy_is_refused() {
+        let dir = scratch("clobber-rescue");
+        let home = dir.join("home");
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).expect("mkdir");
+        let profile = codex.join("sbproxy.config.toml");
+        let staged = codex.join("sbproxy.config.toml.sbproxy.removed");
+        std::fs::write(&profile, "model = \"the one on disk now\"\n").expect("seed profile");
+        std::fs::write(&staged, "model = \"an earlier rescue\"\n").expect("seed rescue");
+        let env = Environment::fixture(&home);
+
+        let error = plan_codex(&env, &settings(Direction::Disconnect)).expect_err("must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("sbproxy.removed"), "{message}");
+        assert!(profile.is_file(), "nothing may be unlinked on a refusal");
+        assert_eq!(
+            std::fs::read_to_string(&staged).expect("read rescue"),
+            "model = \"an earlier rescue\"\n",
+            "the earlier rescue copy must survive untouched"
+        );
+
+        // Same content on both sides: nothing is at stake, so it proceeds.
+        std::fs::write(&staged, "model = \"the one on disk now\"\n").expect("match the rescue");
+        let removal = plan_codex(&env, &settings(Direction::Disconnect)).expect("plan removal");
+        apply(&removal).expect("disconnect");
+        assert!(!profile.exists(), "the profile should be gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory sync that will not answer is not a write that did not
+    /// happen. `sync_all` is `F_FULLFSYNC` on macOS, which returns ENOTSUP on
+    /// an SMB- or FUSE-mounted home, so this is somebody's every run. Folding
+    /// it into the error told them nothing was written while the file sat on
+    /// disk, which is the one report that leaves them unable to undo it.
+    #[test]
+    fn a_sync_failure_after_the_rename_is_a_write_that_landed() {
+        let dir = scratch("not-synced");
+        let path = dir.join("sbproxy.config.toml");
+        std::fs::write(&path, "before\n").expect("seed");
+
+        let durability = replace_atomically_with(&path, "after\n", None, refusing_sync)
+            .expect("a post-rename sync failure must not read as a failed write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "after\n",
+            "the rename landed, so the new bytes are the ones on disk"
+        );
+        let why = durability
+            .warning()
+            .expect("the report has to say the sync did not land");
+        assert!(why.contains("was written"), "{why}");
+        assert!(why.contains("sbproxy.config.toml"), "{why}");
+
+        let durability = remove_durably_with(&path, refusing_sync)
+            .expect("a post-unlink sync failure must not read as a failed removal");
+        assert!(!path.exists(), "the unlink landed");
+        let why = durability
+            .warning()
+            .expect("the report has to say the sync did not land");
+        assert!(why.contains("was removed"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reporting half of the same property. `describe` returns early on a
+    /// failure and prints one `failed:` line, which for an unsynced write
+    /// would tell the operator nothing was written while the file sits on
+    /// disk: no path, no backup, no diff, and no `undo` hint. So this case
+    /// reports as a write, with the warning beside it.
+    #[test]
+    fn an_unsynced_write_is_reported_as_a_write_with_a_warning() {
+        let dir = scratch("report-unsynced");
+        let home = dir.join("home");
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).expect("mkdir");
+        std::fs::write(codex.join("sbproxy.config.toml"), EDITED_PROFILE).expect("seed");
+        let env = Environment::fixture(&home);
+        let entry = ClientPlan {
+            client: Client::Codex,
+            presence: Presence::OnPath(home.join("bin").join("codex")),
+            change: Change::File(plan_codex(&env, &settings(Direction::Connect)).expect("plan")),
+        };
+        let outcome = Outcome::Applied(Durability::NotSynced(
+            "'x' was written, but syncing 'y' failed: Operation not supported".to_string(),
+        ));
+
+        let (report, block) = describe(&env, &entry, &outcome);
+        assert_eq!(report.status, "wrote", "{block}");
+        assert_eq!(
+            report.warning.as_deref(),
+            Some("'x' was written, but syncing 'y' failed: Operation not supported")
+        );
+        assert_eq!(
+            report.backup.as_deref(),
+            Some("~/.codex/sbproxy.config.toml.sbproxy.bak")
+        );
+        assert!(
+            block.contains("wrote: ~/.codex/sbproxy.config.toml\n"),
+            "{block}"
+        );
+        assert!(block.contains("    warning: "), "{block}");
+        assert!(
+            block.contains("backup: ~/.codex/sbproxy.config.toml.sbproxy.bak"),
+            "{block}"
+        );
+        assert!(
+            block.contains("+[model_providers.sbproxy]"),
+            "the diff has to survive an unsynced write:\n{block}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `stow` or `chezmoi` profile is a link into somebody's dotfiles, and
+    /// `rename(2)` onto it replaces the link rather than its target. Refused
+    /// rather than noted, because `run` applies before it describes, so a note
+    /// would arrive after the link was already gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_profile_is_refused_rather_than_swapped_for_a_regular_file() {
+        let dir = scratch("symlink");
+        let home = dir.join("home");
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).expect("mkdir");
+        let dotfiles = dir.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).expect("mkdir dotfiles");
+        let target = dotfiles.join("sbproxy.config.toml");
+        std::fs::write(&target, EDITED_PROFILE).expect("seed the dotfiles copy");
+        let link = codex.join("sbproxy.config.toml");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let env = Environment::fixture(&home);
+
+        let error = plan_codex(&env, &settings(Direction::Connect)).expect_err("must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("symlink"), "{message}");
+        assert!(
+            message.contains("dotfiles"),
+            "the target has to be named: {message}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat the link")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced anyway"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the dotfiles copy"),
+            EDITED_PROFILE,
+            "the file the link points at must be untouched"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1662,8 +2194,8 @@ base_url = "https://example.invalid/v1"
         let env = Environment::fixture(&home);
         let edit = plan_codex(&env, &settings(Direction::Connect)).expect("plan");
         assert!(edit.before.is_none(), "nothing should have been read");
-        assert!(edit.backup.is_none(), "nothing to back up");
-        let rendered = edit.after.expect("a body");
+        assert!(one_time_backup(&edit).is_none(), "nothing to back up");
+        let rendered = edit.after().expect("a body").to_string();
         assert!(rendered.contains("[model_providers.sbproxy]"));
         assert!(
             rendered.contains("sbproxy disconnect codex"),

@@ -473,7 +473,221 @@ fn json_output_names_every_requested_client_and_its_status() {
     );
 }
 
-// --- 8. a bad base URL is refused before anything is written ----------
+// --- 8. a removal never takes the only copy of anything ---------------
+
+/// The lifecycle the page walks through, driven end to end by the binary:
+/// connect, hand-edit, disconnect, and then the same thing again.
+///
+/// `.sbproxy.bak` holds the profile as it was before the *first* connect, so
+/// it was never going to hold an edit made after it, and a removal that leaned
+/// on it deleted the only copy of that edit. The second round is here because
+/// the defect was not the first `disconnect`; it was every one after it.
+#[test]
+fn disconnect_never_removes_the_only_copy_of_a_hand_edit() {
+    let fixture = Fixture::new("removal-copy");
+    fixture.install_launcher("codex");
+    let codex = fixture.codex_dir();
+    let profile = codex.join("sbproxy.config.toml");
+    let rescued = codex.join("sbproxy.config.toml.sbproxy.removed");
+
+    assert!(fixture.run(&["connect", "codex"]).status.success());
+    let first_edit = format!(
+        "# round one, added by hand\n{}",
+        std::fs::read_to_string(&profile).expect("read the profile")
+    );
+    std::fs::write(&profile, &first_edit).expect("hand edit");
+
+    let removal = fixture.run(&["disconnect", "codex"]);
+    assert!(removal.status.success(), "{}", stderr_of(&removal));
+    assert!(!profile.exists(), "the profile should be gone");
+    assert_eq!(
+        std::fs::read_to_string(&rescued).expect("the removed bytes have to still be somewhere"),
+        first_edit,
+        "disconnect destroyed the only copy of the operator's edit"
+    );
+    assert!(
+        stdout_of(&removal).contains("saved: ~/.codex/sbproxy.config.toml.sbproxy.removed"),
+        "the run has to say where the removed profile went:\n{}",
+        stdout_of(&removal)
+    );
+
+    // Round two. The rescue copy from round one is still there and holds
+    // different bytes, so overwriting it would be the same defect one level
+    // down. Refused by name, with the profile left where it is.
+    assert!(fixture.run(&["connect", "codex"]).status.success());
+    let second_edit = format!(
+        "# round two, added by hand\n{}",
+        std::fs::read_to_string(&profile).expect("read the profile")
+    );
+    std::fs::write(&profile, &second_edit).expect("hand edit again");
+
+    let refused = fixture.run(&["disconnect", "codex"]);
+    assert!(
+        !refused.status.success(),
+        "clobbering the earlier rescue copy must not be a clean exit:\n{}",
+        stdout_of(&refused)
+    );
+    let said = stdout_of(&refused);
+    assert!(said.contains("blocked"), "{said}");
+    assert!(said.contains("sbproxy.removed"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(&profile).expect("read the profile"),
+        second_edit,
+        "a refusal must not unlink anything"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rescued).expect("read the rescue copy"),
+        first_edit,
+        "the earlier rescue copy must survive untouched"
+    );
+}
+
+/// `--dry-run` writes no backup, so the JSON report names none. The field is
+/// documented as the copy this run wrote, and a setup script that branches on
+/// its presence to decide whether a rollback point exists gets a false
+/// positive from a plan.
+#[test]
+fn a_dry_run_reports_no_backup_because_it_wrote_none() {
+    let fixture = Fixture::new("dryrun-backup");
+    fixture.install_launcher("codex");
+    let codex = fixture.codex_dir();
+    std::fs::write(codex.join("sbproxy.config.toml"), "# mine\n").expect("seed a profile");
+    let backup = codex.join("sbproxy.config.toml.sbproxy.bak");
+
+    let dry = fixture.run(&["connect", "codex", "--dry-run", "--format", "json"]);
+    assert!(dry.status.success(), "{}", stderr_of(&dry));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_of(&dry)).expect("valid JSON");
+    assert_eq!(parsed["dry_run"], true);
+    assert_eq!(parsed["clients"][0]["status"], "would_write");
+    assert!(
+        parsed["clients"][0].get("backup").is_none(),
+        "a dry run reported a backup nothing wrote:\n{}",
+        stdout_of(&dry)
+    );
+    assert!(!backup.exists(), "a dry run wrote a backup");
+
+    // The run that does write one says so.
+    let real = fixture.run(&["connect", "codex", "--format", "json"]);
+    assert!(real.status.success(), "{}", stderr_of(&real));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_of(&real)).expect("valid JSON");
+    assert_eq!(
+        parsed["clients"][0]["backup"],
+        "~/.codex/sbproxy.config.toml.sbproxy.bak"
+    );
+    assert!(backup.is_file(), "the real run wrote no backup");
+}
+
+// --- 9. the page shows what the binary prints -------------------------
+
+/// The two output blocks in `docs/use-case-connect-coding-agents.md` are
+/// captures rather than transcripts: each carries a `<!-- CAPTURE: ... -->`
+/// marker naming the command that produced it, and
+/// `scripts/check-doc-captures.py` replays them.
+///
+/// That lane wants a release binary and runs on tags and nightly, so this
+/// replays the same two commands here, against the binary this test target
+/// just built. A change to what `connect` prints then fails in the lane that
+/// made the change rather than at the next release.
+#[cfg(unix)]
+#[test]
+fn the_use_case_page_shows_what_the_binary_prints() {
+    let page = repo_root().join("docs/use-case-connect-coding-agents.md");
+    let text = std::fs::read_to_string(&page)
+        .unwrap_or_else(|error| panic!("read {}: {error}", page.display()));
+    let captures = captured_blocks(&text);
+    assert_eq!(
+        captures.len(),
+        2,
+        "the page should carry two captures, found {}",
+        captures.len()
+    );
+    for (command, shown) in captures {
+        let actual = replay(&command);
+        assert_eq!(
+            normalize_block(&shown),
+            normalize_block(&actual),
+            "`{command}` no longer prints what the page shows. Re-capture with:\n  \
+             python3 scripts/check-doc-captures.py --update docs/use-case-connect-coding-agents.md"
+        );
+    }
+}
+
+/// The repository root, from this crate's manifest directory.
+#[cfg(unix)]
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Every `<!-- CAPTURE: command -->` marker on a page, paired with the fenced
+/// block underneath it. The same pairing `scripts/check-doc-captures.py`
+/// reads, kept to the smallest thing that can find it.
+#[cfg(unix)]
+fn captured_blocks(page: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = page.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim().strip_prefix("<!-- CAPTURE:") else {
+            continue;
+        };
+        let Some(command) = rest.strip_suffix("-->") else {
+            continue;
+        };
+        let mut cursor = index + 1;
+        while cursor < lines.len() && lines[cursor].trim().is_empty() {
+            cursor += 1;
+        }
+        assert!(
+            cursor < lines.len() && lines[cursor].trim_start().starts_with("```"),
+            "the CAPTURE marker on line {} has no block under it",
+            index + 1
+        );
+        cursor += 1;
+        let start = cursor;
+        while cursor < lines.len() && !lines[cursor].trim_start().starts_with("```") {
+            cursor += 1;
+        }
+        found.push((command.trim().to_string(), lines[start..cursor].join("\n")));
+    }
+    found
+}
+
+/// Run one captured command with the binary under test first on `PATH`, so a
+/// bare `sbproxy` in a doc resolves to this build rather than to whatever the
+/// host has installed. Both streams are returned, because a command that
+/// failed has to read as drift rather than as an empty match.
+#[cfg(unix)]
+fn replay(command: &str) -> String {
+    let binary = sbproxy_bin();
+    let dir = binary
+        .parent()
+        .expect("the built binary has a parent directory");
+    let path = match std::env::var("PATH") {
+        Ok(existing) => format!("{}:{existing}", dir.display()),
+        Err(_) => dir.display().to_string(),
+    };
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .output()
+        .expect("run the captured command");
+    format!("{}{}", stdout_of(&output), stderr_of(&output))
+}
+
+/// Trailing whitespace and the blank lines around a block are not the
+/// subject, so both sides lose them before they are compared.
+#[cfg(unix)]
+fn normalize_block(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_matches('\n')
+        .to_string()
+}
+
+// --- 10. a bad base URL is refused before anything is written ---------
 
 #[test]
 fn a_base_url_with_no_scheme_is_refused_and_writes_nothing() {
