@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -523,8 +523,10 @@ Response body: an array of `RequestLogEntry`:
     "failover_engaged": true,
     "failover_from": "openai",
     "failover_to": "anthropic",
+    "failover_trigger": "context_window",
     "load_balancer_strategy": "lowest_latency",
     "load_balancer_target": "anthropic",
+    "routing_detail": "matched anthropic exemplar 1 at 0.831 (floor 0.750)",
     "provider": "anthropic",
     "model": "claude-sonnet-4",
     "tokens_in": 315,
@@ -552,7 +554,10 @@ Response body: an array of `RequestLogEntry`:
 | `retry_count` | int | Additional upstream attempts after the first. Zero means no retry. |
 | `failover_engaged` | bool | Whether fallback or AI provider failover ran. |
 | `failover_from`, `failover_to` | string | First failed and final selected provider or target, when known. |
+| `failover_trigger` | string | Which trigger drove an AI reroute. Closed set: `context_window` (the prompt outgrew the model's window), `content_policy` (the provider refused on safety grounds), and `generic` (an ordinary availability or transport failover). Absent when no reroute happened. The counter spells the generic case differently; see [ai-gateway.md](ai-gateway.md#typed-fallback-triggers). |
 | `load_balancer_strategy`, `load_balancer_target` | string | Bounded routing strategy and selected target. |
+| `zone_locality` | string | Zone-locality verdict for the selected target: `local` (narrowed to the proxy's own zone) or `spilled` (no same-zone target was healthy, selection widened across zones). Absent when the stage did not engage. |
+| `routing_detail` | string | Why a per-request strategy picked that target. Bounded and operator-derived, never exemplar text or caller input. `semantic_route` writes the matched deployment with the winning exemplar's ordinal (or `centroid`) and the cosine score against the floor, for example `matched fast-pool exemplar 1 at 0.831 (floor 0.750)`, or the near-miss that sent the request to the fallback: `below floor: closest fast-pool at 0.612 (floor 0.750)`, `no user message to embed`, `embedder unavailable; routed to the default`, or `matched fast-pool at 0.831 but it is not eligible for this request` when the winner was filtered out before selection. Absent for strategies that do not decide per request. |
 | `provider`, `model` | string | AI provider and model when the AI gateway handled the request. |
 | `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
 | `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
@@ -1175,10 +1180,12 @@ diagnose why a load balancer is short on candidates.
 ```json
 {
   "config_revision": "abc123...",
+  "proxy_zone": "us-east-1a",
   "origins": [
     {
       "hostname": "api.example.com",
       "origin_id": "api",
+      "local_zone": "us-east-1a",
       "targets": [
         {
           "index": 0,
@@ -1189,7 +1196,8 @@ diagnose why a load balancer is short on candidates.
           "circuit_breaker_state": "closed",
           "weight": 10,
           "backup": false,
-          "group": null
+          "group": null,
+          "zone": "us-east-1a"
         }
       ]
     }
@@ -1211,11 +1219,16 @@ diagnose why a load balancer is short on candidates.
 | `origins[].targets[].weight` | int | Authored weight. |
 | `origins[].targets[].backup` | bool | True when this is a backup target. |
 | `origins[].targets[].group` | string \| null | Authored group tag, if any. |
+| `origins[].targets[].zone` | string \| null | Authored zone label, if any. A live routing input: same-zone targets are preferred while the pipeline's `proxy_zone` is set. |
+| `proxy_zone` | string \| null | The zone this proxy resolved for itself (`proxy.zone`, else `SB_ZONE`). Null means the zone-locality stage never engages. |
+| `origins[].local_zone` | string \| null | The zone bound to this origin's load balancer; matches `proxy_zone` on the live pipeline. |
 
-A `zone` field used to appear here, echoing the load balancer's
-`targets[].zone` label. That config key is refused at config compile
-now (target selection was never locality aware), so the response no
-longer carries it.
+The `zone` field disappeared from this response for a stretch: the
+label was display-only decoration, then refused at config compile,
+and it returned when zone-aware selection shipped and made it a
+routing input. Read it together with `proxy_zone`: a labeled target
+list under a null `proxy_zone` is exactly the shape the boot warning
+about an unzoned proxy points at.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.

@@ -400,6 +400,7 @@ export function gatewayBadges(request: RequestLog): GatewayBadge[] {
     "failover_engaged",
     "failover_from",
     "failover_to",
+    "failover_trigger",
     "load_balancer_strategy",
     "load_balancer_target",
   ].some((key) => Object.prototype.hasOwnProperty.call(request, key));
@@ -425,10 +426,18 @@ export function gatewayBadges(request: RequestLog): GatewayBadge[] {
     badges.push({ kind: "retry", label: `retry ×${retries}`, tone: "warn" });
   }
   if (request.failover_engaged || request.failover_from || request.failover_to) {
-    const label =
+    const route =
       request.failover_from && request.failover_to
         ? `${request.failover_from} → ${request.failover_to}`
         : `failover${request.failover_to ? ` → ${request.failover_to}` : ""}`;
+    // WOR-2556: name the trigger that fired, so "the prompt outgrew the
+    // model" and "the provider refused" read differently from an
+    // ordinary availability failover. "generic" is the availability
+    // case and adds nothing the route itself does not say.
+    const label =
+      request.failover_trigger && request.failover_trigger !== "generic"
+        ? `${words(request.failover_trigger)}: ${route}`
+        : route;
     badges.push({ kind: "failover", label, tone: "warn" });
   }
   if (request.load_balancer_strategy || request.load_balancer_target) {
