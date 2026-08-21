@@ -4402,7 +4402,7 @@ impl McpAction {
         // wrong. Iterated in sorted label order so the message a given
         // config produces does not depend on hash iteration order.
         let mut policies: Vec<(&String, &ToolAccessPolicy)> = cfg.rbac_policies.iter().collect();
-        policies.sort_by(|(left, _), (right, _)| left.cmp(right));
+        policies.sort_by_key(|(label, _)| *label);
         for (label, policy) in policies {
             policy.validate_quota_windows().map_err(|error| {
                 anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
