@@ -3979,6 +3979,12 @@ pub fn record_payment_provider_call(rail: &str, operation: &str, provider_class:
 /// There is no `rail` label here on purpose. A sweep claims rows across
 /// every rail in one batch and reports one total, so splitting it by rail
 /// would mean inventing an attribution the worker never computed.
+///
+/// `outcome = "failed"` is the one value that is not a durable row. It
+/// counts sweeps of that operation that returned a store error and moved
+/// nothing, which is what makes a flat row series next to it readable as an
+/// outage rather than as an empty queue. The other stages of the same tick
+/// still ran.
 pub fn record_payment_recovery(operation: &str, outcome: &str, count: u64) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

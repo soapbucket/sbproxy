@@ -285,6 +285,7 @@ agent_classes:
 |-------|------|---------|-------------|
 | `catalog` | string | `builtin` | `builtin` loads the embedded catalog. `inline` loads `entries`. `hosted-feed` and `merged` are reserved for the registry fetcher and currently fall back to builtin. |
 | `entries` | list | `[]` | Complete inline catalog used when `catalog: inline`. Entries use `id`, `vendor`, `purpose`, `expected_user_agent_pattern`, optional `expected_reverse_dns_suffixes`, and optional `expected_keyids`. |
+| `entries[].expected_user_agent_pattern` | string | required | Regex compiled exactly as written and searched for anywhere in the `User-Agent` header. Write the `(?i)` yourself: without it the match is case-sensitive and the entry silently never fires, which the proxy warns about once per entry at load. Write your own boundary too, because an unanchored bare literal also matches a header that merely contains it: prefer `(?i)\\bMyBot/\\d` over `MyBot`. |
 | `resolver.rdns_enabled` | bool | `true` | Run forward-confirmed reverse DNS as resolver step 2. |
 | `resolver.bot_auth_keyid_enabled` | bool | `true` | Let a verified Web Bot Auth `keyid` match `expected_keyids` as resolver step 1. |
 | `resolver.cache_size` | int | `10000` | Per-process reverse-DNS verdict cache capacity. |

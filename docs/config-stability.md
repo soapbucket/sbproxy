@@ -366,6 +366,34 @@ no surface carries the URL.
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
 
+### The usage ledger now `fsync`s every entry
+
+**Who this reaches.** Any config with a metering role, which is what makes
+the proxy open `proxy.attestation.ledger.path`. A deployment with no metering role
+never writes the file and is unaffected.
+
+**What changes.** Each ledger append now forces its entry to stable storage
+before returning, where before it called `Write::flush`, which `std::fs::File`
+documents as a no-op. Nothing about the file format, the hash chain, or the
+signatures changes; a file written by the previous release replays and
+verifies exactly as it did. What changes is throughput: the ledger's append
+rate is now bounded by how fast the filesystem under `proxy.attestation.ledger.path`
+can `fsync`, and appends are serialized behind one mutex, so a ledger on a
+network filesystem or a spinning disk is a new ceiling on metered request
+rate.
+
+**What an operator sees when it bites.** `sbproxy_meter_append_duration_seconds`
+moves, because it measures the whole critical section including the sync.
+Metering never fails a request, so the symptom is queueing on the metering
+path rather than errors.
+
+**What to do before upgrading.** Put `proxy.attestation.ledger.path` on local
+storage. If the histogram's tail is unacceptable there, the honest answer is
+that this deployment wants an unsigned usage sink rather than a receipt chain,
+because a chain whose entries are not durable cannot answer the dispute it
+exists for: a truncated hash chain verifies clean, so the lost entries leave
+no marker anywhere.
+
 ### `egress.token_exchange` now gates the MCP run-as-user token exchange
 
 **Who this reaches.** Any config with `egress.token_exchange` set to

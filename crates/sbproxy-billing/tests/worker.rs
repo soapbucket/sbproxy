@@ -10,13 +10,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use sbproxy_billing::error::BillingError;
 use sbproxy_billing::registry::{RailRegistry, UsageEvent};
 use sbproxy_billing::service::BillingService;
 use sbproxy_billing::sqlite::SqliteSettlementStore;
 use sbproxy_billing::store::{BillingClock, SharedSettlementStore};
 use sbproxy_billing::types::{
     provider_idempotency_key, AttemptOperation, AttemptStatus, IntentStatus, PaymentProof,
-    SettlementRail,
+    RecoveryEnvelopeRecord, SettlementRail,
 };
 use sbproxy_billing::worker::{SettlementWorker, WorkerConfig};
 
@@ -45,6 +46,7 @@ struct World {
     service: Arc<BillingService>,
     state: Arc<FixtureState>,
     clock: Arc<TestClock>,
+    path: std::path::PathBuf,
     _directory: tempfile::TempDir,
 }
 
@@ -82,6 +84,7 @@ impl World {
             service,
             state,
             clock,
+            path,
             _directory: directory,
         }
     }
@@ -432,4 +435,96 @@ async fn the_worker_stops_claiming_and_drains_on_shutdown() {
     assert!(status.ticks >= 1, "the loop ran at least one tick");
     assert_eq!(world.state.settle_calls(), 0);
     assert_eq!(world.state.provider_writes(), 0);
+}
+
+// --- One broken sweep must not cancel the sweeps below it ---
+
+#[tokio::test]
+async fn a_failed_early_sweep_still_lets_the_later_sweeps_drain() {
+    let world = World::new();
+    let intent_id = world.challenge("req-1", "request-key").await;
+    let prepared = world.attempt(&intent_id, "spt_value", true).await;
+
+    // An envelope already past its hard expiry. Purging it is the last stage
+    // of the tick, so it only happens if nothing above it short-circuited.
+    let envelope = RecoveryEnvelopeRecord {
+        attempt_id: prepared.attempt_id().to_string(),
+        key_id: "key-1".to_string(),
+        nonce: [7u8; 12],
+        ciphertext: vec![1, 2, 3, 4],
+        aad_digest: [9u8; 32],
+        created_at_ms: START_MS - 2,
+        expires_at_ms: START_MS - 1,
+    };
+    world
+        .store
+        .put_recovery_envelope(&envelope)
+        .await
+        .expect("seal an expired envelope");
+
+    // Work for the usage stage, which sits between the broken sweep and the
+    // purge.
+    let event = UsageEvent {
+        reporter: "fixture_meter".to_string(),
+        usage_identifier: "usage-1".to_string(),
+        tenant_id: "tenant-1".to_string(),
+        origin_id: "origin-1".to_string(),
+        event_name: "tokens".to_string(),
+        quantity: 128,
+        occurred_at_ms: START_MS,
+        attributes: Default::default(),
+    };
+    assert!(world
+        .store
+        .enqueue_usage_event(&event)
+        .await
+        .expect("queue"));
+
+    // Break exactly the table the first stage reads, and nothing the later
+    // stages read. The saboteur connection does not enable foreign keys, so
+    // the drop leaves the attempt row and the envelope row in place, which is
+    // what makes this a per-stage failure rather than a broken database.
+    // Same shape as the storage failure `quote_nonce.rs` injects: it does not
+    // depend on filesystem permissions or on lock contention timing.
+    {
+        let saboteur = rusqlite::Connection::open(&world.path).expect("open a second connection");
+        saboteur
+            .execute_batch("DROP TABLE payment_intents;")
+            .expect("drop the intent table");
+    }
+
+    let worker = world.worker();
+    world.clock.advance(700_000);
+    let outcome = worker.run_once().await;
+    assert!(
+        matches!(outcome, Err(BillingError::Storage(_))),
+        "a tick with a broken sweep still reports the failure: {outcome:?}",
+    );
+
+    let status = worker.status();
+    assert_eq!(
+        status.stage_failures.expire_challenges, 1,
+        "the stage that failed is named, not just the tick",
+    );
+    assert_eq!(status.ticks, 0, "a partial pass is not a completed tick");
+
+    // The two assertions this test exists for. Before the stages were made
+    // independent, `expire_challenges` returned early and neither of these
+    // ran, so a database contended on one table stopped the usage drain and
+    // retained recovery ciphertext past its hard expiry.
+    assert_eq!(
+        status.usage_reports_sent, 1,
+        "the usage queue drains even though an earlier sweep failed",
+    );
+    assert_eq!(
+        status.envelopes_purged, 1,
+        "expired recovery ciphertext is deleted even though an earlier sweep failed",
+    );
+    assert!(world
+        .store
+        .load_recovery_envelope(prepared.attempt_id())
+        .await
+        .expect("read the envelope back")
+        .is_none());
+    assert_eq!(world.state.settle_calls(), 0, "the worker must not settle");
 }

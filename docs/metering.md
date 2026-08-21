@@ -1,6 +1,6 @@
 # Attested metering
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![A metered request cuts a signed receipt, the chain verifies, one tampered entry on disk breaks it, and the verifier names the broken sequence number](assets/metering-verify.gif)
 
@@ -174,7 +174,9 @@ The public half is published by opting the origin into `web_bot_auth_publish`, w
 
 The queue is where claims wait between "call started" and "call settled"; the gap between those two moments is where a crash loses money, and the queue is that gap made durable. The ledger is the receipt chain itself: an append-only JSONL file, one entry per metered call, each entry hash-chained to its predecessor and signed. Both paths become required as soon as a role is declared.
 
-The ledger file is its own write-ahead log: each entry is serialized, written, and flushed before the append returns. Appends happen after the response is already sent, so metering never adds latency to the call it records, and a metering defect can never fail the request it is reporting on.
+The ledger file is its own write-ahead log: each entry is serialized, written with its newline in one syscall, and `fsync`ed before the append returns. Both details are the difference between a log and a ledger. One write means a process killed mid-entry cannot leave a payload with no terminator for the next append to run into, which would make the file unreadable and, under `failure_mode: closed`, stop traffic until somebody edited it. The `fsync` is what makes "written" mean the disk: a truncated hash chain still verifies clean, so entries lost to a power cut would leave no marker anywhere and simply not be billed.
+
+The price is one `fsync` per metered call, which is the ledger's throughput ceiling on a spinning disk or a network filesystem. It is inside the same lock that already serializes appends, and `sbproxy_meter_append_duration_seconds` measures that whole section, so watch that histogram rather than guessing. Appends happen after the response is already sent, so metering never adds latency to the call it records, and a metering defect can never fail the request it is reporting on.
 
 ### `billable`: the outcome table
 
