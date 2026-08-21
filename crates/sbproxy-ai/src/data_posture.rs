@@ -82,16 +82,23 @@ impl Default for DataPostureRequirement {
 pub struct DataPostureOverride {
     /// Override the catalog's `retains_data` declaration for this
     /// entry. Unset keeps the catalog value, except that setting
-    /// `zdr: true` alone implies `false`.
+    /// `zdr: true` alone implies `false`. Setting it `false` implies
+    /// `zdr: true` unless you also set `zdr` explicitly, which is the
+    /// same rule the catalog layer applies.
     #[serde(default)]
     pub retains_data: Option<bool>,
     /// Declare that this deployment operates under a zero-data-retention
     /// arrangement with the vendor. This is what makes a provider whose
     /// stock terms retain prompt data eligible for `require_zdr`; the
     /// catalog's `zdr_available` records only that the vendor sells such
-    /// an arrangement, never that you hold one. Unset falls back to the
-    /// catalog's retention declaration (a vendor that stores nothing on a
-    /// stock account is zero data retention as it stands).
+    /// an arrangement, never that you hold one.
+    ///
+    /// Unset, it follows `retains_data`: this entry's override if you set
+    /// one, otherwise the catalog's declaration. A destination that stores
+    /// nothing is zero data retention as it stands, so `retains_data:
+    /// false` alone is enough and this key is for the case where the
+    /// vendor does retain on a stock account and your agreement says
+    /// otherwise.
     #[serde(default)]
     pub zdr: Option<bool>,
 }

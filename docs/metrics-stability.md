@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
