@@ -25201,7 +25201,7 @@ mod routing_batch_seam_tests {
             "max_tokens": 1000,
             "messages": [{"role": "user", "content": "Summarize the incident review."}]
         });
-        let providers = vec![
+        let providers = [
             provider("anthropic", "anthropic"),
             provider("openai", "openai"),
         ];
@@ -25499,7 +25499,7 @@ mod routing_batch_seam_tests {
                 .fields
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            values.record(&mut SpanFieldVisitor(&mut *fields));
+            values.record(&mut SpanFieldVisitor(&mut fields));
         }
     }
 
