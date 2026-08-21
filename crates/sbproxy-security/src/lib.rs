@@ -8,6 +8,7 @@ pub mod agent_verify;
 pub mod cookie;
 pub mod crypto;
 pub mod egress;
+pub mod governed_egress;
 #[cfg(feature = "tls-fingerprint")]
 pub mod headless_detect;
 pub mod hostfilter;

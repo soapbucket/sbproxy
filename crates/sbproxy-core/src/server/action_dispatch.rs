@@ -6128,6 +6128,7 @@ pub(super) async fn handle_mcp_action(
                                         .redirect(reqwest::redirect::Policy::none())
                                         .build()
                                         .unwrap_or_else(|_| reqwest::Client::new());
+                                    let token_exchange_egress = mcp_token_exchange_gate();
                                     let subject_token = session
                                         .req_header()
                                         .headers
@@ -6143,7 +6144,7 @@ pub(super) async fn handle_mcp_action(
                                         &mcp_exec,
                                         &mcp_secret_lookup,
                                         &http,
-                                        None,
+                                        token_exchange_egress.as_ref(),
                                         subject_token,
                                     )
                                     .await
@@ -7220,6 +7221,28 @@ fn mcp_server_approval_refusal_for_non_tool_call(
 
 /// WOR-1792 / GS: mint upstream Authorization for run-as-user without
 /// mutating tool arguments. Identity and tokens never enter args.
+/// The authorizer the MCP run-as-user token exchange dials under.
+///
+/// WOR-2620: the one production call site passed a literal `None`, so
+/// the exchange ran ungated whatever the operator configured: no
+/// allowlist, no private-address refusal, and no pin set for the dial
+/// to be held to, while two docs said the opposite. The top-level
+/// `egress.token_exchange:` block is the authority for this purpose,
+/// the same way `proxy_http.rs` arms the non-MCP outbound-credential
+/// resolver from it; a per-server `egress:` block gates that server's
+/// upstream connects and OpenAPI tool calls and never reaches here.
+///
+/// A named function rather than the read spelled inline at the call
+/// site, because inline it had no test seam: every test caller of
+/// `mcp_prepare_run_as_user_auth` hands it `None`, so putting the
+/// literal back would have left the suite green. See
+/// `the_mcp_token_exchange_reads_its_gate_from_the_egress_registry`.
+fn mcp_token_exchange_gate() -> Option<sbproxy_security::egress::EgressAuthorizer> {
+    sbproxy_security::egress::configured_gate(
+        sbproxy_security::egress::EgressPurpose::TokenExchange,
+    )
+}
+
 async fn mcp_prepare_run_as_user_auth(
     arguments: serde_json::Value,
     auth_config: &sbproxy_extension::mcp::auth::McpUpstreamAuthConfig,
@@ -10446,6 +10469,84 @@ mod govern_security_tests {
             .await
             .expect_err("anonymous must fail closed");
         assert_eq!(err, UpstreamAuthError::AnonymousCaller);
+    }
+
+    /// WOR-2620: the production MCP token exchange takes its authorizer
+    /// out of the `egress.token_exchange:` registry slot, and a slot
+    /// that does not name the endpoint refuses the exchange.
+    ///
+    /// Every other caller of `mcp_prepare_run_as_user_auth` in this file
+    /// hands it a literal `None`, which is how the literal `None` at the
+    /// one production site survived being the whole defect: deleting the
+    /// wiring left the suite green, and the unit tests in
+    /// `sbproxy_extension::mcp::auth` construct their authorizer by hand
+    /// and say nothing about where the production site gets one. This
+    /// drives `mcp_token_exchange_gate` itself, so putting the `None`
+    /// back is red here.
+    ///
+    /// Reads a process-global registry, so it relies on nextest giving
+    /// every test its own process; it clears the slot on the way out for
+    /// the serial `cargo test` fallback.
+    #[tokio::test]
+    async fn the_mcp_token_exchange_reads_its_gate_from_the_egress_registry() {
+        use sbproxy_security::egress::{
+            install_configured_gate, EgressAuthorizer, EgressConfig, EgressPurpose,
+            PurposeAllowlist,
+        };
+        use std::collections::HashSet;
+
+        // The compiled shape of an `egress.token_exchange:` sub-block
+        // set to `deny_by_default` with a host list this endpoint is not
+        // on.
+        let mut purposes = HashMap::new();
+        purposes.insert(
+            EgressPurpose::TokenExchange,
+            PurposeAllowlist {
+                hosts: HashSet::from(["idp.allowed.test".to_string()]),
+                schemes: HashSet::from(["https".to_string()]),
+                ports: HashSet::from([443u16]),
+                allow_private: false,
+            },
+        );
+        install_configured_gate(
+            EgressPurpose::TokenExchange,
+            Some(EgressAuthorizer::new(EgressConfig { purposes })),
+        );
+
+        let gate = mcp_token_exchange_gate();
+        assert!(
+            gate.is_some(),
+            "the production reader must find the armed `token_exchange` slot"
+        );
+
+        let principal = jwt_principal("user-a");
+        let exec = exec_ctx(&principal);
+        let cfg = McpUpstreamAuthConfig::TokenExchange {
+            token_endpoint: "https://idp.denied.test/token"
+                .parse()
+                .expect("endpoint url"),
+            audience: "wor2620-audience".to_string(),
+            scope: None,
+            client_credential_ref: None,
+        };
+        let lookup = |_r: &str| Ok("unused".to_string());
+        let http = reqwest::Client::new();
+        // A host refusal short-circuits before any DNS lookup, so this
+        // reaches no network even though the endpoint looks live.
+        let err = mcp_prepare_run_as_user_auth(
+            json!({}),
+            &cfg,
+            &exec,
+            &lookup,
+            &http,
+            gate.as_ref(),
+            Some("caller-subject-token"),
+        )
+        .await
+        .expect_err("a token endpoint outside the allowlist must be refused");
+        assert_eq!(err, UpstreamAuthError::EgressDenied);
+
+        install_configured_gate(EgressPurpose::TokenExchange, None);
     }
 
     #[test]

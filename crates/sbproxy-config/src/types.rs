@@ -476,10 +476,13 @@ pub struct EgressTopLevelConfig {
     /// fetcher's HTTP downloads.
     #[serde(default)]
     pub model_artifacts: Option<EgressPurposeConfig>,
-    /// Arms `EgressPurpose::TokenExchange` for the non-MCP outbound
-    /// credential resolver's OAuth token-endpoint calls. The MCP token
-    /// exchange path (`sbproxy_extension::mcp::auth`) has its own
-    /// `egress:` block and is unaffected by this section.
+    /// Arms `EgressPurpose::TokenExchange`: every OAuth token-endpoint
+    /// call this proxy makes, the non-MCP outbound credential
+    /// resolver's and the MCP run-as-user token exchange's
+    /// (`sbproxy_extension::mcp::auth`) alike. A per-server `egress:`
+    /// block gates that server's upstream connects and OpenAPI tool
+    /// calls and does not reach this purpose, so this sub-block is the
+    /// only way to arm a token endpoint.
     #[serde(default)]
     pub token_exchange: Option<EgressPurposeConfig>,
     /// Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric,

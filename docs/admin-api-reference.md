@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -1694,17 +1694,46 @@ The top-level `egress:` section (see
 [Egress allowlists](configuration.md#egress-allowlists)) arms six of
 the purposes above through five sub-blocks: `ai_providers` (AI
 providers), `usage_sinks` (usage sinks and webhooks, one allowlist for
-both), `model_artifacts`, `token_exchange` (the non-MCP token-exchange
-resolver only), and `telemetry`. Until a sub-block sets
+both, including the `events:` webhook sink), `model_artifacts`,
+`token_exchange` (both the non-MCP outbound-credential resolver and the
+MCP run-as-user token exchange), and `telemetry`. Until a sub-block sets
 `mode: deny_by_default`, its purpose stays `ungated`: reached, but
 nothing was ever denied because nothing was armed.
 
-Four more purposes arm outside that section, per-tool or per-action:
-MCP upstream connects, OpenAPI-backed MCP tools, and the MCP
-token-exchange path each take a per-server `egress:` block (see [mcp-security.md](mcp-security.md));
-the dual-LLM quarantine judge takes a per-action `egress:` block.
+Three more purposes arm outside that section, per-tool or per-action:
+MCP upstream connects and OpenAPI-backed MCP tools take a per-server
+`egress:` block (see [mcp-security.md](mcp-security.md)), and the
+dual-LLM quarantine judge takes a per-action `egress:` block. A
+per-server `egress:` block does not reach the token-exchange purpose;
+that one is armed by `egress.token_exchange` and nothing else.
 Extension bundle hooks are armed automatically from the bundle's own
 outbound grant and never appear as `ungated`.
+
+No purpose lets its HTTP client follow a redirect on its own. Each `3xx`
+`Location` is re-authorized from scratch, against the same purpose, with
+fresh DNS pins; a chain longer than ten hops is refused with
+`too_many_redirects`.
+
+Two purposes go further and dial only the addresses that authorization
+resolved, on the first request and on every hop after it: the
+`token_exchange` calls the MCP run-as-user exchange makes, and the
+`webhook` deliveries the `events:` sink makes. Those are the two whose
+request body is itself a credential. The others, `ai_provider`,
+`usage_sink`, and `model_artifact`, re-authorize each hop against the
+allowlist and then let the client resolve the host again at dial time,
+so the allowlist and the hop bound apply and the DNS pin does not yet.
+
+Every hop shows up in this inventory under its own host, so a redirect
+chain is visible here as the several destinations it actually is rather
+than as the one URL an operator configured.
+
+On the two pinned purposes, a hop that changes scheme, host, or port
+drops `Authorization`, `Proxy-Authorization`, `Cookie`, and any
+signature header before it is replayed. A request carrying a body does
+not make that hop at all: it is refused with
+`redirect_to_unlisted_host`, because a body that is itself the
+credential (an OAuth subject token in a form field, an HMAC-signed event
+batch) cannot be stripped and still be the request the caller asked for.
 
 One purpose cannot be armed by any config today: engine-artifact
 downloads pass no authorizer, so they stay `ungated` regardless of

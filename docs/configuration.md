@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -321,9 +321,9 @@ egress:
 | Sub-block | Purpose(s) armed | Gates |
 |---|---|---|
 | `ai_providers` | `ai_provider` | Every upstream AI provider dispatch the AI gateway client makes. |
-| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
+| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
-| `token_exchange` | `token_exchange` | The non-MCP outbound-credential resolver's OAuth token-endpoint calls. The MCP token-exchange path has its own per-server `egress:` block (see [mcp-security.md](mcp-security.md)) and is unaffected by this section. |
+| `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |
 | `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload re-verifies the still-running trace and metric exporters against the new allowlist and refuses the reload, naming the endpoint, if either is now denied; the log exporter is rebuilt on every reload and re-authorizes itself then. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
