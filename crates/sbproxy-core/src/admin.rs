@@ -1530,6 +1530,13 @@ fn render_openapi(state: &AdminState, yaml: bool) -> Result<String, String> {
     // and the next request sees the bump and re-renders. Reading them
     // the other way round caches the older pipeline's document under
     // the newer generation, which is served until the reload after it.
+    //
+    // This ordering argument only holds because `load_pipeline`
+    // advances the generation strictly after the pipeline store swap
+    // (see `advance_config_version`). With the bump before the store,
+    // no read order here would be safe: this one would see the new
+    // generation while the old pipeline was still installed and cache
+    // the stale document under it.
     let generation = crate::reload::pipeline_generation();
     let pipeline = crate::reload::current_pipeline();
 

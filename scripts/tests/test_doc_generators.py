@@ -915,6 +915,11 @@ class DocCaptureCheckerTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent.parent.parent
         for rel, config in self.mod.MANIFEST.items():
             self.assertTrue((repo_root / rel).exists(), f"{rel} is in the manifest but is gone")
+            self.assertTrue(
+                self.mod._has_marker(repo_root / rel),
+                f"{rel} is in the manifest but carries no CAPTURE marker; "
+                "the document glob would drop it from coverage without a word",
+            )
             sections = config.get("sections") or []
             self.assertTrue(sections, f"{rel} has no sections")
             for section in sections:

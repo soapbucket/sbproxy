@@ -11,15 +11,18 @@
 //! position is why this resolver exists: an operator who wants a flat price
 //! per endpoint should not have to teach their upstream to report anything.
 //!
-//! # Provability comes from the config bundle, for free
+//! # The dispute path goes through the signed bundle
 //!
 //! Because the weight is written down rather than counted, the interesting
 //! dispute is never "did you count right". It is "you priced my call under a
-//! config I never agreed to". So every unit this resolver produces carries
-//! the revision of the document the weight was read from, and a buyer
-//! holding the signed config bundle can look the number up themselves. No
-//! separate proof mechanism was needed: the config was already signed, and
-//! naming the revision is what makes that signature reach the invoice.
+//! config I never agreed to". The unit's `count` is the applied weight, so
+//! the receipt already shows the number charged, and the buyer checks it
+//! against the weight in the signed config bundle they hold. Each unit also
+//! carries the `config_revision` that was serving when the weight was read,
+//! which scopes the receipt to a routable generation. The revision is an
+//! origin-set identity, not a document hash: a weight edit behind an
+//! unchanged hostname set does not move it, so it narrows a dispute to a
+//! generation rather than proving the rate by itself.
 //!
 //! # A reload must not reprice a call already in flight
 //!
@@ -29,7 +32,7 @@
 //! admitted it until it finishes, so a config swapped in halfway through a
 //! response cannot change what that response costs. The alternative, looking
 //! the current revision up when the unit is written, produces receipts whose
-//! evidence names a document that did not price the call, which is worse
+//! evidence names a generation that did not price the call, which is worse
 //! than no evidence because it reads as proof.
 //!
 //! # Absence is not zero here
@@ -281,7 +284,7 @@ mod tests {
             Evidence::RouteWeight {
                 config_revision: REVISION.to_string(),
             },
-            "a buyer holding the signed bundle has to be able to look the weight up"
+            "the unit has to carry the revision of the generation that priced it"
         );
     }
 

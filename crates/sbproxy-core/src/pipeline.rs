@@ -4556,17 +4556,19 @@ mod tests {
     /// Three boots of one unchanged two-origin file reported
     /// `8cb4b33d8ffc` and `cf7ba3e14142`, alternating.
     ///
-    /// Four origins and 128 compiles, and both numbers are load
-    /// bearing. Four because the defect is an index permutation: two
-    /// origins give two permutations, so an unfixed run has an even
-    /// chance of drawing the same one twice and reading as green,
-    /// whereas four give 24. 128 because `RandomState` bumps its seed
-    /// per map instance within a thread, so each compile here is a
-    /// fresh draw rather than a repeat of the first one; against the
-    /// unfixed compiler the set reaches two entries inside the first
-    /// few iterations, and 128 puts the "got lucky 128 times" reading
-    /// far enough out of reach that a green result means the ordering
-    /// is fixed rather than that the dice were kind.
+    /// Four origins and 128 compiles walk the map-order space: four
+    /// origins give 24 index permutations, and `RandomState` bumps its
+    /// seed per map instance within a thread, so each compile is a
+    /// fresh draw rather than a repeat of the first one. What a green
+    /// run proves is that nothing on the whole compile-to-revision
+    /// path reads that order anymore. It is deliberately not the red
+    /// test for the compiler seam: `compute_config_revision` ranks
+    /// hostnames internally, so this assertion holds even over a
+    /// compiler that assigns indices in map order. The test that goes
+    /// red on that regression is the compiler's own
+    /// `repeated_compiles_assign_the_same_origin_indices`; this one
+    /// exists so the end-to-end contract keeps a pin of its own if the
+    /// hash input ever grows a new order-sensitive component.
     #[test]
     fn one_unchanged_multi_origin_config_hashes_to_one_revision() {
         let yaml = r#"

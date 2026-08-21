@@ -154,12 +154,19 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     //
     // Compute projections before storing the pipeline so the cache is
     // hot for the first request that observes the new pipeline. The
-    // config_version is derived from the pipeline-store epoch counter
-    // (incremented per swap); A4.1 leaves the exact version-source
-    // unspecified so an in-process counter is sufficient for the
-    // hot-path freshness check. Cross-process verification (Wave 6
-    // signed batch) re-derives the version from the config bytes.
-    let config_version = next_config_version();
+    // config_version is derived from the pipeline-store epoch counter;
+    // A4.1 leaves the exact version-source unspecified so an in-process
+    // counter is sufficient for the hot-path freshness check.
+    // Cross-process verification (Wave 6 signed batch) re-derives the
+    // version from the config bytes.
+    //
+    // Read here, advanced only inside the store closure below. The
+    // generation must never be observable before the pipeline it
+    // names: `render_openapi` reads generation-then-pipeline and keys
+    // its cache on the pair, so a bump that precedes the store lets a
+    // request cache the old document under the new generation and
+    // serve it until the reload after this one (WOR-2602 review).
+    let config_version = staged_config_version();
     let docs = sbproxy_modules::projections::render_projections_with_listings(
         &new_pipeline.config,
         &new_pipeline.listings,
@@ -188,6 +195,7 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     new_pipeline.activate_background_tasks();
     sbproxy_extension::flags::replace_global_store_after(next_feature_flags, || {
         pipeline_store().store(Arc::new(new_pipeline));
+        advance_config_version();
     });
 }
 
@@ -196,8 +204,33 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
 /// never).
 static CONFIG_VERSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn next_config_version() -> u64 {
-    CONFIG_VERSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+/// The version stamp the next publication will serve under.
+///
+/// Read-only: `load_pipeline` stamps its projections with this value
+/// and advances the counter only after the pipeline store swap, via
+/// [`advance_config_version`].
+fn staged_config_version() -> u64 {
+    // Relaxed is enough here: only the publisher thread calls this,
+    // and it reads its own prior `advance_config_version` writes.
+    CONFIG_VERSION_COUNTER.load(Ordering::Relaxed)
+}
+
+/// Advance the pipeline generation.
+///
+/// Called in exactly one place: the publication closure in
+/// `load_pipeline`, strictly after the pipeline store swap. Keeping
+/// the bump behind the swap is what makes `pipeline_generation` safe
+/// to read before `current_pipeline`: a reader racing a reload can
+/// only see the newer pipeline under the older generation, which the
+/// next request re-renders, never the older pipeline under the newer
+/// generation, which would be served until the following reload.
+fn advance_config_version() {
+    // Release pairs with the Acquire in `pipeline_generation`: a
+    // reader that observes the bump must also observe the pipeline
+    // swap sequenced before it, or the stale-document-under-new-
+    // generation window reopens as a reordering on weakly ordered
+    // hardware.
+    CONFIG_VERSION_COUNTER.fetch_add(1, Ordering::Release);
 }
 
 /// The current pipeline generation.
@@ -209,7 +242,9 @@ fn next_config_version() -> u64 {
 /// auth block, a forward rule or a port does, and a cache keyed on it
 /// serves the pre-reload answer for the life of the process.
 pub(crate) fn pipeline_generation() -> u64 {
-    CONFIG_VERSION_COUNTER.load(Ordering::Relaxed)
+    // Acquire pairs with the Release bump in `advance_config_version`;
+    // see the comment there.
+    CONFIG_VERSION_COUNTER.load(Ordering::Acquire)
 }
 
 /// Load a read guard to the current pipeline.

@@ -569,7 +569,11 @@ def start_settlement_stack(binary: Path, logs: Path) -> Stack | None:
             stderr=subprocess.STDOUT,
         )
     )
-    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+    # This page's captures call the admin listener on 9090, which
+    # binds after the proxy service; readiness on 8080 alone can hand
+    # the first capture a connection refused. 9090 up implies 8080 is
+    # serving.
+    if not _wait_for_port(9090, stack.procs):
         stack.stop()
         return None
     return stack
@@ -644,7 +648,9 @@ def start_temp_budget_override_stack(binary: Path, logs: Path) -> Stack | None:
             },
         )
     )
-    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+    # Same readiness rule as the settlement stack: the captures here
+    # drive 9090, which binds last, so wait on it directly.
+    if not _wait_for_port(9090, stack.procs):
         stack.stop()
         return None
     return stack
@@ -704,7 +710,12 @@ def start_audit_log_stack(binary: Path, logs: Path) -> Stack | None:
             stderr=subprocess.STDOUT,
         )
     )
-    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+    # Both pages this stack serves only ever call the admin listener on
+    # 9090, and the admin listener binds after the proxy service is up,
+    # so readiness on 8080 can declare a stack whose admin port still
+    # refuses connections. Wait on 9090 itself, the way the
+    # admin-reporting stack does.
+    if not _wait_for_port(9090, stack.procs):
         stack.stop()
         return None
     return stack
@@ -1038,6 +1049,20 @@ def main() -> int:
             }
         )
 
+    # A page in the MANIFEST whose CAPTURE markers were stripped (a doc
+    # regen that drops HTML comments, say) falls out of the glob above
+    # and out of coverage without a word, while the MANIFEST still
+    # reads as covering it. Refuse that state by name.
+    stripped = [rel for rel in MANIFEST if not _has_marker(ROOT / rel)]
+    if stripped:
+        for rel in stripped:
+            print(
+                f"capture check: {rel} is in MANIFEST but carries no "
+                "CAPTURE marker; its coverage silently lapsed",
+                file=sys.stderr,
+            )
+        return 2
+
     if args.list:
         total = 0
         for path in docs:
@@ -1058,6 +1083,16 @@ def main() -> int:
     if binary is not None and not binary.exists():
         print(f"capture check: binary not found at {binary}", file=sys.stderr)
         return 2
+    if binary is None and not args.stackless_only:
+        print(
+            "capture check: a full replay was requested (no --stackless-only), "
+            "but no proxy binary exists at target/release/sbproxy and "
+            "SBPROXY_CAPTURE_BIN is unset. Every stack capture would be "
+            "silently skipped and the run would read as coverage. Build the "
+            "binary or point SBPROXY_CAPTURE_BIN at one.",
+            file=sys.stderr,
+        )
+        return 2
 
     logs = Path("/tmp/sbproxy-capture-logs")
     logs.mkdir(parents=True, exist_ok=True)
@@ -1077,8 +1112,10 @@ def main() -> int:
     # asked to replay could not be started, so those captures were not
     # checked, and a run that verified nothing must not exit 0 and read
     # as coverage. `skipped` stays out of it: that is the deliberately
-    # partial run, `--stackless-only` or no binary, which the local gate
-    # asks for by name.
+    # partial run, `--stackless-only`, which the local gate asks for by
+    # name. A full run with no binary cannot get this far: it is
+    # refused up front, before any capture is replayed, for the same
+    # reason `blocked` fails.
     failures = [
         r for r in all_results if r.status in ("drift", "empty", "missing", "blocked")
     ]
