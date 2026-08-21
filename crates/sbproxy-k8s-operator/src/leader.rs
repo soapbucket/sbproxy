@@ -4,16 +4,16 @@
 //! drives the well-trodden `coordination.k8s.io/v1.Lease` pattern by hand.
 //! The shape mirrors `sbproxy-k8s-controller`'s, which arrived at it first:
 //!
-//! 1. **Acquire**: [`acquire_lease`] blocks until this pod owns the Lease.
+//! 1. **Acquire**: `acquire_lease` blocks until this pod owns the Lease.
 //!    Creation uses POST, and takeover of an expired Lease uses a
 //!    `resourceVersion`-checked replace, so two candidates racing the same
 //!    stale Lease see exactly one winner. Server-side apply is deliberately
 //!    not used anywhere here: SSA's force-ownership semantics would let a
 //!    non-holder steal the holder field.
-//! 2. **Renew**: [`renew_loop`] re-reads the Lease every [`RENEW_PERIOD`],
+//! 2. **Renew**: `renew_loop` re-reads the Lease every `RENEW_PERIOD`,
 //!    confirms the holder is still us, and replaces it under the
 //!    `resourceVersion` that read returned.
-//! 3. **Fence**: the [`WriteGate`] closes *before* [`renew_loop`] returns,
+//! 3. **Fence**: the `WriteGate` closes *before* `renew_loop` returns,
 //!    and the reconcile path refuses every apply while the gate is closed.
 //!    Aborting the controller task is not a fence on its own: a request
 //!    already dispatched to the apiserver still lands, and a task is only
@@ -38,11 +38,11 @@
 //!
 //! | Field | Value |
 //! | --- | --- |
-//! | [`LEASE_DURATION`] | 15s |
-//! | [`RENEW_PERIOD`] | 5s |
-//! | [`RETRY_PERIOD`] | 2s |
-//! | [`RENEW_DEADLINE`] | 5s |
-//! | [`SAFETY_DEADLINE`] | 10s |
+//! | `LEASE_DURATION` | 15s |
+//! | `RENEW_PERIOD` | 5s |
+//! | `RETRY_PERIOD` | 2s |
+//! | `RENEW_DEADLINE` | 5s |
+//! | `SAFETY_DEADLINE` | 10s |
 //!
 //! Three properties make the fence sound, and all three are arithmetic both
 //! sides have to agree on:
@@ -54,19 +54,19 @@
 //!   elapsed time by the call's whole latency. The one anchor the hold loop
 //!   cannot take itself is the acquisition's, so it renews once immediately
 //!   on entry rather than riding an inherited one for a whole
-//!   [`RENEW_PERIOD`].
+//!   `RENEW_PERIOD`.
 //! * The deadline is absolute and is enforced from *inside* the wait, not
 //!   checked after it. An apiserver that hangs rather than erroring never
 //!   returns, so a check placed after the call runs late by however long the
 //!   hang lasted.
-//! * [`SAFETY_DEADLINE`] is strictly less than [`LEASE_DURATION`], by a full
-//!   [`RENEW_PERIOD`]. That margin is what absorbs clock skew between the two
+//! * `SAFETY_DEADLINE` is strictly less than `LEASE_DURATION`, by a full
+//!   `RENEW_PERIOD`. That margin is what absorbs clock skew between the two
 //!   replicas and the successor's own read latency.
 //!
 //! A single transient apiserver error is *not* a step-down. It used to be:
 //! one 500 on one GET, which an apiserver rollout or an etcd leader election
 //! produces routinely, restarted the pod and cost 15s of no reconciliation.
-//! Renewals are now retried until [`SAFETY_DEADLINE`] and only then fenced.
+//! Renewals are now retried until `SAFETY_DEADLINE` and only then fenced.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,7 +84,7 @@ use kube::Client;
 pub const LEASE_DURATION: Duration = Duration::from_secs(15);
 
 /// How long the holder waits between renew attempts. Three renewal windows
-/// fit inside one [`LEASE_DURATION`], so a single failed renewal is
+/// fit inside one `LEASE_DURATION`, so a single failed renewal is
 /// survivable.
 pub const RENEW_PERIOD: Duration = Duration::from_secs(5);
 
@@ -95,18 +95,18 @@ pub const RETRY_PERIOD: Duration = Duration::from_secs(2);
 /// Per-renew API call timeout. A renewal that stalls longer than this is
 /// counted as a failure rather than awaited indefinitely.
 ///
-/// No longer than one [`RENEW_PERIOD`], so one hung call cannot eat the
+/// No longer than one `RENEW_PERIOD`, so one hung call cannot eat the
 /// window the next attempt needs. It used to be 10s, which combined with the
 /// period to put the step-down as late as 5s + 10s = 15s: exactly
-/// [`LEASE_DURATION`], which is to say not inside it at all. It is now a
+/// `LEASE_DURATION`, which is to say not inside it at all. It is now a
 /// retry cadence rather than a safety property, because the fence deadline in
-/// [`renew_loop`] is absolute and caps this one.
+/// `renew_loop` is absolute and caps this one.
 pub const RENEW_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How long renewals may keep failing, measured from the *start* of the last
 /// successful one, before the holder fences itself.
 ///
-/// Strictly less than [`LEASE_DURATION`], by a full [`RENEW_PERIOD`]. A
+/// Strictly less than `LEASE_DURATION`, by a full `RENEW_PERIOD`. A
 /// standby may only take over once the whole lease duration has elapsed since
 /// the `renewTime` stamped on the Lease, and that stamp is taken at the start
 /// of a renewal, which is the same instant this deadline is measured from.
@@ -388,7 +388,7 @@ async fn renew_once<A: LeaseApi>(api: &A, identity: &str) -> anyhow::Result<Rene
     }
 }
 
-/// Engine behind [`acquire_lease`]: poll until the Lease is ours. Transient
+/// Engine behind `acquire_lease`: poll until the Lease is ours. Transient
 /// API errors are logged and retried; they do not kill a candidate.
 pub(crate) async fn acquire_via<A: LeaseApi>(api: &A, cfg: &LeaderConfig, gate: &WriteGate) {
     loop {
@@ -427,7 +427,7 @@ pub(crate) async fn acquire_via<A: LeaseApi>(api: &A, cfg: &LeaderConfig, gate: 
     }
 }
 
-/// Engine behind [`renew_loop`]: renew until leadership ends. The gate is
+/// Engine behind `renew_loop`: renew until leadership ends. The gate is
 /// closed before this returns, on every path.
 pub(crate) async fn hold_via<A: LeaseApi>(api: &A, cfg: &LeaderConfig, gate: &WriteGate) {
     // The instant the last renewal we can prove *started*, which is the
@@ -627,14 +627,14 @@ impl LeaseApi for KubeLeaseApi {
 
 /// Block until this pod owns the Lease, then open `gate`.
 ///
-/// Polls every [`RETRY_PERIOD`]. The function only returns once we are the
-/// holder; the caller then enters [`renew_loop`].
+/// Polls every `RETRY_PERIOD`. The function only returns once we are the
+/// holder; the caller then enters `renew_loop`.
 pub async fn acquire_lease(client: &Client, cfg: &LeaderConfig, gate: &WriteGate) {
     let api = KubeLeaseApi::new(client.clone(), cfg);
     acquire_via(&api, cfg, gate).await;
 }
 
-/// Stay holder by renewing every [`RENEW_PERIOD`], and return once
+/// Stay holder by renewing every `RENEW_PERIOD`, and return once
 /// leadership has ended.
 ///
 /// Returns only after `gate` has been closed, so by the time the caller sees
