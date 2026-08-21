@@ -1025,7 +1025,7 @@
           ]
         },
         "external_id": {
-          "description": "External ID demanded by the role's trust policy. Only read by `assume_role`. Treated as a credential: it is never logged.",
+          "description": "External ID demanded by the role's trust policy. Only read by `assume_role`. Held as a credential, so no SBproxy code path formats it, but note that the process-wide log redactor keys off a fixed list of credential field names that does not include this one (`external_id` is also a non-secret payment identifier elsewhere in the product, so widening that list would mask reconciliation IDs). Supply it as a `${VAR}` or `vault://` reference so the literal never sits in the config file.",
           "type": [
             "string",
             "null"
