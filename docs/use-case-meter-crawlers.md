@@ -4,7 +4,7 @@
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
-GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 72 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
+GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 70 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
 
 ## What you will build
 

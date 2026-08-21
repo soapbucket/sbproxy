@@ -75,6 +75,38 @@ pub fn spawn_provider_health_probes_on(
         if !provider.enabled {
             continue;
         }
+        // WOR-2648: a SigV4 provider is not probed.
+        //
+        // The probe is a bare GET built once at spawn and replayed on a
+        // timer, which is exactly the shape a request signature cannot
+        // take: SigV4 binds the credential to the method, host, path,
+        // and a timestamp inside a five-minute window, so a cached
+        // header goes stale on the second tick and a per-tick signature
+        // would spend an STS credential and file a CloudTrail entry
+        // every interval for a call that cannot answer the question.
+        // There is no cheap signed liveness call to make either:
+        // `bedrock-runtime` has no `/models` route, and the control
+        // plane's `ListFoundationModels` is a different host, a
+        // different signing service, and a different IAM action, so it
+        // says nothing about the data plane.
+        //
+        // Skipping costs nothing, which is the point. `Router`'s health
+        // axis starts at unknown and abstains, and an unsigned probe's
+        // 403 is not a server error, so `response_is_healthy` would
+        // call it healthy anyway. The verdict is identical; what is
+        // avoided is an unauthenticated dial per interval carrying an
+        // empty `Authorization` header. Envoy reaches the same place by
+        // construction: its `aws_request_signing` filter sits in the
+        // HTTP filter chain and active health checks never traverse it.
+        if provider.aws_sigv4.is_some() {
+            tracing::warn!(
+                provider = %provider.name,
+                "ai health probe skipped for provider: a SigV4-signed provider has no \
+                 signable liveness endpoint, so the health axis abstains and routing \
+                 relies on real-traffic failures instead"
+            );
+            continue;
+        }
         let Some(probe_url) = probe_url_for(provider, &cfg.path) else {
             continue;
         };
@@ -501,6 +533,42 @@ mod tests {
             spawn_provider_health_probes(&config),
             2,
             "one probe per enabled provider, and none for the disabled one"
+        );
+    }
+
+    /// WOR-2648: a SigV4 provider carries no signable liveness
+    /// endpoint, so it gets no probe task at all.
+    ///
+    /// The failure this guards is quiet in both directions. Spawning
+    /// one would send an unauthenticated GET carrying an empty
+    /// `Authorization` header on every interval, forever, for a verdict
+    /// the health axis already reaches by abstaining. Skipping it
+    /// silently, without the count changing, would mean nobody notices
+    /// if the skip is ever cut.
+    #[tokio::test]
+    async fn a_sigv4_provider_is_not_probed() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                provider_json("first", "http://127.0.0.1:1/v1"),
+                {
+                    "name": "bedrock",
+                    "provider_type": "bedrock",
+                    "aws_sigv4": {"region": "us-east-1"},
+                },
+            ],
+            "resilience": {
+                "health_check": {
+                    "path": "/models",
+                    "interval_secs": 3600,
+                },
+            },
+        }))
+        .expect("config compiles");
+
+        assert_eq!(
+            spawn_provider_health_probes(&config),
+            1,
+            "the bearer provider is probed and the signed one is not"
         );
     }
 

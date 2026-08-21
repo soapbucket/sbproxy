@@ -1,6 +1,6 @@
 # Frequently asked questions
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-08-21*
 
 Quick answers to the questions operators hit most often when standing up SBproxy, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
@@ -52,7 +52,7 @@ See [troubleshooting.md](./troubleshooting.md) for the most common validation er
 Everything in this repository ships under Apache-2.0:
 
 * The full proxy: HTTP/1.1, HTTP/2, websockets, gRPC, GraphQL, MCP.
-* The AI gateway: 72 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
+* The AI gateway: 70 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
 * Every auth provider (API key, Basic, Bearer, JWT, Digest, forward-auth, Web Bot Auth, CAP, OIDC).
 * Every policy (rate limit, WAF, IP filter, CORS, HSTS, CSRF, agent budget, content digest, BOLA / `object_authz`, ...).
 * Every transform (26 types, including `json`, `template`, `wasm`).
