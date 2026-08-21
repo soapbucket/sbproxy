@@ -4555,6 +4555,14 @@ fn emit_tool_definition_changed_event(
     );
     fields.insert("sbproxy.tenant.id".to_string(), "".into());
     fields.insert("sbproxy.evidence.seq".to_string(), seq.into());
+    // The sequence is process-local and restarts at 1 in every replica,
+    // so it only identifies a record once the emitter is named beside
+    // it: a receiver groups by (instance, tenant) to find a hole. See
+    // `sbproxy_observe::evidence_seq`'s module docs.
+    fields.insert(
+        "sbproxy.evidence.instance".to_string(),
+        sbproxy_observe::instance::instance_id().into(),
+    );
     let data = serde_json::Value::Object(fields);
     let event = ProxyEvent::new(event_type, String::new(), String::new(), data);
     sbproxy_observe::event_sink::publish_proxy_event(event_type, || event);

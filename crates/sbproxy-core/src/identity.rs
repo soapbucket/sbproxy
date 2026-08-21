@@ -39,29 +39,17 @@ pub fn mtls_cert_cache() -> sbproxy_tls::mtls::MtlsCertCacheHandle {
 /// receiver can distinguish replicas with the same host name.
 ///
 /// Format: `<host>-<8 hex chars>` (e.g. `sbproxy-7c4d8b9a`).
+///
+/// One value per process, not one per surface. This used to derive its
+/// own tag from the same recipe, which meant the callback envelope's
+/// `x-sbproxy-instance` and the alert webhook's `X-Sbproxy-Instance`
+/// carried two different strings for one running proxy, and neither
+/// matched the `sbproxy.evidence.instance` a governance record ships.
+/// A receiver told to group on the instance had no way to know that.
+/// Everything now reads
+/// `sbproxy_observe::instance::instance_id`.
 pub fn instance_id() -> &'static str {
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        let host = hostname()
-            .unwrap_or_else(|| "sbproxy".to_string())
-            .replace('.', "-");
-        let tag: u32 = rand::random();
-        format!("{host}-{tag:08x}")
-    })
-}
-
-fn hostname() -> Option<String> {
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        if !h.is_empty() {
-            return Some(h);
-        }
-    }
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    sbproxy_observe::instance::instance_id()
 }
 
 /// Generate a fresh request identifier suitable for correlation across
@@ -154,6 +142,22 @@ mod tests {
         let a = instance_id();
         let b = instance_id();
         assert_eq!(a, b);
+    }
+
+    /// One process, one instance identifier, whichever surface stamps
+    /// it.
+    ///
+    /// The callback envelope and its `x-sbproxy-instance` header take
+    /// this one; the alert webhook envelope, its `X-Sbproxy-Instance`
+    /// header, and `sbproxy.evidence.instance` on every governance
+    /// record take `sbproxy_observe`'s. While this function minted its
+    /// own random tag the two disagreed for the whole life of the
+    /// process, so a SIEM told to group a gapless evidence sequence by
+    /// its instance could not join that grouping to anything else the
+    /// same proxy sent it.
+    #[test]
+    fn instance_id_is_the_one_every_other_surface_stamps() {
+        assert_eq!(instance_id(), sbproxy_observe::instance::instance_id());
     }
 
     #[test]
