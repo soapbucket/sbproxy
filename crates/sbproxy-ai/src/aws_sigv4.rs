@@ -87,7 +87,7 @@
 //!
 //! AWS rejects a signature whose `x-amz-date` is too far from its own
 //! clock, and on Bedrock that arrives as a 403 that is not obviously
-//! different from a bad key. [`AwsSigV4Signer::record_response_timing`]
+//! different from a bad key. `AwsSigV4Signer::record_response_timing`
 //! implements the AWS SDKs' clock-skew correction: on a client-error
 //! response it reads the `Date` response header, estimates the local
 //! clock's offset against the round trip's midpoint, and once the
