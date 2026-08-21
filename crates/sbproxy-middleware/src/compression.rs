@@ -40,12 +40,13 @@ impl Encoding {
     /// here means a caller built a `CompressionConfig` in code rather than
     /// from YAML.
     fn from_token(token: &str) -> Option<Encoding> {
-        match token.trim().to_ascii_lowercase().as_str() {
-            "zstd" => Some(Encoding::Zstd),
-            "br" => Some(Encoding::Brotli),
-            "gzip" => Some(Encoding::Gzip),
-            _ => None,
-        }
+        // Compared in place rather than lowercased into a String: this
+        // runs once per configured entry on every response. Driven off
+        // `DEFAULT_PREFERENCE` so the negotiable set is written once.
+        let token = token.trim();
+        DEFAULT_PREFERENCE
+            .into_iter()
+            .find(|encoding| token.eq_ignore_ascii_case(encoding.as_str()))
     }
 }
 

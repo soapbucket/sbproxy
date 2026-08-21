@@ -26,6 +26,12 @@
 # The script prints the headers as `SIG_INPUT=...` and `SIG=...` shell
 # assignments so the eval form above works. Use --raw to print the
 # header values bare instead.
+#
+# --target-uri is copied into the signature base verbatim. RFC 9421
+# 2.2.2 defines @target-uri as the absolute URI, so pass
+# http://blog.local/article to sign the conformant shape. The bare
+# path is what earlier releases derived; sbproxy still accepts it for
+# a deprecation window and logs once per process when it does.
 
 set -euo pipefail
 
@@ -45,7 +51,7 @@ while [ $# -gt 0 ]; do
     --authority)   AUTHORITY="$2"; shift 2 ;;
     --raw)         RAW=1; shift ;;
     -h|--help)
-      sed -n '2,32p' "$0"
+      sed -n '2,34p' "$0"
       exit 0
       ;;
     *)
@@ -58,7 +64,7 @@ done
 for var in KEY KEYID METHOD URI; do
   if [ -z "${!var}" ]; then
     echo "missing required flag: --${var,,}" >&2
-    sed -n '2,32p' "$0" >&2
+    sed -n '2,34p' "$0" >&2
     exit 2
   fi
 done

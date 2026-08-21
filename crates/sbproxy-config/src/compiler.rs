@@ -3565,7 +3565,7 @@ fn validate_origin_cors(hostname: &str, cors: &CorsConfig) -> Result<()> {
 
 /// Refuse a `compression.algorithms` entry that names no codec.
 ///
-/// An unrecognised name used to make every codec unnegotiable for the
+/// An unrecognized name used to make every codec unnegotiable for the
 /// origin, so `algorithms: [deflate]` served every response uncompressed
 /// with no load-time error and nothing in the logs or metrics separating
 /// it from a client that advertised no encodings at all.

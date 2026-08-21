@@ -1118,10 +1118,12 @@ fn derived_component(
         // request line, which for the origin-form requests a proxy sees
         // is the path and query alone. The legacy shape prefixed the
         // uppercased method, which is draft-cavage's `(request-target)`
-        // and matches neither spec.
+        // and matches neither spec. The scheme is not part of either
+        // shape, so the other-scheme attempt derives this component
+        // identically to the conformant one.
         "request-target" => match dialect {
             BaseDialect::Legacy => format!("{} {}", req.method().as_str(), path_and_query),
-            BaseDialect::Rfc9421 => path_and_query.to_string(),
+            BaseDialect::Rfc9421 | BaseDialect::Rfc9421OtherScheme => path_and_query.to_string(),
         },
         other => anyhow::bail!("unsupported derived component: @{}", other),
     })
@@ -1788,6 +1790,48 @@ mod tests {
                 .unwrap()
                 .verify_request(&live),
             VerifyVerdict::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn the_other_scheme_attempt_reaches_a_request_target_component() {
+        // `@scheme` pulls a signature into the other-scheme attempt and
+        // `@request-target` then has to derive under that dialect too.
+        // The component is scheme-free, so both dialects must produce
+        // the same bytes for it; deriving it differently, or refusing to
+        // derive it at all, breaks a covered set a signer may well pick.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let signed_over_https = http::Request::builder()
+            .method("GET")
+            .uri("https://api.example.com/v1/orders?page=2")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let raw_input = format!(
+            r#"sig1=("@scheme" "@request-target");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let entry = parse_signature_input(&raw_input).unwrap().pop().unwrap().1;
+        let base = build_signature_base(&signed_over_https, &entry).unwrap();
+        assert!(base.starts_with("\"@scheme\": https\n\"@request-target\": /v1/orders?page=2\n"));
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        // Origin form: this layer guesses `http`, so only the
+        // other-scheme candidate can match.
+        let live = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders?page=2")
+            .header("host", "api.example.com")
+            .header("signature-input", raw_input.as_str())
+            .header("signature", format!("sig1=:{sig_b64}:"))
+            .body(bytes::Bytes::new())
+            .unwrap();
+        assert!(matches!(
+            MessageSignatureVerifier::new(config_hmac(secret_hex))
+                .unwrap()
+                .verify_request(&live),
+            VerifyVerdict::Ok { .. }
         ));
     }
 

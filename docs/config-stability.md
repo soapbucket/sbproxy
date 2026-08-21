@@ -386,6 +386,32 @@ OpenAPI tool calls, never its token endpoint.
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
+### Redis-backed idempotency entries move to a new keyspace
+
+**Who this reaches.** Any origin with `idempotency.backend: redis`. The
+`memory` backend keeps its entries in process and is unaffected.
+
+**What changes.** The storage key was `sbproxy:idem::<Idempotency-Key>`
+for every origin in the cluster, because the workspace segment it was
+scoped by is a field nothing ever fills. It now carries the owning
+origin's `tenant_id` and origin id in length-delimited segments. That
+closes the cross-origin read, and it also means entries written by the
+old build are not readable by the new one. They are not deleted either:
+they sit in the store until their TTL (24 h by default) expires them.
+
+**What an operator sees when it bites.** For the first request under any
+given `Idempotency-Key` after the upgrade, the proxy reports a miss and
+contacts the upstream, even if the pre-upgrade build had already cached a
+response for that key. A client retrying across the restart therefore
+gets its request executed a second time. On a rolling upgrade the two
+builds do not share entries at all, so the window lasts until the last
+old node is drained.
+
+**What to do before upgrading.** Treat it as a cache flush on a path
+where a repeat is a real repeat. Drain in-flight idempotent retries
+before the restart on anything that settles money, or accept one
+re-execution per key. Nothing in the config changes.
+
 ### `compression.algorithms` now selects in the order you wrote
 
 **Who this reaches.** Any origin with a `compression.algorithms` list of

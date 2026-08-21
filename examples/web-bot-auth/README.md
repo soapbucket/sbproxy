@@ -69,6 +69,8 @@ curl -i -H 'Host: blog.local' \
 - `required_components` - signed components every accepted signature must cover
 - `clock_skew_seconds` - bounds replay tolerance on the `created` parameter
 
+The signer above passes `--target-uri /article`, the path alone, which is the derivation earlier releases used. RFC 9421 §2.2.2 defines `@target-uri` as the absolute URI; the proxy derives that now and accepts the path form for a deprecation window, logging once per process when one arrives. Pass the absolute URI (`--target-uri http://blog.local/article`) to sign the conformant shape; the helper takes either.
+
 ## See also
 
 - [docs/web-bot-auth.md](../../docs/web-bot-auth.md)

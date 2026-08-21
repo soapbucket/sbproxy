@@ -127,7 +127,7 @@ impl IdempotencyOutcome {
 /// across the whole cluster and folds the origin's identity into every
 /// storage key.
 ///
-/// The `put` call is responsible for honouring the embedded
+/// The `put` call is responsible for honoring the embedded
 /// `expires_at_unix` field; backends that support native TTLs SHOULD
 /// use them, but the middleware also re-checks expiry on every read
 /// so a backend without TTLs (in-memory in tests) stays correct.

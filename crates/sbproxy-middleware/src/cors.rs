@@ -39,7 +39,7 @@ pub fn is_preflight(method: &Method, headers: &HeaderMap) -> bool {
 /// - **Wildcard plus credentials is refused.** When `allowed_origins` is
 ///   `["*"]` and `allow_credentials` is `true`, no CORS headers are emitted.
 ///   Browsers reject this combination per the Fetch spec; refusing it at the
-///   proxy layer prevents the proxy from appearing to authorise something the
+///   proxy layer prevents the proxy from appearing to authorize something the
 ///   browser will then strip. The config compiler now fails the load on the
 ///   same pair, so this guard only fires for a `CorsConfig` built in code.
 ///   It logs once per process and counts every refusal on

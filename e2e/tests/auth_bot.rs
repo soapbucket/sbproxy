@@ -28,13 +28,16 @@
 //! ```
 //!
 //! `created` sits far in the past, which the verifier now refuses as
-//! stale unless the window covers it. That is why every config in this
-//! file sets `clock_skew_seconds: 9999999999`: the fixture signature is
-//! a committed constant and cannot be re-minted per run, so the window
-//! is what has to move. No `expires` is set. The HMAC key is supplied
-//! as a hex string so `decode_secret` reliably ends up with the same 15
-//! bytes both at signing time (Python) and at verification time (the
-//! proxy).
+//! stale unless the window covers it. That is why every config here
+//! that expects a signature to verify sets
+//! `clock_skew_seconds: 9999999999`: the fixture signature is a
+//! committed constant and cannot be re-minted per run, so the window is
+//! what has to move. The `directory_*` configs leave the default,
+//! because none of them asserts a successful verification: they assert
+//! directory fetch counts and refusals. No `expires` is set. The HMAC
+//! key is supplied as a hex string so `decode_secret` reliably ends up
+//! with the same 15 bytes both at signing time (Python) and at
+//! verification time (the proxy).
 //!
 //! We sign `"@target-uri": /`, which is the derivation earlier releases
 //! used. RFC 9421 §2.2.2 defines it as the absolute URI, and the proxy

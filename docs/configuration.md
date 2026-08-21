@@ -2696,7 +2696,6 @@ process when one arrives. `@request-target`, for the same reason, is
 the bare request target (`/v1/orders?page=2`) rather than
 draft-cavage's `GET /v1/orders?page=2`.
 
-
 The default components bind the verb and the route, not the body. A signature over `("@method" "@target-uri")` alone says nothing about the bytes that follow it, so a request captured off the wire can be replayed with a different body until its `created` timestamp falls outside `clock_skew_seconds`. Covering `content-digest` is what closes that:
 
 ```text
