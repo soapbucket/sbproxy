@@ -25169,6 +25169,7 @@ mod upstream_body_error_redaction_tests {
     }
 }
 
+#[cfg(test)]
 mod price_ceiling_tests {
     //! WOR-2559: the per-request price ceiling's request-level resolution
     //! and its fail-closed refusal body. Candidate-set partition behavior

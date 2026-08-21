@@ -651,8 +651,12 @@ mod tests {
     /// either factory runs, or the winner has already been constructed.
     #[test]
     fn the_auth_registry_refuses_a_duplicate_name_instead_of_taking_the_first() {
+        // `.map(|_| ())` before `expect_err`: the Ok side is a
+        // `Box<dyn AuthProvider>`, which has no `Debug`, and `expect_err`
+        // needs one to render the value it did not want.
         let error = build_auth_plugin("duplicate_fixture_auth", serde_json::Value::Null)
             .expect("duplicate name has registrations")
+            .map(|_| ())
             .expect_err("a duplicate claim is refused rather than built");
 
         let plugin_error = error
