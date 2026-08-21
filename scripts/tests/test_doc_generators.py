@@ -911,6 +911,119 @@ class DocCaptureCheckerTests(unittest.TestCase):
             self.mod.normalize("requirement_id: req_01kz57t7yk9kyh51ksvgd96j15"),
         )
 
+    def test_the_usage_bridge_walkthrough_replays_every_step_it_shows(self) -> None:
+        """Producer, both reads, and the metric scrape, in that order.
+
+        The page bills a call, reads the row it wrote twice, and scrapes
+        the counter the same call incremented. Three of the four were
+        marked and the scrape was not (WOR-2643), so the page read as
+        covered while its metric claim was a transcript. Order is pinned
+        alongside the count because the producer has to run first: the
+        stack wipes /tmp/sbproxy-usage-bridge on every boot, so a read
+        that ran before the bill would read an empty database.
+        """
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        readme = repo_root / "examples" / "usage-bridge-queue" / "README.md"
+        commands = [capture.command for capture in self.mod.parse_captures(readme)]
+        self.assertEqual(
+            len(commands),
+            4,
+            f"expected producer, two reads, and the metric scrape; got {commands}",
+        )
+        self.assertEqual(commands[0], "bash examples/usage-bridge-queue/bin/bill-one-call.sh")
+        self.assertIn("from usage_reports order by created_at_ms", commands[1])
+        self.assertIn("select event_jcs from usage_reports", commands[2])
+        self.assertEqual(
+            commands[3],
+            "curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge",
+        )
+
+    def test_a_shown_output_with_no_marker_is_a_finding(self) -> None:
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            echo hello
+            ```
+
+            ```
+            hello
+            ```
+            """
+        )
+        findings = self.mod.uncaptured_output_blocks(path)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0][1], "echo hello")
+
+    def test_a_marker_between_command_and_output_clears_the_finding(self) -> None:
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            echo hello
+            ```
+
+            <!-- CAPTURE: echo hello -->
+
+            ```
+            hello
+            ```
+            """
+        )
+        self.assertEqual(self.mod.uncaptured_output_blocks(path), [])
+
+    def test_a_setup_block_that_shows_no_output_is_not_policed(self) -> None:
+        """`mkdir`, `cargo build`, `kill %1` are outside the rule by shape.
+
+        They print nothing the page shows, so no output block follows
+        them and there is no claim to hold to the code. Exempting them
+        by name would be a list that grows with every walkthrough.
+        """
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            mkdir -p /tmp/demo
+            ```
+
+            Then, from the repository root:
+
+            ```bash
+            sbproxy serve -f sb.yml
+            ```
+
+            ```yaml
+            proxy:
+              listen: 127.0.0.1:8080
+            ```
+            """
+        )
+        self.assertEqual(self.mod.uncaptured_output_blocks(path), [])
+
+    def test_no_manifest_page_shows_an_output_nothing_accounts_for(self) -> None:
+        """The repo-level gate: every shown output is replayed or recorded.
+
+        `check_block_coverage` also audits the other direction, so a note
+        in `UNCAPTURED_BLOCKS` that stops matching a block fails here
+        rather than sitting in the file excusing something that no longer
+        exists.
+        """
+        self.assertEqual(self.mod.check_block_coverage(), [])
+
+    def test_every_uncaptured_block_note_names_a_manifest_page(self) -> None:
+        for rel, blocks in self.mod.UNCAPTURED_BLOCKS.items():
+            self.assertIn(
+                rel,
+                self.mod.MANIFEST,
+                f"{rel} records uncaptured blocks but is not a covered page",
+            )
+            self.assertTrue(blocks, f"{rel} has an empty UNCAPTURED_BLOCKS entry")
+            for needle, reason in blocks.items():
+                self.assertTrue(reason.strip(), f"{rel}: '{needle}' gives no reason")
+
     def test_every_manifest_section_names_a_known_stack(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent.parent
         for rel, config in self.mod.MANIFEST.items():

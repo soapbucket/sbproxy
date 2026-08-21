@@ -470,15 +470,108 @@ pub fn list_providers() -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Size of the shipped catalog, pinned rather than bounded.
+    ///
+    /// These assertions read `>= 43` until WOR-2627. A floor is true of
+    /// every count above it, so the suite agreed with the catalog at 43,
+    /// at 72, and with `MIGRATION.md`'s claim of "90+" at the same time,
+    /// and none of the three could be wrong as far as any test here was
+    /// concerned. `scripts/check-doc-drift.sh` derives the same number
+    /// from the YAML and holds the prose to it, so a provider added
+    /// without updating this constant fails here, and one added without
+    /// updating the docs fails there.
+    const CATALOG_PROVIDERS: usize = 72;
+
+    /// Wire-format split of the catalog, as `docs/providers.md`,
+    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 66
+    /// OpenAI-format passthroughs, three in-tree translators (Anthropic,
+    /// Gemini, Bedrock), three custom-format entries.
+    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (66, 1, 1, 1, 3);
+
+    /// The checked-in plain-text catalog.
+    ///
+    /// Only the `.gz` beside it is `include_bytes!`d, so an edit to the
+    /// `.yml` that is never recompressed ships a binary that ignores it
+    /// while every reader of the repo sees the new entry.
+    const CATALOG_SOURCE: &str = include_str!("../../data/ai_providers.yml");
+
     #[test]
     fn embedded_catalog_decompresses_and_parses() {
         let yaml = decompress_embedded().expect("embedded gzip valid");
         let catalog: YamlCatalog = serde_yaml::from_str(&yaml).expect("yaml parses");
-        assert!(
-            catalog.providers.len() >= 43,
-            "expected the full default catalog to be embedded; got {}",
-            catalog.providers.len()
+        assert_eq!(
+            catalog.providers.len(),
+            CATALOG_PROVIDERS,
+            "the embedded catalog changed size"
         );
+    }
+
+    #[test]
+    fn embedded_gzip_matches_the_checked_in_catalog() {
+        let yaml = decompress_embedded().expect("embedded gzip valid");
+        assert!(
+            yaml == CATALOG_SOURCE,
+            "data/ai_providers.yml.gz does not decompress to data/ai_providers.yml. \
+             Only the .gz reaches the binary, so the change is not shipped. \
+             Regenerate it: gzip -9 -n -c crates/sbproxy-ai/data/ai_providers.yml \
+             > crates/sbproxy-ai/data/ai_providers.yml.gz"
+        );
+    }
+
+    #[test]
+    fn embedded_catalog_matches_published_counts() {
+        let yaml = decompress_embedded().expect("embedded gzip valid");
+        let catalog: YamlCatalog = serde_yaml::from_str(&yaml).expect("yaml parses");
+
+        assert_eq!(
+            catalog.providers.len(),
+            CATALOG_PROVIDERS,
+            "the provider count is published in README.md, llms.txt, MIGRATION.md, \
+             and every use-case doc; scripts/check-doc-drift.sh holds those to the \
+             catalog, and this constant is the code half of the same claim"
+        );
+
+        let mut split = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for provider in &catalog.providers {
+            match provider.format {
+                ProviderFormat::OpenAi => split.0 += 1,
+                ProviderFormat::Anthropic => split.1 += 1,
+                ProviderFormat::Google => split.2 += 1,
+                ProviderFormat::Bedrock => split.3 += 1,
+                ProviderFormat::Custom => split.4 += 1,
+            }
+        }
+        assert_eq!(
+            split, CATALOG_FORMAT_SPLIT,
+            "the format split is published as a breakdown of the total; \
+             got (openai, anthropic, google, bedrock, custom) = {split:?}"
+        );
+
+        // Uniqueness is a property of the shipped artifact, not of the
+        // registry: `build_registry` deliberately lets a later alias win
+        // so an operator override via `proxy.ai_providers_file` can
+        // re-point one. A collision inside the file we ship is a typo
+        // that silently makes one entry unreachable by name.
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for provider in &catalog.providers {
+            let canonical = provider.name.as_str();
+            let previous = seen.insert(canonical, canonical);
+            assert!(
+                previous.is_none(),
+                "duplicate canonical provider name in the shipped catalog: {canonical}"
+            );
+        }
+        for provider in &catalog.providers {
+            for alias in &provider.aliases {
+                if let Some(owner) = seen.insert(alias.as_str(), provider.name.as_str()) {
+                    panic!(
+                        "alias {alias} on {} is already taken by {owner}; \
+                         one of the two is unreachable by name",
+                        provider.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -487,7 +580,7 @@ mod tests {
         assert!(names.contains(&"openai".to_string()));
         assert!(names.contains(&"anthropic".to_string()));
         assert!(names.contains(&"watsonx".to_string()));
-        assert!(names.len() >= 43);
+        assert_eq!(names.len(), CATALOG_PROVIDERS);
     }
 
     #[test]
@@ -658,6 +751,6 @@ mod tests {
         // log and use the embedded set.
         let registry = build_registry(Some(Path::new("/dev/null/nope/missing.yml")))
             .expect("falls back when override unreadable");
-        assert!(registry.providers.len() >= 43);
+        assert_eq!(registry.providers.len(), CATALOG_PROVIDERS);
     }
 }

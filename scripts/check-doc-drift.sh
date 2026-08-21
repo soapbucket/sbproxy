@@ -5,7 +5,9 @@
 # Guard against regression of provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs. Code reality:
 #
-#   - crates/sbproxy-ai/data/ai_providers.yml has 72 entries.
+#   - crates/sbproxy-ai/data/ai_providers.yml is the provider catalog.
+#     Its size is read at check time rather than written down here, so
+#     this comment cannot be the thing that goes stale (WOR-2627).
 #   - crates/sbproxy-ai/src/routing.rs defines 19 routing strategies
 #     (RoundRobin, Weighted, FallbackChain, Random, LowestLatency,
 #     LeastConnections, CostOptimized, TokenRate, LeastTokenUsage,
@@ -44,7 +46,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --root) ROOT_DIR="$2"; shift 2 ;;
     -h|--help)
-      sed -n '1,30p' "$0"
+      # Through the Usage and exit-code blocks. The window was 30 lines
+      # and the header outgrew it, so --help stopped before the usage it
+      # exists to print.
+      sed -n '1,40p' "$0"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -59,7 +64,21 @@ TARGETS=(
   "$ROOT_DIR/README.md"
   "$ROOT_DIR/SECURITY.md"
   "$ROOT_DIR/CLAUDE.md"
+  # WOR-2627: MIGRATION.md was outside every scan here, so the one page
+  # still claiming a "90+ AI provider catalog" was the one page nothing
+  # read. It is buyer-facing upgrade guidance and drifts like the rest.
+  "$ROOT_DIR/MIGRATION.md"
 )
+
+# `docs/llms-full.txt` is the one file under those targets that this
+# check must not read. It is a generated corpus: `regen-llms-full.sh`
+# concatenates README.md, MIGRATION.md, CHANGELOG.md, and docs/*.md, and
+# the repo convention (CLAUDE.md, "Provider catalog", point 4) refreshes
+# it at release prep rather than on feature branches. So it lags its own
+# sources by design, and scanning it turns every doc fix red until the
+# next release cut. Nothing is lost: every string it carries is policed
+# in the page it was copied from, and all of those pages are targets.
+GENERATED_CORPUS="llms-full.txt"
 
 # Substrings that must never reappear. Each entry is a fixed (-F) string
 # so YAML / table escapes do not matter.
@@ -76,6 +95,10 @@ STALE_STRINGS=(
   "15 routing strategies"
   "17 routing strategies"
   "43 native providers"
+  # WOR-2627: MIGRATION.md claimed this from the initial commit and no
+  # scan ever covered the file. The derived check below is what stops
+  # the next one; this entry stops this one coming back.
+  "90+ AI provider"
   "one trivial built-in strategy"
   "36 OpenAI-compatible"
   "certpin"
@@ -95,6 +118,7 @@ for needle in "${STALE_STRINGS[@]}"; do
     [ -e "$target" ] || continue
     if hits=$(grep -RFn --binary-files=without-match \
                  --include='*.md' --include='*.txt' \
+                 --exclude="$GENERATED_CORPUS" \
                  -e "$needle" "$target" 2>/dev/null); then
       echo "stale string found: '$needle'" >&2
       echo "$hits" | sed 's/^/  /' >&2
@@ -102,6 +126,144 @@ for needle in "${STALE_STRINGS[@]}"; do
     fi
   done
 done
+
+# Provider-count claims, derived from the catalog rather than listed.
+#
+# The list above can only ever catch a number somebody already noticed
+# was wrong, which is how MIGRATION.md carried "90+" from the initial
+# commit through the catalog's growth to 43 and its settling at 72
+# without a single lane objecting. This reads
+# `crates/sbproxy-ai/data/ai_providers.yml`, counts the entries, and
+# holds every documented provider count to that number, so the next
+# provider added turns every page that was not updated with it red.
+# That is CLAUDE.md's "update the hardcoded provider count everywhere"
+# step, enforced instead of remembered.
+if ! python3 - "$ROOT_DIR" "$GENERATED_CORPUS" "${TARGETS[@]}" <<'PY'
+import gzip
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+generated_corpus = sys.argv[2]
+targets = [Path(argument) for argument in sys.argv[3:]]
+
+problems: list[str] = []
+
+catalog = root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml"
+embedded = root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml.gz"
+try:
+    catalog_bytes = catalog.read_bytes()
+    embedded_bytes = embedded.read_bytes()
+except OSError as error:
+    print(f"cannot read the provider catalog: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+# One entry per `  - name:` at the list indent. A regex rather than a
+# YAML parse because this runs in lanes with no third-party packages,
+# and the shape is pinned from the other side by
+# `sbproxy_ai::providers::tests::embedded_catalog_matches_published_counts`.
+provider_count = len(re.findall(rb"^  - name:", catalog_bytes, re.MULTILINE))
+if provider_count == 0:
+    print(
+        f"no providers parsed out of {catalog}; the catalog's shape changed "
+        "and this check is now blind",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+# Only the `.gz` is `include_bytes!`d into the binary. An edit to the
+# `.yml` that never gets recompressed ships a catalog nothing runs, and
+# leaves this check reading a file the product does not use.
+if gzip.decompress(embedded_bytes) != catalog_bytes:
+    problems.append(
+        "ai_providers.yml.gz does not decompress to ai_providers.yml; "
+        "regenerate it with "
+        "`gzip -9 -n -c crates/sbproxy-ai/data/ai_providers.yml "
+        "> crates/sbproxy-ai/data/ai_providers.yml.gz`"
+    )
+
+# A number attached to a provider noun. Digits only: word-form claims
+# ("seventy-two providers") are the fixed-string list's job.
+CLAIM = re.compile(
+    r"(?P<count>\d+)\s*(?:\+|-plus)?[- ]"
+    r"(?:(?:native|hosted|LLM|AI|model|in-tree|supported|OpenAI-compatible)[- ])*"
+    r"providers?\b",
+    re.IGNORECASE,
+)
+
+# Counts that are correctly not ours. Keyed on the exact phrase so a
+# reworded claim loses its exception and gets policed again, and audited
+# below so an exception that stops matching anything is reported rather
+# than quietly covering nothing.
+NOT_OUR_CATALOG: dict[tuple[str, str], str] = {
+    ("docs/comparison.md", "100+ providers"): "LiteLLM's catalog, in the comparison table",
+    ("docs/comparison.md", "100+ native providers"): "LiteLLM's catalog, in the prose above the table",
+    ("docs/comparison.md", "100+ LLM providers"): "LiteLLM's catalog, in the LiteLLM section",
+    ("docs/admin-api-reference.md", "10 provider"): (
+        "a sample-size floor for a latency estimate, not a catalog size: "
+        "'inactive until at least 10 provider attempts contribute'"
+    ),
+}
+used: set[tuple[str, str]] = set()
+
+DOC_SUFFIXES = (".md", ".txt", ".html")
+
+
+def documents() -> list[Path]:
+    found: list[Path] = []
+    for target in targets:
+        if target.is_dir():
+            found.extend(
+                path
+                for path in sorted(target.rglob("*"))
+                if path.is_file() and path.suffix in DOC_SUFFIXES
+            )
+        elif target.is_file() and target.suffix in DOC_SUFFIXES:
+            found.append(target)
+    return [path for path in found if path.name != generated_corpus]
+
+
+for path in documents():
+    # `--root .` makes every path relative already, and older pathlib
+    # refuses `relative_to('.')`. The display name is cosmetic, so fall
+    # back rather than fail the lane over it.
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        relative = path.as_posix()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        continue
+    for number, line in enumerate(text.splitlines(), start=1):
+        for match in CLAIM.finditer(line):
+            key = (relative, match.group(0))
+            if key in NOT_OUR_CATALOG:
+                used.add(key)
+                continue
+            if int(match.group("count")) != provider_count:
+                problems.append(
+                    f"{relative}:{number}: claims '{match.group(0)}' but the "
+                    f"catalog has {provider_count} providers"
+                )
+
+for key in sorted(NOT_OUR_CATALOG):
+    if key not in used:
+        problems.append(
+            f"{key[0]} no longer contains '{key[1]}'; drop the "
+            "NOT_OUR_CATALOG exception, it is covering nothing"
+        )
+
+if problems:
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  echo "provider-count claims disagree with the shipped catalog" >&2
+  rc=1
+fi
 
 # Release-platform behavior. This reads the build matrix rather than matching
 # prose, so a newly added or removed artifact forces an installation-doc review.

@@ -80,8 +80,10 @@ MANIFEST: dict[str, dict] = {
     "examples/usage-bridge-queue/README.md": {
         # The same worker as docs/payment-settlement.md's usage_bridge
         # section, reached by its own dedicated walkthrough. It drives
-        # its own traffic: the page's first capture bills a call and the
-        # two `sqlite3` reads below it read what that produced.
+        # its own traffic: the page's first capture bills a call, the
+        # two `sqlite3` reads below it read the row that produced, and
+        # the `/metrics` scrape at the end reads the counter the same
+        # call incremented (WOR-2643).
         #
         # That driver marker is load bearing rather than tidy. The two
         # reads used to be the only markers here, on the assumption that
@@ -280,7 +282,18 @@ MANIFEST: dict[str, dict] = {
 #
 # The two whole-page exemptions above are machine-checked below, so a
 # marker landing on one of them is refused rather than quietly ignored.
-# The block-level notes stay prose: they name blocks, not pages.
+#
+# The block-level notes used to stay prose, on the reasoning that they
+# name blocks and not pages. That reasoning is what WOR-2643 walked
+# through: `examples/usage-bridge-queue/README.md` showed a `/metrics`
+# scrape and its three-line output with no marker on it, and the block
+# was neither replayed nor named here, which are the same thing to
+# every lane that reads this file. Blocks that show output now go in
+# `UNCAPTURED_BLOCKS` below and are held to the same standard as the
+# page-level list: a reason, and a match. What stays prose is the two
+# notes above with no command to replay at all - the audit stdout
+# lines, which no command produces, and the per-route response shapes,
+# which are not output of anything.
 EXEMPT_DOCS: dict[str, str] = {
     "docs/admin-ui.md": (
         "nothing on the page is command output: prose, screenshots, and "
@@ -290,6 +303,67 @@ EXEMPT_DOCS: dict[str, str] = {
         "timing-dependent: the walkthrough scrapes inside the window before a "
         "probe's third consecutive failure, which no replay can hold open"
     ),
+}
+
+# Fenced languages a block uses when it holds the output of the command
+# above it. `bash` blocks are commands; `yaml`, `rust`, `toml` and the
+# rest are source. A block in one of these, sitting directly under a
+# `bash` block, is this repo's shape for "here is what that printed".
+OUTPUT_FENCE_LANGS = frozenset({"", "text", "json"})
+
+# Command blocks on a MANIFEST page that show their output and are
+# deliberately not replayed. Keyed on a substring of the command, so a
+# rewritten block loses its entry and gets policed again.
+#
+# Every one of these is a page in the manifest, which is the point: the
+# manifest says the page is covered, and a reader has no way to tell
+# which blocks on it are. Recording the exceptions by command is what
+# makes "this page is captured" mean something, and what makes adding an
+# uncaptured block to a captured page a decision somebody has to write
+# down rather than an omission nothing sees.
+UNCAPTURED_BLOCKS: dict[str, dict[str, str]] = {
+    "docs/payment-settlement.md": {
+        "/admin/payments/status": (
+            "an operator's own deployment, not this page's fixture: it "
+            "authenticates with ${SB_ADMIN_PASSWORD}, which nothing on the "
+            "page sets, and the body shows two configured rails and six "
+            "figures of worker ticks that a fixture started seconds ago "
+            "cannot produce"
+        ),
+        "/admin/payments/reconcile": (
+            "same deployment and same unset ${SB_ADMIN_PASSWORD} as the "
+            "status block above it; the response claims a lightning_cln "
+            "attempt that only a stranded real payment produces"
+        ),
+    },
+    "docs/audit-log.md": {
+        "chain?limit=5": (
+            "runs against the hand-written /tmp/sbproxy-audit-demo/sb.yml the "
+            "page prints inline, which has four chains and its own keystore; "
+            "the audit_log stack boots examples/audit-log/sb.yml instead"
+        ),
+        "chain?channel=admin&limit=2": (
+            "same inline /tmp/sbproxy-audit-demo walkthrough, and it pages "
+            "through records the three calls above it wrote"
+        ),
+        "sed -i ''": (
+            "tampers with a chained record on disk to show the walk stopping. "
+            "Destructive by design, and the BSD spelling of sed -i is not "
+            "portable to the Linux lanes"
+        ),
+        ": > /tmp/sbproxy-audit-demo": (
+            "truncates the security chain to show what a deleted trail looks "
+            "like. Destructive by design, against the same inline fixture"
+        ),
+    },
+    "docs/admin-api-reference.md": {
+        "api/routing-decisions": (
+            "the one worked example left out, for the reason written above: "
+            "its setup is a config inline in the page needing a second "
+            "provider on 18591 and a deliberately closed port, a fixture that "
+            "exists nowhere else in the repo"
+        ),
+    },
 }
 
 
@@ -483,6 +557,68 @@ def _block_after(lines: list[str], start: int) -> tuple[str | None, tuple[int, i
         if lines[end].startswith(fence) and not lines[end][len(fence):].strip():
             return "\n".join(lines[body_start:end]), (body_start, end)
     return None, None
+
+
+def _fences(lines: list[str]) -> list[tuple[int, int, str]]:
+    """Every fenced block in a document as `(open, close, language)`.
+
+    Indices are into `lines`. A block whose fence is never closed is
+    dropped rather than run to the end of the file, which is what a
+    stray triple-backtick inside prose would otherwise do to every
+    block below it.
+    """
+    blocks: list[tuple[int, int, str]] = []
+    cursor = 0
+    while cursor < len(lines):
+        opening = FENCE.match(lines[cursor])
+        if not opening:
+            cursor += 1
+            continue
+        fence = opening.group("fence")
+        for end in range(cursor + 1, len(lines)):
+            if lines[end].startswith(fence) and not lines[end][len(fence):].strip():
+                blocks.append((cursor, end, opening.group("lang")))
+                cursor = end + 1
+                break
+        else:
+            break
+    return blocks
+
+
+def uncaptured_output_blocks(path: Path) -> list[tuple[int, str]]:
+    """Commands whose output the page shows and no marker replays.
+
+    The shape this looks for is the one every captured block on every
+    page here already has: a `bash` block, then the output it printed.
+    A marker between the two means the harness re-runs the command and
+    diffs it. No marker means the block is a transcript somebody typed
+    once, and nothing in this repo can tell whether it is still true.
+
+    Setup and teardown are outside the rule by construction rather than
+    by exemption: `cargo build`, `mkdir`, `kill %1` show no output, so
+    no output block follows them and there is nothing to hold to the
+    code. This looks only at commands the page makes a claim about.
+
+    Returns `(line number of the command fence, the command text)`.
+    """
+    lines = path.read_text().split("\n")
+    blocks = _fences(lines)
+    findings: list[tuple[int, str]] = []
+    for index, (start, end, lang) in enumerate(blocks):
+        if lang != "bash" or index + 1 >= len(blocks):
+            continue
+        next_start, _, next_lang = blocks[index + 1]
+        if next_lang not in OUTPUT_FENCE_LANGS:
+            continue
+        between = [line for line in lines[end + 1:next_start] if line.strip()]
+        if any(MARKER.match(line) for line in between):
+            continue
+        # Prose between the two means the second block is not this
+        # command's output; it is the next thing the page shows.
+        if between:
+            continue
+        findings.append((start + 1, "\n".join(lines[start + 1:end])))
+    return findings
 
 
 # --- Stacks ------------------------------------------------------------
@@ -900,6 +1036,59 @@ def check_exemptions() -> list[str]:
     return errors
 
 
+def check_block_coverage() -> list[str]:
+    """Refuse a shown output that neither a marker nor a note accounts for.
+
+    Coverage here has always been per marker, which makes it per block
+    that somebody remembered. A page in the MANIFEST reads as covered,
+    and until now that could mean any fraction of it: WOR-2643's
+    `/metrics` scrape sat three lines under a captured `sqlite3` read on
+    a manifest page, showed a counter value, and was replayed by
+    nothing. Every lane was green and the page was two thirds checked.
+
+    So the unit of the decision moves from the page to the block. A
+    command that shows its output on a manifest page is either replayed
+    or named in `UNCAPTURED_BLOCKS` with a reason, and both halves are
+    audited: a note that matches no block is reported the same way a
+    missing marker is, so the exceptions cannot outlive the blocks they
+    were written for.
+    """
+    errors: list[str] = []
+    for rel in sorted(UNCAPTURED_BLOCKS):
+        if rel not in MANIFEST:
+            errors.append(
+                f"{rel} has UNCAPTURED_BLOCKS entries but is not in MANIFEST; "
+                "an unlisted page is not covered, so the notes describe nothing"
+            )
+    for rel in sorted(MANIFEST):
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        recorded = UNCAPTURED_BLOCKS.get(rel, {})
+        matched: set[str] = set()
+        for line, command in uncaptured_output_blocks(path):
+            hits = [needle for needle in recorded if needle in command]
+            if hits:
+                matched.update(hits)
+                continue
+            first = command.strip().split("\n")[0]
+            errors.append(
+                f"{rel}:{line}: shows the output of `{first}` and no CAPTURE "
+                "marker replays it. Add a marker, or record the block in "
+                "UNCAPTURED_BLOCKS with the reason it cannot be replayed"
+            )
+        for needle, reason in sorted(recorded.items()):
+            if not reason.strip():
+                errors.append(f"{rel}: UNCAPTURED_BLOCKS entry '{needle}' gives no reason")
+            if needle not in matched:
+                errors.append(
+                    f"{rel}: UNCAPTURED_BLOCKS entry '{needle}' matches no "
+                    "uncaptured block; the block was captured or rewritten, so "
+                    "drop the entry rather than leave it excusing nothing"
+                )
+    return errors
+
+
 def section_for(capture: Capture, doc_config: dict) -> dict:
     """The manifest section governing one capture.
 
@@ -1110,6 +1299,16 @@ def main() -> int:
     for error in exempt_errors:
         print(f"capture exemption: {error}", file=sys.stderr)
 
+    coverage_errors = check_block_coverage()
+    for error in coverage_errors:
+        print(f"capture coverage: {error}", file=sys.stderr)
+
+    # Both are static: they read the documents and the two maps, and
+    # need no binary and no stack. So they run in every mode, including
+    # `--list` and the `--stackless-only` lane CI uses, which is the
+    # lane a missing marker has to be caught in.
+    static_errors = exempt_errors + coverage_errors
+
     if args.list:
         total = 0
         for path in docs:
@@ -1120,7 +1319,10 @@ def main() -> int:
         print(f"\n{total} capture(s) in {len(docs)} document(s)")
         for rel, reason in sorted(EXEMPT_DOCS.items()):
             print(f"exempt: {rel}: {reason}")
-        return 1 if exempt_errors else 0
+        for rel, blocks in sorted(UNCAPTURED_BLOCKS.items()):
+            for needle, reason in sorted(blocks.items()):
+                print(f"uncaptured block: {rel}: `{needle}`: {reason}")
+        return 1 if static_errors else 0
 
     raw_binary = args.binary or os.environ.get("SBPROXY_CAPTURE_BIN")
     binary: Path | None
@@ -1188,8 +1390,8 @@ def main() -> int:
         )
 
     if args.update:
-        return 1 if exempt_errors else 0
-    return 1 if (failures or exempt_errors) else 0
+        return 1 if static_errors else 0
+    return 1 if (failures or static_errors) else 0
 
 
 if __name__ == "__main__":
