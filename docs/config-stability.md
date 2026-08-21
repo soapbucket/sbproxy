@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -208,6 +208,42 @@ see that case, because the key is read.
 |---|---|---|
 | `audit.sink: tracing` | It never selected anything. Emission to the `config_audit`, `security_audit`, and `key_audit` targets has always been unconditional, so `tracing` and `memory` described the same proxy. | `memory` for the same behavior under an honest name, or `chain` with a `path` and a `sign_with` for a hash-chained, signed trail that survives a restart. |
 | `audit.path`, `audit.sign_with` under any sink but `chain` | Nothing would write to the file or sign anything. A path nothing writes to is the more dangerous of the two shapes, because it looks configured. | Set `sink: chain`, or remove the key. |
+
+#### Rego base data that collides with a rule (upgrade-affecting)
+
+`policies[].data` and `ai_routing_policy.data` are unchanged as keys and stay
+`stable`. What narrowed is the set of documents they accept, and a config that
+compiled before this change can refuse after it.
+
+Rego resolves a base-data value over a rule's computed value at the same path,
+per rule rather than per query. The load-time check used to compare the data
+document against the queried rule's path only, so a document that landed on a
+helper rule several references away from the query compiled clean and then made
+that helper a constant: the query still evaluated, the decision still looked
+computed, and a `deny` rule that stopped running failed open with nothing in
+the logs to say so. The check now compares against every rule head the module
+defines. Three shapes refuse where two of them did not before:
+
+| Base data | Rule the module defines | Previously |
+|---|---|---|
+| `data.<pkg>.<helper>` | a rule at that path that is not the query's | compiled, helper silently dead |
+| `data.<pkg>.<rule>` set to JSON `null` | a rule at that path | compiled, rule silently dead |
+| `data.<pkg>` set to a scalar | a rule beneath that path | refused at load with an opaque `previous value is not an object` from the interpreter, or compiled with the rule dead if the query never reached it |
+
+The refusal names the data path, the rule it landed on, and the reference chain
+from the query to that rule:
+
+```
+policy `rego`: base data defines `data.sbproxy.trusted`, and the module defines a rule at
+that path, so Rego resolves the base document there and the rule never evaluates. The query
+`data.sbproxy.allow` reaches it: data.sbproxy.allow -> data.sbproxy.trusted. Move the base
+data under a key no rule in the module produces.
+```
+
+The fix is to move the table off the rule's path. A sibling key inside the
+package (`data.sbproxy.roles` next to an `allow` rule) still loads, and a
+top-level key (`data.allowed_methods`) always did. See
+[`scripting.md`](scripting.md#base-data-the-table-the-rule-reads).
 
 ### Current config-only compatibility fields
 
