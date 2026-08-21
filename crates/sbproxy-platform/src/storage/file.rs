@@ -16,6 +16,17 @@ use bytes::Bytes;
 
 use super::KVStore;
 
+/// How long a release's exclusive claim may sit before the next writer
+/// treats it as a corpse and clears it.
+///
+/// A release holds its claim for two syscalls, so any claim older than this
+/// belongs to a process that died mid-release. `unlock` has no lease TTL of
+/// its own to borrow (the lease is being given up, so its remaining time is
+/// not a bound on anything), which is why this is stated here rather than
+/// threaded through. It only governs corpse reaping; it never extends a
+/// lease or delays a takeover.
+const DEFAULT_CLAIM_TTL_SECS: u64 = 120;
+
 /// File-backed key-value store. All operations are synchronous and
 /// mutex-protected; it is not intended for high-concurrency workloads.
 pub struct FileKVStore {
@@ -88,13 +99,6 @@ impl FileKVStore {
     /// a lease it observed at `generation`.
     fn takeover_marker(path: &std::path::Path, generation: u64) -> PathBuf {
         path.with_extension(format!("take.{generation}"))
-    }
-
-    /// Claim path a renewal must atomically create before it may re-read and
-    /// rewrite the lease. One holder renews one lock, so contention here is
-    /// never routine: it means a second process believes it is the holder.
-    fn renew_claim(path: &std::path::Path) -> PathBuf {
-        path.with_extension("renew")
     }
 
     /// Whether `path` has not been touched for longer than `ttl_secs`.
@@ -467,7 +471,8 @@ impl KVStore for FileKVStore {
         let Ok(observed) = fs::read(&path) else {
             return Ok(false);
         };
-        if decode_lock(&observed).2 != want {
+        let (_, observed_generation, observed_holder) = decode_lock(&observed);
+        if observed_holder != want {
             return Ok(false);
         }
 
@@ -484,18 +489,32 @@ impl KVStore for FileKVStore {
         // would be a self-inflicted outage. "Could not prove ownership on
         // this beat" is what the heartbeat's error path already knows how
         // to ride out, up to its own safety deadline.
-        let claim = Self::renew_claim(&path);
+        // The claim is the generation's marker, the same file a contender
+        // taking this lease over would stake, and that shared name is the
+        // whole point. A renewal and a takeover both end by renaming their
+        // claim onto the lock, so two different claim names would serialize
+        // neither: a takeover could publish generation N+1 while a renewal
+        // that had already passed its compare-and-swap was mid-stage, and
+        // the renewal's rename would then land generation N on top of it.
+        // The fence would go backwards and two nodes would mint the same
+        // generation, which is exactly the hazard the marker exists to
+        // close. One name means one winner.
+        let claim = Self::takeover_marker(&path, observed_generation);
         if !Self::stake_claim(&claim, ttl_secs)? {
             anyhow::bail!(
-                "another renewal holds the exclusive claim {:?}; could not prove \
+                "another writer holds the exclusive claim {:?}; could not prove \
                  ownership of this lease on this beat",
                 claim
             );
         }
         let renewed = renew_under_claim(&claim, &path, &observed, &want, token, ttl_secs);
-        // Never leave the claim behind on a refusal; a successful publish
-        // has already consumed it and this is a no-op.
-        let _ = fs::remove_file(&claim);
+        // Only clear the claim when nothing was published. A successful
+        // publish consumed it by renaming it away, and a peer may already
+        // have staked a fresh claim under the same name, which this would
+        // delete out from under them and leave two writers unexcluded.
+        if matches!(renewed, Ok(false)) {
+            let _ = fs::remove_file(&claim);
+        }
         renewed
     }
 
@@ -514,7 +533,33 @@ impl KVStore for FileKVStore {
         if holder != want {
             return Ok(());
         }
-        self.atomic_write(&path, &encode_lock(0, generation, b""))?;
+        // Release under the same claim discipline as a renewal. This used
+        // to be a blind write, which could put a stale generation back on
+        // top of a peer's newer one and clear its holder along with it, so
+        // a release could undo a takeover that had already happened.
+        let claim = Self::takeover_marker(&path, generation);
+        if !Self::stake_claim(&claim, DEFAULT_CLAIM_TTL_SECS)? {
+            // Somebody else is mid-write on this generation. They either
+            // take the lease over or renew it; either way this lease is no
+            // longer ours to release, and the expiry it already carries is
+            // what frees it.
+            return Ok(());
+        }
+        let released = encode_lock(0, generation, b"");
+        let still_ours = fs::read(&path)
+            .map(|bytes| {
+                let (_, current_generation, current_holder) = decode_lock(&bytes);
+                current_generation == generation && current_holder == want
+            })
+            .unwrap_or(false);
+        if !still_ours {
+            let _ = fs::remove_file(&claim);
+            return Ok(());
+        }
+        stage_into_claim(&claim, &released)?;
+        if !consume_claim(&claim, &path, &released)? {
+            let _ = fs::remove_file(&claim);
+        }
         // Superseded takeover markers cannot be won by anyone now: a
         // contender that observed an older generation fails the re-read
         // check above. Clearing them keeps the directory from accumulating
@@ -833,11 +878,20 @@ mod tests {
         // regressed generation. The claim is what makes the re-read and the
         // write one critical section across processes; `O_CREAT|O_EXCL` is
         // the primitive a shared filesystem serializes.
+        //
+        // The claim is the generation's takeover marker, not a name of the
+        // renewal's own, and that is load bearing: a renewal and a takeover
+        // both finish by renaming their claim onto the lock, so two
+        // different names would exclude neither and a renewal mid-stage
+        // could land its older generation on top of a takeover that had
+        // already published. Planting the marker here is therefore exactly
+        // what a contender taking this lease over would do.
         let (store, dir) = make_store();
         let key = b"acme:lock:claim.example";
         assert!(store.try_lock_fenced(key, b"holder", 60).unwrap().is_some());
         let path = dir.path().join(hex::encode(key));
-        let claim = path.with_extension("renew");
+        let (_, generation, _) = decode_lock(&std::fs::read(&path).expect("read lease"));
+        let claim = FileKVStore::takeover_marker(&path, generation);
 
         // A peer is inside the critical section for this same lock.
         std::fs::write(&claim, b"").expect("plant the claim");

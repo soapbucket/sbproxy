@@ -121,10 +121,10 @@ impl CertStore {
     /// Persist JSON-encoded [`CertMeta`] for a hostname under the legacy
     /// standalone key.
     ///
-    /// Kept for tests and for reading tools that predate WOR-2635. The
-    /// publication path does not use it: metadata now travels inside the
-    /// bundle record so it cannot describe a generation the store does not
-    /// have.
+    /// Test-only. The publication path does not use it: metadata now
+    /// travels inside the bundle record so it cannot describe a generation
+    /// the store does not have. It survives to stage a legacy row that
+    /// migration then has to read.
     // WOR-2635: no production caller remains. The fenced single-record
     // publish replaced this; the only callers left are the tests that
     // stage a legacy record to prove migration still reads one. Gating it
@@ -231,7 +231,8 @@ impl CertStore {
                     tracing::warn!(
                         target: "sbproxy::tls",
                         hostname = %hostname,
-                        "legacy certificate row adopted without a key-pair check:                          the signing key cannot produce its public key"
+                        "legacy certificate row adopted without a key-pair check: \
+                         the signing key cannot produce its public key"
                     );
                 }
                 Err(_) => return Ok(Err(BundleReject::TornLegacy)),
@@ -278,10 +279,10 @@ impl CertStore {
     /// or the whole new one. `generation` is one past whatever is currently
     /// published, and the record carries a digest a reader checks.
     ///
-    /// Crate-internal: the production path publishes through
+    /// Test-only. The production path publishes through
     /// [`Self::put_cert_bundle_fenced`] so every publication is checked
-    /// against the issuance lease. This unfenced form exists for tests and
-    /// single-node tooling inside the crate.
+    /// against the issuance lease; this unfenced form is compiled out of
+    /// real builds so that check cannot be bypassed.
     // WOR-2635: no production caller remains. The fenced single-record
     // publish replaced this; the only callers left are the tests that
     // stage a legacy record to prove migration still reads one. Gating it

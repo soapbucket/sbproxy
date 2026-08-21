@@ -186,8 +186,23 @@ impl CertBundle {
         key_pem: &[u8],
         meta: CertMeta,
     ) -> Result<Self> {
-        crate::cert_resolver::load_certified_key(cert_pem, key_pem)
+        // Parsing both halves does not prove they belong together:
+        // `load_certified_key` reads the chain and the key independently.
+        // `keys_match` compares the key's SubjectPublicKeyInfo against the
+        // certificate's, which is what "a pair" has to mean. A signing key
+        // that cannot produce its public key leaves the pairing unprovable
+        // rather than disproved, so it is allowed through here the same way
+        // legacy adoption allows it.
+        let certified = crate::cert_resolver::load_certified_key(cert_pem, key_pem)
             .context("the certificate and private key being published are not a pair")?;
+        match certified.keys_match() {
+            Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "the certificate and private key being published are not a pair: {e}"
+                ));
+            }
+        }
         let digest = digest_of(generation, hostname, cert_pem, key_pem, &meta);
         Ok(Self {
             version: BUNDLE_VERSION,
@@ -228,8 +243,15 @@ impl CertBundle {
         if bundle.hostname != expect_hostname {
             return Err(BundleReject::HostnameMismatch);
         }
-        if crate::cert_resolver::load_certified_key(&bundle.cert_pem, &bundle.key_pem).is_err() {
-            return Err(BundleReject::KeyMismatch);
+        // Same rule as `new`: parsing is not pairing, so `KeyMismatch`
+        // could never fire on an actual mismatch without this comparison.
+        match crate::cert_resolver::load_certified_key(&bundle.cert_pem, &bundle.key_pem) {
+            Err(_) => return Err(BundleReject::KeyMismatch),
+            Ok(certified) => match certified.keys_match() {
+                Ok(())
+                | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+                Err(_) => return Err(BundleReject::KeyMismatch),
+            },
         }
         Ok(bundle)
     }
