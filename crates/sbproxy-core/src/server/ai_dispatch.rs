@@ -814,6 +814,143 @@ fn resolve_model_alias(
     ))
 }
 
+/// The origin's default model, when every enabled provider that names
+/// one names the same one.
+///
+/// `default_model` is documented on `ProviderConfig` as "Default model
+/// used when the request omits an explicit model", and that rustdoc
+/// ships verbatim as the operator-facing JSON schema. The served and
+/// `/v1/models` paths honored it; the main JSON dispatch path never read
+/// it at all, so a hosted request that omitted `model` carried the empty
+/// string all the way to the wire (WOR-2531).
+///
+/// The empty string is not a harmless placeholder there. `model.is_empty()`
+/// short-circuits `is_model_allowed`, the virtual-key model gate,
+/// model-scoped budgets, provider eligibility, and the compression
+/// runtime, so against an upstream that infers the model itself (an Azure
+/// deployment-scoped `base_url`, a single-model vLLM or Ollama) omitting
+/// `model` reached the provider with the action allowlist,
+/// `blocked_models`, and per-key model scoping all skipped. Substituting
+/// a concrete model is what puts those gates back in the path.
+///
+/// `default_model` is per-provider and provider selection happens
+/// thousands of lines later, so there is no one provider to ask at this
+/// seam. The rule is the one `pick_local_model_name` already states for
+/// the served path: a default applies only when it is unambiguous.
+/// Providers that name nothing abstain; providers disabled for routing
+/// do not get a vote, because a request can never land on one. Two
+/// enabled providers naming different defaults leave the request
+/// modelless exactly as before, which is the honest answer to "which one
+/// did the operator mean".
+///
+/// **Where this does not apply.** The JSON dispatch path only. A
+/// multipart request (audio transcription, image edits, image
+/// variations) that carries no `model` form field keeps the old
+/// behavior, because the multipart rewrite can replace a `model` part
+/// and cannot add one; the multipart seam carries the long version of
+/// that limit. Nothing here reaches the served or `/v1/models` paths
+/// either, which read `default_model` per provider through
+/// `pick_local_model_name` and `model_discovery` and always did.
+fn unambiguous_default_model(config: &AiHandlerConfig) -> Option<String> {
+    let mut chosen: Option<&str> = None;
+    for provider in config.providers.iter().filter(|p| p.enabled) {
+        let Some(candidate) = provider.default_model.as_ref().map(|m| m.as_str()) else {
+            continue;
+        };
+        match chosen {
+            None => chosen = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+    chosen.map(str::to_owned)
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::unambiguous_default_model;
+
+    fn config(providers: serde_json::Value) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": providers
+        }))
+        .expect("AI handler config fixture")
+    }
+
+    #[test]
+    fn one_provider_naming_a_default_supplies_it() {
+        let config = config(serde_json::json!([
+            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"}
+        ]));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn providers_agreeing_on_a_default_supply_it() {
+        let config = config(serde_json::json!([
+            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"},
+            {"name": "azure", "api_key": "x", "default_model": "gpt-4o"}
+        ]));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn a_provider_naming_nothing_abstains_rather_than_disagreeing() {
+        // The common shape: one provider carries the default and the
+        // rest say nothing. Treating an absent value as a disagreement
+        // would make the feature unusable on any multi-provider origin.
+        let config = config(serde_json::json!([
+            {"name": "openai", "api_key": "x"},
+            {"name": "azure", "api_key": "x", "default_model": "gpt-4o"}
+        ]));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn disagreeing_providers_supply_nothing() {
+        // Picking the first would route a modelless request to whichever
+        // provider happens to be listed first, which is not a decision
+        // the operator made.
+        let config = config(serde_json::json!([
+            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"},
+            {"name": "anthropic", "api_key": "x", "default_model": "claude-haiku-4-5"}
+        ]));
+        assert_eq!(unambiguous_default_model(&config), None);
+    }
+
+    #[test]
+    fn a_disabled_provider_does_not_get_a_vote() {
+        // A request can never land on a disabled provider, so its
+        // default cannot be the one the operator meant, and letting it
+        // vote would turn an unambiguous origin ambiguous.
+        let config = config(serde_json::json!([
+            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"},
+            {"name": "retired", "api_key": "x", "default_model": "gpt-3.5", "enabled": false}
+        ]));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn no_provider_naming_one_supplies_nothing() {
+        let config = config(serde_json::json!([
+            {"name": "openai", "api_key": "x"}
+        ]));
+        assert_eq!(unambiguous_default_model(&config), None);
+    }
+}
+
 /// Resolve a JSON request body's `model` field against the alias registry.
 ///
 /// Rewrites the model string and the body together so the request that
@@ -6347,6 +6484,22 @@ pub(super) async fn handle_ai_proxy(
             })?;
             requested_model = Some(route_to.to_string());
         }
+        // WOR-2531 does NOT reach here, and the gap is deliberate. The
+        // JSON path substitutes the origin's unambiguous `default_model`
+        // when the body omits one, which puts the model gates back in
+        // the path. A multipart body cannot take the same treatment:
+        // `rewrite_engine_model` replaces an existing `model` part and
+        // cannot add one (`rewrite_multipart_model` errors when
+        // `multipart_field_range` finds no `model` field), and
+        // `requested_model` being `None` here means exactly that the
+        // part is absent. Calling it anyway would turn a transcription
+        // that works today into a 400 the moment an operator declares a
+        // `default_model` anywhere on the origin, which is a worse
+        // answer than the gap. So on a multipart request with no `model`
+        // form field the allow/block gate below still does not run, the
+        // same as before. Closing it needs a part-insertion helper in
+        // `model_plane`, not a call from here.
+        //
         // WOR-2312: the multipart surfaces (audio transcription, image
         // edits) resolve global aliases too, so one alias means the same
         // model everywhere rather than only on the JSON surfaces. The
@@ -7154,6 +7307,21 @@ pub(super) async fn handle_ai_proxy(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // WOR-2531: the origin's `default_model` applies here, at the one
+    // seam every downstream plane reads its model from, and not at the
+    // per-provider dispatch arms thousands of lines below. Every gate
+    // between here and the wire (`is_model_allowed`, the virtual-key
+    // model gate, model-scoped budgets, provider eligibility, the
+    // compression runtime) short-circuits on an empty model, so a
+    // default applied any later would leave them all skipped for
+    // exactly the requests it was meant to name a model for.
+    if model.is_empty() {
+        if let Some(default_model) = unambiguous_default_model(config) {
+            model = default_model;
+            set_body_model(&mut body, &model);
+        }
+    }
 
     // A governed key's route override defines the effective model for this
     // request. Update both representations before any model gate, budget,
@@ -23171,6 +23339,161 @@ mod ai_error_classification_tests {
                 sbproxy_ai::tracing_spans::error_type::TIMEOUT
             ),
             "timeout"
+        );
+    }
+
+    /// WOR-2531: red first, and red on the security half rather than on
+    /// the rule.
+    ///
+    /// `handle_ai_proxy` read `body["model"]` and substituted the EMPTY
+    /// STRING when the request omitted it, and `default_model` appeared
+    /// nowhere in this file. Empty is not a harmless placeholder: the
+    /// model allow/block gate is `if !model.is_empty() &&
+    /// !config.is_model_allowed(&model)`, so a request that omitted
+    /// `model` walked past a `blocked_models` entry naming the very
+    /// model the origin would have used, and reached the provider. On
+    /// main this test sees a 200 and one upstream hit.
+    #[tokio::test]
+    async fn an_omitted_model_takes_the_origin_default_and_faces_the_block_list() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "retired-model"
+            }],
+            "blocked_models": ["retired-model"]
+        }))
+        .expect("default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the blocked default model is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "the origin's default model is blocked, so the gate must refuse: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a blocked model must not reach the provider"
+        );
+    }
+
+    /// The positive half: with nothing blocking it, the origin's default
+    /// becomes the request's model everywhere downstream, which is what
+    /// puts a value on the access log, the span, and the model-scoped
+    /// budget key that previously carried none.
+    #[tokio::test]
+    async fn an_omitted_model_takes_the_origin_default_on_the_wire() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o"
+            }]
+        }))
+        .expect("default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the defaulted request is dispatched");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_logical_model.as_deref(),
+            Some("gpt-4o"),
+            "the model every downstream plane reads was the empty string before WOR-2531"
+        );
+    }
+
+    /// The boundary the fallback must not cross: two enabled providers
+    /// naming different defaults leave the request modelless, exactly as
+    /// before, rather than routing it to whichever one is listed first.
+    #[tokio::test]
+    async fn disagreeing_defaults_leave_the_request_modelless() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o"
+            }, {
+                "name": "second",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o-mini"
+            }]
+        }))
+        .expect("ambiguous default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the ambiguous request is dispatched unchanged");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_logical_model, None,
+            "an ambiguous origin must not pick a default for the operator"
         );
     }
 
