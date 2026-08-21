@@ -10,8 +10,37 @@
 //! it can check for holes. [`next_seq`](crate::evidence_seq::next_seq)
 //! is that counter: strictly
 //! monotonic per tenant, starting at 1, with no gaps under concurrent
-//! callers, so a receiver that sees `1, 2, 4` for a tenant knows exactly
-//! one record is missing without cross-referencing anything else.
+//! callers, so a receiver that sees `1, 2, 4` for one tenant on one
+//! emitting process knows exactly one record is missing without
+//! cross-referencing anything else.
+//!
+//! # The guarantee is per (instance, tenant), and the record says so
+//!
+//! The counter is process-local and starts every tenant at 1, so the
+//! tenant alone is not a sequence's identity. Two replicas behind a
+//! load balancer serve one tenant and each hand out 1, 2, 3, and a
+//! restarted replica hands out 1 again after reaching 901. A receiver
+//! grouping only by tenant reads the first as an undetectable
+//! interleaving and the second as a 900-record rollback, and both
+//! readings are wrong.
+//!
+//! So every record carries [`crate::instance::instance_id`] alongside
+//! its sequence, as `sbproxy.evidence.instance` beside
+//! `sbproxy.evidence.seq`, and the property a consumer may rely on is
+//! this: **within one `sbproxy.evidence.instance`, one tenant's
+//! sequence is gapless and strictly increasing.** Group by
+//! `(sbproxy.evidence.instance, sbproxy.tenant.id)` and a hole is a
+//! real hole. The instance identifier is fresh on every process start
+//! by construction, which is what makes a restart look like a new
+//! sequence rather than like a rollback of the old one.
+//!
+//! What that costs a receiver: it cannot tell a replica that was
+//! shut down deliberately from one that was killed mid-stream, because
+//! a sequence that simply stops looks the same either way. Detecting
+//! *that* would need the emitter to announce its own last record,
+//! which a process being killed cannot do. Holes inside a run, which
+//! is what a lossy transport produces, are detectable; a truncated
+//! tail is not.
 //!
 //! # Bounded, mirroring the egress sightings inventory
 //!
@@ -101,7 +130,13 @@ fn registry_saturated() -> &'static std::sync::atomic::AtomicBool {
 /// rather than racing a read-modify-write and losing one.
 ///
 /// Distinct tenants have fully independent sequences; tenant `"acme"`
-/// reaching 40 says nothing about where tenant `"globex"` is.
+/// reaching 40 says nothing about where tenant `"globex"` is. So do
+/// distinct processes: this counter lives in memory and starts at 1 in
+/// every replica and after every restart, which is why the caller
+/// stamps [`crate::instance::instance_id`] on the record next to the
+/// value returned here (see the module docs). A consumer that groups
+/// by tenant alone, without the instance, is reading two sequences as
+/// one.
 ///
 /// Once this process has seen [`MAX_TRACKED_TENANTS`] distinct tenants,
 /// the next new one does not get a dedicated counter: it draws from a

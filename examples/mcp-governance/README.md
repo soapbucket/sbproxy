@@ -222,7 +222,7 @@ Every scenario above emitted a `mcp_governance_decision` record to `mcp-governan
 tail -n 8 mcp-governance-events.ndjson | jq -c '{event_type, tenant_id, data: {tool: .data["gen_ai.tool.name"], server: .data["sbproxy.tool.server"], verdict: .data["sbproxy.decision.verdict"], reason: .data["sbproxy.decision.reason"], rule: .data["sbproxy.decision.rule_id"], seq: .data["sbproxy.evidence.seq"]}}'
 ```
 
-One line per decision, RBAC deny, argument-policy deny, flow deny, draft deny, content-filter warn, and the plain allows in between, each carrying `sbproxy.evidence.seq`: a per-tenant, gapless counter, so a SIEM consuming this file can tell a dropped record from a quiet afternoon.
+One line per decision, RBAC deny, argument-policy deny, flow deny, draft deny, content-filter warn, and the plain allows in between, each carrying `sbproxy.evidence.seq`: a counter that is gapless per tenant within one emitting process, so a SIEM consuming this file can tell a dropped record from a quiet afternoon. The record also carries `sbproxy.evidence.instance`, the identifier of the process that minted the number, because every replica and every restart starts a fresh sequence at 1.
 
 ## Privacy note on `mcp_audit.capture_arguments`
 

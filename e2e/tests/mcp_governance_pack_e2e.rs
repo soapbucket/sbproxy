@@ -962,11 +962,15 @@ fn read_ndjson_lines(path: &Path, min_lines: usize, timeout: Duration) -> Vec<Va
 }
 
 /// Every governed decision -- allowed or refused -- carries
-/// `sbproxy.evidence.seq`, a per-tenant counter that starts at 1 and
-/// never skips. Four decisions of different kinds land on one fresh
-/// tenant here (an RBAC deny, an argument-policy deny, a draft-server
-/// deny, and a plain allow); their recorded sequence numbers must be
-/// exactly `1..=N` with no gaps.
+/// `sbproxy.evidence.seq`, a counter that starts at 1 and never skips
+/// for one tenant on one emitting process, and
+/// `sbproxy.evidence.instance`, which names that process. Four
+/// decisions of different kinds land on one fresh tenant here (an RBAC
+/// deny, an argument-policy deny, a draft-server deny, and a plain
+/// allow); their recorded sequence numbers must be exactly `1..=N` with
+/// no gaps, and every one of them must name the single proxy process
+/// this harness started, because a sequence with no emitter on it is
+/// one a receiver cannot group.
 #[test]
 fn governance_evidence_carries_a_gapless_per_tenant_sequence() {
     let upstream = MockMcpUpstream::start();
@@ -1031,6 +1035,33 @@ fn governance_evidence_carries_a_gapless_per_tenant_sequence() {
     assert_eq!(
         seqs, expected,
         "evidence sequence must be gapless starting at 1, got: {seqs:?}"
+    );
+
+    // The counter is process-local, so the number above only scopes to
+    // a run once the record says which process minted it.
+    let instances: Vec<&str> = lines
+        .iter()
+        .filter(|line| line["event_type"] == "mcp_governance_decision")
+        .map(|line| {
+            line["data"]["sbproxy.evidence.instance"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every evidence record names its emitter: {line}"))
+        })
+        .collect();
+    assert_eq!(
+        instances.len(),
+        seqs.len(),
+        "one instance id per sequence number: {lines:?}"
+    );
+    let distinct: std::collections::BTreeSet<&str> = instances.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "one proxy process must stamp one instance id: {distinct:?}"
+    );
+    assert!(
+        !distinct.iter().any(|id| id.is_empty()),
+        "the instance id must not be empty: {distinct:?}"
     );
 
     let _ = std::fs::remove_file(&lockfile);

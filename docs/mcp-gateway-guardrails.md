@@ -223,7 +223,10 @@ feed.
 
 Every guardrail above, plus RBAC, quotas, and the version gate, emits an
 `mcp_governance_decision` record over `events:` when a sink is configured,
-carrying a per-tenant gapless sequence number (`sbproxy.evidence.seq`).
+carrying a gapless sequence number (`sbproxy.evidence.seq`) and the
+identifier of the process that minted it (`sbproxy.evidence.instance`).
+The sequence is gapless per tenant per emitting process, so a SIEM rule
+groups on both fields; see [mcp-security.md](mcp-security.md).
 Naming the type under `events.fail_closed` refuses the governed call
 instead of serving it silently when the record cannot be queued.
 

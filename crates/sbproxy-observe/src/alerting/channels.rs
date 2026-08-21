@@ -606,30 +606,18 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Per-process instance identifier, lazily computed once per process.
-/// Mirrors `sbproxy_core::identity::instance_id` so receivers see the
-/// same value across all webhook surfaces (we duplicate the helper here
-/// to avoid a cross-crate dep, since `sbproxy-core` already depends on us).
+/// Per-process instance identifier for the alert envelope and the
+/// `X-Sbproxy-Instance` header.
+///
+/// This used to be a second copy of the same host-plus-random-tag
+/// derivation, which meant the alert surfaces and the evidence records
+/// carried two independently random identifiers for one process.
+/// Everything in this crate now reads the one in
+/// [`crate::instance`]. `sbproxy_core::identity::instance_id` remains
+/// separate and mints its own tag, so the callback surfaces it stamps
+/// still disagree with these.
 fn instance_id() -> &'static str {
-    use std::sync::OnceLock;
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        let host = std::env::var("HOSTNAME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or_else(|| "sbproxy".to_string())
-            .replace('.', "-");
-        let tag: u32 = rand::random();
-        format!("{host}-{tag:08x}")
-    })
+    crate::instance::instance_id()
 }
 
 // --- Tests ---
