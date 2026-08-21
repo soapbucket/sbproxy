@@ -578,7 +578,12 @@ pub struct RollupStore {
 
 impl RollupStore {
     /// Open (or create) the store at `path`, creating both tables.
+    ///
+    /// Pre-created owner-only: redb calls `File::create` itself, so the
+    /// rollup of per-tenant usage landed at whatever the umask allowed.
+    /// redb opens an existing file rather than replacing it.
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        sbproxy_util::secure_fs::ensure_file_owner_only(path)?;
         let db = Database::create(path)?;
         let txn = db.begin_write()?;
         {

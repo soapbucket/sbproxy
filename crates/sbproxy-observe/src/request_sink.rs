@@ -155,11 +155,15 @@ impl FileEventSink {
     /// writer thread. Fails only when the file cannot be opened or the
     /// thread cannot be spawned; both are startup problems the caller
     /// reports rather than a per-event failure mode.
+    ///
+    /// The file is owner-only (`0o600`). Request events carry the
+    /// route, the identity, and the decision for every call the proxy
+    /// served, so a world-readable copy on a shared host is a
+    /// disclosure of exactly the traffic the operator asked to record.
+    /// A file that already exists at a looser mode is tightened rather
+    /// than inherited; see [`sbproxy_util::secure_fs`].
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = sbproxy_util::secure_fs::open_append_owner_only(path)?;
         let (tx, rx) = sync_channel::<RequestEvent>(QUEUE_CAPACITY);
         let handle = std::thread::Builder::new()
             .name("sbproxy-request-events".to_string())
@@ -616,6 +620,39 @@ mod tests {
             value.as_str(),
             Some("Bearer sk-abc123def456ghi789jkl012"),
             "x value should be redacted"
+        );
+    }
+
+    /// WOR-2626: the request event file records the route, the
+    /// identity, and the decision for every call served, so it must be
+    /// owner-only.
+    ///
+    /// The file is pre-created world-readable rather than left to the
+    /// ambient umask, so this is red before the fix whatever the
+    /// runner's umask is, and it proves the tightening half of the
+    /// contract rather than only the creation half.
+    #[cfg(unix)]
+    #[test]
+    fn the_event_file_is_owner_only_even_when_it_already_existed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("request-events.ndjson");
+        std::fs::write(&path, b"").expect("pre-create the event file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the pre-created event file");
+
+        let sink = FileEventSink::create(&path).expect("open the event sink");
+        drop(sink);
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat the event file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "request event file is {mode:o}, not owner-only"
         );
     }
 }

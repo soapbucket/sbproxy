@@ -8,13 +8,21 @@ publish = false
 [features]
 default = []
 
-# No workspace crate appears here, and none may. This crate must stay
-# compilable by an operator who meters a plain REST API and has no interest in
-# the AI stack, so it depends on none of sbproxy-core, sbproxy-modules,
-# sbproxy-ai, or sbproxy-config. The third-party entries below are what the
-# hash chain in `ledger` costs: hashing, hex, Ed25519, a timestamp, a mutex,
-# JSON, an error type, and a log line.
+# One workspace crate appears here and only one may: sbproxy-util, the
+# std-only leaf. It carries no dependencies of its own, so it cannot
+# reintroduce the coupling this list exists to prevent. Everything else is
+# still barred: this crate must stay compilable by an operator who meters a
+# plain REST API and has no interest in the AI stack, so it depends on none of
+# sbproxy-core, sbproxy-modules, sbproxy-ai, or sbproxy-config. The
+# third-party entries below are what the hash chain in `ledger` costs:
+# hashing, hex, Ed25519, a timestamp, a mutex, JSON, an error type, and a log
+# line.
 [dependencies]
+# WOR-2626: owner-only creation of the signed ledger file. Inlining the
+# helper here instead is how the workspace ended up with four duration
+# parsers.
+sbproxy-util.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

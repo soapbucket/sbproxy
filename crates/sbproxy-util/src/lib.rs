@@ -6,8 +6,15 @@
 //! behavior). Consolidating them here (WOR-1705) gives each family exactly
 //! one implementation. The crate is a true leaf: it depends on `std` only,
 //! so any crate may depend on it without introducing a cycle.
+//!
+//! [`secure_fs`] is the one module here that touches the outside world.
+//! It lives beside the pure helpers for the same reason they do: every
+//! durable sink in the workspace needs it, and a copy per crate is how
+//! the four duration parsers happened.
 
 #![deny(missing_docs)]
+
+pub mod secure_fs;
 
 use std::borrow::Cow;
 use std::time::Duration;

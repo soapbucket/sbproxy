@@ -1,6 +1,6 @@
 # SBproxy threat model
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 This is the threat-model companion to [`operator-runbook.md`](operator-runbook.md).
 It records the operator-facing assumptions that should be revisited at the end
@@ -164,6 +164,24 @@ compensates.
   never executes any pre-/post-hooks or scripts shipped inside an artifact;
   artifacts are served as opaque bytes. See [`agent-skills.md`](agent-skills.md)
   for the full integrity and archive-safety contract.
+- **Durable sinks on a shared host:** the signed usage ledger, the
+  settlement database and its WAL sidecars, request events, session
+  ledger records, and the AI usage feed are created `0o600`, and a file
+  that already exists at a looser mode is tightened on open rather than
+  inherited. The mode goes into the `open(2)` call rather than a `chmod`
+  after it, so the file never exists at a wider mode: a create-then-chmod
+  leaves a window in which another local account can open a descriptor
+  and keep reading through the tightening. Directories the proxy creates
+  for its own state are `0o700`, because a `0o600` file in a traversable
+  directory still discloses its name, its size, and its existence, and a
+  ledger filename can carry a tenant. Two gaps stay open on purpose and
+  belong to the local operator, not to the proxy: a directory that
+  already exists keeps the mode it has, since a sink path may sit under a
+  deliberately shared `/var/log`, and Windows has no POSIX permission
+  bits, so files there inherit the containing directory's ACL. What none
+  of this defends against is an account that can already read the proxy's
+  own user; the boundary here is other local accounts, not privilege
+  escalation to the proxy's.
 
 ## Review Checklist
 
@@ -172,6 +190,8 @@ compensates.
 - New outbound calls have timeouts and failure modes.
 - New dashboards link to a runbook section.
 - New closed-enum values use the fast-track ADR template when eligible.
+- New durable files are created through `sbproxy_util::secure_fs` rather
+  than `std::fs` directly, so their mode is set in the open.
 
 ## Examples in Practice
 

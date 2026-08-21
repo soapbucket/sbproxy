@@ -215,6 +215,9 @@ pub trait UsageSink: Send + Sync + std::fmt::Debug {
 }
 
 /// A sink that appends one JSON object per line to a file.
+///
+/// The file is owner-only (`0o600`), created and kept that way by
+/// [`sbproxy_util::secure_fs`].
 #[derive(Debug)]
 pub struct JsonlFileSink {
     path: std::path::PathBuf,
@@ -237,11 +240,12 @@ impl UsageSink for JsonlFileSink {
                 return;
             }
         };
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        // Owner-only (`0o600`). A usage line carries the tenant, the
+        // model, and the token counts that price it, and this open
+        // runs once per event, so the tightening also re-asserts the
+        // mode if something loosened the file underneath a long-lived
+        // process.
+        match sbproxy_util::secure_fs::open_append_owner_only(&self.path) {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{line}") {
                     tracing::warn!(error = %e, path = %self.path.display(), "usage sink: write failed");
@@ -2239,5 +2243,47 @@ mod tests {
                     && e.host == synthetic_host),
             "record() must not recompute the synthetic default from a fresh environment scan"
         );
+    }
+
+    /// WOR-2626: a usage line carries the tenant, the model, and the
+    /// token counts that price it, so the JSONL feed must be
+    /// owner-only.
+    ///
+    /// This sink reopens its file on every event, so the test asserts
+    /// twice: once on the file this call created, and once after
+    /// something loosens it underneath a running process. The second
+    /// half is the one a create-time mode alone cannot satisfy.
+    #[cfg(unix)]
+    #[test]
+    fn the_jsonl_feed_is_owner_only_and_stays_that_way() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("usage.jsonl");
+        let sink = JsonlFileSink::new(&path);
+
+        sink.record(&sample_event());
+        let created = std::fs::metadata(&path)
+            .expect("stat the feed")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(created, 0o600, "new feed is {created:o}, not owner-only");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the feed behind the sink's back");
+        sink.record(&sample_event());
+        let reopened = std::fs::metadata(&path)
+            .expect("stat the feed")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            reopened, 0o600,
+            "reopened feed is {reopened:o}; a loosened file must be tightened, not inherited"
+        );
+
+        let written = std::fs::read_to_string(&path).expect("read the feed");
+        assert_eq!(written.lines().count(), 2, "both events were appended");
     }
 }
