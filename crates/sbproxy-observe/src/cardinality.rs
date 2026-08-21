@@ -10,14 +10,12 @@ use std::sync::Mutex;
 /// Sentinel value used when a label exceeds its cardinality cap.
 pub const OTHER_LABEL: &str = "__other__";
 
-/// Log when a label value is demoted due to cardinality limit.
-pub fn log_demotion(label_name: &str, value: &str) {
-    tracing::warn!(
-        label = label_name,
-        value = value,
-        "label value demoted to __other__ due to cardinality limit"
-    );
-}
+/// Message emitted the first time a label exhausts its budget.
+///
+/// Named so the test that asserts "once, and without the value" can
+/// count occurrences of it.
+const SATURATION_MESSAGE: &str =
+    "label budget exhausted; new values for this label are now demoted to __other__";
 
 /// Configuration for cardinality limiting.
 #[derive(Debug, Clone)]
@@ -170,6 +168,27 @@ pub struct CardinalityLimiter {
     /// Populated at config-compile by
     /// `lifecycle::install_tenant_cardinality_state`.
     tenant_caps: Mutex<HashMap<String, usize>>,
+    /// Label names this limiter has already announced the saturation
+    /// of, so the announcement is one line per label rather than one
+    /// per demoted value.
+    ///
+    /// The accepted-value set never shrinks, so a label at its cap
+    /// demotes every subsequent unseen value for the life of the
+    /// process. `project`, `feature`, `team`, `environment`, and
+    /// `agent_type` arrive on `SB-Attr-*` request headers and nothing
+    /// upstream bounds them (see the budget table above), so a client
+    /// sending a distinct value per request would otherwise buy itself
+    /// one warn line per request, forever, each carrying its own
+    /// string. Latching on the label name is bounded because label
+    /// names are a closed set this crate declares; the demoted value
+    /// is caller-controlled and is deliberately not in the line at
+    /// all.
+    ///
+    /// Held per limiter rather than in a process-global latch so the
+    /// bound is testable against a throwaway limiter. Production has
+    /// exactly one limiter (`metrics::global_limiter`), so per limiter
+    /// and per process are the same thing there.
+    saturation_warned: Mutex<HashSet<String>>,
 }
 
 impl CardinalityLimiter {
@@ -180,6 +199,7 @@ impl CardinalityLimiter {
             seen: Mutex::new(HashMap::new()),
             tenant_seen: Mutex::new(HashMap::new()),
             tenant_caps: Mutex::new(HashMap::new()),
+            saturation_warned: Mutex::new(HashSet::new()),
         }
     }
 
@@ -215,22 +235,30 @@ impl CardinalityLimiter {
                 .copied()
                 .unwrap_or(self.config.max_per_label)
         };
-        let mut guard = self
-            .tenant_seen
-            .lock()
-            .expect("cardinality limiter tenant_seen mutex poisoned");
-        let key = (tenant_id.to_string(), label_name.to_string());
-        let set = guard.entry(key).or_default();
-        if set.contains(value) {
-            return value.to_string();
+        let demoted = {
+            let mut guard = self
+                .tenant_seen
+                .lock()
+                .expect("cardinality limiter tenant_seen mutex poisoned");
+            let key = (tenant_id.to_string(), label_name.to_string());
+            let set = guard.entry(key).or_default();
+            if set.contains(value) {
+                return value.to_string();
+            }
+            if set.len() < cap {
+                set.insert(value.to_string());
+                false
+            } else {
+                true
+            }
+        };
+        // The guard is gone before the announcement, for the reason
+        // `note_saturated` documents.
+        if demoted {
+            self.note_saturated(label_name);
+            return OTHER_LABEL.to_string();
         }
-        if set.len() < cap {
-            set.insert(value.to_string());
-            value.to_string()
-        } else {
-            log_demotion(label_name, value);
-            OTHER_LABEL.to_string()
-        }
+        value.to_string()
     }
 
     /// WOR-1067: count of unique accepted values for a tenant + label
@@ -275,24 +303,77 @@ impl CardinalityLimiter {
     /// Internal helper: sanitize with an explicit cap. Used by both
     /// the workspace-default and per-label-budget paths above.
     fn sanitize_with_cap(&self, label_name: &str, value: &str, cap: usize) -> String {
-        let mut guard = self
-            .seen
-            .lock()
-            .expect("cardinality limiter mutex poisoned");
-        let set = guard.entry(label_name.to_string()).or_default();
+        let demoted = {
+            let mut guard = self
+                .seen
+                .lock()
+                .expect("cardinality limiter mutex poisoned");
+            let set = guard.entry(label_name.to_string()).or_default();
 
-        if set.contains(value) {
-            // Fast path: already accepted.
-            return value.to_string();
-        }
+            if set.contains(value) {
+                // Fast path: already accepted.
+                return value.to_string();
+            }
 
-        if set.len() < cap {
-            set.insert(value.to_string());
-            value.to_string()
-        } else {
-            log_demotion(label_name, value);
-            OTHER_LABEL.to_string()
+            if set.len() < cap {
+                set.insert(value.to_string());
+                false
+            } else {
+                true
+            }
+        };
+        // The guard is gone before the announcement, for the reason
+        // `note_saturated` documents.
+        if demoted {
+            self.note_saturated(label_name);
+            return OTHER_LABEL.to_string();
         }
+        value.to_string()
+    }
+
+    /// Announce, at most once per label name for this limiter, that
+    /// `label_name` has exhausted its budget and is demoting new
+    /// values.
+    ///
+    /// Called with no lock held. `tracing` runs subscriber code of
+    /// unbounded cost, and a sink installed under that subscriber can
+    /// re-enter the limiter to sanitize a label of its own, which
+    /// under the `seen` guard is a self-deadlock on a non-reentrant
+    /// mutex.
+    ///
+    /// The line names the label and never the demoted value: the value
+    /// is caller-controlled, and it is the label whose budget an
+    /// operator has to raise.
+    ///
+    /// What this cannot see: the tenant. A tenant-scoped saturation is
+    /// announced under its label name alone, so the first tenant to
+    /// fill a label mutes the line for every other tenant on that
+    /// label. Latching on `(tenant, label)` would hand back the same
+    /// unbounded growth, because the tenant id is caller-controlled
+    /// too. The tenant dimension is on
+    /// `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label, tenant_id}`
+    /// instead.
+    fn note_saturated(&self, label_name: &str) {
+        {
+            // Poison recovery rather than a panic, unlike the sets
+            // above: this one holds nothing but "have we said this
+            // already", so a thread that died mid-insert leaves
+            // nothing worth refusing to read. The worst outcome is one
+            // repeated line.
+            let mut guard = self
+                .saturation_warned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.insert(label_name.to_string()) {
+                return;
+            }
+        }
+        tracing::warn!(
+            label = label_name,
+            "{SATURATION_MESSAGE}; logged once per label, \
+             sbproxy_label_cardinality_unique_values and \
+             sbproxy_label_cardinality_overflow_total carry the rate"
+        );
     }
 
     /// Return the current count of unique accepted values for a label.
@@ -351,6 +432,14 @@ impl CardinalityLimiter {
             .lock()
             .expect("cardinality limiter tenant_caps mutex poisoned");
         caps_guard.clear();
+        // Cleared with the sets it describes: a limiter whose accepted
+        // values are gone has not saturated anything, so the next
+        // saturation is news again.
+        let mut warned_guard = self
+            .saturation_warned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        warned_guard.clear();
     }
 }
 
@@ -367,16 +456,19 @@ mod tests {
         })
     }
 
-    // --- log_demotion ---
+    // --- saturation notice ---
 
     #[test]
-    fn log_demotion_does_not_panic() {
-        // log_demotion is a tracing call; verify it runs without panicking.
-        log_demotion("origin", "overflow-value");
+    fn note_saturated_does_not_panic() {
+        // The notice is a tracing call behind a latch; verify both
+        // the announcing and the already-announced path run.
+        let lim = limiter_with_max(1);
+        lim.note_saturated("origin");
+        lim.note_saturated("origin");
     }
 
     #[test]
-    fn sanitize_calls_log_demotion_on_overflow() {
+    fn sanitize_demotes_on_overflow() {
         // After the cap is reached, sanitize returns __other__ (demotion occurred).
         let lim = limiter_with_max(2);
         lim.sanitize("lbl", "a");
@@ -693,6 +785,80 @@ mod tests {
         assert_eq!(lim.tenant_unique_count("a", "agent"), 5);
         // A's overflow attempt did not bleed into B.
         assert_eq!(lim.sanitize_tenant("b", "agent", "b-value-3"), "b-value-3");
+    }
+
+    /// The demotion signal is one line per saturated label, and never
+    /// carries the demoted value.
+    ///
+    /// The seam is the demotion arm of `sanitize_with_cap`, which used
+    /// to call a `log_demotion` that emitted one `tracing::warn!` per
+    /// demoted value with the value in it. The accepted-value set
+    /// never shrinks, so a label at its cap demotes forever: with the
+    /// old call this capture holds five lines carrying five
+    /// attacker-chosen strings, and in production it holds one line
+    /// per request for the life of the process.
+    #[test]
+    fn a_saturated_label_announces_once_and_never_carries_the_demoted_value() {
+        #[derive(Clone)]
+        struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+        struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+            type Writer = SharedLogGuard;
+            fn make_writer(&'a self) -> Self::Writer {
+                SharedLogGuard(Arc::clone(&self.0))
+            }
+        }
+        impl std::io::Write for SharedLogGuard {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log capture").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+
+        let lim = limiter_with_max(1);
+        tracing::subscriber::with_default(subscriber, || {
+            // The demotion callsite caches its `Interest` against
+            // whatever subscriber was active the first time this
+            // process evaluated it, process-wide rather than per test.
+            // Without this rebuild the freshly installed subscriber
+            // above can never see the event, and the assertions below
+            // would pass for the wrong reason.
+            tracing::callsite::rebuild_interest_cache();
+            assert_eq!(
+                lim.sanitize("origin", "accepted.example.com"),
+                "accepted.example.com"
+            );
+            // Stands in for a client sending a distinct `SB-Attr-*`
+            // value per request once the budget is full.
+            for i in 0..5 {
+                let unseen = format!("caller-chosen-{i}.example.com");
+                assert_eq!(lim.sanitize("origin", &unseen), OTHER_LABEL);
+            }
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("utf8 log");
+        assert_eq!(
+            output.matches(SATURATION_MESSAGE).count(),
+            1,
+            "five demotions must announce once, got: {output}"
+        );
+        assert!(
+            !output.contains("caller-chosen-"),
+            "the demoted value must not reach the log line: {output}"
+        );
     }
 
     /// WOR-1067: the synthetic `__default__` tenant falls through to
