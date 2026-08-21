@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1431,7 +1431,7 @@ origins:
 | `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
-| `locality` | object | `{min_pool_size: 2}` | Zone-locality tuning. `min_pool_size` deactivates the same-zone preference when fewer eligible targets remain (the same guard as Envoy's `min_cluster_size`); the stage itself needs no block, only `proxy.zone` (or `SB_ZONE`) plus `targets[].zone` labels. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). |
+| `locality` | object | `{min_pool_size: 2}` | Zone-locality tuning. `min_pool_size` deactivates the same-zone preference when the deployment-filtered pool is smaller than this. The pool is counted before health filtering, as Envoy counts cluster hosts for `min_cluster_size`, so a health flap can never toggle the stage on and off. The stage itself needs no block, only `proxy.zone` (or `SB_ZONE`) plus `targets[].zone` labels. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). |
 
 Algorithms:
 
@@ -1593,6 +1593,7 @@ origins:
 | `routing` | string \| object | `round_robin` | Routing strategy. Either a flat string or `{strategy: ..., ...}`. |
 | `context_window_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a prompt overflows the model's context window. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
 | `content_policy_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a provider refuses on content-policy grounds. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
+| `max_price_per_request` | number | unset (gate off) | Hard per-request price ceiling in USD. Each routing candidate on a token-priced chat surface (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is priced before selection; candidates over the ceiling are dropped, and a fully excluded set refuses with `402`. Must be positive when set; a value at or below zero is refused at config load. The `x-sbproxy-max-price` request header tightens the ceiling for one request but can never raise it, and sending that header to a surface the estimate does not model returns `400`. See [Per-request price ceiling](ai-gateway.md#per-request-price-ceiling). |
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
@@ -1609,7 +1610,7 @@ origins:
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
 Peak EWMA accepts the object form:
 
@@ -2110,7 +2111,7 @@ resilience:
     healthy_threshold: 2
 ```
 
-When `resilience` is set, retries fan across providers up to `min(providers.len(), 5)` attempts; ejected providers are skipped on the second and later attempts.
+`resilience` on its own does not add an attempt. A second attempt needs a routing plan that has somewhere to go: `routing.strategy: fallback_chain`, `resilience.content_policy_fallback: true`, or a typed fallback list. With one of those, the dispatch loop visits each configured provider at most once, so the attempt ceiling is the provider count and no separate key raises it. Circuit-broken, ejected, and cooling-down providers are skipped on the second and later attempts.
 
 The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `cooldown_policy` (per-failure-class provider cooldown seconds), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). The typed reroute lists, `context_window_fallbacks` and `content_policy_fallbacks`, are siblings of `routing:` on the action rather than resilience keys. Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 

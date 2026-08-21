@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -87,8 +87,10 @@ set (`500`/`502`/`503`) or when the classified cause clears the policy. A
 class with an explicit count caps its retries; a class with no entry uses
 its default retryability. The classification used for this decision is
 status-only (the retryable classes do not need the body); the total attempt
-count is still capped internally at the configured provider count, up to a
-maximum of 5, not by a separate config key.
+count is bounded by the number of configured providers rather than by a
+separate config key, since the dispatch loop visits each one at most once.
+A `retry_policy` count above the provider count therefore does not buy
+extra tries.
 
 ## Per-error cooldown policy
 
@@ -169,7 +171,7 @@ How a request moves through the triggers:
 
 ```mermaid
 flowchart TD
-    EST["Pre-flight token estimate\n(chat completions; runs after\ncompression, if configured)"] --> FIT{"Estimate fits the primary's\nmapped model window?"}
+    EST["Pre-flight token estimate\n(chat, messages, responses;\nruns after compression,\nif configured)"] --> FIT{"Estimate fits the primary's\nmapped model window?"}
     FIT -->|overflows| CWPRE{"context_window_fallbacks\ncandidate whose window fits?"}
     FIT -->|fits| DISPATCH["Dispatch to the current candidate"]
     CWPRE -->|yes| CW["Typed candidates move to the front\n(trigger: context_window,\nbefore dispatch or stream open)"]

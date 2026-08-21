@@ -508,6 +508,12 @@ pub mod error_type {
     pub const UPSTREAM_5XX: &str = "upstream_5xx";
     /// The upstream request or response stream timed out.
     pub const TIMEOUT: &str = "timeout";
+    /// The gateway refused the request before dispatch because the
+    /// caller's own input was unusable: a malformed header value, or a
+    /// demand the surface cannot honor. Distinct from
+    /// [`BUDGET_EXCEEDED`], which is the gateway declining a
+    /// well-formed request on spend grounds.
+    pub const INVALID_REQUEST: &str = "invalid_request";
 }
 
 /// Mark an AI span as failed (WOR-1231).

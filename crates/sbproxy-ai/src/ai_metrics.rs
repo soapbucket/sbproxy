@@ -601,13 +601,23 @@ static AI_PRICE_CEILING: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
     .ok()
 });
 
-/// Record a per-request price-ceiling outcome (WOR-2559). `outcome` is
-/// `candidate_excluded` (one routing candidate's estimate exceeded the
-/// ceiling and it was dropped from the eligible set) or `refused` (every
-/// candidate was over the ceiling, so the request failed closed with
-/// 402). A rising `candidate_excluded` rate with a flat `refused` rate
-/// means the ceiling is trimming the expensive tier; a rising `refused`
-/// rate means it is blocking traffic outright.
+/// Record a per-request price-ceiling outcome (WOR-2559). `outcome` is a
+/// closed set of four:
+///
+/// - `candidate_excluded`: one routing candidate's estimate exceeded the
+///   ceiling and it was dropped from the eligible set.
+/// - `refused`: every candidate was over the ceiling, so the request
+///   failed closed with 402.
+/// - `invalid_header`: the caller's `x-sbproxy-max-price` was not a
+///   positive USD amount, answered 400.
+/// - `unsupported_surface`: the caller set that header on a surface the
+///   per-token estimate cannot price, answered 400.
+///
+/// A rising `candidate_excluded` rate with a flat `refused` rate means
+/// the ceiling is trimming the expensive tier; a rising `refused` rate
+/// means it is blocking traffic outright. The two 400 outcomes are
+/// caller mistakes rather than gateway decisions, so alert on them
+/// separately or not at all.
 ///
 /// A request has two candidate sets the ceiling can filter, the provider
 /// order and a confidence cascade's tier list, and both count here. On a
@@ -619,6 +629,55 @@ pub fn record_price_ceiling(outcome: &str) {
         return;
     };
     counter.with_label_values(&[outcome]).inc();
+}
+
+// --- Per-error-class provider cooldowns (WOR-2556) ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` above: the production unwrap/expect ratchet is at
+/// its baseline and one metric family is not worth a panic path on a
+/// request the process is already serving.
+static AI_PROVIDER_COOLDOWNS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_provider_cooldowns_total",
+            "AI providers parked out of rotation by a classified-failure cooldown (WOR-2556)"
+        ),
+        &["provider", "cause"]
+    )
+    .ok()
+});
+
+/// Record one provider parked out of rotation by a
+/// `resilience.cooldown_policy` match (WOR-2556).
+///
+/// `cause` is the closed `FailureCause` label set and nothing else:
+/// `timeout`, `rate_limit`, `context_window_exceeded`, `content_policy`,
+/// `auth`, `server_error`, `bad_request`, `unknown`. `provider` is an
+/// operator-declared `providers[].name`, so it is bounded by the config
+/// rather than by traffic.
+///
+/// Both labels still pass the workspace cardinality limiter as a
+/// backstop, so a future call site that hands this an open value demotes
+/// to `__other__` instead of minting unbounded series, the same contract
+/// [`record_translation_dropped`] holds.
+///
+/// The counter exists because the cooldown axis is otherwise invisible:
+/// parking a provider is the moment traffic stops reaching it, and
+/// before this the only record was a rotating `warn!` line, which is
+/// neither alertable nor graphable. The comparable axis, the circuit
+/// breaker, has published `sbproxy_circuit_breaker_transitions_total`
+/// all along. `rate(sbproxy_ai_provider_cooldowns_total[5m]) > 0` is the
+/// expression an operator wants when a rotated credential parks the
+/// whole pool on `cause="auth"`.
+pub fn record_provider_cooldown(provider: &str, cause: &str) {
+    let Some(counter) = &*AI_PROVIDER_COOLDOWNS else {
+        return;
+    };
+    let metric = "sbproxy_ai_provider_cooldowns_total";
+    let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
+    let cause = sbproxy_observe::metrics::sanitize_label_budget(metric, "cause", cause);
+    counter.with_label_values(&[&provider, &cause]).inc();
 }
 
 // --- Shadow supervisor metrics ---
@@ -1654,8 +1713,8 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// closed set (`ok`, `guardrail_block`, `content_filter`,
 /// `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`,
 /// `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`,
-/// `data_posture_block`, `refusal`, `client_error`, `other`) so
-/// cardinality stays bounded.
+/// `data_posture_block`, `price_ceiling_block`, `refusal`,
+/// `client_error`, `other`) so cardinality stays bounded.
 static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(

@@ -13,14 +13,36 @@
 //! are cached in [`SemanticRouteState`], so the steady-state cost is one
 //! embedding call per request. Declared centroids never embed.
 //!
+//! That first-use build is the one place this strategy can amplify, so
+//! it is bounded on three axes. It is single-flighted, so a cold start
+//! that takes 100 concurrent requests pays one build rather than 100.
+//! A failed build is negatively cached behind a doubling retry floor,
+//! so a permanently unbuildable index (a typo in `embedding.model`, a
+//! centroid whose dimensions disagree with the embedder's real output)
+//! costs one build attempt per backoff window instead of one per
+//! request, forever. And the total exemplar count is capped at
+//! [`MAX_TOTAL_EXEMPLARS`], which
+//! [`SemanticRouteConfig::validate`] refuses past and the build
+//! enforces again, so the cold-start cost of the strategy is a number
+//! an operator can read off the config.
+//!
 //! Fail posture: this strategy can only ever narrow a selection, never
 //! fail or hang one. A below-floor score, a request without a user
-//! message, and an unavailable embedder all produce a fallback outcome
-//! that the dispatcher resolves to the declared `fallback` deployment
-//! when one is eligible, and to the round-robin arm in
+//! message, an unavailable embedder, a build already in flight, and a
+//! build inside its retry floor all produce a fallback outcome that the
+//! dispatcher resolves to the declared `fallback` deployment when one
+//! is eligible, and to the round-robin arm in
 //! [`select_from_candidates`](crate::routing::Router) otherwise. The
 //! embedding call itself is bounded by the embedding source's own
 //! timeout, the same bound the semantic cache's lookup path relies on.
+//!
+//! Embedding traffic this strategy generates is metered against the
+//! origin's `quota_pool` when one is configured: the dispatcher reserves
+//! an attempt per embedding call and [`embed_route_text`] settles it at
+//! the send seam, exactly as the semantic cache's lookup embedding does.
+//! A pool denial folds into the same fallback outcome as an embedder
+//! outage, so the shared limit is honored without the routing decision
+//! ever failing a request.
 //!
 //! Requiring an embedding source is a config-compile refusal, not a
 //! runtime surprise, matching the posture `token_rate`'s refusal set:
@@ -46,8 +68,22 @@ pub const MAX_SEMANTIC_ROUTES: usize = 64;
 pub const MAX_EXEMPLARS_PER_ROUTE: usize = 64;
 /// Hard cap on one exemplar text in bytes.
 pub const MAX_EXEMPLAR_BYTES: usize = 4096;
+/// Hard cap on the exemplar texts declared across every route.
+///
+/// The per-route cap alone permits 64 routes of 64 exemplars, and every
+/// one of those 4096 texts is a billed embedding call on the first
+/// request that builds the index. This is the aggregate budget for that
+/// build.
+pub const MAX_TOTAL_EXEMPLARS: usize = 256;
 /// Default similarity floor a match must clear to pin the deployment.
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.75;
+
+/// Shortest wait before a failed exemplar-index build is attempted again.
+const EXEMPLAR_BUILD_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest the retry floor grows to under consecutive failed builds.
+const EXEMPLAR_BUILD_RETRY_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+/// How many times the floor may double before the ceiling applies.
+const EXEMPLAR_BUILD_BACKOFF_DOUBLINGS: u32 = 4;
 
 /// Error returned when a `semantic_route` routing block fails validation
 /// at config load.
@@ -155,14 +191,96 @@ fn default_min_similarity() -> f32 {
     DEFAULT_MIN_SIMILARITY
 }
 
-/// Process-local exemplar-vector cache.
+/// Process-local exemplar-vector cache and the gate that bounds its
+/// build.
 ///
 /// Built on first use from the declared exemplars and centroids, then
-/// reused for the life of the config. A failed build is not cached, so
-/// the next request retries against a recovered embedder.
-#[derive(Default)]
+/// reused for the life of the config. Two things guard that build. The
+/// `build` mutex single-flights it, so concurrent cold-start requests
+/// cannot each fire the whole exemplar set at the embedder. The
+/// `failure` slot negatively caches a failed build with a doubling retry
+/// floor, so an index that can never build (a mistyped embedding model,
+/// a centroid whose dimensions disagree with the embedder) degrades to
+/// one attempt per backoff window rather than one per request.
+///
+/// The retry floor is why a *transient* embedder blip now costs the
+/// origin its matches for up to the current floor (30 seconds at the
+/// first strike, doubling to a 5 minute cap) rather than for one
+/// request. That is the deliberate trade: the alternative
+/// posture turned a permanent failure into an unbounded per-request
+/// embedding amplifier, and every request inside the floor still routes,
+/// on the declared `fallback`.
 pub struct SemanticRouteState {
     index: parking_lot::Mutex<Option<Arc<ExemplarIndex>>>,
+    /// Single-flight gate. Async because a build awaits embedding calls;
+    /// held only by the one request doing the building.
+    build: tokio::sync::Mutex<()>,
+    /// Negative cache for a failed build, cleared by the first success.
+    failure: parking_lot::Mutex<Option<BuildFailure>>,
+}
+
+impl Default for SemanticRouteState {
+    fn default() -> Self {
+        Self {
+            index: parking_lot::Mutex::new(None),
+            build: tokio::sync::Mutex::new(()),
+            failure: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+/// One failed exemplar build: when it failed, and how many consecutive
+/// failures have accumulated behind it.
+struct BuildFailure {
+    at: std::time::Instant,
+    strikes: u32,
+}
+
+impl SemanticRouteState {
+    /// The built index, when one is cached.
+    fn cached(&self) -> Option<Arc<ExemplarIndex>> {
+        self.index.lock().clone()
+    }
+
+    /// Publish a built index and clear any negative-cache entry.
+    fn store(&self, index: Arc<ExemplarIndex>) {
+        *self.index.lock() = Some(index);
+        *self.failure.lock() = None;
+    }
+
+    /// Record one failed build, returning its strike count and the retry
+    /// floor that strike earned.
+    fn note_build_failure(&self, now: std::time::Instant) -> (u32, std::time::Duration) {
+        let mut failure = self.failure.lock();
+        let strikes = failure
+            .as_ref()
+            .map_or(1, |prior| prior.strikes.saturating_add(1));
+        *failure = Some(BuildFailure { at: now, strikes });
+        (strikes, retry_backoff(strikes))
+    }
+
+    /// How much of the current retry floor is left at `now`, or `None`
+    /// when a rebuild is due (including when nothing has failed).
+    fn build_backoff_remaining(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let failure = self.failure.lock();
+        let failure = failure.as_ref()?;
+        let elapsed = now.saturating_duration_since(failure.at);
+        retry_backoff(failure.strikes)
+            .checked_sub(elapsed)
+            .filter(|left| !left.is_zero())
+    }
+}
+
+/// The retry floor a build failure earns: [`EXEMPLAR_BUILD_RETRY_FLOOR`]
+/// doubling once per consecutive strike, capped at
+/// [`EXEMPLAR_BUILD_RETRY_CEILING`].
+fn retry_backoff(strikes: u32) -> std::time::Duration {
+    let doublings = strikes
+        .saturating_sub(1)
+        .min(EXEMPLAR_BUILD_BACKOFF_DOUBLINGS);
+    EXEMPLAR_BUILD_RETRY_FLOOR
+        .saturating_mul(1u32 << doublings)
+        .min(EXEMPLAR_BUILD_RETRY_CEILING)
 }
 
 /// One scored vector: which rule it belongs to and which exemplar ordinal
@@ -279,6 +397,21 @@ impl SemanticRouteConfig {
                 ));
             }
         }
+        // The per-route cap is not an aggregate budget: 64 routes of 64
+        // exemplars is 4096 billed embedding calls on the request that
+        // happens to build the index. Refuse at load, where the operator
+        // can see the number, rather than at 03:00 on a cold start.
+        let declared_exemplars: usize = self.routes.iter().map(|rule| rule.exemplars.len()).sum();
+        if declared_exemplars > MAX_TOTAL_EXEMPLARS {
+            return Err(invalid(
+                "routes",
+                format!(
+                    "must declare at most {MAX_TOTAL_EXEMPLARS} exemplar texts across every \
+                     route, and this config declares {declared_exemplars}: each one is an \
+                     embedding call on the first request that builds the index"
+                ),
+            ));
+        }
         if !self.min_similarity.is_finite() || !(0.0..=1.0).contains(&self.min_similarity) {
             return Err(invalid(
                 "min_similarity",
@@ -346,21 +479,84 @@ impl SemanticRouteConfig {
     /// every declared exemplar text through `embed` and normalizing every
     /// declared centroid.
     ///
-    /// A build failure is returned and not cached, so a transiently
-    /// unavailable embedder costs this request its match (the dispatcher
-    /// falls back) and nothing more.
+    /// Three refusals here are not build failures and are deliberately
+    /// not counted as strikes: a cached index short-circuits, a build
+    /// already in flight elsewhere returns an error this request folds
+    /// into its fallback rather than starting a second build, and a
+    /// build inside its retry floor returns without touching the
+    /// embedder at all.
+    ///
+    /// `try_lock` rather than `lock` is the fail-posture choice. Waiting
+    /// on the in-flight build would trade the embedding amplifier for a
+    /// latency stall on every request that arrived during a cold start,
+    /// and this strategy's contract is to fall back rather than to hang.
+    /// A request that misses the gate pays no embedding call at all and
+    /// routes to the declared `fallback`.
     async fn exemplar_index<F, Fut>(&self, embed: &F) -> anyhow::Result<Arc<ExemplarIndex>>
     where
         F: Fn(String) -> Fut,
         Fut: Future<Output = anyhow::Result<Vec<f32>>>,
     {
-        if let Some(index) = self.state.index.lock().clone() {
+        if let Some(index) = self.state.cached() {
             return Ok(index);
         }
-        // Built without holding the lock: an embedding call must never
-        // block the lock, and two racing cold-start requests merely both
-        // embed, with the last writer winning an identical value.
+        let Ok(_build) = self.state.build.try_lock() else {
+            anyhow::bail!("semantic_route exemplar index is already being built");
+        };
+        // The holder of the gate may have finished between the read
+        // above and this lock, so re-read before spending anything.
+        if let Some(index) = self.state.cached() {
+            return Ok(index);
+        }
+        if let Some(remaining) = self
+            .state
+            .build_backoff_remaining(std::time::Instant::now())
+        {
+            anyhow::bail!(
+                "semantic_route exemplar index build is in backoff for another {} seconds",
+                remaining.as_secs()
+            );
+        }
+        match self.build_exemplar_index(embed).await {
+            Ok(index) => {
+                self.state.store(Arc::clone(&index));
+                Ok(index)
+            }
+            Err(error) => {
+                // Timed at the failure, not at the gate: the build's own
+                // duration must not eat into the floor it just earned.
+                let (strikes, retry_after) =
+                    self.state.note_build_failure(std::time::Instant::now());
+                // One line per build attempt, never one per exemplar: a
+                // permanently unbuildable index must not turn the log
+                // into an amplifier of its own.
+                tracing::warn!(
+                    routes = self.routes.len(),
+                    strikes,
+                    retry_after_secs = retry_after.as_secs(),
+                    error = %error,
+                    "AI proxy: semantic_route exemplar index build failed; requests take the \
+                     declared fallback until the retry floor elapses"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Embed every declared exemplar and normalize every declared
+    /// centroid into one index. Called only by
+    /// [`Self::exemplar_index`], and only under its single-flight gate.
+    ///
+    /// Serial by design: the embedding source is a shared upstream, and
+    /// a fan-out here would replace the per-request amplifier the gate
+    /// just removed with a per-build one.
+    async fn build_exemplar_index<F, Fut>(&self, embed: &F) -> anyhow::Result<Arc<ExemplarIndex>>
+    where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<f32>>>,
+    {
         let mut entries = Vec::new();
+        let mut embedded = 0usize;
         let mut dimensions: Option<usize> = None;
         let mut check_dimensions = |vector: &[f32]| -> anyhow::Result<()> {
             match dimensions {
@@ -387,6 +583,16 @@ impl SemanticRouteConfig {
                 });
             }
             for (exemplar_index, exemplar) in rule.exemplars.iter().enumerate() {
+                // The same aggregate budget `validate` refuses past,
+                // enforced again here because a config can reach this
+                // build without having been validated (serde `skip`
+                // fields and `Default` both construct one).
+                anyhow::ensure!(
+                    embedded < MAX_TOTAL_EXEMPLARS,
+                    "semantic_route declares more than {MAX_TOTAL_EXEMPLARS} exemplar texts \
+                     across its routes"
+                );
+                embedded += 1;
                 let vector = l2_normalize(embed(exemplar.clone()).await?)
                     .ok_or_else(|| anyhow::anyhow!("exemplar embedding is not scoreable"))?;
                 check_dimensions(&vector)?;
@@ -400,12 +606,17 @@ impl SemanticRouteConfig {
         let Some(dimensions) = dimensions else {
             anyhow::bail!("no exemplar produced a scoreable vector");
         };
-        let index = Arc::new(ExemplarIndex {
+        tracing::debug!(
+            routes = self.routes.len(),
+            vectors = entries.len(),
+            embedded,
+            dimensions,
+            "AI proxy: semantic_route exemplar index built"
+        );
+        Ok(Arc::new(ExemplarIndex {
             entries,
             dimensions,
-        });
-        *self.state.index.lock() = Some(index.clone());
-        Ok(index)
+        }))
     }
 }
 
@@ -417,6 +628,13 @@ impl SemanticRouteConfig {
 /// into a fallback outcome: this function never errors and never panics,
 /// because the fail posture of the strategy is "fall to the declared
 /// default, never fail the request".
+///
+/// `embed` is called once for the prompt in steady state. It is called
+/// once per declared exemplar on the one request that builds the index,
+/// and not at all on a request that arrives while another is building or
+/// while a failed build is inside its retry floor: both of those are
+/// fallback outcomes rather than embedding calls, which is what keeps a
+/// cold start or an unbuildable index from amplifying into the embedder.
 pub async fn decide<F, Fut>(
     config: &SemanticRouteConfig,
     prompt: &str,
@@ -481,6 +699,21 @@ where
 /// restriction). Errors from this function are folded into
 /// [`SemanticRouteOutcome::EmbedderUnavailable`] by [`decide`]'s callers
 /// and never carry into a response.
+///
+/// `quota_attempt` is one reservation against the origin's `quota_pool`,
+/// minted by the dispatcher for this call and settled at the send seam
+/// by the `_with_quota` embedding variants, mirroring the semantic
+/// cache's lookup embedding. Without it, a `semantic_route` origin
+/// sharing a pool would drive two upstream calls per admitted request
+/// and meter one. Pass `None` only where no pool is configured: a
+/// no-op guard from [`crate::quota_pool::QuotaPoolAdmission`] is the
+/// right value on a pooled origin, since it keeps every embedding call
+/// on the metered path whatever the pool's admission state is.
+///
+/// The guard is per call, not per request, because a cold start embeds
+/// every exemplar and each of those is its own upstream call. The
+/// sidecar source releases the reservation instead of settling it: a
+/// local classifier process is not a pooled provider call.
 pub async fn embed_route_text(
     config: &SemanticRouteConfig,
     client: &crate::client::AiClient,
@@ -488,6 +721,7 @@ pub async fn embed_route_text(
     allowed: &[String],
     blocked: &[String],
     text: &str,
+    quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
 ) -> anyhow::Result<Vec<f32>> {
     match config.source {
         EmbeddingSource::Provider => {
@@ -510,18 +744,53 @@ pub async fn embed_route_text(
                         embedding.provider
                     )
                 })?;
-            crate::semantic_cache::compute_embedding(client, provider, &embedding.model, text).await
+            match quota_attempt {
+                Some(attempt) => {
+                    crate::semantic_cache::compute_embedding_with_quota(
+                        client,
+                        provider,
+                        &embedding.model,
+                        text,
+                        attempt,
+                    )
+                    .await
+                }
+                None => {
+                    crate::semantic_cache::compute_embedding(
+                        client,
+                        provider,
+                        &embedding.model,
+                        text,
+                    )
+                    .await
+                }
+            }
         }
-        EmbeddingSource::Sidecar => match config.sidecar.as_ref() {
-            Some(sidecar) => crate::semantic_cache::compute_embedding_sidecar(sidecar, text).await,
-            None => anyhow::bail!("semantic_route sidecar source has no sidecar config"),
-        },
+        EmbeddingSource::Sidecar => {
+            // No provider call to meter, so the reservation is released
+            // rather than settled.
+            drop(quota_attempt);
+            match config.sidecar.as_ref() {
+                Some(sidecar) => {
+                    crate::semantic_cache::compute_embedding_sidecar(sidecar, text).await
+                }
+                None => anyhow::bail!("semantic_route sidecar source has no sidecar config"),
+            }
+        }
         EmbeddingSource::Openai => match config
             .openai
             .as_ref()
             .filter(|_| allowed.is_empty() && blocked.is_empty())
         {
-            Some(openai) => crate::semantic_cache::compute_embedding_openai(openai, text).await,
+            Some(openai) => match quota_attempt {
+                Some(attempt) => {
+                    crate::semantic_cache::compute_embedding_openai_with_quota(
+                        openai, text, attempt,
+                    )
+                    .await
+                }
+                None => crate::semantic_cache::compute_embedding_openai(openai, text).await,
+            },
             None => anyhow::bail!(
                 "semantic_route openai source has no openai config usable for this credential"
             ),
@@ -753,24 +1022,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_exemplar_build_is_not_cached() {
+    async fn a_failed_exemplar_build_is_negatively_cached_behind_a_retry_floor() {
+        // WOR-2564 review: without the negative cache, a config the
+        // embedder can never build (a mistyped `embedding.model`, a
+        // centroid whose dimensions disagree) re-embeds the whole
+        // exemplar set on every single request, forever. One attempt per
+        // backoff window is the bound.
         let config = exemplar_config();
         let calls = AtomicUsize::new(0);
-        let flaky = |text: String| {
-            let call = calls.fetch_add(1, Ordering::Relaxed);
-            async move {
-                if call == 0 {
-                    anyhow::bail!("cold start failure")
-                }
-                stub_embed(text).await
-            }
+        let broken = |_text: String| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async { anyhow::bail!("no such embedding model") }
         };
-        let first = decide(&config, "Write a Rust function", &flaky).await;
+        let first = decide(&config, "Write a Rust function", &broken).await;
         assert_eq!(first, SemanticRouteOutcome::EmbedderUnavailable);
-        let second = decide(&config, "Write a Rust function", &flaky).await;
+        let after_first = calls.load(Ordering::Relaxed);
+        assert_eq!(
+            after_first, 1,
+            "the build stops at the first exemplar the embedder refuses"
+        );
+        let second = decide(&config, "Write a Rust function", &broken).await;
+        assert_eq!(
+            second,
+            SemanticRouteOutcome::EmbedderUnavailable,
+            "the strategy still falls back, it just does not pay for it twice"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            after_first,
+            "a request inside the retry floor must not touch the embedder at all"
+        );
+    }
+
+    #[test]
+    fn the_build_retry_floor_doubles_per_strike_and_then_expires() {
+        let state = SemanticRouteState::default();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            state.build_backoff_remaining(now),
+            None,
+            "a config that has never failed is always buildable"
+        );
+
+        let (strikes, first) = state.note_build_failure(now);
+        assert_eq!(strikes, 1);
+        assert_eq!(first, EXEMPLAR_BUILD_RETRY_FLOOR);
+        assert!(state.build_backoff_remaining(now).is_some());
+        assert_eq!(
+            state.build_backoff_remaining(now + EXEMPLAR_BUILD_RETRY_FLOOR),
+            None,
+            "a recovered embedder is retried once the floor elapses"
+        );
+
+        let (strikes, second) = state.note_build_failure(now);
+        assert_eq!(strikes, 2);
+        assert_eq!(
+            second,
+            EXEMPLAR_BUILD_RETRY_FLOOR * 2,
+            "consecutive failures back off rather than hammering the embedder"
+        );
+        assert_eq!(
+            retry_backoff(u32::MAX),
+            EXEMPLAR_BUILD_RETRY_CEILING,
+            "the backoff is capped, so a recovered embedder is never parked forever"
+        );
+
+        state.store(Arc::new(ExemplarIndex {
+            entries: Vec::new(),
+            dimensions: 2,
+        }));
+        assert_eq!(
+            state.build_backoff_remaining(now),
+            None,
+            "a successful build clears the negative cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_build_already_in_flight_falls_back_instead_of_starting_a_second() {
+        // 100 concurrent cold-start requests used to mean 100 full
+        // exemplar builds fired at the embedder in one burst. The gate
+        // makes that one build; everyone else takes the declared
+        // fallback for free.
+        let config = exemplar_config();
+        let calls = AtomicUsize::new(0);
+        let embed = |text: String| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async move { stub_embed(text).await }
+        };
+        let held = config.state.build.lock().await;
+        let blocked = decide(&config, "Write a Rust function", &embed).await;
+        assert_eq!(
+            blocked,
+            SemanticRouteOutcome::EmbedderUnavailable,
+            "a request that misses the gate falls back rather than hanging on the build"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "a request that misses the gate must not embed anything, exemplar or prompt"
+        );
+        drop(held);
+
+        let served = decide(&config, "Write a Rust function", &embed).await;
         assert!(
-            matches!(second, SemanticRouteOutcome::Matched { .. }),
-            "a recovered embedder must serve the next request: {second:?}"
+            matches!(served, SemanticRouteOutcome::Matched { .. }),
+            "missing the gate is not a build failure and must not earn a retry floor: {served:?}"
         );
     }
 
@@ -876,6 +1233,36 @@ mod tests {
     }
 
     #[test]
+    fn a_total_exemplar_count_past_the_aggregate_budget_is_refused() {
+        // The per-route cap alone permits 64 routes of 64 exemplars, and
+        // every one of those is a billed embedding call on the request
+        // that builds the index.
+        let mut routes = Vec::new();
+        let mut remaining = MAX_TOTAL_EXEMPLARS + 1;
+        let mut route = 0;
+        while remaining > 0 {
+            let take = remaining.min(MAX_EXEMPLARS_PER_ROUTE);
+            remaining -= take;
+            routes.push(serde_json::json!({
+                "deployment": format!("pool-{route}"),
+                "exemplars": (0..take)
+                    .map(|ordinal| format!("exemplar {route}-{ordinal}"))
+                    .collect::<Vec<_>>(),
+            }));
+            route += 1;
+        }
+        let error = parse_and_validate(serde_json::json!({
+            "routes": routes,
+            "embedding": {"provider": "e", "model": "m"}
+        }))
+        .expect_err("an exemplar set past the aggregate budget must be refused");
+        assert!(
+            error.contains(&MAX_TOTAL_EXEMPLARS.to_string()),
+            "the refusal has to name the budget: {error}"
+        );
+    }
+
+    #[test]
     fn unknown_fields_are_refused_instead_of_becoming_unused_policy() {
         let error = parse(serde_json::json!({
             "routes": [{"deployment": "a", "exemplars": ["x"]}],
@@ -902,6 +1289,103 @@ mod tests {
             "exemplar text leaked into Debug output: {formatted}"
         );
         assert!(formatted.contains("code-pool"), "{formatted}");
+    }
+
+    /// Quota store that records which reservations settled and which
+    /// were released, so a test can tell a metered upstream call from an
+    /// unmetered one.
+    #[derive(Default)]
+    struct RecordingQuotaStore {
+        settled: parking_lot::Mutex<Vec<String>>,
+        released: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::quota_pool::QuotaPoolStore for RecordingQuotaStore {
+        async fn reserve(
+            &self,
+            pool: &str,
+            member: &str,
+            units: u64,
+            reservation_id: &str,
+        ) -> Result<crate::quota_pool::QuotaReservation, crate::quota_pool::PoolError> {
+            Ok(crate::quota_pool::QuotaReservation {
+                pool: pool.to_string(),
+                member: member.to_string(),
+                units,
+                reservation_id: reservation_id.to_string(),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            reservation: crate::quota_pool::QuotaReservation,
+            _actual: crate::quota_pool::PoolUsage,
+        ) -> Result<(), crate::quota_pool::PoolError> {
+            self.settled.lock().push(reservation.reservation_id);
+            Ok(())
+        }
+
+        async fn release(
+            &self,
+            reservation: crate::quota_pool::QuotaReservation,
+        ) -> Result<(), crate::quota_pool::PoolError> {
+            self.released.lock().push(reservation.reservation_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_routing_embed_settles_its_quota_reservation() {
+        // WOR-2564 review: the semantic cache's lookup embedding goes
+        // through the `_with_quota` variants on the same origin and the
+        // same provider. Routing's did not, so an origin declaring a
+        // `quota_pool` drove two upstream calls per admitted request and
+        // metered one. The endpoint here is unreachable on purpose: the
+        // settle happens at the send seam, before the socket, so the
+        // reservation is the assertion and the transport error is
+        // expected.
+        let config = parse_and_validate(serde_json::json!({
+            "routes": [{"deployment": "code-pool", "centroid": [1.0, 0.0]}],
+            "source": "openai",
+            "openai": {"base_url": "http://127.0.0.1:1/v1", "model": "m", "timeout_ms": 200}
+        }))
+        .expect("openai-source fixture validates");
+        let recording = Arc::new(RecordingQuotaStore::default());
+        let store: Arc<dyn crate::quota_pool::QuotaPoolStore> = recording.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(
+                serde_json::from_value(serde_json::json!({
+                    "name": "shared-upstream",
+                    "total_limit": 10,
+                    "weights": {"virtual-key-a": 1},
+                    "policy": "burst"
+                }))
+                .expect("quota fixture"),
+            ),
+            Ok(Some(store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let reservation_id = "req-1:quota-pool:semantic-route:openai:0";
+        let attempt = admission
+            .reserve_attempt(reservation_id)
+            .await
+            .expect("quota reservation");
+
+        let client = crate::client::AiClient::new();
+        embed_route_text(&config, &client, &[], &[], &[], "route me", Some(attempt))
+            .await
+            .expect_err("nothing is listening on port 1");
+
+        assert_eq!(
+            recording.settled.lock().as_slice(),
+            [reservation_id.to_string()],
+            "the routing embed has to consume a pool unit like the cache's embed does"
+        );
+        assert!(
+            recording.released.lock().is_empty(),
+            "a dispatched embedding call settles, it does not release"
+        );
     }
 
     #[test]

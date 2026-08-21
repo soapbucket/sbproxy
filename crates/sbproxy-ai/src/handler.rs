@@ -1162,13 +1162,26 @@ impl AiHandlerConfig {
         // would be silently swallowed, which is the failure mode the
         // `context_overflow:` refusal above exists to prevent. Refuse and
         // point at the level the keys live on.
-        if let Some(routing) = value.get("routing").and_then(|v| v.as_object()) {
+        //
+        // `resilience:` is checked on the same footing, and is the
+        // likelier of the two misplacements: `content_policy_fallback`
+        // (singular, a boolean) is a real key that already lives there,
+        // so the plural list is one character and one nesting level from
+        // a spelling operators are already using. `AiResilienceConfig`
+        // sets no `deny_unknown_fields`, so without this the key is
+        // dropped in silence, `sbproxy validate` exits 0, and every
+        // content-policy refusal reaches the caller with nothing in the
+        // logs to say the configured reroute never ran.
+        for parent in ["routing", "resilience"] {
+            let Some(object) = value.get(parent).and_then(|v| v.as_object()) else {
+                continue;
+            };
             for key in ["context_window_fallbacks", "content_policy_fallbacks"] {
                 anyhow::ensure!(
-                    !routing.contains_key(key),
-                    "ai `routing.{key}` is not read by any strategy and would be silently \
-                     ignored: `{key}:` is a sibling of `routing:` on the ai_proxy action, \
-                     not a key inside it"
+                    !object.contains_key(key),
+                    "ai `{parent}.{key}` is not read there and would be silently ignored: \
+                     `{key}:` is a sibling of `{parent}:` on the ai_proxy action, not a key \
+                     inside it"
                 );
             }
         }
@@ -2191,6 +2204,35 @@ mod tests {
     }
 
     #[test]
+    fn typed_fallback_keys_nested_under_resilience_are_refused() {
+        // WOR-2556 review: `resilience.content_policy_fallback`
+        // (singular) is a real key, so the plural list next to it is the
+        // likelier misplacement of the two. `AiResilienceConfig` has no
+        // `deny_unknown_fields`, so nothing else in the load path sees it.
+        for key in ["context_window_fallbacks", "content_policy_fallbacks"] {
+            let mut resilience = serde_json::Map::new();
+            resilience.insert(
+                "content_policy_fallback".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            resilience.insert(key.to_string(), serde_json::json!(["permissive"]));
+            let error = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [
+                    {"name": "small", "api_key": "k"},
+                    {"name": "permissive", "api_key": "k"},
+                ],
+                "resilience": resilience,
+            }))
+            .expect_err("a typed fallback list nested under resilience: must fail the config");
+            let message = error.to_string();
+            assert!(
+                message.contains(key) && message.contains("resilience"),
+                "the error has to name the misplaced key and its parent: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn typed_fallback_lists_parse_when_names_match_providers() {
         let config = AiHandlerConfig::from_config(serde_json::json!({
             "providers": [
@@ -2237,6 +2279,54 @@ mod tests {
             router.eligible_indices(&config.providers),
             vec![1],
             "an unmapped class never triggers a cooldown"
+        );
+    }
+
+    #[test]
+    fn a_cooldown_records_the_parked_provider_and_cause_on_its_counter() {
+        // WOR-2556 review: parking a provider is the moment traffic
+        // stops reaching it, and a `warn!` line was the only record. A
+        // rotating log line cannot be graphed and nothing can alert on
+        // it, so the seam that parks the provider writes the counter
+        // too. Asserted through `config.router()` rather than against
+        // the recorder directly: a covered recorder is not a wired one.
+        //
+        // The provider name is unique to this test on purpose. The
+        // prometheus registry is process-global and other tests in this
+        // binary park providers of their own.
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "cooldown-counter-probe", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"},
+            ],
+            "resilience": {"cooldown_policy": {"auth": 300}},
+        }))
+        .expect("config compiles");
+        let router = config.router();
+        router.note_classified_failure(
+            0,
+            "cooldown-counter-probe",
+            crate::failure_cause::FailureCause::Auth,
+        );
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "sbproxy_ai_provider_cooldowns_total")
+            .expect("the cooldown seam has to register its counter");
+        let has_label = |metric: &prometheus::proto::Metric, name: &str, value: &str| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == name && label.value() == value)
+        };
+        assert!(
+            family.get_metric().iter().any(|metric| {
+                has_label(metric, "provider", "cooldown-counter-probe")
+                    && has_label(metric, "cause", "auth")
+                    && metric.get_counter().value() >= 1.0
+            }),
+            "the parked provider and the class that parked it both have to be on the series"
         );
     }
 

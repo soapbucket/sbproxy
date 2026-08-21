@@ -132,8 +132,11 @@ pub enum ZoneLocality {
 }
 
 impl ZoneLocality {
-    /// Stable lowercase label for logs, the admin request ring, and
-    /// the access log.
+    /// Stable lowercase label for logs, the admin request ring, the
+    /// access log's `zone_locality` field, and the `verdict` label on
+    /// `sbproxy_lb_zone_locality_total`. All four carry the same two
+    /// strings, so an operator can join a spilled log line to the
+    /// series that alerted.
     pub fn as_str(self) -> &'static str {
         match self {
             ZoneLocality::Local => "local",
@@ -778,10 +781,16 @@ impl LoadBalancerAction {
         self.zoned_targets
     }
 
-    /// Effective `locality.min_pool_size` for this action.
-    pub fn locality_min_pool_size(&self) -> usize {
-        self.locality_min_pool_size
-    }
+    // There was a `pub fn locality_min_pool_size()` accessor here.
+    // Nothing outside this file's tests ever called it: production
+    // reads `self.locality_min_pool_size` directly at the one call
+    // site in `select_target_for_request`. The pub-item ratchet is
+    // blind to a same-file test consumer, so it shipped as public API
+    // surface promising a capability no caller had. The two tests read
+    // the field, which they can do from a child module.
+    //
+    // `has_zoned_targets()` and `local_zone()` above stay: both have
+    // production callers in `sbproxy-core`'s boot path.
 
     /// Returns `true` when the breaker for the target at `idx` would
     /// allow a new request right now (Closed or HalfOpen). Returns
@@ -1454,9 +1463,16 @@ async fn run_health_probe_loop(
 /// zone match is local.
 ///
 /// A free function rather than a method so the build-time
-/// config-reader guard sees the `Target::zone` and
-/// `LocalityConfig::min_pool_size` reads (the guard cannot see into
-/// inherent impls; see `sbproxy-capability`'s `config_scan`).
+/// config-reader guard sees the `Target::zone` read (the guard proves
+/// a key through field access and cannot see into inherent impls; see
+/// `sbproxy-capability`'s `config_scan`). It does not cover
+/// `locality.min_pool_size`: that arrives here as a plain `usize`
+/// parameter, so `pool_size < min_pool_size` is an identifier
+/// comparison the scanner never sees as a field read. The key is
+/// covered by the `stable("origins.*.action.locality.min_pool_size",
+/// ...)` override in `sbproxy-config`'s `key_registry`, which is
+/// load-bearing and must not be deleted on the strength of this
+/// signature.
 fn locality_filter<'t>(
     local_zone: Option<&str>,
     pool_is_zoned: bool,
@@ -2237,7 +2253,7 @@ mod tests {
             "algorithm": "round_robin",
             "locality": {"min_pool_size": 3}
         }));
-        assert_eq!(lb.locality_min_pool_size(), 3);
+        assert_eq!(lb.locality_min_pool_size, 3);
         lb.bind_local_zone("zone-a");
 
         let mut visited = std::collections::BTreeSet::new();
@@ -2252,7 +2268,7 @@ mod tests {
     #[test]
     fn min_pool_size_defaults_to_two() {
         let lb = zoned_two_target_lb();
-        assert_eq!(lb.locality_min_pool_size(), 2);
+        assert_eq!(lb.locality_min_pool_size, 2);
     }
 
     #[test]

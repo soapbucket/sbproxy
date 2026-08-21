@@ -605,7 +605,11 @@ impl Router {
         // another class just set.
         slot.fetch_max(until_ms, Ordering::Relaxed);
         // Like an outlier ejection, the moment traffic stops reaching a
-        // provider must be visible somewhere an operator looks.
+        // provider must be visible somewhere an operator looks. A log
+        // line alone is not that: it rotates, it cannot be graphed, and
+        // nothing can alert on it. The counter is the durable half, and
+        // the breaker axis has published one all along.
+        crate::ai_metrics::record_provider_cooldown(provider_name, cause.as_str());
         tracing::warn!(
             provider = %provider_name,
             cause = cause.as_str(),

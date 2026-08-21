@@ -3398,12 +3398,101 @@ pub(super) fn extract_semantic_prompt(body: &serde_json::Value) -> SemanticPromp
 /// for that digest on every request of a `semantic_route` origin would
 /// be a hot-path cost with no reader.
 ///
-/// Both call the same slot extractor, so the text a routing decision
-/// scores is the text the cache would have embedded, and the two cannot
-/// drift into disagreeing about which turn is the query.
+/// This walks the body read-only. The cache path's extractor takes
+/// `&mut` because it leaves the typed sentinel behind for the context
+/// digest, and routing reached it by deep-cloning the whole request just
+/// to throw the clone away: a 200 KB message history meant a 200 KB
+/// allocation per request of a `semantic_route` origin, for one string.
+/// `semantic_query_slot` walks the same precedence without the clone,
+/// and `semantic_query_text_agrees_with_the_cache_extractor_on_every_body_shape`
+/// is the guard that keeps the two from drifting into disagreeing about
+/// which turn is the query.
 pub(super) fn semantic_query_text(body: &serde_json::Value) -> String {
-    let mut normalized = body.clone();
-    replace_semantic_query_slot(&mut normalized)
+    semantic_query_slot(body)
+}
+
+/// Read the semantic query slot without rewriting it.
+///
+/// The precedence is [`replace_semantic_query_slot`]'s, walked in the
+/// same order and with the same abstentions: a `messages` array commits
+/// to the final `user` turn and yields nothing when there is not one, an
+/// `input` that is neither a string nor an array is ambiguous rather
+/// than empty, and a non-string `prompt` falls through. Keep the two in
+/// step; the equivalence test is what proves they are.
+fn semantic_query_slot(body: &serde_json::Value) -> String {
+    if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
+        let Some(turn) = messages
+            .iter()
+            .rev()
+            .find(|turn| turn.get("role").and_then(|role| role.as_str()) == Some("user"))
+        else {
+            return String::new();
+        };
+        return match turn.get("content") {
+            Some(content) => content_query_slot(content),
+            None => String::new(),
+        };
+    }
+    if let Some(input) = body.get("input") {
+        if input.is_string() || input.is_array() {
+            return responses_input_query_slot(input);
+        }
+        return String::new();
+    }
+    if let Some(prompt) = body.get("prompt").and_then(|value| value.as_str()) {
+        return prompt.to_string();
+    }
+    String::new()
+}
+
+/// Read the query text out of one OpenAI Responses `input` field.
+fn responses_input_query_slot(input: &serde_json::Value) -> String {
+    if let Some(text) = input.as_str() {
+        return text.to_string();
+    }
+    let Some(items) = input.as_array() else {
+        return String::new();
+    };
+    let Some(item) = items
+        .iter()
+        .rev()
+        .find(|item| item.get("role").and_then(|role| role.as_str()) == Some("user"))
+    else {
+        return String::new();
+    };
+    match item.get("content") {
+        Some(content) => content_query_slot(content),
+        None => String::new(),
+    }
+}
+
+/// Read every text-bearing part of one message content field.
+///
+/// A string content is the whole query. An array content contributes its
+/// text parts joined by newlines and skips everything else, so a final
+/// turn's image, audio, or file reference is no more part of the query
+/// here than it is on the cache path.
+fn content_query_slot(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
+    let mut collected: Vec<&str> = Vec::new();
+    for part in parts {
+        let Some(text) = part
+            .as_object()
+            .and_then(|object| object.get("text"))
+            .and_then(|text| text.as_str())
+        else {
+            continue;
+        };
+        if !text.is_empty() {
+            collected.push(text);
+        }
+    }
+    collected.join("\n")
 }
 
 /// Replace the semantic query slot with the sentinel and return its text.
@@ -3926,11 +4015,14 @@ mod semantic_identity_tests {
         // WOR-2564: `semantic_route` scores this text and the semantic
         // cache embeds that one. Two extractors that disagree about
         // which turn is the query would route on one sentence and cache
-        // another, so the routing path reuses the cache path's slot
-        // logic and this pins the two together across every shape the
-        // slot extractor recognizes: chat messages, an Anthropic or
-        // Responses body after the inbound shim normalizes it, a
-        // Responses `input`, a legacy `prompt`, and an ambiguous batch.
+        // another. The routing path walks the body read-only rather than
+        // deep-cloning it just to run the cache path's sentinel rewrite,
+        // so the two are now separate walks and this is the guard that
+        // keeps them in step, across every shape the slot extractor
+        // recognizes: chat messages, multi-part content with a
+        // non-text block, a Responses `input` in both its string and
+        // array forms, a legacy `prompt`, a non-string `prompt`, a
+        // user turn with no content, and an ambiguous batch.
         for body in [
             serde_json::json!({
                 "model": "gpt-4o-mini",
@@ -3941,8 +4033,27 @@ mod semantic_identity_tests {
                     {"role": "user", "content": "the question that routes"}
                 ]
             }),
+            serde_json::json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+                    {"type": "text", "text": "in one sentence"}
+                ]}]
+            }),
+            serde_json::json!({"messages": [{"role": "user"}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": "no user turn"}]}),
+            serde_json::json!({"messages": "not an array", "prompt": "the fallthrough"}),
             serde_json::json!({"input": "a responses-shaped query"}),
+            serde_json::json!({
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                    {"role": "assistant", "content": "an answer"},
+                    {"role": "user", "content": [{"type": "input_text", "text": "the last turn"}]}
+                ]
+            }),
+            serde_json::json!({"input": {"not": "a query"}}),
             serde_json::json!({"prompt": "a legacy completions query"}),
+            serde_json::json!({"prompt": ["not", "a", "string"]}),
             serde_json::json!({
                 "requests": [{"prompt": "batch one"}, {"prompt": "batch two"}]
             }),
