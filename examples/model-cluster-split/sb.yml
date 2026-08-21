@@ -39,7 +39,10 @@ proxy:
     authority: file_managed
     handoff_timeout_ms: 15000
     cache:
-      directory: ./state/authority/models
+      # Absolute path required: each node opens this root from its own
+      # working directory, and the engine subprocess needs an absolute
+      # snapshot path.
+      directory: ${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}/authority
       budget_gib: 4
       max_resident_models: 1
     engines:

@@ -17,7 +17,10 @@ proxy:
     shutdown_deadline_ms: 30000
 
     cache:
-      directory: ./.cache/sbproxy-models
+      # Absolute path required. The engine subprocess launched from this
+      # cache has its own working directory, so a relative value would
+      # name a different place there than it does here.
+      directory: ${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}
       budget_gib: 20
       max_resident_models: 1
 
