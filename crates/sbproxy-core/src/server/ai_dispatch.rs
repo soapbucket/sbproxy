@@ -3884,6 +3884,260 @@ fn set_body_model(body: &mut serde_json::Value, model: &str) {
     }
 }
 
+/// Resolve the effective per-request price ceiling (WOR-2559): the
+/// origin-level `max_price_per_request` and the caller's
+/// `x-sbproxy-max-price` header, whichever is stricter. The header can
+/// only tighten an operator ceiling, never raise it, or a caller could
+/// talk the gateway out of a guard the operator set. A malformed or
+/// non-positive header is an error rather than being ignored: a caller
+/// who asked for a ceiling and mistyped it must not dispatch unbounded.
+fn effective_price_ceiling(
+    config_ceiling: Option<f64>,
+    header_value: Option<&str>,
+) -> Result<Option<f64>, String> {
+    let header = match header_value {
+        None => None,
+        Some(raw) => {
+            let parsed: f64 = raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("x-sbproxy-max-price is not a number: {raw:?}"))?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(format!(
+                    "x-sbproxy-max-price must be a positive USD amount, got {raw:?}"
+                ));
+            }
+            Some(parsed)
+        }
+    };
+    Ok(match (config_ceiling, header) {
+        (Some(config), Some(request)) => Some(config.min(request)),
+        (ceiling @ Some(_), None) => ceiling,
+        (None, request) => request,
+    })
+}
+
+/// Build the WOR-2559 fail-closed refusal body for a candidate set the
+/// price ceiling fully excluded. Names the ceiling and carries each
+/// excluded candidate's resolved price, so a caller sees what the
+/// request would have cost instead of guessing.
+fn price_ceiling_refusal_body(
+    ceiling_usd: f64,
+    request_id: &str,
+    excluded: &[sbproxy_ai::budget::PriceCeilingExclusion],
+) -> Vec<u8> {
+    let body = serde_json::json!({
+        "error": {
+            "type": "price_ceiling_exceeded",
+            "message": format!(
+                "no eligible provider can serve this request under the price \
+                 ceiling of ${ceiling_usd} per request; each candidate's \
+                 estimated cost is listed in error.excluded"
+            ),
+            "request_id": request_id,
+            "ceiling_usd": ceiling_usd,
+            "excluded": excluded,
+        }
+    });
+    // The value is built here from owned data with no map keys that can
+    // collide, so serialization cannot fail; an empty body on the
+    // impossible branch still refuses with 402 rather than dispatching.
+    serde_json::to_vec(&body).unwrap_or_default()
+}
+
+/// Whether the per-request price ceiling (WOR-2559) is enforceable on
+/// this surface.
+///
+/// The gate needs a per-token pre-dispatch estimate, so it covers the
+/// three surfaces that carry a token-priced chat body. `/v1/messages`
+/// and `/v1/responses` arrive in their own wire formats but the native
+/// inbound shim rewrites both into the canonical OpenAI chat body before
+/// anything downstream reads it, so by the time the filter runs they are
+/// the same request shape `chat_completions` is, priced by the same
+/// per-million rates. Leaving them out would have been the quiet kind of
+/// gap: an operator sets a ceiling on an origin, every Anthropic-SDK
+/// call through `/v1/messages` ignores it, and no refusal, log line,
+/// metric, or admin row says so.
+///
+/// Per-image, per-second, per-character, and multipart surfaces are
+/// priced on units this estimate does not model, so there is nothing to
+/// compare a ceiling against there.
+///
+/// One predicate, read by both the early caller-header check and the
+/// candidate filter, so the two cannot drift into a gap where a request
+/// carrying `x-sbproxy-max-price` is admitted on a surface the filter
+/// never runs on.
+fn price_ceiling_enforceable_surface(surface: &sbproxy_ai::handler::AiSurface) -> bool {
+    matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Messages
+            | sbproxy_ai::handler::AiSurface::Responses
+    )
+}
+
+/// The prompt-token volume the price ceiling (WOR-2559) prices a request
+/// at, estimated from the canonical chat body.
+///
+/// Chat completions already computed this for budget accounting
+/// (`estimated_prompt_tokens_for_budget`), and callers reuse that rather
+/// than estimating the same body twice. `/v1/messages` and
+/// `/v1/responses` reach the filter carrying the same canonical body but
+/// no estimate, because the gate that computes one is scoped to budget
+/// debiting (WOR-1146) and widening it would change what those surfaces
+/// charge. Estimating here keeps the ceiling as wide as the surfaces it
+/// claims to cover while leaving every budget debit exactly as it was.
+///
+/// A body with no `messages` array yields zero prompt tokens. The
+/// request is still gated on its output allowance, so the ceiling never
+/// reads as free; such a body is rejected upstream anyway.
+fn price_ceiling_prompt_tokens(body: &serde_json::Value) -> u64 {
+    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        return 0;
+    };
+    let parsed: Vec<sbproxy_ai::Message> = messages
+        .iter()
+        .filter_map(|message| serde_json::from_value::<sbproxy_ai::Message>(message.clone()).ok())
+        .collect();
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    sbproxy_ai::estimate_tokens(model, &parsed)
+}
+
+/// Bounded admin-facing summary of a price-ceiling refusal (WOR-2559),
+/// written to [`RequestContext::deny_reason`] so the admin request
+/// record shows the ceiling-caused exclusion and what it would have
+/// cost, alongside the existing decision fields.
+///
+/// Names at most three candidates and counts the rest. Only the
+/// configured provider name and the resolved estimate go in: those come
+/// from the operator's own config and a float, so the reason string
+/// stays bounded by the provider list. The model name is caller-chosen
+/// text, so it stays in the 402 body (which is not retained) rather than
+/// being copied once per candidate into a retained admin ring row.
+fn price_ceiling_deny_reason(
+    ceiling_usd: f64,
+    excluded: &[sbproxy_ai::budget::PriceCeilingExclusion],
+) -> String {
+    const MAX_NAMED: usize = 3;
+    let named = excluded
+        .iter()
+        .take(MAX_NAMED)
+        .map(|exclusion| format!("{} ${}", exclusion.provider, exclusion.estimated_cost_usd))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut reason = format!(
+        "price_ceiling: no candidate under ${ceiling_usd} ({}",
+        if named.is_empty() {
+            "none priced"
+        } else {
+            &named
+        }
+    );
+    if excluded.len() > MAX_NAMED {
+        use std::fmt::Write as _;
+        // Writing into a `String` cannot fail; the result is discarded
+        // rather than unwrapped so this stays off the panic ratchet.
+        let _ = write!(reason, ", +{} more", excluded.len() - MAX_NAMED);
+    }
+    reason.push(')');
+    reason
+}
+
+/// The completion-token volume the price ceiling (WOR-2559) prices a
+/// request at: the caller's own declared output cap when the body
+/// carries one under any of the three spellings the surfaces use, else
+/// the documented default allowance.
+///
+/// Shared by both candidate sets the ceiling filters (provider order and
+/// cascade tiers) so the two cannot price the same request differently.
+fn price_ceiling_completion_allowance(body: &serde_json::Value) -> u64 {
+    body.get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(sbproxy_ai::budget::PRICE_CEILING_DEFAULT_COMPLETION_TOKENS)
+}
+
+/// Count and trace every candidate the price ceiling dropped
+/// (WOR-2559).
+///
+/// Debug, not info: this fires once per excluded candidate on the hot
+/// path. The durable records are the counter, the admin decision row,
+/// and the 402 body on a full refusal.
+fn log_price_ceiling_exclusions(
+    ceiling_usd: f64,
+    excluded: &[sbproxy_ai::budget::PriceCeilingExclusion],
+) {
+    for exclusion in excluded {
+        sbproxy_ai::ai_metrics::record_price_ceiling("candidate_excluded");
+        tracing::debug!(
+            event = "ai.price_ceiling.exclude",
+            provider = %exclusion.provider,
+            model = %exclusion.model,
+            estimated_cost_usd = exclusion.estimated_cost_usd,
+            price_source = %exclusion.price_source,
+            ceiling_usd,
+            "price ceiling excluded a routing candidate"
+        );
+    }
+}
+
+/// Write this request's single price-ceiling verdict onto the admin
+/// decision row (WOR-2559).
+///
+/// A request has two candidate sets the ceiling can rule on, the provider
+/// order and a cascade's tier list, so recording per site would put two
+/// `price_ceiling:` entries on one row. An operator reading `allow` next
+/// to `deny` cannot tell which one decided the request. Replacing in
+/// place keeps one verdict per request, and the last writer is by
+/// construction the one that decided the outcome: a narrowing runs after
+/// the pass that found everything eligible, and a refusal runs after
+/// both.
+fn set_price_ceiling_verdict(ctx: &mut RequestContext, verdict: &str) {
+    if let Some(existing) = ctx
+        .policy_decisions
+        .iter_mut()
+        .find(|decision| decision.starts_with("price_ceiling:"))
+    {
+        *existing = format!("price_ceiling:{verdict}");
+        return;
+    }
+    ctx.record_policy_decision("price_ceiling", verdict);
+}
+
+/// Fail closed on a candidate set the price ceiling fully excluded
+/// (WOR-2559): record the refusal on the metric and on the admin
+/// decision row, then answer 402 with each candidate's resolved price.
+///
+/// One emitter for both candidate sets, so a cascade refusal and a
+/// provider-order refusal are indistinguishable to an operator reading
+/// the metric, the admin row, or the response body.
+async fn refuse_over_price_ceiling(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    ceiling_usd: f64,
+    excluded: &[sbproxy_ai::budget::PriceCeilingExclusion],
+) -> Result<()> {
+    sbproxy_ai::ai_metrics::record_price_ceiling("refused");
+    // The admin request record is the operator-readable decision
+    // surface: `policy_decisions` says the ceiling ruled, and
+    // `deny_reason` carries what the excluded candidates would have
+    // cost. Both are rendered by the admin logs view's expanded row
+    // next to the existing decision fields.
+    set_price_ceiling_verdict(ctx, "deny");
+    ctx.deny_reason = Some(price_ceiling_deny_reason(ceiling_usd, excluded));
+    warn!(
+        ceiling_usd,
+        excluded = excluded.len(),
+        "AI proxy: price ceiling excluded every routing candidate; refusing"
+    );
+    let bytes = price_ceiling_refusal_body(ceiling_usd, ctx.request_id.as_str(), excluded);
+    send_response(session, 402, "application/json", &bytes).await
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -4058,6 +4312,50 @@ pub(super) async fn handle_ai_proxy(
     // context so the admin ring row names the key-policy generation
     // that governed this request.
     ctx.ai_policy_version = Some(peer_policy_revision.clone());
+    // WOR-2559: resolve the effective per-request price ceiling before
+    // the request body is read, so every surface branch below sees the
+    // same answer. The multipart, audio, and cached-replay branches all
+    // answer and return before the candidate filter that applies the
+    // ceiling, so resolving at the filter would silently ignore a
+    // malformed `x-sbproxy-max-price` on them and would dispatch a
+    // caller who set a ceiling on a surface that has no pre-dispatch
+    // cost estimate. It sits below the per-surface counter, the latency
+    // guard, and identity resolution rather than at the top of the
+    // function, so a refusal here is counted, timed, traced, and
+    // authenticated like every other refusal in this function.
+    let price_ceiling_header = req_header_value(session, "x-sbproxy-max-price");
+    let price_ceiling_usd = match effective_price_ceiling(
+        config.max_price_per_request,
+        price_ceiling_header.as_deref(),
+    ) {
+        Ok(ceiling) => ceiling,
+        Err(reason) => {
+            let bytes = ErrorEnvelope::new("invalid_price_ceiling", &reason)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, 400, "application/json", &bytes).await?;
+            return Ok(());
+        }
+    };
+    if price_ceiling_header.is_some() && !price_ceiling_enforceable_surface(&surface) {
+        // An operator ceiling is a broad default and simply does not
+        // reach these surfaces. A caller-set header is a demand about
+        // this one request, so the honest answer is that the gateway
+        // cannot honor it here, not a quiet dispatch.
+        let bytes = ErrorEnvelope::new(
+            "price_ceiling_unsupported_surface",
+            &format!(
+                "x-sbproxy-max-price is enforceable only on token-priced chat \
+                 surfaces; the {surface_label} surface has no pre-dispatch cost \
+                 estimate to compare a ceiling against"
+            ),
+        )
+        .request_id(ctx.request_id.as_str())
+        .to_bytes();
+        send_response(session, 400, "application/json", &bytes).await?;
+        return Ok(());
+    }
+
     let router = config.router();
     if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
         && router.cascade_config().is_some()
@@ -8351,6 +8649,79 @@ pub(super) async fn handle_ai_proxy(
         provider_order = eligible;
     }
 
+    // WOR-2559: per-request hard price ceiling (the OpenRouter
+    // `provider.max_price` analog). Estimate what each remaining candidate
+    // would charge for this request, through the same price resolution the
+    // cost tracker bills with, and drop candidates whose estimate exceeds
+    // the effective ceiling before any strategy can choose them. A fully
+    // excluded set refuses with 402 naming the ceiling and each candidate's
+    // resolved price: failing closed is the point, since the guard exists so
+    // a request can never silently route to something more expensive than
+    // the caller was willing to pay. The ceiling itself was resolved at the
+    // top of this function, so a caller who set it on a surface this filter
+    // never reaches has already been refused rather than dispatched.
+    //
+    // The token volumes are resolved once, here, and shared by both
+    // candidate-set filters, so the provider order and a cascade's tier
+    // list cannot end up pricing the same request off different numbers.
+    // Nothing is estimated when no ceiling is in force.
+    let price_ceiling_tokens = price_ceiling_usd
+        .filter(|_| price_ceiling_enforceable_surface(&surface))
+        .map(|_| {
+            (
+                // The chat surface already estimated its prompt for budget
+                // accounting; the two native chat surfaces did not, so
+                // they are estimated from the same canonical body here.
+                estimated_prompt_tokens_for_budget
+                    .unwrap_or_else(|| price_ceiling_prompt_tokens(&body)),
+                // The declared output cap when the request carries one,
+                // else a documented 1024-token assumption, so an
+                // output-priced frontier model cannot slip under the
+                // ceiling on a short prompt alone.
+                price_ceiling_completion_allowance(&body),
+            )
+        });
+    if let Some(((prompt_tokens, completion_allowance), ceiling_usd)) =
+        price_ceiling_tokens.zip(price_ceiling_usd)
+    {
+        let partition = sbproxy_ai::budget::partition_by_price_ceiling(
+            ceiling_usd,
+            &provider_order,
+            &config.providers,
+            &model,
+            prompt_tokens,
+            completion_allowance,
+        );
+        log_price_ceiling_exclusions(ceiling_usd, &partition.excluded);
+        // An empty candidate set that the ceiling did not empty is not a
+        // ceiling refusal; leaving it to the resilience check below keeps
+        // "no eligible provider at all" answering 503 as it always has.
+        if partition.kept.is_empty() && !partition.excluded.is_empty() {
+            refuse_over_price_ceiling(session, ctx, ceiling_usd, &partition.excluded).await?;
+            return Ok(());
+        }
+        if partition.excluded.is_empty() {
+            // Recorded even when nothing was excluded, so an operator
+            // reading a row can tell "the ceiling ran and everything fit"
+            // from "no ceiling was configured on this origin".
+            set_price_ceiling_verdict(ctx, "allow");
+        } else {
+            set_price_ceiling_verdict(ctx, "narrowed");
+            // Surface the narrowing on the request context's route
+            // reason too, alongside the reasons an operator routing
+            // policy and an `ai_policy` override already write there,
+            // so a later reader of that field sees the same story.
+            if ctx.ai_route_reason.is_none() {
+                ctx.ai_route_reason = Some(format!(
+                    "price_ceiling: excluded {} of {} candidates over ${ceiling_usd}",
+                    partition.excluded.len(),
+                    partition.excluded.len() + partition.kept.len(),
+                ));
+            }
+            provider_order = partition.kept;
+        }
+    }
+
     // Intersect the request's final policy/model candidate set with live
     // resilience state before any strategy can choose or order providers.
     // Policy, model eligibility, and `enabled` are hard; the three
@@ -8530,6 +8901,64 @@ pub(super) async fn handle_ai_proxy(
     ctx.admin_load_balancer_target = provider_order
         .first()
         .map(|&index| config.providers[index].name.to_string());
+    // WOR-2559: the second candidate set. A confidence cascade does not
+    // route over `provider_order`: each tier names its own provider and
+    // its own model, and the tier's model wins over the request's, so
+    // the filter above never reaches it. Without this a cascade origin
+    // with a ceiling would narrow the provider order, then dispatch tier
+    // 1 anyway and bill the caller for the very candidate the ceiling
+    // excluded, which is worse than having no ceiling: it reads as a
+    // guarantee and is not one.
+    //
+    // Filtering here, before the streaming tier-1 pin, means both
+    // cascade entry points see the same surviving tier list. The pin
+    // simply finds no tier when the ceiling excluded them all and leaves
+    // the (already filtered) provider order to the sequential loop; the
+    // non-streaming executor, which is the only path where the cascade
+    // is the whole of dispatch, refuses instead.
+    let mut cascade_ceiling: Option<sbproxy_ai::routing::CascadeConfig> = None;
+    // The ceiling and the exclusions that produced `cascade_ceiling`,
+    // kept together so the refusal below reports the number this filter
+    // actually applied instead of re-deriving it from a second source.
+    let mut cascade_ceiling_refusal: Option<(f64, Vec<sbproxy_ai::budget::PriceCeilingExclusion>)> =
+        None;
+    if let Some(((prompt_tokens, completion_allowance), ceiling_usd)) =
+        price_ceiling_tokens.zip(price_ceiling_usd)
+    {
+        if let Some(configured) = routing_policy_cascade
+            .as_ref()
+            .or_else(|| router.cascade_config())
+            .filter(|_| !disallow_training)
+        {
+            let partition = sbproxy_ai::budget::partition_cascade_tiers_by_price_ceiling(
+                ceiling_usd,
+                &configured.tiers,
+                &config.providers,
+                prompt_tokens,
+                completion_allowance,
+            );
+            if !partition.excluded.is_empty() {
+                log_price_ceiling_exclusions(ceiling_usd, &partition.excluded);
+                let mut narrowed = configured.clone();
+                narrowed.tiers = partition
+                    .kept
+                    .iter()
+                    .map(|&index| configured.tiers[index].clone())
+                    .collect();
+                set_price_ceiling_verdict(ctx, "narrowed");
+                if ctx.ai_route_reason.is_none() {
+                    ctx.ai_route_reason = Some(format!(
+                        "price_ceiling: excluded {} of {} cascade tiers over ${ceiling_usd}",
+                        partition.excluded.len(),
+                        configured.tiers.len(),
+                    ));
+                }
+                cascade_ceiling_refusal = Some((ceiling_usd, partition.excluded));
+                cascade_ceiling = Some(narrowed);
+            }
+        }
+    }
+
     // Whether the streaming tier-1 pin below actually reordered the
     // providers. Only then did a routing plan decide a streaming request.
     let mut streaming_plan_pinned = false;
@@ -8537,8 +8966,9 @@ pub(super) async fn handle_ai_proxy(
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
     // applied to the request body below in the per-provider loop.
-    if let Some(cascade_cfg) = routing_policy_cascade
+    if let Some(cascade_cfg) = cascade_ceiling
         .as_ref()
+        .or(routing_policy_cascade.as_ref())
         .or_else(|| router.cascade_config())
         .filter(|_| !disallow_training)
     {
@@ -8639,8 +9069,9 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
-    if let Some(cascade_cfg) = routing_policy_cascade
+    if let Some(cascade_cfg) = cascade_ceiling
         .as_ref()
+        .or(routing_policy_cascade.as_ref())
         .or_else(|| router.cascade_config())
         .filter(|_| !disallow_training && !has_managed_local)
     {
@@ -8686,6 +9117,17 @@ pub(super) async fn handle_ai_proxy(
                         return Ok(());
                     }
                 }
+            }
+            // WOR-2559: on this path the cascade is the whole of
+            // dispatch, so a tier list the ceiling emptied has nothing
+            // left to route to. Refuse rather than hand the executor an
+            // empty cascade, which would fail as an opaque 502.
+            if let Some((ceiling_usd, excluded)) = cascade_ceiling_refusal
+                .as_ref()
+                .filter(|_| cascade_cfg.tiers.is_empty())
+            {
+                refuse_over_price_ceiling(session, ctx, *ceiling_usd, excluded).await?;
+                return Ok(());
             }
             let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
             let outcome = AI_CLIENT
@@ -15440,6 +15882,18 @@ mod external_guardrail_context_tests {
         content_type: &str,
         body: Vec<u8>,
     ) -> (Session, DownstreamClient) {
+        downstream_method_bytes_session_with_headers(method, path, content_type, body, &[]).await
+    }
+
+    /// The fixture above plus caller-supplied request headers, for the
+    /// header-driven request paths (WOR-2559's `x-sbproxy-max-price`).
+    async fn downstream_method_bytes_session_with_headers(
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        extra_headers: &[(&str, &str)],
+    ) -> (Session, DownstreamClient) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
@@ -15447,12 +15901,16 @@ mod external_guardrail_context_tests {
         let method = method.to_string();
         let path = path.to_string();
         let content_type = content_type.to_string();
+        let extra = extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
         let mut client = DownstreamClient::new(tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect downstream fixture");
             let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -18703,6 +19161,717 @@ origins:
                 assert!(!response.contains('\u{fffd}'));
             }
         }
+    }
+
+    // --- WOR-2559: per-request price ceiling, wired through dispatch ---
+
+    fn price_ceiling_proxy_config(
+        upstream_url: &str,
+        ceiling: Option<f64>,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut config = serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        });
+        if let Some(ceiling) = ceiling {
+            config["max_price_per_request"] = serde_json::json!(ceiling);
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(config).expect("price ceiling proxy config")
+    }
+
+    fn price_ceiling_chat_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_below_every_candidate_refuses_402_before_any_dispatch() {
+        let (upstream_url, upstream_hits) = upstream_fixture("{}").await;
+        // gpt-4o estimates near a penny for this request through the
+        // built-in catalog; a $0.0001 ceiling is under every candidate.
+        let config = price_ceiling_proxy_config(&upstream_url, Some(0.0001));
+        let (mut session, client) = downstream_session(price_ceiling_chat_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("price ceiling refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 402"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["error"]["type"], "price_ceiling_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("refusal message")
+                .contains("$0.0001"),
+            "the refusal names the ceiling: {}",
+            body["error"]["message"]
+        );
+        assert_eq!(body["error"]["ceiling_usd"], 0.0001);
+        assert_eq!(body["error"]["excluded"][0]["provider"], "openai");
+        assert_eq!(body["error"]["excluded"][0]["model"], "gpt-4o");
+        assert_eq!(body["error"]["excluded"][0]["price_source"], "catalog");
+        assert!(
+            body["error"]["excluded"][0]["estimated_cost_usd"]
+                .as_f64()
+                .expect("resolved estimate")
+                > 0.0001,
+            "the exclusion carries the candidate's over-ceiling resolved estimate"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a fully excluded request never dials an upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_ceiling_leaves_the_request_on_the_normal_dispatch_path() {
+        // The same provider and request as the refusal test above, minus
+        // the ceiling: the request dispatches to the upstream unchanged.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            canonical_chat_response("under ceiling"),
+            Some("application/json"),
+            200,
+        )
+        .await;
+        let config = price_ceiling_proxy_config(&upstream_url, None);
+        let (mut session, client) = downstream_session(price_ceiling_chat_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("AI request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "a request with no ceiling reaches the upstream as before"
+        );
+    }
+
+    /// Two candidates for one logical model, each renamed by its own
+    /// `model_map`: `gpt-4o` at $2.50 / $10.00 per million and
+    /// `gpt-4o-mini` at $0.15 / $0.60. With a 1,000-token output cap the
+    /// first estimates above a cent and the second under a tenth of one,
+    /// so a half-cent ceiling separates them.
+    fn price_ceiling_two_candidate_config(
+        expensive_url: &str,
+        cheap_url: &str,
+        ceiling: f64,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "max_price_per_request": ceiling,
+            "providers": [
+                {
+                    "name": "expensive",
+                    "provider_type": "openai",
+                    "base_url": expensive_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "model_map": {"chat-default": "gpt-4o"}
+                },
+                {
+                    "name": "cheap",
+                    "provider_type": "openai",
+                    "base_url": cheap_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "model_map": {"chat-default": "gpt-4o-mini"}
+                }
+            ]
+        }))
+        .expect("two candidate price ceiling config")
+    }
+
+    #[tokio::test]
+    async fn a_partial_exclusion_routes_to_the_survivor_and_records_the_narrowing() {
+        let (expensive_url, expensive_hits) = upstream_fixture("{}").await;
+        let (cheap_url, cheap_hits) = upstream_bytes_fixture_with_status(
+            canonical_chat_response("under ceiling"),
+            Some("application/json"),
+            200,
+        )
+        .await;
+        let config = price_ceiling_two_candidate_config(&expensive_url, &cheap_url, 0.005);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "chat-default",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the surviving candidate dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(
+            expensive_hits.load(Ordering::SeqCst),
+            0,
+            "the over-ceiling candidate is never dialed"
+        );
+        assert_eq!(
+            cheap_hits.load(Ordering::SeqCst),
+            1,
+            "routing proceeds over the survivors"
+        );
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "price_ceiling:narrowed"),
+            "the admin decision row records the narrowing: {:?}",
+            context.policy_decisions
+        );
+        assert!(
+            context.deny_reason.is_none(),
+            "a narrowed request is not a denied one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_every_candidate_clears_still_records_that_the_gate_ran() {
+        let (expensive_url, expensive_hits) = upstream_bytes_fixture_with_status(
+            canonical_chat_response("under ceiling"),
+            Some("application/json"),
+            200,
+        )
+        .await;
+        let (cheap_url, _cheap_hits) = upstream_fixture("{}").await;
+        // $5.00 is above both candidates, so nothing is excluded and the
+        // first candidate serves the request as it would with no ceiling.
+        let config = price_ceiling_two_candidate_config(&expensive_url, &cheap_url, 5.0);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "chat-default",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("AI request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(expensive_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "price_ceiling:allow"),
+            "an operator can tell the gate ran from the gate being unset: {:?}",
+            context.policy_decisions
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_ceiling_on_the_admin_decision_row() {
+        let (upstream_url, upstream_hits) = upstream_fixture("{}").await;
+        let config = price_ceiling_proxy_config(&upstream_url, Some(0.0001));
+        let (mut session, client) = downstream_session(price_ceiling_chat_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("price ceiling refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 402"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "price_ceiling:deny"),
+            "the admin decision row shows the ceiling ruled: {:?}",
+            context.policy_decisions
+        );
+        let deny_reason = context.deny_reason.expect("a refusal sets a deny reason");
+        assert!(
+            deny_reason.contains("$0.0001"),
+            "the admin row names the ceiling: {deny_reason}"
+        );
+        assert!(
+            deny_reason.contains("openai $0.0"),
+            "the admin row carries the excluded candidate's resolved price: {deny_reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_header_tightens_an_operator_ceiling_the_request_would_have_cleared() {
+        let (upstream_url, upstream_hits) = upstream_fixture("{}").await;
+        // $0.05 is well above this request's gpt-4o estimate, so the
+        // operator ceiling alone would dispatch. The header is the only
+        // reason it refuses.
+        let config = price_ceiling_proxy_config(&upstream_url, Some(0.05));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&price_ceiling_chat_request()).expect("request JSON"),
+            &[("x-sbproxy-max-price", "0.0001")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the tightened ceiling refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 402"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["error"]["type"], "price_ceiling_exceeded");
+        assert_eq!(
+            body["error"]["ceiling_usd"], 0.0001,
+            "the stricter caller ceiling is the one enforced"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_ceiling_header_refuses_on_a_surface_the_filter_never_reaches() {
+        let (upstream_url, upstream_hits) = upstream_fixture("{}").await;
+        let config = price_ceiling_proxy_config(&upstream_url, None);
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/embeddings",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "text-embedding-3-small",
+                "input": "fixture"
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-max-price", "free-please")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the malformed header is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["error"]["type"], "invalid_price_ceiling");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a mistyped ceiling never dispatches, on any surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_ceiling_header_refuses_on_a_surface_that_cannot_enforce_it() {
+        let (upstream_url, upstream_hits) = upstream_fixture("{}").await;
+        let config = price_ceiling_proxy_config(&upstream_url, None);
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/embeddings",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "text-embedding-3-small",
+                "input": "fixture"
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-max-price", "0.01")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the unsupported-surface refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["error"]["type"], "price_ceiling_unsupported_surface");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("refusal message")
+                .contains("embeddings"),
+            "the refusal names the surface it cannot gate: {}",
+            body["error"]["message"]
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a ceiling the gateway cannot honor never dispatches unbounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_ceiling_alone_leaves_ungated_surfaces_dispatching() {
+        // The counterpart to the test above: an origin-level ceiling is a
+        // broad default, not a per-request demand, so it does not turn
+        // every non-chat surface on the origin into a refusal.
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"data":[]}"#).await;
+        let config = price_ceiling_proxy_config(&upstream_url, Some(0.0001));
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/embeddings",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "text-embedding-3-small",
+                "input": "fixture"
+            }))
+            .expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the embeddings request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            context.policy_decisions.is_empty(),
+            "no ceiling decision is recorded where the gate does not run: {:?}",
+            context.policy_decisions
+        );
+    }
+
+    /// An operator ceiling has to reach `/v1/messages`, not only
+    /// `/v1/chat/completions`. The native inbound shim rewrites the
+    /// Anthropic body into the canonical chat body before routing, so the
+    /// request the filter sees is token-priced exactly like a chat
+    /// completion. Skipping it would leave an origin whose ceiling looks
+    /// set while every Anthropic-SDK call through it dispatched unbounded,
+    /// with no refusal, log line, metric, or admin row saying so.
+    #[tokio::test]
+    async fn a_ceiling_reaches_the_native_anthropic_chat_surface() {
+        let (upstream_url, upstream_hits) = upstream_fixture("{}").await;
+        let config = price_ceiling_proxy_config(&upstream_url, Some(0.0001));
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/messages",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the messages-surface refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 402"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["error"]["type"], "price_ceiling_exceeded");
+        assert_eq!(
+            body["error"]["excluded"][0]["model"], "gpt-4o",
+            "the native surface is priced on the model it would dispatch"
+        );
+        assert!(
+            body["error"]["excluded"][0]["estimated_cost_usd"]
+                .as_f64()
+                .expect("resolved estimate")
+                > 0.0006,
+            "the prompt and the declared output cap are both priced, not zeroed"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "an Anthropic-SDK call over the ceiling never dials an upstream"
+        );
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "price_ceiling:deny"),
+            "{:?}",
+            context.policy_decisions
+        );
+    }
+
+    /// A confidence cascade over two upstreams whose tiers name their own
+    /// models. The request model stays cheap so the provider-order filter
+    /// admits both candidates; the expensive model only ever appears on a
+    /// tier, which is the whole point: the tier list is a second candidate
+    /// set the provider-order filter cannot see.
+    fn price_ceiling_cascade_config(
+        first_tier_url: &str,
+        second_tier_url: &str,
+        first_tier_model: &str,
+        second_tier_model: &str,
+        ceiling: f64,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "max_price_per_request": ceiling,
+            "providers": [
+                {
+                    "name": "tier-one",
+                    "base_url": first_tier_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "tier-two",
+                    "base_url": second_tier_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {
+                        "provider_id": "tier-one",
+                        "model": first_tier_model,
+                        "quality_threshold": 0.5
+                    },
+                    {
+                        "provider_id": "tier-two",
+                        "model": second_tier_model,
+                        "quality_threshold": 0.5
+                    }
+                ]
+            }
+        }))
+        .expect("price ceiling cascade config")
+    }
+
+    fn price_ceiling_cascade_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        })
+    }
+
+    /// The cascade executor routes over its own tier list, not over
+    /// `provider_order`, and a tier's model overrides the request's. So a
+    /// ceiling that filtered only the provider order would admit both
+    /// candidates on a cheap request model and then dispatch tier one at
+    /// the expensive model it names: an overspend the ceiling was set to
+    /// prevent, on an origin where the ceiling looks like it is working.
+    #[tokio::test]
+    async fn a_cascade_tier_over_the_ceiling_is_excluded_before_the_cascade_dispatches() {
+        let (expensive_url, expensive_hits) =
+            upstream_bytes_fixture(canonical_chat_response("tier one"), "application/json").await;
+        let (cheap_url, cheap_hits) =
+            upstream_bytes_fixture(canonical_chat_response("tier two"), "application/json").await;
+        // gpt-4o at a 1,000-token output cap estimates just over a cent;
+        // gpt-4o-mini estimates well under a tenth of one.
+        let config = price_ceiling_cascade_config(
+            &expensive_url,
+            &cheap_url,
+            "gpt-4o",
+            "gpt-4o-mini",
+            0.005,
+        );
+        let (mut session, client) = downstream_session(price_ceiling_cascade_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the surviving tier dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(
+            expensive_hits.load(Ordering::SeqCst),
+            0,
+            "the over-ceiling tier is never dialed"
+        );
+        assert_eq!(
+            cheap_hits.load(Ordering::SeqCst),
+            1,
+            "the cascade runs over the surviving tiers"
+        );
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "price_ceiling:narrowed"),
+            "one coherent ceiling verdict on the admin row: {:?}",
+            context.policy_decisions
+        );
+        assert_eq!(
+            context
+                .policy_decisions
+                .iter()
+                .filter(|decision| decision.starts_with("price_ceiling:"))
+                .count(),
+            1,
+            "the cascade narrowing upgrades the provider-order verdict rather than \
+             appending a contradictory second one: {:?}",
+            context.policy_decisions
+        );
+        let reason = context
+            .ai_route_reason
+            .expect("a narrowing writes a reason");
+        assert!(
+            reason.contains("cascade tiers"),
+            "the route reason says which candidate set was narrowed: {reason}"
+        );
+    }
+
+    /// Every tier over the ceiling on the non-streaming cascade path,
+    /// where the cascade is the whole of dispatch: nothing survives to
+    /// route to, so the request fails closed with the tier prices rather
+    /// than handing the executor an empty cascade.
+    #[tokio::test]
+    async fn a_cascade_with_every_tier_over_the_ceiling_refuses_402() {
+        let (first_url, first_hits) =
+            upstream_bytes_fixture(canonical_chat_response("tier one"), "application/json").await;
+        let (second_url, second_hits) =
+            upstream_bytes_fixture(canonical_chat_response("tier two"), "application/json").await;
+        let config =
+            price_ceiling_cascade_config(&first_url, &second_url, "gpt-4o", "gpt-4o", 0.005);
+        let (mut session, client) = downstream_session(price_ceiling_cascade_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the cascade ceiling refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 402"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["error"]["type"], "price_ceiling_exceeded");
+        assert_eq!(body["error"]["ceiling_usd"], 0.005);
+        assert_eq!(
+            body["error"]["excluded"][0]["model"], "gpt-4o",
+            "the refusal prices the model the tier would have dispatched, not the request's"
+        );
+        assert_eq!(body["error"]["excluded"][1]["provider"], "tier-two");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        let verdicts: Vec<_> = context
+            .policy_decisions
+            .iter()
+            .filter(|decision| decision.starts_with("price_ceiling:"))
+            .collect();
+        assert_eq!(
+            verdicts,
+            ["price_ceiling:deny"],
+            "one verdict per request, and the refusal is the one that decided it: {:?}",
+            context.policy_decisions
+        );
     }
 }
 
@@ -22045,6 +23214,209 @@ mod served_model_rewrite_tests {
         assert!(
             mcp_inject_denial_first_seen(rev_b, "acme", "gw-typo"),
             "a hot reload re-arms the latch for the same reference"
+        );
+    }
+}
+
+#[cfg(test)]
+mod price_ceiling_tests {
+    //! WOR-2559: the per-request price ceiling's request-level resolution
+    //! and its fail-closed refusal body. Candidate-set partition behavior
+    //! itself is tested next to its implementation in
+    //! `sbproxy_ai::budget`.
+
+    use super::{effective_price_ceiling, price_ceiling_refusal_body};
+
+    #[test]
+    fn no_ceiling_configured_or_requested_resolves_to_none() {
+        // A request with no ceiling anywhere is untouched by the gate.
+        assert_eq!(effective_price_ceiling(None, None), Ok(None));
+    }
+
+    #[test]
+    fn config_and_header_each_apply_alone() {
+        assert_eq!(effective_price_ceiling(Some(0.05), None), Ok(Some(0.05)));
+        assert_eq!(effective_price_ceiling(None, Some("0.02")), Ok(Some(0.02)));
+    }
+
+    #[test]
+    fn the_header_tightens_but_never_loosens_the_operator_ceiling() {
+        assert_eq!(
+            effective_price_ceiling(Some(0.05), Some("0.01")),
+            Ok(Some(0.01)),
+            "a stricter caller ceiling wins"
+        );
+        assert_eq!(
+            effective_price_ceiling(Some(0.05), Some("5.00")),
+            Ok(Some(0.05)),
+            "a caller cannot raise the operator's ceiling"
+        );
+    }
+
+    #[test]
+    fn malformed_and_non_positive_headers_fail_closed() {
+        assert!(effective_price_ceiling(None, Some("cheap")).is_err());
+        assert!(effective_price_ceiling(None, Some("")).is_err());
+        assert!(effective_price_ceiling(None, Some("0")).is_err());
+        assert!(effective_price_ceiling(None, Some("-0.05")).is_err());
+        assert!(effective_price_ceiling(None, Some("inf")).is_err());
+        assert!(effective_price_ceiling(None, Some("NaN")).is_err());
+        // A config ceiling does not rescue a malformed header: the caller
+        // asked for a bound the gateway cannot honor.
+        assert!(effective_price_ceiling(Some(0.05), Some("cheap")).is_err());
+    }
+
+    #[test]
+    fn the_refusal_body_names_the_ceiling_and_lists_resolved_prices() {
+        let excluded = vec![
+            sbproxy_ai::budget::PriceCeilingExclusion {
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                estimated_cost_usd: 0.0125,
+                price_source: "catalog".to_string(),
+            },
+            sbproxy_ai::budget::PriceCeilingExclusion {
+                provider: "anthropic".to_string(),
+                model: "claude-opus-4".to_string(),
+                estimated_cost_usd: 0.0915,
+                price_source: "catalog".to_string(),
+            },
+        ];
+        let body = price_ceiling_refusal_body(0.005, "req-123", &excluded);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("refusal body is JSON");
+        let error = &json["error"];
+        assert_eq!(error["type"], "price_ceiling_exceeded");
+        assert!(
+            error["message"]
+                .as_str()
+                .expect("message is a string")
+                .contains("$0.005"),
+            "the refusal names the ceiling: {}",
+            error["message"]
+        );
+        assert_eq!(error["request_id"], "req-123");
+        assert_eq!(error["ceiling_usd"], 0.005);
+        assert_eq!(error["excluded"][0]["provider"], "openai");
+        assert_eq!(error["excluded"][0]["model"], "gpt-4o");
+        assert_eq!(error["excluded"][0]["estimated_cost_usd"], 0.0125);
+        assert_eq!(error["excluded"][0]["price_source"], "catalog");
+        assert_eq!(error["excluded"][1]["provider"], "anthropic");
+        assert_eq!(error["excluded"][1]["estimated_cost_usd"], 0.0915);
+    }
+
+    #[test]
+    fn every_token_priced_chat_surface_can_enforce_a_ceiling() {
+        use sbproxy_ai::handler::AiSurface;
+        // The native inbound shim rewrites `/v1/messages` and
+        // `/v1/responses` into the canonical chat body before anything
+        // downstream reads it, so all three reach the filter as the same
+        // token-priced request shape and all three must be gated. A
+        // ceiling that quietly skipped two of them would read as a
+        // guarantee on an origin serving an Anthropic-SDK client.
+        for surface in [
+            AiSurface::ChatCompletions,
+            AiSurface::Messages,
+            AiSurface::Responses,
+        ] {
+            assert!(
+                super::price_ceiling_enforceable_surface(&surface),
+                "{surface:?} carries a token-priced chat body"
+            );
+        }
+        // Every other surface the classifier can return. Listed rather
+        // than sampled: this predicate is what decides whether a caller
+        // who set `x-sbproxy-max-price` is refused or dispatched
+        // unbounded, so a new surface silently joining the enforceable
+        // set is exactly the failure worth pinning.
+        for surface in [
+            AiSurface::Models,
+            AiSurface::Embeddings,
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Files,
+            AiSurface::Realtime,
+            AiSurface::ImageGeneration,
+            AiSurface::ImageEdits,
+            AiSurface::ImageVariations,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+            AiSurface::Unknown,
+        ] {
+            assert!(
+                !super::price_ceiling_enforceable_surface(&surface),
+                "{surface:?} is not priced per token, so there is nothing to gate against"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prompt_estimate_reads_the_canonical_chat_body() {
+        // What `/v1/messages` and `/v1/responses` hand the filter after
+        // the native shim: a canonical chat body. The estimate has to
+        // come off that, or those surfaces price every prompt at zero.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Draft the quarterly summary."}]
+        });
+        assert!(
+            super::price_ceiling_prompt_tokens(&body) > 0,
+            "a real prompt must not price as zero tokens"
+        );
+        // A body with no messages array yields zero rather than panicking;
+        // the output allowance still gates the request.
+        assert_eq!(
+            super::price_ceiling_prompt_tokens(&serde_json::json!({"model": "gpt-4o"})),
+            0
+        );
+    }
+
+    fn exclusion(provider: &str, cost: f64) -> sbproxy_ai::budget::PriceCeilingExclusion {
+        sbproxy_ai::budget::PriceCeilingExclusion {
+            provider: provider.to_string(),
+            // A caller-chosen model name, deliberately long: it must not
+            // reach the retained admin reason string.
+            model: "m".repeat(4096),
+            estimated_cost_usd: cost,
+            price_source: "catalog".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_admin_deny_reason_names_the_ceiling_and_the_resolved_prices() {
+        let reason = super::price_ceiling_deny_reason(
+            0.005,
+            &[exclusion("openai", 0.0125), exclusion("anthropic", 0.0915)],
+        );
+        assert!(reason.contains("$0.005"), "{reason}");
+        assert!(reason.contains("openai $0.0125"), "{reason}");
+        assert!(reason.contains("anthropic $0.0915"), "{reason}");
+    }
+
+    #[test]
+    fn the_admin_deny_reason_is_bounded_by_the_candidate_list_it_summarizes() {
+        let excluded: Vec<_> = (0..12)
+            .map(|index| exclusion(&format!("p{index}"), 0.01))
+            .collect();
+        let reason = super::price_ceiling_deny_reason(0.001, &excluded);
+        assert!(reason.contains("p0 $0.01"), "{reason}");
+        assert!(reason.contains("p2 $0.01"), "{reason}");
+        assert!(
+            !reason.contains("p3 "),
+            "past three candidates the rest are counted, not named: {reason}"
+        );
+        assert!(reason.contains("+9 more"), "{reason}");
+        assert!(
+            !reason.contains("mmmm"),
+            "the caller-chosen model name never reaches the retained admin row: {reason}"
+        );
+        assert!(
+            reason.len() < 256,
+            "the reason stays a row field, not a payload: {} bytes",
+            reason.len()
         );
     }
 }

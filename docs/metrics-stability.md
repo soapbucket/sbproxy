@@ -132,6 +132,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_multipart_inspection_skipped_total` | Counter | `stable` | `beta` | `check`, `surface` | Request-body inspection skipped because the AI request body was multipart, by inspection kind and classified surface. |
 | `sbproxy_ai_native_bypass_total` | Counter | `stable` | `beta` | `inbound_format`, `provider_format` | AI requests that bypassed the hub format round-trip when client format matched provider format. |
 | `sbproxy_ai_output_throughput_tokens_per_second` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming output throughput (completion tokens / generation duration). |
+| `sbproxy_ai_price_ceiling_total` | Counter | `stable` | `alpha` | `outcome` | Per-request price-ceiling guard outcomes: routing candidates excluded over the ceiling, and fully excluded requests refused. |
 | `sbproxy_ai_price_source_total` | Counter | `stable` | `alpha` | `source` | Cost estimates by the price-table layer that produced the price. |
 | `sbproxy_ai_provider_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts during failover/selection, by provider and outcome. |
 | `sbproxy_ai_provider_errors_total` | Counter | `stable` | `stable` | `provider`, `error_kind` | Per-provider AI error events. |

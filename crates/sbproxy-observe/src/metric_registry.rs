@@ -1061,6 +1061,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_price_ceiling_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_price_ceiling"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Per-request price-ceiling guard outcomes: routing candidates excluded over the ceiling, and fully excluded requests refused.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_price_source_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_price_source"),
